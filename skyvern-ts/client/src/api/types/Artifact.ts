@@ -10,7 +10,6 @@ export interface Artifact {
     artifact_id: string;
     artifact_type: Skyvern.ArtifactType;
     uri: string;
-    bundle_key?: string;
     task_id?: string;
     step_id?: string;
     workflow_run_id?: string;

@@ -587,8 +587,6 @@ describe("SkyvernClient", () => {
                 run_with: "run_with",
                 ai_fallback: true,
                 cache_key: "cache_key",
-                adaptive_caching: true,
-                generate_script_on_terminal: true,
                 run_sequentially: true,
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
@@ -665,8 +663,6 @@ describe("SkyvernClient", () => {
                 run_with: "run_with",
                 ai_fallback: true,
                 cache_key: "cache_key",
-                adaptive_caching: true,
-                generate_script_on_terminal: true,
                 run_sequentially: true,
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
@@ -743,8 +739,6 @@ describe("SkyvernClient", () => {
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
             run_sequentially: true,
             sequential_key: "sequential_key",
             folder_id: "folder_id",
@@ -819,8 +813,6 @@ describe("SkyvernClient", () => {
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
             run_sequentially: true,
             sequential_key: "sequential_key",
             folder_id: "folder_id",
@@ -905,8 +897,6 @@ describe("SkyvernClient", () => {
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
             run_sequentially: true,
             sequential_key: "sequential_key",
             folder_id: "folder_id",
@@ -978,8 +968,6 @@ describe("SkyvernClient", () => {
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
             run_sequentially: true,
             sequential_key: "sequential_key",
             folder_id: "folder_id",
@@ -1046,524 +1034,6 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
-    test("get_folders (1)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = [
-            {
-                title: "title",
-                description: "description",
-                folder_id: "folder_id",
-                organization_id: "organization_id",
-                workflow_count: 1,
-                created_at: "2024-01-15T09:30:00Z",
-                modified_at: "2024-01-15T09:30:00Z",
-            },
-        ];
-        server.mockEndpoint().get("/v1/folders").respondWith().statusCode(200).jsonBody(rawResponseBody).build();
-
-        const response = await client.getFolders({
-            page: 1,
-            page_size: 1,
-            search: "search",
-        });
-        expect(response).toEqual([
-            {
-                title: "title",
-                description: "description",
-                folder_id: "folder_id",
-                organization_id: "organization_id",
-                workflow_count: 1,
-                created_at: "2024-01-15T09:30:00Z",
-                modified_at: "2024-01-15T09:30:00Z",
-            },
-        ]);
-    });
-
-    test("get_folders (2)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = { key: "value" };
-        server.mockEndpoint().get("/v1/folders").respondWith().statusCode(422).jsonBody(rawResponseBody).build();
-
-        await expect(async () => {
-            return await client.getFolders();
-        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
-    });
-
-    test("create_folder (1)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { title: "title" };
-        const rawResponseBody = {
-            title: "title",
-            description: "description",
-            folder_id: "folder_id",
-            organization_id: "organization_id",
-            workflow_count: 1,
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-        };
-        server
-            .mockEndpoint()
-            .post("/v1/folders")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(200)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        const response = await client.createFolder({
-            title: "title",
-        });
-        expect(response).toEqual({
-            title: "title",
-            description: "description",
-            folder_id: "folder_id",
-            organization_id: "organization_id",
-            workflow_count: 1,
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-        });
-    });
-
-    test("create_folder (2)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { title: "x" };
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .post("/v1/folders")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(400)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.createFolder({
-                title: "x",
-            });
-        }).rejects.toThrow(Skyvern.BadRequestError);
-    });
-
-    test("create_folder (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { title: "x" };
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .post("/v1/folders")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(422)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.createFolder({
-                title: "x",
-            });
-        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
-    });
-
-    test("get_folder (1)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = {
-            title: "title",
-            description: "description",
-            folder_id: "folder_id",
-            organization_id: "organization_id",
-            workflow_count: 1,
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-        };
-        server
-            .mockEndpoint()
-            .get("/v1/folders/fld_123")
-            .respondWith()
-            .statusCode(200)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        const response = await client.getFolder("fld_123");
-        expect(response).toEqual({
-            title: "title",
-            description: "description",
-            folder_id: "folder_id",
-            organization_id: "organization_id",
-            workflow_count: 1,
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-        });
-    });
-
-    test("get_folder (2)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .get("/v1/folders/folder_id")
-            .respondWith()
-            .statusCode(404)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.getFolder("folder_id");
-        }).rejects.toThrow(Skyvern.NotFoundError);
-    });
-
-    test("get_folder (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .get("/v1/folders/folder_id")
-            .respondWith()
-            .statusCode(422)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.getFolder("folder_id");
-        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
-    });
-
-    test("update_folder (1)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = {
-            title: "title",
-            description: "description",
-            folder_id: "folder_id",
-            organization_id: "organization_id",
-            workflow_count: 1,
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-        };
-        server
-            .mockEndpoint()
-            .put("/v1/folders/fld_123")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(200)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        const response = await client.updateFolder("fld_123");
-        expect(response).toEqual({
-            title: "title",
-            description: "description",
-            folder_id: "folder_id",
-            organization_id: "organization_id",
-            workflow_count: 1,
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-        });
-    });
-
-    test("update_folder (2)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .put("/v1/folders/folder_id")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(404)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.updateFolder("folder_id");
-        }).rejects.toThrow(Skyvern.NotFoundError);
-    });
-
-    test("update_folder (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .put("/v1/folders/folder_id")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(422)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.updateFolder("folder_id");
-        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
-    });
-
-    test("delete_folder (1)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .delete("/v1/folders/fld_123")
-            .respondWith()
-            .statusCode(200)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        const response = await client.deleteFolder("fld_123", {
-            delete_workflows: true,
-        });
-        expect(response).toEqual({
-            key: "value",
-        });
-    });
-
-    test("delete_folder (2)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .delete("/v1/folders/folder_id")
-            .respondWith()
-            .statusCode(404)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.deleteFolder("folder_id");
-        }).rejects.toThrow(Skyvern.NotFoundError);
-    });
-
-    test("delete_folder (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .delete("/v1/folders/folder_id")
-            .respondWith()
-            .statusCode(422)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.deleteFolder("folder_id");
-        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
-    });
-
-    test("update_workflow_folder (1)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = {
-            workflow_id: "workflow_id",
-            organization_id: "organization_id",
-            title: "title",
-            workflow_permanent_id: "workflow_permanent_id",
-            version: 1,
-            is_saved_task: true,
-            is_template: true,
-            description: "description",
-            workflow_definition: {
-                version: 1,
-                parameters: [
-                    {
-                        parameter_type: "aws_secret",
-                        key: "key",
-                        aws_secret_parameter_id: "aws_secret_parameter_id",
-                        workflow_id: "workflow_id",
-                        aws_key: "aws_key",
-                        created_at: "2024-01-15T09:30:00Z",
-                        modified_at: "2024-01-15T09:30:00Z",
-                    },
-                ],
-                blocks: [
-                    {
-                        block_type: "action",
-                        label: "label",
-                        output_parameter: {
-                            key: "key",
-                            output_parameter_id: "output_parameter_id",
-                            workflow_id: "workflow_id",
-                            created_at: "2024-01-15T09:30:00Z",
-                            modified_at: "2024-01-15T09:30:00Z",
-                        },
-                    },
-                ],
-                finally_block_label: "finally_block_label",
-            },
-            proxy_location: "RESIDENTIAL",
-            webhook_callback_url: "webhook_callback_url",
-            totp_verification_url: "totp_verification_url",
-            totp_identifier: "totp_identifier",
-            persist_browser_session: true,
-            model: { key: "value" },
-            status: "published",
-            max_screenshot_scrolls: 1,
-            extra_http_headers: { key: "value" },
-            run_with: "run_with",
-            ai_fallback: true,
-            cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
-            run_sequentially: true,
-            sequential_key: "sequential_key",
-            folder_id: "folder_id",
-            import_error: "import_error",
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-            deleted_at: "2024-01-15T09:30:00Z",
-        };
-        server
-            .mockEndpoint()
-            .put("/v1/workflows/wpid_123/folder")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(200)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        const response = await client.updateWorkflowFolder("wpid_123");
-        expect(response).toEqual({
-            workflow_id: "workflow_id",
-            organization_id: "organization_id",
-            title: "title",
-            workflow_permanent_id: "workflow_permanent_id",
-            version: 1,
-            is_saved_task: true,
-            is_template: true,
-            description: "description",
-            workflow_definition: {
-                version: 1,
-                parameters: [
-                    {
-                        parameter_type: "aws_secret",
-                        key: "key",
-                        aws_secret_parameter_id: "aws_secret_parameter_id",
-                        workflow_id: "workflow_id",
-                        aws_key: "aws_key",
-                        created_at: "2024-01-15T09:30:00Z",
-                        modified_at: "2024-01-15T09:30:00Z",
-                    },
-                ],
-                blocks: [
-                    {
-                        block_type: "action",
-                        label: "label",
-                        output_parameter: {
-                            key: "key",
-                            output_parameter_id: "output_parameter_id",
-                            workflow_id: "workflow_id",
-                            created_at: "2024-01-15T09:30:00Z",
-                            modified_at: "2024-01-15T09:30:00Z",
-                        },
-                    },
-                ],
-                finally_block_label: "finally_block_label",
-            },
-            proxy_location: "RESIDENTIAL",
-            webhook_callback_url: "webhook_callback_url",
-            totp_verification_url: "totp_verification_url",
-            totp_identifier: "totp_identifier",
-            persist_browser_session: true,
-            model: {
-                key: "value",
-            },
-            status: "published",
-            max_screenshot_scrolls: 1,
-            extra_http_headers: {
-                key: "value",
-            },
-            run_with: "run_with",
-            ai_fallback: true,
-            cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
-            run_sequentially: true,
-            sequential_key: "sequential_key",
-            folder_id: "folder_id",
-            import_error: "import_error",
-            created_at: "2024-01-15T09:30:00Z",
-            modified_at: "2024-01-15T09:30:00Z",
-            deleted_at: "2024-01-15T09:30:00Z",
-        });
-    });
-
-    test("update_workflow_folder (2)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .put("/v1/workflows/workflow_permanent_id/folder")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(400)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.updateWorkflowFolder("workflow_permanent_id");
-        }).rejects.toThrow(Skyvern.BadRequestError);
-    });
-
-    test("update_workflow_folder (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .put("/v1/workflows/workflow_permanent_id/folder")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(404)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.updateWorkflowFolder("workflow_permanent_id");
-        }).rejects.toThrow(Skyvern.NotFoundError);
-    });
-
-    test("update_workflow_folder (4)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .put("/v1/workflows/workflow_permanent_id/folder")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(422)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.updateWorkflowFolder("workflow_permanent_id");
-        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
-    });
-
     test("get_artifact (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
@@ -1574,7 +1044,6 @@ describe("SkyvernClient", () => {
             artifact_id: "artifact_id",
             artifact_type: "recording",
             uri: "uri",
-            bundle_key: "bundle_key",
             task_id: "task_id",
             step_id: "step_id",
             workflow_run_id: "workflow_run_id",
@@ -1601,7 +1070,6 @@ describe("SkyvernClient", () => {
             artifact_id: "artifact_id",
             artifact_type: "recording",
             uri: "uri",
-            bundle_key: "bundle_key",
             task_id: "task_id",
             step_id: "step_id",
             workflow_run_id: "workflow_run_id",
@@ -1662,7 +1130,6 @@ describe("SkyvernClient", () => {
                 artifact_id: "artifact_id",
                 artifact_type: "recording",
                 uri: "uri",
-                bundle_key: "bundle_key",
                 task_id: "task_id",
                 step_id: "step_id",
                 workflow_run_id: "workflow_run_id",
@@ -1691,7 +1158,6 @@ describe("SkyvernClient", () => {
                 artifact_id: "artifact_id",
                 artifact_type: "recording",
                 uri: "uri",
-                bundle_key: "bundle_key",
                 task_id: "task_id",
                 step_id: "step_id",
                 workflow_run_id: "workflow_run_id",
@@ -2018,6 +1484,9 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 ai_fallback: true,
                 code_gen: true,
+                waiting_for_verification_code: true,
+                verification_code_identifier: "verification_code_identifier",
+                verification_code_polling_started_at: "2024-01-15T09:30:00Z",
                 queued_at: "2024-01-15T09:30:00Z",
                 started_at: "2024-01-15T09:30:00Z",
                 finished_at: "2024-01-15T09:30:00Z",
@@ -2065,6 +1534,9 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 ai_fallback: true,
                 code_gen: true,
+                waiting_for_verification_code: true,
+                verification_code_identifier: "verification_code_identifier",
+                verification_code_polling_started_at: "2024-01-15T09:30:00Z",
                 queued_at: "2024-01-15T09:30:00Z",
                 started_at: "2024-01-15T09:30:00Z",
                 finished_at: "2024-01-15T09:30:00Z",
@@ -2139,8 +1611,6 @@ describe("SkyvernClient", () => {
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
             run_sequentially: true,
             sequential_key: "sequential_key",
             folder_id: "folder_id",
@@ -2214,8 +1684,6 @@ describe("SkyvernClient", () => {
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
-            adaptive_caching: true,
-            generate_script_on_terminal: true,
             run_sequentially: true,
             sequential_key: "sequential_key",
             folder_id: "folder_id",
@@ -2298,8 +1766,6 @@ describe("SkyvernClient", () => {
                 run_with: "run_with",
                 ai_fallback: true,
                 cache_key: "cache_key",
-                adaptive_caching: true,
-                generate_script_on_terminal: true,
                 run_sequentially: true,
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
@@ -2374,8 +1840,6 @@ describe("SkyvernClient", () => {
                 run_with: "run_with",
                 ai_fallback: true,
                 cache_key: "cache_key",
-                adaptive_caching: true,
-                generate_script_on_terminal: true,
                 run_sequentially: true,
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
@@ -2692,7 +2156,6 @@ describe("SkyvernClient", () => {
                 app_url: "app_url",
                 extensions: ["ad-blocker"],
                 browser_type: "msedge",
-                browser_profile_id: "browser_profile_id",
                 vnc_streaming_supported: true,
                 download_path: "download_path",
                 downloaded_files: [{ url: "url" }],
@@ -2725,7 +2188,6 @@ describe("SkyvernClient", () => {
                 app_url: "app_url",
                 extensions: ["ad-blocker"],
                 browser_type: "msedge",
-                browser_profile_id: "browser_profile_id",
                 vnc_streaming_supported: true,
                 download_path: "download_path",
                 downloaded_files: [
@@ -2798,7 +2260,6 @@ describe("SkyvernClient", () => {
             app_url: "app_url",
             extensions: ["ad-blocker"],
             browser_type: "msedge",
-            browser_profile_id: "browser_profile_id",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -2834,7 +2295,6 @@ describe("SkyvernClient", () => {
             app_url: "app_url",
             extensions: ["ad-blocker"],
             browser_type: "msedge",
-            browser_profile_id: "browser_profile_id",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -2881,25 +2341,6 @@ describe("SkyvernClient", () => {
     });
 
     test("create_browser_session (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = {};
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .post("/v1/browser_sessions")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(404)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.createBrowserSession();
-        }).rejects.toThrow(Skyvern.NotFoundError);
-    });
-
-    test("create_browser_session (4)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
@@ -2988,7 +2429,6 @@ describe("SkyvernClient", () => {
             app_url: "app_url",
             extensions: ["ad-blocker"],
             browser_type: "msedge",
-            browser_profile_id: "browser_profile_id",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -3023,7 +2463,6 @@ describe("SkyvernClient", () => {
             app_url: "app_url",
             extensions: ["ad-blocker"],
             browser_type: "msedge",
-            browser_profile_id: "browser_profile_id",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -3196,7 +2635,6 @@ describe("SkyvernClient", () => {
                 name: "Amazon Login",
                 browser_profile_id: "browser_profile_id",
                 tested_url: "tested_url",
-                user_context: "user_context",
             },
         ];
         server.mockEndpoint().get("/v1/credentials").respondWith().statusCode(200).jsonBody(rawResponseBody).build();
@@ -3217,7 +2655,6 @@ describe("SkyvernClient", () => {
                 name: "Amazon Login",
                 browser_profile_id: "browser_profile_id",
                 tested_url: "tested_url",
-                user_context: "user_context",
             },
         ]);
     });
@@ -3238,9 +2675,9 @@ describe("SkyvernClient", () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {
-            name: "Amazon Login",
+            name: "My Credential",
             credential_type: "password",
-            credential: { password: "securepassword123", username: "user@example.com" },
+            credential: { password: "securepassword123", username: "user@example.com", totp: "JBSWY3DPEHPK3PXP" },
         };
         const rawResponseBody = {
             credential_id: "cred_1234567890",
@@ -3253,7 +2690,6 @@ describe("SkyvernClient", () => {
             name: "Amazon Login",
             browser_profile_id: "browser_profile_id",
             tested_url: "tested_url",
-            user_context: "user_context",
         };
         server
             .mockEndpoint()
@@ -3265,11 +2701,12 @@ describe("SkyvernClient", () => {
             .build();
 
         const response = await client.createCredential({
-            name: "Amazon Login",
+            name: "My Credential",
             credential_type: "password",
             credential: {
                 password: "securepassword123",
                 username: "user@example.com",
+                totp: "JBSWY3DPEHPK3PXP",
             },
         });
         expect(response).toEqual({
@@ -3283,7 +2720,6 @@ describe("SkyvernClient", () => {
             name: "Amazon Login",
             browser_profile_id: "browser_profile_id",
             tested_url: "tested_url",
-            user_context: "user_context",
         });
     });
 
@@ -3321,9 +2757,9 @@ describe("SkyvernClient", () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {
-            name: "Amazon Login",
+            name: "My Credential",
             credential_type: "password",
-            credential: { password: "securepassword123", username: "user@example.com" },
+            credential: { password: "newpassword123", username: "user@example.com" },
         };
         const rawResponseBody = {
             credential_id: "cred_1234567890",
@@ -3336,7 +2772,6 @@ describe("SkyvernClient", () => {
             name: "Amazon Login",
             browser_profile_id: "browser_profile_id",
             tested_url: "tested_url",
-            user_context: "user_context",
         };
         server
             .mockEndpoint()
@@ -3348,10 +2783,10 @@ describe("SkyvernClient", () => {
             .build();
 
         const response = await client.updateCredential("cred_1234567890", {
-            name: "Amazon Login",
+            name: "My Credential",
             credential_type: "password",
             credential: {
-                password: "securepassword123",
+                password: "newpassword123",
                 username: "user@example.com",
             },
         });
@@ -3366,7 +2801,6 @@ describe("SkyvernClient", () => {
             name: "Amazon Login",
             browser_profile_id: "browser_profile_id",
             tested_url: "tested_url",
-            user_context: "user_context",
         });
     });
 
@@ -3443,7 +2877,6 @@ describe("SkyvernClient", () => {
             name: "Amazon Login",
             browser_profile_id: "browser_profile_id",
             tested_url: "tested_url",
-            user_context: "user_context",
         };
         server
             .mockEndpoint()
@@ -3465,7 +2898,6 @@ describe("SkyvernClient", () => {
             name: "Amazon Login",
             browser_profile_id: "browser_profile_id",
             tested_url: "tested_url",
-            user_context: "user_context",
         });
     });
 
@@ -4022,6 +3454,44 @@ describe("SkyvernClient", () => {
                     },
                 ],
             });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("clear_workflow_cache (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { deleted_count: 1, message: "message" };
+        server
+            .mockEndpoint()
+            .delete("/v1/scripts/wpid_abc123/cache")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.clearWorkflowCache("wpid_abc123");
+        expect(response).toEqual({
+            deleted_count: 1,
+            message: "message",
+        });
+    });
+
+    test("clear_workflow_cache (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .delete("/v1/scripts/workflow_permanent_id/cache")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.clearWorkflowCache("workflow_permanent_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 

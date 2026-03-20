@@ -25,8 +25,7 @@ export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.TextPrompt
     | Skyvern.ForLoopBlockLoopBlocksItem.UploadToS3
     | Skyvern.ForLoopBlockLoopBlocksItem.Validation
-    | Skyvern.ForLoopBlockLoopBlocksItem.Wait
-    | Skyvern.ForLoopBlockLoopBlocksItem.WorkflowTrigger;
+    | Skyvern.ForLoopBlockLoopBlocksItem.Wait;
 
 export namespace ForLoopBlockLoopBlocksItem {
     export interface Action extends Skyvern.ActionBlock {
@@ -119,9 +118,5 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface Wait extends Skyvern.WaitBlock {
         block_type: "wait";
-    }
-
-    export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlock {
-        block_type: "workflow_trigger";
     }
 }

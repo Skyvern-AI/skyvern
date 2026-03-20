@@ -29,6 +29,9 @@ export interface WorkflowRun {
     sequential_key?: string;
     ai_fallback?: boolean;
     code_gen?: boolean;
+    waiting_for_verification_code?: boolean;
+    verification_code_identifier?: string;
+    verification_code_polling_started_at?: string;
     queued_at?: string;
     started_at?: string;
     finished_at?: string;

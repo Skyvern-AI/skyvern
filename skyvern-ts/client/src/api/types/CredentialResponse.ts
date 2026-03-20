@@ -18,8 +18,6 @@ export interface CredentialResponse {
     browser_profile_id?: string;
     /** Login page URL used during the credential test */
     tested_url?: string;
-    /** User-provided context describing the login sequence (e.g., 'click SSO button first') */
-    user_context?: string;
 }
 
 export namespace CredentialResponse {

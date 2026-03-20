@@ -24,6 +24,5 @@ export const BlockType = {
     HttpRequest: "http_request",
     HumanInteraction: "human_interaction",
     PrintPage: "print_page",
-    WorkflowTrigger: "workflow_trigger",
 } as const;
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];
