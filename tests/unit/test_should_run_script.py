@@ -1,15 +1,23 @@
-"""Tests for WorkflowService.should_run_script().
+"""Tests for WorkflowService.should_run_script() and script reviewer gating.
 
 Verifies the priority chain:
   run-level run_with > workflow-level run_with > default (agent).
 adaptive_caching alone does NOT force code mode.
+
+Also verifies that the script reviewer only fires when the script was actually
+executed (should_run_script=True), not merely when adaptive caching is enabled.
 """
 
 from datetime import datetime, timezone
 
 import pytest
 
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowRun,
+    WorkflowRunStatus,
+    is_adaptive_caching,
+)
 
 
 def _make_workflow(run_with: str | None = None, adaptive_caching: bool = False) -> Workflow:
@@ -105,3 +113,30 @@ class TestShouldRunScript:
         wf = _make_workflow(run_with="code_v2")
         wr = _make_run(run_with=None)
         assert service.should_run_script(wf, wr) is True
+
+
+class TestScriptReviewerGate:
+    """The script reviewer should only fire when the script was actually executed.
+
+    The gate requires BOTH is_adaptive_caching()=True AND should_run_script()=True.
+    This prevents wasting LLM tokens reviewing scripts based on agent-only runs.
+    """
+
+    @pytest.mark.parametrize(
+        "run_with,adaptive_caching,expect_reviewer",
+        [
+            ("code_v2", True, True),
+            ("code_v2", False, True),  # is_adaptive_caching=True for code_v2 regardless
+            (None, True, False),  # the key case: adaptive caching on but script not executed
+            (None, False, False),
+            ("agent", True, False),
+            ("agent", False, False),
+            ("code", True, False),  # code without code_v2 → is_adaptive_caching=False
+            ("code", False, False),
+        ],
+    )
+    def test_reviewer_gate(self, service, run_with, adaptive_caching, expect_reviewer):
+        wf = _make_workflow(run_with=None, adaptive_caching=adaptive_caching)
+        wr = _make_run(run_with=run_with)
+        should_review = is_adaptive_caching(wf, wr) and service.should_run_script(wf, wr)
+        assert should_review is expect_reviewer
