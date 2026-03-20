@@ -26,6 +26,7 @@ import {
   Edge,
 } from "@xyflow/react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
@@ -241,6 +242,7 @@ function Workspace({
   const [nudge, setNudge] = useState(false);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
+  const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const { getNodes, getEdges } = useReactFlow();
@@ -996,6 +998,11 @@ function Workspace({
       ...nodes.slice(previousNodeIndex + 1),
     ];
     workflowChangesStore.setHasChanges(true);
+    postHog.capture("builder.block.added", {
+      org_id: workflow.organization_id,
+      block_type: nodeType,
+      position: previousNodeIndex + 1,
+    });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
