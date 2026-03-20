@@ -123,6 +123,9 @@ Do NOT add FIELD_MAP entries for any of these standard categories — they are m
 
 Only add FIELD_MAP entries for truly **custom/company-specific** fields that don't fit any standard category above.
 
+## Slow Page Load / Page Not Ready
+When the error or page text suggests the page wasn't ready for interaction, the script acted too soon. Signs include: blank page messages, "still on X page", loading spinners/overlays, progress indicators, or the page text showing a transitional state rather than the expected content. Fix this by adding `await page.wait(timeout_ms=5000)` **before the first action that failed**. If the existing code already has a `page.wait()` before that action and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
+
 ## What to do
 1. Compare the episode's form fields to the existing FIELD_MAP.
 2. For each field in the episode, first check if it matches a standard category listed above. If it does, do NOT add it to FIELD_MAP — canonical matching handles it automatically.
