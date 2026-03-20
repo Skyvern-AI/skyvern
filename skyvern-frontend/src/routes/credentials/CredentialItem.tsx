@@ -17,6 +17,7 @@ import { DeleteCredentialButton } from "./DeleteCredentialButton";
 import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
+import { SaveIcon } from "@/components/icons/SaveIcon";
 
 type Props = {
   credential: CredentialApiResponse;
@@ -117,9 +118,16 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
         <p className="text-sm text-slate-400">{credential.credential_id}</p>
         {credential.browser_profile_id && (
           <div className="flex items-center gap-1 text-xs">
-            <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-green-400">
-              saved-profile
-            </span>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center text-green-400">
+                    <SaveIcon className="size-4" />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>Saved browser session</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             {credential.tested_url && (
               <span className="text-muted-foreground">
                 {getHostname(credential.tested_url) ?? credential.tested_url}
