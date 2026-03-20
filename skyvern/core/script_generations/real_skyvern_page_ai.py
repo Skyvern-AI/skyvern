@@ -445,7 +445,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
 
-        if public_url_only and not validate_download_url(files):
+        if public_url_only and not validate_download_url(files, organization_id=organization_id):
             raise Exception("Only public URLs are allowed")
 
         if action and organization_id and task and step:
