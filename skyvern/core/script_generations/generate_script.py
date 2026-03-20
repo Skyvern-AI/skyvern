@@ -2286,8 +2286,16 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
         )
     ```
     """
-    # Extract loop configuration
-    loop_over_parameter_key = block.get("loop_variable_reference", "")
+    # Extract loop configuration.
+    # For loops can reference values in two ways:
+    # 1. loop_variable_reference — references another block's output (e.g., "extract_rows")
+    # 2. loop_over — a workflow parameter object with a "key" field (e.g., {"key": "items", ...})
+    # The script passes this to skyvern.loop(values=...) which resolves it at runtime.
+    loop_over_parameter_key = block.get("loop_variable_reference") or ""
+    if not loop_over_parameter_key:
+        loop_over = block.get("loop_over")
+        if isinstance(loop_over, dict) and loop_over.get("key"):
+            loop_over_parameter_key = loop_over["key"]
     loop_blocks = block.get("loop_blocks", [])
 
     # Create the for loop target (current_value)
