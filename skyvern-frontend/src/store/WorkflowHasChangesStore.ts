@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { create } from "zustand";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
@@ -84,6 +85,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
 const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const {
     getSaveData,
     saidOkToCodeCacheDeletion,
@@ -192,6 +194,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       if (!saveData) {
         return;
       }
+
+      postHog.capture("builder.workflow.saved", {
+        org_id: saveData.workflow.organization_id,
+        workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        block_count: saveData.blocks.length,
+        block_types: saveData.blocks.map((b) => b.block_type),
+      });
 
       toast({
         title: "Changes saved",
