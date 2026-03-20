@@ -35,6 +35,8 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     # DEPRECATED: we're using CSS selector map now
     ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP: "json",
     ArtifactType.PDF: "pdf",
+    ArtifactType.STEP_ARCHIVE: "zip",
+    ArtifactType.TASK_ARCHIVE: "zip",
 }
 
 
@@ -213,7 +215,11 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def download_uploaded_file(self, uri: str) -> bytes | None:
+    def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
         pass
 
     @abstractmethod

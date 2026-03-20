@@ -13,6 +13,13 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -25,6 +32,7 @@ import {
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  CodeIcon,
   MixerHorizontalIcon,
   Pencil2Icon,
   PlayIcon,
@@ -65,7 +73,8 @@ function WorkflowPage() {
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
 
-  const PAGE_SIZE = 10;
+  const PAGE_SIZE_OPTIONS = ["10", "25", "50"];
+  const pageSize = Number(searchParams.get("page_size") || "10");
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const [openRunParams, setOpenRunParams] = useState<string | null>(null);
@@ -81,6 +90,7 @@ function WorkflowPage() {
     workflowPermanentId,
     statusFilters,
     page,
+    pageSize,
     search: debouncedSearch,
     refetchOnMount: "always",
   });
@@ -138,9 +148,12 @@ function WorkflowPage() {
               onSuccessfullyDeleted={() => navigate("/workflows")}
             />
           )}
-          {/* Scripts button intentionally hidden — page is reachable via
-              /workflows/:wpid/scripts but not linked from the UI until the
-              design is finalized and ready for user-facing release. */}
+          <Button asChild variant="secondary">
+            <Link to={`/workflows/${workflowPermanentId}/scripts`}>
+              <CodeIcon className="mr-2 size-4" />
+              Scripts
+            </Link>
+          </Button>
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/build`}>
               <Pencil2Icon className="mr-2 size-4" />
@@ -306,43 +319,68 @@ function WorkflowPage() {
             workflowPermanentId={workflowPermanentId}
             workflowRunId={openRunParams}
           />
-          <Pagination className="pt-2">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({ "cursor-not-allowed": page === 1 })}
-                  onClick={() => {
-                    if (page === 1) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set("page", String(Math.max(1, page - 1)));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  className={cn({
-                    "cursor-not-allowed":
-                      workflowRuns !== undefined &&
-                      workflowRuns.length < PAGE_SIZE,
-                  })}
-                  onClick={() => {
-                    if (workflowRuns && workflowRuns.length < PAGE_SIZE) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set("page", String(page + 1));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
+          <div className="flex items-center justify-between pt-2">
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-slate-400">Items per page</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(size) => {
+                  const params = new URLSearchParams(searchParams);
+                  params.set("page_size", size);
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              >
+                <SelectTrigger className="w-[65px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((size) => (
+                    <SelectItem key={size} value={size}>
+                      {size}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Pagination>
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    className={cn({ "cursor-not-allowed": page === 1 })}
+                    onClick={() => {
+                      if (page === 1) {
+                        return;
+                      }
+                      const params = new URLSearchParams(searchParams);
+                      params.set("page", String(Math.max(1, page - 1)));
+                      setSearchParams(params, { replace: true });
+                    }}
+                  />
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationLink>{page}</PaginationLink>
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationNext
+                    className={cn({
+                      "cursor-not-allowed":
+                        workflowRuns !== undefined &&
+                        workflowRuns.length < pageSize,
+                    })}
+                    onClick={() => {
+                      if (workflowRuns && workflowRuns.length < pageSize) {
+                        return;
+                      }
+                      const params = new URLSearchParams(searchParams);
+                      params.set("page", String(page + 1));
+                      setSearchParams(params, { replace: true });
+                    }}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
+          </div>
         </div>
       </div>
     </div>

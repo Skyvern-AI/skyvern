@@ -56,9 +56,7 @@ from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
-    create_named_temporary_file,
     download_file,
-    download_from_s3,
     get_download_dir,
     get_path_for_workflow_download_directory,
     parse_uri_to_path,
@@ -231,6 +229,7 @@ class Block(BaseModel, abc.ABC):
         executed_branch_expression: str | None = None,
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
+        error_codes: list[str] | None = None,
     ) -> BlockResult:
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -247,10 +246,12 @@ class Block(BaseModel, abc.ABC):
                 executed_branch_expression=executed_branch_expression,
                 executed_branch_result=executed_branch_result,
                 executed_branch_next_block=executed_branch_next_block,
+                error_codes=error_codes,
             )
         return BlockResult(
             success=success,
             failure_reason=failure_reason,
+            error_codes=error_codes or [],
             output_parameter=self.output_parameter,
             output_parameter_value=output_parameter_value,
             status=status,
@@ -498,6 +499,10 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
 
+    def get_failure_error_codes(self) -> list[str]:
+        """Return block-level error codes for unexpected failures. Override in subclasses."""
+        return []
+
     @traced()
     async def execute_safe(
         self,
@@ -588,6 +593,7 @@ class Block(BaseModel, abc.ABC):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
             )
 
     @abc.abstractmethod
@@ -2202,50 +2208,149 @@ class CodeBlock(Block):
     code: str
     parameters: list[PARAMETER_TYPE] = []
 
+    # Dangerous attribute names that must never be accessed in user code.
+    # This blocks subprocess creation, OS access, and sandbox-escape primitives.
+    # NOTE: This is a blocklist-based sandbox, not real process-level isolation.
+    # It is inherently incomplete — a determined attacker may find bypasses.
+    # Long-term we should run user code in a proper sandbox. This blocklist is
+    # a defense-in-depth layer, not a security boundary.
+    # NOTE: Do not add names that collide with safe module methods (e.g. re.compile).
+    # Builtin functions like compile(), eval(), exec() are already blocked via __builtins__: {}.
+    BLOCKED_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {
+            # Subprocess / OS execution
+            "create_subprocess_exec",
+            "create_subprocess_shell",
+            "system",
+            "popen",
+            "Popen",
+            "exec",
+            "spawn",
+            "spawnl",
+            "spawnle",
+            "spawnlp",
+            "spawnlpe",
+            "check_call",
+            "check_output",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "execl",
+            "execlp",
+            "execlpe",
+            "fork",
+            # Network primitives
+            "open_connection",
+            "start_server",
+            "create_connection",
+            "create_server",
+            # Frame / code object internals (classic RestrictedPython escape vectors)
+            "f_globals",
+            "f_locals",
+            "f_builtins",
+            "f_code",
+            "co_code",
+            "co_consts",
+            "co_names",
+            "co_varnames",
+            "gi_frame",
+            "gi_code",
+            "cr_frame",
+            "cr_code",
+            "tb_frame",
+            "tb_next",
+            # Class hierarchy escape
+            "mro",
+            # Filesystem operations (unambiguous — these only appear on os/pathlib, not user objects)
+            "listdir",
+            "makedirs",
+            "rmdir",
+            # Module traversal (json.codecs.sys.modules etc.)
+            "codecs",
+            "modules",
+            "builtins",
+            "stdout",
+            "stderr",
+            "stdin",
+            # Sandbox-escape helpers (builtin equivalents already blocked via __builtins__: {})
+            "getattr",
+            "setattr",
+            "delattr",
+            "globals",
+            "eval",
+            "vars",
+        }
+    )
+
     @staticmethod
     def is_safe_code(code: str) -> None:
         tree = ast.parse(code)
         for node in ast.walk(tree):
+            # Block dunder attribute access (obj.__foo__)
             if hasattr(node, "attr") and str(node.attr).startswith("__"):
+                raise InsecureCodeDetected("Not allowed to access private methods or attributes")
+            # Block bare dunder identifiers (__capture_locals, __builtins__, etc.)
+            if isinstance(node, ast.Name) and node.id.startswith("__"):
                 raise InsecureCodeDetected("Not allowed to access private methods or attributes")
             if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
                 raise InsecureCodeDetected("Not allowed to import modules")
+            # Block dangerous method/attribute access on any object
+            if hasattr(node, "attr") and node.attr in CodeBlock.BLOCKED_ATTRS:
+                raise InsecureCodeDetected(f"Not allowed to access '{node.attr}'")
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
         return {
             "__builtins__": {},  # only allow several builtins due to security concerns
-            "locals": locals,
             "print": print,
             "len": len,
             "range": range,
             "str": str,
             "int": int,
+            "float": float,
             "dict": dict,
             "list": list,
             "tuple": tuple,
             "set": set,
             "bool": bool,
-            "asyncio": asyncio,
-            "re": re,
-            "json": json,
+            "sleep": asyncio.sleep,
+            "asyncio": SimpleNamespace(sleep=asyncio.sleep),
+            "re": SimpleNamespace(
+                match=re.match,
+                search=re.search,
+                findall=re.findall,
+                sub=re.sub,
+                compile=re.compile,
+                split=re.split,
+                IGNORECASE=re.IGNORECASE,
+                MULTILINE=re.MULTILINE,
+                DOTALL=re.DOTALL,
+            ),
+            "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
             "Exception": Exception,
         }
 
     def generate_async_user_function(
         self, code: str, page: Page, parameters: dict[str, Any] | None = None
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
-        code = textwrap.indent(code, "    ")
+        # SECURITY: validate before exec(). The AST check must run on the raw
+        # user code so it can block dunder identifiers like __capture_locals.
+        self.is_safe_code(code)
+        code = textwrap.indent(textwrap.dedent(code), "    ")
         full_code = f"""
 async def wrapper():
 {code}
-    return locals()
+    return __capture_locals()
 """
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
         if parameters:
-            safe_vars.update(parameters)
+            for key, value in parameters.items():
+                if key not in safe_vars:
+                    safe_vars[key] = value
         safe_vars["page"] = page
+        safe_vars["__capture_locals"] = locals
         exec(full_code, safe_vars, runtime_variables)
         return runtime_variables["wrapper"]
 
@@ -2351,8 +2456,9 @@ async def wrapper():
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         try:
-            self.is_safe_code(self.code)
-        except Exception as e:
+            user_function = self.generate_async_user_function(self.code, page, parameter_values)
+            result = await user_function()
+        except InsecureCodeDetected as e:
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
@@ -2361,10 +2467,6 @@ async def wrapper():
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-
-        user_function = self.generate_async_user_function(self.code, page, parameter_values)
-        try:
-            result = await user_function()
         except Exception as e:
             exc = CustomizedCodeException(e)
             return await self.build_block_result(
@@ -2407,12 +2509,32 @@ class TextPromptBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
+    def _render_schema_templates(self, obj: Any, workflow_run_context: WorkflowRunContext) -> Any:
+        if isinstance(obj, str):
+            try:
+                return self.format_block_parameter_template_from_workflow_run_context(obj, workflow_run_context)
+            except Exception:
+                LOG.warning(
+                    "Failed to render Jinja template in json_schema value, using original value",
+                    value=obj,
+                    block_label=self.label,
+                    exc_info=True,
+                )
+                return obj
+        elif isinstance(obj, dict):
+            return {k: self._render_schema_templates(v, workflow_run_context) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._render_schema_templates(item, workflow_run_context) for item in obj]
+        return obj
+
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.llm_key:
             self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.llm_key, workflow_run_context
             )
         self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+        if self.json_schema:
+            self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
     async def send_prompt(
         self,
@@ -2616,7 +2738,7 @@ class DownloadToS3Block(Block):
             )
 
         try:
-            file_path = await download_file(self.url, max_size_mb=10)
+            file_path = await download_file(self.url, max_size_mb=10, organization_id=organization_id)
         except Exception as e:
             LOG.error("DownloadToS3Block: Failed to download file", url=self.url, error=str(e))
             raise e
@@ -3139,6 +3261,7 @@ class SendEmailBlock(Block):
                 path.startswith("http://")
                 or path.startswith("https://")
                 or path.startswith("s3://")
+                or path.startswith("azure://")
                 or path.startswith("www.")
             ):
                 file_paths.append(path)
@@ -3146,13 +3269,6 @@ class SendEmailBlock(Block):
                 LOG.warning("SendEmailBlock: File not found", file_path=path)
 
         return file_paths
-
-    async def _download_from_s3(self, s3_uri: str) -> str:
-        client = self.get_async_aws_client()
-        downloaded_bytes = await client.download_file(uri=s3_uri)
-        file_path = create_named_temporary_file(delete=False)
-        file_path.write(downloaded_bytes)
-        return file_path.name
 
     def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
         recipients = []
@@ -3181,7 +3297,10 @@ class SendEmailBlock(Block):
         return recipients
 
     async def _build_email_message(
-        self, workflow_run_context: WorkflowRunContext, workflow_run_id: str
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        organization_id: str | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = (
@@ -3200,10 +3319,8 @@ class SendEmailBlock(Block):
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
         for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
-            if filename.startswith("s3://"):
-                path = await download_from_s3(self.get_async_aws_client(), filename)
-            elif filename.startswith("http://") or filename.startswith("https://"):
-                path = await download_file(filename)
+            if filename.startswith(("s3://", "azure://", "http://", "https://")):
+                path = await download_file(filename, organization_id=organization_id)
             else:
                 LOG.info("SendEmailBlock: Looking for file locally", filename=filename)
                 if not os.path.exists(filename):
@@ -3310,7 +3427,11 @@ class SendEmailBlock(Block):
             smtp_host.starttls()
             smtp_host.login(smtp_username_value, smtp_password_value)
             LOG.info("SendEmailBlock: Logged in to SMTP server")
-            message = await self._build_email_message(workflow_run_context, workflow_run_id)
+            message = await self._build_email_message(
+                workflow_run_context,
+                workflow_run_id,
+                organization_id=organization_id,
+            )
             smtp_host.send_message(message)
             LOG.info("SendEmailBlock: Email sent")
         except Exception as e:
@@ -3349,6 +3470,9 @@ class FileParserBlock(Block):
     file_url: str
     file_type: FileType
     json_schema: dict[str, Any] | None = None
+
+    def get_failure_error_codes(self) -> list[str]:
+        return ["FILE_PARSER_ERROR"]
 
     def get_all_parameters(
         self,
@@ -3745,20 +3869,29 @@ class FileParserBlock(Block):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
             )
 
-        # Download the file
-        if self.file_url.startswith("s3://"):
-            file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
-        else:
-            file_path = await download_file(self.file_url)
+        try:
+            # Download the file.
+            file_path = await download_file(self.file_url, organization_id=organization_id)
 
-        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
-        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
-            self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
+            # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
+            if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
+                self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
-        # Validate the file type
-        self.validate_file_type(self.file_url, file_path)
+            # Validate the file type
+            self.validate_file_type(self.file_url, file_path)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to download or validate file: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
+            )
 
         LOG.debug(
             "FileParserBlock: After file type validation",
@@ -3787,6 +3920,7 @@ class FileParserBlock(Block):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
             )
 
         # If json_schema is provided, use AI to extract structured data
@@ -3810,6 +3944,7 @@ class FileParserBlock(Block):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    error_codes=self.get_failure_error_codes() or None,
                 )
         else:
             # Return raw parsed data
@@ -3889,12 +4024,8 @@ class PDFParserBlock(Block):
                 organization_id=organization_id,
             )
 
-        # Download the file
-        file_path = None
-        if self.file_url.startswith("s3://"):
-            file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
-        else:
-            file_path = await download_file(self.file_url)
+        # Download the file.
+        file_path = await download_file(self.file_url, organization_id=organization_id)
 
         try:
             extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
@@ -4664,6 +4795,7 @@ class HttpRequestBlock(Block):
                 headers=self.headers,
                 output_dir=output_dir,
                 filename=self.download_filename,
+                organization_id=organization_id,
             )
 
             response_data = {
@@ -4803,11 +4935,11 @@ class HttpRequestBlock(Block):
                 else:
                     actual_file_path = file_path
 
-                # Check if file_path is a URL or S3 URI
+                # Check if file_path is a URL or managed storage URI
                 is_url = (
                     file_path.startswith("http://") or file_path.startswith("https://") or file_path.startswith("www.")
                 )
-                is_s3_uri = file_path.startswith("s3://")
+                is_managed_storage_uri = file_path.startswith("s3://") or file_path.startswith("azure://")
 
                 # Check if file is in allowed directories
                 is_allowed_local_file = False
@@ -4831,11 +4963,11 @@ class HttpRequestBlock(Block):
                             # Paths are on different drives (Windows) or incompatible
                             continue
 
-                # If not URL, S3 URI, or allowed local file, reject
-                if not (is_url or is_s3_uri or is_allowed_local_file):
+                # If not URL, managed storage URI, or allowed local file, reject
+                if not (is_url or is_managed_storage_uri or is_allowed_local_file):
                     return await self.build_block_result(
                         success=False,
-                        failure_reason=f"No permission to access local file: {file_path}. Only HTTP/HTTPS URLs, S3 URIs, or files in allowed directories are allowed.",
+                        failure_reason=f"No permission to access local file: {file_path}. Only HTTP/HTTPS URLs, managed storage URIs, or files in allowed directories are allowed.",
                         output_parameter_value=None,
                         status=BlockStatus.failed,
                         workflow_run_block_id=workflow_run_block_id,
@@ -4869,12 +5001,9 @@ class HttpRequestBlock(Block):
                             field_name=field_name,
                             file_path=file_path,
                             is_url=is_url,
-                            is_s3_uri=is_s3_uri,
+                            is_managed_storage_uri=is_managed_storage_uri,
                         )
-                        if is_s3_uri:
-                            local_file_path = await download_from_s3(self.get_async_aws_client(), file_path)
-                        else:
-                            local_file_path = await download_file(file_path)
+                        local_file_path = await download_file(file_path, organization_id=organization_id)
                         downloaded_files[field_name] = local_file_path
                         LOG.info(
                             "HttpRequestBlock: File downloaded successfully",
@@ -5944,10 +6073,15 @@ class ConditionalBlock(Block):
         }
 
         # Step 4: Create and execute single ExtractionBlock.
-        # When all expressions have been Jinja-rendered successfully, omit
-        # browser_session_id so the LLM won't reinterpret resolved literal
-        # values as on-screen references (SKY-7985).
-        effective_browser_session_id = browser_session_id if has_any_pure_natlang else None
+        # Always pass the browser_session_id so page-referencing conditions
+        # (e.g. "the date on the page matches X") can see the screenshot.
+        # The prompt template instructs the LLM to only use page content
+        # when the condition explicitly references the page, and to evaluate
+        # self-contained conditions purely from the expression text.
+        # NOTE: The previous approach of setting browser_session_id=None for
+        # Jinja-rendered expressions (SKY-7985) was ineffective because
+        # BaseTaskBlock.execute() finds the browser via workflow_run_id cache
+        # regardless of browser_session_id.
 
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
@@ -5970,7 +6104,7 @@ class ConditionalBlock(Block):
             block_label=self.label,
             num_conditions=len(branches),
             extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-            has_browser_session=effective_browser_session_id is not None,
+            has_browser_session=browser_session_id is not None,
             has_any_pure_natlang=has_any_pure_natlang,
             has_context=context_json is not None,
         )
@@ -5980,7 +6114,7 @@ class ConditionalBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                browser_session_id=effective_browser_session_id,
+                browser_session_id=browser_session_id,
             )
 
             if not extraction_result.success:

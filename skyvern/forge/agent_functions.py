@@ -477,17 +477,26 @@ class AgentFunction:
         task: Task,
         step: Step,
         browser_state: BrowserState,
-    ) -> None:
+    ) -> list[Action] | None:
         """
         Get prepared for the step execution. It's called at the first beginning when step running.
+
+        Returns:
+            A list of actions to inject into the step (skipping LLM), or None for normal flow.
         """
-        return
+        return None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
         return
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
+
+    async def auto_solve_captchas(self, page: Page) -> bool:
+        """Proactively detect and solve captchas on the current page.
+        Returns True if a captcha was detected and solved.
+        Cloud override provides actual solving; OSS base is a no-op."""
+        return False
 
     async def generate_async_operations(
         self,
@@ -608,3 +617,11 @@ class AgentFunction:
 
     async def post_action_execution(self, action: Action) -> None:
         pass
+
+    def get_copilot_security_rules(self) -> str:
+        """Return security guardrails for the workflow copilot system prompt.
+
+        Override in cloud to inject prompt injection defenses.
+        OSS returns empty string (no hardening).
+        """
+        return ""

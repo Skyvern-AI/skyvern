@@ -123,6 +123,9 @@ The user has provided the following instructions for fixing this script. Priorit
 ```
 {% endif %}
 
+## Slow Page Load / Page Not Ready
+When the error or page text suggests the page wasn't ready for interaction, the script acted too soon. Signs include: blank page messages, "still on X page", loading spinners/overlays, progress indicators, or the page text showing a transitional state rather than the expected content. Fix this by adding `await page.wait(timeout_ms=5000)` **before the first action that failed**. If the existing code already has a `page.wait()` before that action and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
+
 ## What to do
 
 {% for episode in episodes %}

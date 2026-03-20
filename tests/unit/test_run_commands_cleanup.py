@@ -136,6 +136,8 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     cleanup_blocking.assert_called_once()
 
 
-def test_run_task_tool_registration_points_to_browser_module() -> None:
-    tool = run_commands.mcp._tool_manager._tools["skyvern_run_task"]  # type: ignore[attr-defined]
+@pytest.mark.asyncio
+async def test_run_task_tool_registration_points_to_browser_module() -> None:
+    tool = await run_commands.mcp.get_tool("skyvern_run_task")
+    assert tool is not None
     assert tool.fn.__module__ == "skyvern.cli.mcp_tools.browser"

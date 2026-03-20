@@ -5,7 +5,7 @@ import pydantic.json
 import structlog
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     ArtifactModel,
@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -89,6 +91,16 @@ from skyvern.webeye.actions.actions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
+    if not raw:
+        return None
+    try:
+        return WorkflowRunTriggerType(raw)
+    except ValueError:
+        LOG.warning("Unknown trigger_type in DB, defaulting to None", trigger_type=raw)
+        return None
 
 
 def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
@@ -314,6 +326,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_id=artifact_model.artifact_id,
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
+        bundle_key=artifact_model.bundle_key,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
@@ -426,6 +439,8 @@ def convert_to_workflow_run(
         run_with=workflow_run_model.run_with,
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
+        trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
+        workflow_schedule_id=workflow_run_model.workflow_schedule_id,
     )
 
 
@@ -605,6 +620,7 @@ def convert_to_workflow_run_block(
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
+        error_codes=workflow_run_block_model.error_codes or [],
         engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,
         loop_values=workflow_run_block_model.loop_values,
@@ -735,3 +751,14 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         raise ValueError(f"Unsupported action type: {action_model.action_type}")
 
     return action_class(**action_data)
+
+
+def convert_to_workflow_schedule(
+    workflow_schedule_model: WorkflowScheduleModel, debug_enabled: bool = False
+) -> WorkflowSchedule:
+    if debug_enabled:
+        LOG.debug(
+            "Converting WorkflowScheduleModel to WorkflowSchedule",
+            workflow_schedule_id=workflow_schedule_model.workflow_schedule_id,
+        )
+    return WorkflowSchedule.model_validate(workflow_schedule_model)

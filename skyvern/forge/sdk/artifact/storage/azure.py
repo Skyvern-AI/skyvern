@@ -8,7 +8,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
-from skyvern.forge.sdk.api.azure import StandardBlobTier
+from skyvern.forge.sdk.api.azure import AzureUri, StandardBlobTier
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -546,8 +546,24 @@ class AzureStorage(BaseStorage):
         except Exception:
             return False
 
-    async def download_uploaded_file(self, uri: str) -> bytes | None:
-        """Download a user-uploaded file from Azure."""
+    def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
+        try:
+            parsed_uri = AzureUri(uri)
+        except Exception as e:
+            raise PermissionError(f"No permission to access storage URI: {uri}") from e
+
+        allowed_prefixes = (
+            f"{settings.ENV}/{organization_id}/",
+            f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
+        )
+        if parsed_uri.container != settings.AZURE_STORAGE_CONTAINER_UPLOADS or not any(
+            parsed_uri.blob_path.startswith(prefix) for prefix in allowed_prefixes
+        ):
+            raise PermissionError(f"No permission to access storage URI: {uri}")
+
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
+        """Download a managed org-scoped file from Azure."""
+        self.assert_managed_file_access(uri, organization_id)
         return await self.async_client.download_file(uri, log_exception=False)
 
     async def file_exists(self, uri: str) -> bool:

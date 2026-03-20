@@ -7,6 +7,9 @@ import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
+  ai_fallback: true,
+  adaptive_caching: true,
+  run_with: "code",
   workflow_definition: {
     version: 2,
     blocks: [],

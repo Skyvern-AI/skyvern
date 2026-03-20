@@ -403,6 +403,13 @@ class NoFileDownloadTriggered(SkyvernException):
         super().__init__(f"Clicking on element doesn't trigger the file download. element_id={element_id}")
 
 
+class CachedDownloadError(SkyvernException):
+    """Raised when a cached download block fails to produce a file on the local filesystem."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Cached download error: {message}")
+
+
 class BitwardenSecretError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Bitwarden secret error: {message}")

@@ -1609,7 +1609,7 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await handler_utils.download_file(file_url, action.model_dump())
+    file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
     is_file_input = await skyvern_element.is_file_input()
 
     if not is_file_input:
@@ -2130,9 +2130,18 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
-        action.errors = await extract_user_defined_errors(
-            task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
-        )
+        try:
+            action.errors = await extract_user_defined_errors(
+                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+            )
+        except Exception:
+            LOG.warning(
+                "extract_user_defined_errors failed, using errors from action reasoning",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                action_errors=action.errors,
+                exc_info=True,
+            )
     return [ActionSuccess()]
 
 
@@ -2482,7 +2491,7 @@ async def chain_click(
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
-        file = await handler_utils.download_file(file_url, action.model_dump())
+        file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
 
     is_filechooser_trigger = False
 

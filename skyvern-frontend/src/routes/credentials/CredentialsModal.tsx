@@ -32,7 +32,7 @@ import { AxiosError } from "axios";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
-  InfoCircledIcon,
+  ExclamationTriangleIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -42,6 +42,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
+import { ExternalLinkIcon } from "@radix-ui/react-icons";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -175,10 +176,13 @@ function CredentialsModal({
   );
   // The temporary credential ID and workflow run ID created by the test-login endpoint
   const [testCredentialId, setTestCredentialId] = useState<string | null>(null);
-  // testWorkflowRunId is stored only as a ref (not state) because it's never
-  // rendered — it's only needed by cancelTest/close to call the cancel API.
-  // Refs mirror state so cancelTest always has the latest IDs regardless of
-  // React's async render cycle (e.g. cancel during the startTest HTTP call).
+  // Workflow run ID used to render the "watch live" link — must be state so the
+  // link appears immediately after the POST returns (refs don't trigger re-renders).
+  const [testWorkflowRunId, setTestWorkflowRunId] = useState<string | null>(
+    null,
+  );
+  // Refs mirror state so cancelTest/close always have the latest IDs regardless
+  // of React's async render cycle (e.g. cancel during the startTest HTTP call).
   const testCredentialIdRef = useRef<string | null>(null);
   const testWorkflowRunIdRef = useRef<string | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -311,6 +315,7 @@ function CredentialsModal({
     setTestStatus("idle");
     setTestFailureReason(null);
     setTestCredentialId(null);
+    setTestWorkflowRunId(null);
     testCredentialIdRef.current = null;
     testWorkflowRunIdRef.current = null;
     pollStartTimeRef.current = null;
@@ -490,6 +495,7 @@ function CredentialsModal({
       }
 
       setTestCredentialId(data.credential_id);
+      setTestWorkflowRunId(data.workflow_run_id);
       setTestStatus("testing");
       pollStartTimeRef.current = Date.now();
 
@@ -982,9 +988,22 @@ function CredentialsModal({
               )}
 
               {isTestInProgress && (
-                <div className="flex items-center gap-2 pl-7 text-sm text-muted-foreground">
-                  <ReloadIcon className="size-4 animate-spin" />
-                  <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <ReloadIcon className="size-4 animate-spin" />
+                    <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
+                  </div>
+                  {testWorkflowRunId && (
+                    <a
+                      href={`/runs/${testWorkflowRunId}/overview`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                    >
+                      <ExternalLinkIcon className="size-3" />
+                      Watch Skyvern test login live
+                    </a>
+                  )}
                 </div>
               )}
               {testStatus === "completed" && (
@@ -1120,6 +1139,7 @@ function CredentialsModal({
     testCredentialIdRef.current = null;
     testWorkflowRunIdRef.current = null;
     setTestCredentialId(null);
+    setTestWorkflowRunId(null);
     toast({
       title: "Test canceled",
       description: "The credential test has been canceled.",
@@ -1182,11 +1202,12 @@ function CredentialsModal({
           </DialogTitle>
         </DialogHeader>
         {isEditMode && editingGroups.values && (
-          <Alert>
-            <InfoCircledIcon className="size-4" />
+          <Alert variant="warning">
+            <ExclamationTriangleIcon className="size-4" />
             <AlertDescription>
-              For security, saved values are never retrieved. All credential
-              fields must be filled in to save your changes.
+              For security, saved values are never retrieved. Changing any field
+              other than the credential name requires re-entering all fields,
+              including passwords and 2FA settings.
             </AlertDescription>
           </Alert>
         )}
