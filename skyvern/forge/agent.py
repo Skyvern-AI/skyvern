@@ -982,7 +982,7 @@ class ForgeAgent:
                 context.step_id = step.step_id
 
             step = await self.update_step(step=step, status=StepStatus.running)
-            await app.AGENT_FUNCTION.prepare_step_execution(
+            injected_actions = await app.AGENT_FUNCTION.prepare_step_execution(
                 organization=organization, task=task, step=step, browser_state=browser_state
             )
 
@@ -1025,7 +1025,17 @@ class ForgeAgent:
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
             actions: list[Action]
 
-            if engine == RunEngine.openai_cua:
+            # If prepare_step_execution injected actions (e.g. proactive captcha solving),
+            # skip LLM entirely and use the injected actions directly.
+            if injected_actions is not None:
+                LOG.info(
+                    "Using injected actions from prepare_step_execution, skipping LLM",
+                    step_id=step.step_id,
+                    num_actions=len(injected_actions),
+                    action_types=[a.action_type for a in injected_actions],
+                )
+                actions = injected_actions
+            elif engine == RunEngine.openai_cua:
                 actions, new_cua_response = await self._generate_cua_actions(
                     task=task,
                     step=step,
