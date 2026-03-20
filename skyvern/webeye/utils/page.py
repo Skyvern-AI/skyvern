@@ -456,7 +456,13 @@ class SkyvernFrame:
             timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[draw_boxes, frame, frame_index],
         )
-        return scroll_y_px
+        if not isinstance(scroll_y_px, (int, float)):
+            LOG.warning(
+                "scroll_to_top returned non-numeric value, falling back to 0.0",
+                scroll_y_px=scroll_y_px,
+            )
+            return 0.0
+        return float(scroll_y_px)
 
     async def scroll_to_next_page(
         self, draw_boxes: bool, frame: str, frame_index: int, need_overlap: bool = True
@@ -474,7 +480,13 @@ class SkyvernFrame:
             timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[draw_boxes, frame, frame_index, need_overlap],
         )
-        return scroll_y_px
+        if not isinstance(scroll_y_px, (int, float)):
+            LOG.warning(
+                "scroll_to_next_page returned non-numeric value, falling back to 0.0",
+                scroll_y_px=scroll_y_px,
+            )
+            return 0.0
+        return float(scroll_y_px)
 
     async def remove_bounding_boxes(self) -> None:
         """
