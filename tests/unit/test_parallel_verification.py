@@ -219,7 +219,7 @@ async def test_agent_step_skips_user_goal_check_when_feature_disabled(monkeypatc
         "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
         lambda *_args, **_kwargs: llm_handler_mock,
     )
-    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock())
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
     monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
@@ -344,7 +344,7 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
 
     action_handler_mock = AsyncMock(return_value=[ActionSuccess()])
     monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", action_handler_mock)
-    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock())
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
     monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
