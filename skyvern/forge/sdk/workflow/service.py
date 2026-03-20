@@ -514,7 +514,8 @@ class WorkflowService:
         if not artifacts:
             return []
 
-        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+        urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        return [u for u in urls if u is not None]
 
     async def _refresh_output_screenshot_urls(
         self,
@@ -3729,7 +3730,8 @@ class WorkflowService:
         )
         if not artifacts:
             return []
-        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+        urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        return [u for u in urls if u is not None]
 
     async def get_recent_workflow_screenshot_artifacts(
         self,
@@ -3802,7 +3804,8 @@ class WorkflowService:
         )
         if not artifacts:
             return []
-        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+        urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+        return [u for u in urls if u is not None]
 
     async def build_workflow_run_status_response_by_workflow_id(
         self,
@@ -4262,9 +4265,57 @@ class WorkflowService:
         if not last_step:
             return
 
-        await self.persist_browser_console_log(browser_state, last_step, workflow, workflow_run)
-        await self.persist_har_data(browser_state, last_step, workflow, workflow_run)
-        await self.persist_tracing_data(browser_state, last_step, workflow_run)
+        context = skyvern_context.current()
+        if context and context.use_artifact_bundling:
+            await self._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
+        else:
+            await self.persist_browser_console_log(browser_state, last_step, workflow, workflow_run)
+            await self.persist_har_data(browser_state, last_step, workflow, workflow_run)
+            await self.persist_tracing_data(browser_state, last_step, workflow_run)
+
+    async def _persist_debug_artifacts_bundled(
+        self,
+        browser_state: BrowserState,
+        last_step: Step,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> None:
+        """Bundle HAR, browser console log, and trace into a single task archive ZIP."""
+        task_archive_entries: dict[str, tuple[ArtifactType, bytes]] = {}
+
+        browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_state=browser_state,
+        )
+        LOG.debug("Persisting browser log (bundled)", browser_log_size=len(browser_log))
+        if browser_log:
+            task_archive_entries["browser_console.log"] = (ArtifactType.BROWSER_CONSOLE_LOG, browser_log)
+
+        har_data = await app.BROWSER_MANAGER.get_har_data(
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_state=browser_state,
+        )
+        LOG.debug("Persisting har data (bundled)", har_size=len(har_data))
+        if har_data:
+            task_archive_entries["har.har"] = (ArtifactType.HAR, har_data)
+
+        if browser_state.browser_context is not None and browser_state.browser_artifacts.traces_dir is not None:
+            trace_path = f"{browser_state.browser_artifacts.traces_dir}/{workflow_run.workflow_run_id}.zip"
+            try:
+                with open(trace_path, "rb") as f:
+                    trace_data = f.read()
+                task_archive_entries["trace.zip"] = (ArtifactType.TRACE, trace_data)
+            except Exception:
+                LOG.warning("Failed to read workflow trace file", trace_path=trace_path, exc_info=True)
+
+        if task_archive_entries:
+            await app.ARTIFACT_MANAGER.create_task_archive(
+                step=last_step,
+                entries=task_archive_entries,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
 
     async def make_workflow_definition(
         self,

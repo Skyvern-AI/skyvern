@@ -537,29 +537,51 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
+            _should_bundle = (
+                step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
+            )
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
+            _bundle_hashed_href_map: bytes | None = None
+            _bundle_prompt: bytes | None = None
+            _bundle_request: bytes | None = None
+            _bundle_response: bytes | None = None
+            _bundle_parsed: bytes | None = None
+            _bundle_rendered: bytes | None = None
             try:
-                await _log_hashed_href_map_artifacts_if_needed(
-                    artifacts,
-                    context,
-                    step,
-                    task_v2,
-                    thought,
-                    ai_suggestion,
-                    is_speculative_step=is_speculative_step,
-                )
+                if context and context.hashed_href_map and should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_hashed_href_map = json.dumps(context.hashed_href_map, indent=2).encode("utf-8")
+                    else:
+                        await _log_hashed_href_map_artifacts_if_needed(
+                            artifacts,
+                            context,
+                            step,
+                            task_v2,
+                            thought,
+                            ai_suggestion,
+                            is_speculative_step=is_speculative_step,
+                        )
 
                 llm_prompt_value = prompt
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=llm_prompt_value.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_PROMPT,
-                            screenshots=screenshots,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_prompt = llm_prompt_value.encode("utf-8")
+                        if screenshots and step:
+                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                step=step,
+                                screenshots=screenshots,
+                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            )
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=llm_prompt_value.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_PROMPT,
+                                screenshots=screenshots,
+                                **artifact_targets,
+                            )
                         )
-                    )
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
@@ -579,7 +601,7 @@ class LLMAPIHandlerFactory:
                         "vertex_cache_attached": vertex_cache_attached_flag,
                     }
                     llm_request_json = json.dumps(llm_request_payload)
-                    if should_persist_llm_artifacts:
+                    if should_persist_llm_artifacts and not _should_bundle:
                         artifacts.append(
                             await app.ARTIFACT_MANAGER.prepare_llm_artifact(
                                 data=llm_request_json.encode("utf-8"),
@@ -768,13 +790,17 @@ class LLMAPIHandlerFactory:
 
                 llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=llm_response_json.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_RESPONSE,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_request = llm_request_json.encode("utf-8")
+                        _bundle_response = llm_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=llm_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE,
+                                **artifact_targets,
+                            )
                         )
-                    )
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -833,13 +859,16 @@ class LLMAPIHandlerFactory:
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=parsed_response_json.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_parsed = parsed_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=parsed_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                **artifact_targets,
+                            )
                         )
-                    )
 
                 rendered_response_json = None
                 if context and len(context.hashed_href_map) > 0:
@@ -848,13 +877,16 @@ class LLMAPIHandlerFactory:
                     parsed_response = json.loads(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=rendered_response_json.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                                **artifact_targets,
+                        if _should_bundle:
+                            _bundle_rendered = rendered_response_json.encode("utf-8")
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=rendered_response_json.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                    **artifact_targets,
+                                )
                             )
-                        )
 
                 # Track LLM API handler duration, token counts, and cost
                 organization_id = organization_id or (
@@ -900,6 +932,20 @@ class LLMAPIHandlerFactory:
                     await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
                 except Exception:
                     LOG.error("Failed to persist artifacts", exc_info=True)
+                if _should_bundle and should_persist_llm_artifacts and step:
+                    _ctx = skyvern_context.current()
+                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                        step=step,
+                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                        run_id=_ctx.run_id if _ctx else None,
+                        hashed_href_map=_bundle_hashed_href_map,
+                        prompt=_bundle_prompt,
+                        request=_bundle_request,
+                        response=_bundle_response,
+                        parsed_response=_bundle_parsed,
+                        rendered_response=_bundle_rendered,
+                    )
 
         llm_api_handler_with_router_and_fallback.llm_key = llm_key  # type: ignore[attr-defined]
         LLMAPIHandlerFactory._router_handler_cache[llm_key] = llm_api_handler_with_router_and_fallback
@@ -985,29 +1031,51 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
+            _should_bundle = (
+                step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
+            )
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
+            _bundle_hashed_href_map: bytes | None = None
+            _bundle_prompt: bytes | None = None
+            _bundle_request: bytes | None = None
+            _bundle_response: bytes | None = None
+            _bundle_parsed: bytes | None = None
+            _bundle_rendered: bytes | None = None
             try:
-                await _log_hashed_href_map_artifacts_if_needed(
-                    artifacts,
-                    context,
-                    step,
-                    task_v2,
-                    thought,
-                    ai_suggestion,
-                    is_speculative_step=is_speculative_step,
-                )
+                if context and context.hashed_href_map and should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_hashed_href_map = json.dumps(context.hashed_href_map, indent=2).encode("utf-8")
+                    else:
+                        await _log_hashed_href_map_artifacts_if_needed(
+                            artifacts,
+                            context,
+                            step,
+                            task_v2,
+                            thought,
+                            ai_suggestion,
+                            is_speculative_step=is_speculative_step,
+                        )
 
                 llm_prompt_value = prompt
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=llm_prompt_value.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_PROMPT,
-                            screenshots=screenshots,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_prompt = llm_prompt_value.encode("utf-8")
+                        if screenshots and step:
+                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                step=step,
+                                screenshots=screenshots,
+                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            )
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=llm_prompt_value.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_PROMPT,
+                                screenshots=screenshots,
+                                **artifact_targets,
+                            )
                         )
-                    )
 
                 if not llm_config.supports_vision:
                     screenshots = None
@@ -1101,13 +1169,16 @@ class LLMAPIHandlerFactory:
                 }
                 llm_request_json = json.dumps(llm_request_payload)
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=llm_request_json.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_REQUEST,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_request = llm_request_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=llm_request_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_REQUEST,
+                                **artifact_targets,
+                            )
                         )
-                    )
 
                 # Strip static prompt from the request messages because it's already in the cache
                 # Sending it again causes double-billing (once cached, once uncached)
@@ -1180,13 +1251,16 @@ class LLMAPIHandlerFactory:
 
                 llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=llm_response_json.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_RESPONSE,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_response = llm_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=llm_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE,
+                                **artifact_targets,
+                            )
                         )
-                    )
 
                 prompt_tokens = 0
                 completion_tokens = 0
@@ -1249,13 +1323,16 @@ class LLMAPIHandlerFactory:
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=parsed_response_json.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_parsed = parsed_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=parsed_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                **artifact_targets,
+                            )
                         )
-                    )
 
                 rendered_response_json = None
                 if context and len(context.hashed_href_map) > 0:
@@ -1264,13 +1341,16 @@ class LLMAPIHandlerFactory:
                     parsed_response = json.loads(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=rendered_response_json.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                                **artifact_targets,
+                        if _should_bundle:
+                            _bundle_rendered = rendered_response_json.encode("utf-8")
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=rendered_response_json.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                    **artifact_targets,
+                                )
                             )
-                        )
 
                 # Track LLM API handler duration, token counts, and cost
                 organization_id = organization_id or (
@@ -1316,6 +1396,20 @@ class LLMAPIHandlerFactory:
                     await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
                 except Exception:
                     LOG.error("Failed to persist artifacts", exc_info=True)
+                if _should_bundle and should_persist_llm_artifacts and step:
+                    _ctx = skyvern_context.current()
+                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                        step=step,
+                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                        run_id=_ctx.run_id if _ctx else None,
+                        hashed_href_map=_bundle_hashed_href_map,
+                        prompt=_bundle_prompt,
+                        request=_bundle_request,
+                        response=_bundle_response,
+                        parsed_response=_bundle_parsed,
+                        rendered_response=_bundle_rendered,
+                    )
 
         llm_api_handler.llm_key = llm_key  # type: ignore[attr-defined]
         return llm_api_handler
@@ -1444,18 +1538,31 @@ class LLMCaller:
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
         )
+        _should_bundle = (
+            step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
+        )
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
+        _bundle_hashed_href_map: bytes | None = None
+        _bundle_prompt: bytes | None = None
+        _bundle_request: bytes | None = None
+        _bundle_response: bytes | None = None
+        _bundle_parsed: bytes | None = None
+        _bundle_rendered: bytes | None = None
         try:
-            await _log_hashed_href_map_artifacts_if_needed(
-                artifacts,
-                context,
-                step,
-                task_v2,
-                thought,
-                ai_suggestion,
-                is_speculative_step=is_speculative_step,
-            )
+            if context and context.hashed_href_map and should_persist_llm_artifacts:
+                if _should_bundle:
+                    _bundle_hashed_href_map = json.dumps(context.hashed_href_map, indent=2).encode("utf-8")
+                else:
+                    await _log_hashed_href_map_artifacts_if_needed(
+                        artifacts,
+                        context,
+                        step,
+                        task_v2,
+                        thought,
+                        ai_suggestion,
+                        is_speculative_step=is_speculative_step,
+                    )
 
             if screenshots and self.screenshot_scaling_enabled:
                 target_dimension = self.get_screenshot_resize_target_dimension(window_dimension)
@@ -1476,14 +1583,23 @@ class LLMCaller:
 
             llm_prompt_value = prompt or ""
             if prompt and should_persist_llm_artifacts:
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=prompt.encode("utf-8"),
-                        artifact_type=ArtifactType.LLM_PROMPT,
-                        screenshots=screenshots,
-                        **artifact_targets,
+                if _should_bundle:
+                    _bundle_prompt = prompt.encode("utf-8")
+                    if screenshots and step:
+                        app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                            step=step,
+                            screenshots=screenshots,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                        )
+                else:
+                    artifacts.append(
+                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=prompt.encode("utf-8"),
+                            artifact_type=ArtifactType.LLM_PROMPT,
+                            screenshots=screenshots,
+                            **artifact_targets,
+                        )
                     )
-                )
 
             if not self.llm_config.supports_vision:
                 screenshots = None
@@ -1514,13 +1630,16 @@ class LLMCaller:
             }
             llm_request_json = json.dumps(llm_request_payload)
             if should_persist_llm_artifacts:
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=llm_request_json.encode("utf-8"),
-                        artifact_type=ArtifactType.LLM_REQUEST,
-                        **artifact_targets,
+                if _should_bundle:
+                    _bundle_request = llm_request_json.encode("utf-8")
+                else:
+                    artifacts.append(
+                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=llm_request_json.encode("utf-8"),
+                            artifact_type=ArtifactType.LLM_REQUEST,
+                            **artifact_targets,
+                        )
                     )
-                )
 
             t_llm_request = time.perf_counter()
             try:
@@ -1568,13 +1687,16 @@ class LLMCaller:
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=llm_response_json.encode("utf-8"),
-                        artifact_type=ArtifactType.LLM_RESPONSE,
-                        **artifact_targets,
+                if _should_bundle:
+                    _bundle_response = llm_response_json.encode("utf-8")
+                else:
+                    artifacts.append(
+                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=llm_response_json.encode("utf-8"),
+                            artifact_type=ArtifactType.LLM_RESPONSE,
+                            **artifact_targets,
+                        )
                     )
-                )
 
             call_stats = await self.get_call_stats(response)
             if step and not is_speculative_step:
@@ -1627,13 +1749,16 @@ class LLMCaller:
             parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if should_persist_llm_artifacts:
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=parsed_response_json.encode("utf-8"),
-                        artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                        **artifact_targets,
+                if _should_bundle:
+                    _bundle_parsed = parsed_response_json.encode("utf-8")
+                else:
+                    artifacts.append(
+                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=parsed_response_json.encode("utf-8"),
+                            artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                            **artifact_targets,
+                        )
                     )
-                )
 
             rendered_response_json = None
             if context and len(context.hashed_href_map) > 0:
@@ -1642,13 +1767,16 @@ class LLMCaller:
                 parsed_response = json.loads(rendered_content)
                 rendered_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=rendered_response_json.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                            **artifact_targets,
+                    if _should_bundle:
+                        _bundle_rendered = rendered_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=rendered_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                **artifact_targets,
+                            )
                         )
-                    )
 
             if step and is_speculative_step:
                 step.speculative_llm_metadata = SpeculativeLLMMetadata(
@@ -1673,6 +1801,20 @@ class LLMCaller:
                 await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
             except Exception:
                 LOG.error("Failed to persist artifacts", exc_info=True)
+            if _should_bundle and should_persist_llm_artifacts and step:
+                _ctx = skyvern_context.current()
+                app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                    step=step,
+                    workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                    workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                    run_id=_ctx.run_id if _ctx else None,
+                    hashed_href_map=_bundle_hashed_href_map,
+                    prompt=_bundle_prompt,
+                    request=_bundle_request,
+                    response=_bundle_response,
+                    parsed_response=_bundle_parsed,
+                    rendered_response=_bundle_rendered,
+                )
 
     def get_screenshot_resize_target_dimension(self, window_dimension: Resolution | None) -> Resolution:
         if window_dimension and window_dimension != self.browser_window_dimension:

@@ -436,6 +436,32 @@ class Settings(BaseSettings):
     The secret used to sign the email/identity of the user.
     """
 
+    ARTIFACT_CONTENT_HMAC_KEYRING: str | None = None
+    """
+    JSON keyring for HMAC-SHA256 signing of bundled-artifact content URLs.
+
+    When set, /artifacts/{id}/content URLs generated for bundled artifacts carry
+    expiry/kid/sig query parameters and the endpoint validates them without requiring
+    an org-level API key.
+
+    Format::
+
+        {
+          "current_kid": "2026-03-12-v1",
+          "keys": {
+            "2026-03-12-v1": {
+              "secret": "my-hmac-secret",
+              "created_at": "2026-03-12"
+            }
+          }
+        }
+
+    current_kid must be present in keys.
+
+    Key rotation: add the new key to keys and point current_kid at it; keep the
+    old key in keys until all URLs it signed have expired (12 h), then remove it.
+    """
+
     # Debug Session Settings
     DEBUG_SESSION_TIMEOUT_MINUTES: int = 20
     """

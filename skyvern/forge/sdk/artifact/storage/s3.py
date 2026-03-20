@@ -1,6 +1,8 @@
+import io
 import os
 import shutil
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from typing import BinaryIO
 
@@ -139,10 +141,22 @@ class S3Storage(BaseStorage):
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         data = await self.async_client.download_file(artifact.uri)
-        # Decompress zstd-compressed files
+        # Decompress zstd-compressed files (HAR only)
         if data and artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX):
             dctx = zstd.ZstdDecompressor()
             data = dctx.decompress(data)
+        # Extract a named entry from a ZIP archive (STEP_ARCHIVE / TASK_ARCHIVE)
+        if data and artifact.bundle_key:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    return zf.read(artifact.bundle_key)
+            except (KeyError, zipfile.BadZipFile):
+                LOG.warning(
+                    "Failed to extract entry from archive",
+                    bundle_key=artifact.bundle_key,
+                    artifact_id=artifact.artifact_id,
+                )
+                return None
         return data
 
     async def get_share_link(self, artifact: Artifact) -> str | None:

@@ -477,11 +477,14 @@ class AgentFunction:
         task: Task,
         step: Step,
         browser_state: BrowserState,
-    ) -> None:
+    ) -> list[Action] | None:
         """
         Get prepared for the step execution. It's called at the first beginning when step running.
+
+        Returns:
+            A list of actions to inject into the step (skipping LLM), or None for normal flow.
         """
-        return
+        return None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
         return

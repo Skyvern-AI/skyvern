@@ -1594,6 +1594,30 @@ class AgentDB(BaseAlchemyDB):
             LOG.exception("UnexpectedError")
             raise
 
+    async def get_artifact_by_id_no_org(
+        self,
+        artifact_id: str,
+    ) -> Artifact | None:
+        """Fetch an artifact by ID without an organization filter.
+
+        Only use this when the caller has already verified authorization through
+        an out-of-band mechanism (e.g. a valid HMAC-signed URL).
+        """
+        try:
+            async with self.Session() as session:
+                if artifact := (
+                    await session.scalars(select(ArtifactModel).filter_by(artifact_id=artifact_id))
+                ).first():
+                    return convert_to_artifact(artifact, self.debug_enabled)
+                else:
+                    return None
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError")
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError")
+            raise
+
     async def get_artifacts_by_ids(
         self,
         artifact_ids: list[str],
