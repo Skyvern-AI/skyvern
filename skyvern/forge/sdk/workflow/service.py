@@ -3430,6 +3430,8 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 run_with=workflow_run.run_with,
                 ai_fallback=workflow_run.ai_fallback,
+                trigger_type=workflow_run.trigger_type,
+                workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
         return workflow_run
 
