@@ -1752,6 +1752,11 @@ async def run_task(
                 )
             return output
 
+        except ScriptTerminationException:
+            # Explicit termination from script (e.g., ATS validation failure).
+            # Do NOT fall back to AI — the script intentionally terminated.
+            LOG.info("Script requested termination. Not falling back to AI.")
+            raise
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
             await _fallback_to_ai_run(
