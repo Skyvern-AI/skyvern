@@ -28,6 +28,12 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+AI_OVERRIDE_ACTIONS = {
+    ActionType.INPUT_TEXT,
+    ActionType.SELECT_OPTION,
+    ActionType.UPLOAD_FILE,
+}
+
 
 @dataclass
 class ActionMetadata:
@@ -85,21 +91,21 @@ class SkyvernPage(Page):
         **kwargs: Any,
     ) -> Any:
         context = skyvern_context.current()
-        # label = self.current_label
-        # action_override = None
-        # if context and label:
-        #     current_count = context.action_counters.get(label, 0) + 1
-        # context.action_counters[label] = current_count
-        # action_override = context.action_ai_overrides.get(label, {}).get(current_count)
-        # context.ai_mode_override = action_override
+        label = self.current_label
+        previous_override = context.ai_mode_override if context else None
+        should_apply_override = context and label and action in AI_OVERRIDE_ACTIONS
+        if should_apply_override:
+            current_count = context.action_counters.get(label, 0) + 1
+            context.action_counters[label] = current_count
+            action_override = context.action_ai_overrides.get(label, {}).get(current_count)
+            context.ai_mode_override = action_override
 
         try:
             return await fn(self, *args, **kwargs)
         finally:
-            if context:
+            if should_apply_override:
                 # Reset override after each action so defaults apply when no mapping is provided.
-                # context.ai_mode_override = None
-                pass
+                context.ai_mode_override = previous_override
 
     @staticmethod
     def action_wrap(

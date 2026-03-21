@@ -804,6 +804,85 @@ def _determine_action_ai_mode(
     return "proactive"
 
 
+def _extract_select_option_choices(action: Action) -> list[dict[str, Any]]:
+    """Return serialized select choices captured for a historical select action."""
+    options: list[dict[str, Any]] = []
+
+    if action.skyvern_element_data:
+        raw_options = action.skyvern_element_data.get("options")
+        if isinstance(raw_options, list):
+            for raw_option in raw_options:
+                if not isinstance(raw_option, dict):
+                    continue
+                options.append(
+                    {
+                        "label": raw_option.get("label") or raw_option.get("text"),
+                        "value": raw_option.get("value"),
+                        "index": raw_option.get("index") or raw_option.get("optionIndex"),
+                    }
+                )
+
+    if action.option and (action.option.label or action.option.value):
+        selected_choice = {
+            "label": action.option.label,
+            "value": action.option.value,
+            "index": action.option.index,
+        }
+        if selected_choice not in options:
+            options.append(selected_choice)
+
+    return options
+
+
+def _normalize_select_choice(value: str | None) -> str:
+    """Normalize select labels/values for case-insensitive comparisons."""
+    return str(value or "").strip().casefold()
+
+
+def _resolve_select_option_value(action: Action, merged_value: Any) -> str | None:
+    """Map a merged select choice to a known option value when possible."""
+    if not isinstance(merged_value, str) or not merged_value.strip():
+        return None
+
+    normalized_merged_value = _normalize_select_choice(merged_value)
+    if not normalized_merged_value:
+        return None
+
+    for option in _extract_select_option_choices(action):
+        option_value = option.get("value")
+        option_label = option.get("label")
+        if normalized_merged_value in {
+            _normalize_select_choice(option_value),
+            _normalize_select_choice(option_label),
+        }:
+            resolved_value = option_value or option_label
+            return str(resolved_value).strip() if resolved_value else None
+
+    LOG.info(
+        "Merged cached select value did not match recorded options",
+        merged_value=merged_value,
+        recorded_options=_extract_select_option_choices(action),
+        action_intention=action.intention,
+    )
+    return None
+
+
+def _build_cached_action_field_prompt(action: Action, field_name: str) -> dict[str, Any]:
+    """Build merged-prompt metadata for a cached input/select action."""
+    prompt_text = action.intention or action.reasoning or ""
+    if action.input_or_select_context and action.input_or_select_context.intention:
+        prompt_text = action.input_or_select_context.intention
+
+    field_prompt: dict[str, Any] = {
+        "name": field_name,
+        "prompt": prompt_text,
+        "action_type": action.action_type,
+    }
+    if action.action_type == ActionType.SELECT_OPTION:
+        field_prompt["available_options"] = _extract_select_option_choices(action)
+    return field_prompt
+
+
 def _clear_cached_block_overrides(cache_key: str) -> None:
     context = skyvern_context.current()
     if not context:
@@ -851,16 +930,14 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
         return
 
     try:
-        # actios are ordered by created_at
+        # actions are ordered by created_at
         actions = await app.DATABASE.get_task_actions_hydrated(task_id=task_id, organization_id=context.organization_id)
     except Exception:
         return
 
-    input_actions = [action for action in actions if action.action_type in {ActionType.INPUT_TEXT}]
-    # TODO: how to support select_option actions?
-    # input_actions = [
-    #     action for action in actions if action.action_type in {ActionType.INPUT_TEXT, ActionType.SELECT_OPTION}
-    # ]
+    input_actions = [
+        action for action in actions if action.action_type in {ActionType.INPUT_TEXT, ActionType.SELECT_OPTION}
+    ]
 
     if not input_actions:
         return
@@ -869,11 +946,7 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
     field_iter = iter(input_fields)
     action_entries: list[tuple[Action, str | None]] = []
     for action in input_actions:
-        field_name = None
-        try:
-            field_name = next(field_iter, None)
-        except StopIteration:
-            field_name = None
+        field_name = next(field_iter, None)
         action_entries.append((action, field_name))
 
     merged_values: dict[str, Any] = {}
@@ -888,10 +961,7 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
         for action, field_name in action_entries:
             if not field_name:
                 continue
-            prompt_text = action.intention or action.reasoning or ""
-            if action.input_or_select_context and action.input_or_select_context.intention:
-                prompt_text = action.input_or_select_context.intention
-            field_prompts.append({"name": field_name, "prompt": prompt_text})
+            field_prompts.append(_build_cached_action_field_prompt(action, field_name))
 
         if field_prompts:
             merged_prompt = (
@@ -925,6 +995,8 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
     overrides: dict[int, str] = {}
     for idx, (action, field_name) in enumerate(action_entries, start=1):
         merged_value = merged_values.get(field_name, "") if field_name else ""
+        if action.action_type == ActionType.SELECT_OPTION:
+            merged_value = _resolve_select_option_value(action, merged_value)
         ai_mode = _determine_action_ai_mode(action, merged_value)
         overrides[idx] = ai_mode
 
@@ -932,9 +1004,9 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
             # Seed the run context parameters with merged values for cached execution.
             run_context.parameters[field_name] = merged_value
 
-    # if overrides:
-    #     context.action_ai_overrides[cache_key] = overrides
-    #     context.action_counters[cache_key] = 0
+    if overrides:
+        context.action_ai_overrides[cache_key] = overrides
+        context.action_counters[cache_key] = 0
 
 
 async def _detect_user_defined_errors(
