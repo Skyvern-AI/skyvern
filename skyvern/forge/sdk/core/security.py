@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Union
 
-from jose import jwt
+import jwt
 
 from skyvern.config import settings
 
