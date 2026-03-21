@@ -93,7 +93,7 @@ class SkyvernPage(Page):
         context = skyvern_context.current()
         label = self.current_label
         previous_override = context.ai_mode_override if context else None
-        should_apply_override = context and label and action in AI_OVERRIDE_ACTIONS
+        should_apply_override = context is not None and label is not None and action in AI_OVERRIDE_ACTIONS
         if should_apply_override:
             current_count = context.action_counters.get(label, 0) + 1
             context.action_counters[label] = current_count

@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.services.script_service import _prepare_cached_block_inputs
-from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputOrSelectContext, SelectOption
 
