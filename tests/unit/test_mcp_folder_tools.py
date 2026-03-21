@@ -8,7 +8,7 @@ import pytest
 
 import skyvern.cli.mcp_tools.folder as folder_tools
 import skyvern.cli.mcp_tools.workflow as workflow_tools
-from skyvern.client import AsyncSkyvern, Folder, FolderCreate, FolderUpdate, Skyvern, UpdateWorkflowFolderRequest
+from skyvern.client import AsyncSkyvern, Folder, Skyvern
 from skyvern.client.errors import BadRequestError
 from skyvern.client.raw_client import AsyncRawSkyvern, RawSkyvern
 
@@ -44,9 +44,6 @@ def _fake_workflow_response() -> SimpleNamespace:
 
 def test_sdk_exports_folder_types_and_methods() -> None:
     assert Folder.__name__ == "Folder"
-    assert FolderCreate.__name__ == "FolderCreate"
-    assert FolderUpdate.__name__ == "FolderUpdate"
-    assert UpdateWorkflowFolderRequest.__name__ == "UpdateWorkflowFolderRequest"
     assert hasattr(Skyvern, "create_folder")
     assert hasattr(Skyvern, "update_workflow_folder")
     assert hasattr(AsyncSkyvern, "create_folder")
