@@ -12,13 +12,21 @@ import { WorkflowParameterValueType } from "../types/workflowTypes";
 import { PlusIcon } from "@radix-ui/react-icons";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { useState } from "react";
+import { credentialTypeToModalType } from "@/routes/credentials/useCredentialModalState";
+
+type SkyvernCredentialType = "password" | "credit_card" | "secret";
 
 type Props = {
   value: string;
   onChange: (value: string) => void;
+  credentialType?: SkyvernCredentialType;
 };
 
-function CredentialParameterSourceSelector({ value, onChange }: Props) {
+function CredentialParameterSourceSelector({
+  value,
+  onChange,
+  credentialType = "password",
+}: Props) {
   const { data: credentials, isLoading } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
   });
@@ -89,6 +97,7 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
       <CredentialsModal
         isOpen={isModalOpen}
         onOpenChange={setIsModalOpen}
+        overrideType={credentialTypeToModalType(credentialType)}
         onCredentialCreated={(id) => {
           onChange(id);
           setIsModalOpen(false);

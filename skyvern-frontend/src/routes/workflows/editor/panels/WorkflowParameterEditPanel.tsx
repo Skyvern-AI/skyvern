@@ -784,6 +784,11 @@ function WorkflowParameterEditPanel({
               <CredentialParameterSourceSelector
                 value={credentialId}
                 onChange={(value) => setCredentialId(value)}
+                credentialType={
+                  credentialDataType === "creditCard"
+                    ? "credit_card"
+                    : credentialDataType
+                }
               />
             </div>
           )}
