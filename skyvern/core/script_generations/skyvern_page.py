@@ -93,8 +93,10 @@ class SkyvernPage(Page):
         context = skyvern_context.current()
         label = self.current_label
         previous_override = context.ai_mode_override if context else None
-        should_apply_override = context is not None and label is not None and action in AI_OVERRIDE_ACTIONS
-        if should_apply_override:
+        apply_override = context is not None and label is not None and action in AI_OVERRIDE_ACTIONS
+        if apply_override:
+            assert context is not None
+            assert label is not None
             current_count = context.action_counters.get(label, 0) + 1
             context.action_counters[label] = current_count
             action_override = context.action_ai_overrides.get(label, {}).get(current_count)
@@ -103,7 +105,8 @@ class SkyvernPage(Page):
         try:
             return await fn(self, *args, **kwargs)
         finally:
-            if should_apply_override:
+            if apply_override:
+                assert context is not None
                 # Reset override after each action so defaults apply when no mapping is provided.
                 context.ai_mode_override = previous_override
 
