@@ -254,6 +254,33 @@ export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
 }
 
+export interface BitwardenCredential {
+  email: string;
+  master_password: string;
+}
+
+export interface BitwardenCredentialSafe {
+  email: string;
+}
+
+export interface BitwardenOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  credential: BitwardenCredentialSafe;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateBitwardenCredentialRequest {
+  credential: BitwardenCredential;
+}
+
+export interface BitwardenCredentialResponse {
+  token: BitwardenOrganizationAuthToken;
+}
+
 export interface CustomCredentialServiceConfig {
   api_base_url: string;
   api_token: string;
