@@ -605,13 +605,40 @@ class WorkflowRunContext:
         if item.notes:
             self._add_secret_parameter_value(parameter, "notes", item.notes)
 
-    async def register_bitwarden_login_credential_parameter_value(
+    async def _get_bitwarden_credentials(
         self,
-        parameter: BitwardenLoginCredentialParameter,
         organization: Organization,
-    ) -> None:
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Get Bitwarden credentials, checking org-level token first, then falling back to env vars / AWS secrets.
+
+        Returns: (client_id, client_secret, master_password, email)
+
+        Priority order:
+        1. Per-org Bitwarden credential (from organization_auth_tokens table) — always wins if present
+        2. Global env vars (BITWARDEN_CLIENT_ID, etc.) or AWS secrets (from workflow parameter keys)
+
+        When an org-level token is configured with email auth, client_id and client_secret will be None
+        and the email will be used for `bw login <email> --passwordenv BW_PASSWORD`. To fall back to
+        env vars / AWS secrets for a specific workflow, the org-level credential must be deleted.
+        """
+        # Check for per-org Bitwarden credential first
+        org_bw_token = await app.DATABASE.get_valid_org_auth_token(
+            organization_id=organization.organization_id,
+            token_type=OrganizationAuthTokenType.bitwarden_credential.value,
+        )
+        if org_bw_token:
+            return (
+                None,  # client_id — not used in email auth
+                None,  # client_secret — not used in email auth
+                org_bw_token.credential.master_password,
+                org_bw_token.credential.email,
+            )
+
+        # Fall back to env vars / AWS secrets
         try:
-            # Get the Bitwarden login credentials from AWS secrets
             client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
                 parameter.bitwarden_client_id_aws_secret_key
             )
@@ -625,9 +652,20 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id and not settings.BITWARDEN_EMAIL:
+        return client_id, client_secret, master_password, None
+
+    async def register_bitwarden_login_credential_parameter_value(
+        self,
+        parameter: BitwardenLoginCredentialParameter,
+        organization: Organization,
+    ) -> None:
+        client_id, client_secret, master_password, email = await self._get_bitwarden_credentials(
+            organization, parameter
+        )
+
+        if not client_id and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
+        if not client_secret and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -650,6 +688,7 @@ class WorkflowRunContext:
                 url,
                 collection_id=collection_id,
                 item_id=item_id,
+                email=email,
             )
             if secret_credentials:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
@@ -740,24 +779,13 @@ class WorkflowRunContext:
         parameter: BitwardenSensitiveInformationParameter,
         organization: Organization,
     ) -> None:
-        try:
-            # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
-                parameter.bitwarden_client_id_aws_secret_key
-            )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
-                parameter.bitwarden_client_secret_aws_secret_key
-            )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
-                parameter.bitwarden_master_password_aws_secret_key
-            )
-        except Exception as e:
-            LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
-            raise e
+        client_id, client_secret, master_password, email = await self._get_bitwarden_credentials(
+            organization, parameter
+        )
 
-        if not client_id and not settings.BITWARDEN_EMAIL:
+        if not client_id and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
+        if not client_secret and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -780,6 +808,7 @@ class WorkflowRunContext:
                 collection_id,
                 bitwarden_identity_key,
                 parameter.bitwarden_identity_fields,
+                email=email,
             )
             if sensitive_values:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
@@ -809,24 +838,13 @@ class WorkflowRunContext:
         parameter: BitwardenCreditCardDataParameter,
         organization: Organization,
     ) -> None:
-        try:
-            # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
-                parameter.bitwarden_client_id_aws_secret_key
-            )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
-                parameter.bitwarden_client_secret_aws_secret_key
-            )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
-                parameter.bitwarden_master_password_aws_secret_key
-            )
-        except Exception as e:
-            LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
-            raise e
+        client_id, client_secret, master_password, email = await self._get_bitwarden_credentials(
+            organization, parameter
+        )
 
-        if not client_id and not settings.BITWARDEN_EMAIL:
+        if not client_id and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
+        if not client_secret and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -850,6 +868,7 @@ class WorkflowRunContext:
                 organization.bw_collection_ids,
                 collection_id,
                 item_id,
+                email=email,
             )
             if not credit_card_data:
                 raise ValueError("Credit card data not found in Bitwarden")

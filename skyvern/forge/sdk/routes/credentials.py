@@ -71,7 +71,12 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
+    BitwardenCredentialResponse,
+    BitwardenCredentialSafe,
+    BitwardenOrganizationAuthToken,
+    BitwardenOrganizationAuthTokenSafe,
     CreateAzureClientSecretCredentialRequest,
+    CreateBitwardenCredentialRequest,
     CreateCustomCredentialServiceConfigRequest,
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
@@ -1501,6 +1506,119 @@ async def update_onepassword_token(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create or update OnePassword service account token: {str(e)}",
+        )
+
+
+def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> BitwardenCredentialResponse:
+    """Strip master_password from the response for security."""
+    safe_token = BitwardenOrganizationAuthTokenSafe(
+        id=auth_token.id,
+        organization_id=auth_token.organization_id,
+        token_type=auth_token.token_type,
+        valid=auth_token.valid,
+        created_at=auth_token.created_at,
+        modified_at=auth_token.modified_at,
+        credential=BitwardenCredentialSafe(email=auth_token.credential.email),
+    )
+    return BitwardenCredentialResponse(token=safe_token)
+
+
+@base_router.get(
+    "/credentials/bitwarden/get",
+    response_model=BitwardenCredentialResponse,
+    summary="Get Bitwarden credential",
+    description="Retrieves the current Bitwarden credential for the organization. The master_password is never returned for security.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/bitwarden/get/",
+    response_model=BitwardenCredentialResponse,
+    include_in_schema=False,
+)
+async def get_bitwarden_credential(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BitwardenCredentialResponse:
+    """
+    Get the current Bitwarden credential for the organization.
+    """
+    try:
+        auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.bitwarden_credential.value,
+        )
+        if not auth_token:
+            raise HTTPException(
+                status_code=404,
+                detail="No Bitwarden credential found for this organization",
+            )
+
+        return _to_safe_bitwarden_response(auth_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.error(
+            "Failed to get Bitwarden credential",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to get Bitwarden credential",
+        )
+
+
+@base_router.post(
+    "/credentials/bitwarden/create",
+    response_model=BitwardenCredentialResponse,
+    summary="Create or update Bitwarden credential",
+    description="Creates or updates a Bitwarden credential for the current organization. Only one valid credential is allowed per organization.",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/bitwarden/create/",
+    response_model=BitwardenCredentialResponse,
+    include_in_schema=False,
+)
+async def update_bitwarden_credential(
+    request: CreateBitwardenCredentialRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BitwardenCredentialResponse:
+    """
+    Create or update a Bitwarden credential for the current organization.
+
+    Only one valid Bitwarden credential exists per organization.
+    If a valid credential already exists, it will be invalidated before creating the new one.
+    """
+    try:
+        # Atomically invalidate old + create new in a single transaction
+        auth_token = await app.DATABASE.replace_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.bitwarden_credential,
+            token=request.credential,
+        )
+
+        LOG.info(
+            "Created or updated Bitwarden credential",
+            organization_id=current_org.organization_id,
+            token_id=auth_token.id,
+        )
+
+        return _to_safe_bitwarden_response(auth_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.error(
+            "Failed to create or update Bitwarden credential",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create or update Bitwarden credential",
         )
 
 

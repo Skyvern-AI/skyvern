@@ -38,9 +38,12 @@ _ALLOWED_PAGE_API: frozenset[str] = frozenset(
         "extract",
         "validate",
         "classify",
-        "scan_form_fields",
+        "extract_form_fields",
         # Form filling
         "fill_form",
+        "dynamic_field_map",
+        "fill_from_mapping",
+        "validate_mapping",
         # Lifecycle
         "complete",
         "wait",

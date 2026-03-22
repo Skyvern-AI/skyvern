@@ -184,8 +184,8 @@ class BitwardenService:
         shell_subprocess = None
         try:
             async with asyncio.timeout(timeout):
-                shell_subprocess = await asyncio.create_subprocess_shell(
-                    " ".join(command),
+                shell_subprocess = await asyncio.create_subprocess_exec(
+                    *command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
@@ -240,6 +240,7 @@ class BitwardenService:
         item_id: str | None = None,
         max_retries: int = settings.BITWARDEN_MAX_RETRIES,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+        email: str | None = None,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
@@ -267,6 +268,7 @@ class BitwardenService:
                         collection_id=collection_id,
                         item_id=item_id,
                         timeout=timeout,
+                        email=email,
                     )
             except BitwardenAccessDeniedError as e:
                 raise e
@@ -308,12 +310,13 @@ class BitwardenService:
         collection_id: str | None = None,
         item_id: str | None = None,
         timeout: int = 60,
+        email: str | None = None,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
         """
         try:
-            await BitwardenService.login(client_id, client_secret)
+            await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
             await BitwardenService.sync()
             session_key = await BitwardenService.unlock(master_password)
 
@@ -440,6 +443,7 @@ class BitwardenService:
         remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
         fail_reasons: list[str] = [],
+        email: str | None = None,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
@@ -459,6 +463,7 @@ class BitwardenService:
                     collection_id=collection_id,
                     identity_key=identity_key,
                     identity_fields=identity_fields,
+                    email=email,
                 )
         except BitwardenAccessDeniedError as e:
             raise e
@@ -483,6 +488,7 @@ class BitwardenService:
                 # Double the timeout for the next retry
                 timeout=timeout * 2,
                 fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
+                email=email,
             )
 
     @staticmethod
@@ -495,12 +501,13 @@ class BitwardenService:
         identity_fields: list[str],
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
+        email: str | None = None,
     ) -> dict[str, str]:
         """
         Get the sensitive information from the Bitwarden CLI.
         """
         try:
-            await BitwardenService.login(client_id, client_secret)
+            await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
             await BitwardenService.sync()
             session_key = await BitwardenService.unlock(master_password)
 
@@ -565,16 +572,28 @@ class BitwardenService:
             await BitwardenService.logout()
 
     @staticmethod
-    async def login(client_id: str | None, client_secret: str | None) -> None:
+    async def login(
+        client_id: str | None,
+        client_secret: str | None,
+        email: str | None = None,
+        master_password: str | None = None,
+    ) -> None:
         """
         Log in to the Bitwarden CLI.
+
+        Supports two auth modes:
+        1. Email + master_password (preferred when available)
+        2. API key (client_id + client_secret) via --apikey flag
         """
+        bw_email = email or settings.BITWARDEN_EMAIL
+        bw_master_password = master_password or settings.BITWARDEN_MASTER_PASSWORD
         env = {
             "BW_CLIENTID": client_id or "",
             "BW_CLIENTSECRET": client_secret or "",
+            "BW_PASSWORD": bw_master_password or "",
         }
-        if settings.BITWARDEN_EMAIL and settings.BITWARDEN_MASTER_PASSWORD:
-            login_command = ["bw", "login", settings.BITWARDEN_EMAIL, settings.BITWARDEN_MASTER_PASSWORD]
+        if bw_email and bw_master_password:
+            login_command = ["bw", "login", bw_email, "--passwordenv", "BW_PASSWORD"]
         else:
             login_command = ["bw", "login", "--apikey"]
         login_result = await BitwardenService.run_command(login_command, env)
@@ -647,12 +666,13 @@ class BitwardenService:
         bw_collection_ids: list[str] | None,
         collection_id: str,
         item_id: str,
+        email: str | None = None,
     ) -> dict[str, str]:
         """
         Get the credit card data from the Bitwarden CLI.
         """
         try:
-            await BitwardenService.login(client_id, client_secret)
+            await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
             await BitwardenService.sync()
             session_key = await BitwardenService.unlock(master_password)
 
@@ -725,6 +745,7 @@ class BitwardenService:
         item_id: str,
         remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
         fail_reasons: list[str] = [],
+        email: str | None = None,
     ) -> dict[str, str]:
         """
         Get the credit card data from the Bitwarden CLI.
@@ -744,6 +765,7 @@ class BitwardenService:
                     bw_collection_ids=bw_collection_ids,
                     collection_id=collection_id,
                     item_id=item_id,
+                    email=email,
                 )
         except BitwardenAccessDeniedError as e:
             raise e
@@ -765,6 +787,7 @@ class BitwardenService:
                 item_id=item_id,
                 remaining_retries=remaining_retries,
                 fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
+                email=email,
             )
 
     @staticmethod

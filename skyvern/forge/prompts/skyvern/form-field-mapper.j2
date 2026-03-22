@@ -1,0 +1,60 @@
+# Goal
+You are filling out a form. Map the provided data to every form field on the page.
+{% if prompt %}
+
+# User Instructions
+The following instructions were provided by the user who created this automation.
+Follow these instructions when deciding how to fill fields — they take priority over default behavior.
+```
+{{ prompt }}
+```
+{% endif %}
+
+# Provided Data
+{% for key, value in data.items() %}
+- **{{ key }}**: {{ value }}
+{% endfor %}
+
+# Form Fields on Page
+{% for field in form_fields %}
+{{ loop.index }}. **{{ field.label or "(unlabeled)" }}** ({{ field.type }})
+{%- if field.required %} [REQUIRED]{% endif %}
+{%- if field.placeholder %} — hint: "{{ field.placeholder }}"{% endif %}
+{%- if field.options %} — options: [{{ field.options | join(", ") }}]{% endif %}
+{% endfor %}
+
+# Instructions
+
+For EVERY field above, decide the correct value from the provided data.
+
+## CRITICAL — Common mistakes to avoid
+- **graduation_year** maps to graduation/graduation date fields. Do NOT put other data (like additional_info) into graduation fields.
+- **additional_info** is a generic note — it goes ONLY into "Additional information" or "Cover letter" textareas, NEVER into specific fields like graduation date, name, or phone.
+- **needs_sponsorship** answers sponsorship questions DIRECTLY: if needs_sponsorship = "No", then "Will you require sponsorship?" → "No". Do NOT invert it.
+- **authorized_to_work** answers authorization questions DIRECTLY: if authorized_to_work = "Yes", then "Are you authorized to work?" → "Yes".
+- Each data key should map to at most ONE field. Never reuse the same value for unrelated fields.
+
+## Text fields
+- Match semantically: "email" data → "Email address" field, "phone" → "Phone number", "graduation_year" → "Expected graduation date", etc.
+- For fields with no matching data (e.g., "Twitter URL" when no twitter data exists), return null.
+
+## Choice fields (dropdown, radio, checkbox)
+- Return the EXACT option text from the options list. Do NOT rephrase, abbreviate, or summarize.
+- Example: if options are ["I am not a protected veteran", "I am a protected veteran"], return "I am not a protected veteran" — NOT "No".
+- For EEO/demographic fields with no matching data, pick the "Decline to self-identify" or "I do not want to answer" option.
+- For checkboxes, return a JSON array of the exact option labels to check.
+- For Yes/No radio buttons: match the provided data value directly. If the data says "Yes", select "Yes". If "No", select "No".
+
+## File upload fields (type: file)
+- Look for URL values in the provided data that match file upload fields. For example: a parameter named "resume" with a URL value like "https://example.com/resume.pdf" should be mapped to a "Resume/CV" file upload field.
+- Return the URL string as the value — the system will download and upload the file.
+- If no matching URL exists in the provided data, return null.
+
+## Fields with no matching data
+- For REQUIRED text fields with no matching data, write a brief professional response (1-2 sentences) based on the available data context.
+- For OPTIONAL fields with no matching data, return null.
+
+# Output Format
+JSON object mapping field number (1-indexed string) to the value to fill.
+Return null for file uploads and optional fields with no matching data.
+Example: {"1": "John Smith", "2": "john@example.com", "3": null, "4": "Yes", "5": ["Front-end", "Back-end"]}

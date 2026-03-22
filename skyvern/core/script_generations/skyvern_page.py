@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import os
+import json as _json
 import re
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import structlog
 from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
-from skyvern.core.script_generations.canonical_fields import get_category, match_field_to_category
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.exceptions import ScriptTerminationException
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
@@ -27,6 +28,16 @@ if TYPE_CHECKING:
     from skyvern.webeye.actions.responses import ActionResult
 
 LOG = structlog.get_logger()
+
+_EXTRACT_FORM_FIELDS_JS: str | None = None
+
+
+def _get_extract_form_fields_js() -> str:
+    global _EXTRACT_FORM_FIELDS_JS
+    if _EXTRACT_FORM_FIELDS_JS is None:
+        js_path = Path(__file__).parent / "extract_form_fields.js"
+        _EXTRACT_FORM_FIELDS_JS = js_path.read_text()
+    return _EXTRACT_FORM_FIELDS_JS
 
 
 @dataclass
@@ -1288,7 +1299,7 @@ class SkyvernPage(Page):
             text_patterns=text_patterns,
         )
 
-    async def scan_form_fields(self) -> list[dict[str, Any]]:
+    async def extract_form_fields(self) -> list[dict[str, Any]]:
         """Scan the page for visible form fields using DOM inspection (no LLM).
 
         Two-pass approach:
@@ -1305,356 +1316,427 @@ class SkyvernPage(Page):
           "tag": "input", "type": "checkbox_group", "name": "field0", "required": False,
           "options": [{"label": "Engineering", "value": "Engineering", "selector": "..."}]}]
         """
-        return await self.page.evaluate(
-            """() => {
-            const fields = [];
-            const seen = new Set();
+        return await self.page.evaluate(_get_extract_form_fields_js())
 
-            function isVisible(el) {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                return style.display !== 'none' && style.visibility !== 'hidden'
-                    && style.opacity !== '0' && el.offsetWidth > 0 && el.offsetHeight > 0;
-            }
+    async def dynamic_field_map(
+        self,
+        form_fields: list[dict[str, Any]],
+        data: dict[str, Any],
+        *,
+        prompt: str | None = None,
+    ) -> dict[int, str | list | bool | None]:
+        """Map data to form fields via a single cheap text-only LLM call.
 
-            function getLabel(el) {
-                if (el.id) {
-                    const lbl = document.querySelector('label[for="' + el.id + '"]');
-                    if (lbl) return lbl.textContent.trim();
+        One LLM call sees ALL fields + ALL data and produces a complete mapping —
+        no deterministic matching, no caching, no accumulated state.
+
+        Args:
+            form_fields: Output of :meth:`extract_form_fields`.
+            data: Flat dict of data keys/values to map to form fields.
+
+        Returns:
+            Mapping of 0-based field index -> value to fill (or None to skip).
+        """
+        if not form_fields or not data:
+            return {}
+
+        # Build field descriptions for the LLM
+        field_descs: list[dict[str, Any]] = []
+        for field in form_fields:
+            label = field.get("label") or field.get("name") or field.get("placeholder") or "unknown"
+            field_type = field.get("type", "text")
+            options: list[str] | None = None
+            if field.get("options"):
+                options = [o.get("label") or o.get("value", "") for o in field["options"]]
+            field_descs.append(
+                {
+                    "label": label,
+                    "type": field_type,
+                    "required": field.get("required", False),
+                    "placeholder": field.get("placeholder"),
+                    "options": options,
                 }
-                const parentLabel = el.closest('label');
-                if (parentLabel) return parentLabel.textContent.trim();
-                if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
-                const labelledBy = el.getAttribute('aria-labelledby');
-                if (labelledBy) {
-                    const ref = document.getElementById(labelledBy);
-                    if (ref) return ref.textContent.trim();
-                }
-                if (el.placeholder) return el.placeholder;
-                return null;
-            }
+            )
 
-            function buildSelector(el, label) {
-                const tag = el.tagName.toLowerCase();
-                // Prefer stable attribute selectors over fragile label text.
-                // name/id selectors survive DOM re-renders and label text changes.
-                if (el.name) return tag + '[name="' + el.name + '"]:visible';
-                if (el.id) return '#' + el.id + ':visible';
-                if (label && label.length < 80) {
-                    const escapedLabel = label.replace(/'/g, "\\\\'");
-                    const parentLabel = el.closest('label');
-                    if (parentLabel || (el.id && document.querySelector('label[for="' + el.id + '"]'))) {
-                        return 'label:has-text(\\'' + escapedLabel + '\\') ' + tag + ':visible';
-                    }
-                    if (el.getAttribute('aria-label')) {
-                        return tag + '[aria-label="' + escapedLabel + '"]:visible';
-                    }
-                }
-                return null;
-            }
-
-            function buildOptionSelector(el) {
-                if (el.id) return '#' + el.id;
-                const tag = el.tagName.toLowerCase();
-                const name = el.name;
-                const value = el.value;
-                if (name && value) return tag + '[name="' + name + '"][value="' + value + '"]';
-                if (name) return tag + '[name="' + name + '"]';
-                return null;
-            }
-
-            // Find the group-level label for a set of checkbox/radio elements
-            function getGroupLabel(elements) {
-                if (!elements.length) return null;
-                const first = elements[0];
-
-                // 1. <fieldset><legend> wrapping the group
-                const fieldset = first.closest('fieldset');
-                if (fieldset) {
-                    const legend = fieldset.querySelector('legend');
-                    if (legend) return legend.textContent.trim();
-                }
-
-                // 2. Find nearest common ancestor, then look for a heading/label before it
-                let ancestor = first.parentElement;
-                const allInAncestor = () => elements.every(el => ancestor && ancestor.contains(el));
-                while (ancestor && !allInAncestor()) {
-                    ancestor = ancestor.parentElement;
-                }
-                if (ancestor) {
-                    // aria-label on container
-                    if (ancestor.getAttribute('aria-label')) return ancestor.getAttribute('aria-label');
-                    // aria-labelledby on container
-                    const lblBy = ancestor.getAttribute('aria-labelledby');
-                    if (lblBy) {
-                        const ref = document.getElementById(lblBy);
-                        if (ref) return ref.textContent.trim();
-                    }
-                    // Look for heading or label element immediately before the container
-                    let prev = ancestor.previousElementSibling;
-                    if (prev) {
-                        const tagName = prev.tagName.toLowerCase();
-                        if (['label', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'div'].includes(tagName)) {
-                            const text = prev.textContent.trim();
-                            if (text && text.length < 200) return text;
-                        }
-                    }
-                }
-
-                // 3. Fall back to the first element's label
-                return getLabel(first);
-            }
-
-            const elements = document.querySelectorAll('input, select, textarea');
-            // Collect checkbox/radio inputs for pass 2
-            const checkRadioGroups = {};
-
-            for (const el of elements) {
-                const type = (el.getAttribute('type') || '').toLowerCase();
-                if (['hidden', 'submit', 'button', 'image', 'reset'].includes(type)) continue;
-                if (!isVisible(el)) continue;
-
-                // Pass 2 collection: group checkboxes/radios by shared name attribute.
-                // Checkboxes/radios without a name can't be reliably grouped —
-                // emit them as individual fields (type: "checkbox" / "radio").
-                if (type === 'checkbox' || type === 'radio') {
-                    if (el.name) {
-                        if (!checkRadioGroups[el.name]) {
-                            checkRadioGroups[el.name] = { type: type, elements: [] };
-                        }
-                        checkRadioGroups[el.name].elements.push(el);
-                    } else {
-                        // Individual checkbox/radio without a name — emit directly
-                        const label = getLabel(el);
-                        const selector = buildSelector(el, label);
-                        if (selector) {
-                            fields.push({
-                                label: label || null,
-                                selector: selector,
-                                tag: 'input',
-                                type: type,
-                                name: null,
-                                required: el.required || false,
-                                placeholder: null,
-                            });
-                        }
-                    }
-                    continue;
-                }
-
-                // Pass 1: non-checkbox/non-radio elements
-                const uid = el.name || el.id || el.getAttribute('aria-label') || Math.random().toString();
-                if (seen.has(uid)) continue;
-                seen.add(uid);
-
-                const label = getLabel(el);
-                const selector = buildSelector(el, label);
-                if (!selector) continue;
-
-                fields.push({
-                    label: label || null,
-                    selector: selector,
-                    tag: el.tagName.toLowerCase(),
-                    type: type || (el.tagName.toLowerCase() === 'select' ? 'select' : el.tagName.toLowerCase() === 'textarea' ? 'textarea' : 'text'),
-                    name: el.name || null,
-                    required: el.required || false,
-                    placeholder: el.placeholder || null,
-                });
-
-                // Collect <select> options for batch planning
-                if (el.tagName.toLowerCase() === 'select') {
-                    const selectOptions = [];
-                    for (const opt of el.options) {
-                        const optText = opt.textContent.trim();
-                        if (!opt.value || opt.value === '' || optText === '' || optText === '--') continue;
-                        selectOptions.push({
-                            label: optText,
-                            value: opt.value,
-                        });
-                    }
-                    if (selectOptions.length > 0) {
-                        fields[fields.length - 1].options = selectOptions;
-                    }
-                }
-            }
-
-            // Pass 2: emit grouped checkbox/radio entries
-            for (const [groupKey, group] of Object.entries(checkRadioGroups)) {
-                const els = group.elements;
-                if (seen.has(groupKey)) continue;
-                seen.add(groupKey);
-
-                const groupLabel = getGroupLabel(els);
-                const firstSelector = buildOptionSelector(els[0]) || buildSelector(els[0], getLabel(els[0]));
-                if (!firstSelector) continue;
-
-                const options = [];
-                for (const el of els) {
-                    const optLabel = getLabel(el) || el.value || null;
-                    const optSelector = buildOptionSelector(el);
-                    if (!optSelector) continue;
-                    options.push({
-                        label: optLabel,
-                        value: el.value || null,
-                        selector: optSelector,
-                    });
-                }
-
-                const groupType = group.type === 'radio' ? 'radio_group' : 'checkbox_group';
-                fields.push({
-                    label: groupLabel || null,
-                    selector: firstSelector,
-                    tag: 'input',
-                    type: groupType,
-                    name: els[0].name || null,
-                    required: els[0].required || false,
-                    placeholder: null,
-                    options: options,
-                });
-            }
-            return fields;
-        }"""
+        prompt_text = prompt_engine.load_prompt(
+            template="form-field-mapper",
+            form_fields=field_descs,
+            data=data,
+            prompt=prompt,
         )
+
+        try:
+            skyvern_ctx = skyvern_context.current()
+            org_id = skyvern_ctx.organization_id if skyvern_ctx else None
+            if skyvern_ctx:
+                skyvern_ctx.script_llm_call_count += 1
+
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt_text,
+                prompt_name="form-field-mapper",
+                organization_id=org_id,
+            )
+
+            if not isinstance(json_response, dict):
+                LOG.warning(
+                    "dynamic_field_map: LLM returned non-dict",
+                    response_type=type(json_response).__name__,
+                )
+                raise ValueError(f"LLM returned {type(json_response).__name__} instead of dict")
+
+            result: dict[int, Any] = {}
+            for k, v in json_response.items():
+                if v is None:
+                    continue
+                try:
+                    idx = int(k) - 1  # 1-indexed prompt -> 0-indexed
+                    if 0 <= idx < len(form_fields):
+                        result[idx] = v
+                except (ValueError, TypeError):
+                    LOG.warning("dynamic_field_map: non-numeric key in LLM response", key=k)
+            LOG.info("dynamic_field_map: mapped fields", mapped=len(result), total=len(form_fields))
+            return result
+
+        except Exception:
+            LOG.warning("dynamic_field_map: LLM call failed", exc_info=True)
+            raise
+
+    async def fill_from_mapping(
+        self,
+        form_fields: list[dict[str, Any]],
+        mapping: dict[int, str | list | bool | None],
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Fill form fields using a pre-computed mapping from :meth:`dynamic_field_map`.
+
+        Iterates over the mapping and fills each field using the appropriate
+        browser method based on field type.  No LLM calls — pure execution.
+
+        Args:
+            form_fields: Output of :meth:`extract_form_fields`.
+            mapping: Output of :meth:`dynamic_field_map` (index -> value).
+            data: Original data dict for post-fill file upload matching.
+        """
+        ai_fallback_count = 0
+        max_ai_fallbacks = 10
+
+        def _budget_available() -> bool:
+            nonlocal ai_fallback_count
+            if ai_fallback_count >= max_ai_fallbacks:
+                LOG.warning("fill_from_mapping: AI fallback budget exhausted", count=ai_fallback_count)
+                return False
+            ai_fallback_count += 1
+            return True
+
+        for idx, value in sorted(mapping.items()):
+            if idx >= len(form_fields) or value is None:
+                continue
+
+            field = form_fields[idx]
+            selector = field.get("selector", "")
+            field_type = field.get("type", "text")
+            field_tag = field.get("tag", "input")
+            label = field.get("label") or field.get("name") or "unknown"
+
+            try:
+                if field_type in ("radio_group", "checkbox_group"):
+                    if isinstance(value, str):
+                        try:
+                            parsed = _json.loads(value)
+                            selected = (
+                                [str(v).lower().strip() for v in parsed]
+                                if isinstance(parsed, list)
+                                else [value.lower().strip()]
+                            )
+                        except (ValueError, TypeError):
+                            selected = [value.lower().strip()]
+                    elif isinstance(value, list):
+                        selected = [str(v).lower().strip() for v in value]
+                    else:
+                        selected = [str(value).lower().strip()]
+
+                    options = field.get("options", [])
+                    opt_labels = [(o.get("label") or o.get("value", "")).lower().strip() for o in options]
+
+                    matched_any = False
+                    for sel_label in selected:
+                        for oi, ol in enumerate(opt_labels):
+                            # Exact match, or substring match with min length 3 to avoid
+                            # false positives (e.g., "No" matching "None of the above")
+                            if (
+                                sel_label == ol
+                                or (len(sel_label) >= 3 and sel_label in ol)
+                                or (len(ol) >= 3 and ol in sel_label)
+                            ):
+                                await self.click(selector=options[oi]["selector"], ai=None)
+                                matched_any = True
+                                break
+
+                    if not matched_any:
+                        # No option text-matched — use AI fallback (Code 2.0 style)
+                        LOG.info(
+                            "fill_from_mapping: no option matched for group, using AI fallback",
+                            field_label=label,
+                            intended_value=str(value)[:100],
+                            available_options=[o[:50] for o in opt_labels],
+                        )
+                        if _budget_available():
+                            try:
+                                self._track_ai_call()
+                                prompt = f"For the question '{label}', select the option closest to '{value}'"
+                                await self.click(selector=selector, ai="fallback", prompt=prompt)
+                            except Exception:
+                                LOG.warning(
+                                    "fill_from_mapping: AI fallback for radio/checkbox group failed, skipping",
+                                    field_label=label,
+                                )
+
+                elif field_tag == "select":
+                    locator = self.page.locator(selector)
+                    try:
+                        await locator.select_option(label=str(value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                    except Exception:
+                        try:
+                            await locator.select_option(str(value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                        except Exception:
+                            # Dropdown value didn't match — AI fallback (Code 2.0 style)
+                            LOG.info(
+                                "fill_from_mapping: select option not found, using AI fallback",
+                                field_label=label,
+                                intended_value=str(value)[:100],
+                            )
+                            if _budget_available():
+                                try:
+                                    self._track_ai_call()
+                                    prompt = f"Select '{value}' from the '{label}' dropdown"
+                                    await self.select_option(selector=selector, ai="fallback", prompt=prompt)
+                                except Exception:
+                                    LOG.warning(
+                                        "fill_from_mapping: select AI fallback failed, skipping", field_label=label
+                                    )
+
+                elif field_type in ("checkbox", "radio"):
+                    if value and str(value).lower() not in ("false", "no", "0", "skip"):
+                        await self.click(selector=selector, ai=None)
+
+                elif field_type == "file":
+                    await self.upload_file(
+                        selector=selector,
+                        files=str(value),
+                        ai="fallback",
+                        prompt=f"Upload file for {label}",
+                    )
+
+                else:
+                    await self.fill(selector=selector, value=str(value), ai=None)
+
+            except Exception:
+                LOG.warning(
+                    "fill_from_mapping: field fill failed, trying AI fallback",
+                    field_label=label,
+                    field_type=field_type,
+                    field_index=idx,
+                    exc_info=True,
+                )
+                # Field-type-aware AI fallback (Code 2.0 — selector + fallback, not proactive)
+                if not _budget_available():
+                    continue
+                try:
+                    self._track_ai_call()
+                    if field_type in ("radio_group", "checkbox_group"):
+                        prompt = f"Select '{value}' for the question '{label}'"
+                        await self.click(selector=selector, ai="fallback", prompt=prompt)
+                    elif field_type in ("radio", "checkbox"):
+                        prompt = f"Click the '{label}' option to select '{value}'"
+                        await self.click(selector=selector, ai="fallback", prompt=prompt)
+                    elif field_tag == "select":
+                        prompt = f"Select '{value}' from the '{label}' dropdown"
+                        await self.select_option(selector=selector, ai="fallback", prompt=prompt)
+                    else:
+                        prompt = f"Fill the '{label}' field with: {value}"
+                        await self.fill(selector=selector, ai="fallback", prompt=prompt)
+                except Exception:
+                    LOG.warning("fill_from_mapping: AI fallback also failed", field_label=label, exc_info=True)
+
+        # Post-fill: handle unmapped file upload fields by matching URL parameters
+        # LLMs often return null for file fields even when a matching URL parameter exists.
+        # This catches those cases by scanning for file fields that weren't in the mapping
+        # and trying to match them against URL-like parameter values.
+        if data:
+            url_params = {k: v for k, v in data.items() if isinstance(v, str) and v.startswith("http")}
+            file_fields = [(i, f) for i, f in enumerate(form_fields) if f.get("type") == "file"]
+            unmapped_files = [(i, f) for i, f in file_fields if i not in mapping]
+            LOG.info(
+                "fill_from_mapping: file upload check",
+                url_params_count=len(url_params),
+                url_param_keys=list(url_params.keys()) if url_params else [],
+                file_field_count=len(file_fields),
+                unmapped_file_count=len(unmapped_files),
+                unmapped_file_labels=[(f.get("label") or f.get("name") or "?")[:50] for _, f in unmapped_files],
+            )
+            if url_params:
+                for idx, field in enumerate(form_fields):
+                    if field.get("type") != "file" or idx in mapping:
+                        continue
+                    field_label = (field.get("label") or "").lower()
+                    field_name = (field.get("name") or "").lower()
+                    selector = field.get("selector", "")
+                    if not selector:
+                        continue
+                    # Try to match file field name/label against parameter keys
+                    for param_key, param_url in url_params.items():
+                        pk = param_key.lower()
+                        if (
+                            pk == field_name  # "resume" == "resume"
+                            or (len(pk) >= 3 and pk in field_name)  # "resume" in "resume-upload"
+                            or (len(field_name) >= 3 and field_name in pk)  # "doc" in "resume_doc"
+                            or (field_label and len(pk) >= 3 and pk in field_label)
+                        ):
+                            LOG.info(
+                                "fill_from_mapping: matched URL param to file field",
+                                param_key=param_key,
+                                field_label=field_label,
+                            )
+                            try:
+                                await self.upload_file(
+                                    selector=selector,
+                                    files=param_url,
+                                    ai=None,
+                                )
+                            except Exception:
+                                LOG.warning(
+                                    "fill_from_mapping: file upload failed",
+                                    field_label=field_label,
+                                    param_url=param_url[:100],
+                                    exc_info=True,
+                                )
+                            break
+
+    async def validate_mapping(
+        self,
+        form_fields: list[dict[str, Any]],
+        mapping: dict[int, str | list | bool | None],
+        prompt: str | None,
+    ) -> bool:
+        """Validate the field mapping against the user's prompt/instructions.
+
+        Makes one LLM call that sees the prompt (user instructions),
+        the form fields, and what was mapped to each field.  Returns True if
+        the run should complete, False if it should terminate.
+
+        This catches user directives like "terminate if you can't answer the
+        security clearance question" or "never fabricate answers — fail if
+        data is missing for required fields."
+
+        Args:
+            form_fields: Output of :meth:`extract_form_fields`.
+            mapping: Output of :meth:`dynamic_field_map`.
+            prompt: The user's instructions/prompt for this automation.
+
+        Returns:
+            True to complete, False to terminate.
+        """
+        if not prompt:
+            return True
+
+        # Build a summary of what was mapped
+        field_summary: list[str] = []
+        for i, field in enumerate(form_fields):
+            label = field.get("label") or field.get("name") or f"field_{i}"
+            field_type = field.get("type", "text")
+            required = field.get("required", False)
+            value = mapping.get(i)
+            if value is not None:
+                field_summary.append(f"- {label} ({field_type}{'*' if required else ''}): {str(value)[:100]}")
+            else:
+                field_summary.append(f"- {label} ({field_type}{'*' if required else ''}): [NOT FILLED]")
+
+        prompt_text = (
+            "You are validating a job application form that was filled automatically.\n\n"
+            "# User Instructions\n"
+            f"```\n{prompt}\n```\n\n"
+            "# Form Fields and Values\n" + "\n".join(field_summary) + "\n\n"
+            "# Task\n"
+            "Review the filled values against the user instructions above.\n"
+            "Decide whether this application should COMPLETE or TERMINATE.\n\n"
+            "TERMINATE only if:\n"
+            "- The user instructions EXPLICITLY say to terminate/fail/stop for a specific condition, "
+            "and that condition is met (e.g., 'terminate if work authorization is unknown')\n"
+            "- The user instructions say 'do not submit', 'don't submit', 'don't click submit', "
+            "or similar — this means they are testing and want to stop before submission\n"
+            "- Do NOT terminate just because some fields are [NOT FILLED] — that's normal for "
+            "optional fields or file uploads without matching data\n\n"
+            "COMPLETE if:\n"
+            "- The user didn't specify any termination conditions (DEFAULT — most cases)\n"
+            "- All explicit user termination conditions are satisfied\n"
+            "- Fields are filled reasonably given the available data\n"
+            "- Some fields being [NOT FILLED] is OK as long as no user instruction says otherwise\n\n"
+            "# Output\n"
+            'Return JSON: {"decision": "complete"} or {"decision": "terminate", "reason": "brief explanation"}\n'
+        )
+
+        try:
+            skyvern_ctx = skyvern_context.current()
+            org_id = skyvern_ctx.organization_id if skyvern_ctx else None
+            if skyvern_ctx:
+                skyvern_ctx.script_llm_call_count += 1
+
+            result = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt_text,
+                prompt_name="form-validate-mapping",
+                organization_id=org_id,
+            )
+
+            decision = result.get("decision", "complete") if isinstance(result, dict) else "complete"
+
+            if decision == "terminate":
+                reason = result.get("reason", "Validation failed") if isinstance(result, dict) else "Validation failed"
+                LOG.info(
+                    "validate_mapping: TERMINATE",
+                    reason=reason,
+                    prompt=prompt[:200],
+                )
+                return False
+
+            LOG.info("validate_mapping: COMPLETE")
+            return True
+
+        except Exception:
+            LOG.warning("validate_mapping: validation call failed, defaulting to complete", exc_info=True)
+            return True
 
     async def fill_form(
         self,
-        field_map: dict[str, dict],
-        context: Any,
+        data: dict[str, Any],
         *,
-        navigation_goal: str = "Fill out the form",
+        prompt: str = "Fill out the form",
     ) -> None:
-        """Scan page for form fields and fill them using the field_map.
+        """Scan page for form fields, map data to fields via LLM, and fill them.
 
-        Two-pass structural anti-scrambling approach:
-        - Pass 1: Resolve canonical extracted values and direct parameter values.
-          These fields are removed from the batch planner's view entirely.
-        - Pass 2: Batch plan ONLY unresolved fields (the planner can't scramble
-          canonical values because it never sees them).
-        - Pass 3: Fill everything.
+        This is the primary SDK interface for form filling. It composes:
+        1. extract_form_fields() — scan all fields from the DOM (free)
+        2. dynamic_field_map() — one LLM call to map data to fields
+        3. validate_mapping() — one LLM call to check user conditions
+        4. fill_from_mapping() — fill via CSS selectors with AI fallback
 
-        field_map keys are descriptive snake_case names (e.g., "full_name", "phone").
-        field_map values are dicts with:
-          - "param": parameter key in context.parameters (or None)
-          - "action": "fill" | "select" | "fill_autocomplete" | "click" | "upload_file"
-          - "ai": optional, "fallback" | "proactive" (default: "fallback" when param exists, "proactive" otherwise)
-          - "prompt": AI prompt for this field
-          - "labels": list of known label variants (used for fuzzy matching)
-
-        Fields found on page but NOT in field_map are filled with ai='proactive'.
+        Args:
+            data: Dict of data keys/values to fill into the form.
+            prompt: User instructions for how to fill the form.
         """
-        fields = await self.scan_form_fields()
+        form_fields = await self.extract_form_fields()
 
         LOG.info(
-            "fill_form: scanned page fields",
-            field_count=len(fields),
-            field_map_size=len(field_map),
+            "fill_form: extracted fields",
+            field_count=len(form_fields),
+            data_keys=list(data.keys())[:10],
         )
 
-        # PASS 1: Structurally resolve canonical + direct-param fields
-        resolved: dict[int, tuple[Any, dict]] = {}  # i -> (value, entry)
-        unresolved_fields: list[tuple[int, dict, dict | None]] = []  # (i, field, matched_entry)
+        mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
 
-        for i, field in enumerate(fields):
-            matched_entry = self._match_field_to_map(field, field_map, context)
+        if not await self.validate_mapping(form_fields, mapping, prompt):
+            raise ScriptTerminationException("fill_form validation failed: user termination conditions not met")
 
-            # Canonical extracted value → structural fill, skip batch planner
-            if matched_entry and matched_entry.get("_extracted_value") is not None:
-                LOG.info(
-                    "fill_form: structurally resolved (canonical)",
-                    field_label=field.get("label"),
-                    category=matched_entry.get("_canonical"),
-                    value_preview=str(matched_entry["_extracted_value"])[:40],
-                )
-                resolved[i] = (matched_entry["_extracted_value"], matched_entry)
-                continue
-
-            # Direct param value → structural fill, skip batch planner
-            if matched_entry:
-                param = matched_entry.get("param")
-                direct_value = context.parameters.get(param) if param else None
-                if direct_value:
-                    LOG.info(
-                        "fill_form: structurally resolved (param)",
-                        field_label=field.get("label"),
-                        param=param,
-                    )
-                    resolved[i] = (direct_value, matched_entry)
-                    continue
-
-            unresolved_fields.append((i, field, matched_entry))
-
-        LOG.info(
-            "fill_form: structural resolution complete",
-            resolved_count=len(resolved),
-            unresolved_count=len(unresolved_fields),
-        )
-
-        # PASS 2: Batch plan ONLY unresolved fields (no canonical fields in the prompt)
-        planned_values: dict[int, Any] | None = None
-        if unresolved_fields:
-            only_fields = [f for _, f, _ in unresolved_fields]
-            planned_values = await self._batch_plan_form_values(only_fields, field_map, context, navigation_goal)
-
-        # PASS 3: Fill everything (with error tracking for element retry)
-        # Pre-build lookup: original field index -> (unresolved_idx, matched_entry)
-        original_to_unresolved: dict[int, tuple[int, dict | None]] = {
-            fi: (ui, entry) for ui, (fi, _, entry) in enumerate(unresolved_fields)
-        }
-
-        failed_fields: list[tuple[int, dict]] = []  # (field_index, field) pairs that failed
-
-        for i, field in enumerate(fields):
-            try:
-                if i in resolved:
-                    value, entry = resolved[i]
-                    await self._fill_with_planned_value(field, value, entry, navigation_goal=navigation_goal)
-                elif i in original_to_unresolved:
-                    unresolved_idx, matched = original_to_unresolved[i]
-                    if planned_values and unresolved_idx in planned_values:
-                        await self._fill_with_planned_value(
-                            field, planned_values[unresolved_idx], matched, navigation_goal=navigation_goal
-                        )
-                    elif matched:
-                        # Try to resolve a value from param/extracted before falling back to per-field AI
-                        fallback_value = self._resolve_fallback_value(field, matched, context)
-                        if fallback_value is not None:
-                            await self._fill_with_planned_value(
-                                field, fallback_value, matched, navigation_goal=navigation_goal
-                            )
-                        else:
-                            await self._fill_matched_field(field, matched, context, navigation_goal)
-                    else:
-                        await self._fill_unknown_field(field, navigation_goal)
-                else:
-                    await self._fill_unknown_field(field, navigation_goal)
-            except Exception:
-                LOG.warning(
-                    "fill_form: field failed during pass 3, will retry",
-                    field_label=field.get("label"),
-                    field_index=i,
-                    exc_info=True,
-                )
-                failed_fields.append((i, field))
-
-        # PASS 4: Element retry of failed fields only (prevents full-block AI fallback)
-        if failed_fields:
-            LOG.info(
-                "fill_form: retrying failed fields with AI",
-                failed_count=len(failed_fields),
-            )
-            for i, field in failed_fields:
-                try:
-                    await self._fill_unknown_field(field, navigation_goal)
-                except Exception:
-                    LOG.warning(
-                        "fill_form: element retry also failed",
-                        field_label=field.get("label"),
-                        exc_info=True,
-                    )
-
-        # QUALITY AUDIT: LLM-based verification (test-only, gated by env var)
-        if os.environ.get("SCRIPT_QUALITY_AUDIT"):
-            await self.quality_audit(context, navigation_goal)
+        await self.fill_from_mapping(form_fields, mapping, data=data)
 
     def _match_field_to_map(
         self,
@@ -1711,8 +1793,8 @@ class SkyvernPage(Page):
         if best_match:
             return best_match
 
-        # Priority 3: Canonical category match
-        category = match_field_to_category(field_label)
+        # Priority 3: Canonical category match (cloud-only; returns None in OSS)
+        category = app.AGENT_FUNCTION.match_field_to_canonical_category(field_label)
         if category:
             # Build a synthetic entry from the canonical category
             extracted_value = None
@@ -1803,7 +1885,7 @@ class SkyvernPage(Page):
         # matches any of the mapping_labels (handles "prefer not to answer" -> decline).
         category_name = entry.get("_canonical")
         if category_name:
-            cat_obj = get_category(category_name)
+            cat_obj = app.AGENT_FUNCTION.get_canonical_category(category_name)
             if cat_obj and cat_obj.value_mappings:
                 for mapping_key, mapping_labels in cat_obj.value_mappings:
                     key_matches = mapping_key in candidate_str or candidate_str in mapping_key
