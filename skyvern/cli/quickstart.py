@@ -13,7 +13,7 @@ from skyvern.analytics import capture_setup_error, capture_setup_event
 
 # Import console after skyvern.cli to ensure proper initialization
 from skyvern.cli.console import console
-from skyvern.cli.init_command import init_env  # init is used directly
+from skyvern.cli.init_command import _normalize_database_string, init_env  # init is used directly
 from skyvern.cli.llm_setup import setup_llm_providers
 from skyvern.cli.utils import start_services
 
@@ -159,6 +159,9 @@ def quickstart(
     docker_compose: bool = typer.Option(False, "--docker-compose", help="Use Docker Compose for full setup"),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
+    # Typer OptionInfo can leak through when quickstart is called programmatically.
+    database_string = _normalize_database_string(database_string)
+
     # Check Docker
     with console.status("Checking Docker installation...") as status:
         docker_available = check_docker()
