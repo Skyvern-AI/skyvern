@@ -618,6 +618,19 @@ wheels = [
 ]
 
 [[package]]
+name = "croniter"
+version = "3.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+    { name = "pytz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/07/ea/98665cd116af6d3c4e79c8dc91bbd9a13746cb3c7d72efbfdef5b720c43b/croniter-3.0.4.tar.gz", hash = "sha256:f9dcd4bdb6c97abedb6f09d6ed3495b13ede4d4544503fa580b6372a56a0c520", size = 54500, upload-time = "2024-10-25T12:22:33.14Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/f5/135d0e57e5bdd2f978388d77ee818f1ac5ac584eb48034362770001f4cad/croniter-3.0.4-py2.py3-none-any.whl", hash = "sha256:96e14cdd5dcb479dd48d7db14b53d8434b188dfb9210448bef6f65663524a6f0", size = 23220, upload-time = "2024-10-25T12:22:30.75Z" },
+]
+
+[[package]]
 name = "cronsim"
 version = "2.7"
 source = { registry = "https://pypi.org/simple" }
@@ -746,18 +759,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ae/b6/03bb70946330e88ffec97aefd3ea75ba575cb2e762061e0e62a213befee8/docutils-0.22.4.tar.gz", hash = "sha256:4db53b1fde9abecbb74d91230d32ab626d94f6badfc575d6db9194a49df29968", size = 2291750, upload-time = "2025-12-18T19:00:26.443Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/02/10/5da547df7a391dcde17f59520a231527b8571e6f46fc8efb02ccb370ab12/docutils-0.22.4-py3-none-any.whl", hash = "sha256:d0013f540772d1420576855455d050a2180186c91c15779301ac2ccb3eeb68de", size = 633196, upload-time = "2025-12-18T19:00:18.077Z" },
-]
-
-[[package]]
-name = "ecdsa"
-version = "0.19.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "six" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c0/1f/924e3caae75f471eae4b26bd13b698f6af2c44279f67af317439c2f4c46a/ecdsa-0.19.1.tar.gz", hash = "sha256:478cba7b62555866fcb3bb3fe985e06decbdb68ef55713c4e5ab98c57d508e61", size = 201793, upload-time = "2025-03-13T11:52:43.25Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/a3/460c57f094a4a165c84a1341c373b0a4f5ec6ac244b998d5021aade89b77/ecdsa-0.19.1-py2.py3-none-any.whl", hash = "sha256:30638e27cf77b7e15c4c4cc1973720149e1033827cfd00661ca5c8cc0cdb24c3", size = 150607, upload-time = "2025-03-13T11:52:41.757Z" },
 ]
 
 [[package]]
@@ -3656,25 +3657,6 @@ wheels = [
 ]
 
 [[package]]
-name = "python-jose"
-version = "3.5.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "ecdsa" },
-    { name = "pyasn1" },
-    { name = "rsa" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c6/77/3a1c9039db7124eb039772b935f2244fbb73fc8ee65b9acf2375da1c07bf/python_jose-3.5.0.tar.gz", hash = "sha256:fb4eaa44dbeb1c26dcc69e4bd7ec54a1cb8dd64d3b4d81ef08d90ff453f2b01b", size = 92726, upload-time = "2025-05-28T17:31:54.288Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/c3/0bd11992072e6a1c513b16500a5d07f91a24017c5909b02c72c62d7ad024/python_jose-3.5.0-py2.py3-none-any.whl", hash = "sha256:abd1202f23d34dfad2c3d28cb8617b90acf34132c7afd60abd0b0b7d3cb55771", size = 34624, upload-time = "2025-05-28T17:31:52.802Z" },
-]
-
-[package.optional-dependencies]
-cryptography = [
-    { name = "cryptography" },
-]
-
-[[package]]
 name = "python-json-logger"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4115,7 +4097,7 @@ wheels = [
 [[package]]
 name = "skyvern"
 version = "1.0.24"
-source = { registry = "https://pypi.org/simple" }
+source = { directory = "../../" }
 dependencies = [
     { name = "aioboto3" },
     { name = "aiofiles" },
@@ -4125,10 +4107,12 @@ dependencies = [
     { name = "anthropic" },
     { name = "asyncache" },
     { name = "asyncpg" },
+    { name = "authlib" },
     { name = "azure-identity" },
     { name = "azure-keyvault-secrets" },
     { name = "azure-storage-blob" },
     { name = "cachetools" },
+    { name = "croniter" },
     { name = "curlparser" },
     { name = "email-validator" },
     { name = "fastapi" },
@@ -4157,14 +4141,15 @@ dependencies = [
     { name = "psutil" },
     { name = "psycopg", version = "3.1.18", source = { registry = "https://pypi.org/simple" }, extra = ["binary", "pool"], marker = "python_full_version < '3.13'" },
     { name = "psycopg", version = "3.2.13", source = { registry = "https://pypi.org/simple" }, extra = ["binary", "pool"], marker = "python_full_version >= '3.13'" },
+    { name = "pyasn1" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pyotp" },
     { name = "pypdf" },
     { name = "python-calamine" },
     { name = "python-docx" },
     { name = "python-dotenv" },
-    { name = "python-jose", extra = ["cryptography"] },
     { name = "python-multipart" },
     { name = "requests-toolbelt" },
     { name = "rich", extra = ["jupyter"] },
@@ -4175,6 +4160,7 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tldextract" },
     { name = "toml" },
+    { name = "tornado" },
     { name = "typer" },
     { name = "types-boto3", extra = ["full"] },
     { name = "types-toml" },
@@ -4183,9 +4169,128 @@ dependencies = [
     { name = "websockets" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f5/59/bbb03dfb07d597f3c448695fac2402e280f9d8c20c336e699dc5396b7d98/skyvern-1.0.24.tar.gz", hash = "sha256:a39936f01137d9f9bb1c66d99fe890cc3669f5fb1c255498d9d57c524cc4e545", size = 4060115, upload-time = "2026-03-13T02:52:11.027Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b4/ad/8e4b6f132e51df2b352ca7b3d1d9e73347e0d11fcccb73669ba26a83fd52/skyvern-1.0.24-py3-none-any.whl", hash = "sha256:53214db5d4d2c1430a84525be4134f47ae422c2d2a3d70ac1197fab834b838da", size = 4793854, upload-time = "2026-03-13T02:52:08.82Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "aioboto3", specifier = ">=14.3.0,<15" },
+    { name = "aiofiles", specifier = ">=24.1.0,<25" },
+    { name = "aiohttp", specifier = ">=3.8.5,<4" },
+    { name = "aioredlock", specifier = ">=0.7.3,<0.8" },
+    { name = "alembic", specifier = ">=1.12.1,<2" },
+    { name = "anthropic", specifier = ">=0.50.0,<0.51" },
+    { name = "asyncache", specifier = ">=0.3.1,<0.4" },
+    { name = "asyncpg", specifier = ">=0.30.0,<0.31" },
+    { name = "authlib", specifier = ">=1.6.9" },
+    { name = "azure-identity", specifier = ">=1.24.0,<2" },
+    { name = "azure-keyvault-secrets", specifier = ">=4.2.0,<5" },
+    { name = "azure-storage-blob", specifier = ">=12.26.0" },
+    { name = "cachetools", specifier = ">=5.3.2,<6" },
+    { name = "croniter", specifier = ">=1.3.8,<4" },
+    { name = "curlparser", specifier = ">=0.1.0,<0.2" },
+    { name = "email-validator", specifier = ">=2.2.0,<3" },
+    { name = "fastapi", specifier = ">=0.121.0,<0.129" },
+    { name = "fastmcp", specifier = ">=2.10.1,<4" },
+    { name = "filetype", specifier = ">=1.2.0,<2" },
+    { name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" },
+    { name = "greenlet", marker = "python_full_version == '3.11.*'", specifier = "==3.0.3" },
+    { name = "greenlet", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">3.0.3" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
+    { name = "jinja2", specifier = ">=3.1.2,<4" },
+    { name = "json-repair", specifier = ">=0.34.0,<0.35" },
+    { name = "jsonschema", specifier = ">=4.25.1" },
+    { name = "lark", specifier = ">=1.2.2,<2" },
+    { name = "libcst", specifier = ">=1.8.2,<2" },
+    { name = "litellm", specifier = ">=1.80.10" },
+    { name = "onepassword-sdk", specifier = "==0.3.0" },
+    { name = "openai", specifier = ">=1.68.2" },
+    { name = "opentelemetry-api", specifier = ">=1.39.0,<2" },
+    { name = "orjson", specifier = ">=3.9.10,<4" },
+    { name = "pandas", specifier = ">=2.3.1,<3" },
+    { name = "pdfplumber", specifier = ">=0.11.0,<0.12" },
+    { name = "pillow", specifier = ">=10.2.0" },
+    { name = "playwright", marker = "python_full_version == '3.11.*'", specifier = "==1.46.0" },
+    { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">1.46.0" },
+    { name = "posthog", specifier = ">=3.7.0,<4" },
+    { name = "psutil", specifier = ">=7.0.0" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version >= '3.11' and python_full_version < '3.13'", specifier = "==3.1.18" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version == '3.13.*'", specifier = ">=3.2.2,<3.3.0" },
+    { name = "pyasn1", specifier = ">=0.6.3" },
+    { name = "pydantic", specifier = ">=2.5.2,<3" },
+    { name = "pydantic-settings", specifier = ">=2.1.0,<3" },
+    { name = "pyjwt", specifier = ">=2.12.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.12.0,<3" },
+    { name = "pyotp", specifier = ">=2.9.0,<3" },
+    { name = "pypdf", specifier = ">=6.7.5,<7" },
+    { name = "python-calamine", specifier = ">=0.6.1" },
+    { name = "python-docx", specifier = ">=1.1.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0,<2" },
+    { name = "python-multipart", specifier = ">=0.0.22,<1" },
+    { name = "requests-toolbelt", specifier = ">=1.0.0,<2" },
+    { name = "rich", extras = ["jupyter"], specifier = ">=13.7.0,<14" },
+    { name = "sqlalchemy", extras = ["mypy"], specifier = ">=2.0.29,<3" },
+    { name = "sse-starlette", specifier = ">=3.0.3,<4" },
+    { name = "starlette-context", specifier = ">=0.3.6,<0.4" },
+    { name = "structlog", specifier = ">=23.2.0,<24" },
+    { name = "tiktoken", specifier = ">=0.9.0" },
+    { name = "tldextract", specifier = ">=5.1.2,<6" },
+    { name = "toml", specifier = ">=0.10.2,<0.11" },
+    { name = "tornado", specifier = ">=6.5.5" },
+    { name = "typer", specifier = ">=0.16.0" },
+    { name = "types-boto3", extras = ["full"], specifier = ">=1.38.31,<2" },
+    { name = "types-toml", specifier = ">=0.10.8.7,<0.11" },
+    { name = "urllib3", specifier = ">=2.6.3" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.35.0" },
+    { name = "websockets", specifier = ">=12.0,<15.1" },
+    { name = "zstandard", specifier = ">=0.25.0" },
+]
+
+[package.metadata.requires-dev]
+cloud = [
+    { name = "kr8s", specifier = ">=0.20.14,<1" },
+    { name = "opentelemetry-distro", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.39.1,<2" },
+    { name = "opentelemetry-instrumentation-aiohttp-client", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-asyncio", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-asyncpg", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-botocore", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-grpc", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-logging", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-redis", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-requests", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-sqlalchemy", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-instrumentation-urllib3", specifier = ">=0.60b1,<1" },
+    { name = "opentelemetry-sdk", specifier = ">=1.39.0,<2" },
+    { name = "pyrate-limiter", specifier = ">=3.7.0,<4" },
+    { name = "redis", specifier = ">=5.0.3,<6" },
+    { name = "stripe", specifier = ">=9.7.0,<10" },
+    { name = "temporalio", specifier = ">=1.6.0,<2" },
+    { name = "temporalio", extras = ["opentelemetry"], specifier = ">=1.6.0,<2" },
+]
+dev = [
+    { name = "aiosqlite", specifier = ">=0.21.0,<0.22" },
+    { name = "autoflake", specifier = ">=2.2.0,<3" },
+    { name = "build", specifier = ">=1.2.2.post1,<2" },
+    { name = "curlify", specifier = ">=3.0.0" },
+    { name = "fpdf", specifier = ">=1.7.2,<2" },
+    { name = "freezegun", specifier = ">=1.2.2,<2" },
+    { name = "gspread", specifier = ">=6" },
+    { name = "ipykernel", specifier = ">=6.26.0,<7" },
+    { name = "ipython", specifier = ">=8.17.2,<9" },
+    { name = "isort", specifier = ">=5.13.2" },
+    { name = "moto", extras = ["s3", "server"], specifier = ">=5.1.5,<6" },
+    { name = "mypy", specifier = ">=1.18.2,<2" },
+    { name = "notebook", specifier = ">=7.0.6,<8" },
+    { name = "openpyxl", specifier = ">=3.1.0" },
+    { name = "pre-commit", specifier = ">=4.2.0,<5" },
+    { name = "pydevd-pycharm", specifier = ">=233.6745.319,<234" },
+    { name = "pytest", specifier = ">=7.4.0,<8" },
+    { name = "pytest-asyncio", specifier = ">=0.21.1,<0.22" },
+    { name = "python-pptx", specifier = ">=1.0.2" },
+    { name = "ruff", specifier = ">=0.14.1,<0.15" },
+    { name = "twine", specifier = ">=6.1.0,<7" },
+    { name = "types-requests", specifier = ">=2.31.0.2,<3" },
 ]
 
 [[package]]
@@ -4208,7 +4313,7 @@ dev = [
 requires-dist = [
     { name = "langchain", specifier = ">=1.2.0" },
     { name = "langchain-core", specifier = ">=1.2.11" },
-    { name = "skyvern", specifier = ">=0.2.0" },
+    { name = "skyvern", directory = "../../" },
     { name = "urllib3", specifier = ">=2.6.0" },
 ]
 
@@ -4443,6 +4548,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/be/ba/1f744cdc819428fc6b5084ec34d9b30660f6f9daaf70eead706e3203ec3c/toml-0.10.2.tar.gz", hash = "sha256:b3bda1d108d5dd99f4a20d24d9c348e91c4db7ab1b749200bded2f839ccbe68f", size = 22253, upload-time = "2020-11-01T01:40:22.204Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/44/6f/7120676b6d73228c96e17f1f794d8ab046fc910d781c8d151120c3f1569e/toml-0.10.2-py2.py3-none-any.whl", hash = "sha256:806143ae5bfb6a3c6e736a764057db0e6a0e05e338b5630894a5f779cabb4f9b", size = 16588, upload-time = "2020-11-01T01:40:20.672Z" },
+]
+
+[[package]]
+name = "tornado"
+version = "6.5.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/f1/3173dfa4a18db4a9b03e5d55325559dab51ee653763bb8745a75af491286/tornado-6.5.5.tar.gz", hash = "sha256:192b8f3ea91bd7f1f50c06955416ed76c6b72f96779b962f07f911b91e8d30e9", size = 516006, upload-time = "2026-03-10T21:31:02.067Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/59/8c/77f5097695f4dd8255ecbd08b2a1ed8ba8b953d337804dd7080f199e12bf/tornado-6.5.5-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:487dc9cc380e29f58c7ab88f9e27cdeef04b2140862e5076a66fb6bb68bb1bfa", size = 445983, upload-time = "2026-03-10T21:30:44.28Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/5e/7625b76cd10f98f1516c36ce0346de62061156352353ef2da44e5c21523c/tornado-6.5.5-cp39-abi3-macosx_10_9_x86_64.whl", hash = "sha256:65a7f1d46d4bb41df1ac99f5fcb685fb25c7e61613742d5108b010975a9a6521", size = 444246, upload-time = "2026-03-10T21:30:46.571Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/04/7b5705d5b3c0fab088f434f9c83edac1573830ca49ccf29fb83bf7178eec/tornado-6.5.5-cp39-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:e74c92e8e65086b338fd56333fb9a68b9f6f2fe7ad532645a290a464bcf46be5", size = 447229, upload-time = "2026-03-10T21:30:48.273Z" },
+    { url = "https://files.pythonhosted.org/packages/34/01/74e034a30ef59afb4097ef8659515e96a39d910b712a89af76f5e4e1f93c/tornado-6.5.5-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:435319e9e340276428bbdb4e7fa732c2d399386d1de5686cb331ec8eee754f07", size = 448192, upload-time = "2026-03-10T21:30:51.22Z" },
+    { url = "https://files.pythonhosted.org/packages/be/00/fe9e02c5a96429fce1a1d15a517f5d8444f9c412e0bb9eadfbe3b0fc55bf/tornado-6.5.5-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:3f54aa540bdbfee7b9eb268ead60e7d199de5021facd276819c193c0fb28ea4e", size = 448039, upload-time = "2026-03-10T21:30:53.52Z" },
+    { url = "https://files.pythonhosted.org/packages/82/9e/656ee4cec0398b1d18d0f1eb6372c41c6b889722641d84948351ae19556d/tornado-6.5.5-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:36abed1754faeb80fbd6e64db2758091e1320f6bba74a4cf8c09cd18ccce8aca", size = 447445, upload-time = "2026-03-10T21:30:55.541Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/76/4921c00511f88af86a33de770d64141170f1cfd9c00311aea689949e274e/tornado-6.5.5-cp39-abi3-win32.whl", hash = "sha256:dd3eafaaeec1c7f2f8fdcd5f964e8907ad788fe8a5a32c4426fbbdda621223b7", size = 448582, upload-time = "2026-03-10T21:30:57.142Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/23/f6c6112a04d28eed765e374435fb1a9198f73e1ec4b4024184f21faeb1ad/tornado-6.5.5-cp39-abi3-win_amd64.whl", hash = "sha256:6443a794ba961a9f619b1ae926a2e900ac20c34483eea67be4ed8f1e58d3ef7b", size = 448990, upload-time = "2026-03-10T21:30:58.857Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/c8/876602cbc96469911f0939f703453c1157b0c826ecb05bdd32e023397d4e/tornado-6.5.5-cp39-abi3-win_arm64.whl", hash = "sha256:2c9a876e094109333f888539ddb2de4361743e5d21eece20688e3e351e4990a6", size = 448016, upload-time = "2026-03-10T21:31:00.43Z" },
 ]
 
 [[package]]

@@ -42,6 +42,9 @@ override-dependencies = [
     "openai>=1.40.0,<2",
 ]
 
+[tool.uv.sources]
+skyvern = { path = "../.." }
+
 [tool.hatch.build.targets.sdist]
 include = ["skyvern_llamaindex"]
 
