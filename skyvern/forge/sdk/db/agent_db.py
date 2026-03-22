@@ -116,6 +116,8 @@ from skyvern.forge.sdk.schemas.organization_bitwarden_collections import Organiz
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
 )
@@ -1303,13 +1305,24 @@ class AgentDB(BaseAlchemyDB):
         token_type: Literal["azure_client_secret_credential"],
     ) -> AzureOrganizationAuthToken | None: ...
 
+    @overload
+    async def get_valid_org_auth_token(  # type: ignore
+        self,
+        organization_id: str,
+        token_type: Literal["bitwarden_credential"],
+    ) -> BitwardenOrganizationAuthToken | None: ...
+
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
         token_type: Literal[
-            "api", "onepassword_service_account", "azure_client_secret_credential", "custom_credential_service"
+            "api",
+            "onepassword_service_account",
+            "azure_client_secret_credential",
+            "custom_credential_service",
+            "bitwarden_credential",
         ],
-    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | None:
         try:
             async with self.Session() as session:
                 if token := (
@@ -1395,12 +1408,16 @@ class AgentDB(BaseAlchemyDB):
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-        token: str | AzureClientSecretCredential,
+        token: str | AzureClientSecretCredential | BitwardenCredential,
         encrypted_method: EncryptMethod | None = None,
-    ) -> OrganizationAuthToken:
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
             if not isinstance(token, AzureClientSecretCredential):
                 raise TypeError("Expected AzureClientSecretCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        elif token_type is OrganizationAuthTokenType.bitwarden_credential:
+            if not isinstance(token, BitwardenCredential):
+                raise TypeError("Expected BitwardenCredential for this token_type")
             plaintext_token = token.model_dump_json()
         else:
             if not isinstance(token, str):
@@ -1449,6 +1466,55 @@ class AgentDB(BaseAlchemyDB):
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def replace_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token: str | AzureClientSecretCredential | BitwardenCredential,
+        encrypted_method: EncryptMethod | None = None,
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+        """Atomically invalidate existing tokens and create a new one in a single transaction."""
+        if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
+            if not isinstance(token, AzureClientSecretCredential):
+                raise TypeError("Expected AzureClientSecretCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        elif token_type is OrganizationAuthTokenType.bitwarden_credential:
+            if not isinstance(token, BitwardenCredential):
+                raise TypeError("Expected BitwardenCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        else:
+            if not isinstance(token, str):
+                raise TypeError("Expected str token for this token_type")
+            plaintext_token = token
+
+        encrypted_token = ""
+        if encrypted_method is not None:
+            encrypted_token = await encryptor.encrypt(plaintext_token, encrypted_method)
+            plaintext_token = ""
+
+        async with self.Session() as session:
+            # Invalidate existing tokens
+            await session.execute(
+                update(OrganizationAuthTokenModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .filter_by(valid=True)
+                .values(valid=False)
+            )
+            # Create new token
+            auth_token = OrganizationAuthTokenModel(
+                organization_id=organization_id,
+                token_type=token_type,
+                token=plaintext_token,
+                encrypted_token=encrypted_token,
+                encrypted_method=encrypted_method.value if encrypted_method is not None else "",
+            )
+            session.add(auth_token)
+            await session.commit()
+            await session.refresh(auth_token)
+
+        return await convert_to_organization_auth_token(auth_token, token_type)
 
     async def get_artifacts_for_task_v2(
         self,
