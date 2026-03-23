@@ -420,10 +420,10 @@ function WorkflowRunTimelineBlockItem({
       <div
         data-slot="block-item"
         className={cn(
-          "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/20",
+          "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
           getBlockElevation(depth),
           {
-            "ring-white/20":
+            "ring-white/30":
               isWorkflowRunBlock(activeItem) &&
               activeItem.workflow_run_block_id === block.workflow_run_block_id,
           },
