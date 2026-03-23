@@ -2,6 +2,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -268,6 +269,13 @@ function LoginBlockCredentialSelector({
           )}
         </SelectTrigger>
         <SelectContent>
+          <SelectItem value="new">
+            <div className="flex items-center gap-2">
+              <PlusIcon className="size-4" />
+              <span>Add new credential</span>
+            </div>
+          </SelectItem>
+          {options.length > 0 && <SelectSeparator />}
           {options.map((option) => (
             <SelectItem key={option.value} value={option.value}>
               <div className="flex items-center gap-2">
@@ -287,12 +295,6 @@ function LoginBlockCredentialSelector({
               </div>
             </SelectItem>
           ))}
-          <SelectItem value="new">
-            <div className="flex items-center gap-2">
-              <PlusIcon className="size-4" />
-              <span>Add new credential</span>
-            </div>
-          </SelectItem>
         </SelectContent>
       </Select>
       <CredentialsModal
