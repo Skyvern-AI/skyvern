@@ -575,14 +575,22 @@ class S3Storage(BaseStorage):
         except Exception as e:
             raise PermissionError(f"No permission to access storage URI: {uri}") from e
 
-        allowed_prefixes = (
-            f"{settings.ENV}/{organization_id}/",
-            f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
-        )
-        if parsed_uri.bucket != settings.AWS_S3_BUCKET_UPLOADS or not any(
-            parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes
-        ):
-            raise PermissionError(f"No permission to access storage URI: {uri}")
+        # Uploads bucket: keys use {env}/{org}/ or downloads/{env}/{org}/
+        if parsed_uri.bucket == settings.AWS_S3_BUCKET_UPLOADS:
+            allowed_prefixes = (
+                f"{settings.ENV}/{organization_id}/",
+                f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
+            )
+            if any(parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes):
+                return
+
+        # Artifacts bucket: keys use v1/{env}/{org}/
+        if parsed_uri.bucket == settings.AWS_S3_BUCKET_ARTIFACTS:
+            artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
+            if parsed_uri.key.startswith(artifact_prefix):
+                return
+
+        raise PermissionError(f"No permission to access storage URI: {uri}")
 
     async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
         """Download a managed org-scoped file from S3."""

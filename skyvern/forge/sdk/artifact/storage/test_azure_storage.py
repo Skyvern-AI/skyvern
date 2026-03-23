@@ -156,8 +156,27 @@ class TestAzureStorageBrowserSessionFiles:
         azure_storage.assert_managed_file_access(legacy_uri, TEST_ORGANIZATION_ID)
         azure_storage.assert_managed_file_access(downloads_uri, TEST_ORGANIZATION_ID)
 
+    async def test_assert_managed_file_access_accepts_artifact_container(
+        self, azure_storage: AzureStorageForTests
+    ) -> None:
+        artifact_uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/"
+            "workflow_runs/wr_123/wrb_456/2026-03-23T17:57:58.370827_a_789_pdf.pdf"
+        )
+        azure_storage.assert_managed_file_access(artifact_uri, TEST_ORGANIZATION_ID)
+
     async def test_assert_managed_file_access_rejects_other_org(self, azure_storage: AzureStorageForTests) -> None:
         uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_other/file.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            azure_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org_artifact_container(
+        self, azure_storage: AzureStorageForTests
+    ) -> None:
+        uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/o_other/"
+            "workflow_runs/wr_123/wrb_456/artifact.pdf"
+        )
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             azure_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
 
