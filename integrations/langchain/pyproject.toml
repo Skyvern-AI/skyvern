@@ -14,10 +14,15 @@ dependencies = [
 ]
 
 [tool.uv]
-constraint-dependencies = [
+override-dependencies = [
     "authlib>=1.6.9",
     "pyasn1>=0.6.3",
     "pyjwt>=2.12.0",
+    # Security: fastmcp 3.x switches py-key-value-aio off the vulnerable
+    # disk-backed extra path that pulls in diskcache.
+    "fastmcp>=3.1.1",
+    "mcp>=1.23.0",
+    "websockets>=15.0.1",
 ]
 
 [tool.uv.sources]
