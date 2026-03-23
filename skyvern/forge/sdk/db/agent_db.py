@@ -6299,6 +6299,7 @@ class AgentDB(BaseAlchemyDB):
         browser_profile_id: str | None | object = _UNSET,
         tested_url: str | None | object = _UNSET,
         user_context: str | None | object = _UNSET,
+        save_browser_session_intent: bool | None | object = _UNSET,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -6319,6 +6320,8 @@ class AgentDB(BaseAlchemyDB):
                 credential.tested_url = tested_url
             if user_context is not _UNSET:
                 credential.user_context = user_context
+            if save_browser_session_intent is not _UNSET:
+                credential.save_browser_session_intent = save_browser_session_intent
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)

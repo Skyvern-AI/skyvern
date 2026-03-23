@@ -429,6 +429,8 @@ async def rename_credential(
         update_kwargs["tested_url"] = data.tested_url
     if data.user_context is not None:
         update_kwargs["user_context"] = data.user_context
+    if data.save_browser_session_intent is not None:
+        update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
     updated = await app.DATABASE.update_credential(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
@@ -1867,6 +1869,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             browser_profile_id=credential.browser_profile_id,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
+            save_browser_session_intent=credential.save_browser_session_intent,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -1881,6 +1884,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             browser_profile_id=credential.browser_profile_id,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
+            save_browser_session_intent=credential.save_browser_session_intent,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -1892,6 +1896,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             browser_profile_id=credential.browser_profile_id,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
+            save_browser_session_intent=credential.save_browser_session_intent,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")

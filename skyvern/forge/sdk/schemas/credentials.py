@@ -181,6 +181,10 @@ class CredentialResponse(BaseModel):
         default=None,
         description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
     )
+    save_browser_session_intent: bool | None = Field(
+        default=None,
+        description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
 
 
 class Credential(BaseModel):
@@ -216,6 +220,10 @@ class Credential(BaseModel):
         default=None,
         description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
     )
+    save_browser_session_intent: bool | None = Field(
+        default=False,
+        description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
@@ -240,6 +248,10 @@ class UpdateCredentialRequest(BaseModel):
         default=None,
         max_length=1000,
         description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+    save_browser_session_intent: bool | None = Field(
+        default=None,
+        description="Whether the user intends to save a browser session, regardless of test outcome",
     )
 
     @field_validator("user_context", mode="before")

@@ -1014,6 +1014,7 @@ class CredentialModel(Base):
     browser_profile_id = Column(String, nullable=True)
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
+    save_browser_session_intent = Column(Boolean, nullable=True, default=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
