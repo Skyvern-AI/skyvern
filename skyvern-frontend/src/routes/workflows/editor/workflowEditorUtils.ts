@@ -74,6 +74,7 @@ import {
   conditionalNodeDefaultData,
   createDefaultBranchConditions,
   ConditionalNode,
+  isConditionalNode,
 } from "./nodes/ConditionalNode/types";
 import {
   isLoopNode,
@@ -400,7 +401,20 @@ function layout(
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
+    // Use measured header height when available, fall back to 225 for initial render.
+    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
+    const conditionalHeaderHeight = isConditionalNode(node)
+      ? node.data._headerHeight
+      : undefined;
+    const conditionalBaseMargin = conditionalHeaderHeight
+      ? conditionalHeaderHeight + 28
+      : 225;
+    // Only add extra margin for the status row when using the fallback height,
+    // since the measured height already includes the status row content.
+    const marginy =
+      isTargetted && !conditionalHeaderHeight
+        ? conditionalBaseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
+        : conditionalBaseMargin;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,

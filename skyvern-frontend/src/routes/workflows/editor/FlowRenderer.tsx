@@ -468,6 +468,29 @@ function FlowRenderer({
     };
   }, [reactFlowInstance, debouncedLayoutForDimensions]);
 
+  // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
+  useEffect(() => {
+    const handleConditionalHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "conditional-header-resized",
+      handleConditionalHeaderResized,
+    );
+    return () => {
+      window.removeEventListener(
+        "conditional-header-resized",
+        handleConditionalHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
   // Re-layout when a workflow trigger node's async content changes
   // (e.g., target workflow parameters finish loading, skeleton → actual fields)
   useEffect(() => {
