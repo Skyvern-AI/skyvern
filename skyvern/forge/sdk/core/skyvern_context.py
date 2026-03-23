@@ -85,6 +85,10 @@ class SkyvernContext:
     # Used to determine if finalize regeneration is needed at workflow completion
     script_gen_had_incomplete_actions: bool = False
 
+    # Track task_ids where proactive captcha injection has already been attempted,
+    # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
+    proactive_captcha_task_ids: set[str] = field(default_factory=set)
+
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"
 
