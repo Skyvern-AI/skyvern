@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.schemas.steps import AgentStepOutput
+from skyvern.schemas.steps import AgentStepOutput, BrowserMetadata
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
@@ -63,8 +63,13 @@ class DetailedAgentStepOutput(BaseModel):
     def to_agent_step_output(self) -> AgentStepOutput:
         clean_output = self.get_clean_detailed_output()
 
+        browser_metadata: BrowserMetadata | None = None
+        if clean_output.scraped_page and clean_output.scraped_page.url:
+            browser_metadata = BrowserMetadata(website_url=clean_output.scraped_page.url)
+
         return AgentStepOutput(
             action_results=clean_output.action_results if clean_output.action_results else [],
             actions_and_results=(clean_output.actions_and_results if clean_output.actions_and_results else []),
             errors=clean_output.extract_errors(),
+            browser_metadata=browser_metadata,
         )

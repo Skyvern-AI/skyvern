@@ -33,6 +33,7 @@ class SkyvernContext:
     browser_container_task_arn: str | None = None
 
     # feature flags
+    enable_page_ready_wait: bool = False
     enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
@@ -41,6 +42,7 @@ class SkyvernContext:
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
     enable_speed_optimizations: bool = False
+    use_artifact_bundling: bool = False
 
     # script run context
     script_id: str | None = None

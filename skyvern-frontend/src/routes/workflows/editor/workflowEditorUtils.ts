@@ -1606,31 +1606,20 @@ function getElements(
     if (children.length === 0) {
       edges.push(defaultEdge(startNodeId, adderNodeId));
     } else {
-      const childById = new Map<string, (typeof children)[number]>();
-      children.forEach((c) => childById.set(c.id, c));
+      // Chain children using their array order (after branch-label filtering)
+      // rather than the previous/next pointers from getNodeData. Those pointers
+      // reflect the original unfiltered array and may reference blocks that were
+      // removed as conditional branch targets, breaking the chain and leaving
+      // subsequent blocks (including merge targets) as unreachable orphans.
+      edges.push(edgeWithAddButton(startNodeId, children[0]!.id));
 
-      const firstChild =
-        children.find(
-          (c) => c.previous === null || !childById.has(c.previous),
-        ) ?? children[0]!;
-      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
-
-      let current = firstChild;
-      let lastChild = firstChild;
-      while (current) {
-        const nextChild = current.next ? childById.get(current.next) : null;
-        if (!nextChild) {
-          break;
-        }
-        edges.push(edgeWithAddButton(current.id, nextChild.id));
-        lastChild = nextChild;
-        current = nextChild;
+      for (let i = 0; i < children.length - 1; i++) {
+        edges.push(edgeWithAddButton(children[i]!.id, children[i + 1]!.id));
       }
 
+      const lastChild = children[children.length - 1]!;
       nodes.push(nodeAdderNode(adderNodeId, block.id));
-      if (lastChild) {
-        edges.push(defaultEdge(lastChild.id, adderNodeId));
-      }
+      edges.push(defaultEdge(lastChild.id, adderNodeId));
       return;
     }
 
@@ -2677,11 +2666,13 @@ function getOrderedChildrenBlocks(
 
     if (node.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
+      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
       children.push({
         block_type: "for_loop",
         label: node.data.label,
         continue_on_failure: node.data.continueOnFailure,
         next_loop_on_failure: node.data.nextLoopOnFailure,
+        next_block_label: nextBlockLabel,
         loop_blocks: loopChildren,
         loop_variable_reference: node.data.loopVariableReference,
         complete_if_empty: node.data.completeIfEmpty,
@@ -2774,7 +2765,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
-    runWith: "agent",
+    runWith: "code_v2",
     scriptCacheKey: null,
     aiFallback: true,
     runSequentially: false,

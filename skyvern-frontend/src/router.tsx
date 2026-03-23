@@ -17,6 +17,8 @@ import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
 import { Debugger } from "@/routes/workflows/debugger/Debugger";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
+import { WorkflowScriptDetailPage } from "./routes/workflows/WorkflowScriptDetailPage";
+import { WorkflowScriptsPage } from "./routes/workflows/WorkflowScriptsPage";
 import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
@@ -30,6 +32,8 @@ import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode"
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
 import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
 import { RunRouter } from "@/routes/runs/RunRouter";
+import { SchedulesRoute } from "@/routes/schedules/SchedulesRoute";
+import { ScheduleDetailRoute } from "@/routes/schedules/ScheduleDetailRoute";
 
 const router = createBrowserRouter([
   {
@@ -63,6 +67,20 @@ const router = createBrowserRouter([
       {
         path: "runs/:runId/*",
         element: <RunRouter />,
+      },
+      {
+        path: "schedules",
+        element: <PageLayout />,
+        children: [
+          {
+            index: true,
+            element: <SchedulesRoute />,
+          },
+          {
+            path: ":workflowPermanentId/:scheduleId",
+            element: <ScheduleDetailRoute />,
+          },
+        ],
       },
       {
         path: "browser-sessions",
@@ -165,6 +183,20 @@ const router = createBrowserRouter([
               {
                 path: "runs",
                 element: <WorkflowPage />,
+              },
+              {
+                path: "scripts",
+                element: <Outlet />,
+                children: [
+                  {
+                    index: true,
+                    element: <WorkflowScriptsPage />,
+                  },
+                  {
+                    path: ":scriptId",
+                    element: <WorkflowScriptDetailPage />,
+                  },
+                ],
               },
               {
                 path: ":workflowRunId",

@@ -1,12 +1,16 @@
 import sys
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
 
+import skyvern.forge.sdk.workflow.models.block as _block_mod
 from skyvern.config import settings as base_settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import TextPromptBlockYAML, WorkflowRequest
@@ -14,17 +18,54 @@ from skyvern.schemas.workflows import TextPromptBlockYAML, WorkflowRequest
 block_module = sys.modules["skyvern.forge.sdk.workflow.models.block"]
 
 
+def _make_workflow_run_context(values: dict | None = None) -> WorkflowRunContext:
+    """Create a minimal WorkflowRunContext with given values for template rendering tests."""
+    ctx = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    if values:
+        ctx.values.update(values)
+    return ctx
+
+
+def _make_text_prompt_block(
+    prompt: str = "test prompt",
+    json_schema: dict | None = None,
+) -> TextPromptBlock:
+    now = datetime.now(timezone.utc)
+    return TextPromptBlock(
+        label="test-block",
+        llm_key=None,
+        prompt=prompt,
+        parameters=[],
+        json_schema=json_schema,
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="text_prompt_output",
+            description=None,
+            output_parameter_id="output-test",
+            workflow_id="workflow-1",
+            created_at=now,
+            modified_at=now,
+            deleted_at=None,
+        ),
+        model=None,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model_name", "expected_llm_key"),
-    [
-        ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH"),
-        ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO"),
-    ],
+    "model_name",
+    ["gemini-2.5-flash", "gemini-3-pro-preview"],
 )
-async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name, expected_llm_key):
+async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name):
     # Reset SettingsManager to base settings so cloud overrides from earlier tests don't leak
     monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", base_settings)
+    expected_llm_key = base_settings.get_model_name_to_llm_key()[model_name]["llm_key"]
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
         parameter_type=ParameterType.OUTPUT,
@@ -387,3 +428,98 @@ def test_workflow_request_deserialization_strips_invalid_text_prompt_llm_key() -
     block = workflow_request.json_definition.workflow_definition.blocks[0]
     assert block.llm_key is None
     assert block.model is None
+
+
+# --- json_schema Jinja template rendering tests (SKY-6479) ---
+
+
+def test_render_schema_templates_resolves_variables():
+    """json_schema description fields with {{ }} should be rendered."""
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "description": "Add 14 days to {{ start_date }}",
+                }
+            },
+        },
+    )
+    ctx = _make_workflow_run_context({"start_date": "2025-01-15"})
+    rendered = block._render_schema_templates(block.json_schema, ctx)
+
+    assert rendered["properties"]["result"]["description"] == "Add 14 days to 2025-01-15"
+    # non-template values preserved
+    assert rendered["type"] == "object"
+    assert rendered["properties"]["result"]["type"] == "string"
+
+
+def test_render_schema_templates_nested_list():
+    """Templates inside lists within the schema should also be rendered."""
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "required": ["{{ field_name }}"],
+        },
+    )
+    ctx = _make_workflow_run_context({"field_name": "invoice_date"})
+    rendered = block._render_schema_templates(block.json_schema, ctx)
+
+    assert rendered["required"] == ["invoice_date"]
+
+
+def test_render_schema_templates_failure_preserves_original():
+    """When a single value fails to render, it should be preserved and a warning logged."""
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "properties": {
+                "good": {"description": "value is {{ known }}"},
+                "bad": {"description": "value is {{ unknown }}"},
+            },
+        },
+    )
+    strict_env = SandboxedEnvironment(undefined=StrictUndefined)
+    with (
+        patch.object(base_settings, "WORKFLOW_TEMPLATING_STRICTNESS", "strict"),
+        patch.object(_block_mod, "jinja_sandbox_env", strict_env),
+    ):
+        ctx = _make_workflow_run_context({"known": "hello"})
+        rendered = block._render_schema_templates(block.json_schema, ctx)
+
+        # good value rendered
+        assert rendered["properties"]["good"]["description"] == "value is hello"
+        # bad value preserved as-is
+        assert rendered["properties"]["bad"]["description"] == "value is {{ unknown }}"
+
+
+def test_format_potential_template_parameters_renders_json_schema():
+    """format_potential_template_parameters should render json_schema templates."""
+    block = _make_text_prompt_block(
+        prompt="Calculate dates for {{ start_date }}",
+        json_schema={
+            "type": "object",
+            "properties": {
+                "date_plus_14": {
+                    "type": "string",
+                    "description": "14 days after {{ start_date }}",
+                }
+            },
+        },
+    )
+    ctx = _make_workflow_run_context({"start_date": "2025-01-15"})
+    block.format_potential_template_parameters(ctx)
+
+    assert block.prompt == "Calculate dates for 2025-01-15"
+    assert block.json_schema["properties"]["date_plus_14"]["description"] == "14 days after 2025-01-15"
+
+
+def test_format_potential_template_parameters_no_json_schema():
+    """When json_schema is None, format_potential_template_parameters should not fail."""
+    block = _make_text_prompt_block(prompt="simple prompt", json_schema=None)
+    ctx = _make_workflow_run_context()
+    block.format_potential_template_parameters(ctx)
+
+    assert block.json_schema is None
+    assert block.prompt == "simple prompt"

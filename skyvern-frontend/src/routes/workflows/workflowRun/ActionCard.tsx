@@ -20,9 +20,10 @@ type Props = {
   index: number;
   active: boolean;
   onClick: React.DOMAttributes<HTMLDivElement>["onClick"];
+  cardClassName?: string;
 };
 
-function ActionCard({ action, onClick, active, index }: Props) {
+function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
   // Wait actions always succeed — they intentionally return ActionFailure
   // from the backend but completing a wait is expected, not a failure.
   const success =
@@ -35,7 +36,7 @@ function ActionCard({ action, onClick, active, index }: Props) {
       active={active}
       status={success ? "success" : "failure"}
       onClick={onClick}
-      className="flex"
+      className={cardClassName ? `flex ${cardClassName}` : "flex"}
     >
       <div className="flex-1 space-y-2 p-4 pl-5">
         <div className="flex justify-between">

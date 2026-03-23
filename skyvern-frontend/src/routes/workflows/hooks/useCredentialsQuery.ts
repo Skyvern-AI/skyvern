@@ -27,6 +27,7 @@ function useCredentialsQuery(props: Props = {}) {
       params.set("page_size", String(page_size));
       return client.get("/credentials", { params }).then((res) => res.data);
     },
+    refetchOnMount: "always",
     ...queryOptions,
   });
 }

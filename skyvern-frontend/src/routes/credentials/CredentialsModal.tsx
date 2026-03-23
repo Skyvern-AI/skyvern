@@ -32,7 +32,7 @@ import { AxiosError } from "axios";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
-  InfoCircledIcon,
+  ExclamationTriangleIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -40,7 +40,9 @@ import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuer
 import { Checkbox } from "@/components/ui/checkbox";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
+import { ExternalLinkIcon } from "@radix-ui/react-icons";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -108,7 +110,11 @@ type Props = {
   /** Override the modal type (used in edit mode to set the correct form) */
   overrideType?: CredentialModalType;
   /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
-  onStartBackgroundTest?: (credentialId: string, url: string) => void;
+  onStartBackgroundTest?: (
+    credentialId: string,
+    url: string,
+    userContext?: string,
+  ) => void;
 };
 
 function CredentialsModal({
@@ -161,6 +167,7 @@ function CredentialsModal({
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
   const [testUrl, setTestUrl] = useState("");
+  const [userContext, setUserContext] = useState("");
   const [testStatus, setTestStatus] = useState<
     "idle" | "testing" | "completed" | "failed" | "profile_failed"
   >("idle");
@@ -169,10 +176,13 @@ function CredentialsModal({
   );
   // The temporary credential ID and workflow run ID created by the test-login endpoint
   const [testCredentialId, setTestCredentialId] = useState<string | null>(null);
-  // testWorkflowRunId is stored only as a ref (not state) because it's never
-  // rendered — it's only needed by cancelTest/close to call the cancel API.
-  // Refs mirror state so cancelTest always has the latest IDs regardless of
-  // React's async render cycle (e.g. cancel during the startTest HTTP call).
+  // Workflow run ID used to render the "watch live" link — must be state so the
+  // link appears immediately after the POST returns (refs don't trigger re-renders).
+  const [testWorkflowRunId, setTestWorkflowRunId] = useState<string | null>(
+    null,
+  );
+  // Refs mirror state so cancelTest/close always have the latest IDs regardless
+  // of React's async render cycle (e.g. cancel during the startTest HTTP call).
   const testCredentialIdRef = useRef<string | null>(null);
   const testWorkflowRunIdRef = useRef<string | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -186,7 +196,9 @@ function CredentialsModal({
   const saveIntentRef = useRef<{
     shouldTestAfterSave: boolean;
     testUrl: string;
-  }>({ shouldTestAfterSave: false, testUrl: "" });
+    userContext: string;
+    name: string;
+  }>({ shouldTestAfterSave: false, testUrl: "", userContext: "", name: "" });
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -214,7 +226,7 @@ function CredentialsModal({
       setTestCredentialId(null);
       testCredentialIdRef.current = null;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to login-affecting field changes, not testStatus or name
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to login-affecting field changes, not testStatus, name, or userContext (context is cosmetic, not credential identity)
   }, [
     passwordCredentialValues.username,
     passwordCredentialValues.password,
@@ -236,6 +248,15 @@ function CredentialsModal({
     if (isEditMode) {
       reset();
       const cred = editingCredential.credential;
+      if (editingCredential.tested_url) {
+        setTestUrl(editingCredential.tested_url);
+      }
+      if (editingCredential.browser_profile_id) {
+        setTestAndSave(true);
+      }
+      if (editingCredential.user_context) {
+        setUserContext(editingCredential.user_context);
+      }
       if (isPasswordCredential(cred)) {
         setPasswordCredentialValues({
           name: editingCredential.name,
@@ -294,12 +315,19 @@ function CredentialsModal({
     setTestStatus("idle");
     setTestFailureReason(null);
     setTestCredentialId(null);
+    setTestWorkflowRunId(null);
     testCredentialIdRef.current = null;
     testWorkflowRunIdRef.current = null;
     pollStartTimeRef.current = null;
     pollErrorCountRef.current = 0;
     pollCancelledRef.current = false;
-    saveIntentRef.current = { shouldTestAfterSave: false, testUrl: "" };
+    setUserContext("");
+    saveIntentRef.current = {
+      shouldTestAfterSave: false,
+      testUrl: "",
+      userContext: "",
+      name: "",
+    };
     if (pollIntervalRef.current) {
       clearTimeout(pollIntervalRef.current);
       pollIntervalRef.current = null;
@@ -445,6 +473,7 @@ function CredentialsModal({
           totp_type: passwordCredentialValues.totp_type,
           totp_identifier:
             passwordCredentialValues.totp_identifier.trim() || null,
+          user_context: userContext.trim() || null,
         },
       );
       const data = response.data;
@@ -466,6 +495,7 @@ function CredentialsModal({
       }
 
       setTestCredentialId(data.credential_id);
+      setTestWorkflowRunId(data.workflow_run_id);
       setTestStatus("testing");
       pollStartTimeRef.current = Date.now();
 
@@ -485,7 +515,13 @@ function CredentialsModal({
         variant: "destructive",
       });
     }
-  }, [credentialGetter, testUrl, passwordCredentialValues, pollTestStatus]);
+  }, [
+    credentialGetter,
+    testUrl,
+    passwordCredentialValues,
+    userContext,
+    pollTestStatus,
+  ]);
 
   const createCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
@@ -494,16 +530,20 @@ function CredentialsModal({
       return response.data;
     },
     onSuccess: async (data) => {
-      const { shouldTestAfterSave, testUrl: capturedTestUrl } =
-        saveIntentRef.current;
+      const {
+        shouldTestAfterSave,
+        testUrl: capturedTestUrl,
+        userContext: capturedUserContext,
+      } = saveIntentRef.current;
 
-      // If the user entered a URL, save it on the credential as metadata
-      if (capturedTestUrl) {
+      // Save metadata (tested_url, user_context) on the credential via PATCH
+      if (capturedTestUrl || capturedUserContext) {
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           await client.patch(`/credentials/${data.credential_id}`, {
             name: data.name,
-            tested_url: capturedTestUrl,
+            ...(capturedTestUrl && { tested_url: capturedTestUrl }),
+            user_context: capturedUserContext?.trim() || null,
           });
         } catch {
           // Best-effort — credential was created, URL is just metadata
@@ -517,7 +557,11 @@ function CredentialsModal({
       setIsOpen(false);
 
       if (shouldTestAfterSave && onStartBackgroundTest) {
-        onStartBackgroundTest(data.credential_id, capturedTestUrl);
+        onStartBackgroundTest(
+          data.credential_id,
+          capturedTestUrl,
+          capturedUserContext || undefined,
+        );
         toast({
           title: "Credential saved",
           description:
@@ -559,17 +603,66 @@ function CredentialsModal({
       );
       return response.data;
     },
-    onSuccess: () => {
+    onSuccess: async () => {
+      const {
+        shouldTestAfterSave,
+        testUrl: capturedTestUrl,
+        userContext: capturedUserContext,
+        name: capturedName,
+      } = saveIntentRef.current;
+
+      // Persist metadata (tested_url, user_context) via PATCH
+      if (editingCredential?.credential_id) {
+        try {
+          const client = await getClient(credentialGetter, "sans-api-v1");
+          await client.patch(
+            `/credentials/${editingCredential.credential_id}`,
+            {
+              name: capturedName || editingCredential.name,
+              ...(capturedTestUrl && { tested_url: capturedTestUrl }),
+              user_context: capturedUserContext?.trim() || null,
+            },
+          );
+        } catch {
+          toast({
+            title: "Partial save",
+            description:
+              "Credential updated, but login instructions could not be saved. Please try editing again.",
+            variant: "destructive",
+          });
+        }
+      }
+
       reset();
       setIsOpen(false);
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      toast({
-        title: "Credential updated",
-        description: "Your credential has been updated successfully",
-        variant: "success",
-      });
+
+      if (
+        shouldTestAfterSave &&
+        capturedTestUrl &&
+        editingCredential?.credential_id &&
+        onStartBackgroundTest
+      ) {
+        onStartBackgroundTest(
+          editingCredential.credential_id,
+          capturedTestUrl,
+          capturedUserContext || undefined,
+        );
+        toast({
+          title: "Credential updated",
+          description:
+            "Testing login and saving browser session in the background…",
+          variant: "success",
+        });
+      } else {
+        toast({
+          title: "Credential updated",
+          description: "Your credential has been updated successfully",
+          variant: "success",
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -586,15 +679,20 @@ function CredentialsModal({
       id,
       name,
       tested_url,
+      user_context,
     }: {
       id: string;
       name: string;
       tested_url?: string;
+      user_context?: string | null;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const body: Record<string, string> = { name };
+      const body: Record<string, string | null> = { name };
       if (tested_url) {
         body.tested_url = tested_url;
+      }
+      if (user_context !== undefined) {
+        body.user_context = user_context;
       }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
@@ -691,19 +789,33 @@ function CredentialsModal({
       // If test passed, rename the temp credential instead of creating a new one
       if (testAndSave && testStatus === "completed" && testCredentialId) {
         const url = testUrl.trim();
+        const ctx = userContext.trim();
         renameCredentialMutation.mutate({
           id: testCredentialId,
           name,
           tested_url: url || undefined,
+          user_context: ctx || null,
         });
         return;
       }
 
       // Capture intent before mutation — state will be reset in onSuccess
+      // In edit mode, only trigger a background test if the user actually changed
+      // credentials, user_context, or URL — not just because the checkbox was pre-checked.
+      const hasEditModeChanges =
+        !isEditMode ||
+        editingGroups.values ||
+        userContext.trim() !== (editingCredential?.user_context ?? "") ||
+        testUrl.trim() !== (editingCredential?.tested_url ?? "");
       saveIntentRef.current = {
         shouldTestAfterSave:
-          testAndSave && testStatus !== "completed" && testUrl.trim() !== "",
+          testAndSave &&
+          testStatus !== "completed" &&
+          testUrl.trim() !== "" &&
+          hasEditModeChanges,
         testUrl: testUrl.trim(),
+        userContext: userContext.trim(),
+        name,
       };
 
       activeMutation.mutate({
@@ -826,7 +938,7 @@ function CredentialsModal({
           values={passwordCredentialValues}
           onChange={setPasswordCredentialValues}
           url={testUrl}
-          onUrlChange={!isEditMode ? setTestUrl : undefined}
+          onUrlChange={setTestUrl}
           urlRequired={testAndSave}
           urlDisabled={isTestInProgress}
           editMode={isEditMode}
@@ -834,72 +946,105 @@ function CredentialsModal({
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
           afterUrl={
-            !isEditMode ? (
-              <div className="space-y-3">
-                <div className="flex items-center gap-3">
-                  <Checkbox
-                    id="test-and-save"
-                    checked={testAndSave}
-                    onCheckedChange={(checked) =>
-                      setTestAndSave(checked === true)
-                    }
-                    disabled={isTestInProgress}
-                  />
-                  <Label
-                    htmlFor="test-and-save"
-                    className="cursor-pointer text-sm font-medium"
-                  >
-                    Save browser session for future logins
-                  </Label>
-                  <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future workflow runs will skip the login form entirely because the saved session is already authenticated." />
-                </div>
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <Checkbox
+                  id="test-and-save"
+                  checked={testAndSave}
+                  onCheckedChange={(checked) =>
+                    setTestAndSave(checked === true)
+                  }
+                  disabled={isTestInProgress}
+                />
+                <Label
+                  htmlFor="test-and-save"
+                  className="cursor-pointer text-sm font-medium"
+                >
+                  Save browser session for future logins
+                </Label>
+                <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future workflow runs will skip the login form entirely because the saved session is already authenticated." />
+              </div>
 
-                {isTestInProgress && (
-                  <div className="flex items-center gap-2 pl-7 text-sm text-muted-foreground">
+              {testAndSave && (
+                <div className="space-y-1 pl-7">
+                  <Label
+                    htmlFor="user-context"
+                    className="text-xs text-muted-foreground"
+                  >
+                    Login instructions (optional)
+                  </Label>
+                  {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
+                  <Textarea
+                    id="user-context"
+                    value={userContext}
+                    onChange={(e) => setUserContext(e.target.value)}
+                    placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
+                    disabled={isTestInProgress}
+                    className="min-h-[60px] resize-y"
+                    rows={2}
+                    maxLength={500}
+                  />
+                </div>
+              )}
+
+              {isTestInProgress && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
                     <ReloadIcon className="size-4 animate-spin" />
                     <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
                   </div>
-                )}
-                {testStatus === "completed" && (
-                  <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
-                    <CheckCircledIcon className="size-4" />
+                  {testWorkflowRunId && (
+                    <a
+                      href={`/runs/${testWorkflowRunId}/overview`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                    >
+                      <ExternalLinkIcon className="size-3" />
+                      Watch Skyvern test login live
+                    </a>
+                  )}
+                </div>
+              )}
+              {testStatus === "completed" && (
+                <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
+                  <CheckCircledIcon className="size-4" />
+                  <span>
+                    {`Login test passed — saved browser session available for workflows using ${getHostname(testUrl) ?? testUrl}`}
+                  </span>
+                </div>
+              )}
+              {testStatus === "profile_failed" && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-destructive">
+                    <CrossCircledIcon className="size-4" />
+                    <span>Browser profile was not saved</span>
+                  </div>
+                  {testFailureReason && (
+                    <p className="text-xs text-destructive/70">
+                      {testFailureReason}
+                    </p>
+                  )}
+                </div>
+              )}
+              {testStatus === "failed" && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-destructive">
+                    <CrossCircledIcon className="size-4" />
                     <span>
-                      {`Login test passed — saved browser session available for workflows using ${getHostname(testUrl) ?? testUrl}`}
+                      {testUrl
+                        ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
+                        : "Unable to save browser session"}
                     </span>
                   </div>
-                )}
-                {testStatus === "profile_failed" && (
-                  <div className="space-y-1 pl-7">
-                    <div className="flex items-center gap-2 text-sm text-destructive">
-                      <CrossCircledIcon className="size-4" />
-                      <span>Browser profile was not saved</span>
-                    </div>
-                    {testFailureReason && (
-                      <p className="text-xs text-destructive/70">
-                        {testFailureReason}
-                      </p>
-                    )}
-                  </div>
-                )}
-                {testStatus === "failed" && (
-                  <div className="space-y-1 pl-7">
-                    <div className="flex items-center gap-2 text-sm text-destructive">
-                      <CrossCircledIcon className="size-4" />
-                      <span>
-                        {testUrl
-                          ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
-                          : "Unable to save browser session"}
-                      </span>
-                    </div>
-                    {testFailureReason && (
-                      <p className="text-xs text-destructive/70">
-                        {testFailureReason}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-            ) : undefined
+                  {testFailureReason && (
+                    <p className="text-xs text-destructive/70">
+                      {testFailureReason}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
           }
         />
       );
@@ -994,6 +1139,7 @@ function CredentialsModal({
     testCredentialIdRef.current = null;
     testWorkflowRunIdRef.current = null;
     setTestCredentialId(null);
+    setTestWorkflowRunId(null);
     toast({
       title: "Test canceled",
       description: "The credential test has been canceled.",
@@ -1001,7 +1147,10 @@ function CredentialsModal({
   }, [credentialGetter]);
 
   // Whether the Test button should be shown
-  const showTestButton = testAndSave && type === CredentialModalTypes.PASSWORD;
+  const showTestButton =
+    testAndSave &&
+    type === CredentialModalTypes.PASSWORD &&
+    (!isEditMode || editingGroups.values);
 
   // Whether the Test button should be enabled
   const canTest =
@@ -1053,11 +1202,12 @@ function CredentialsModal({
           </DialogTitle>
         </DialogHeader>
         {isEditMode && editingGroups.values && (
-          <Alert>
-            <InfoCircledIcon className="size-4" />
+          <Alert variant="warning">
+            <ExclamationTriangleIcon className="size-4" />
             <AlertDescription>
-              For security, saved values are never retrieved. All credential
-              fields must be filled in to save your changes.
+              For security, saved values are never retrieved. Changing any field
+              other than the credential name requires re-entering all fields,
+              including passwords and 2FA settings.
             </AlertDescription>
           </Alert>
         )}

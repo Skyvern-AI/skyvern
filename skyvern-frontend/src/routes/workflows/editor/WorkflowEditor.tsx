@@ -77,7 +77,7 @@ function WorkflowEditor() {
     runWith:
       workflow.adaptive_caching && workflow.run_with === "code"
         ? "code_v2"
-        : workflow.run_with,
+        : workflow.run_with ?? "agent",
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,

@@ -91,6 +91,12 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         except Exception:
             LOG.exception("Failed to execute api app startup event")
 
+    # Close browser sessions left active by a previous process
+    try:
+        await forge_app.PERSISTENT_SESSIONS_MANAGER.cleanup_stale_sessions()
+    except Exception:
+        LOG.exception("Failed to clean up stale browser sessions")
+
     # Start cleanup scheduler if enabled
     cleanup_task = start_cleanup_scheduler()
     if cleanup_task:
@@ -184,7 +190,7 @@ def create_api_app() -> FastAPI:
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
         detail = format_validation_errors(exc)
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": detail},
         )
 

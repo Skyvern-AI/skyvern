@@ -16,6 +16,11 @@ type CredentialFilter = "password" | "credit_card" | "secret";
 
 type Props = {
   filter?: CredentialFilter;
+  onStartBackgroundTest?: (
+    credentialId: string,
+    url: string,
+    userContext?: string,
+  ) => void;
 };
 
 const EMPTY_MESSAGE: Record<CredentialFilter, string> = {
@@ -26,7 +31,7 @@ const EMPTY_MESSAGE: Record<CredentialFilter, string> = {
 
 const PAGE_SIZE = 25;
 
-function CredentialsList({ filter }: Props = {}) {
+function CredentialsList({ filter, onStartBackgroundTest }: Props = {}) {
   const [page, setPage] = useState(1);
   const { data: credentials, isLoading } = useCredentialsQuery({
     page,
@@ -75,6 +80,7 @@ function CredentialsList({ filter }: Props = {}) {
           <CredentialItem
             key={credential.credential_id}
             credential={credential}
+            onStartBackgroundTest={onStartBackgroundTest}
           />
         ))}
       </div>

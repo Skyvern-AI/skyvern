@@ -43,6 +43,7 @@ Respond with EXACTLY one line — either `CODE_FIXABLE` or `NOT_CODE_FIXABLE` �
 - Agent got stuck repeating the same action (value typed but didn't persist)
 - Max steps reached because of a single problematic field
 - Form validation errors that better input handling could avoid
+- Page not ready (blank page, loading spinner/overlay, transitional state) — add a wait
 
 **NOT_CODE_FIXABLE** — no code change would help:
 - Website is down, returning 404/500, or page content is an error page

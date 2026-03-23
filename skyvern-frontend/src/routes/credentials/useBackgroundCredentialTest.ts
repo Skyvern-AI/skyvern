@@ -8,6 +8,7 @@ import type {
   TestLoginResponse,
 } from "@/api/types";
 import { getHostname } from "@/util/getHostname";
+import { useCredentialTestStore } from "@/store/useCredentialTestStore";
 
 const MAX_POLL_DURATION_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 5000;
@@ -26,9 +27,13 @@ type ActiveTest = {
  * Hook that manages background credential browser-profile tests.
  *
  * After a credential is saved with "Save browser session" checked,
- * call `startBackgroundTest(credentialId, url)` to kick off an async test.
+ * call `startBackgroundTest(credentialId, url, userContext?)` to kick off an async test.
  * The hook polls the backend, shows toast notifications on completion/failure,
  * and invalidates the credentials query so the list updates.
+ *
+ * Active test state is persisted in a zustand store backed by sessionStorage
+ * so it survives both SPA navigation and full page reloads. On mount, the hook
+ * checks for persisted state and resumes polling if a test was in progress.
  *
  * Instantiate this in a component that outlives the modal (e.g. CredentialsPage)
  * so polling survives modal close.
@@ -37,17 +42,28 @@ function useBackgroundCredentialTest() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const activeTestRef = useRef<ActiveTest | null>(null);
+  const { setActiveTest, clearActiveTest } = useCredentialTestStore();
 
+  // Full cleanup: stop polling AND clear the persisted store.
+  // Used when a test reaches a terminal state (completed/failed/timeout).
   const cleanup = useCallback(() => {
     if (activeTestRef.current?.timeoutId) {
       clearTimeout(activeTestRef.current.timeoutId);
     }
     activeTestRef.current = null;
-  }, []);
+    clearActiveTest();
+  }, [clearActiveTest]);
 
+  // On unmount, only stop the timer — don't clear the store so the test
+  // link survives SPA navigation. Polling resumes via rehydration on remount.
   useEffect(() => {
-    return cleanup;
-  }, [cleanup]);
+    return () => {
+      if (activeTestRef.current?.timeoutId) {
+        clearTimeout(activeTestRef.current.timeoutId);
+        activeTestRef.current.timeoutId = null;
+      }
+    };
+  }, []);
 
   const poll = useCallback(async () => {
     const test = activeTestRef.current;
@@ -88,6 +104,19 @@ function useBackgroundCredentialTest() {
       }
 
       if (data.status === "completed") {
+        // The backend sets browser_profile_id in a separate background task
+        // AFTER the workflow completes. If the profile isn't ready yet and
+        // no failure reason has been reported, keep polling.
+        if (!data.browser_profile_id && !data.browser_profile_failure_reason) {
+          if (activeTestRef.current) {
+            activeTestRef.current.timeoutId = setTimeout(
+              poll,
+              POLL_INTERVAL_MS,
+            );
+          }
+          return;
+        }
+
         cleanup();
         queryClient.invalidateQueries({ queryKey: ["credentials"] });
 
@@ -154,8 +183,36 @@ function useBackgroundCredentialTest() {
     }
   }, [credentialGetter, queryClient, cleanup]);
 
+  // Rehydrate polling from persisted store after a full page reload.
+  // If a test was in progress before the reload, resume polling so the
+  // link stays visible and the toast fires when the test finishes.
+  const rehydratedRef = useRef(false);
+  useEffect(() => {
+    if (rehydratedRef.current) return;
+    rehydratedRef.current = true;
+
+    const stored = useCredentialTestStore.getState().activeTest;
+    if (!stored || activeTestRef.current) return;
+
+    // If the persisted test already exceeded the timeout, clean up
+    if (Date.now() - stored.startTime > MAX_POLL_DURATION_MS) {
+      clearActiveTest();
+      return;
+    }
+
+    activeTestRef.current = {
+      credentialId: stored.credentialId,
+      workflowRunId: stored.workflowRunId,
+      url: stored.url,
+      startTime: stored.startTime,
+      timeoutId: setTimeout(poll, POLL_INTERVAL_MS),
+      errorCount: 0,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally runs once on mount
+  }, []);
+
   const startBackgroundTest = useCallback(
-    async (credentialId: string, url: string) => {
+    async (credentialId: string, url: string, userContext?: string) => {
       // Clean up any previous test
       cleanup();
 
@@ -166,18 +223,26 @@ function useBackgroundCredentialTest() {
           {
             url,
             save_browser_profile: true,
+            user_context: userContext?.trim() || null,
           },
         );
         const data = response.data;
 
+        const startTime = Date.now();
         activeTestRef.current = {
           credentialId,
           workflowRunId: data.workflow_run_id,
           url,
-          startTime: Date.now(),
+          startTime,
           timeoutId: setTimeout(poll, POLL_INTERVAL_MS),
           errorCount: 0,
         };
+        setActiveTest({
+          credentialId,
+          workflowRunId: data.workflow_run_id,
+          url,
+          startTime,
+        });
       } catch {
         toast({
           title: "Failed to start browser profile test",
@@ -187,7 +252,7 @@ function useBackgroundCredentialTest() {
         });
       }
     },
-    [credentialGetter, cleanup, poll],
+    [credentialGetter, cleanup, poll, setActiveTest],
   );
 
   return { startBackgroundTest };

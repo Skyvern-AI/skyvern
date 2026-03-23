@@ -19,6 +19,14 @@ export const ArtifactType = {
 
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
 
+export const TriggerType = {
+  Manual: "manual",
+  Api: "api",
+  Scheduled: "scheduled",
+} as const;
+
+export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
+
 export const Status = {
   Created: "created",
   Running: "running",
@@ -115,6 +123,7 @@ export type Task = {
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
+  started_at: string | null; // ISO 8601
   finished_at: string | null; // ISO 8601
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
@@ -386,12 +395,18 @@ export type DebugSessionApiResponse = {
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
+  started_at: string | null; // ISO 8601
   finished_at: string | null; // ISO 8601
   modified_at: string;
   proxy_location: ProxyLocation | null;
   script_run: boolean | null;
   status: Status;
   title?: string;
+  trigger_type?: TriggerType | null;
+  schedule_id?: string | null;
+  schedule_name?: string | null;
+  schedule_cron?: string | null;
+  scheduled_for?: string | null;
   webhook_callback_url: string;
   workflow_id: string;
   workflow_permanent_id: string;
@@ -407,6 +422,7 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  started_at: string | null;
   finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
@@ -436,6 +452,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  started_at: string | null;
   finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
@@ -537,6 +554,7 @@ export type CredentialApiResponse = {
   name: string;
   browser_profile_id?: string | null;
   tested_url?: string | null;
+  user_context?: string | null;
 };
 
 export function isPasswordCredential(

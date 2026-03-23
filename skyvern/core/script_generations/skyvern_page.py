@@ -428,8 +428,17 @@ class SkyvernPage(Page):
         # Skip fill when value is None (missing parameter) and AI won't generate one.
         # ai='proactive' means the LLM generates the value from the prompt, so None is fine there.
         if value is None and ai != "proactive":
-            LOG.info("Skipping fill — value is None (missing parameter)", selector=selector, prompt=prompt)
-            return ""
+            if prompt:
+                LOG.info(
+                    "Upgrading to proactive — value is None but prompt provided",
+                    selector=selector,
+                    prompt=prompt,
+                    original_ai=ai,
+                )
+                ai = "proactive"
+            else:
+                LOG.info("Skipping fill — value is None and no prompt", selector=selector, prompt=prompt)
+                return ""
 
         timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
         data = kwargs.pop("data", None)
@@ -544,10 +553,20 @@ class SkyvernPage(Page):
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
 
-        # Skip when value is None and AI won't generate one
+        # Skip fill when value is None (missing parameter) and AI won't generate one.
+        # ai='proactive' means the LLM generates the value from the prompt, so None is fine there.
         if value is None and ai != "proactive":
-            LOG.info("Skipping fill_autocomplete — value is None (missing parameter)", selector=selector, prompt=prompt)
-            return ""
+            if prompt:
+                LOG.info(
+                    "Upgrading to proactive — value is None but prompt provided",
+                    selector=selector,
+                    prompt=prompt,
+                    original_ai=ai,
+                )
+                ai = "proactive"
+            else:
+                LOG.info("Skipping fill_autocomplete — value is None and no prompt", selector=selector, prompt=prompt)
+                return ""
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -910,7 +929,10 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector and files:
                 try:
-                    file_path = await download_file_from_url(files)
+                    file_path = await download_file_from_url(
+                        files,
+                        organization_id=context.organization_id if context else None,
+                    )
                     locator = self.page.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
                 except Exception as e:
@@ -945,7 +967,7 @@ class SkyvernPage(Page):
         if not files:
             raise ValueError("Parameter 'files' is required but was not provided")
 
-        file_path = await download_file_from_url(files)
+        file_path = await download_file_from_url(files, organization_id=context.organization_id if context else None)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
@@ -1084,7 +1106,6 @@ class SkyvernPage(Page):
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(self, errors: list[str], **kwargs: Any) -> None:
-        # TODO: update the workflow run status to terminated
         return
 
     @action_wrap(ActionType.COMPLETE)
@@ -1113,7 +1134,12 @@ class SkyvernPage(Page):
         # Use uuid as fallback for empty file_name, matching handler.py behavior
         file_name = file_name or str(uuid.uuid4())
 
-        file_path = await download_file_from_url(download_url, filename=file_name)
+        context = skyvern_context.current()
+        file_path = await download_file_from_url(
+            download_url,
+            filename=file_name,
+            organization_id=context.organization_id if context else None,
+        )
         return file_path
 
     @action_wrap(ActionType.RELOAD_PAGE)
