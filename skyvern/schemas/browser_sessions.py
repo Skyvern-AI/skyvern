@@ -1,10 +1,10 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, validate_proxy_location_str
+from skyvern.schemas.runs import ValidatedProxyLocationInput
 
 MIN_TIMEOUT = 5
 MAX_TIMEOUT = 60 * 24  # 24 hours
@@ -18,17 +18,10 @@ class CreateBrowserSessionRequest(BaseModel):
         ge=MIN_TIMEOUT,
         le=MAX_TIMEOUT,
     )
-    proxy_location: ProxyLocationInput | None = Field(
+    proxy_location: ValidatedProxyLocationInput | None = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
     )
-
-    @field_validator("proxy_location")
-    @classmethod
-    def validate_proxy_location(cls, v: ProxyLocationInput) -> ProxyLocationInput:
-        if isinstance(v, str) and not isinstance(v, ProxyLocation):
-            return validate_proxy_location_str(v)
-        return v
 
     extensions: list[Extensions] | None = Field(
         default=None,

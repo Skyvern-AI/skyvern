@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.docs.doc_examples import (
@@ -243,20 +245,36 @@ class GeoTarget(BaseModel):
 # Type alias for proxy location that accepts either legacy enum or new GeoTarget
 ProxyLocationInput = ProxyLocation | str | GeoTarget | dict | None
 
-# Minimum proxy URL pattern: must have a valid proxy scheme and a host
-_PROXY_URL_SCHEMES = {"http", "https", "socks5"}
+
+def _validate_proxy_location_input(v: ProxyLocationInput) -> ProxyLocationInput:
+    """BeforeValidator for proxy_location fields: validate plain strings as proxy URLs."""
+    if isinstance(v, str) and not isinstance(v, ProxyLocation):
+        return validate_proxy_location_str(v)
+    return v
+
+
+# Annotated type that auto-validates proxy URLs; use this as the field type
+# instead of ProxyLocationInput + a manual @field_validator.
+ValidatedProxyLocationInput = Annotated[ProxyLocationInput, BeforeValidator(_validate_proxy_location_input)]
+
+_PROXY_PATTERN = re.compile(r"^(http|https|socks5):\/\/([^:@]+(:[^@]*)?@)?[^\s:\/]+(:\d+)?$")
+
+
+def is_valid_proxy_url(url: str) -> bool:
+    """Check whether *url* looks like a usable proxy URL (scheme + host at minimum)."""
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        return bool(_PROXY_PATTERN.match(url))
+    except Exception:
+        return False
 
 
 def validate_proxy_location_str(value: str) -> str:
-    """Validate that a string proxy_location looks like a proxy URL (scheme + host at minimum)."""
-    try:
-        from urllib.parse import urlparse
-
-        parsed = urlparse(value)
-        if parsed.scheme in _PROXY_URL_SCHEMES and parsed.hostname:
-            return value
-    except Exception:
-        pass
+    """Validate that a string proxy_location looks like a proxy URL; raises ``ValueError`` on failure."""
+    if is_valid_proxy_url(value):
+        return value
     raise ValueError(
         f"Invalid proxy URL: must start with http://, https://, or socks5:// and include a hostname. Got: {value!r}"
     )
