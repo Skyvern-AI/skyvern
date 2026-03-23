@@ -65,6 +65,7 @@ import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
+import { getOrderedRunParameters } from "./utils";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -458,7 +459,10 @@ function WorkflowRunParameters({
     (workflow?.workflow_definition.parameters ?? []).map((p) => [p.key, p]),
   );
 
-  const parameterItems = Object.entries(run.parameters).map(([key, value]) => {
+  const parameterItems = getOrderedRunParameters(
+    workflow?.workflow_definition.parameters,
+    run.parameters,
+  ).map(([key, value]) => {
     const def = defByKey.get(key);
     const description = def && "description" in def ? def.description : null;
     return {
