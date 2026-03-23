@@ -582,6 +582,7 @@ export type CredentialApiResponse = {
   browser_profile_id?: string | null;
   tested_url?: string | null;
   user_context?: string | null;
+  save_browser_session_intent?: boolean | null;
 };
 
 export function isPasswordCredential(

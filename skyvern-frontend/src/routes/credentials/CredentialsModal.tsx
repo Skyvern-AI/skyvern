@@ -195,10 +195,17 @@ function CredentialsModal({
   // reset by the time onSuccess runs, so we snapshot them here.
   const saveIntentRef = useRef<{
     shouldTestAfterSave: boolean;
+    saveBrowserSessionIntent: boolean;
     testUrl: string;
     userContext: string;
     name: string;
-  }>({ shouldTestAfterSave: false, testUrl: "", userContext: "", name: "" });
+  }>({
+    shouldTestAfterSave: false,
+    saveBrowserSessionIntent: false,
+    testUrl: "",
+    userContext: "",
+    name: "",
+  });
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -251,7 +258,10 @@ function CredentialsModal({
       if (editingCredential.tested_url) {
         setTestUrl(editingCredential.tested_url);
       }
-      if (editingCredential.browser_profile_id) {
+      if (
+        editingCredential.save_browser_session_intent ||
+        !!editingCredential.browser_profile_id
+      ) {
         setTestAndSave(true);
       }
       if (editingCredential.user_context) {
@@ -324,6 +334,7 @@ function CredentialsModal({
     setUserContext("");
     saveIntentRef.current = {
       shouldTestAfterSave: false,
+      saveBrowserSessionIntent: false,
       testUrl: "",
       userContext: "",
       name: "",
@@ -532,18 +543,20 @@ function CredentialsModal({
     onSuccess: async (data) => {
       const {
         shouldTestAfterSave,
+        saveBrowserSessionIntent,
         testUrl: capturedTestUrl,
         userContext: capturedUserContext,
       } = saveIntentRef.current;
 
-      // Save metadata (tested_url, user_context) on the credential via PATCH
-      if (capturedTestUrl || capturedUserContext) {
+      // Save metadata (tested_url, user_context, save_browser_session_intent) on the credential via PATCH
+      if (capturedTestUrl || capturedUserContext || saveBrowserSessionIntent) {
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           await client.patch(`/credentials/${data.credential_id}`, {
             name: data.name,
             ...(capturedTestUrl && { tested_url: capturedTestUrl }),
             user_context: capturedUserContext?.trim() || null,
+            save_browser_session_intent: saveBrowserSessionIntent,
           });
         } catch {
           // Best-effort — credential was created, URL is just metadata
@@ -606,12 +619,13 @@ function CredentialsModal({
     onSuccess: async () => {
       const {
         shouldTestAfterSave,
+        saveBrowserSessionIntent,
         testUrl: capturedTestUrl,
         userContext: capturedUserContext,
         name: capturedName,
       } = saveIntentRef.current;
 
-      // Persist metadata (tested_url, user_context) via PATCH
+      // Persist metadata (tested_url, user_context, save_browser_session_intent) via PATCH
       if (editingCredential?.credential_id) {
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
@@ -621,6 +635,7 @@ function CredentialsModal({
               name: capturedName || editingCredential.name,
               ...(capturedTestUrl && { tested_url: capturedTestUrl }),
               user_context: capturedUserContext?.trim() || null,
+              save_browser_session_intent: saveBrowserSessionIntent,
             },
           );
         } catch {
@@ -680,19 +695,24 @@ function CredentialsModal({
       name,
       tested_url,
       user_context,
+      save_browser_session_intent,
     }: {
       id: string;
       name: string;
       tested_url?: string;
       user_context?: string | null;
+      save_browser_session_intent?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const body: Record<string, string | null> = { name };
+      const body: Record<string, string | boolean | null> = { name };
       if (tested_url) {
         body.tested_url = tested_url;
       }
       if (user_context !== undefined) {
         body.user_context = user_context;
+      }
+      if (save_browser_session_intent !== undefined) {
+        body.save_browser_session_intent = save_browser_session_intent;
       }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
@@ -795,6 +815,7 @@ function CredentialsModal({
           name,
           tested_url: url || undefined,
           user_context: ctx || null,
+          save_browser_session_intent: true,
         });
         return;
       }
@@ -813,6 +834,7 @@ function CredentialsModal({
           testStatus !== "completed" &&
           testUrl.trim() !== "" &&
           hasEditModeChanges,
+        saveBrowserSessionIntent: testAndSave,
         testUrl: testUrl.trim(),
         userContext: userContext.trim(),
         name,
