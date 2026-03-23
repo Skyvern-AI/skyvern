@@ -192,12 +192,23 @@ async def get_workflow_script(
 
         # Auto-enrich with domain when using the default cache key.
         # This ensures the same workflow running against different sites gets
-        # separate cached scripts (e.g., "default:fanr.gov.ae" vs "default:search.gov.hk").
+        # separate cached scripts. For known platform patterns, a platform-level
+        # key is used instead of the domain so all employers on the same platform
+        # share one cached script.
         if rendered_cache_key_value in ("default", ""):
             domain = _extract_first_block_domain(workflow, parameters)
             if domain:
+                ats_platform = app.AGENT_FUNCTION.detect_ats_platform(domain)
+                if ats_platform:
+                    LOG.info(
+                        "Code 2.0: platform detected, using platform-level cache key",
+                        ats_platform=ats_platform,
+                        original_domain=domain,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                    )
+                cache_segment = ats_platform if ats_platform else domain
                 rendered_cache_key_value = (
-                    f"{rendered_cache_key_value}:{domain}" if rendered_cache_key_value else domain
+                    f"{rendered_cache_key_value}:{cache_segment}" if rendered_cache_key_value else cache_segment
                 )
 
         # Namespace adaptive caching (Code 2.0) scripts with :v2 suffix so they

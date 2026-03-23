@@ -159,23 +159,6 @@ def quickstart(
     docker_compose: bool = typer.Option(False, "--docker-compose", help="Use Docker Compose for full setup"),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
-    # Check Docker
-    with console.status("Checking Docker installation...") as status:
-        docker_available = check_docker()
-        if docker_available:
-            status.update("✅ Docker is installed and running")
-        else:
-            if not database_string:
-                console.print(
-                    Panel(
-                        "[bold red]Docker is not installed or not running.[/bold red]\n"
-                        "Please install Docker and start it before running quickstart.\n"
-                        "Get Docker from: [link]https://www.docker.com/get-started[/link]",
-                        border_style="red",
-                    )
-                )
-                raise typer.Exit(1)
-
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
 
@@ -183,6 +166,16 @@ def quickstart(
     docker_compose_available = check_docker_compose_file()
 
     if docker_compose:
+        if not check_docker():
+            console.print(
+                Panel(
+                    "[bold red]Docker is not installed or not running.[/bold red]\n"
+                    "Docker Compose requires Docker to be running.\n"
+                    "Get Docker from: [link]https://www.docker.com/get-started[/link]",
+                    border_style="red",
+                )
+            )
+            raise typer.Exit(1)
         if not docker_compose_available:
             console.print(
                 Panel(
@@ -197,7 +190,7 @@ def quickstart(
         return
 
     # If Docker Compose file exists, offer the choice
-    if docker_compose_available and docker_available and not database_string:
+    if docker_compose_available and check_docker() and not database_string:
         console.print("\n[bold blue]Setup Method[/bold blue]")
         console.print("Docker Compose file detected. Choose your setup method:\n")
         console.print("  [cyan]1.[/cyan] [green]Docker Compose (Recommended)[/green] - Full containerized setup")
