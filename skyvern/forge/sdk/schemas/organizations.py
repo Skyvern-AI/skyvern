@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
@@ -44,6 +44,48 @@ class AzureOrganizationAuthToken(OrganizationAuthTokenBase):
     """Represents OrganizationAuthToken for Azure; defined by 3 fields: tenant_id, client_id, and client_secret"""
 
     credential: AzureClientSecretCredential
+
+
+class BitwardenCredential(BaseModel):
+    email: EmailStr = Field(..., description="Bitwarden account email")
+    master_password: str = Field(..., min_length=1, description="Bitwarden master password")
+
+
+class BitwardenCredentialSafe(BaseModel):
+    """Response-safe view of BitwardenCredential — master_password is never returned."""
+
+    email: EmailStr
+
+
+class BitwardenOrganizationAuthToken(OrganizationAuthTokenBase):
+    """Represents OrganizationAuthToken for Bitwarden; defined by 2 fields: email and master_password"""
+
+    credential: BitwardenCredential
+
+
+class BitwardenOrganizationAuthTokenSafe(OrganizationAuthTokenBase):
+    """Response-safe view — omits master_password for security."""
+
+    credential: BitwardenCredentialSafe
+
+
+class CreateBitwardenCredentialRequest(BaseModel):
+    """Request model for creating or updating a Bitwarden credential."""
+
+    credential: BitwardenCredential
+
+
+class BitwardenCredentialResponse(BaseModel):
+    """Response model for Bitwarden credential operations.
+
+    The master_password is never returned in API responses for security.
+    To update credentials, submit a new POST request with the full credential.
+    """
+
+    token: BitwardenOrganizationAuthTokenSafe = Field(
+        ...,
+        description="The Bitwarden credential (master_password redacted for security)",
+    )
 
 
 class CreateOnePasswordTokenRequest(BaseModel):

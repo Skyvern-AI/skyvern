@@ -36,6 +36,8 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
 )
@@ -287,7 +289,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -295,6 +297,17 @@ async def convert_to_organization_auth_token(
     if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
         credential = AzureClientSecretCredential.model_validate_json(token)
         return AzureOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.bitwarden_credential:
+        credential = BitwardenCredential.model_validate_json(token)
+        return BitwardenOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),

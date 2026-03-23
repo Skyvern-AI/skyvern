@@ -5227,9 +5227,9 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Priority: run-level run_with > workflow-level run_with > default (agent).
-        The adaptive_caching flag does NOT independently force code mode — it only
-        controls whether a code run uses v1 or v2 (see is_adaptive_caching()).
+        Priority: run-level run_with > workflow-level run_with > adaptive_caching fallback > default (agent).
+        When adaptive_caching is enabled at the workflow level and no explicit run_with
+        is set, the run defaults to code mode so cached scripts are actually used.
         """
         if workflow_run.run_with in ("code", "code_v2"):
             return True
@@ -5237,5 +5237,10 @@ class WorkflowService:
             return False
         if workflow.run_with in ("code", "code_v2"):
             return True
-        # workflow.run_with is "agent" or null — default to agent
+        if workflow.run_with == "agent":
+            return False
+        # No explicit run_with on either workflow or run — fall back to
+        # adaptive_caching: if the workflow has caching enabled, run code.
+        if workflow.adaptive_caching:
+            return True
         return False
