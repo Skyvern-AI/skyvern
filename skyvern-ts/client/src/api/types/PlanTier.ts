@@ -5,5 +5,6 @@ export const PlanTier = {
     Free: "free",
     Hobby: "hobby",
     Pro: "pro",
+    Enterprise: "enterprise",
 } as const;
 export type PlanTier = (typeof PlanTier)[keyof typeof PlanTier];

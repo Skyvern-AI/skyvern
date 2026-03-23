@@ -3,5 +3,6 @@
 export const PersistentBrowserType = {
     Msedge: "msedge",
     Chrome: "chrome",
+    StealthChromium: "stealth-chromium",
 } as const;
 export type PersistentBrowserType = (typeof PersistentBrowserType)[keyof typeof PersistentBrowserType];

@@ -28,5 +28,7 @@ export const ArtifactType = {
     Har: "har",
     ScriptFile: "script_file",
     Pdf: "pdf",
+    StepArchive: "step_archive",
+    TaskArchive: "task_archive",
 } as const;
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
