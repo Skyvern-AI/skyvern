@@ -636,6 +636,65 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
     return _dump_definition_dict(raw, parsed_format)
 
 
+# Parameter types that are auto-managed (not user-visible input parameters) and should
+# be preserved during MCP updates when the caller omits them from the definition.
+_AUTO_MANAGED_PARAMETER_TYPES = frozenset({"credential"})
+
+
+async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> str:
+    """Preserve auto-managed parameters (e.g. credential) when MCP update omits them.
+
+    When an MCP client updates a workflow, it may provide blocks and workflow-level
+    input parameters but omit credential parameters that were created automatically
+    when the user selected a credential in the UI.  This function reads the existing
+    workflow's parameters and injects any auto-managed parameters whose keys are
+    missing from the update definition, preventing accidental data loss.
+    """
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    wf_def = raw.get("workflow_definition")
+    if not isinstance(wf_def, dict):
+        return definition
+
+    update_params: list[dict[str, Any]] = wf_def.get("parameters", [])
+    update_keys = {p.get("key") for p in update_params if isinstance(p, dict)}
+
+    existing_workflow = await _get_workflow_by_id(workflow_id)
+    existing_wf_def = existing_workflow.get("workflow_definition")
+    if not isinstance(existing_wf_def, dict):
+        return definition
+
+    existing_params: list[dict[str, Any]] = existing_wf_def.get("parameters", [])
+
+    injected = False
+    for param in existing_params:
+        if not isinstance(param, dict):
+            continue
+        ptype = param.get("parameter_type")
+        pkey = param.get("key")
+        if ptype in _AUTO_MANAGED_PARAMETER_TYPES and pkey and pkey not in update_keys:
+            # Build a minimal YAML-compatible parameter dict (strip runtime-only fields)
+            injected_param: dict[str, Any] = {
+                "parameter_type": ptype,
+                "key": pkey,
+            }
+            if param.get("description"):
+                injected_param["description"] = param["description"]
+            if ptype == "credential" and param.get("credential_id"):
+                injected_param["credential_id"] = param["credential_id"]
+            update_params.append(injected_param)
+            injected = True
+
+    if not injected:
+        return definition
+
+    wf_def["parameters"] = update_params
+    return _dump_definition_dict(raw, parsed_format)
+
+
 def _parse_definition(
     definition: str, fmt: str
 ) -> tuple[WorkflowCreateYamlRequest | None, str | None, dict[str, Any] | None]:
@@ -894,6 +953,7 @@ async def skyvern_workflow_update(
 
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
+        definition = await _inject_workflow_update_parameters(definition, format, workflow_id)
     except NotFoundError:
         return make_result(
             "skyvern_workflow_update",
