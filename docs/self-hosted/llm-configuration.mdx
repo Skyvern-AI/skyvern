@@ -19,6 +19,23 @@ For most deployments, configure a single provider using `LLM_KEY`. Skyvern also 
 
 ---
 
+## Quick Start Recommendations
+
+**Best models for production (2025):**
+
+| Provider | Primary Model | Secondary Model | Notes |
+|----------|--------------|-----------------|-------|
+| **Anthropic** | `ANTHROPIC_CLAUDE4.5_OPUS` | `ANTHROPIC_CLAUDE4.5_SONNET` | Most capable |
+| **OpenAI** | `OPENAI_GPT5` | `OPENAI_GPT5_MINI` | Latest |
+| **Google** | `GEMINI_3_PRO` | `GEMINI_3.0_FLASH` | Latest |
+| **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Latest Claude |
+
+<Tip>
+**New in 2025:** GPT-5 series, Claude 4.6 Opus, Gemini 3, Amazon Nova, and many new open-source models via Novita and VolcEngine.
+</Tip>
+
+---
+
 ## OpenAI
 
 The most common choice. Requires an API key from [platform.openai.com](https://platform.openai.com/).
@@ -31,16 +48,29 @@ LLM_KEY=OPENAI_GPT4O
 
 ### Available models
 
-| LLM_KEY | Model | Notes |
-|---------|-------|-------|
-| `OPENAI_GPT4O` | gpt-4o | Recommended for most use cases |
-| `OPENAI_GPT4O_MINI` | gpt-4o-mini | Cheaper, less capable |
-| `OPENAI_GPT4_1` | gpt-4.1 | Latest GPT-4 family |
-| `OPENAI_GPT4_1_MINI` | gpt-4.1-mini | Cheaper GPT-4.1 variant |
-| `OPENAI_O3` | o3 | Reasoning model |
-| `OPENAI_O3_MINI` | o3-mini | Cheaper reasoning model |
-| `OPENAI_GPT4_TURBO` | gpt-4-turbo | Previous generation |
-| `OPENAI_GPT4V` | gpt-4-turbo | Legacy alias for gpt-4-turbo |
+| LLM_KEY | Notes |
+|---------|-------|
+| **GPT-5 Series** | |
+| `OPENAI_GPT5` | Recommended for most complex tasks |
+| `OPENAI_GPT5_MINI` | |
+| `OPENAI_GPT5_MINI_FLEX` | Flex service tier, 15min timeout |
+| `OPENAI_GPT5_NANO` | |
+| `OPENAI_GPT5_1` | |
+| `OPENAI_GPT5_2` | |
+| `OPENAI_GPT5_4` | |
+| **GPT-4 Series** | |
+| `OPENAI_GPT4O` | |
+| `OPENAI_GPT4O_MINI` | |
+| `OPENAI_GPT4_1` | |
+| `OPENAI_GPT4_1_MINI` | |
+| `OPENAI_GPT4_1_NANO` | |
+| `OPENAI_GPT4_5` | |
+| `OPENAI_GPT4_TURBO` | Legacy |
+| `OPENAI_GPT4V` | Legacy alias |
+| **O-Series (Reasoning)** | |
+| `OPENAI_O4_MINI` | Vision support |
+| `OPENAI_O3` | Vision support |
+| `OPENAI_O3_MINI` | No vision |
 
 ### Optional settings
 
@@ -66,15 +96,26 @@ LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
 
 ### Available models
 
-| LLM_KEY | Model | Notes |
-|---------|-------|-------|
-| `ANTHROPIC_CLAUDE4.5_SONNET` | claude-4.5-sonnet | Latest Sonnet |
-| `ANTHROPIC_CLAUDE4.5_OPUS` | claude-4.5-opus | Most capable |
-| `ANTHROPIC_CLAUDE4_SONNET` | claude-4-sonnet | Claude 4 |
-| `ANTHROPIC_CLAUDE4_OPUS` | claude-4-opus | Claude 4 Opus |
-| `ANTHROPIC_CLAUDE3.7_SONNET` | claude-3-7-sonnet | Previous generation |
-| `ANTHROPIC_CLAUDE3.5_SONNET` | claude-3-5-sonnet | Previous generation |
-| `ANTHROPIC_CLAUDE3.5_HAIKU` | claude-3-5-haiku | Cheap and fast |
+| LLM_KEY | Notes |
+|---------|-------|
+| **Claude 4.6** | |
+| `ANTHROPIC_CLAUDE4.6_OPUS` | Newest |
+| **Claude 4.5** | |
+| `ANTHROPIC_CLAUDE4.5_OPUS` | Recommended for primary use |
+| `ANTHROPIC_CLAUDE4.5_SONNET` | Recommended for secondary use |
+| `ANTHROPIC_CLAUDE4.5_HAIKU` | Fastest |
+| **Claude 4** | |
+| `ANTHROPIC_CLAUDE4_OPUS` | |
+| `ANTHROPIC_CLAUDE4_SONNET` | |
+| **Claude 3.7** | |
+| `ANTHROPIC_CLAUDE3.7_SONNET` | |
+| **Claude 3.5** | |
+| `ANTHROPIC_CLAUDE3.5_SONNET` | |
+| `ANTHROPIC_CLAUDE3.5_HAIKU` | |
+| **Claude 3 (Legacy)** | |
+| `ANTHROPIC_CLAUDE3_OPUS` | |
+| `ANTHROPIC_CLAUDE3_SONNET` | |
+| `ANTHROPIC_CLAUDE3_HAIKU` | |
 
 ---
 
@@ -117,8 +158,28 @@ The quickest way to use Gemini. Get an API key from [Google AI Studio](https://a
 ```bash .env
 ENABLE_GEMINI=true
 GEMINI_API_KEY=your-gemini-api-key
-LLM_KEY=VERTEX_GEMINI_2.5_FLASH
+LLM_KEY=GEMINI_2.5_PRO
 ```
+
+#### Available Gemini API models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **Gemini 3** | |
+| `GEMINI_3_PRO` | Recommended for primary use |
+| `GEMINI_3.0_FLASH` | Recommended for secondary use |
+| **Gemini 2.5** | |
+| `GEMINI_2.5_PRO` | |
+| `GEMINI_2.5_PRO_PREVIEW` | |
+| `GEMINI_2.5_PRO_EXP_03_25` | Experimental |
+| `GEMINI_2.5_FLASH` | |
+| `GEMINI_2.5_FLASH_PREVIEW` | |
+| **Gemini 2.0** | |
+| `GEMINI_FLASH_2_0` | |
+| `GEMINI_FLASH_2_0_LITE` | |
+| **Gemini 1.5 Legacy** | |
+| `GEMINI_PRO` | |
+| `GEMINI_FLASH` | |
 
 ### Vertex AI
 
@@ -126,10 +187,10 @@ For enterprise deployments through [Vertex AI](https://cloud.google.com/vertex-a
 
 ```bash .env
 ENABLE_VERTEX_AI=true
-LLM_KEY=VERTEX_GEMINI_3.0_FLASH
+LLM_KEY=VERTEX_GEMINI_3_PRO
 GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 GCP_PROJECT_ID=your-gcp-project-id
-GCP_REGION=us-central1
+VERTEX_LOCATION=us-central1
 ```
 
 **Vertex AI setup steps:**
@@ -140,13 +201,28 @@ GCP_REGION=us-central1
 4. Download the service account JSON key file
 5. Set `GOOGLE_APPLICATION_CREDENTIALS` to the path of that file
 
-### Available models
+<Note>
+For global endpoint access, set `VERTEX_LOCATION=global` and ensure `VERTEX_PROJECT_ID` is set. Not all models support the global endpoint.
+</Note>
 
-| LLM_KEY | Model | Notes |
-|---------|-------|-------|
-| `VERTEX_GEMINI_3.0_FLASH` | gemini-3-flash-preview | Recommended |
-| `VERTEX_GEMINI_2.5_PRO` | gemini-2.5-pro | Stable |
-| `VERTEX_GEMINI_2.5_FLASH` | gemini-2.5-flash | Cheaper, faster |
+#### Available Vertex AI models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **Gemini 3** | |
+| `VERTEX_GEMINI_3_PRO` | Recommended for primary use |
+| `VERTEX_GEMINI_3.0_FLASH` | Recommended for secondary use |
+| **Gemini 2.5** | |
+| `VERTEX_GEMINI_2.5_PRO` | |
+| `VERTEX_GEMINI_2.5_PRO_PREVIEW` | |
+| `VERTEX_GEMINI_2.5_FLASH` | |
+| `VERTEX_GEMINI_2.5_FLASH_LITE` | |
+| `VERTEX_GEMINI_2.5_FLASH_PREVIEW` | |
+| **Gemini 2.0** | |
+| `VERTEX_GEMINI_FLASH_2_0` | |
+| **Gemini 1.5 Legacy** | |
+| `VERTEX_GEMINI_PRO` | |
+| `VERTEX_GEMINI_FLASH` | |
 
 ---
 
@@ -171,17 +247,170 @@ AWS_SECRET_ACCESS_KEY=...
 
 ### Available models
 
-| LLM_KEY | Model |
+| LLM_KEY | Notes |
 |---------|-------|
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET` | Claude 3.5 Sonnet v2 |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1` | Claude 3.5 Sonnet v1 |
-| `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE` | Claude 3.7 Sonnet (cross-region) |
-| `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE` | Claude 4 Sonnet (cross-region) |
-| `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Claude 4.5 Sonnet (cross-region) |
+| **Amazon Nova (AWS Native)** | |
+| `BEDROCK_AMAZON_NOVA_PRO` | |
+| `BEDROCK_AMAZON_NOVA_LITE` | |
+| **Claude 4.6** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE` | Cross-region |
+| **Claude 4.5** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Cross-region |
+| **Claude 4** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE` | Cross-region |
+| **Claude 3.7** | |
+| `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE` | Cross-region |
+| **Claude 3.5** | |
+| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET` | v2 |
+| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1` | |
+| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE3.5_HAIKU` | |
+| **Claude 3 (Legacy)** | |
+| `BEDROCK_ANTHROPIC_CLAUDE3_OPUS` | |
+| `BEDROCK_ANTHROPIC_CLAUDE3_SONNET` | |
+| `BEDROCK_ANTHROPIC_CLAUDE3_HAIKU` | |
 
 <Note>
 Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inference and require `AWS_REGION` only. No access keys needed if running on an IAM-authenticated instance.
 </Note>
+
+---
+
+## MiniMax
+
+[MiniMax](https://www.minimax.io/) models with vision support.
+
+```bash .env
+ENABLE_MINIMAX=true
+MINIMAX_API_KEY=your-minimax-api-key
+LLM_KEY=MINIMAX_M2_5
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `MINIMAX_M2_5` | |
+| `MINIMAX_M2_5_HIGHSPEED` | Faster variant |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+MINIMAX_API_BASE=https://api.minimax.io/v1
+```
+
+---
+
+## VolcEngine (ByteDance Doubao)
+
+[VolcEngine](https://www.volcengine.com/) provides access to ByteDance's Doubao models with vision support.
+
+```bash .env
+ENABLE_VOLCENGINE=true
+VOLCENGINE_API_KEY=your-volcengine-api-key
+LLM_KEY=VOLCENGINE_DOUBAO_SEED_1_6
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `VOLCENGINE_DOUBAO_SEED_1_6` | Recommended for general use |
+| `VOLCENGINE_DOUBAO_SEED_1_6_FLASH` | Faster variant |
+| `VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO` | Reasoning model |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+VOLCENGINE_API_BASE=https://ark.cn-beijing.volces.com/api/v3
+```
+
+---
+
+## Novita
+
+[Novita AI](https://novita.ai/) provides access to DeepSeek, Llama, and other open-source models.
+
+```bash .env
+ENABLE_NOVITA=true
+NOVITA_API_KEY=your-novita-api-key
+LLM_KEY=NOVITA_LLAMA_3_2_11B_VISION
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **DeepSeek** | |
+| `NOVITA_DEEPSEEK_R1` | Reasoning model |
+| `NOVITA_DEEPSEEK_V3` | |
+| **Llama 3.3** | |
+| `NOVITA_LLAMA_3_3_70B` | |
+| **Llama 3.2** | |
+| `NOVITA_LLAMA_3_2_11B_VISION` | Vision support |
+| `NOVITA_LLAMA_3_2_3B` | |
+| `NOVITA_LLAMA_3_2_1B` | |
+| **Llama 3.1** | |
+| `NOVITA_LLAMA_3_1_405B` | |
+| `NOVITA_LLAMA_3_1_70B` | |
+| `NOVITA_LLAMA_3_1_8B` | |
+| **Llama 3** | |
+| `NOVITA_LLAMA_3_70B` | |
+| `NOVITA_LLAMA_3_8B` | |
+
+---
+
+## Moonshot
+
+[Moonshot AI](https://www.moonshot.cn/) provides the Kimi series models with long context support.
+
+```bash .env
+ENABLE_MOONSHOT=true
+MOONSHOT_API_KEY=your-moonshot-api-key
+LLM_KEY=MOONSHOT_KIMI_K2
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `MOONSHOT_KIMI_K2` | |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+MOONSHOT_API_BASE=https://api.moonshot.cn/v1
+```
+
+---
+
+## Inception
+
+[Inception AI](https://inception.ai/) provides the Mercury series models.
+
+```bash .env
+ENABLE_INCEPTION=true
+INCEPTION_API_KEY=your-inception-api-key
+LLM_KEY=INCEPTION_MERCURY_2
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `INCEPTION_MERCURY_2` | |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+INCEPTION_API_BASE=https://api.inception.ai/v1
+```
 
 ---
 
@@ -276,11 +505,27 @@ Configure a cheaper model for lightweight operations:
 
 ```bash .env
 # Main model for complex decisions
-LLM_KEY=OPENAI_GPT4O
+LLM_KEY=ANTHROPIC_CLAUDE4.5_OPUS
+# or: OPENAI_GPT5
+# or: GEMINI_3_PRO
 
-# Cheaper model for simple tasks like dropdown selection
-SECONDARY_LLM_KEY=OPENAI_GPT4O_MINI
+# Faster model for simple tasks like dropdown selection
+SECONDARY_LLM_KEY=ANTHROPIC_CLAUDE4.5_SONNET
+# or: OPENAI_GPT5_MINI
+# or: GEMINI_3.0_FLASH
 ```
+
+<Tip>
+**Recommended primary models (latest):**
+- **Anthropic Claude 4.5 Opus** (`ANTHROPIC_CLAUDE4.5_OPUS`) - Most capable
+- **OpenAI GPT-5** (`OPENAI_GPT5`) - Latest
+- **Google Gemini 3 Pro** (`GEMINI_3_PRO`) - Latest
+
+**Recommended secondary models (latest):**
+- **Claude 4.5 Sonnet** (`ANTHROPIC_CLAUDE4.5_SONNET`) - Balanced
+- **GPT-5 Mini** (`OPENAI_GPT5_MINI`) - Faster GPT-5
+- **Gemini 3.0 Flash** (`GEMINI_3.0_FLASH`) - Faster Gemini 3
+</Tip>
 
 ### Task-specific models
 
@@ -288,10 +533,10 @@ For fine-grained control, you can override models for specific operations:
 
 ```bash .env
 # Model for data extraction from pages (defaults to LLM_KEY if not set)
-EXTRACTION_LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+EXTRACTION_LLM_KEY=ANTHROPIC_CLAUDE4.5_SONNET
 
 # Model for generating code/scripts in code blocks (defaults to LLM_KEY if not set)
-SCRIPT_GENERATION_LLM_KEY=OPENAI_GPT4O
+SCRIPT_GENERATION_LLM_KEY=OPENAI_GPT5
 ```
 
 Most deployments don't need task-specific models. Start with `LLM_KEY` and `SECONDARY_LLM_KEY`.
@@ -311,7 +556,7 @@ SECONDARY_LLM_KEY=OPENAI_GPT4O_MINI
 ### "Context window exceeded"
 
 The page content is too large for the model's context window. Options:
-- Use a model with a larger context (GPT-4o supports 128k tokens)
+- Use a model with larger context support (GPT-5, Gemini 2.5 Pro, or Claude 4.5 Sonnet)
 - Simplify your prompt to require less page analysis
 - Start from a more specific URL with less content
 

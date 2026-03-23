@@ -612,6 +612,145 @@ header[class*="header"] {
 
 
 /* =============================================
+   CHANGELOG — Custom Layout
+   ============================================= */
+
+.cl-page {
+  position: relative;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 48px 40px 80px;
+}
+
+/* --- Sidebar nav --- */
+.cl-sidebar {
+  display: block !important;
+  position: fixed;
+  top: 140px;
+  left: max(20px, calc(50% - 430px - 200px));
+  width: 180px;
+}
+
+.cl-sidebar-title {
+  font-family: var(--sk-mono) !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.06em !important;
+  text-transform: uppercase !important;
+  color: var(--sk-text-muted) !important;
+  margin: 0 0 12px 0 !important;
+}
+
+.cl-sidebar-link {
+  display: block;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--sk-text-muted) !important;
+  text-decoration: none !important;
+  padding: 6px 0;
+  border-bottom: none !important;
+  transition: color 0.15s ease;
+}
+
+.cl-sidebar-link:hover {
+  color: var(--sk-blue) !important;
+}
+
+/* --- Content area --- */
+.cl-content {
+  min-width: 0;
+}
+
+.cl-title {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #0f172a;
+  margin: 0 0 8px 0;
+}
+
+.cl-subtitle {
+  font-size: 16px;
+  color: #64748b;
+  margin: 0 0 40px 0;
+}
+
+/* --- Text colour inside Update blocks --- */
+.cl-content h2 {
+  color: #0f172a !important;
+}
+
+.cl-content li,
+.cl-content p {
+  color: #334155 !important;
+}
+
+.cl-content li strong {
+  color: #0f172a !important;
+}
+
+/* --- Bullets and spacing inside Update blocks --- */
+.cl-content ul {
+  padding-left: 24px !important;
+  list-style-type: disc !important;
+}
+
+.cl-content li {
+  margin-bottom: 8px;
+  line-height: 1.7;
+  display: list-item !important;
+  list-style-type: disc !important;
+}
+
+/* --- Dark mode overrides for changelog text --- */
+.dark .cl-title,
+[data-theme="dark"] .cl-title {
+  color: #f1f5f9;
+}
+
+.dark .cl-subtitle,
+[data-theme="dark"] .cl-subtitle {
+  color: #94a3b8;
+}
+
+.dark .cl-content h2,
+[data-theme="dark"] .cl-content h2 {
+  color: #f1f5f9 !important;
+}
+
+.dark .cl-content li,
+.dark .cl-content p,
+[data-theme="dark"] .cl-content li,
+[data-theme="dark"] .cl-content p {
+  color: #cbd5e1 !important;
+}
+
+.dark .cl-content li strong,
+[data-theme="dark"] .cl-content li strong {
+  color: #f1f5f9 !important;
+}
+
+/* --- Responsive --- */
+@media (max-width: 1100px) {
+  .cl-sidebar {
+    display: none !important;
+  }
+
+  .cl-page {
+    padding: 160px 20px 60px;
+  }
+
+  .cl-title {
+    font-size: 26px;
+  }
+
+  .cl-subtitle {
+    margin-bottom: 24px;
+  }
+}
+
+
+/* =============================================
    DARK MODE
    ============================================= */
 

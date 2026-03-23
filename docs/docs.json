@@ -49,6 +49,7 @@
             "pages": [
               "getting-started/introduction",
               "getting-started/quickstart",
+              "getting-started/ai-agents-quickstart",
               "getting-started/core-concepts"
             ]
           },
