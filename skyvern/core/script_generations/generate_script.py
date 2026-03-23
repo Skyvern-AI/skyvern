@@ -486,7 +486,7 @@ def _annotate_multi_field_totp_sequence(actions: list[dict[str, Any]]) -> list[d
     return actions
 
 
-def _safe_name(label: str) -> str:
+def safe_name(label: str) -> str:
     s = "".join(c if c.isalnum() else "_" for c in label).lower()
     if not s or s[0].isdigit() or keyword.iskeyword(s):
         s = f"_{s}"
@@ -587,7 +587,7 @@ def _workflow_decorator(wf_req: dict[str, Any]) -> cst.Decorator:
     )
 
 
-def _make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
+def make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
     kwargs = [
         cst.Arg(
             keyword=cst.Name("cache_key"),
@@ -1034,87 +1034,15 @@ def _build_form_filling_block_fn(
     actions: list[dict[str, Any]],
     value_to_param: dict[str, str] | None = None,
 ) -> FunctionDef:
-    """Generate a FIELD_MAP-based block function from V1 actions.
+    """Generate a form-filling block function that uses page.fill_form().
 
-    Instead of procedural page.fill()/page.select_option() calls, produces a
-    FIELD_MAP dictionary + page.fill_form() call for dynamic form filling.
+    Produces a simple function that calls page.fill_form(context.parameters)
+    which internally uses LLM-based field mapping (extract → map → fill).
     """
-    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
 
-    # Build FIELD_MAP entries from actions
-    field_map_lines: list[str] = []
-    seen_keys: set[str] = set()
-
     navigation_goal = block.get("navigation_goal") or "Fill out the form"
-
-    for act in actions:
-        action_type = act.get("action_type")
-        if action_type not in (ActionType.INPUT_TEXT, ActionType.SELECT_OPTION):
-            continue
-
-        intention = act.get("intention") or act.get("reasoning") or ""
-        # field_name is set by hydrate_input_text_actions_with_field_names()
-        # but may not match actual workflow parameter keys. Use value_to_param
-        # to look up the real parameter key from the literal value.
-        field_name = act.get("field_name")
-
-        # Look up the actual workflow parameter key via the literal action value
-        actual_param: str | None = None
-        if value_to_param:
-            if action_type == ActionType.INPUT_TEXT:
-                literal_value = act.get("text", "")
-            elif action_type == ActionType.SELECT_OPTION:
-                option = act.get("option", {})
-                literal_value = option.get("value") or option.get("label") or ""
-            else:
-                literal_value = ""
-            if literal_value and literal_value in value_to_param:
-                actual_param = value_to_param[literal_value]
-
-        # Determine the snake_case key for this field
-        if field_name:
-            key = sanitize_variable_name(field_name)
-        elif intention:
-            key = sanitize_variable_name(intention[:40])
-        else:
-            continue
-
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-
-        # Determine action type for FIELD_MAP
-        if action_type == ActionType.SELECT_OPTION:
-            fm_action = "select"
-        else:
-            fm_action = "fill"
-
-        # Build the label from intention/reasoning
-        label = intention.lower().strip() if intention else key.replace("_", " ")
-        if len(label) > 60:
-            label = label[:60]
-
-        # Use actual_param (from value_to_param lookup) if found, else fall back to field_name.
-        # If neither exists, this field has no parameter → use ai='proactive'.
-        param = actual_param or field_name
-        param_str = repr(param) if param else "None"
-        ai_str = repr("proactive") if not param else repr("fallback")
-        prompt = intention or f"Fill the {key.replace('_', ' ')} field"
-
-        entry = (
-            f"        {repr(key)}: {{\n"
-            f'            "param": {param_str},\n'
-            f'            "action": {repr(fm_action)},\n'
-            f'            "ai": {ai_str},\n'
-            f'            "labels": [{repr(label)}],\n'
-            f'            "prompt": {repr(prompt)},\n'
-            f"        }},"
-        )
-        field_map_lines.append(entry)
-
-    # Build the function body as a string, then parse it
-    field_map_body = "\n".join(field_map_lines)
 
     # Include page.goto(url) if the block has a URL, just like _build_block_fn does
     goto_line = ""
@@ -1124,12 +1052,7 @@ def _build_form_filling_block_fn(
     func_code = (
         f"async def {name}(page: SkyvernPage, context: RunContext):\n"
         f"{goto_line}"
-        f"    FIELD_MAP = {{\n"
-        f"{field_map_body}\n"
-        f"    }}\n"
-        f"    await page.fill_form(FIELD_MAP, context, navigation_goal={repr(navigation_goal)})\n"
-        f"    if not await page.structural_validate():\n"
-        f"        await page.complete()\n"
+        f"    await page.fill_form(context.parameters, prompt={repr(navigation_goal)})\n"
     )
 
     # Parse and add decorator
@@ -1138,8 +1061,17 @@ def _build_form_filling_block_fn(
     assert isinstance(func_def, FunctionDef)
 
     # Add the @skyvern.cached decorator
-    decorated = func_def.with_changes(decorators=[_make_decorator(cache_key, block)])
+    decorated = func_def.with_changes(decorators=[make_decorator(cache_key, block)])
     return decorated
+
+
+def _detect_block_ats_platform(block: dict[str, Any]) -> str | None:
+    """Check if a block's URL belongs to a known ATS platform.
+
+    Delegates to app.AGENT_FUNCTION which is overridden in cloud builds.
+    Returns None in OSS (no ATS detection).
+    """
+    return app.AGENT_FUNCTION.detect_ats_platform(block.get("url", ""))
 
 
 def _build_block_fn(
@@ -1149,11 +1081,25 @@ def _build_block_fn(
     use_semantic_selectors: bool = False,
     is_in_for_loop: bool = False,
 ) -> FunctionDef:
+    # Check for platform-specific pipeline (cloud-only; returns None in OSS)
+    if use_semantic_selectors:
+        ats_platform = _detect_block_ats_platform(block)
+        if ats_platform:
+            pipeline_fn = app.AGENT_FUNCTION.build_ats_pipeline_block_fn(block, ats_platform)
+            if pipeline_fn:
+                LOG.info(
+                    "Code 2.0: platform detected, generating optimized pipeline",
+                    ats_platform=ats_platform,
+                    block_label=block.get("label"),
+                    block_url=block.get("url"),
+                )
+                return pipeline_fn
+
     # Check if this block is form-filling (4+ input_text/select actions)
     if use_semantic_selectors and _is_form_filling_block(actions):
         return _build_form_filling_block_fn(block, actions, value_to_param)
 
-    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
 
@@ -1216,7 +1162,7 @@ def _build_block_fn(
                 Param(name=Name("context"), annotation=cst.Annotation(cst.Name("RunContext"))),
             ]
         ),
-        decorators=[_make_decorator(cache_key, block)],
+        decorators=[make_decorator(cache_key, block)],
         body=cst.IndentedBlock(body_stmts),
         returns=None,
         asynchronous=cst.Asynchronous(),
@@ -1226,7 +1172,7 @@ def _build_block_fn(
 def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, Any]]) -> FunctionDef:
     """Build a cached function for task_v2 blocks that calls child workflow sub-tasks."""
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
-    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     body_stmts: list[cst.BaseStatement] = []
 
     # Add calls to child workflow sub-tasks
@@ -1251,7 +1197,7 @@ def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, 
                 Param(name=Name("context"), annotation=cst.Annotation(cst.Name("RunContext"))),
             ]
         ),
-        decorators=[_make_decorator(cache_key, block)],
+        decorators=[make_decorator(cache_key, block)],
         body=cst.IndentedBlock(body_stmts),
         returns=None,
         asynchronous=cst.Asynchronous(),

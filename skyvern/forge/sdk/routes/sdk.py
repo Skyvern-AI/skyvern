@@ -33,6 +33,7 @@ LOG = structlog.get_logger()
     summary="Run an SDK action",
     description="Execute a single SDK action with the specified parameters",
     tags=["SDK"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "run_sdk_action",
     },
