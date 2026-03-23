@@ -388,8 +388,23 @@ class TestS3StorageBrowserSessionFiles:
         s3_storage.assert_managed_file_access(legacy_uri, TEST_ORGANIZATION_ID)
         s3_storage.assert_managed_file_access(downloads_uri, TEST_ORGANIZATION_ID)
 
+    async def test_assert_managed_file_access_accepts_artifact_bucket(self, s3_storage: S3Storage) -> None:
+        artifact_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/"
+            "workflow_runs/wr_123/wrb_456/2026-03-23T17:57:58.370827_a_789_pdf.pdf"
+        )
+        s3_storage.assert_managed_file_access(artifact_uri, TEST_ORGANIZATION_ID)
+
     async def test_assert_managed_file_access_rejects_other_org(self, s3_storage: S3Storage) -> None:
         uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_other/uploaded.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            s3_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org_artifact_bucket(self, s3_storage: S3Storage) -> None:
+        uri = (
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/o_other/"
+            "workflow_runs/wr_123/wrb_456/artifact.pdf"
+        )
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             s3_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
 
