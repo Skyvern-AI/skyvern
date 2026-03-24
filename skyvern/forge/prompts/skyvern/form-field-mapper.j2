@@ -21,22 +21,29 @@ Follow these instructions when deciding how to fill fields — they take priorit
 {%- if field.required %} [REQUIRED]{% endif %}
 {%- if field.placeholder %} — hint: "{{ field.placeholder }}"{% endif %}
 {%- if field.options %} — options: [{{ field.options | join(", ") }}]{% endif %}
+{%- if field.currentValue %} — current: "{{ field.currentValue }}"{% endif %}
+{%- if field.formatHint %} — FORMAT: {{ field.formatHint }}{% endif %}
 {% endfor %}
 
 # Instructions
 
 For EVERY field above, decide the correct value from the provided data.
 
-## CRITICAL — Common mistakes to avoid
-- **graduation_year** maps to graduation/graduation date fields. Do NOT put other data (like additional_info) into graduation fields.
-- **additional_info** is a generic note — it goes ONLY into "Additional information" or "Cover letter" textareas, NEVER into specific fields like graduation date, name, or phone.
-- **needs_sponsorship** answers sponsorship questions DIRECTLY: if needs_sponsorship = "No", then "Will you require sponsorship?" → "No". Do NOT invert it.
-- **authorized_to_work** answers authorization questions DIRECTLY: if authorized_to_work = "Yes", then "Are you authorized to work?" → "Yes".
+## CRITICAL — General rules
 - Each data key should map to at most ONE field. Never reuse the same value for unrelated fields.
+- Match semantically, not literally. A data key like "phone" maps to a field labeled "Phone number" or "Mobile".
+- For boolean/Yes-No data keys, map them DIRECTLY without inverting. If the data says "Yes", select "Yes".
+{% if platform_hints %}
+
+## Platform-specific guidance
+{{ platform_hints }}
+{% endif %}
 
 ## Text fields
-- Match semantically: "email" data → "Email address" field, "phone" → "Phone number", "graduation_year" → "Expected graduation date", etc.
-- For fields with no matching data (e.g., "Twitter URL" when no twitter data exists), return null.
+- Match semantically: "email" data → "Email address" field, "phone" → "Phone number", etc.
+- For fields with no matching data, return null.
+- For **multiselect** and **search-dropdown** fields: return a SPECIFIC, SEARCHABLE value from the data. The value will be typed into a search box, so it must match real option text.
+- **Fields with FORMAT hints**: Some fields show a required format (e.g., phone: "(xxx) xxx-xxxx"). You MUST reformat the data value to match the specified format. For phone numbers, convert raw digits like "5551234567" to the format shown (e.g., "(555) 123-4567"). For dates, convert to the required format (e.g., "MM/DD/YYYY").
 
 ## Choice fields (dropdown, radio, checkbox)
 - Return the EXACT option text from the options list. Do NOT rephrase, abbreviate, or summarize.
@@ -44,15 +51,28 @@ For EVERY field above, decide the correct value from the provided data.
 - For EEO/demographic fields with no matching data, pick the "Decline to self-identify" or "I do not want to answer" option.
 - For checkboxes, return a JSON array of the exact option labels to check.
 - For Yes/No radio buttons: match the provided data value directly. If the data says "Yes", select "Yes". If "No", select "No".
+- **Match questions by INTENT, not exact wording.** "Are you a U.S. citizen or permanent resident?" and "Are you authorized to work in the US?" ask the same thing — if the data has ANY key about work authorization, citizenship, or legal status, use it to answer.
+- For Yes/No questions with NO matching data (e.g., "Have you previously worked for [company]?", "Are you a former employee?"), default to "No" unless the data says otherwise.
 
 ## File upload fields (type: file)
 - Look for URL values in the provided data that match file upload fields. For example: a parameter named "resume" with a URL value like "https://example.com/resume.pdf" should be mapped to a "Resume/CV" file upload field.
 - Return the URL string as the value — the system will download and upload the file.
 - If no matching URL exists in the provided data, return null.
 
+## Toggle fields (type: toggle)
+- Toggle fields are standalone checkboxes that enable or reveal additional form sections when checked (e.g., "I have a preferred name" reveals a preferred name section, "SMS Opt-In" enables text notifications).
+- They show their current state: "current: unchecked" or "current: checked".
+- **Default behavior: return null (leave unchanged).**
+- Only return true to CHECK a toggle if the provided data EXPLICITLY requires what it enables — e.g., only check "I have a preferred name" if the data contains a preferred_name that differs from first_name.
+- When in doubt, return null — checking a toggle adds unnecessary complexity to the form.
+
 ## Fields with no matching data
 - For REQUIRED text fields with no matching data, write a brief professional response (1-2 sentences) based on the available data context.
 - For OPTIONAL fields with no matching data, return null.
+
+## Listbox fields (type: listbox) with current value
+- If a listbox already shows a correct value (currentValue is set), return null to keep it.
+- If it shows "Select One" or needs changing, return the value to select.
 
 # Output Format
 JSON object mapping field number (1-indexed string) to the value to fill.

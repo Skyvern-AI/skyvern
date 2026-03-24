@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import datetime
 import json as _json
+import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +16,7 @@ import structlog
 from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
+from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.exceptions import ScriptTerminationException
 from skyvern.forge import app
@@ -33,6 +37,7 @@ _EXTRACT_FORM_FIELDS_JS: str | None = None
 
 
 def _get_extract_form_fields_js() -> str:
+    """Load the base form field extraction JS (cached after first read)."""
     global _EXTRACT_FORM_FIELDS_JS
     if _EXTRACT_FORM_FIELDS_JS is None:
         js_path = Path(__file__).parent / "extract_form_fields.js"
@@ -512,7 +517,7 @@ class SkyvernPage(Page):
     ) -> str:
         """Fill an autocomplete input by typing a value and clicking the matching dropdown option.
 
-        Handles widgets like Google Places, Lever location fields, and other
+        Handles widgets like Google Places, autocomplete location fields, and other
         autocomplete inputs where typing triggers a dropdown and the user must
         select an option for the value to persist.
 
@@ -653,7 +658,7 @@ class SkyvernPage(Page):
         "[data-option-id]:visible",
         "ul.autocomplete-results li:visible",
         '.dropdown-menu li:visible, .dropdown-menu [role="option"]:visible',
-        ".autocomplete-dropdown-container div:visible",  # Lever location
+        ".autocomplete-dropdown-container div:visible",  # autocomplete location
         '[class*="suggestion"]:visible',
         '[class*="option"]:visible:not(select option)',
     ]
@@ -735,9 +740,6 @@ class SkyvernPage(Page):
                 selector=selector,
                 value=value,
             )
-            # Small delay for the value to commit
-            await asyncio.sleep(0.3)
-            return value
         else:
             # No close text match — click the first option as best guess
             first = option_locators[0]
@@ -747,8 +749,10 @@ class SkyvernPage(Page):
                 selector=selector,
                 value=value,
             )
-            await asyncio.sleep(0.3)
-            return value
+
+        # Wait for the selection to register in the UI
+        await asyncio.sleep(0.5)
+        return value
 
     async def _find_autocomplete_options(
         self,
@@ -1302,21 +1306,24 @@ class SkyvernPage(Page):
     async def extract_form_fields(self) -> list[dict[str, Any]]:
         """Scan the page for visible form fields using DOM inspection (no LLM).
 
-        Two-pass approach:
-        - Pass 1: Process non-checkbox/non-radio elements (text, email, select, textarea, etc.)
-        - Pass 2: Group checkbox/radio inputs by their ``name`` attribute into
-          ``checkbox_group`` / ``radio_group`` entries with an ``options`` list.
+        The base scanner handles standard HTML form elements (input, select,
+        textarea) and ARIA role-based groups.  Platform-specific passes
+        (e.g., custom listbox buttons, multiselect widgets) are injected
+        at runtime via ``AgentFunction.get_form_field_extraction_js()``.
 
-        Returns a list of field descriptors. Regular fields:
-        [{"label": "Full name", "selector": "label:has-text('Full name') input",
-          "tag": "input", "type": "text", "name": "full_name", "required": True}, ...]
-
-        Group fields:
-        [{"label": "Areas of focus", "selector": "input[name='field0']",
-          "tag": "input", "type": "checkbox_group", "name": "field0", "required": False,
-          "options": [{"label": "Engineering", "value": "Engineering", "selector": "..."}]}]
+        Returns a list of field descriptors.
         """
-        return await self.page.evaluate(_get_extract_form_fields_js())
+        base_js = _get_extract_form_fields_js()
+
+        ext_js = app.AGENT_FUNCTION.get_form_field_extraction_js(url=self.page.url)
+        if ext_js:
+            marker = "// PLATFORM_EXTENSION_POINT"
+            if marker not in base_js:
+                LOG.warning("extract_form_fields: extension point marker missing from base JS")
+            else:
+                base_js = base_js.replace(marker, ext_js)
+
+        return await self.page.evaluate(base_js)
 
     async def dynamic_field_map(
         self,
@@ -1348,21 +1355,25 @@ class SkyvernPage(Page):
             options: list[str] | None = None
             if field.get("options"):
                 options = [o.get("label") or o.get("value", "") for o in field["options"]]
-            field_descs.append(
-                {
-                    "label": label,
-                    "type": field_type,
-                    "required": field.get("required", False),
-                    "placeholder": field.get("placeholder"),
-                    "options": options,
-                }
-            )
+            desc: dict[str, Any] = {
+                "label": label,
+                "type": field_type,
+                "required": field.get("required", False),
+                "placeholder": field.get("placeholder"),
+                "options": options,
+            }
+            if field.get("currentValue"):
+                desc["currentValue"] = field["currentValue"]
+            if field.get("formatHint"):
+                desc["formatHint"] = field["formatHint"]
+            field_descs.append(desc)
 
         prompt_text = prompt_engine.load_prompt(
             template="form-field-mapper",
             form_fields=field_descs,
             data=data,
             prompt=prompt,
+            platform_hints=app.AGENT_FUNCTION.get_form_field_mapper_hints(),
         )
 
         try:
@@ -1394,7 +1405,17 @@ class SkyvernPage(Page):
                         result[idx] = v
                 except (ValueError, TypeError):
                     LOG.warning("dynamic_field_map: non-numeric key in LLM response", key=k)
-            LOG.info("dynamic_field_map: mapped fields", mapped=len(result), total=len(form_fields))
+            mapped_labels = [(form_fields[i].get("label") or form_fields[i].get("name") or "?")[:40] for i in result]
+            unmapped_labels = [
+                (f.get("label") or f.get("name") or "?")[:40] for idx, f in enumerate(form_fields) if idx not in result
+            ]
+            LOG.info(
+                "dynamic_field_map: mapped fields",
+                mapped=len(result),
+                total=len(form_fields),
+                mapped_labels=mapped_labels,
+                unmapped_labels=unmapped_labels,
+            )
             return result
 
         except Exception:
@@ -1440,6 +1461,15 @@ class SkyvernPage(Page):
 
             try:
                 if field_type in ("radio_group", "checkbox_group"):
+                    LOG.info(
+                        "fill_from_mapping: processing group field",
+                        field_label=label[:50],
+                        field_type=field_type,
+                        field_index=idx,
+                        value=str(value)[:50],
+                        options_count=len(field.get("options", [])),
+                        option_labels=[o.get("label", "?")[:30] for o in field.get("options", [])],
+                    )
                     if isinstance(value, str):
                         try:
                             parsed = _json.loads(value)
@@ -1456,21 +1486,15 @@ class SkyvernPage(Page):
                         selected = [str(value).lower().strip()]
 
                     options = field.get("options", [])
-                    opt_labels = [(o.get("label") or o.get("value", "")).lower().strip() for o in options]
+                    opt_labels = [(o.get("label") or o.get("value", "")).strip() for o in options]
 
                     matched_any = False
                     for sel_label in selected:
-                        for oi, ol in enumerate(opt_labels):
-                            # Exact match, or substring match with min length 3 to avoid
-                            # false positives (e.g., "No" matching "None of the above")
-                            if (
-                                sel_label == ol
-                                or (len(sel_label) >= 3 and sel_label in ol)
-                                or (len(ol) >= 3 and ol in sel_label)
-                            ):
-                                await self.click(selector=options[oi]["selector"], ai=None)
-                                matched_any = True
-                                break
+                        match_idx = _match_option(sel_label, opt_labels)
+                        if match_idx is not None:
+                            await self.click(selector=options[match_idx]["selector"], ai=None)
+                            matched_any = True
+                            break
 
                     if not matched_any:
                         # No option text-matched — use AI fallback (Code 2.0 style)
@@ -1519,6 +1543,11 @@ class SkyvernPage(Page):
                     if value and str(value).lower() not in ("false", "no", "0", "skip"):
                         await self.click(selector=selector, ai=None)
 
+                elif field_type == "toggle":
+                    # Standalone toggles — only click if LLM explicitly said true
+                    if value is True or str(value).lower() in ("true", "yes", "1"):
+                        await self.click(selector=selector, ai=None)
+
                 elif field_type == "file":
                     await self.upload_file(
                         selector=selector,
@@ -1526,6 +1555,36 @@ class SkyvernPage(Page):
                         ai="fallback",
                         prompt=f"Upload file for {label}",
                     )
+
+                elif field_type in ("multiselect", "listbox") or (field.get("placeholder") or "").lower() == "search":
+                    # Custom widgets (e.g., multiselect chip-pickers, listbox
+                    # dropdowns).  Dispatch to platform-specific filler via
+                    # AgentFunction; fall back to element_fallback if no
+                    # platform handler is registered or the handler fails.
+                    LOG.info(
+                        "fill_from_mapping: custom widget detected",
+                        field_label=label,
+                        widget_type=field_type,
+                        value=str(value)[:50],
+                    )
+                    if _budget_available():
+                        filled = await app.AGENT_FUNCTION.fill_custom_widget(
+                            self.page,
+                            field,
+                            value,
+                            label,
+                        )
+                        # None means "not handled" — use element_fallback
+                        if filled is None or filled is False:
+                            if _budget_available():
+                                self._track_ai_call()
+                                await self.element_fallback(
+                                    navigation_goal=(
+                                        f"For the '{label}' field, select or type '{str(value)[:30]}' "
+                                        f"and pick the best match. Do NOT click Save and Continue."
+                                    ),
+                                    max_steps=3,
+                                )
 
                 else:
                     await self.fill(selector=selector, value=str(value), ai=None)
@@ -1563,7 +1622,18 @@ class SkyvernPage(Page):
         # This catches those cases by scanning for file fields that weren't in the mapping
         # and trying to match them against URL-like parameter values.
         if data:
+            # Collect all URL params — including nested ones in user_data JSON
             url_params = {k: v for k, v in data.items() if isinstance(v, str) and v.startswith("http")}
+            # Parse user_data if it's a JSON string (resume_url is often nested inside it)
+            user_data_str = data.get("user_data", "")
+            if isinstance(user_data_str, str) and user_data_str.startswith("{"):
+                try:
+                    user_data_parsed = _json.loads(user_data_str)
+                    for k, v in user_data_parsed.items():
+                        if isinstance(v, str) and v.startswith("http") and k not in url_params:
+                            url_params[k] = v
+                except Exception:
+                    pass
             file_fields = [(i, f) for i, f in enumerate(form_fields) if f.get("type") == "file"]
             unmapped_files = [(i, f) for i, f in file_fields if i not in mapping]
             LOG.info(
@@ -1574,7 +1644,8 @@ class SkyvernPage(Page):
                 unmapped_file_count=len(unmapped_files),
                 unmapped_file_labels=[(f.get("label") or f.get("name") or "?")[:50] for _, f in unmapped_files],
             )
-            if url_params:
+            if url_params and unmapped_files:
+                uploaded = False
                 for idx, field in enumerate(form_fields):
                     if field.get("type") != "file" or idx in mapping:
                         continue
@@ -1591,6 +1662,17 @@ class SkyvernPage(Page):
                             or (len(pk) >= 3 and pk in field_name)  # "resume" in "resume-upload"
                             or (len(field_name) >= 3 and field_name in pk)  # "doc" in "resume_doc"
                             or (field_label and len(pk) >= 3 and pk in field_label)
+                            # Generic file upload fallback — match resume/cv params
+                            # only when the field label is also generic or matches
+                            or (
+                                ("resume" in pk or "cv" in pk)
+                                and (
+                                    not field_label
+                                    or "resume" in field_label
+                                    or "cv" in field_label
+                                    or "upload" in field_label
+                                )
+                            )
                         ):
                             LOG.info(
                                 "fill_from_mapping: matched URL param to file field",
@@ -1601,8 +1683,10 @@ class SkyvernPage(Page):
                                 await self.upload_file(
                                     selector=selector,
                                     files=param_url,
-                                    ai=None,
+                                    ai="fallback",
+                                    prompt=f"Upload resume file to the '{field_label or 'file upload'}' field",
                                 )
+                                uploaded = True
                             except Exception:
                                 LOG.warning(
                                     "fill_from_mapping: file upload failed",
@@ -1611,6 +1695,8 @@ class SkyvernPage(Page):
                                     exc_info=True,
                                 )
                             break
+                    if uploaded:
+                        break
 
     async def validate_mapping(
         self,
@@ -1737,6 +1823,224 @@ class SkyvernPage(Page):
             raise ScriptTerminationException("fill_form validation failed: user termination conditions not met")
 
         await self.fill_from_mapping(form_fields, mapping, data=data)
+
+    async def _dump_html(self, debug_dir: str | None, label: str) -> None:
+        """Dump current page HTML to a timestamped file for debugging."""
+        if not debug_dir:
+            return
+        try:
+            ts = datetime.datetime.now().strftime("%H%M%S_%f")[:-3]
+            filename = f"{ts}_{label}.html"
+            filepath = os.path.join(debug_dir, filename)
+            html = await self.page.content()
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(html)
+            LOG.info("_dump_html: saved", path=filepath, size=len(html))
+        except Exception:
+            LOG.warning("_dump_html: failed", exc_info=True)
+
+    async def fill_multipage_form(
+        self,
+        data: dict[str, Any],
+        *,
+        prompt: str = "Fill out the form",
+        next_button: str = 'button:has-text("Save and Continue"), button:has-text("Next"), button:has-text("Continue")',
+        max_pages: int = 10,
+        timeout_seconds: float = 300,
+        debug_dir: str | None = None,
+    ) -> int:
+        """Fill a multi-page form by looping: fill current page → click next → repeat.
+
+        Returns the number of pages filled. Stops when:
+        - No fillable form fields are found on the current page (e.g., Review page)
+        - The next button is not found (last page)
+        - max_pages is reached
+        - Wall-clock timeout is exceeded
+
+        Args:
+            data: Dict of data keys/values to fill into the form.
+            prompt: User instructions for how to fill the form.
+            next_button: CSS selector(s) for the next/continue button.
+            max_pages: Safety limit on number of pages to fill.
+            timeout_seconds: Wall-clock timeout for the entire multi-page fill (default 5 min).
+        """
+        start_time = time.monotonic()
+        pages_filled = 0
+        prev_field_signature: str | None = None
+
+        for page_num in range(max_pages):
+            elapsed = time.monotonic() - start_time
+            if elapsed > timeout_seconds:
+                LOG.warning(
+                    "fill_multipage_form: timeout exceeded, stopping",
+                    page_num=page_num,
+                    elapsed_s=round(elapsed, 1),
+                    timeout_s=timeout_seconds,
+                )
+                break
+
+            # Small wait on page 1+ to let React DOM settle after transition
+            if page_num > 0:
+                await asyncio.sleep(1)
+
+            form_fields = await self.extract_form_fields()
+
+            # Filter to fillable fields — includes standard inputs AND custom widgets
+            fillable = [
+                f
+                for f in form_fields
+                if (f.get("tag") in ("input", "select", "textarea") and f.get("type") != "hidden")
+                or f.get("type") in ("listbox", "multiselect", "toggle")
+            ]
+
+            if not fillable:
+                await self._dump_html(debug_dir, f"p{page_num}_empty")
+                LOG.info(
+                    "fill_multipage_form: no fillable fields on page, stopping",
+                    page_num=page_num,
+                    total_fields=len(form_fields),
+                )
+                break
+
+            # Detect stuck on same page: if field labels haven't changed, the
+            # next-button click didn't navigate. Stop to avoid infinite loop.
+            field_sig = "|".join((f.get("label") or f.get("name") or f.get("placeholder") or "") for f in fillable)
+            if field_sig and field_sig == prev_field_signature:
+                LOG.warning(
+                    "fill_multipage_form: same fields detected, page did not advance — stopping",
+                    page_num=page_num,
+                    field_count=len(fillable),
+                )
+                break
+            prev_field_signature = field_sig
+
+            field_labels = [(f.get("label") or f.get("name") or f.get("placeholder") or "?")[:40] for f in fillable]
+            # Log unlabeled fields with their raw data for debugging
+            unlabeled = [
+                {k: v for k, v in f.items() if k in ("tag", "type", "selector", "placeholder", "name")}
+                for f in fillable
+                if not f.get("label") and not f.get("name") and not f.get("placeholder")
+            ]
+            LOG.info(
+                "fill_multipage_form: filling page",
+                page_num=page_num,
+                field_count=len(fillable),
+                field_labels=field_labels,
+                unlabeled_fields=unlabeled[:5] if unlabeled else None,
+                elapsed_s=round(time.monotonic() - start_time, 1),
+            )
+
+            await self._dump_html(debug_dir, f"p{page_num}_00_before_fill")
+
+            mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
+
+            # Skip validation on intermediate pages — validate_mapping checks user
+            # instructions like "do not submit" which only apply to the final page.
+            # We'll validate after the loop if needed.
+            await self.fill_from_mapping(form_fields, mapping, data=data)
+            pages_filled += 1
+
+            await self._dump_html(debug_dir, f"p{page_num}_01_after_fill")
+
+            # Re-scan for dynamically revealed fields (e.g., State appears after
+            # Country may be auto-filled). Fill any new fields that appeared.
+            rescan_fields = await self.extract_form_fields()
+            rescan_fillable = [
+                f
+                for f in rescan_fields
+                if (f.get("tag") in ("input", "select", "textarea") and f.get("type") != "hidden")
+                or f.get("type") in ("listbox", "multiselect", "toggle")
+            ]
+            new_field_count = len(rescan_fillable) - len(fillable)
+            if new_field_count > 0:
+                LOG.info(
+                    "fill_multipage_form: new fields appeared after fill, re-mapping",
+                    page_num=page_num,
+                    original_count=len(fillable),
+                    new_count=len(rescan_fillable),
+                    new_fields=new_field_count,
+                )
+                rescan_mapping = await self.dynamic_field_map(rescan_fields, data, prompt=prompt)
+                # Only fill indices that weren't in the original mapping
+                new_mapping: dict[int, str | list | bool | None] = {
+                    k: v for k, v in rescan_mapping.items() if k not in mapping and v is not None
+                }
+                if new_mapping:
+                    await self.fill_from_mapping(rescan_fields, new_mapping, data=data)
+                    await self._dump_html(debug_dir, f"p{page_num}_02_after_rescan_fill")
+                # Update field signature to use the new fields for stuck detection
+                fillable = rescan_fillable
+                form_fields = rescan_fields
+                prev_field_signature = "|".join(
+                    (f.get("label") or f.get("name") or f.get("placeholder") or "") for f in fillable
+                )
+
+            # Try to click the next/continue button
+            try:
+                await self.click(
+                    selector=next_button,
+                    ai="fallback",
+                    prompt="Click the button to save and continue to the next page of the application",
+                )
+            except Exception:
+                LOG.info(
+                    "fill_multipage_form: next button not found, stopping",
+                    page_num=page_num,
+                )
+                break
+
+            await self._dump_html(debug_dir, f"p{page_num}_03_after_click_next")
+
+            # Wait for page transition using DOM readiness check
+            try:
+                from skyvern.webeye.utils.page import SkyvernFrame
+
+                skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+                await skyvern_frame.wait_for_page_ready(
+                    network_idle_timeout_ms=3000,
+                    loading_indicator_timeout_ms=5000,
+                    dom_stable_ms=300,
+                    dom_stability_timeout_ms=3000,
+                )
+            except Exception:
+                # Fall back to a short sleep if readiness check fails
+                await asyncio.sleep(2)
+
+            # Check for validation errors AFTER clicking next (some sites show
+            # errors only after clicking Save and Continue)
+            try:
+                post_click_errors = await self.page.evaluate("""() => {
+                    const errs = [];
+                    // Common error patterns: inline error messages, alert banners
+                    const selectors = '[data-automation-id*="error"], [data-automation-id*="Error"], [class*="errorMessage"], [class*="fieldError"], [role="alert"], [aria-invalid="true"]';
+                    document.querySelectorAll(selectors).forEach(el => {
+                        const t = el.textContent.trim();
+                        if (t && t.length > 3 && t.length < 300 && el.offsetWidth > 0) {
+                            // Skip upload success messages — not real errors
+                            if (/successfully uploaded/i.test(t)) return;
+                            errs.push(t.substring(0, 100));
+                        }
+                    });
+                    return errs;
+                }""")
+                if post_click_errors:
+                    LOG.warning(
+                        "fill_multipage_form: validation errors after Save and Continue",
+                        page_num=page_num,
+                        error_count=len(post_click_errors),
+                        errors=post_click_errors[:5],
+                    )
+                    await self._dump_html(debug_dir, f"p{page_num}_04_validation_errors")
+            except Exception:
+                pass
+
+        elapsed = time.monotonic() - start_time
+        LOG.info(
+            "fill_multipage_form: completed",
+            pages_filled=pages_filled,
+            total_elapsed_s=round(elapsed, 1),
+        )
+        return pages_filled
 
     def _match_field_to_map(
         self,
@@ -2317,8 +2621,6 @@ class SkyvernPage(Page):
         navigation_goal: str = "Fill out the form",
     ) -> None:
         """Fill a field with a pre-planned value (no per-field LLM call)."""
-        import json as _json
-
         selector = field.get("selector", "")
         field_type = field.get("type", "text")
         field_tag = field.get("tag", "input")
