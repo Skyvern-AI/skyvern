@@ -7423,12 +7423,17 @@ class AgentDB(BaseAlchemyDB):
         page_size: int = 50,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
-    ) -> tuple[list[WorkflowRunModel], int, dict[str, int]]:
-        """Get workflow runs associated with a script, with total count and status counts.
+    ) -> tuple[list[WorkflowRunModel], int, dict[str, int], float | None]:
+        """Get workflow runs associated with a script, with total count, status counts,
+        and average AI fallbacks per run.
 
-        Returns (runs, total_count, status_counts) where runs is limited by page_size,
-        total_count is derived from the status_counts GROUP BY, and status_counts is a
-        GROUP BY aggregation of statuses across all runs.
+        Only includes actual script runs (run_with='code'), excluding agent runs that
+        generated the script.
+
+        Returns (runs, total_count, status_counts, avg_fallbacks_per_run) where runs
+        is limited by page_size, total_count is derived from the status_counts GROUP BY,
+        status_counts is a GROUP BY aggregation of statuses across all runs, and
+        avg_fallbacks_per_run is the average number of fallback episodes per run.
 
         If created_after/created_before are provided, filters by the workflow_script
         entry's created_at (not the run's created_at), scoping to the version that
@@ -7455,10 +7460,11 @@ class AgentDB(BaseAlchemyDB):
                         WorkflowScriptModel.created_at < created_before,
                     )
 
-                # Base filter for workflow runs
+                # Base filter for workflow runs — only include actual script runs
                 base_filters = [
                     WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
                     WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.run_with.in_(["code", "code_v2"]),
                 ]
 
                 # Count statuses via GROUP BY (also gives us total_count)
@@ -7471,7 +7477,7 @@ class AgentDB(BaseAlchemyDB):
                 total_count = sum(status_counts.values())
 
                 if total_count == 0:
-                    return [], 0, {}
+                    return [], 0, {}, None
 
                 # Get the actual workflow runs (paginated)
                 runs_query = (
@@ -7482,7 +7488,27 @@ class AgentDB(BaseAlchemyDB):
                 )
                 runs = list((await session.scalars(runs_query)).all())
 
-                return runs, total_count, status_counts
+                # Compute average AI fallbacks per run over the last 20 runs.
+                max_fallback_sample = 20
+                recent_run_ids = (
+                    select(WorkflowRunModel.workflow_run_id)
+                    .filter(*base_filters)
+                    .order_by(WorkflowRunModel.created_at.desc())
+                    .limit(max_fallback_sample)
+                )
+                total_fallbacks_result = await session.execute(
+                    select(func.count())
+                    .select_from(ScriptFallbackEpisodeModel)
+                    .filter(
+                        ScriptFallbackEpisodeModel.workflow_run_id.in_(recent_run_ids),
+                        ScriptFallbackEpisodeModel.organization_id == organization_id,
+                    )
+                )
+                total_fallbacks = total_fallbacks_result.scalar() or 0
+                sample_size = min(total_count, max_fallback_sample)
+                avg_fallbacks_per_run = round(total_fallbacks / sample_size, 2)
+
+                return runs, total_count, status_counts, avg_fallbacks_per_run
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -7524,6 +7550,7 @@ class AgentDB(BaseAlchemyDB):
                         WorkflowScriptModel.deleted_at.is_(None),
                         WorkflowScriptModel.workflow_run_id.isnot(None),
                         WorkflowRunModel.organization_id == organization_id,
+                        WorkflowRunModel.run_with.in_(["code", "code_v2"]),
                     )
                     .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
                 )
