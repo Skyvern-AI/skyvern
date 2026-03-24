@@ -121,8 +121,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.utils.css_selector import compute_stable_selector
-from skyvern.webeye.actions.actions import Action
+from skyvern.utils.css_selector import build_action_summary  # shared with script_service
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -288,69 +287,6 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
                     queue.append(item)
 
     return workflow_dict
-
-
-# Attributes safe to pass to the script reviewer (excludes noisy/dynamic attrs)
-_REVIEWER_SAFE_ATTRS = frozenset(
-    {
-        "name",
-        "id",
-        "placeholder",
-        "aria-label",
-        "type",
-        "role",
-        "data-testid",
-        "data-test-id",
-        "data-cy",
-        "data-qa",
-        "href",
-        "for",
-        "alt",
-        "title",
-        "action",
-        "method",
-        "autocomplete",
-        "inputmode",
-        "pattern",
-        "maxlength",
-        "aria-describedby",
-        "aria-labelledby",
-        "aria-haspopup",
-        "value",  # useful for pre-selected state
-    }
-)
-
-
-def _build_action_summary(a: Action) -> dict:
-    """Build a rich action summary dict for the script reviewer.
-
-    Includes a computed CSS selector suggestion so the reviewer can write
-    reliable selectors without guessing from sparse attributes.
-    """
-    elem = a.skyvern_element_data or {}
-    attrs = elem.get("attributes") or {}
-
-    # Broad attribute set for the reviewer (filtered to safe, useful attrs)
-    useful_attrs = {k: v for k, v in attrs.items() if k in _REVIEWER_SAFE_ATTRS and v}
-
-    return {
-        "action_type": a.action_type,
-        "intention": a.intention,
-        "reasoning": a.reasoning,
-        "status": a.status,
-        "field": (a.input_or_select_context.field if a.input_or_select_context else None),
-        # Legacy: 6 core attributes (kept for backward compat with older templates)
-        "element_attributes": (
-            {k: v for k, v in attrs.items() if k in ("name", "id", "placeholder", "aria-label", "type", "role") and v}
-            if attrs
-            else None
-        ),
-        # New: element context for better selector generation
-        "element_tag": elem.get("tagName"),
-        "element_text": (elem.get("text") or "")[:100] or None,
-        "all_attributes": useful_attrs or None,
-        "css_suggestion": compute_stable_selector(elem),
-    }
 
 
 class WorkflowService:
@@ -2147,7 +2083,7 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = [_build_action_summary(a) for a in actions[:20]]
+                                    agent_actions_summary["actions"] = [build_action_summary(a) for a in actions[:20]]
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",

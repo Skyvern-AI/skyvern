@@ -1082,6 +1082,7 @@ async def delete_workflow(
     "/folders",
     response_model=Folder,
     tags=["Workflow Folders"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "create_folder",
     },
@@ -1124,6 +1125,7 @@ async def create_folder(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflow Folders"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "get_folder",
     },
@@ -1168,6 +1170,7 @@ async def get_folder(
     "/folders",
     response_model=list[Folder],
     tags=["Workflow Folders"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "get_folders",
     },
@@ -1225,6 +1228,7 @@ async def get_folders(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflow Folders"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "update_folder",
     },
@@ -1271,6 +1275,7 @@ async def update_folder(
 @base_router.delete(
     "/folders/{folder_id}",
     tags=["Workflow Folders"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "delete_folder",
     },
@@ -1307,6 +1312,7 @@ async def delete_folder(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
     tags=["Workflow Folders"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "update_workflow_folder",
     },
@@ -1397,6 +1403,7 @@ async def convert_curl_to_http(
     "/artifacts/{artifact_id}",
     tags=["Artifacts"],
     response_model=Artifact,
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "get_artifact",
     },
