@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -23,9 +24,14 @@ class SessionState:
     browser: SkyvernBrowser | None = None
     context: BrowserContext | None = None
     api_key_hash: str | None = None
-    console_messages: list[dict[str, Any]] = field(default_factory=list)
+    console_messages: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     tracing_active: bool = False
     har_enabled: bool = False
+    _hooked_page_id: int | None = None
+    _hooked_raw_page: Any = None
+    _hooked_handlers: dict[str, Any] = field(default_factory=dict)
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
@@ -195,6 +201,16 @@ async def get_page(
     """Get the working page from the current or specified browser session."""
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     page = await browser.get_working_page()
+
+    # Register inspection hooks (console, network, dialog) on the underlying
+    # Playwright page. Idempotent — only registers when the page object changes
+    # (e.g., after tab switch). Import here to avoid circular imports.
+    from skyvern.cli.mcp_tools.inspection import ensure_hooks_registered
+
+    state = get_current_session()
+    if state is not None:
+        ensure_hooks_registered(state, page)
+
     return page, ctx
 
 

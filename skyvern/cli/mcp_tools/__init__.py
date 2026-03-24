@@ -40,6 +40,11 @@ from .folder import (
     skyvern_folder_list,
     skyvern_folder_update,
 )
+from .inspection import (
+    skyvern_console_messages,
+    skyvern_handle_dialog,
+    skyvern_network_requests,
+)
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .session import (
     skyvern_browser_session_close,
@@ -135,16 +140,14 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 - **Cloud browsers with proxies** — skyvern_browser_session_create launches cloud browsers with geographic proxy support.
 
 ## When to Use Playwright Instead of Skyvern
-For capabilities that Skyvern does not wrap, fall back to Playwright MCP tools. These are the ONLY cases where Playwright tools are appropriate:
-- browser_console_messages — reading console logs
-- browser_network_requests — inspecting network traffic
-- browser_handle_dialog — JavaScript alert/confirm/prompt dialogs
+For capabilities that Skyvern does not yet wrap, fall back to Playwright MCP tools. These are the ONLY cases where Playwright tools are appropriate:
 - browser_file_upload — file chooser uploads
 - browser_tabs — managing multiple tabs
 - browser_run_code — raw Playwright code snippets
 - browser_drag — drag-and-drop
 
-For ALL other browser interactions, use Skyvern.
+Skyvern now handles console logs (skyvern_console_messages), network inspection (skyvern_network_requests), \
+and dialog handling (skyvern_handle_dialog) natively. For ALL other browser interactions, use Skyvern.
 
 ## Tool Modes (precision tools)
 skyvern_click, skyvern_hover, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, skyvern_wait support three modes. When unsure, use intent. For multiple actions, prefer skyvern_act.
@@ -286,6 +289,11 @@ mcp.tool()(skyvern_select_option)
 mcp.tool()(skyvern_press_key)
 mcp.tool()(skyvern_wait)
 
+# -- Inspection tools (console, network, dialog) --
+mcp.tool()(skyvern_console_messages)
+mcp.tool()(skyvern_network_requests)
+mcp.tool()(skyvern_handle_dialog)
+
 # -- Block discovery + validation (no browser needed) --
 mcp.tool()(skyvern_block_schema)
 mcp.tool()(skyvern_block_validate)
@@ -344,6 +352,10 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    # Inspection (console, network, dialog)
+    "skyvern_console_messages",
+    "skyvern_network_requests",
+    "skyvern_handle_dialog",
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
