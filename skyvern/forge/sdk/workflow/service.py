@@ -676,6 +676,8 @@ class WorkflowService:
             workflow_request.proxy_location = workflow.proxy_location
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
+        if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
+            workflow_request.extra_http_headers = workflow.extra_http_headers
 
         # Force ai_fallback=True for adaptive caching (code_v2) runs.
         # Adaptive caching requires AI fallback to self-heal when cached scripts break.
