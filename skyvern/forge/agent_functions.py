@@ -629,7 +629,7 @@ class AgentFunction:
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.
 
-        Returns a platform key (e.g., "lever") or None.
+        Returns a platform key string or None.
         Override in cloud to provide platform detection.
         """
         return None
@@ -650,6 +650,25 @@ class AgentFunction:
         """
         return None
 
+    async def ensure_static_script(
+        self,
+        workflow: Any,
+        workflow_run: Any,
+        organization_id: str,
+    ) -> tuple[Any, dict[str, Any], Any] | None:
+        """Ensure a static pre-built script exists in the DB for this platform.
+
+        If the workflow targets a known platform (detected from block URLs),
+        creates a pinned script in the DB from the static source file on first
+        run.  On subsequent runs the cached script is returned normally.
+
+        Returns ``(script, script_blocks_by_label, loaded_module)`` if a
+        static script was created/loaded, or None if no static script applies.
+
+        Override in cloud.  OSS returns None.
+        """
+        return None
+
     def build_ats_pipeline_block_fn(self, block: dict, ats_platform: str) -> Any:
         """Build an ATS-optimized script block for a detected platform.
 
@@ -664,3 +683,50 @@ class AgentFunction:
         Returns an empty list in OSS. Override in cloud.
         """
         return []
+
+    def get_form_field_mapper_hints(self) -> str | None:
+        """Return platform-specific hints for the form-field-mapper LLM prompt.
+
+        These hints are injected into the prompt template under
+        ``{{ platform_hints }}``.  Use them to guide the LLM on
+        field-to-data key mappings specific to a platform (e.g., ATS
+        job applications).
+
+        Returns None in OSS.  Override in cloud.
+        """
+        return None
+
+    def get_form_field_extraction_js(self, url: str | None = None) -> str | None:
+        """Return platform-specific JS to extend the base form field scanner.
+
+        The returned JS is concatenated into the base extract_form_fields.js
+        IIFE.  It can reference ``fields``, ``seen``, ``isVisible``,
+        ``getLabel``, ``buildSelector``, ``buildOptionSelector``, and
+        ``getGroupLabel`` defined in the base script.
+
+        Args:
+            url: Current page URL, used to select the right platform JS.
+
+        Returns None in OSS (no platform-specific extraction).
+        Override in cloud to inject platform-specific passes.
+        """
+        return None
+
+    async def fill_custom_widget(
+        self,
+        page: Any,
+        field: dict,
+        value: Any,
+        label: str,
+    ) -> bool | None:
+        """Fill a platform-specific custom widget (e.g., hierarchical multiselect).
+
+        Returns:
+            True if the widget was filled successfully.
+            False if the widget was recognized but filling failed.
+            None if this field type is not a custom widget — caller should
+            use default handling.
+
+        Override in cloud to dispatch to platform-specific widget fillers.
+        """
+        return None

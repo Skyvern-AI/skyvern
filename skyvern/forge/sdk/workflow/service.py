@@ -1307,9 +1307,10 @@ class WorkflowService:
                         if spec and spec.loader:
                             loaded_script_module = importlib.util.module_from_spec(spec)
                             spec.loader.exec_module(loaded_script_module)
+                            param_cls = getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
                             await skyvern.setup(
                                 script_parameters,
-                                generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
+                                generated_parameter_cls=param_cls,
                             )
                             LOG.info(
                                 "Successfully loaded script module",
@@ -1332,6 +1333,40 @@ class WorkflowService:
                 )
                 script_blocks_by_label = {}
                 loaded_script_module = None
+
+        # If no cached script exists, check if a static pre-built script
+        # should be created for this platform (e.g., ATS).  This persists the
+        # script to DB (pinned) on first run so it shows in the Code tab.
+        if is_script_run and not script_blocks_by_label:
+            try:
+                static_result = await app.AGENT_FUNCTION.ensure_static_script(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization_id=organization_id,
+                )
+                if static_result:
+                    script, script_blocks_by_label, loaded_script_module = static_result
+                    is_script_run = True
+                    # Initialize RunContext with the browser page + parameters,
+                    # same as the normal script loading path at line 1310.
+                    parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    script_parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+                    param_cls = getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
+                    await skyvern.setup(
+                        script_parameters,
+                        generated_parameter_cls=param_cls,
+                    )
+                    LOG.info(
+                        "Static script loaded successfully",
+                        script_id=script.script_id if script else None,
+                        blocks=list(script_blocks_by_label.keys()),
+                    )
+                else:
+                    LOG.info("No static script available for this workflow")
+            except Exception:
+                LOG.error("Failed to load static script", exc_info=True)
 
         # Mark workflow as running, preserving the user's original run_with intent.
         # The run_with field records what the user requested (e.g. "code_v2"),

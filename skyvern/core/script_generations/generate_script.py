@@ -1065,13 +1065,32 @@ def _build_form_filling_block_fn(
     return decorated
 
 
-def _detect_block_ats_platform(block: dict[str, Any]) -> str | None:
-    """Check if a block's URL belongs to a known ATS platform.
+def _detect_block_ats_platform(block: dict[str, Any], all_blocks: list[dict[str, Any]] | None = None) -> str | None:
+    """Check if a block belongs to a known platform with optimized scripts.
+
+    Checks the block's own URL first.  If the block has no URL (common for
+    continuation blocks that share the previous block's page), checks all
+    other blocks in the workflow for a URL match.
 
     Delegates to app.AGENT_FUNCTION which is overridden in cloud builds.
-    Returns None in OSS (no ATS detection).
+    Returns None in OSS (no detection).
     """
-    return app.AGENT_FUNCTION.detect_ats_platform(block.get("url", ""))
+    # Check block URL first
+    result = app.AGENT_FUNCTION.detect_ats_platform(block.get("url") or "")
+    if result:
+        return result
+
+    # Fall back: check any sibling block's URL (all blocks in the same
+    # workflow share the same site context)
+    if all_blocks:
+        for sibling in all_blocks:
+            sibling_url = sibling.get("url") or ""
+            if sibling_url:
+                result = app.AGENT_FUNCTION.detect_ats_platform(sibling_url)
+                if result:
+                    return result
+
+    return None
 
 
 def _build_block_fn(
@@ -1080,10 +1099,11 @@ def _build_block_fn(
     value_to_param: dict[str, str] | None = None,
     use_semantic_selectors: bool = False,
     is_in_for_loop: bool = False,
+    all_blocks: list[dict[str, Any]] | None = None,
 ) -> FunctionDef:
     # Check for platform-specific pipeline (cloud-only; returns None in OSS)
     if use_semantic_selectors:
-        ats_platform = _detect_block_ats_platform(block)
+        ats_platform = _detect_block_ats_platform(block, all_blocks=all_blocks)
         if ats_platform:
             pipeline_fn = app.AGENT_FUNCTION.build_ats_pipeline_block_fn(block, ats_platform)
             if pipeline_fn:
@@ -2746,6 +2766,7 @@ async def generate_workflow_script_python_code(
                 block_actions,
                 value_to_param=value_to_param,
                 use_semantic_selectors=use_semantic_selectors,
+                all_blocks=task_v1_blocks,
             )
             temp_module = cst.Module(body=[block_fn_def])
             block_code = temp_module.code
