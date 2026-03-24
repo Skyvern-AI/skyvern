@@ -14,7 +14,7 @@ from fastapi import WebSocket
 from websockets.exceptions import ConnectionClosedOK
 
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import auth
+from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
 from skyvern.forge.sdk.routes.streaming.channels.vnc import (
     Loops,
     VncChannel,
@@ -70,14 +70,14 @@ async def stream(
     token: str | None = None,
     workflow_run_id: str | None = None,
 ) -> None:
-    if not client_id:
-        LOG.error(
-            "Client ID not provided for vnc stream.",
-            browser_session_id=browser_session_id,
-            task_id=task_id,
-            workflow_run_id=workflow_run_id,
-        )
+    if not require_client_id(
+        client_id,
+        browser_session_id=browser_session_id,
+        task_id=task_id,
+        workflow_run_id=workflow_run_id,
+    ):
         return
+    assert client_id is not None
 
     LOG.debug(
         "Starting vnc stream.",
