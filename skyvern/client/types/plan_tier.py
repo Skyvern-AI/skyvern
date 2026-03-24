@@ -2,4 +2,4 @@
 
 import typing
 
-PlanTier = typing.Union[typing.Literal["free", "hobby", "pro"], typing.Any]
+PlanTier = typing.Union[typing.Literal["free", "hobby", "pro", "enterprise"], typing.Any]
