@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import uuid
 
@@ -148,8 +149,16 @@ def init_env(
         update_or_add_env_var("SKYVERN_API_KEY", api_key)
     console.print(f"✅ [green]{resolve_backend_env_path()} file has been initialized.[/green]")
 
+    # Retrieve browser config for MCP setup (set during local init)
+    _mcp_browser_type = os.environ.get("BROWSER_TYPE") if run_local else None
+    _mcp_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if run_local else None
+
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
-        setup_mcp(local=run_local)
+        setup_mcp(
+            local=run_local,
+            browser_type=_mcp_browser_type,
+            browser_remote_debugging_url=_mcp_browser_url,
+        )
 
         if not run_local:
             console.print(
