@@ -1200,15 +1200,18 @@ class RawSkyvern:
                 )
                 return HttpResponse(response=_response, data=_data)
             if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
+                _body_404: typing.Optional[typing.Any] = None
+                if _response.text:
+                    _body_404 = typing.cast(
                         typing.Optional[typing.Any],
                         parse_obj_as(
                             type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
-                    ),
+                    )
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=_body_404,
                 )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
@@ -4806,15 +4809,18 @@ class AsyncRawSkyvern:
                 )
                 return AsyncHttpResponse(response=_response, data=_data)
             if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
+                _body_404: typing.Optional[typing.Any] = None
+                if _response.text:
+                    _body_404 = typing.cast(
                         typing.Optional[typing.Any],
                         parse_obj_as(
                             type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
-                    ),
+                    )
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=_body_404,
                 )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
