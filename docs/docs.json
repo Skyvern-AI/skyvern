@@ -67,7 +67,8 @@
               "multi-step-automations/build-a-workflow",
               "multi-step-automations/workflow-blocks-reference",
               "multi-step-automations/file-operations",
-              "multi-step-automations/workflow-parameters"
+              "multi-step-automations/workflow-parameters",
+              "multi-step-automations/scheduling-workflows"
             ]
           },
           {
@@ -133,7 +134,8 @@
               "cloud/building-workflows/manage-workflows",
               "cloud/building-workflows/add-parameters",
               "cloud/building-workflows/configure-blocks",
-              "cloud/building-workflows/run-a-workflow"
+              "cloud/building-workflows/run-a-workflow",
+              "cloud/building-workflows/scheduling"
             ]
           },
           {

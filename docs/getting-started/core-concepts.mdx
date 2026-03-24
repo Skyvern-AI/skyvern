@@ -4,7 +4,7 @@ subtitle: The building blocks of Skyvern automations
 slug: getting-started/core-concepts
 ---
 
-Skyvern has eight core concepts. Master these and you can build any browser automation.
+Skyvern has nine core concepts. Master these and you can build any browser automation.
 
 ---
 
@@ -93,6 +93,37 @@ Workflows support Jinja templating:
 **Use Workflows for:** repeatable automations, multi-step processes, team-shared templates, complex logic with loops or conditionals.
 
 See [Workflow Blocks](/multi-step-automations/workflow-blocks-reference) for the full block reference.
+
+---
+
+## Schedules
+
+A **Schedule** runs a workflow automatically on a recurring basis. You define a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+
+```python
+schedule = await skyvern.create_schedule(
+    workflow_id="wpid_abc123",
+    cron_expression="0 9 * * 1-5",  # Weekdays at 9 AM
+    timezone="America/New_York",
+    parameters={
+        "search_query": "wireless headphones",
+        "max_price": 100
+    }
+)
+```
+
+**Key properties:**
+
+| Property | Description |
+|----------|-------------|
+| `cron_expression` | 5-field cron expression defining the recurrence (minimum 5-minute interval) |
+| `timezone` | IANA timezone identifier (defaults to UTC) |
+| `parameters` | Workflow parameters passed to each scheduled run |
+| `status` | `active` or `paused` |
+
+**Use Schedules for:** recurring data extraction, periodic report generation, daily monitoring tasks, any workflow you want to run without manual intervention.
+
+See [Scheduling Workflows](/multi-step-automations/scheduling-workflows) for the full API reference.
 
 ---
 
@@ -355,6 +386,7 @@ result = await skyvern.run_task(
 | Keep a browser open between tasks | [Browser Session](#browser-sessions) |
 | Skip login on repeated runs | [Browser Profile](#browser-profiles) |
 | Store secrets securely | [Credentials](#credentials) |
+| Run a workflow on a recurring schedule | [Schedule](#schedules) |
 | Debug a failed run | [Artifacts](#artifacts) |
 
 ---

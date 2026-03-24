@@ -16,7 +16,7 @@ Looking to use browser sessions from code? See the [API & SDK guide](/optimizati
 
 Click **Browsers** in the left sidebar to open the Browsers page. It lists all browser sessions in your organization.
 
-{/* <img src="/images/cloud/browsers-page-overview.png" alt="Browsers page showing a table of active browser sessions" /> */}
+<img src="/images/cloud/browsers-page-overview.png" alt="Browsers page with the sessions table showing columns for ID, open status, occupied status, started time, timeout, and CDP URL" />
 
 Each row shows:
 
@@ -35,7 +35,7 @@ Each row shows:
 
 Click the **Create Browser Session** button at the top of the Browsers page. A panel opens with the following settings:
 
-{/* <img src="/images/cloud/create-session-drawer.png" alt="Create Browser Session panel with configuration options" /> */}
+<img src="/images/cloud/create-session-drawer.png" alt="Create Browser Session panel showing fields for timeout, proxy location, browser type, extensions, and browser profile" />
 
 | Setting | What it does |
 |---------|-------------|
@@ -61,7 +61,7 @@ Click any session row in the table to open its detail page. The detail page has 
 
 A live view of the browser. You can watch pages load and actions fire in real time. If you need to interact with the browser yourself — log in, dismiss a popup, solve a CAPTCHA — use the controls to take over.
 
-{/* <img src="/images/cloud/session-stream-tab.png" alt="Live browser stream showing a website" /> */}
+<img src="/images/cloud/session-detail-stream.png" alt="Browser session detail page with the Stream tab active, showing a live browser view and session controls" />
 
 ### Recordings
 
@@ -85,7 +85,7 @@ Once you have a running session, you can run tasks inside it from the [Discover 
 
 The task executes inside your existing session. Cookies, login state, and page context from previous tasks are still there.
 
-{/* <img src="/images/cloud/session-id-in-discover.png" alt="Advanced settings on the Discover page with Browser Session ID filled in" /> */}
+<img src="/images/cloud/discover-session-id-field.png" alt="Advanced settings panel on the Discover page with a pbs_ session ID entered in the Browser Session ID field" />
 
 ---
 
@@ -101,11 +101,15 @@ You can also run workflows inside an existing session:
 
 The workflow picks up where the browser left off — same page, same cookies, same form data.
 
+<img src="/images/cloud/workflow-run-session-id-field.png" alt="Workflow run settings panel with a pbs_ session ID entered in the Browser Session ID field" />
+
 ---
 
 ## Closing a session
 
 From the session detail page, click **Stop**. A confirmation dialog appears. The browser shuts down immediately and the session moves to `closed` status.
+
+<img src="/images/cloud/session-stop-confirmation.png" alt="Stop browser session confirmation dialog with Cancel and Stop buttons" />
 
 Sessions also close automatically when their timeout expires, **even if a task is still running**. Set timeouts with enough margin for your longest expected task.
 

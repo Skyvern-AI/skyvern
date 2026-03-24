@@ -1,0 +1,153 @@
+---
+title: Schedule a Workflow
+subtitle: Set up recurring cron-based execution from the UI
+slug: cloud/scheduling
+---
+
+You can schedule any saved workflow to run automatically on a recurring basis. Schedules are configured with a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+
+Schedules are created as **active** by default — they start triggering runs immediately after creation.
+
+When creating a schedule you'll fill in these fields:
+
+- **Workflow** (required) — The workflow to run. When creating from the workflow editor this is pre-selected.
+- **Cron Expression** (required) — A standard 5-field cron expression that defines how often the workflow runs (e.g., `0 9 * * 1-5` for every weekday at 9 AM). The UI validates the expression in real time and shows a human-readable translation. Quick presets are available for common patterns like hourly, daily, and weekly.
+- **Timezone** (required) — The IANA timezone the cron expression is evaluated in (e.g., `America/New_York`). Defaults to your browser's local timezone. The dropdown is searchable by city name.
+- **Name** — A human-readable label to identify this schedule in the table and run history.
+- **Description** — Optional notes about what this schedule does or why it exists.
+
+<Warning>
+The minimum interval between runs is **5 minutes**. Expressions that resolve to shorter intervals are rejected.
+</Warning>
+
+---
+
+## Creating a schedule
+
+<Tabs>
+  <Tab title="From the Schedules page">
+    <Steps>
+      <Step title="Open the Schedules page">
+        Click **Schedules** (calendar icon) in the left sidebar.
+      </Step>
+      <Step title="Click Create Schedule">
+        Click **Create Schedule** in the top right corner.
+      </Step>
+      <Step title="Select a workflow">
+        Choose the workflow you want to schedule from the dropdown. Only saved workflows appear in this list.
+      </Step>
+      <Step title="Configure the schedule">
+        Fill in the cron expression, timezone, and optionally a name and description.
+      </Step>
+      <Step title="Review next runs">
+        Check the **Next Scheduled Runs** preview to verify the upcoming execution times match your expectations.
+      </Step>
+      <Step title="Create">
+        Click **Create Schedule**. The schedule starts in an **Active** state and triggers at the next scheduled time.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="From the workflow editor">
+    <Steps>
+      <Step title="Open the workflow">
+        Navigate to **Workflows** in the sidebar and click the workflow you want to schedule.
+      </Step>
+      <Step title="Click the Schedule button">
+        In the editor header bar, click the **Schedule** button (clock icon).
+      </Step>
+      <Step title="Click Add">
+        A panel opens showing any existing schedules for this workflow. Click **Add** to create a new one.
+      </Step>
+      <Step title="Configure the schedule">
+        Fill in the cron expression, timezone, and optionally a name and description. The workflow is already selected.
+      </Step>
+      <Step title="Create">
+        Click **Create Schedule**. The schedule appears in the panel and starts immediately.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+---
+
+## The Schedules page
+
+Click **Schedules** in the left sidebar to see every schedule across all workflows.
+
+Each row shows:
+
+| Column | What it shows |
+|--------|--------------|
+| **Workflow** | The workflow this schedule triggers |
+| **Name** | Schedule name |
+| **Schedule** | Human-readable cron description (e.g., "Every weekday at 9:00 AM") |
+| **Next Run** | Next execution time in your local timezone |
+| **Status** | **Active** (green) or **Paused** (gray) |
+
+Use the search bar to filter by schedule name or workflow title. The status filter narrows to Active or Paused schedules.
+
+---
+
+## Editing a schedule
+
+Click a schedule row to open its detail page. You can edit the name, description, cron expression, and timezone inline. Changes take effect immediately and the Next Scheduled Runs preview updates to reflect the new configuration.
+
+<Info>
+To change which workflow a schedule runs, delete the schedule and create a new one for the target workflow.
+</Info>
+
+---
+
+## Pausing and resuming
+
+Toggle the **Status** switch on the schedule row or on the detail page. Paused schedules keep their configuration and can be resumed at any time — no runs are triggered while paused.
+
+---
+
+## Deleting a schedule
+
+Delete from the detail page header, the three-dot row menu, or by selecting multiple schedules and using bulk delete. Deletion is permanent. Runs already triggered by the schedule are not affected.
+
+---
+
+## Bulk operations
+
+Select multiple schedules with the row checkboxes. The bulk actions bar lets you **Activate**, **Pause**, **Duplicate**, or **Delete** all selected schedules at once.
+
+---
+
+## Scheduled runs in Run History
+
+Runs triggered by a schedule show a **calendar icon badge** in the [Run History](/cloud/viewing-results/run-history) table. The run details include the schedule name and cron expression. Use the **Trigger Type** filter to show only scheduled runs.
+
+<Tip>
+You can also create and manage schedules programmatically via the API. See [Scheduling Workflows](/multi-step-automations/scheduling-workflows) for the full reference.
+</Tip>
+
+---
+
+## What's next
+
+<CardGroup cols={3}>
+  <Card
+    title="Scheduling API"
+    icon="code"
+    href="/multi-step-automations/scheduling-workflows"
+  >
+    Create and manage schedules programmatically
+  </Card>
+  <Card
+    title="Run History"
+    icon="clock-rotate-left"
+    href="/cloud/viewing-results/run-history"
+  >
+    View and filter results from scheduled runs
+  </Card>
+  <Card
+    title="Cost Control"
+    icon="gauge"
+    href="/optimization/cost-control"
+  >
+    Manage costs for recurring automations
+  </Card>
+</CardGroup>
