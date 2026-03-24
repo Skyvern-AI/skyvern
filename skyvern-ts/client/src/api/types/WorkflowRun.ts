@@ -29,6 +29,8 @@ export interface WorkflowRun {
     sequential_key?: string;
     ai_fallback?: boolean;
     code_gen?: boolean;
+    trigger_type?: Skyvern.WorkflowRunTriggerType;
+    workflow_schedule_id?: string;
     queued_at?: string;
     started_at?: string;
     finished_at?: string;
