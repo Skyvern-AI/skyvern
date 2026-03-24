@@ -5173,7 +5173,7 @@ class PrintPageBlock(Block):
         workflow_run_block_id: str,
         workflow_run_context: WorkflowRunContext,
         organization_id: str | None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         artifact_org_id = organization_id or workflow_run_context.organization_id
         if not artifact_org_id:
             LOG.warning(
@@ -5181,7 +5181,7 @@ class PrintPageBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
-            return None
+            return None, None
 
         try:
             workflow_run_block = await app.DATABASE.get_workflow_run_block(
@@ -5195,9 +5195,9 @@ class PrintPageBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=artifact_org_id,
             )
-            return None
+            return None, None
 
-        _, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
+        artifact_id, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
             workflow_run_block=workflow_run_block,
             artifact_type=ArtifactType.PDF,
             data=pdf_bytes,
@@ -5211,9 +5211,22 @@ class PrintPageBlock(Block):
                 workflow_run_block_id=workflow_run_block.workflow_run_block_id,
                 exc_info=True,
             )
-            return None
+            return None, None
 
-        return artifact_uri
+        # Generate a downloadable URL for the artifact
+        artifact_url = None
+        try:
+            artifact = await app.DATABASE.get_artifact_by_id(artifact_id, organization_id=artifact_org_id)
+            if artifact:
+                artifact_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock: Failed to generate artifact download URL",
+                artifact_id=artifact_id,
+                exc_info=True,
+            )
+
+        return artifact_uri, artifact_url
 
     async def execute(
         self,
@@ -5284,7 +5297,7 @@ class PrintPageBlock(Block):
             await f.write(pdf_bytes)
 
         # Upload to artifact storage for downstream block access (e.g., File Extraction Block)
-        artifact_uri = await self._upload_pdf_artifact(
+        artifact_uri, artifact_url = await self._upload_pdf_artifact(
             pdf_bytes=pdf_bytes,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
@@ -5297,6 +5310,7 @@ class PrintPageBlock(Block):
             "file_path": file_path,
             "size_bytes": len(pdf_bytes),
             "artifact_uri": artifact_uri,
+            "artifact_url": artifact_url,
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
 
