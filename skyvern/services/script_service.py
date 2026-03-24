@@ -1305,6 +1305,7 @@ async def _fallback_to_ai_run(
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus(task.status.value),
+                task_id=task_id,
                 failure_reason=failure_reason,
                 label=cache_key,
                 ai_fallback_triggered=True,
