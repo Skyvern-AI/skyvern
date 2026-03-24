@@ -321,6 +321,9 @@ class ScriptSkyvernPage(SkyvernPage):
             # Auto-create screenshot artifact after execution
             await self._create_screenshot_after_execution()
 
+            # Auto-create HTML artifact after execution
+            await self._create_html_action_after_execution()
+
     async def _update_action_reasoning(
         self,
         action_id: str,
@@ -546,6 +549,85 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception:
             # If screenshot creation fails, don't block execution
             pass
+
+    @classmethod
+    async def _create_html_action_after_execution(cls) -> None:
+        """Create an HTML_ACTION artifact after action execution.
+
+        Mirrors Agent.record_artifacts_after_action() so that cached script runs
+        produce the same HTML artifacts that customers consume via the
+        /runs/{run_id}/artifacts API.
+        """
+        try:
+            context = skyvern_context.ensure_context()
+            if not context or not context.task_id or not context.step_id:
+                return
+
+            browser_state = await cls._get_browser_state()
+            if not browser_state:
+                return
+
+            working_page = await browser_state.get_working_page()
+            if not working_page:
+                return
+
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            html = await skyvern_frame.get_content()
+
+            if html:
+                step = await app.DATABASE.get_step(
+                    context.step_id,
+                    organization_id=context.organization_id,
+                )
+                if not step:
+                    return
+
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.HTML_ACTION,
+                    data=html.encode("utf-8"),
+                )
+
+        except Exception:
+            LOG.warning("Failed to create HTML artifact after action", exc_info=True)
+
+    @classmethod
+    async def _create_final_screenshot(cls) -> None:
+        """Create a SCREENSHOT_FINAL artifact at block completion.
+
+        Mirrors the final screenshot in Agent.send_task_response() so that cached
+        script runs produce the same end-of-block screenshot.
+        """
+        try:
+            context = skyvern_context.ensure_context()
+            if not context or not context.task_id or not context.step_id:
+                return
+
+            browser_state = await cls._get_browser_state()
+            if not browser_state:
+                return
+
+            if await browser_state.get_working_page() is None:
+                return
+
+            screenshot = await browser_state.take_fullpage_screenshot()
+
+            if screenshot:
+                step = await app.DATABASE.get_step(
+                    context.step_id,
+                    organization_id=context.organization_id,
+                )
+                if not step:
+                    return
+
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                    data=screenshot,
+                )
+
+        except Exception:
+            LOG.warning("Failed to create final screenshot", exc_info=True)
 
     async def _wait_for_page_ready_before_action(self) -> None:
         """
@@ -863,6 +945,9 @@ class ScriptSkyvernPage(SkyvernPage):
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise ScriptTerminationException(result[-1].exception_message)
+
+        # Capture final full-page screenshot at block completion
+        await self._create_final_screenshot()
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(self, errors: list[str], **kwargs: Any) -> None:
