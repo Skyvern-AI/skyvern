@@ -137,6 +137,13 @@
             ]
           },
           {
+            "group": "Re-using Browsers",
+            "pages": [
+              "cloud/browser-management/browser-sessions",
+              "cloud/browser-management/browser-profiles"
+            ]
+          },
+          {
             "group": "Viewing Results",
             "pages": [
               "cloud/viewing-results/run-history",
