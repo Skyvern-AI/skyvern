@@ -9,6 +9,10 @@ targets the same element without relying on ephemeral unique_ids.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from skyvern.webeye.actions.actions import Action
 
 
 def compute_stable_selector(element_data: dict | None) -> str | None:
@@ -95,3 +99,72 @@ def _css_escape(s: str) -> str:
 def _css_escape_attr(s: str) -> str:
     """Escape a string for use inside a CSS attribute value."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+# ---------------------------------------------------------------------------
+# Action summary builder (shared between workflow service & script service)
+# ---------------------------------------------------------------------------
+
+# Attributes safe to pass to the script reviewer (excludes noisy/dynamic attrs)
+REVIEWER_SAFE_ATTRS = frozenset(
+    {
+        "name",
+        "id",
+        "placeholder",
+        "aria-label",
+        "type",
+        "role",
+        "data-testid",
+        "data-test-id",
+        "data-cy",
+        "data-qa",
+        "href",
+        "for",
+        "alt",
+        "title",
+        "action",
+        "method",
+        "autocomplete",
+        "inputmode",
+        "pattern",
+        "maxlength",
+        "aria-describedby",
+        "aria-labelledby",
+        "aria-haspopup",
+        "value",  # useful for pre-selected state
+    }
+)
+
+
+def build_action_summary(action: Action) -> dict:
+    """Build a rich action summary dict for the script reviewer.
+
+    Includes a computed CSS selector suggestion so the reviewer can write
+    reliable selectors without guessing from sparse attributes.
+
+    Kept in this module (rather than workflow/service.py) so both the workflow
+    service and script_service can use it without circular imports.
+    """
+    elem = action.skyvern_element_data or {}
+    attrs = elem.get("attributes") or {}
+
+    useful_attrs = {k: v for k, v in attrs.items() if k in REVIEWER_SAFE_ATTRS and v}
+
+    return {
+        "action_type": action.action_type,
+        "intention": action.intention,
+        "reasoning": action.reasoning,
+        "status": action.status,
+        "field": (action.input_or_select_context.field if action.input_or_select_context else None),
+        # Legacy: 6 core attributes (kept for backward compat with older templates)
+        "element_attributes": (
+            {k: v for k, v in attrs.items() if k in ("name", "id", "placeholder", "aria-label", "type", "role") and v}
+            if attrs
+            else None
+        ),
+        # Element context for better selector generation
+        "element_tag": elem.get("tagName"),
+        "element_text": (elem.get("text") or "")[:100] or None,
+        "all_attributes": useful_attrs or None,
+        "css_suggestion": compute_stable_selector(elem),
+    }
