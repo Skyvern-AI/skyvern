@@ -1006,7 +1006,7 @@ async def get_script_runs(
         if not version_found:
             raise HTTPException(status_code=404, detail=f"Script version {version} not found")
 
-    runs, total_count, status_counts = await app.DATABASE.get_workflow_runs_for_script(
+    runs, total_count, status_counts, avg_fallbacks_per_run = await app.DATABASE.get_workflow_runs_for_script(
         organization_id=organization_id,
         script_id=script_id,
         page_size=page_size,
@@ -1028,6 +1028,7 @@ async def get_script_runs(
         ],
         total_count=total_count,
         status_counts=status_counts,
+        avg_fallbacks_per_run=avg_fallbacks_per_run,
     )
 
 

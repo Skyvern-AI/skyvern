@@ -140,6 +140,8 @@ function WorkflowScriptDetailPage() {
   const totalCount = runsData?.total_count ?? 0;
   const successRate =
     totalCount > 0 ? (statusCounts["completed"] ?? 0) / totalCount : null;
+  const avgFallbacks = runsData?.avg_fallbacks_per_run ?? null;
+  const blockCount = codeData?.blocks ? Object.keys(codeData.blocks).length : 0;
   const MAX_RUNS_SHOWN = 50;
 
   if (!workflowPermanentId || !scriptId) return null;
@@ -209,7 +211,7 @@ function WorkflowScriptDetailPage() {
         )}
       </header>
 
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-5 gap-4">
         <div className="rounded-md border p-4">
           <p className="text-sm text-muted-foreground">Viewing Revision</p>
           <div className="flex flex-col gap-1">
@@ -282,6 +284,29 @@ function WorkflowScriptDetailPage() {
                 }
               >
                 {Math.round(successRate * 100)}%
+              </span>
+            ) : (
+              "N/A"
+            )}
+          </p>
+        </div>
+        <div className="rounded-md border p-4">
+          <p className="text-sm text-muted-foreground">Avg AI Fallbacks</p>
+          <p className="text-2xl font-semibold">
+            {runsLoading ? (
+              <Skeleton className="h-8 w-12" />
+            ) : avgFallbacks != null ? (
+              <span
+                className={(() => {
+                  // Color based on fallback ratio relative to block count
+                  const ratio =
+                    blockCount > 0 ? avgFallbacks / blockCount : avgFallbacks;
+                  if (ratio < 0.1) return "text-green-500";
+                  if (ratio < 0.3) return "text-yellow-500";
+                  return "text-red-500";
+                })()}
+              >
+                {avgFallbacks}
               </span>
             ) : (
               "N/A"
