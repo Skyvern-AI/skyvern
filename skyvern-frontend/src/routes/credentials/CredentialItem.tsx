@@ -5,7 +5,11 @@ import {
   isSecretCredential,
 } from "@/api/types";
 import { useState } from "react";
-import { Pencil1Icon } from "@radix-ui/react-icons";
+import {
+  ExternalLinkIcon,
+  Pencil1Icon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -17,13 +21,25 @@ import { DeleteCredentialButton } from "./DeleteCredentialButton";
 import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
+import { SaveIcon } from "@/components/icons/SaveIcon";
+import { useCredentialTestStore } from "@/store/useCredentialTestStore";
 
 type Props = {
   credential: CredentialApiResponse;
+  onStartBackgroundTest?: (
+    credentialId: string,
+    url: string,
+    userContext?: string,
+  ) => void;
 };
 
-function CredentialItem({ credential }: Props) {
+function CredentialItem({ credential, onStartBackgroundTest }: Props) {
   const [editModalOpen, setEditModalOpen] = useState(false);
+  const activeTest = useCredentialTestStore((s) =>
+    s.activeTest?.credentialId === credential.credential_id
+      ? s.activeTest
+      : null,
+  );
   const credentialData = credential.credential;
   const modalType = credentialTypeToModalType(credential.credential_type);
   const getTotpTypeDisplay = (totpType: string) => {
@@ -110,11 +126,32 @@ function CredentialItem({ credential }: Props) {
           {credential.name}
         </p>
         <p className="text-sm text-slate-400">{credential.credential_id}</p>
+        {activeTest && (
+          <div className="flex items-center gap-1 text-xs">
+            <ReloadIcon className="size-3 animate-spin text-blue-400" />
+            <a
+              href={`/runs/${activeTest.workflowRunId}/overview`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1 text-blue-400 hover:text-blue-300"
+            >
+              Testing login
+              <ExternalLinkIcon className="size-3" />
+            </a>
+          </div>
+        )}
         {credential.browser_profile_id && (
           <div className="flex items-center gap-1 text-xs">
-            <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-green-400">
-              saved-profile
-            </span>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center text-green-400">
+                    <SaveIcon className="size-4" />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>Saved browser session</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             {credential.tested_url && (
               <span className="text-muted-foreground">
                 {getHostname(credential.tested_url) ?? credential.tested_url}
@@ -148,6 +185,7 @@ function CredentialItem({ credential }: Props) {
         onOpenChange={setEditModalOpen}
         editingCredential={credential}
         overrideType={modalType}
+        onStartBackgroundTest={onStartBackgroundTest}
       />
     </div>
   );

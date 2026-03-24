@@ -1,10 +1,12 @@
 You need to help checking two goals:
-1. Based on the context/intention, check whether the current value is used to input as a phone number 
+1. Based on the context/intention, check whether the current value is used to input as a phone number
 2. If the current value is a phone number, check whether the format of the phone number matches the required format based on the user's goals, user details, and HTML elements.
 
 There are several checkpoints to verify the format of the phone number:
+- Whether there are form validation errors near the phone input field (e.g., <mat-error>, inline error text). If present, the error message takes priority over the formatting signals below.
+- Whether the country code is already present near the phone number field (as a dropdown, input, or displayed text). If so, do NOT include the country code in the recommended number.
 - Whether the phone number should add hyphen.
-- Whether the phone number should add country code.
+- Whether the phone number should add country code. Only add if there is NO separate country code element on the page.
 - Whether the phone number should add space between the country code and the area code.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
@@ -16,7 +18,7 @@ Reply in JSON format with the following keys:
 "thought": str, // Think step by step. Describe your thought about how you come up with the phone_number_format. Use information you see on the site to explain.
 "phone_number_format": str, // Think step by step. The format of the phone number required on the page according to HTML elements. Null if is_phone_number_input is False.
 "is_current_format_correct": bool, // True if the current phone number format is matching the required format. Null if is_phone_number_input is False.
-"recommended_phone_number": str, // If is_current_format_correct is True or is_phone_number_input is False, return null. Otherwise, return the recommended phone number with the correct format.
+"recommended_phone_number": str, // If is_current_format_correct is True or is_phone_number_input is False, return null. Otherwise, return the recommended phone number with the correct format. Exclude country code if handled by a separate element.
 }
 
 Context/Intention

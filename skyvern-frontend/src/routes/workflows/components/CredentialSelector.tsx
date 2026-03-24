@@ -4,6 +4,7 @@ import {
   SelectContent,
   SelectItem,
   SelectItemText,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -20,15 +21,16 @@ import {
 type Props = {
   value: string;
   onChange: (value: string) => void;
+  placeholder?: string;
 };
 
-function CredentialSelector({ value, onChange }: Props) {
+function CredentialSelector({ value, onChange, placeholder }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
-  const { data: credentials, isFetching } = useCredentialsQuery({
+  const { data: credentials, isLoading } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
   });
 
-  if (isFetching) {
+  if (isLoading) {
     return <Skeleton className="h-10 w-full" />;
   }
 
@@ -50,9 +52,16 @@ function CredentialSelector({ value, onChange }: Props) {
         }}
       >
         <SelectTrigger>
-          <SelectValue placeholder="Select a credential" />
+          <SelectValue placeholder={placeholder ?? "Select a credential"} />
         </SelectTrigger>
         <SelectContent>
+          <SelectItem value="new">
+            <div className="flex items-center gap-2">
+              <PlusIcon className="size-4" />
+              <span>Add new credential</span>
+            </div>
+          </SelectItem>
+          {credentials.length > 0 && <SelectSeparator />}
           {credentials.map((credential) => (
             <CustomSelectItem
               key={credential.credential_id}
@@ -86,12 +95,6 @@ function CredentialSelector({ value, onChange }: Props) {
               </div>
             </CustomSelectItem>
           ))}
-          <SelectItem value="new">
-            <div className="flex items-center gap-2">
-              <PlusIcon className="size-4" />
-              <span>Add new credential</span>
-            </div>
-          </SelectItem>
         </SelectContent>
       </Select>
       <CredentialsModal

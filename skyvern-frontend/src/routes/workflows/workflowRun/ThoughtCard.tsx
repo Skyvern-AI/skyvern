@@ -8,14 +8,17 @@ type Props = {
   active: boolean;
   thought: ObserverThought;
   onClick: (thought: ObserverThought) => void;
+  cardClassName?: string;
 };
 
-function ThoughtCard({ thought, onClick, active }: Props) {
+function ThoughtCard({ thought, onClick, active, cardClassName }: Props) {
   return (
     <RunCard
       active={active}
       onClick={() => onClick(thought)}
-      className="space-y-3 p-4"
+      className={
+        cardClassName ? `space-y-3 p-4 ${cardClassName}` : "space-y-3 p-4"
+      }
     >
       <div className="flex justify-between">
         <div className="flex gap-3">

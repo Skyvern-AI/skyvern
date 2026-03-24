@@ -1,6 +1,6 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
-import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -160,74 +160,130 @@ class TestIsDownloadResponse:
 
 
 class TestExtractFilename:
-    """Tests for extract_filename()."""
+    """Tests for extract_filename().
+
+    extract_filename returns an empty string when no filename can be determined —
+    the caller (_resolve_save_path) is responsible for generating a fallback name.
+    """
 
     def test_rfc5987_filename_star(self) -> None:
         headers = {"content-disposition": "attachment; filename*=UTF-8''my%20report%282024%29.pdf"}
-        result = extract_filename(headers, "https://example.com/download", 1)
+        result = extract_filename(headers, "https://example.com/download")
         assert result == "my report(2024).pdf"
 
     def test_regular_filename(self) -> None:
         headers = {"content-disposition": 'attachment; filename="report.csv"'}
-        result = extract_filename(headers, "https://example.com/download", 1)
+        result = extract_filename(headers, "https://example.com/download")
         assert result == "report.csv"
 
     def test_unquoted_filename(self) -> None:
         headers = {"content-disposition": "attachment; filename=report.csv"}
-        result = extract_filename(headers, "https://example.com/download", 1)
+        result = extract_filename(headers, "https://example.com/download")
         assert result == "report.csv"
 
     def test_filename_star_takes_priority(self) -> None:
         headers = {
             "content-disposition": "attachment; filename=\"fallback.csv\"; filename*=UTF-8''preferred.csv",
         }
-        result = extract_filename(headers, "https://example.com/download", 1)
+        result = extract_filename(headers, "https://example.com/download")
         assert result == "preferred.csv"
 
     def test_url_path_fallback(self) -> None:
         headers: dict[str, str] = {}
-        result = extract_filename(headers, "https://example.com/files/document.pdf", 1)
+        result = extract_filename(headers, "https://example.com/files/document.pdf")
         assert result == "document.pdf"
 
     def test_url_path_with_encoded_chars(self) -> None:
         headers: dict[str, str] = {}
-        result = extract_filename(headers, "https://example.com/files/my%20report.xlsx", 1)
+        result = extract_filename(headers, "https://example.com/files/my%20report.xlsx")
         assert result == "my report.xlsx"
 
-    def test_url_path_no_extension_uses_fallback(self) -> None:
+    def test_url_path_no_extension_returns_empty(self) -> None:
+        """No extension in URL path and no Content-Disposition — returns empty string."""
         headers: dict[str, str] = {}
-        result = extract_filename(headers, "https://example.com/download", 1)
-        assert result.startswith("download_")
+        result = extract_filename(headers, "https://example.com/download")
+        assert result == ""
 
-    def test_fallback_format(self) -> None:
-        headers: dict[str, str] = {}
-        before = int(time.time())
-        result = extract_filename(headers, "https://example.com/api/export", 42)
-        after = int(time.time())
-        # Should be download_{timestamp}_{index}
-        parts = result.split("_")
-        assert parts[0] == "download"
-        assert before <= int(parts[1]) <= after
-        assert parts[2] == "42"
+    def test_no_headers_no_url_returns_empty(self) -> None:
+        """Completely empty inputs — returns empty string for _resolve_save_path to handle."""
+        result = extract_filename({}, "https://example.com/api/export")
+        assert result == ""
 
     def test_empty_content_disposition(self) -> None:
         headers = {"content-disposition": ""}
-        result = extract_filename(headers, "https://example.com/files/data.csv", 1)
+        result = extract_filename(headers, "https://example.com/files/data.csv")
         assert result == "data.csv"
 
     def test_content_disposition_inline(self) -> None:
         """inline disposition without filename should fall back to URL."""
         headers = {"content-disposition": "inline"}
-        result = extract_filename(headers, "https://example.com/files/report.pdf", 1)
+        result = extract_filename(headers, "https://example.com/files/report.pdf")
         assert result == "report.pdf"
 
-    def test_path_traversal_stripped(self) -> None:
-        """Path traversal in filename should be sanitized to just the filename part."""
+    def test_path_traversal_returned_raw(self) -> None:
+        """extract_filename returns raw name; sanitization is done in _resolve_save_path."""
         headers = {"content-disposition": 'attachment; filename="../../etc/cron.d/evil"'}
-        result = extract_filename(headers, "https://example.com/download", 1)
-        # extract_filename returns the raw name; sanitization is done in _handle_download.
-        # But verify the raw output so tests document the behavior.
+        result = extract_filename(headers, "https://example.com/download")
         assert result == "../../etc/cron.d/evil"
+
+
+class TestResolveSavePath:
+    """Tests for CDPDownloadInterceptor._resolve_save_path()."""
+
+    def _make_interceptor(self, tmp_path: Path) -> CDPDownloadInterceptor:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        return interceptor
+
+    def test_normal_filename(self, tmp_path: Path) -> None:
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("report.pdf")
+        assert filename == "report.pdf"
+        assert save_path == tmp_path / "report.pdf"
+
+    def test_empty_filename_gets_uuid_fallback(self, tmp_path: Path) -> None:
+        """Empty filename should generate a download_{uuid} fallback."""
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("")
+        assert filename.startswith("download_")
+        assert len(filename) > len("download_")
+        assert save_path == tmp_path / filename
+
+    def test_default_param_empty_string(self, tmp_path: Path) -> None:
+        """Calling without arguments should also trigger fallback."""
+        interceptor = self._make_interceptor(tmp_path)
+        _, filename = interceptor._resolve_save_path()
+        assert filename.startswith("download_")
+
+    def test_path_traversal_sanitized(self, tmp_path: Path) -> None:
+        """Path traversal components should be stripped — only the final name is kept."""
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("../../etc/cron.d/evil")
+        assert filename == "evil"
+        assert save_path == tmp_path / "evil"
+
+    def test_increments_download_index(self, tmp_path: Path) -> None:
+        interceptor = self._make_interceptor(tmp_path)
+        assert interceptor._download_index == 0
+        interceptor._resolve_save_path("a.pdf")
+        assert interceptor._download_index == 1
+        interceptor._resolve_save_path("b.pdf")
+        assert interceptor._download_index == 2
+
+    def test_collision_warning_logged(self, tmp_path: Path) -> None:
+        """Existing file with the same name should warn but still return the path."""
+        interceptor = self._make_interceptor(tmp_path)
+        # Create a file that will collide
+        (tmp_path / "report.pdf").write_bytes(b"existing")
+        save_path, filename = interceptor._resolve_save_path("report.pdf")
+        assert filename == "report.pdf"
+        assert save_path == tmp_path / "report.pdf"
+
+    def test_creates_output_dir_if_missing(self, tmp_path: Path) -> None:
+        nested = tmp_path / "sub" / "dir"
+        interceptor = CDPDownloadInterceptor(output_dir=str(nested))
+        save_path, _ = interceptor._resolve_save_path("file.txt")
+        assert nested.exists()
+        assert save_path.parent == nested
 
 
 class TestCDPDownloadInterceptorProxyAuth:

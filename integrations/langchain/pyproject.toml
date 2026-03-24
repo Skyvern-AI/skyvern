@@ -8,10 +8,23 @@ readme = "README.md"
 
 dependencies = [
     "skyvern>=0.2.0",
-    "langchain>=0.3.19,<0.4",
-    "langchain-core>=0.3.81",
+    "langchain>=1.2.0",
+    "langchain-core>=1.2.11",
     "urllib3>=2.6.0",
 ]
+
+[tool.uv]
+override-dependencies = [
+    "authlib>=1.6.9",
+    "pyasn1>=0.6.3",
+    "pyjwt>=2.12.0",
+    "fastmcp>=3.1.1",
+    "mcp>=1.23.0",
+    "websockets>=15.0.1",
+]
+
+[tool.uv.sources]
+skyvern = { path = "../.." }
 
 [build-system]
 requires = ["hatchling"]

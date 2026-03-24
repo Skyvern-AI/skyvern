@@ -161,6 +161,16 @@ class Action(BaseModel):
     modified_at: datetime | None = None
     created_by: str | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"action_type={self.action_type}, "
+            f"element_id={self.element_id}, "
+            f"action_id={self.action_id}, "
+            f"status={self.status}"
+            f")"
+        )
+
     def set_has_mini_agent(self) -> None:
         """
         Set the has_mini_agent flag to True if any mini-agent is involved when handling the action.

@@ -14,6 +14,11 @@ ENV VITE_WSS_BASE_URL=__VITE_WSS_BASE_URL_PLACEHOLDER__
 ENV VITE_ARTIFACT_API_BASE_URL=__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__
 ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
 
+# APP_VERSION is baked into the JS bundle at build time via Vite's define.
+# Pass --build-arg APP_VERSION=$(git rev-parse HEAD) when building the image.
+ARG APP_VERSION=development
+ENV APP_VERSION=$APP_VERSION
+
 # Build at image time
 RUN npm run build
 

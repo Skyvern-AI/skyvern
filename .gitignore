@@ -160,6 +160,7 @@ ig_*
 .idea/
 
 # Skyvern ignores
+browser_sessions/
 videos/
 skyvern/artifacts/
 artifacts/

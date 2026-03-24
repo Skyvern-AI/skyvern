@@ -5,7 +5,7 @@ import pydantic.json
 import structlog
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     ArtifactModel,
@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -35,6 +36,8 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
 )
@@ -42,6 +45,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -89,6 +93,16 @@ from skyvern.webeye.actions.actions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
+    if not raw:
+        return None
+    try:
+        return WorkflowRunTriggerType(raw)
+    except ValueError:
+        LOG.warning("Unknown trigger_type in DB, defaulting to None", trigger_type=raw)
+        return None
 
 
 def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
@@ -211,9 +225,6 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
-        waiting_for_verification_code=task_obj.waiting_for_verification_code or False,
-        verification_code_identifier=task_obj.verification_code_identifier,
-        verification_code_polling_started_at=task_obj.verification_code_polling_started_at,
     )
     return task
 
@@ -278,7 +289,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -286,6 +297,17 @@ async def convert_to_organization_auth_token(
     if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
         credential = AzureClientSecretCredential.model_validate_json(token)
         return AzureOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.bitwarden_credential:
+        credential = BitwardenCredential.model_validate_json(token)
+        return BitwardenOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),
@@ -317,6 +339,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_id=artifact_model.artifact_id,
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
+        bundle_key=artifact_model.bundle_key,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
@@ -429,9 +452,8 @@ def convert_to_workflow_run(
         run_with=workflow_run_model.run_with,
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
-        waiting_for_verification_code=workflow_run_model.waiting_for_verification_code or False,
-        verification_code_identifier=workflow_run_model.verification_code_identifier,
-        verification_code_polling_started_at=workflow_run_model.verification_code_polling_started_at,
+        trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
+        workflow_schedule_id=workflow_run_model.workflow_schedule_id,
     )
 
 
@@ -611,6 +633,7 @@ def convert_to_workflow_run_block(
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
+        error_codes=workflow_run_block_model.error_codes or [],
         engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,
         loop_values=workflow_run_block_model.loop_values,
@@ -741,3 +764,14 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         raise ValueError(f"Unsupported action type: {action_model.action_type}")
 
     return action_class(**action_data)
+
+
+def convert_to_workflow_schedule(
+    workflow_schedule_model: WorkflowScheduleModel, debug_enabled: bool = False
+) -> WorkflowSchedule:
+    if debug_enabled:
+        LOG.debug(
+            "Converting WorkflowScheduleModel to WorkflowSchedule",
+            workflow_schedule_id=workflow_schedule_model.workflow_schedule_id,
+        )
+    return WorkflowSchedule.model_validate(workflow_schedule_model)

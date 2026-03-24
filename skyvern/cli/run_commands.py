@@ -21,6 +21,7 @@ from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware, close_auth_db
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.core.session_manager import close_current_session, set_stateless_http_mode
 from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
+from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime
 from skyvern.cli.utils import start_services
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
@@ -110,6 +111,7 @@ def run_server() -> None:
         port=port,
         log_level="info",
         factory=True,
+        ws="websockets-sansio",
     )
 
 
@@ -236,6 +238,8 @@ def run_dev() -> None:
             "--port",
             str(skyvern_settings.PORT),
             "--factory",
+            "--ws",
+            "websockets-sansio",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -295,6 +299,7 @@ def run_mcp(
     """Run the MCP server with configurable transport for local or remote hosting."""
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
+    configure_mcp_telemetry_runtime(server_mode="local_cli", transport=transport)
     # atexit covers signal-based exits (SIGTERM); finally covers normal
     # mcp.run() completion or unhandled exceptions. Both are needed because
     # atexit doesn't fire on normal return and finally doesn't fire on signals.

@@ -33,6 +33,7 @@ LOG = structlog.get_logger()
     summary="Run an SDK action",
     description="Execute a single SDK action with the specified parameters",
     tags=["SDK"],
+    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "run_sdk_action",
     },
@@ -180,7 +181,7 @@ async def run_sdk_action(
                 timeout=action.timeout,
             )
         elif action.type == "ai_upload_file":
-            if action.file_url and not validate_download_url(action.file_url):
+            if action.file_url and not validate_download_url(action.file_url, organization_id=organization_id):
                 raise HTTPException(status_code=400, detail="Unsupported file url")
             result = await page_ai.ai_upload_file(
                 selector=action.selector,

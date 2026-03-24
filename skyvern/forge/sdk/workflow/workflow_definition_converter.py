@@ -21,6 +21,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
+    WorkflowDefinitionHasDuplicateBlockLabels,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
     WorkflowDefinitionHasUndefinedParameters,
@@ -98,10 +99,17 @@ def convert_workflow_definition(
     if any(parameter.parameter_type == ParameterType.OUTPUT for parameter in workflow_definition_yaml.parameters):
         raise InvalidWorkflowDefinition(message="Cannot manually create output parameters")
 
+    # Collect all block labels recursively (including nested loop blocks) and check for duplicates
+    all_block_labels = _collect_all_block_labels(workflow_definition_yaml.blocks)
+    label_counts: dict[str, int] = {}
+    for label in all_block_labels:
+        label_counts[label] = label_counts.get(label, 0) + 1
+    duplicate_labels = {label for label, count in label_counts.items() if count > 1}
+    if duplicate_labels:
+        raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
+
     # Check if any parameter keys collide with automatically created output parameter keys
-    block_labels = [block.label for block in workflow_definition_yaml.blocks]
-    # TODO (kerem): Check if block labels are unique
-    output_parameter_keys = [f"{block_label}_output" for block_label in block_labels]
+    output_parameter_keys = [f"{label}_output" for label in all_block_labels]
     parameter_keys = [parameter.key for parameter in workflow_definition_yaml.parameters]
     if any(key in output_parameter_keys for key in parameter_keys):
         raise WorkflowDefinitionHasReservedParameterKeys(
@@ -323,6 +331,16 @@ def convert_workflow_definition(
     )
 
     return workflow_definition
+
+
+def _collect_all_block_labels(block_yamls: list[BLOCK_YAML_TYPES]) -> list[str]:
+    """Recursively collect all block labels including those inside for-loop blocks."""
+    labels = []
+    for block_yaml in block_yamls:
+        labels.append(block_yaml.label)
+        if isinstance(block_yaml, ForLoopBlockYAML) and block_yaml.loop_blocks:
+            labels.extend(_collect_all_block_labels(block_yaml.loop_blocks))
+    return labels
 
 
 def _create_all_output_parameters_for_workflow(

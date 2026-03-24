@@ -33,6 +33,7 @@ class SkyvernContext:
     browser_container_task_arn: str | None = None
 
     # feature flags
+    enable_page_ready_wait: bool = False
     enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
@@ -41,6 +42,7 @@ class SkyvernContext:
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
     enable_speed_optimizations: bool = False
+    use_artifact_bundling: bool = False
 
     # script run context
     script_id: str | None = None
@@ -49,6 +51,7 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
+    loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[dict[str, Any]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
@@ -81,6 +84,10 @@ class SkyvernContext:
     # Track if script generation skipped any actions due to missing data (race condition)
     # Used to determine if finalize regeneration is needed at workflow completion
     script_gen_had_incomplete_actions: bool = False
+
+    # Track task_ids where proactive captcha injection has already been attempted,
+    # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
+    proactive_captcha_task_ids: set[str] = field(default_factory=set)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"

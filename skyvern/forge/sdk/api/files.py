@@ -18,19 +18,9 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
 from skyvern.forge import app
-from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.utils.url_validators import encode_url
 
 LOG = structlog.get_logger()
-
-
-async def download_from_s3(client: AsyncAWSClient, s3_uri: str) -> str:
-    downloaded_bytes = await client.download_file(uri=s3_uri)
-    filename = s3_uri.split("/")[-1]  # Extract filename from the end of S3 URI
-    file_path = create_named_temporary_file(delete=False, file_name=filename)
-    LOG.info(f"Downloaded file to {file_path.name}")
-    file_path.write(downloaded_bytes)
-    return file_path.name
 
 
 def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[str, str]) -> tuple[str, str]:
@@ -110,7 +100,7 @@ def _determine_download_filename(
     return sanitize_filename(file_name)
 
 
-def validate_download_url(url: str) -> bool:
+def validate_download_url(url: str, organization_id: str | None = None) -> bool:
     """Validate if a URL is supported for downloading.
 
     Security validation for URL downloads to prevent:
@@ -132,17 +122,14 @@ def validate_download_url(url: str) -> bool:
         if scheme in ("http", "https"):
             return True
 
-        # Allow S3 URIs for Skyvern uploads bucket
-        if scheme == "s3":
-            if url.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"):
+        if scheme in ("s3", "azure"):
+            try:
+                if organization_id is None:
+                    return False
+                app.STORAGE.assert_managed_file_access(url, organization_id)
                 return True
-            return False
-
-        # Allow Azure URIs for Skyvern uploads container
-        if scheme == "azure":
-            if url.startswith(f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"):
-                return True
-            return False
+            except (PermissionError, RuntimeError):
+                return False
 
         # Allow file:// URLs only in local environment
         if scheme == "file":
@@ -172,7 +159,11 @@ async def download_file(
     headers: dict[str, str] | None = None,
     output_dir: str | None = None,
     filename: str | None = None,
+    organization_id: str | None = None,
 ) -> str:
+    if not url or not url.strip():
+        raise ValueError("Download URL is empty — no file download was triggered by the browser")
+
     try:
         # Check if URL is a Google Drive link
         if "drive.google.com" in url:
@@ -182,32 +173,28 @@ async def download_file(
                 url = f"https://drive.google.com/uc?export=download&id={file_id}"
                 LOG.info("Converting Google Drive link to direct download", url=url)
 
-        # Check if URL is a cloud storage URI (S3 or Azure)
+        # Check if URL is a cloud storage URI handled by the configured storage backend.
         parsed = urlparse(url)
-        if parsed.scheme == "s3":
-            uploads_prefix = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"
-            if url.startswith(uploads_prefix):
-                LOG.info("Downloading Skyvern file from S3", url=url)
-                data = await app.STORAGE.download_uploaded_file(url)
-                if data is None:
-                    raise Exception(f"Failed to download file from S3: {url}")
-                filename = url.split("/")[-1]
-                temp_file = create_named_temporary_file(delete=False, file_name=filename)
-                LOG.info(f"Downloaded file to {temp_file.name}")
-                temp_file.write(data)
-                return temp_file.name
-        elif parsed.scheme == "azure":
-            uploads_prefix = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"
-            if url.startswith(uploads_prefix):
-                LOG.info("Downloading Skyvern file from Azure Blob Storage", url=url)
-                data = await app.STORAGE.download_uploaded_file(url)
-                if data is None:
-                    raise Exception(f"Failed to download file from Azure Blob Storage: {url}")
-                filename = url.split("/")[-1]
-                temp_file = create_named_temporary_file(delete=False, file_name=filename)
-                LOG.info(f"Downloaded file to {temp_file.name}")
-                temp_file.write(data)
-                return temp_file.name
+        if parsed.scheme in ("s3", "azure"):
+            if organization_id is None:
+                raise PermissionError(f"No permission to access storage URI: {url}")
+
+            app.STORAGE.assert_managed_file_access(url, organization_id)
+
+            LOG.info(
+                "Downloading managed storage file",
+                url=url,
+                organization_id=organization_id,
+                storage_type=getattr(app.STORAGE, "storage_type", None),
+            )
+            data = await app.STORAGE.download_managed_file(url, organization_id)
+            if data is None:
+                raise Exception(f"Failed to download managed storage file: {url}")
+            filename = url.split("/")[-1]
+            temp_file = create_named_temporary_file(delete=False, file_name=filename)
+            LOG.info(f"Downloaded file to {temp_file.name}")
+            temp_file.write(data)
+            return temp_file.name
 
         # Check if URL is a file:// URI
         # we only support to download local files when the environment is local
@@ -255,6 +242,14 @@ async def download_file(
         raise
     except DownloadFileMaxSizeExceeded as e:
         LOG.exception(f"Failed to download file, max size exceeded: {e.max_size}")
+        raise
+    except PermissionError as e:
+        LOG.warning(
+            "Rejected storage URI download",
+            url=url,
+            organization_id=organization_id,
+            reason=str(e),
+        )
         raise
     except Exception:
         LOG.exception("Failed to download file")

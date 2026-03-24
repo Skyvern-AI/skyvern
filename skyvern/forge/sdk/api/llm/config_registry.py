@@ -151,6 +151,18 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_4",
+        LLMConfig(
+            "gpt-5.4",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -337,6 +349,9 @@ if settings.ENABLE_ANTHROPIC:
             max_completion_tokens=8192,
         ),
     )
+    # All Claude 4+ models require temperature=1 when extended thinking is enabled.
+    # The runtime applies thinking optimization to all Anthropic models, so temperature=1
+    # must be set here to avoid "temperature must be 1" errors from the Anthropic API.
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE4_OPUS",
         LLMConfig(
@@ -345,6 +360,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=32000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -355,6 +371,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -365,6 +382,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -375,6 +393,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -504,6 +523,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -514,6 +534,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=32000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -799,6 +820,31 @@ if settings.ENABLE_AZURE_GPT5_2:
                 api_key=settings.AZURE_GPT5_2_API_KEY,
                 api_version=settings.AZURE_GPT5_2_API_VERSION,
                 model_info={"model_name": "azure/gpt-5.2"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_4:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_4",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_4_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_4_DEPLOYMENT",
+                "AZURE_GPT5_4_API_KEY",
+                "AZURE_GPT5_4_API_BASE",
+                "AZURE_GPT5_4_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_4_API_BASE,
+                api_key=settings.AZURE_GPT5_4_API_KEY,
+                api_version=settings.AZURE_GPT5_4_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.4"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,

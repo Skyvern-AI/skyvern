@@ -1,26 +1,53 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
+  "theme": "palm",
   "name": "Skyvern",
   "colors": {
-    "primary": "#6366F1",
-    "light": "#818CF8",
-    "dark": "#4F46E5"
+    "primary": "#4A6CF7",
+    "light": "#7B93FA",
+    "dark": "#1B2559"
+  },
+  "appearance": {
+    "default": "light"
+  },
+  "background": {
+    "color": {
+      "light": "#F8F5EF",
+      "dark": "#1C1917"
+    }
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg",
+    "light": "/images/skyvern_logo_blackbg.png",
+    "dark": "/logo/dark.png",
     "href": "https://skyvern.com"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
+  "search": {
+    "prompt": "Search Skyvern docs..."
+  },
   "navigation": {
     "tabs": [
+      {
+        "tab": "Home",
+        "pages": ["index"]
+      },
       {
         "tab": "Documentation",
         "groups": [
           {
             "group": "Getting Started",
             "pages": [
+              "getting-started/introduction",
               "getting-started/quickstart",
               "getting-started/core-concepts"
             ]
@@ -67,6 +94,7 @@
             "pages": [
               "debugging/using-artifacts",
               "debugging/troubleshooting-guide",
+              "debugging/observability-with-laminar",
               "debugging/faq"
             ]
           },
@@ -190,14 +218,12 @@
       },
       {
         "tab": "Changelog",
-        "pages": [
-          "changelog"
-        ]
+        "pages": ["changelog"]
       },
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
-      },
+      }
     ]
   },
   "navbar": {
@@ -210,7 +236,7 @@
     "primary": {
       "type": "button",
       "label": "Get API Key",
-      "href": "https://app.skyvern.com/settings/api-keys"
+      "href": "https://app.skyvern.com/settings/"
     }
   },
   "footer": {
@@ -220,6 +246,7 @@
       "twitter": "https://twitter.com/skyvernai"
     }
   },
+  "css": "/style.css",
   "api": {
     "baseUrl": "https://api.skyvern.com",
     "auth": {
@@ -229,5 +256,139 @@
     "playground": {
       "display": "interactive"
     }
-  }
+  },
+  "redirects": [
+    {
+      "source": "/introduction",
+      "destination": "/getting-started/quickstart"
+    },
+    {
+      "source": "/getting-started/skyvern-in-action",
+      "destination": "/getting-started/core-concepts"
+    },
+    {
+      "source": "/getting-started/prompting-guide",
+      "destination": "/debugging/troubleshooting-guide"
+    },
+    {
+      "source": "/running-tasks/run-tasks",
+      "destination": "/running-automations/run-a-task"
+    },
+    {
+      "source": "/running-tasks/visualizing-results",
+      "destination": "/debugging/using-artifacts"
+    },
+    {
+      "source": "/running-tasks/cancel-runs",
+      "destination": "/running-automations/run-a-task"
+    },
+    {
+      "source": "/running-tasks/webhooks-faq",
+      "destination": "/going-to-production/webhooks"
+    },
+    {
+      "source": "/running-tasks/connect-local-browser",
+      "destination": "/self-hosted/browser"
+    },
+    {
+      "source": "/running-tasks/proxy-location",
+      "destination": "/going-to-production/proxy-geolocation"
+    },
+    {
+      "source": "/running-tasks/advanced-features",
+      "destination": "/running-automations/task-parameters"
+    },
+    {
+      "source": "/running-tasks/api-spec",
+      "destination": "/running-automations/run-a-task"
+    },
+    {
+      "source": "/workflows/manage-workflows",
+      "destination": "/cloud/building-workflows/manage-workflows"
+    },
+    {
+      "source": "/workflows/workflow-blocks-details",
+      "destination": "/multi-step-automations/workflow-blocks-reference"
+    },
+    {
+      "source": "/workflows/workflow-parameters",
+      "destination": "/multi-step-automations/workflow-parameters"
+    },
+    {
+      "source": "/workflows/run-workflows",
+      "destination": "/cloud/building-workflows/run-a-workflow"
+    },
+    {
+      "source": "/workflows/consistent-workflows",
+      "destination": "/going-to-production/reliability-tips"
+    },
+    {
+      "source": "/workflows/running-workflows",
+      "destination": "/cloud/building-workflows/run-a-workflow"
+    },
+    {
+      "source": "/workflows/introduction",
+      "destination": "/multi-step-automations/build-a-workflow"
+    },
+    {
+      "source": "/workflows/workflow-blocks",
+      "destination": "/multi-step-automations/workflow-blocks-reference"
+    },
+    {
+      "source": "/workflows/creating-workflows",
+      "destination": "/multi-step-automations/build-a-workflow"
+    },
+    {
+      "source": "/workflows/getting-workflows",
+      "destination": "/multi-step-automations/build-a-workflow#step-7:-get-results"
+    },
+    {
+      "source": "/workflows/what-is-a-parameter",
+      "destination": "/multi-step-automations/workflow-parameters"
+    },
+    {
+      "source": "/credentials/introduction",
+      "destination": "/cloud/managing-credentials/credentials-overview"
+    },
+    {
+      "source": "/credentials/passwords",
+      "destination": "/cloud/managing-credentials/password-credentials"
+    },
+    {
+      "source": "/credentials/credit-cards",
+      "destination": "/cloud/managing-credentials/credit-card-credentials"
+    },
+    {
+      "source": "/credentials/totp",
+      "destination": "/cloud/managing-credentials/totp-setup"
+    },
+    {
+      "source": "/credentials/bitwarden",
+      "destination": "/cloud/managing-credentials/external-providers"
+    },
+    {
+      "source": "/credentials/custom-credential-service",
+      "destination": "/cloud/managing-credentials/external-providers"
+    },
+    {
+      "source": "/browser-sessions/introduction",
+      "destination": "/optimization/browser-sessions"
+    },
+    {
+      "source": "/browser-sessions/browser-profiles",
+      "destination": "/optimization/browser-profiles"
+    },
+    {
+      "source": "/observability/overview",
+      "destination": "/debugging/using-artifacts"
+    },
+    {
+      "source": "/integrations/make.com",
+      "destination": "/integrations/make"
+    },
+    {
+      "source": "/integrations/ollama-litellm",
+      "destination": "/integrations/local-llms"
+    }
+  ]
 }

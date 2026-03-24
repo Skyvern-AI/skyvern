@@ -27,7 +27,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -38,12 +38,14 @@ from skyvern.webeye.actions.actions import (
     ExtractAction,
     SelectOption,
     SolveCaptchaAction,
+    TerminateAction,
 )
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     generate_totp_value,
     get_actual_value_of_parameter_if_secret,
     handle_complete_action,
+    handle_terminate_action,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
@@ -465,7 +467,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 await app.DATABASE.update_action_reasoning(
                     organization_id=str(context.organization_id),
                     action_id=str(created_action.action_id),
-                    reasoning=f"Script execution: {intention[:80]}",
+                    reasoning=f"Script execution: {intention[:80]}" if intention else "Script execution",
                 )
             else:
                 asyncio.create_task(
@@ -626,21 +628,16 @@ class ScriptSkyvernPage(SkyvernPage):
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
-                # Try credential TOTP first (higher priority than webhook/totp_identifier)
-                credential_totp = try_generate_totp_from_credential(workflow_run_id)
-                if credential_totp:
-                    value = credential_totp.value
-                else:
-                    totp_value = await poll_otp_value(
-                        organization_id=organization_id,
-                        task_id=task_id,
-                        workflow_run_id=workflow_run_id,
-                        totp_verification_url=totp_url,
-                        totp_identifier=totp_identifier,
-                    )
-                    if totp_value:
-                        # use the totp verification code
-                        value = totp_value.value
+                totp_value = await poll_otp_value(
+                    organization_id=organization_id,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    totp_verification_url=totp_url,
+                    totp_identifier=totp_identifier,
+                )
+                if totp_value:
+                    # use the totp verification code
+                    value = totp_value.value
 
         return value
 
@@ -762,40 +759,6 @@ class ScriptSkyvernPage(SkyvernPage):
         )
         return ""
 
-    async def _auto_solve_captchas(self) -> bool:
-        """Proactively detect and solve captchas after page load.
-        Returns True if a captcha was detected and solved."""
-        context = skyvern_context.current()
-        is_script = context and context.script_mode
-        try:
-            from cloud.webeye.utils.captcha import cloudflare_detect_and_wait_for_resolve
-
-            # Wait for CapMonster extension to inject its addon div into the DOM.
-            # The extension needs a moment after page load to detect any Turnstile
-            # widget and inject its overlay. We use wait_for with a short timeout
-            # so non-captcha pages only add ~5s latency (acceptable since code mode
-            # saves minutes vs agent mode).
-            capmonster_div = self.page.locator('div[class~="cm-addon-turnstile"]')
-            try:
-                await capmonster_div.wait_for(state="attached", timeout=5_000)
-            except Exception:
-                # No CapMonster div appeared — no Cloudflare captcha on this page
-                return False
-
-            if is_script:
-                print("  🔓 Cloudflare captcha detected, solving...")
-
-            detected, solved = await cloudflare_detect_and_wait_for_resolve(self.page, timeout=90)
-            if detected and is_script:
-                print(f"  {'✓' if solved else '✗'} Cloudflare captcha {'solved' if solved else 'not solved'}")
-            return detected and solved
-        except ImportError:
-            # cloud module not available (open source)
-            return False
-        except Exception:
-            LOG.warning("Auto captcha solve failed", exc_info=True)
-            return False
-
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
         url = prepend_scheme_and_validate_url(url)
@@ -841,7 +804,7 @@ class ScriptSkyvernPage(SkyvernPage):
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             # Fallback: solve directly without DB context
-            await self._auto_solve_captchas()
+            await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.get_task(context.task_id, context.organization_id)
@@ -900,6 +863,47 @@ class ScriptSkyvernPage(SkyvernPage):
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise ScriptTerminationException(result[-1].exception_message)
+
+    @action_wrap(ActionType.TERMINATE)
+    async def terminate(self, errors: list[str], **kwargs: Any) -> None:
+        context = skyvern_context.current()
+        # Only run handler inside a full workflow context (DB lookups + LLM extraction)
+        if (
+            not context
+            or not context.organization_id
+            or not context.workflow_run_id
+            or not context.task_id
+            or not context.step_id
+        ):
+            msg = "Terminate called"
+            if errors:
+                msg += ": " + "; ".join(errors)
+            raise ScriptTerminationException(msg)
+
+        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        if task and step:
+            action = TerminateAction(
+                organization_id=context.organization_id,
+                workflow_run_id=context.workflow_run_id,
+                task_id=context.task_id,
+                step_id=context.step_id,
+                step_order=step.order,
+                action_order=context.action_order,
+                # errors=[] is list[UserDefinedError] for LLM-extracted error codes (populated by
+                # handle_terminate_action); errors param above is list[str] for exception messaging.
+                errors=[],
+                reasoning="; ".join(errors) if errors else None,
+            )
+            try:
+                await handle_terminate_action(action, self.page, self.scraped_page, task, step)
+            except Exception:
+                LOG.warning("handle_terminate_action failed during script terminate()", exc_info=True)
+
+        msg = "Terminate called"
+        if errors:
+            msg += ": " + "; ".join(errors)
+        raise ScriptTerminationException(msg)
 
     async def _update_step_output_before_complete(self, context: skyvern_context.SkyvernContext) -> None:
         """Update step.output with actions_and_results before complete validation.

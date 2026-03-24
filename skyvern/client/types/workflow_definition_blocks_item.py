@@ -39,6 +39,7 @@ from .url_block_parameters_item import UrlBlockParametersItem
 from .validation_block_data_schema import ValidationBlockDataSchema
 from .validation_block_parameters_item import ValidationBlockParametersItem
 from .wait_block_parameters_item import WaitBlockParametersItem
+from .workflow_trigger_block_parameters_item import WorkflowTriggerBlockParametersItem
 
 
 class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
@@ -754,6 +755,32 @@ class WorkflowDefinitionBlocksItem_Wait(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class WorkflowDefinitionBlocksItem_WorkflowTrigger(UniversalBaseModel):
+    block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    workflow_permanent_id: str
+    payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    wait_for_completion: typing.Optional[bool] = None
+    browser_session_id: typing.Optional[str] = None
+    use_parent_browser_session: typing.Optional[bool] = None
+    parameters: typing.Optional[typing.List[WorkflowTriggerBlockParametersItem]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 
 WorkflowDefinitionBlocksItem = typing.Union[
@@ -780,6 +807,7 @@ WorkflowDefinitionBlocksItem = typing.Union[
     WorkflowDefinitionBlocksItem_UploadToS3,
     WorkflowDefinitionBlocksItem_Validation,
     WorkflowDefinitionBlocksItem_Wait,
+    WorkflowDefinitionBlocksItem_WorkflowTrigger,
 ]
 update_forward_refs(WorkflowDefinitionBlocksItem_Action)
 update_forward_refs(WorkflowDefinitionBlocksItem_Code)
@@ -796,3 +824,4 @@ update_forward_refs(WorkflowDefinitionBlocksItem_Task)
 update_forward_refs(WorkflowDefinitionBlocksItem_TextPrompt)
 update_forward_refs(WorkflowDefinitionBlocksItem_Validation)
 update_forward_refs(WorkflowDefinitionBlocksItem_Wait)
+update_forward_refs(WorkflowDefinitionBlocksItem_WorkflowTrigger)

@@ -2,6 +2,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -74,7 +75,7 @@ function LoginBlockCredentialSelector({
       parameter.parameterType === "onepassword",
   );
   const isCloud = useContext(CloudContext);
-  const { data: credentials = [], isFetching } = useCredentialsQuery({
+  const { data: credentials = [], isLoading } = useCredentialsQuery({
     enabled: isCloud,
     page_size: 100,
   });
@@ -120,7 +121,7 @@ function LoginBlockCredentialSelector({
     return !credentialIdsInVault.has(selectedCredentialId);
   }, [selectedCredentialId, credentialIdsInVault]);
 
-  if (isCloud && isFetching) {
+  if (isCloud && isLoading) {
     return <Skeleton className="h-8 w-full" />;
   }
 
@@ -268,6 +269,13 @@ function LoginBlockCredentialSelector({
           )}
         </SelectTrigger>
         <SelectContent>
+          <SelectItem value="new">
+            <div className="flex items-center gap-2">
+              <PlusIcon className="size-4" />
+              <span>Add new credential</span>
+            </div>
+          </SelectItem>
+          {options.length > 0 && <SelectSeparator />}
           {options.map((option) => (
             <SelectItem key={option.value} value={option.value}>
               <div className="flex items-center gap-2">
@@ -287,12 +295,6 @@ function LoginBlockCredentialSelector({
               </div>
             </SelectItem>
           ))}
-          <SelectItem value="new">
-            <div className="flex items-center gap-2">
-              <PlusIcon className="size-4" />
-              <span>Add new credential</span>
-            </div>
-          </SelectItem>
         </SelectContent>
       </Select>
       <CredentialsModal

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from urllib.parse import urlparse
 
@@ -25,6 +26,9 @@ from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedP
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
+
+SETTLE_TIME_MS = 750
+SETTLE_JITTER_MS = 500
 
 
 class RealBrowserState(BrowserState):
@@ -120,10 +124,16 @@ class RealBrowserState(BrowserState):
             if url and page.url.rstrip("/") != url.rstrip("/"):
                 await self.navigate_to_url(page=page, url=url)
 
+    async def _wait_for_settle(self) -> None:
+        total_wait_ms = SETTLE_TIME_MS
+        if SETTLE_JITTER_MS > 0:
+            total_wait_ms += random.randint(0, SETTLE_JITTER_MS)
+        await asyncio.sleep(total_wait_ms / 1000)
+
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
         try:
             for retry_time in range(retry_times):
-                LOG.info(f"Trying to navigate to {url} and waiting for 1 second.", url=url, retry_time=retry_time)
+                LOG.info("Trying to navigate to url", url=url, retry_time=retry_time)
                 try:
                     start_time = time.time()
                     await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -133,9 +143,8 @@ class RealBrowserState(BrowserState):
                         loading_time=end_time - start_time,
                         url=url,
                     )
-                    # Do we need this?
-                    await asyncio.sleep(5)
-                    LOG.info(f"Successfully went to {url}", url=url, retry_time=retry_time)
+                    await self._wait_for_settle()
+                    LOG.info("Successfully navigated to url", url=url, retry_time=retry_time)
                     return
 
                 except Exception as e:
@@ -373,7 +382,7 @@ class RealBrowserState(BrowserState):
     async def reload_page(self) -> None:
         page = await self.__assert_page()
 
-        LOG.info(f"Reload page {page.url} and waiting for 5 seconds")
+        LOG.info("Reload page", url=page.url)
         try:
             start_time = time.time()
             await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -382,7 +391,7 @@ class RealBrowserState(BrowserState):
                 "Page loading time",
                 loading_time=end_time - start_time,
             )
-            await asyncio.sleep(5)
+            await self._wait_for_settle()
         except Exception as e:
             LOG.exception(f"Error while reload url: {repr(e)}")
             raise FailedToReloadPage(url=page.url, error_message=repr(e))

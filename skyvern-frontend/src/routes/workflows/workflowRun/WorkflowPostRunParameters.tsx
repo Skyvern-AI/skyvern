@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { SendEmailBlockParameters } from "./blockInfo/SendEmailBlockInfo";
 import { ProxyLocation } from "@/api/types";
+import { getOrderedRunParameters } from "../utils";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { CodeBlockParameters } from "./blockInfo/CodeBlockParameters";
 import { TextPromptBlockParameters } from "./blockInfo/TextPromptBlockParameters";
@@ -339,7 +340,10 @@ function WorkflowPostRunParameters() {
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <h1 className="text-lg font-bold">Workflow Input Parameters</h1>
-          {Object.entries(parameters).map(([key, value]) => {
+          {getOrderedRunParameters(
+            workflow?.workflow_definition.parameters,
+            parameters,
+          ).map(([key, value]) => {
             return (
               <div key={key} className="flex gap-16">
                 <span className="w-80 truncate text-lg" title={key}>
@@ -362,7 +366,7 @@ function WorkflowPostRunParameters() {
               </div>
             );
           })}
-          {Object.entries(parameters).length === 0 ? (
+          {Object.keys(parameters).length === 0 ? (
             <div>No input parameters found for this workflow</div>
           ) : null}
           <h1 className="text-lg font-bold">Other Workflow Parameters</h1>
@@ -405,15 +409,18 @@ function WorkflowPostRunParameters() {
               <Input value={workflowRun.browser_session_id} readOnly />
             </div>
           ) : null}
-          {workflow?.run_with ? (
+          {workflowRun.run_with ?? workflow?.run_with ? (
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Run With</h1>
                 <h2 className="text-base text-slate-400">
-                  Execution mode for this workflow
+                  Execution mode for this run
                 </h2>
               </div>
-              <Input value={workflow.run_with} readOnly />
+              <Input
+                value={workflowRun.run_with ?? workflow?.run_with ?? ""}
+                readOnly
+              />
             </div>
           ) : null}
           {workflowRun.max_screenshot_scrolls != null ? (

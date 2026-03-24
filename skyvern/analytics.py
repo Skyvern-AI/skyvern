@@ -8,20 +8,30 @@ import structlog
 import typer
 from posthog import Posthog
 
+from skyvern._version import __version__ as _build_version
 from skyvern.config import settings
 
 LOG = structlog.get_logger(__name__)
 
-posthog = Posthog(
-    "phc_bVT2ugnZhMHRWqMvSRHPdeTjaPxQqT3QSsI3r5FlQR5",
-    host="https://app.posthog.com",
-    disable_geoip=False,
+
+def _build_posthog_client(api_key: str, host: str) -> Posthog:
+    return Posthog(api_key, host=host, disable_geoip=False, timeout=2)
+
+
+posthog = _build_posthog_client(
+    settings.POSTHOG_PROJECT_API_KEY,
+    settings.POSTHOG_PROJECT_HOST,
 )
+_custom_posthog_clients: dict[tuple[str, str], Posthog] = {}
 
 DISTINCT_ID = "oss"
 
 
 def get_oss_version() -> str:
+    # CI builds stamp skyvern/_version.py with the git SHA; prefer that.
+    if _build_version and _build_version != "development":
+        return _build_version
+    # Fallback for pip-installed environments (e.g. OSS users)
     try:
         return importlib.metadata.version("skyvern")
     except Exception:
@@ -41,17 +51,63 @@ def analytics_metadata() -> Dict[str, Any]:
     }
 
 
+def dynamic_analytics_metadata() -> Dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if settings.ANALYTICS_TEST_ID:
+        metadata["analytics_test_id"] = settings.ANALYTICS_TEST_ID
+    return metadata
+
+
+def reconfigure_posthog_client(
+    api_key: str | None = None,
+    host: str | None = None,
+) -> None:
+    global posthog
+    posthog = _build_posthog_client(
+        api_key or settings.POSTHOG_PROJECT_API_KEY,
+        host or settings.POSTHOG_PROJECT_HOST,
+    )
+
+
+def _resolve_posthog_client(
+    api_key: str | None = None,
+    host: str | None = None,
+) -> Posthog:
+    if api_key is None and host is None:
+        return posthog
+
+    resolved_api_key = api_key or settings.POSTHOG_PROJECT_API_KEY
+    resolved_host = host or settings.POSTHOG_PROJECT_HOST
+    cache_key = (resolved_api_key, resolved_host)
+    client = _custom_posthog_clients.get(cache_key)
+    if client is None:
+        client = _build_posthog_client(resolved_api_key, resolved_host)
+        _custom_posthog_clients[cache_key] = client
+    return client
+
+
+def flush(
+    api_key: str | None = None,
+    host: str | None = None,
+) -> None:
+    _resolve_posthog_client(api_key=api_key, host=host).flush()
+
+
 def capture(
     event: str,
     data: dict[str, Any] | None = None,
+    distinct_id: str | None = None,
+    api_key: str | None = None,
+    host: str | None = None,
 ) -> None:
     if not settings.SKYVERN_TELEMETRY:
         return
 
     try:
-        distinct_id = settings.ANALYTICS_ID
-        payload: dict[str, Any] = data or {}
-        posthog.capture(distinct_id=distinct_id, event=event, properties=payload)
+        resolved_distinct_id = distinct_id or settings.ANALYTICS_ID
+        payload: dict[str, Any] = {**dynamic_analytics_metadata(), **(data or {})}
+        client = _resolve_posthog_client(api_key=api_key, host=host)
+        client.capture(distinct_id=resolved_distinct_id, event=event, properties=payload)
     except Exception:
         LOG.debug("analytics capture failed", event=event, exc_info=True)
 

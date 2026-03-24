@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { create } from "zustand";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
@@ -31,13 +32,16 @@ type WorkflowHasChangesStore = {
   saveIsPending: boolean;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
-  isInternalUpdate: boolean;
+  // Reference-counted flag: multiple concurrent internal updates won't
+  // accidentally clear each other. Gate on > 0 in consumers.
+  internalUpdateCount: number;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
-  setIsInternalUpdate: (isInternalUpdate: boolean) => void;
+  beginInternalUpdate: () => void;
+  endInternalUpdate: () => void;
 };
 
 interface WorkflowSaveOpts {
@@ -50,7 +54,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     saveIsPending: false,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
-    isInternalUpdate: false,
+    internalUpdateCount: 0,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -67,8 +71,13 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     setShowConfirmCodeCacheDeletion: (show: boolean) => {
       set({ showConfirmCodeCacheDeletion: show });
     },
-    setIsInternalUpdate: (isInternalUpdate: boolean) => {
-      set({ isInternalUpdate });
+    beginInternalUpdate: () => {
+      set((state) => ({ internalUpdateCount: state.internalUpdateCount + 1 }));
+    },
+    endInternalUpdate: () => {
+      set((state) => ({
+        internalUpdateCount: Math.max(0, state.internalUpdateCount - 1),
+      }));
     },
   };
 });
@@ -76,6 +85,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
 const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const {
     getSaveData,
     saidOkToCodeCacheDeletion,
@@ -184,6 +194,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       if (!saveData) {
         return;
       }
+
+      postHog.capture("builder.workflow.saved", {
+        org_id: saveData.workflow.organization_id,
+        workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        block_count: saveData.blocks.length,
+        block_types: saveData.blocks.map((b) => b.block_type),
+      });
 
       toast({
         title: "Changes saved",

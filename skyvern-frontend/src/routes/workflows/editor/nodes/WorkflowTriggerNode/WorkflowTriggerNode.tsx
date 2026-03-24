@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Accordion,
   AccordionContent,
@@ -29,19 +29,23 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { BrowserSessionSelector } from "./BrowserSessionSelector";
+import {
+  PARENT_SESSION_VALUE,
+  FRESH_SESSION_VALUE,
+} from "./browserSessionConstants";
 
 const workflowPermanentIdTooltip =
   "Select the workflow to trigger when this block runs.";
 const payloadTooltip =
   "Parameters to pass to the triggered workflow. Values support Jinja2 templates like {{ some_parameter }}.";
 const waitForCompletionTooltip =
-  "If enabled, this block will wait for the triggered workflow to complete before continuing to the next block. If disabled, the workflow is triggered asynchronously and execution continues immediately.";
-const useParentBrowserSessionTooltip =
-  "When enabled, the triggered workflow will use the same browser session as the parent workflow, continuing where it left off (same tabs, cookies, login state).";
-const browserSessionIdTooltip =
-  "Optional browser session ID to pass to the triggered workflow. This allows the triggered workflow to reuse an existing browser session. Overrides the parent session toggle if set.";
+  "If enabled, this block will wait for the triggered workflow to complete before continuing to the next block. If disabled, the workflow is triggered asynchronously and the parent continues immediately. When disabled, the triggered workflow cannot continue in the same session because the parent may close it before the child finishes.";
+const browserSessionTooltip =
+  "Choose which browser session the triggered workflow should use. Continuing in the same session shares tabs, cookies, and login state. Creating a new browser gives the triggered workflow a fresh browser.";
 
 function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
   const { editable, label } = data;
@@ -64,6 +68,8 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
 
   const update = useUpdate<WorkflowTriggerNodeType["data"]>({ id, editable });
   const recordingStore = useRecordingStore();
+  const { beginInternalUpdate, endInternalUpdate } =
+    useWorkflowHasChangesStore();
 
   const {
     workflowParameters,
@@ -71,12 +77,80 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
     workflowTitle: fetchedTitle,
   } = useTargetWorkflowParametersQuery(data.workflowPermanentId);
 
+  const isCustomBrowserSession =
+    !data.useParentBrowserSession && data.browserSessionId !== "";
+
+  const [useDynamicBrowserSession, setUseDynamicBrowserSession] = useState(
+    isCustomBrowserSession,
+  );
+
+  const browserSessionValue = data.useParentBrowserSession
+    ? PARENT_SESSION_VALUE
+    : data.browserSessionId || FRESH_SESSION_VALUE;
+
+  const handleBrowserSessionChange = useCallback(
+    (value: string) => {
+      if (value === PARENT_SESSION_VALUE) {
+        update({ useParentBrowserSession: true, browserSessionId: "" });
+      } else if (value === FRESH_SESSION_VALUE) {
+        update({ useParentBrowserSession: false, browserSessionId: "" });
+      } else {
+        update({ useParentBrowserSession: false, browserSessionId: value });
+      }
+    },
+    [update],
+  );
+
+  const handleWaitForCompletionChange = useCallback(
+    (checked: boolean) => {
+      if (!checked && data.useParentBrowserSession) {
+        update({
+          waitForCompletion: checked,
+          useParentBrowserSession: false,
+          browserSessionId: "",
+        });
+      } else {
+        update({ waitForCompletion: checked });
+      }
+    },
+    [update, data.useParentBrowserSession],
+  );
+
   // Hydrate title from fetched workflow data (single API call, no duplicate)
+  // Mark as internal update to prevent triggering "unsaved changes" dialog
   useEffect(() => {
     if (fetchedTitle && fetchedTitle !== data.workflowTitle) {
+      beginInternalUpdate();
       update({ workflowTitle: fetchedTitle });
+      let ended = false;
+      const timer = setTimeout(() => {
+        ended = true;
+        endInternalUpdate();
+      }, 50);
+      return () => {
+        clearTimeout(timer);
+        if (!ended) {
+          endInternalUpdate();
+        }
+      };
     }
-  }, [fetchedTitle, data.workflowTitle, update]);
+  }, [
+    fetchedTitle,
+    data.workflowTitle,
+    update,
+    beginInternalUpdate,
+    endInternalUpdate,
+  ]);
+
+  // Signal FlowRenderer to re-layout after async parameters load,
+  // because the skeleton → actual fields transition changes node dimensions
+  const prevIsLoadingRef = useRef(isLoadingParams);
+  useEffect(() => {
+    if (prevIsLoadingRef.current && !isLoadingParams) {
+      window.dispatchEvent(new Event("workflow-trigger-content-changed"));
+    }
+    prevIsLoadingRef.current = isLoadingParams;
+  }, [isLoadingParams]);
 
   const hasWorkflowSelected = isConcreteWpid(data.workflowPermanentId);
 
@@ -164,28 +238,82 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
             )}
           </div>
           <Separator />
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">
+                  Browser Session
+                </Label>
+                <HelpTooltip content={browserSessionTooltip} />
+              </div>
+              <button
+                type="button"
+                className="text-xs text-blue-400 hover:underline"
+                onClick={() => {
+                  const next = !useDynamicBrowserSession;
+                  setUseDynamicBrowserSession(next);
+                  if (!next) {
+                    update({
+                      useParentBrowserSession: data.waitForCompletion,
+                      browserSessionId: "",
+                    });
+                  }
+                }}
+              >
+                {useDynamicBrowserSession
+                  ? "Use selector"
+                  : "Use dynamic value"}
+              </button>
+            </div>
+            {useDynamicBrowserSession ? (
+              <WorkflowBlockInputTextarea
+                nodeId={id}
+                onChange={(value) => {
+                  update({
+                    useParentBrowserSession: false,
+                    browserSessionId: value,
+                  });
+                }}
+                value={data.browserSessionId}
+                placeholder="e.g. {{ browser_session_id }}"
+                className="nopan text-xs"
+              />
+            ) : (
+              <BrowserSessionSelector
+                value={browserSessionValue}
+                onChange={handleBrowserSessionChange}
+                waitForCompletion={data.waitForCompletion}
+              />
+            )}
+          </div>
+          <div className="flex items-center justify-between">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">
+                Wait for Completion
+              </Label>
+              <HelpTooltip content={waitForCompletionTooltip} />
+            </div>
+            <div className="w-52">
+              <Switch
+                checked={data.waitForCompletion}
+                onCheckedChange={handleWaitForCompletionChange}
+              />
+            </div>
+          </div>
+          {!data.waitForCompletion && !useDynamicBrowserSession && (
+            <p className="text-xs text-slate-400">
+              &quot;Continue in the same session&quot; is disabled because the
+              parent workflow may close its browser before the triggered
+              workflow finishes.
+            </p>
+          )}
+          <Separator />
           <Accordion type="single" collapsible>
-            <AccordionItem value="advanced" className="border-b-0">
+            <AccordionItem value="advanced" className="border-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="space-y-4 pl-6 pr-1 pt-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Wait for Completion
-                    </Label>
-                    <HelpTooltip content={waitForCompletionTooltip} />
-                  </div>
-                  <div className="w-52">
-                    <Switch
-                      checked={data.waitForCompletion}
-                      onCheckedChange={(checked) => {
-                        update({ waitForCompletion: checked });
-                      }}
-                    />
-                  </div>
-                </div>
                 <BlockExecutionOptions
                   continueOnFailure={data.continueOnFailure}
                   nextLoopOnFailure={data.nextLoopOnFailure}
@@ -198,50 +326,8 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
                   onNextLoopOnFailureChange={(checked) => {
                     update({ nextLoopOnFailure: checked });
                   }}
+                  hideTopSeparator
                 />
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Use Parent Browser Session
-                      </Label>
-                      <HelpTooltip content={useParentBrowserSessionTooltip} />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.useParentBrowserSession}
-                        onCheckedChange={(checked) => {
-                          update({ useParentBrowserSession: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
-                  {!data.waitForCompletion && data.useParentBrowserSession && (
-                    <p className="text-xs text-yellow-500">
-                      Using the parent browser session while "Wait for
-                      Completion" is off may cause the triggered workflow to
-                      fail if the parent finishes and closes the browser first.
-                    </p>
-                  )}
-                </div>
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Browser Session ID
-                    </Label>
-                    <HelpTooltip content={browserSessionIdTooltip} />
-                  </div>
-                  <WorkflowBlockInputTextarea
-                    nodeId={id}
-                    onChange={(value) => {
-                      update({ browserSessionId: value });
-                    }}
-                    value={data.browserSessionId}
-                    placeholder="Optional: {{ browser_session_id }}"
-                    className="nopan text-xs"
-                  />
-                </div>
-                <Separator />
                 <ParametersMultiSelect
                   availableOutputParameters={availableOutputParameterKeys}
                   parameters={data.parameterKeys}

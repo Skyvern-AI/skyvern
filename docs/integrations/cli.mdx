@@ -83,6 +83,29 @@ skyvern browser login --url https://app.example.com --credential-id cred_xxx
 Every browser command supports `--json` for machine-readable output, and `--session` / `--cdp` to target a specific session. If omitted, the CLI uses the last active session automatically.
 </Tip>
 
+### Connect your local browser to Skyvern Cloud
+
+Expose your local Chrome to Skyvern Cloud so tasks can access localhost, internal tools, and your existing login sessions.
+
+```bash
+# Launch with ngrok tunnel and your Chrome profile's cookies/logins
+skyvern browser serve --tunnel --use-local-profile
+
+# Use a specific Chrome profile
+skyvern browser serve --tunnel --use-local-profile --chrome-profile-name "Profile 2"
+
+# Headless mode with JSON output (for scripting)
+skyvern browser serve --tunnel --headless --json
+```
+
+The `--use-local-profile` flag clones cookies and saved passwords from your Chrome profile into the served browser. Your original profile is never modified, and it works while Chrome is open.
+
+<Warning>
+Always pass `--api-key` when using `--tunnel`. Without it, anyone with the ngrok URL has full browser control.
+</Warning>
+
+See the [full guide](/optimization/browser-tunneling) for all options, manual tunnel setup, and security details.
+
 ### Workflows
 
 ```bash
@@ -122,19 +145,28 @@ skyvern block validate --file block.json   # Validate a block definition
 Register Skyvern's MCP server with your AI coding tool in one command:
 
 ```bash
-skyvern setup claude-code        # Register with Claude Code (global)
-skyvern setup claude-code --project  # Register with Claude Code (project-level)
-skyvern setup claude-desktop     # Register with Claude Desktop
+skyvern setup claude-code             # Auto: .mcp.json in a project, ~/.claude.json otherwise
+skyvern setup claude-code --project   # Force project-local Claude Code config
+skyvern setup claude-code --global    # Force global Claude Code config
+skyvern setup claude                  # Register with Claude Desktop
 skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
-skyvern setup codex              # Register with Codex
+skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
+skyvern mcp switch --dry-run          # Preview changes without writing files
+skyvern mcp profile list              # List saved switch sources
+skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
+
+For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the MCP connection fully local for localhost testing.
+
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, and Codex configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Other
 
 ```bash
 skyvern docs                     # Open documentation in your browser
 skyvern quickstart               # One-command setup + start
+skyvern init                     # Interactive setup without starting services
 skyvern init browser             # Initialize browser configuration only
 ```
 
@@ -169,7 +201,7 @@ skyvern skill copy skyvern -o .     # Copy a single skill
 
 Skills are plain markdown files. You can load them into any AI coding tool that supports custom instructions:
 
-**Claude Code** — add the skill path as a custom instructions file or use `skyvern setup claude-code` which configures MCP (the richer integration path).
+**Claude Code** — the recommended local path is `skyvern quickstart` or `skyvern init`, then choose Claude Code during MCP setup. That writes `.mcp.json` and installs bundled skills like `/qa`. You can also run `skyvern setup claude-code` later if you are configuring MCP separately.
 
 **Codex** — copy the skill into your project's `.codex/skills/` directory:
 
@@ -226,7 +258,7 @@ You can also pass it directly:
 skyvern credentials add --api-key YOUR_KEY
 ```
 
-Get an API key from [Settings](https://app.skyvern.com/settings/api-keys) in the Skyvern dashboard.
+Get an API key from [Settings](https://app.skyvern.com/settings/) in the Skyvern dashboard.
 </Accordion>
 
 <Accordion title="No active browser session">

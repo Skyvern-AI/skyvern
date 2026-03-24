@@ -2,12 +2,12 @@ import time
 from dataclasses import dataclass
 from typing import Annotated, Sequence
 
+import jwt
 import structlog
 from asyncache import cached
 from cachetools import TTLCache
 from fastapi import Header, HTTPException, status
-from jose import jwt
-from jose.exceptions import JWTError
+from jwt.exceptions import PyJWTError
 from opentelemetry import trace
 from pydantic import ValidationError
 
@@ -196,9 +196,10 @@ async def resolve_org_from_api_key(
             x_api_key,
             settings.SECRET_KEY,
             algorithms=[ALGORITHM],
+            options={"verify_exp": False},
         )
         api_key_data = TokenPayload(**payload)
-    except (JWTError, ValidationError):
+    except (PyJWTError, ValidationError):
         LOG.error("Error decoding JWT", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

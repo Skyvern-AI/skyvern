@@ -1,3 +1,4 @@
+import io
 from datetime import datetime
 from pathlib import Path
 from typing import Generator
@@ -11,6 +12,7 @@ from types_boto3_s3.client import S3Client
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.artifact.storage.test_helpers import (
@@ -21,6 +23,7 @@ from skyvern.forge.sdk.artifact.storage.test_helpers import (
     create_fake_workflow_run_block,
 )
 from skyvern.forge.sdk.db.id import generate_artifact_id
+from skyvern.forge.sdk.models import Step
 
 # Test constants
 TEST_BUCKET = "test-skyvern-bucket"
@@ -74,6 +77,7 @@ def boto3_test_client(moto_server: str) -> Generator[S3Client, None, None]:
         endpoint_url=moto_server,
     )
     client.create_bucket(Bucket=TEST_BUCKET)  # Ensure the bucket exists for the test
+    client.create_bucket(Bucket=settings.AWS_S3_BUCKET_UPLOADS)
     yield client
 
 
@@ -375,32 +379,61 @@ class TestS3StorageBrowserSessionFiles:
         exists = await s3_storage.file_exists(uri)
         assert exists is False
 
-    async def test_download_uploaded_file(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
-    ) -> None:
-        """Test downloading an uploaded file."""
-        test_data = b"uploaded file content"
-        test_file = tmp_path / "uploaded.pdf"
-        test_file.write_bytes(test_data)
-
-        uri = await s3_storage.sync_browser_session_file(
-            organization_id=TEST_ORGANIZATION_ID,
-            browser_session_id=TEST_BROWSER_SESSION_ID,
-            artifact_type="downloads",
-            local_file_path=str(test_file),
-            remote_path="uploaded.pdf",
+    async def test_assert_managed_file_access_accepts_org_scoped_uploads(self, s3_storage: S3Storage) -> None:
+        legacy_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/uploaded.pdf"
+        downloads_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/downloads/{settings.ENV}/{TEST_ORGANIZATION_ID}/wr_123/uploaded.pdf"
         )
 
-        downloaded = await s3_storage.download_uploaded_file(uri)
+        s3_storage.assert_managed_file_access(legacy_uri, TEST_ORGANIZATION_ID)
+        s3_storage.assert_managed_file_access(downloads_uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_accepts_artifact_bucket(self, s3_storage: S3Storage) -> None:
+        artifact_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/"
+            "workflow_runs/wr_123/wrb_456/2026-03-23T17:57:58.370827_a_789_pdf.pdf"
+        )
+        s3_storage.assert_managed_file_access(artifact_uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org(self, s3_storage: S3Storage) -> None:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_other/uploaded.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            s3_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org_artifact_bucket(self, s3_storage: S3Storage) -> None:
+        uri = (
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/o_other/"
+            "workflow_runs/wr_123/wrb_456/artifact.pdf"
+        )
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            s3_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_download_managed_file(self, s3_storage: S3Storage) -> None:
+        """Test downloading a managed file."""
+        test_data = b"uploaded file content"
+        saved = await s3_storage.save_legacy_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            filename="uploaded.pdf",
+            fileObj=io.BytesIO(test_data),
+        )
+        assert saved is not None
+
+        _, uri = saved
+        downloaded = await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
         assert downloaded == test_data
 
-    async def test_download_uploaded_file_nonexistent(self, s3_storage: S3Storage) -> None:
-        """Test downloading a non-existent file returns None."""
-        uri = f"s3://{TEST_BUCKET}/nonexistent/path/file.txt"
-        downloaded = await s3_storage.download_uploaded_file(uri)
+    async def test_download_managed_file_nonexistent(self, s3_storage: S3Storage) -> None:
+        """Test downloading a non-existent managed file returns None."""
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/nonexistent/file.txt"
+        downloaded = await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
         assert downloaded is None
 
-    def test_storage_type_property(self, s3_storage: S3Storage) -> None:
+    async def test_download_managed_file_rejects_other_org(self, s3_storage: S3Storage) -> None:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_other/uploaded.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+
+    async def test_storage_type_property(self, s3_storage: S3Storage) -> None:
         """Test storage_type returns 's3'."""
         assert s3_storage.storage_type == "s3"
 
@@ -546,3 +579,209 @@ class TestS3StorageHARCompression:
         obj_response = boto3_test_client.get_object(Bucket=TEST_BUCKET, Key=s3uri.key)
         stored_data = obj_response["Body"].read()
         assert stored_data == test_data
+
+
+_build_zip = ArtifactManager._build_zip
+
+
+@pytest.mark.asyncio
+class TestS3StorageZIPArchiveRetrieve:
+    """Test retrieve_artifact with STEP_ARCHIVE / TASK_ARCHIVE bundle_key extraction."""
+
+    def _make_archive_artifact(
+        self,
+        s3_storage: S3Storage,
+        step: Step,
+        archive_type: ArtifactType,
+        bundle_key: str,
+    ) -> Artifact:
+        archive_artifact_id = generate_artifact_id()
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id=archive_artifact_id,
+            step=step,
+            artifact_type=archive_type,
+        )
+        member_artifact_id = generate_artifact_id()
+        return Artifact(
+            artifact_id=member_artifact_id,
+            artifact_type=ArtifactType.HTML_SCRAPE,
+            uri=uri,
+            bundle_key=bundle_key,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+
+    async def test_retrieve_text_entry_from_step_archive(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        """Retrieve a text artifact stored inside a STEP_ARCHIVE ZIP."""
+        step = create_fake_step(TEST_STEP_ID)
+        bundle_key = "scrape.html"
+        expected = b"<html>hello world</html>"
+        zip_bytes = _build_zip({bundle_key: expected, "element_tree.json": b"[]"})
+
+        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, bundle_key)
+
+        # Upload the archive directly (simulating what _flush_step_archive does)
+        archive_artifact = Artifact(
+            artifact_id=generate_artifact_id(),
+            artifact_type=ArtifactType.STEP_ARCHIVE,
+            uri=artifact.uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+        await s3_storage.store_artifact(archive_artifact, zip_bytes)
+
+        retrieved = await s3_storage.retrieve_artifact(artifact)
+        assert retrieved == expected
+
+    async def test_retrieve_screenshot_from_step_archive(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        """Retrieve a PNG screenshot from a STEP_ARCHIVE ZIP."""
+        step = create_fake_step(TEST_STEP_ID)
+        bundle_key = "screenshot_llm_0.png"
+        fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        zip_bytes = _build_zip({bundle_key: fake_png})
+
+        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, bundle_key)
+        archive_artifact = Artifact(
+            artifact_id=generate_artifact_id(),
+            artifact_type=ArtifactType.STEP_ARCHIVE,
+            uri=artifact.uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+        await s3_storage.store_artifact(archive_artifact, zip_bytes)
+
+        retrieved = await s3_storage.retrieve_artifact(artifact)
+        assert retrieved == fake_png
+
+    async def test_retrieve_from_task_archive(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
+        """Retrieve a browser console log from a TASK_ARCHIVE ZIP."""
+        step = create_fake_step(TEST_STEP_ID)
+        bundle_key = "browser_console.log"
+        log_content = b"[info] page loaded\n[error] fetch failed"
+        zip_bytes = _build_zip({bundle_key: log_content, "har.har": b'{"log":{}}'})
+
+        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.TASK_ARCHIVE, bundle_key)
+        archive_artifact = Artifact(
+            artifact_id=generate_artifact_id(),
+            artifact_type=ArtifactType.TASK_ARCHIVE,
+            uri=artifact.uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+        await s3_storage.store_artifact(archive_artifact, zip_bytes)
+
+        retrieved = await s3_storage.retrieve_artifact(artifact)
+        assert retrieved == log_content
+
+    async def test_retrieve_missing_bundle_key_returns_none(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        """bundle_key that doesn't exist inside the ZIP should return None."""
+        step = create_fake_step(TEST_STEP_ID)
+        zip_bytes = _build_zip({"scrape.html": b"content"})
+
+        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, "nonexistent.txt")
+        archive_artifact = Artifact(
+            artifact_id=generate_artifact_id(),
+            artifact_type=ArtifactType.STEP_ARCHIVE,
+            uri=artifact.uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+        await s3_storage.store_artifact(archive_artifact, zip_bytes)
+
+        result = await s3_storage.retrieve_artifact(artifact)
+        assert result is None
+
+    async def test_retrieve_corrupt_zip_returns_none(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
+        """A corrupt (non-ZIP) payload with a bundle_key should return None gracefully."""
+        step = create_fake_step(TEST_STEP_ID)
+        artifact = self._make_archive_artifact(s3_storage, step, ArtifactType.STEP_ARCHIVE, "scrape.html")
+
+        # Upload garbage bytes as the archive
+        archive_artifact = Artifact(
+            artifact_id=generate_artifact_id(),
+            artifact_type=ArtifactType.STEP_ARCHIVE,
+            uri=artifact.uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+        await s3_storage.store_artifact(archive_artifact, b"this is not a zip file at all")
+
+        result = await s3_storage.retrieve_artifact(artifact)
+        assert result is None
+
+    async def test_retrieve_without_bundle_key_returns_raw_bytes(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        """An artifact with no bundle_key (e.g. RECORDING) is returned as-is."""
+        step = create_fake_step(TEST_STEP_ID)
+        raw_data = b"raw recording bytes"
+        artifact_id_val = generate_artifact_id()
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id=artifact_id_val,
+            step=step,
+            artifact_type=ArtifactType.RECORDING,
+        )
+        artifact = Artifact(
+            artifact_id=artifact_id_val,
+            artifact_type=ArtifactType.RECORDING,
+            uri=uri,
+            bundle_key=None,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+        await s3_storage.store_artifact(artifact, raw_data)
+        retrieved = await s3_storage.retrieve_artifact(artifact)
+        assert retrieved == raw_data
+
+    async def test_build_uri_step_archive_has_zip_extension(self, s3_storage: S3Storage) -> None:
+        """STEP_ARCHIVE URIs should end with .zip (not .zst)."""
+        step = create_fake_step(TEST_STEP_ID)
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id=generate_artifact_id(),
+            step=step,
+            artifact_type=ArtifactType.STEP_ARCHIVE,
+        )
+        assert uri.endswith(".zip")
+        assert not uri.endswith(".zst")
+
+    async def test_build_uri_task_archive_has_zip_extension(self, s3_storage: S3Storage) -> None:
+        """TASK_ARCHIVE URIs should end with .zip (not .zst)."""
+        step = create_fake_step(TEST_STEP_ID)
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id=generate_artifact_id(),
+            step=step,
+            artifact_type=ArtifactType.TASK_ARCHIVE,
+        )
+        assert uri.endswith(".zip")
+        assert not uri.endswith(".zst")

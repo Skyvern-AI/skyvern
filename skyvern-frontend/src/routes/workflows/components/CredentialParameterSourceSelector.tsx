@@ -2,6 +2,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -19,7 +20,7 @@ type Props = {
 };
 
 function CredentialParameterSourceSelector({ value, onChange }: Props) {
-  const { data: credentials, isFetching } = useCredentialsQuery({
+  const { data: credentials, isLoading } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
   });
   // Use local state for modal to avoid conflicts with other CredentialsModal instances
@@ -31,7 +32,7 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
       parameter.dataType === WorkflowParameterValueType.CredentialId,
   );
 
-  if (isFetching) {
+  if (isLoading) {
     return <Skeleton className="h-10 w-full" />;
   }
 
@@ -73,17 +74,18 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
           <SelectValue placeholder="Select a credential" />
         </SelectTrigger>
         <SelectContent>
-          {options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
-              {option.label}
-            </SelectItem>
-          ))}
           <SelectItem value="new">
             <div className="flex items-center gap-2">
               <PlusIcon className="size-4" />
               <span>Add new credential</span>
             </div>
           </SelectItem>
+          {options.length > 0 && <SelectSeparator />}
+          {options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
         </SelectContent>
       </Select>
       <CredentialsModal

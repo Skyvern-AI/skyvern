@@ -596,6 +596,30 @@ class WorkflowDefinitionYamlBlocksItem_Wait(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class WorkflowDefinitionYamlBlocksItem_WorkflowTrigger(UniversalBaseModel):
+    block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    workflow_permanent_id: str
+    payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    wait_for_completion: typing.Optional[bool] = None
+    browser_session_id: typing.Optional[str] = None
+    use_parent_browser_session: typing.Optional[bool] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 WorkflowDefinitionYamlBlocksItem = typing.Union[
     WorkflowDefinitionYamlBlocksItem_Action,
     WorkflowDefinitionYamlBlocksItem_Code,
@@ -620,5 +644,6 @@ WorkflowDefinitionYamlBlocksItem = typing.Union[
     WorkflowDefinitionYamlBlocksItem_UploadToS3,
     WorkflowDefinitionYamlBlocksItem_Validation,
     WorkflowDefinitionYamlBlocksItem_Wait,
+    WorkflowDefinitionYamlBlocksItem_WorkflowTrigger,
 ]
 update_forward_refs(WorkflowDefinitionYamlBlocksItem_ForLoop)

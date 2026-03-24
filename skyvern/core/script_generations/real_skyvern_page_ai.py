@@ -20,7 +20,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
@@ -257,10 +257,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if value and isinstance(data, dict) and "value" not in data:
                     data["value"] = value
 
-                # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
-                otp_value = try_generate_totp_from_credential(workflow_run_id)
-                # Fall back to webhook/totp_identifier
-                if not otp_value and (totp_identifier or totp_url) and context and organization_id and task_id:
+                otp_value = None
+                if (totp_identifier or totp_url) and context and organization_id and task_id:
                     if totp_identifier:
                         totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
                     if totp_url:
@@ -447,7 +445,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
 
-        if public_url_only and not validate_download_url(files):
+        if public_url_only and not validate_download_url(files, organization_id=organization_id):
             raise Exception("Only public URLs are allowed")
 
         if action and organization_id and task and step:

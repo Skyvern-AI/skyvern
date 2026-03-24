@@ -412,6 +412,58 @@ class TestForLoopScriptExecution:
         assert isinstance(func, cst.Attribute)
         assert func.attr.value == "loop"
 
+    def test_forloop_uses_loop_over_parameter_key(self) -> None:
+        """Verify that ForLoop falls back to loop_over.key when loop_variable_reference is null.
+
+        This is the most common pattern: workflows created with loop_over_parameter_key
+        store the parameter reference in loop_over (a workflow parameter object), not
+        in loop_variable_reference.
+        """
+        forloop_block = {
+            "block_type": "for_loop",
+            "label": "iterate_items",
+            "loop_variable_reference": None,
+            "loop_over": {"key": "items", "parameter_type": "workflow", "workflow_parameter_type": "json"},
+            "loop_blocks": [],
+        }
+
+        result = _build_for_loop_statement("iterate_items", forloop_block)
+        code = cst.Module(body=[result]).code
+
+        # Should reference "items" parameter, not None
+        assert "values = 'items'" in code or 'values = "items"' in code
+        assert "values = None" not in code
+
+    def test_forloop_prefers_loop_variable_reference_over_loop_over(self) -> None:
+        """When both loop_variable_reference and loop_over are set, prefer loop_variable_reference."""
+        forloop_block = {
+            "block_type": "for_loop",
+            "label": "my_loop",
+            "loop_variable_reference": "{{ extracted_rows }}",
+            "loop_over": {"key": "urls", "parameter_type": "workflow"},
+            "loop_blocks": [],
+        }
+
+        result = _build_for_loop_statement("my_loop", forloop_block)
+        code = cst.Module(body=[result]).code
+
+        assert "extracted_rows" in code
+        assert "values = 'urls'" not in code and 'values = "urls"' not in code
+
+    def test_forloop_with_no_values_source_generates_empty_string(self) -> None:
+        """When neither loop_variable_reference nor loop_over is set, values defaults to empty string."""
+        forloop_block = {
+            "block_type": "for_loop",
+            "label": "iterate_items",
+            "loop_blocks": [],
+        }
+
+        result = _build_for_loop_statement("iterate_items", forloop_block)
+        code = cst.Module(body=[result]).code
+
+        # Should have values = '' (empty string), not None
+        assert "values = ''" in code or 'values = ""' in code
+
 
 class TestForLoopScriptCompilation:
     """Test that generated scripts with ForLoop blocks compile without SyntaxError.

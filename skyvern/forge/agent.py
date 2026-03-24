@@ -105,11 +105,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
-    poll_otp_value,
-    try_generate_totp_from_credential,
-)
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -601,6 +597,7 @@ class ForgeAgent:
                         task,
                         status=TaskStatus.completed,
                     )
+                    await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                     await self.clean_up_task(
                         task=completed_task,
                         last_step=last_step,
@@ -613,6 +610,8 @@ class ForgeAgent:
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
                 maybe_next_step = await self.handle_failed_step(organization, task, step)
+                # Flush after handle_failed_step (no verification runs for failed steps).
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 # If there is no next step, it means that the task has failed
                 if maybe_next_step:
                     next_step = maybe_next_step
@@ -643,6 +642,10 @@ class ForgeAgent:
                     engine=engine,
                     complete_verification=complete_verification,
                 )
+                # Flush here (after handle_completed_step) so that verification LLM artifacts
+                # from check_user_goal_complete/complete_verify are included in the same
+                # step archive as the rest of the step data.
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
                     await self.clean_up_task(
@@ -668,6 +671,8 @@ class ForgeAgent:
                     "Unexpected step status after agent_step",
                     step_status=step.status,
                 )
+                # Flush for unexpected step status to release any buffered data.
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
 
             cua_response_param = detailed_output.cua_response if detailed_output else None
             if not cua_response_param and cua_response:
@@ -977,7 +982,7 @@ class ForgeAgent:
                 context.step_id = step.step_id
 
             step = await self.update_step(step=step, status=StepStatus.running)
-            await app.AGENT_FUNCTION.prepare_step_execution(
+            injected_actions = await app.AGENT_FUNCTION.prepare_step_execution(
                 organization=organization, task=task, step=step, browser_state=browser_state
             )
 
@@ -1020,7 +1025,17 @@ class ForgeAgent:
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
             actions: list[Action]
 
-            if engine == RunEngine.openai_cua:
+            # If prepare_step_execution injected actions (e.g. proactive captcha solving),
+            # skip LLM entirely and use the injected actions directly.
+            if injected_actions is not None:
+                LOG.info(
+                    "Using injected actions from prepare_step_execution, skipping LLM",
+                    step_id=step.step_id,
+                    num_actions=len(injected_actions),
+                    action_types=[a.action_type for a in injected_actions],
+                )
+                actions = injected_actions
+            elif engine == RunEngine.openai_cua:
                 actions, new_cua_response = await self._generate_cua_actions(
                     task=task,
                     step=step,
@@ -1084,26 +1099,31 @@ class ForgeAgent:
                     if json_response is None:
                         raise MissingExtractActionsResponse()
                     try:
-                        if pdf_embed_src := scraped_page.check_pdf_viewer_embed():
+                        # Check for PDF viewer: either <embed type="application/pdf"> or
+                        # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
+                        pdf_src = scraped_page.check_pdf_viewer_embed()
+                        if not pdf_src:
+                            pdf_src = await scraped_page.check_pdf_iframe()
+                        if pdf_src:
                             LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
                             pdf_bytes: bytes | None = None
                             download_url: str | None = None
 
-                            # Check if the embed src is a data URI with base64 encoded PDF
+                            # Check if the src is a data URI with base64 encoded PDF
                             # Format: data:application/pdf[;charset=...];base64,<base64_data>
-                            if pdf_embed_src.startswith("data:application/pdf"):
+                            if pdf_src.startswith("data:application/pdf"):
                                 # Use more precise regex to extract base64 data after the base64, prefix
                                 # This pattern matches: data:application/pdf[;optional_params];base64,<data>
-                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_embed_src, re.S)
+                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
                                 if not m:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
                                     )
 
                                 base64_data = m.group(1)
                                 LOG.info(
-                                    "Found base64 data in PDF embed src",
+                                    "Found base64 data in PDF src",
                                     step_id=step.step_id,
                                     base64_data_length=len(base64_data),
                                 )
@@ -1113,17 +1133,17 @@ class ForgeAgent:
                                     pdf_bytes = base64.b64decode(base64_data, validate=True)
                                 except Exception as e:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason=f"Failed to decode base64 data: {str(e)}",
                                     ) from e
                             else:
                                 # If not a data URI, treat it as a URL
                                 LOG.info(
-                                    "Found PDF embed src as URL (not base64 data)",
+                                    "Found PDF src as URL (not base64 data)",
                                     step_id=step.step_id,
-                                    download_url=pdf_embed_src,
+                                    download_url=pdf_src,
                                 )
-                                download_url = pdf_embed_src
+                                download_url = pdf_src
 
                             actions = [
                                 DownloadFileAction(
@@ -1969,6 +1989,28 @@ class ForgeAgent:
 
         LOG.debug("Persisting speculative LLM metadata")
 
+        _ctx = skyvern_context.current()
+        if _ctx and _ctx.use_artifact_bundling and not step.is_speculative:
+            if screenshots:
+                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                    step=step,
+                    screenshots=screenshots,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                )
+            app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                step=step,
+                prompt=metadata.prompt.encode("utf-8") if metadata.prompt else None,
+                request=metadata.llm_request_json.encode("utf-8") if metadata.llm_request_json else None,
+                response=metadata.llm_response_json.encode("utf-8") if metadata.llm_response_json else None,
+                parsed_response=metadata.parsed_response_json.encode("utf-8")
+                if metadata.parsed_response_json
+                else None,
+                rendered_response=metadata.rendered_response_json.encode("utf-8")
+                if metadata.rendered_response_json
+                else None,
+            )
+            return
+
         artifacts = []
         if metadata.prompt:
             artifacts.append(
@@ -2320,17 +2362,27 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
-                screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                    data=screenshot,
-                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    step=step,
-                )
-                if screenshot_request:
-                    artifacts.append(screenshot_request)
-                    for artifact_data in screenshot_request.artifacts:
-                        if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
-                            screenshot_artifact_id = artifact_data.artifact_model.artifact_id
-                            break
+                _ctx = skyvern_context.current()
+                if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
+                    ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                        step=step,
+                        screenshots=[screenshot],
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                    )
+                    if ids:
+                        screenshot_artifact_id = ids[0]
+                else:
+                    screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                        data=screenshot,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        step=step,
+                    )
+                    if screenshot_request:
+                        artifacts.append(screenshot_request)
+                        for artifact_data in screenshot_request.artifacts:
+                            if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
+                                screenshot_artifact_id = artifact_data.artifact_model.artifact_id
+                                break
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2340,13 +2392,17 @@ class ForgeAgent:
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
-            artifacts.append(
-                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                    data=html.encode(),
-                    artifact_type=ArtifactType.HTML_ACTION,
-                    step=step,
+            _ctx = skyvern_context.current()
+            if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
+                app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html.encode("utf-8"))
+            else:
+                artifacts.append(
+                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                        data=html.encode(),
+                        artifact_type=ArtifactType.HTML_ACTION,
+                        step=step,
+                    )
                 )
-            )
         except Exception:
             LOG.exception("Failed to record html after action")
 
@@ -2355,23 +2411,33 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
             except Exception:
                 LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
+
+        if screenshot_artifact_id and action.action_id and action.organization_id:
+            action.screenshot_artifact_id = screenshot_artifact_id
+            _ctx = skyvern_context.current()
+            if step and _ctx and _ctx.use_artifact_bundling:
+                # Defer the DB write until _flush_step_archive so the artifact row
+                # exists before the action row references it.
+                app.ARTIFACT_MANAGER.queue_action_screenshot_update(
+                    step=step,
+                    organization_id=action.organization_id,
+                    action_id=action.action_id,
+                    artifact_id=screenshot_artifact_id,
+                )
             else:
-                if screenshot_artifact_id and action.action_id and action.organization_id:
-                    try:
-                        # TODO: consider batching screenshot artifact updates to reduce per-action DB writes.
-                        await app.DATABASE.update_action_screenshot_artifact_id(
-                            organization_id=action.organization_id,
-                            action_id=action.action_id,
-                            screenshot_artifact_id=screenshot_artifact_id,
-                        )
-                        action.screenshot_artifact_id = screenshot_artifact_id
-                    except Exception:
-                        LOG.warning(
-                            "Failed to update action with screenshot artifact id",
-                            action_id=action.action_id,
-                            screenshot_artifact_id=screenshot_artifact_id,
-                            exc_info=True,
-                        )
+                try:
+                    await app.DATABASE.update_action_screenshot_artifact_id(
+                        organization_id=action.organization_id,
+                        action_id=action.action_id,
+                        screenshot_artifact_id=screenshot_artifact_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to update action with screenshot artifact id",
+                        action_id=action.action_id,
+                        screenshot_artifact_id=screenshot_artifact_id,
+                        exc_info=True,
+                    )
 
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
@@ -2521,6 +2587,28 @@ class ForgeAgent:
                     )
                     context.enable_speed_optimizations = False
 
+                try:
+                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                    context.use_artifact_bundling = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "USE_ARTIFACT_BUNDLING",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id},
+                    )
+                    LOG.debug(
+                        "USE_ARTIFACT_BUNDLING flag resolved",
+                        use_artifact_bundling=context.use_artifact_bundling,
+                        distinct_id=distinct_id,
+                        organization_id=task.organization_id,
+                        task_id=task.task_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to check USE_ARTIFACT_BUNDLING feature flag",
+                        exc_info=True,
+                        task_id=task.task_id,
+                    )
+                    context.use_artifact_bundling = False
+
             # start the async tasks while running scrape_website
             if engine not in CUA_ENGINES:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
@@ -2591,7 +2679,7 @@ class ForgeAgent:
                 step,
                 browser_state,
                 scraped_page,
-                verification_code_check=True,
+                verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
                 expire_verification_code=True,
             )
 
@@ -2610,12 +2698,6 @@ class ForgeAgent:
         This is used both for regular runs and when adopting a speculative plan.
         """
 
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.HTML_SCRAPE,
-            data=scraped_page.html.encode(),
-        )
-
         element_tree_format = ElementTreeFormat.HTML
         element_tree_in_prompt = self._build_element_tree_for_prompt(
             scraped_page=scraped_page,
@@ -2625,31 +2707,45 @@ class ForgeAgent:
             element_tree_format=element_tree_format,
         )
 
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-            data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-            data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-            data=json.dumps(scraped_page.element_tree, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-            data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-            data=element_tree_in_prompt.encode(),
-        )
+        if context and context.use_artifact_bundling:
+            app.ARTIFACT_MANAGER.accumulate_scrape_to_archive(
+                step=step,
+                html=scraped_page.html.encode("utf-8"),
+                id_css_map=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
+                id_frame_map=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
+                element_tree=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+                element_tree_trimmed=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                element_tree_in_prompt=element_tree_in_prompt.encode("utf-8"),
+            )
+        else:
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step, artifact_type=ArtifactType.HTML_SCRAPE, data=scraped_page.html.encode("utf-8")
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+                data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+                data=element_tree_in_prompt.encode("utf-8"),
+            )
 
     def _build_element_tree_for_prompt(
         self,
@@ -3586,9 +3682,11 @@ class ForgeAgent:
             n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
         )
         if latest_action_screenshot_artifacts:
-            latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
+            raw_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(
                 latest_action_screenshot_artifacts
             )
+            filtered_urls = [url for url in raw_urls if url is not None]
+            latest_action_screenshot_urls = filtered_urls if filtered_urls else None
 
         if task.organization_id:
             try:
@@ -3670,33 +3768,52 @@ class ForgeAgent:
                     data=video_artifact.video_data,
                 )
 
+            _ctx = skyvern_context.current()
+            _use_bundling = _ctx.use_artifact_bundling if _ctx else False
+
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
             LOG.debug("Uploading har data", har_size=len(har_data))
-            if har_data:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.HAR,
-                    data=har_data,
-                )
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
             LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
-            if browser_log:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.BROWSER_CONSOLE_LOG,
-                    data=browser_log,
-                )
 
+            trace_data: bytes | None = None
             if browser_state.browser_context and browser_state.browser_artifacts.traces_dir:
                 trace_path = f"{browser_state.browser_artifacts.traces_dir}/{task.task_id}.zip"
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.TRACE,
-                    path=trace_path,
-                )
+                try:
+                    with open(trace_path, "rb") as f:
+                        trace_data = f.read()
+                except Exception:
+                    LOG.warning("Failed to read trace file", trace_path=trace_path, exc_info=True)
+
+            if _use_bundling:
+                task_archive_entries: dict[str, tuple[ArtifactType, bytes]] = {}
+                if har_data:
+                    task_archive_entries["har.har"] = (ArtifactType.HAR, har_data)
+                if browser_log:
+                    task_archive_entries["browser_console.log"] = (ArtifactType.BROWSER_CONSOLE_LOG, browser_log)
+                if trace_data:
+                    task_archive_entries["trace.zip"] = (ArtifactType.TRACE, trace_data)
+                if task_archive_entries:
+                    await app.ARTIFACT_MANAGER.create_task_archive(
+                        step=last_step,
+                        entries=task_archive_entries,
+                    )
+            else:
+                if har_data:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step, artifact_type=ArtifactType.HAR, data=har_data
+                    )
+                if browser_log:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step, artifact_type=ArtifactType.BROWSER_CONSOLE_LOG, data=browser_log
+                    )
+                if trace_data:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step, artifact_type=ArtifactType.TRACE, data=trace_data
+                    )
         else:
             LOG.warning(
                 "BrowserState is missing before sending response to webhook_callback_url",
@@ -4526,6 +4643,9 @@ class ForgeAgent:
         if not task.organization_id:
             return json_response, []
 
+        if not task.totp_verification_url and not task.totp_identifier:
+            return json_response, []
+
         should_verify_by_magic_link = json_response.get("should_verify_by_magic_link")
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
@@ -4546,10 +4666,8 @@ class ForgeAgent:
             return json_response, actions
 
         if should_verify_by_magic_link:
-            # Magic links still require TOTP config (need a source to poll the link from)
-            if task.totp_verification_url or task.totp_identifier:
-                actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
-                return json_response, actions
+            actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
+            return json_response, actions
 
         return json_response, []
 
@@ -4606,40 +4724,31 @@ class ForgeAgent:
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
-        if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
+        if (
+            place_to_enter_verification_code
+            and should_enter_verification_code
+            and (task.totp_verification_url or task.totp_identifier)
+            and task.organization_id
+        ):
             LOG.info("Need verification code")
-            # 1. Check navigation payload first for inline OTP.
-            otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-            if otp_value:
-                # Code was already in the payload the LLM saw, so its actions are already correct.
-                # No need to re-prompt, generate from credentials, or poll.
-                return json_response
-
-            # 2. Then try to generate TOTP from credential if payload has no OTP.
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-            # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
-            if not otp_value:
-                workflow_id = workflow_permanent_id = None
-                if task.workflow_run_id:
-                    workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
-                    if workflow_run:
-                        workflow_id = workflow_run.workflow_id
-                        workflow_permanent_id = workflow_run.workflow_permanent_id
-                otp_value = await poll_otp_value(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=task.workflow_run_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
-
+            workflow_id = workflow_permanent_id = None
+            if task.workflow_run_id:
+                workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                if workflow_run:
+                    workflow_id = workflow_run.workflow_id
+                    workflow_permanent_id = workflow_run.workflow_permanent_id
+            otp_value = await poll_otp_value(
+                organization_id=task.organization_id,
+                task_id=task.task_id,
+                workflow_id=workflow_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
+            )
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 
-            # Store the code so _build_navigation_payload injects it, then re-prompt
-            # the LLM so it generates actions that type the real code.
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = otp_value.value
 

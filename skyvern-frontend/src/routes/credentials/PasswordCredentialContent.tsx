@@ -14,6 +14,7 @@ import {
   EyeNoneIcon,
   EyeOpenIcon,
   MobileIcon,
+  Pencil1Icon,
 } from "@radix-ui/react-icons";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
@@ -44,6 +45,10 @@ type Props = {
   urlDisabled?: boolean;
   /** Slot rendered between URL and the separator before Username (e.g. browser profile checkbox) */
   afterUrl?: React.ReactNode;
+  editMode?: boolean;
+  editingGroups?: { name: boolean; values: boolean };
+  onEnableEditName?: () => void;
+  onEnableEditValues?: () => void;
 };
 
 function PasswordCredentialContent({
@@ -54,14 +59,35 @@ function PasswordCredentialContent({
   urlRequired,
   urlDisabled,
   afterUrl,
+  editMode,
+  editingGroups,
+  onEnableEditName,
+  onEnableEditValues,
 }: Props) {
   const { name, username, password, totp, totp_type, totp_identifier } = values;
+  const nameReadOnly = editMode && !editingGroups?.name;
+  const valuesReadOnly = editMode && !editingGroups?.values;
+
   const [totpMethod, setTotpMethod] = useState<
     "authenticator" | "email" | "text"
   >(
     totp_type === "email" || totp_type === "text" ? totp_type : "authenticator",
   );
+  const [totpAccordionValue, setTotpAccordionValue] = useState<string>("");
   const [showPassword, setShowPassword] = useState(false);
+
+  // Sync totpMethod and auto-expand accordion when totp_type prop changes
+  // (e.g. edit data arriving after mount)
+  useEffect(() => {
+    setTotpMethod(
+      totp_type === "email" || totp_type === "text"
+        ? totp_type
+        : "authenticator",
+    );
+    if (totp_type && totp_type !== "none") {
+      setTotpAccordionValue("two-factor-authentication");
+    }
+  }, [totp_type]);
   const prevUsernameRef = useRef(username);
   const prevTotpMethodRef = useRef<typeof totpMethod>(totpMethod);
   const totpIdentifierLabel =
@@ -118,10 +144,11 @@ function PasswordCredentialContent({
     prevTotpMethodRef.current = totpMethod;
   }, [totpMethod, totp_identifier, updateValues, username]);
 
-  // Update totp_type when totpMethod changes
+  // Update totp_type when totpMethod changes; also enter edit mode for values
   const handleTotpMethodChange = (
     method: "authenticator" | "email" | "text",
   ) => {
+    onEnableEditValues?.();
     setTotpMethod(method);
     updateValues({
       totp: method === "authenticator" ? totp : "",
@@ -135,10 +162,24 @@ function PasswordCredentialContent({
         <div className="w-40 shrink-0">
           <Label>Name</Label>
         </div>
-        <Input
-          value={name}
-          onChange={(e) => updateValues({ name: e.target.value })}
-        />
+        <div className="relative w-full">
+          <Input
+            value={name}
+            onChange={(e) => updateValues({ name: e.target.value })}
+            readOnly={nameReadOnly}
+            className={cn({ "pr-9 opacity-70": nameReadOnly })}
+          />
+          {nameReadOnly && (
+            <button
+              type="button"
+              className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+              onClick={onEnableEditName}
+              aria-label="Edit name"
+            >
+              <Pencil1Icon className="size-4" />
+            </button>
+          )}
+        </div>
       </div>
 
       {onUrlChange !== undefined && (
@@ -166,39 +207,73 @@ function PasswordCredentialContent({
         <div className="w-40 shrink-0">
           <Label>Username or Email</Label>
         </div>
-        <Input
-          value={username}
-          onChange={(e) => updateValues({ username: e.target.value })}
-        />
+        <div className="relative w-full">
+          <Input
+            value={username}
+            onChange={(e) => updateValues({ username: e.target.value })}
+            readOnly={valuesReadOnly}
+            className={cn({ "pr-9 opacity-70": valuesReadOnly })}
+          />
+          {valuesReadOnly && (
+            <button
+              type="button"
+              className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+              onClick={onEnableEditValues}
+              aria-label="Edit credential values"
+            >
+              <Pencil1Icon className="size-4" />
+            </button>
+          )}
+        </div>
       </div>
       <div className="flex items-center gap-12">
         <div className="w-40 shrink-0">
           <Label>Password</Label>
         </div>
-        <div className="relative w-full">
-          <Input
-            className="pr-9"
-            type={showPassword ? "text" : "password"}
-            value={password}
-            onChange={(e) => updateValues({ password: e.target.value })}
-          />
-          <div
-            className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center"
-            onClick={() => {
-              setShowPassword((value) => !value);
-            }}
-            aria-label="Toggle password visibility"
-          >
-            {showPassword ? (
-              <EyeOpenIcon className="size-4" />
-            ) : (
-              <EyeNoneIcon className="size-4" />
-            )}
+        {valuesReadOnly ? (
+          <div className="relative w-full">
+            <Input value="••••••••" readOnly className="pr-9 opacity-70" />
+            <button
+              type="button"
+              className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+              onClick={onEnableEditValues}
+              aria-label="Edit credential values"
+            >
+              <Pencil1Icon className="size-4" />
+            </button>
           </div>
-        </div>
+        ) : (
+          <div className="relative w-full">
+            <Input
+              className="pr-9"
+              type={showPassword ? "text" : "password"}
+              value={password}
+              onChange={(e) => updateValues({ password: e.target.value })}
+              placeholder={editMode ? "••••••••" : undefined}
+            />
+            <div
+              className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center"
+              onClick={() => {
+                setShowPassword((value) => !value);
+              }}
+              aria-label="Toggle password visibility"
+            >
+              {showPassword ? (
+                <EyeOpenIcon className="size-4" />
+              ) : (
+                <EyeNoneIcon className="size-4" />
+              )}
+            </div>
+          </div>
+        )}
       </div>
       <Separator />
-      <Accordion type="single" collapsible>
+      <Accordion
+        type="single"
+        collapsible
+        value={totpAccordionValue}
+        onValueChange={setTotpAccordionValue}
+      >
         <AccordionItem value="two-factor-authentication" className="border-b-0">
           <AccordionTrigger className="py-2">
             Two-Factor Authentication
@@ -254,12 +329,26 @@ function PasswordCredentialContent({
                       <div className="w-40 shrink-0">
                         <Label>{totpIdentifierLabel}</Label>
                       </div>
-                      <Input
-                        value={totp_identifier}
-                        onChange={(e) =>
-                          updateValues({ totp_identifier: e.target.value })
-                        }
-                      />
+                      <div className="relative w-full">
+                        <Input
+                          value={totp_identifier}
+                          onChange={(e) =>
+                            updateValues({ totp_identifier: e.target.value })
+                          }
+                          readOnly={valuesReadOnly}
+                          className={cn({ "pr-9 opacity-70": valuesReadOnly })}
+                        />
+                        {valuesReadOnly && (
+                          <button
+                            type="button"
+                            className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+                            onClick={onEnableEditValues}
+                            aria-label="Edit credential values"
+                          >
+                            <Pencil1Icon className="size-4" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <p className="mt-1 text-sm text-slate-400">
                       {totpIdentifierHelper}
@@ -297,10 +386,29 @@ function PasswordCredentialContent({
                         Authenticator Key
                       </Label>
                     </div>
-                    <Input
-                      value={totp}
-                      onChange={(e) => updateValues({ totp: e.target.value })}
-                    />
+                    {valuesReadOnly ? (
+                      <div className="relative w-full">
+                        <Input
+                          value="••••••••"
+                          readOnly
+                          className="pr-9 opacity-70"
+                        />
+                        <button
+                          type="button"
+                          className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+                          onClick={onEnableEditValues}
+                          aria-label="Edit credential values"
+                        >
+                          <Pencil1Icon className="size-4" />
+                        </button>
+                      </div>
+                    ) : (
+                      <Input
+                        value={totp}
+                        onChange={(e) => updateValues({ totp: e.target.value })}
+                        placeholder={editMode ? "••••••••" : undefined}
+                      />
+                    )}
                   </div>
                   <p className="text-sm text-slate-400">
                     You need to find the authenticator secret from the website

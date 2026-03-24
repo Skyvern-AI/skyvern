@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import Self
 
 from fastapi import status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.utils.url_validators import validate_url
@@ -177,6 +177,14 @@ class CredentialResponse(BaseModel):
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+    user_context: str | None = Field(
+        default=None,
+        description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+    save_browser_session_intent: bool | None = Field(
+        default=None,
+        description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
 
 
 class Credential(BaseModel):
@@ -208,6 +216,14 @@ class Credential(BaseModel):
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+    user_context: str | None = Field(
+        default=None,
+        description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+    save_browser_session_intent: bool | None = Field(
+        default=False,
+        description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
@@ -228,6 +244,27 @@ class UpdateCredentialRequest(BaseModel):
         description="Optional login page URL associated with this credential",
         examples=["https://example.com/login"],
     )
+    user_context: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+    save_browser_session_intent: bool | None = Field(
+        default=None,
+        description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
+
+    @field_validator("user_context", mode="before")
+    @classmethod
+    def normalize_user_context(cls, v: str | None) -> str | None:
+        return _normalize_optional_str(v)
+
+
+def _normalize_optional_str(v: str | None) -> str | None:
+    """Normalize whitespace-only strings to None."""
+    if v is not None and not v.strip():
+        return None
+    return v
 
 
 class TestCredentialRequest(BaseModel):
@@ -242,6 +279,16 @@ class TestCredentialRequest(BaseModel):
         default=True,
         description="Whether to save the browser profile after a successful login test",
     )
+    user_context: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+
+    @field_validator("user_context", mode="before")
+    @classmethod
+    def normalize_user_context(cls, v: str | None) -> str | None:
+        return _normalize_optional_str(v)
 
     @model_validator(mode="after")
     def validate_url(self) -> Self:
@@ -284,6 +331,16 @@ class TestLoginRequest(BaseModel):
         default=None,
         description="Identifier (email or phone) for TOTP",
     )
+    user_context: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+
+    @field_validator("user_context", mode="before")
+    @classmethod
+    def normalize_user_context(cls, v: str | None) -> str | None:
+        return _normalize_optional_str(v)
 
     @model_validator(mode="after")
     def validate_url(self) -> Self:

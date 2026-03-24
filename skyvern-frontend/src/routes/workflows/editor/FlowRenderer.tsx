@@ -1,3 +1,4 @@
+import { usePostHog } from "posthog-js/react";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
 import {
@@ -99,6 +100,13 @@ import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
+
+// Grace period after nodesInitialized before we start tracking changes.
+// Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
+// Async API calls (e.g. WorkflowTriggerNode title hydration) are separately
+// protected by beginInternalUpdate/endInternalUpdate guards, so this timeout
+// only needs to cover synchronous mount-time effects.
+const INITIAL_LOAD_SETTLE_MS = 500;
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -314,6 +322,7 @@ function FlowRenderer({
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
+  const postHog = usePostHog();
   const debugStore = useDebugStore();
   const { title, initializeTitle } = useWorkflowTitleStore();
   // const [parameters] = useState<ParametersState>(initialParameters);
@@ -342,8 +351,14 @@ function FlowRenderer({
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
-      // Mark initial load as complete after nodes are initialized
-      isInitialLoadRef.current = false;
+      // Delay marking initial load as complete to allow mount-time effects
+      // (ResizeObserver, async data fetches, visibility toggling) to settle
+      // before we start tracking changes. Must be long enough for async
+      // effects but short enough that users won't notice.
+      const timer = setTimeout(() => {
+        isInitialLoadRef.current = false;
+      }, INITIAL_LOAD_SETTLE_MS);
+      return () => clearTimeout(timer);
     }
   }, [nodesInitialized]);
 
@@ -449,6 +464,52 @@ function FlowRenderer({
       window.removeEventListener(
         "loop-header-resized",
         handleLoopHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
+  // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
+  useEffect(() => {
+    const handleConditionalHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "conditional-header-resized",
+      handleConditionalHeaderResized,
+    );
+    return () => {
+      window.removeEventListener(
+        "conditional-header-resized",
+        handleConditionalHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
+  // Re-layout when a workflow trigger node's async content changes
+  // (e.g., target workflow parameters finish loading, skeleton → actual fields)
+  useEffect(() => {
+    const handleTriggerContentChanged = () => {
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "workflow-trigger-content-changed",
+      handleTriggerContentChanged,
+    );
+    return () => {
+      window.removeEventListener(
+        "workflow-trigger-content-changed",
+        handleTriggerContentChanged,
       );
     };
   }, [reactFlowInstance, debouncedLayoutForDimensions]);
@@ -600,10 +661,21 @@ function FlowRenderer({
       );
 
       workflowChangesStore.setHasChanges(true);
+      postHog.capture("builder.block.removed", {
+        org_id: workflow.organization_id,
+        block_type: node.type,
+      });
 
       doLayout(newNodesWithUpdatedParameters, newEdges);
     },
-    [nodes, edges, doLayout, workflowChangesStore],
+    [
+      nodes,
+      edges,
+      doLayout,
+      workflowChangesStore,
+      postHog,
+      workflow.organization_id,
+    ],
   );
 
   // Use a ref to always have access to the latest deleteNode without causing re-renders
@@ -972,11 +1044,11 @@ function FlowRenderer({
             // Only track changes after initial load is complete and not during internal updates
             // (e.g., switching conditional branches which is UI state, not workflow data)
             // Use getState() to get real-time value (not stale closure from render time)
-            const isInternalUpdate =
-              useWorkflowHasChangesStore.getState().isInternalUpdate;
+            const internalUpdateCount =
+              useWorkflowHasChangesStore.getState().internalUpdateCount;
             if (
               !isInitialLoadRef.current &&
-              !isInternalUpdate &&
+              internalUpdateCount === 0 &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||

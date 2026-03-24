@@ -29,7 +29,7 @@ class S3StorageClass(StrEnum):
     ONEZONE_IA = "ONEZONE_IA"
     GLACIER = "GLACIER"
     GLACIER_IR = "GLACIER_IR"  # Glacier Instant Retrieval
-    # DEEP_ARCHIVE = "DEEP_ARCHIVE"
+    DEEP_ARCHIVE = "DEEP_ARCHIVE"
     # OUTPOSTS = "OUTPOSTS"
     # STANDARD_IA = "STANDARD_IA"
 

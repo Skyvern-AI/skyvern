@@ -1,6 +1,6 @@
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
@@ -18,6 +18,7 @@ from sqlalchemy import (
     or_,
     pool,
     select,
+    text,
     tuple_,
     update,
 )
@@ -32,7 +33,7 @@ from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.exceptions import BrowserProfileNotFound, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB, read_retry
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -76,6 +77,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScheduleModel,
     WorkflowScriptModel,
     WorkflowTemplateModel,
 )
@@ -99,6 +101,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_block,
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
+    convert_to_workflow_schedule,
     hydrate_action,
 )
 from skyvern.forge.sdk.encrypt import encryptor
@@ -113,6 +116,8 @@ from skyvern.forge.sdk.schemas.organization_bitwarden_collections import Organiz
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
 )
@@ -132,6 +137,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_schedules import OrganizationScheduleItem, WorkflowSchedule
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -154,6 +160,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
+from skyvern.forge.sdk.workflow.schedules import compute_next_run
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, RunEngine, RunType
 from skyvern.schemas.scripts import (
     Script,
@@ -199,25 +206,59 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-DB_CONNECT_ARGS: dict[str, Any] = {}
+def _build_engine(database_string: str) -> Any:
+    """
+    Build a SQLAlchemy async engine.
 
-if "postgresql+psycopg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
-elif "postgresql+asyncpg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+    When DISABLE_CONNECTION_POOL=True (NullPool): enforce statement_timeout
+    and allow prepared statements.
+
+    When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
+    and do not set statement_timeout - set at role level in the database,
+    since the transaction pooler does not maintain session-level settings.
+    """
+    connect_args: dict[str, Any] = {}
+    if settings.DISABLE_CONNECTION_POOL:
+        if "postgresql+psycopg" in database_string:
+            connect_args["options"] = f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"
+        if "postgresql+asyncpg" in database_string:
+            connect_args["server_settings"] = {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            poolclass=pool.NullPool,
+        )
+
+    else:
+        if "postgresql+psycopg" in database_string:
+            connect_args["prepare_threshold"] = None
+        if "postgresql+asyncpg" in database_string:
+            connect_args["statement_cache_size"] = 0
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+            pool_size=settings.DATABASE_POOL_SIZE,
+            max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+        )
+
+
+class ScheduleLimitExceededError(Exception):
+    """Raised when attempting to create a schedule that would exceed the per-workflow limit."""
+
+    def __init__(self, organization_id: str, workflow_permanent_id: str, current_count: int, max_allowed: int):
+        self.organization_id = organization_id
+        self.workflow_permanent_id = workflow_permanent_id
+        self.current_count = current_count
+        self.max_allowed = max_allowed
+        super().__init__(f"Schedule limit {max_allowed} reached (current: {current_count})")
 
 
 class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__(
-            db_engine
-            or create_async_engine(
-                database_string,
-                json_serializer=_custom_json_serializer,
-                connect_args=DB_CONNECT_ARGS,
-                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-            )
-        )
+        super().__init__(db_engine or _build_engine(database_string))
         self.debug_enabled = debug_enabled
 
     def is_retryable_error(self, error: SQLAlchemyError) -> bool:
@@ -1264,13 +1305,24 @@ class AgentDB(BaseAlchemyDB):
         token_type: Literal["azure_client_secret_credential"],
     ) -> AzureOrganizationAuthToken | None: ...
 
+    @overload
+    async def get_valid_org_auth_token(  # type: ignore
+        self,
+        organization_id: str,
+        token_type: Literal["bitwarden_credential"],
+    ) -> BitwardenOrganizationAuthToken | None: ...
+
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
         token_type: Literal[
-            "api", "onepassword_service_account", "azure_client_secret_credential", "custom_credential_service"
+            "api",
+            "onepassword_service_account",
+            "azure_client_secret_credential",
+            "custom_credential_service",
+            "bitwarden_credential",
         ],
-    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | None:
         try:
             async with self.Session() as session:
                 if token := (
@@ -1356,12 +1408,16 @@ class AgentDB(BaseAlchemyDB):
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-        token: str | AzureClientSecretCredential,
+        token: str | AzureClientSecretCredential | BitwardenCredential,
         encrypted_method: EncryptMethod | None = None,
-    ) -> OrganizationAuthToken:
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
             if not isinstance(token, AzureClientSecretCredential):
                 raise TypeError("Expected AzureClientSecretCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        elif token_type is OrganizationAuthTokenType.bitwarden_credential:
+            if not isinstance(token, BitwardenCredential):
+                raise TypeError("Expected BitwardenCredential for this token_type")
             plaintext_token = token.model_dump_json()
         else:
             if not isinstance(token, str):
@@ -1410,6 +1466,55 @@ class AgentDB(BaseAlchemyDB):
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def replace_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token: str | AzureClientSecretCredential | BitwardenCredential,
+        encrypted_method: EncryptMethod | None = None,
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+        """Atomically invalidate existing tokens and create a new one in a single transaction."""
+        if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
+            if not isinstance(token, AzureClientSecretCredential):
+                raise TypeError("Expected AzureClientSecretCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        elif token_type is OrganizationAuthTokenType.bitwarden_credential:
+            if not isinstance(token, BitwardenCredential):
+                raise TypeError("Expected BitwardenCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        else:
+            if not isinstance(token, str):
+                raise TypeError("Expected str token for this token_type")
+            plaintext_token = token
+
+        encrypted_token = ""
+        if encrypted_method is not None:
+            encrypted_token = await encryptor.encrypt(plaintext_token, encrypted_method)
+            plaintext_token = ""
+
+        async with self.Session() as session:
+            # Invalidate existing tokens
+            await session.execute(
+                update(OrganizationAuthTokenModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .filter_by(valid=True)
+                .values(valid=False)
+            )
+            # Create new token
+            auth_token = OrganizationAuthTokenModel(
+                organization_id=organization_id,
+                token_type=token_type,
+                token=plaintext_token,
+                encrypted_token=encrypted_token,
+                encrypted_method=encrypted_method.value if encrypted_method is not None else "",
+            )
+            session.add(auth_token)
+            await session.commit()
+            await session.refresh(auth_token)
+
+        return await convert_to_organization_auth_token(auth_token, token_type)
 
     async def get_artifacts_for_task_v2(
         self,
@@ -1544,6 +1649,30 @@ class AgentDB(BaseAlchemyDB):
                         .filter_by(artifact_id=artifact_id)
                         .filter_by(organization_id=organization_id)
                     )
+                ).first():
+                    return convert_to_artifact(artifact, self.debug_enabled)
+                else:
+                    return None
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError")
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError")
+            raise
+
+    async def get_artifact_by_id_no_org(
+        self,
+        artifact_id: str,
+    ) -> Artifact | None:
+        """Fetch an artifact by ID without an organization filter.
+
+        Only use this when the caller has already verified authorization through
+        an out-of-band mechanism (e.g. a valid HMAC-signed URL).
+        """
+        try:
+            async with self.Session() as session:
+                if artifact := (
+                    await session.scalars(select(ArtifactModel).filter_by(artifact_id=artifact_id))
                 ).first():
                     return convert_to_artifact(artifact, self.debug_enabled)
                 else:
@@ -1807,7 +1936,7 @@ class AgentDB(BaseAlchemyDB):
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         run_with: str | None = None,
-        ai_fallback: bool = False,
+        ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
         generate_script_on_terminal: bool = False,
@@ -1945,6 +2074,515 @@ class AgentDB(BaseAlchemyDB):
                         is_template=is_template,
                     )
                 return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def create_workflow_schedule(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cron_expression: str,
+        timezone: str,
+        enabled: bool,
+        parameters: dict[str, Any] | None = None,
+        temporal_schedule_id: str | None = None,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> WorkflowSchedule:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = WorkflowScheduleModel(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    cron_expression=cron_expression,
+                    timezone=timezone,
+                    enabled=enabled,
+                    parameters=parameters,
+                    temporal_schedule_id=temporal_schedule_id,
+                    name=name,
+                    description=description,
+                )
+                session.add(workflow_schedule)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def create_workflow_schedule_with_limit(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        max_schedules: int | None,
+        cron_expression: str,
+        timezone: str,
+        enabled: bool,
+        parameters: dict[str, Any] | None = None,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> tuple[WorkflowSchedule, int]:
+        """Create a schedule atomically with limit enforcement.
+
+        Uses a PostgreSQL advisory lock to serialize concurrent creates for the
+        same workflow, preventing TOCTOU races on the schedule count.
+
+        Returns (created_schedule, count_before_insert).
+        Raises ScheduleLimitExceededError if count >= max_schedules.
+        """
+        try:
+            async with self.Session() as session:
+                lock_key = f"schedule:{organization_id}:{workflow_permanent_id}"
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                    {"key": lock_key},
+                )
+
+                count = (
+                    await session.execute(
+                        select(func.count()).where(
+                            WorkflowScheduleModel.organization_id == organization_id,
+                            WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id,
+                            WorkflowScheduleModel.deleted_at.is_(None),
+                        )
+                    )
+                ).scalar_one()
+
+                if max_schedules is not None and count >= max_schedules:
+                    raise ScheduleLimitExceededError(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        current_count=count,
+                        max_allowed=max_schedules,
+                    )
+
+                workflow_schedule = WorkflowScheduleModel(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    cron_expression=cron_expression,
+                    timezone=timezone,
+                    enabled=enabled,
+                    parameters=parameters,
+                    name=name,
+                    description=description,
+                )
+                session.add(workflow_schedule)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled), count
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def set_temporal_schedule_id(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+        temporal_schedule_id: str,
+    ) -> WorkflowSchedule | None:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel).filter_by(
+                            workflow_schedule_id=workflow_schedule_id,
+                            organization_id=organization_id,
+                            deleted_at=None,
+                        )
+                    )
+                ).first()
+
+                if not workflow_schedule:
+                    return None
+
+                workflow_schedule.temporal_schedule_id = temporal_schedule_id
+                workflow_schedule.modified_at = datetime.now(UTC)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_workflow_schedule(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+        cron_expression: str,
+        timezone: str,
+        enabled: bool,
+        parameters: dict[str, Any] | None = None,
+        temporal_schedule_id: str | None | object = _UNSET,
+        name: str | None | object = _UNSET,
+        description: str | None | object = _UNSET,
+    ) -> WorkflowSchedule | None:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel).filter_by(
+                            workflow_schedule_id=workflow_schedule_id,
+                            organization_id=organization_id,
+                            deleted_at=None,
+                        )
+                    )
+                ).first()
+
+                if not workflow_schedule:
+                    return None
+
+                workflow_schedule.cron_expression = cron_expression
+                workflow_schedule.timezone = timezone
+                workflow_schedule.enabled = enabled
+                workflow_schedule.parameters = parameters
+                if temporal_schedule_id is not _UNSET:
+                    workflow_schedule.temporal_schedule_id = temporal_schedule_id
+                if name is not _UNSET:
+                    workflow_schedule.name = name
+                if description is not _UNSET:
+                    workflow_schedule.description = description
+                workflow_schedule.modified_at = datetime.now(UTC)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_schedule_by_id(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+    ) -> WorkflowSchedule | None:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel).filter_by(
+                            workflow_schedule_id=workflow_schedule_id,
+                            organization_id=organization_id,
+                            deleted_at=None,
+                        )
+                    )
+                ).first()
+                if not workflow_schedule:
+                    return None
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_schedules(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> list[WorkflowSchedule]:
+        try:
+            async with self.Session() as session:
+                rows = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel).filter_by(
+                            workflow_permanent_id=workflow_permanent_id,
+                            organization_id=organization_id,
+                            deleted_at=None,
+                        )
+                    )
+                ).all()
+                return [convert_to_workflow_schedule(r, self.debug_enabled) for r in rows]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_all_enabled_schedules(
+        self,
+        organization_id: str | None = None,
+    ) -> list[WorkflowSchedule]:
+        """Fetch all enabled, non-deleted schedules, optionally filtered by org."""
+        try:
+            async with self.Session() as session:
+                stmt = select(WorkflowScheduleModel).where(
+                    WorkflowScheduleModel.enabled.is_(True),
+                    WorkflowScheduleModel.deleted_at.is_(None),
+                )
+                if organization_id:
+                    stmt = stmt.where(WorkflowScheduleModel.organization_id == organization_id)
+                rows = (await session.scalars(stmt)).all()
+                return [convert_to_workflow_schedule(r, self.debug_enabled) for r in rows]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def has_schedule_fired_since(
+        self,
+        workflow_schedule_id: str,
+        since: datetime,
+    ) -> bool:
+        """Check if a workflow_run exists for the given schedule since a timestamp."""
+        try:
+            async with self.Session() as session:
+                row = (
+                    await session.execute(
+                        select(
+                            exists().where(
+                                WorkflowRunModel.workflow_schedule_id == workflow_schedule_id,
+                                WorkflowRunModel.created_at >= since,
+                            )
+                        )
+                    )
+                ).scalar()
+                return bool(row)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_workflow_schedule_enabled(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+        enabled: bool,
+    ) -> WorkflowSchedule | None:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel).filter_by(
+                            workflow_schedule_id=workflow_schedule_id,
+                            organization_id=organization_id,
+                            deleted_at=None,
+                        )
+                    )
+                ).first()
+                if not workflow_schedule:
+                    return None
+                workflow_schedule.enabled = enabled
+                workflow_schedule.modified_at = datetime.now(UTC)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def delete_workflow_schedule(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+    ) -> WorkflowSchedule | None:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel).filter_by(
+                            workflow_schedule_id=workflow_schedule_id,
+                            organization_id=organization_id,
+                            deleted_at=None,
+                        )
+                    )
+                ).first()
+                if not workflow_schedule:
+                    return None
+
+                workflow_schedule.deleted_at = datetime.now(UTC)
+                workflow_schedule.modified_at = datetime.now(UTC)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def restore_workflow_schedule(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+    ) -> WorkflowSchedule | None:
+        try:
+            async with self.Session() as session:
+                workflow_schedule = (
+                    await session.scalars(
+                        select(WorkflowScheduleModel)
+                        .filter_by(
+                            workflow_schedule_id=workflow_schedule_id,
+                            organization_id=organization_id,
+                        )
+                        .filter(WorkflowScheduleModel.deleted_at.isnot(None))
+                    )
+                ).first()
+                if not workflow_schedule:
+                    return None
+
+                workflow_schedule.deleted_at = None
+                workflow_schedule.modified_at = datetime.now(UTC)
+                await session.commit()
+                await session.refresh(workflow_schedule)
+                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def count_workflow_schedules(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                result = await session.execute(
+                    select(func.count()).where(
+                        WorkflowScheduleModel.organization_id == organization_id,
+                        WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScheduleModel.deleted_at.is_(None),
+                    )
+                )
+                return result.scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def list_organization_schedules(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        enabled_filter: bool | None = None,
+        search: str | None = None,
+    ) -> tuple[list[OrganizationScheduleItem], int]:
+        """
+        List all schedules for an organization, joined with workflow titles.
+        Returns (schedules, total_count).
+        """
+        if page < 1:
+            raise ValueError(f"Page must be greater than 0, got {page}")
+        db_page = page - 1
+        try:
+            async with self.Session() as session:
+                # Subquery to get the latest version title per workflow_permanent_id
+                latest_version_sq = (
+                    select(
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(WorkflowModel.workflow_permanent_id)
+                    .subquery()
+                )
+
+                workflow_title_sq = (
+                    select(
+                        WorkflowModel.workflow_permanent_id,
+                        WorkflowModel.title,
+                    )
+                    .join(
+                        latest_version_sq,
+                        (WorkflowModel.workflow_permanent_id == latest_version_sq.c.workflow_permanent_id)
+                        & (WorkflowModel.version == latest_version_sq.c.max_version),
+                    )
+                    .subquery()
+                )
+
+                # Base query: schedules joined with workflow titles
+                base_filter = (
+                    select(WorkflowScheduleModel, workflow_title_sq.c.title.label("workflow_title"))
+                    .outerjoin(
+                        workflow_title_sq,
+                        WorkflowScheduleModel.workflow_permanent_id == workflow_title_sq.c.workflow_permanent_id,
+                    )
+                    .where(WorkflowScheduleModel.organization_id == organization_id)
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                )
+
+                if enabled_filter is not None:
+                    base_filter = base_filter.where(WorkflowScheduleModel.enabled == enabled_filter)
+
+                if search:
+                    base_filter = base_filter.where(
+                        or_(
+                            workflow_title_sq.c.title.icontains(search, autoescape=True),
+                            WorkflowScheduleModel.name.icontains(search, autoescape=True),
+                        )
+                    )
+
+                # Count query
+                count_query = select(func.count()).select_from(base_filter.subquery())
+                total_count = (await session.execute(count_query)).scalar_one()
+
+                # Data query with pagination
+                data_query = (
+                    base_filter.order_by(WorkflowScheduleModel.created_at.desc())
+                    .limit(page_size)
+                    .offset(db_page * page_size)
+                )
+                rows = (await session.execute(data_query)).all()
+
+                # Materialize row data while session is open
+                raw_schedules = []
+                for row in rows:
+                    schedule_model = row[0]
+                    raw_schedules.append(
+                        (
+                            schedule_model.workflow_schedule_id,
+                            schedule_model.organization_id,
+                            schedule_model.workflow_permanent_id,
+                            row[1] or "Untitled Workflow",
+                            schedule_model.cron_expression,
+                            schedule_model.timezone,
+                            schedule_model.enabled,
+                            schedule_model.parameters,
+                            schedule_model.name,
+                            schedule_model.description,
+                            schedule_model.created_at,
+                            schedule_model.modified_at,
+                        )
+                    )
+
+            # Compute next_run outside session scope (pure CPU, no DB needed)
+            schedules: list[OrganizationScheduleItem] = []
+            for (
+                ws_id,
+                org_id,
+                wpid,
+                title,
+                cron_expr,
+                tz,
+                enabled,
+                params,
+                name,
+                description,
+                created,
+                modified,
+            ) in raw_schedules:
+                next_run = None
+                if enabled:
+                    try:
+                        next_run = compute_next_run(cron_expr, tz)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to compute next_run for schedule",
+                            workflow_schedule_id=ws_id,
+                            exc_info=True,
+                        )
+
+                schedules.append(
+                    OrganizationScheduleItem(
+                        workflow_schedule_id=ws_id,
+                        organization_id=org_id,
+                        workflow_permanent_id=wpid,
+                        workflow_title=title,
+                        cron_expression=cron_expr,
+                        timezone=tz,
+                        enabled=enabled,
+                        parameters=params,
+                        name=name,
+                        description=description,
+                        next_run=next_run,
+                        created_at=created,
+                        modified_at=modified,
+                    )
+                )
+
+            return schedules, total_count
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2367,23 +3005,92 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def soft_delete_workflow_by_permanent_id(
+    async def soft_delete_workflow_and_schedules_by_permanent_id(
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> None:
-        async with self.Session() as session:
-            # soft delete the workflow by setting the deleted_at field
-            update_deleted_at_query = (
-                update(WorkflowModel)
-                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowModel.deleted_at.is_(None))
-            )
-            if organization_id:
-                update_deleted_at_query = update_deleted_at_query.filter_by(organization_id=organization_id)
-            update_deleted_at_query = update_deleted_at_query.values(deleted_at=datetime.utcnow())
-            await session.execute(update_deleted_at_query)
-            await session.commit()
+    ) -> list[str]:
+        """Soft-delete a workflow and its active schedules in a single DB transaction."""
+        try:
+            async with self.Session() as session:
+                select_query = (
+                    select(WorkflowScheduleModel.workflow_schedule_id)
+                    .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                )
+                if organization_id is not None:
+                    select_query = select_query.where(WorkflowScheduleModel.organization_id == organization_id)
+                result = await session.execute(select_query)
+                schedule_ids = list(result.scalars().all())
+
+                deleted_at = datetime.utcnow()
+                if schedule_ids:
+                    update_schedules_query = (
+                        update(WorkflowScheduleModel)
+                        .where(WorkflowScheduleModel.workflow_schedule_id.in_(schedule_ids))
+                        .values(deleted_at=deleted_at)
+                    )
+                    await session.execute(update_schedules_query)
+
+                update_workflow_query = (
+                    update(WorkflowModel)
+                    .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                )
+                if organization_id is not None:
+                    update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
+                await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+                await session.commit()
+                return schedule_ids
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_workflow_and_schedules_by_permanent_id", exc_info=True)
+            raise
+
+    async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
+        """Soft-delete orphaned schedules and return their identities.
+
+        Uses a single UPDATE ... RETURNING statement so orphan detection and
+        soft-deletion happen atomically in one DB round-trip.
+        """
+        try:
+            async with self.Session() as session:
+                active_workflow_exists = (
+                    select(WorkflowModel.workflow_permanent_id)
+                    .where(WorkflowModel.workflow_permanent_id == WorkflowScheduleModel.workflow_permanent_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .correlate(WorkflowScheduleModel)
+                    .exists()
+                )
+                orphaned_schedules = (
+                    select(
+                        WorkflowScheduleModel.workflow_schedule_id.label("workflow_schedule_id"),
+                        WorkflowScheduleModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    )
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                    .where(~active_workflow_exists)
+                    .limit(limit)
+                    .cte("orphaned_schedules")
+                )
+                update_query = (
+                    update(WorkflowScheduleModel)
+                    .where(
+                        WorkflowScheduleModel.workflow_schedule_id.in_(
+                            select(orphaned_schedules.c.workflow_schedule_id)
+                        )
+                    )
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                    .values(deleted_at=datetime.utcnow())
+                    .returning(
+                        WorkflowScheduleModel.workflow_schedule_id,
+                        WorkflowScheduleModel.workflow_permanent_id,
+                    )
+                )
+                result = await session.execute(update_query)
+                await session.commit()
+                return [(row[0], row[1]) for row in result.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_orphaned_schedules", exc_info=True)
+            raise
 
     async def add_workflow_template(
         self,
@@ -2860,9 +3567,15 @@ class AgentDB(BaseAlchemyDB):
         debug_session_id: str | None = None,
         ai_fallback: bool | None = None,
         code_gen: bool | None = None,
+        workflow_run_id: str | None = None,
+        trigger_type: WorkflowRunTriggerType | None = None,
+        workflow_schedule_id: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
+                kwargs: dict[str, Any] = {}
+                if workflow_run_id is not None:
+                    kwargs["workflow_run_id"] = workflow_run_id
                 workflow_run = WorkflowRunModel(
                     workflow_permanent_id=workflow_permanent_id,
                     workflow_id=workflow_id,
@@ -2883,6 +3596,9 @@ class AgentDB(BaseAlchemyDB):
                     debug_session_id=debug_session_id,
                     ai_fallback=ai_fallback,
                     code_gen=code_gen,
+                    trigger_type=trigger_type.value if trigger_type else None,
+                    workflow_schedule_id=workflow_schedule_id,
+                    **kwargs,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -3200,18 +3916,22 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_last_workflow_run_for_browser_session(
+    async def _get_last_workflow_run_by_filter(
         self,
-        browser_session_id: str,
         organization_id: str | None = None,
+        **filters: str,
     ) -> WorkflowRun | None:
+        """Get the last queued or running workflow run matching the given column filters.
+
+        Used for browser_session_id and browser_address sequential execution.
+        """
         try:
             async with self.Session() as session:
-                # check if there's a queued run
-                query = select(WorkflowRunModel).filter_by(browser_session_id=browser_session_id)
+                query = select(WorkflowRunModel).filter_by(**filters)
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
 
+                # check if there's a queued run
                 queue_query = query.filter_by(status=WorkflowRunStatus.queued)
                 queue_query = queue_query.order_by(WorkflowRunModel.modified_at.desc())
                 workflow_run = (await session.scalars(queue_query)).first()
@@ -3229,6 +3949,26 @@ class AgentDB(BaseAlchemyDB):
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
+
+    async def get_last_workflow_run_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        return await self._get_last_workflow_run_by_filter(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+
+    async def get_last_workflow_run_for_browser_address(
+        self,
+        browser_address: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        return await self._get_last_workflow_run_by_filter(
+            organization_id=organization_id,
+            browser_address=browser_address,
+        )
 
     async def get_workflows_depending_on(
         self,
@@ -3298,13 +4038,19 @@ class AgentDB(BaseAlchemyDB):
     def _apply_error_code_filter(query, error_code: str | None):  # type: ignore[no-untyped-def]
         if not error_code:
             return query
-        error_code_exists = exists(
+        error_code_in_tasks = exists(
             select(1)
             .select_from(TaskModel)
             .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
             .where(cast(TaskModel.errors, JSONB).contains(literal([{"error_code": error_code}], type_=JSONB)))
         )
-        return query.where(error_code_exists)
+        error_code_in_blocks = exists(
+            select(1)
+            .select_from(WorkflowRunBlockModel)
+            .where(WorkflowRunBlockModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(cast(WorkflowRunBlockModel.error_codes, JSONB).contains(literal([error_code], type_=JSONB)))
+        )
+        return query.where(or_(error_code_in_tasks, error_code_in_blocks))
 
     async def get_workflow_runs(
         self,
@@ -4608,6 +5354,8 @@ class AgentDB(BaseAlchemyDB):
         output: dict | list | str | None = None,
         continue_on_failure: bool = False,
         engine: RunEngine | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
@@ -4621,6 +5369,8 @@ class AgentDB(BaseAlchemyDB):
                 output=output,
                 continue_on_failure=continue_on_failure,
                 engine=engine,
+                current_value=current_value,
+                current_index=current_index,
             )
             session.add(new_workflow_run_block)
             await session.commit()
@@ -4671,6 +5421,8 @@ class AgentDB(BaseAlchemyDB):
         http_request_timeout: int | None = None,
         http_request_follow_redirects: bool | None = None,
         ai_fallback_triggered: bool | None = None,
+        # block-level error codes (e.g. ["FILE_PARSER_ERROR"])
+        error_codes: list[str] | None = None,
         # human interaction block
         instructions: str | None = None,
         positive_descriptor: str | None = None,
@@ -4698,6 +5450,8 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
+                if error_codes is not None:
+                    workflow_run_block.error_codes = error_codes
                 # Use `is not None` instead of truthiness checks so that falsy
                 # values like current_index=0, empty loop_values=[], or
                 # current_value="" are correctly persisted. Without this,
@@ -4829,6 +5583,22 @@ class AgentDB(BaseAlchemyDB):
                 convert_to_workflow_run_block(workflow_run_block, task=tasks_dict.get(workflow_run_block.task_id))
                 for workflow_run_block in workflow_run_blocks
             ]
+
+    async def get_workflow_run_block_errors(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> list[tuple[list[str], str | None]]:
+        """Return (error_codes, failure_reason) tuples for blocks with non-null error_codes."""
+        async with self.Session() as session:
+            query = select(WorkflowRunBlockModel.error_codes, WorkflowRunBlockModel.failure_reason).filter_by(
+                workflow_run_id=workflow_run_id
+            )
+            if organization_id is not None:
+                query = query.filter_by(organization_id=organization_id)
+            query = query.where(WorkflowRunBlockModel.error_codes.isnot(None))
+            rows = (await session.execute(query)).all()
+            return [(row.error_codes, row.failure_reason) for row in rows]
 
     async def create_browser_profile(
         self,
@@ -5092,11 +5862,11 @@ class AgentDB(BaseAlchemyDB):
                 if not persistent_browser_session:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
 
-                if status:
+                if status is not None:
                     persistent_browser_session.status = status
-                if timeout_minutes:
+                if timeout_minutes is not None:
                     persistent_browser_session.timeout_minutes = timeout_minutes
-                if completed_at:
+                if completed_at is not None:
                     persistent_browser_session.completed_at = completed_at
                 if started_at:
                     persistent_browser_session.started_at = started_at
@@ -5474,6 +6244,7 @@ class AgentDB(BaseAlchemyDB):
         card_brand: str | None,
         totp_identifier: str | None = None,
         secret_label: str | None = None,
+        user_context: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -5488,6 +6259,7 @@ class AgentDB(BaseAlchemyDB):
                 card_last4=card_last4,
                 card_brand=card_brand,
                 secret_label=secret_label,
+                user_context=user_context,
             )
             session.add(credential)
             await session.commit()
@@ -5529,6 +6301,8 @@ class AgentDB(BaseAlchemyDB):
         name: str | None = None,
         browser_profile_id: str | None | object = _UNSET,
         tested_url: str | None | object = _UNSET,
+        user_context: str | None | object = _UNSET,
+        save_browser_session_intent: bool | None | object = _UNSET,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5547,6 +6321,10 @@ class AgentDB(BaseAlchemyDB):
                 credential.browser_profile_id = browser_profile_id
             if tested_url is not _UNSET:
                 credential.tested_url = tested_url
+            if user_context is not _UNSET:
+                credential.user_context = user_context
+            if save_browser_session_intent is not _UNSET:
+                credential.save_browser_session_intent = save_browser_session_intent
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
@@ -6019,6 +6797,78 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_script_versions(
+        self,
+        script_id: str,
+        organization_id: str,
+    ) -> list[Script]:
+        """Get all versions of a script, ordered by version DESC."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptModel)
+                    .filter(
+                        ScriptModel.script_id == script_id,
+                        ScriptModel.organization_id == organization_id,
+                        ScriptModel.deleted_at.is_(None),
+                    )
+                    .order_by(ScriptModel.version.desc())
+                )
+                result = await session.scalars(query)
+                return [convert_to_script(row) for row in result.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_version_stats(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, tuple[int, int]]:
+        """Return {script_id: (latest_version, version_count)} for the given script IDs."""
+        if not script_ids:
+            return {}
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(
+                        ScriptModel.script_id,
+                        # max(version) must include soft-deleted rows so next-version
+                        # assignment doesn't collide with the unique constraint.
+                        func.max(ScriptModel.version),
+                        # version_count only counts live rows (for display).
+                        func.count(ScriptModel.script_revision_id).filter(
+                            ScriptModel.deleted_at.is_(None),
+                        ),
+                    )
+                    .filter(
+                        ScriptModel.organization_id == organization_id,
+                        ScriptModel.script_id.in_(script_ids),
+                    )
+                    .group_by(ScriptModel.script_id)
+                )
+                rows = (await session.execute(query)).all()
+                return {row[0]: (row[1], row[2]) for row in rows}
+        except SQLAlchemyError:
+            LOG.error(
+                "SQLAlchemyError in get_script_version_stats",
+                organization_id=organization_id,
+                script_ids=script_ids,
+                exc_info=True,
+            )
+            raise
+        except Exception:
+            LOG.error(
+                "UnexpectedError in get_script_version_stats",
+                organization_id=organization_id,
+                script_ids=script_ids,
+                exc_info=True,
+            )
+            raise
+
     async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
         async with self.Session() as session:
             script = (
@@ -6165,6 +7015,16 @@ class AgentDB(BaseAlchemyDB):
                 )
             ).all()
             return [convert_to_script_file(script_file) for script_file in script_files]
+
+    async def soft_delete_script_by_revision(self, script_revision_id: str, organization_id: str) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(ScriptModel)
+                .filter_by(script_revision_id=script_revision_id)
+                .filter_by(organization_id=organization_id)
+                .values(deleted_at=datetime.utcnow())
+            )
+            await session.commit()
 
     async def get_script_file_by_id(
         self,
@@ -6317,9 +7177,14 @@ class AgentDB(BaseAlchemyDB):
                 .filter_by(organization_id=organization_id)
                 .filter_by(workflow_permanent_id=workflow_permanent_id)
                 .filter_by(workflow_run_id=workflow_run_id)
+                .filter(WorkflowScriptModel.deleted_at.is_(None))
             )
             if statuses:
                 query = query.filter(WorkflowScriptModel.status.in_(statuses))
+            # A single run can create multiple workflow_script entries (one per
+            # revision cycle).  Return the latest one so callers see the final
+            # version produced by the run.
+            query = query.order_by(WorkflowScriptModel.created_at.desc())
             workflow_script_model = (await session.scalars(query)).first()
             return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
 
@@ -6357,6 +7222,9 @@ class AgentDB(BaseAlchemyDB):
 
                 if workflow_run_id:
                     query = query.where(WorkflowScriptModel.workflow_run_id == workflow_run_id)
+                    # Pin to the script version that existed when this run's
+                    # workflow_script entry was created, not the latest version.
+                    query = query.where(ScriptModel.created_at <= WorkflowScriptModel.created_at)
 
                 if cache_key is not None:
                     query = query.where(WorkflowScriptModel.cache_key == cache_key)
@@ -6364,7 +7232,7 @@ class AgentDB(BaseAlchemyDB):
                 if statuses is not None and len(statuses) > 0:
                     query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-                query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
+                query = query.order_by(ScriptModel.version.desc()).limit(1)
 
                 script = (await session.scalars(query)).first()
                 return convert_to_script(script) if script else None
@@ -6385,7 +7253,7 @@ class AgentDB(BaseAlchemyDB):
         try:
             async with self.Session() as session:
                 query = (
-                    select(func.count())
+                    select(func.count(distinct(WorkflowScriptModel.cache_key_value)))
                     .select_from(WorkflowScriptModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
@@ -6417,7 +7285,7 @@ class AgentDB(BaseAlchemyDB):
         try:
             async with self.Session() as session:
                 query = (
-                    select(WorkflowScriptModel.cache_key_value)
+                    select(distinct(WorkflowScriptModel.cache_key_value))
                     .order_by(WorkflowScriptModel.cache_key_value.asc())
                     .filter_by(organization_id=organization_id)
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
@@ -6537,7 +7405,261 @@ class AgentDB(BaseAlchemyDB):
                 if statuses:
                     query = query.filter(WorkflowScriptModel.status.in_([s.value for s in statuses]))
 
+                query = query.order_by(WorkflowScriptModel.modified_at.desc())
                 return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_for_script(
+        self,
+        organization_id: str,
+        script_id: str,
+        page_size: int = 50,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> tuple[list[WorkflowRunModel], int, dict[str, int]]:
+        """Get workflow runs associated with a script, with total count and status counts.
+
+        Returns (runs, total_count, status_counts) where runs is limited by page_size,
+        total_count is derived from the status_counts GROUP BY, and status_counts is a
+        GROUP BY aggregation of statuses across all runs.
+
+        If created_after/created_before are provided, filters by the workflow_script
+        entry's created_at (not the run's created_at), scoping to the version that
+        was active in that time window.
+        """
+        try:
+            async with self.Session() as session:
+                # Subquery: distinct run IDs for this script
+                run_ids_subquery = (
+                    select(distinct(WorkflowScriptModel.workflow_run_id))
+                    .filter_by(organization_id=organization_id, script_id=script_id)
+                    .filter(WorkflowScriptModel.deleted_at.is_(None))
+                    .filter(WorkflowScriptModel.workflow_run_id.isnot(None))
+                )
+
+                # Time-window filters scope by workflow_script creation time,
+                # which aligns with the script version that was created/used.
+                if created_after is not None:
+                    run_ids_subquery = run_ids_subquery.filter(
+                        WorkflowScriptModel.created_at >= created_after,
+                    )
+                if created_before is not None:
+                    run_ids_subquery = run_ids_subquery.filter(
+                        WorkflowScriptModel.created_at < created_before,
+                    )
+
+                # Base filter for workflow runs
+                base_filters = [
+                    WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
+                    WorkflowRunModel.organization_id == organization_id,
+                ]
+
+                # Count statuses via GROUP BY (also gives us total_count)
+                status_query = (
+                    select(WorkflowRunModel.status, func.count())
+                    .filter(*base_filters)
+                    .group_by(WorkflowRunModel.status)
+                )
+                status_counts = {(s or "unknown"): c for s, c in (await session.execute(status_query)).all()}
+                total_count = sum(status_counts.values())
+
+                if total_count == 0:
+                    return [], 0, {}
+
+                # Get the actual workflow runs (paginated)
+                runs_query = (
+                    select(WorkflowRunModel)
+                    .filter(*base_filters)
+                    .order_by(WorkflowRunModel.created_at.desc())
+                    .limit(page_size)
+                )
+                runs = list((await session.scalars(runs_query)).all())
+
+                return runs, total_count, status_counts
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_run_stats(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, tuple[float | None, int]]:
+        """Get success rate and total run count for each script_id.
+
+        Both metrics are computed from the same population (workflow_scripts joined
+        to workflow_runs), so they are always consistent.
+
+        Returns a dict mapping script_id -> (success_rate, total_runs) where
+        success_rate is 0.0-1.0 or None if no runs.
+        """
+        if not script_ids:
+            return {}
+        try:
+            async with self.Session() as session:
+                # Join workflow_scripts -> workflow_runs, group by script_id and status
+                query = (
+                    select(
+                        WorkflowScriptModel.script_id,
+                        WorkflowRunModel.status,
+                        func.count(distinct(WorkflowRunModel.workflow_run_id)),
+                    )
+                    .join(
+                        WorkflowRunModel,
+                        WorkflowScriptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                    )
+                    .filter(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.script_id.in_(script_ids),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                        WorkflowScriptModel.workflow_run_id.isnot(None),
+                        WorkflowRunModel.organization_id == organization_id,
+                    )
+                    .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
+                )
+                rows = (await session.execute(query)).all()
+
+                # Aggregate per script_id
+                totals: dict[str, int] = {}
+                completed: dict[str, int] = {}
+                for sid, status, count in rows:
+                    totals[sid] = totals.get(sid, 0) + count
+                    if status == "completed":
+                        completed[sid] = completed.get(sid, 0) + count
+
+                return {
+                    sid: (
+                        (completed.get(sid, 0) / totals[sid]) if totals.get(sid) else None,
+                        totals.get(sid, 0),
+                    )
+                    for sid in script_ids
+                }
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    # ── Script Pinning ─────────────────────────────────────────────────
+
+    async def is_script_pinned(
+        self,
+        organization_id: str,
+        script_id: str,
+    ) -> bool:
+        """Check if any active workflow_script row for this script_id is pinned."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel.is_pinned)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.script_id == script_id,
+                        WorkflowScriptModel.is_pinned.is_(True),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first() is not None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def pin_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+        pinned_by: str | None = None,
+    ) -> WorkflowScriptModel | None:
+        """Pin all workflow scripts for a given cache key value."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .values(
+                        is_pinned=True,
+                        pinned_at=datetime.utcnow(),
+                        pinned_by=pinned_by,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+                # Return the first updated model for the response
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key_value=cache_key_value)
+                    .filter_by(deleted_at=None)
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def unpin_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> WorkflowScriptModel | None:
+        """Unpin workflow scripts for a given cache key value."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .values(
+                        is_pinned=False,
+                        pinned_at=None,
+                        pinned_by=None,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+                # Return the first updated model for the response
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key_value=cache_key_value)
+                    .filter_by(deleted_at=None)
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -6652,6 +7774,109 @@ class AgentDB(BaseAlchemyDB):
                     .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
                 )
                 await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_fallback_episodes(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        workflow_run_id: str | None = None,
+        block_label: str | None = None,
+        reviewed: bool | None = None,
+        fallback_type: str | None = None,
+    ) -> list[ScriptFallbackEpisode]:
+        try:
+            async with self.Session() as session:
+                query = select(ScriptFallbackEpisodeModel).filter(
+                    ScriptFallbackEpisodeModel.organization_id == organization_id,
+                    ScriptFallbackEpisodeModel.workflow_permanent_id == workflow_permanent_id,
+                )
+                if workflow_run_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_run_id == workflow_run_id)
+                if block_label is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.block_label == block_label)
+                if reviewed is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.reviewed == reviewed)
+                if fallback_type is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.fallback_type == fallback_type)
+
+                offset = (page - 1) * page_size
+                query = query.order_by(ScriptFallbackEpisodeModel.created_at.desc()).limit(page_size).offset(offset)
+
+                result = await session.scalars(query)
+                return [ScriptFallbackEpisode.model_validate(row) for row in result.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_fallback_episodes_count(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str | None = None,
+        workflow_run_id: str | None = None,
+        block_label: str | None = None,
+        reviewed: bool | None = None,
+        fallback_type: str | None = None,
+        script_revision_id: str | None = None,
+    ) -> int:
+        """Count fallback episodes matching the given filters.
+
+        At least one scoping filter (workflow_permanent_id, workflow_run_id,
+        or script_revision_id) should be provided. Without any, this returns
+        the total count for the entire organization which is rarely intended.
+        """
+        if workflow_permanent_id is None and workflow_run_id is None and script_revision_id is None:
+            LOG.warning(
+                "get_fallback_episodes_count called without any scoping filter",
+                organization_id=organization_id,
+            )
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(ScriptFallbackEpisodeModel)
+                    .filter(
+                        ScriptFallbackEpisodeModel.organization_id == organization_id,
+                    )
+                )
+                if workflow_permanent_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_permanent_id == workflow_permanent_id)
+                if workflow_run_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_run_id == workflow_run_id)
+                if block_label is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.block_label == block_label)
+                if reviewed is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.reviewed == reviewed)
+                if fallback_type is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.fallback_type == fallback_type)
+                if script_revision_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.script_revision_id == script_revision_id)
+
+                result = await session.scalar(query)
+                return result or 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_fallback_episode(
+        self,
+        episode_id: str,
+        organization_id: str,
+    ) -> ScriptFallbackEpisode | None:
+        try:
+            async with self.Session() as session:
+                query = select(ScriptFallbackEpisodeModel).filter(
+                    ScriptFallbackEpisodeModel.episode_id == episode_id,
+                    ScriptFallbackEpisodeModel.organization_id == organization_id,
+                )
+                result = await session.scalar(query)
+                if result:
+                    return ScriptFallbackEpisode.model_validate(result)
+                return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

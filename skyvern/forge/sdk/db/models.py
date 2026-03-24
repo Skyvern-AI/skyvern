@@ -15,6 +15,7 @@ from sqlalchemy import (
     UnicodeText,
     UniqueConstraint,
     desc,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
@@ -59,6 +60,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_id,
+    generate_workflow_schedule_id,
     generate_workflow_script_id,
     generate_workflow_template_id,
 )
@@ -205,6 +207,26 @@ class ArtifactModel(Base):
     __table_args__ = (
         Index("org_task_step_index", "organization_id", "task_id", "step_id"),
         Index("artifacts_org_created_at_index", "organization_id", "created_at"),
+        Index(
+            "ix_artifacts_workflow_run_block_id_partial",
+            "workflow_run_block_id",
+            postgresql_where=text("workflow_run_block_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_thought_id_partial",
+            "observer_thought_id",
+            postgresql_where=text("observer_thought_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_cruise_id_partial",
+            "observer_cruise_id",
+            postgresql_where=text("observer_cruise_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_run_id_partial",
+            "run_id",
+            postgresql_where=text("run_id IS NOT NULL"),
+        ),
     )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
@@ -218,6 +240,7 @@ class ArtifactModel(Base):
     step_id = Column(String, index=True)
     artifact_type = Column(String)
     uri = Column(String)
+    bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -281,7 +304,7 @@ class WorkflowModel(Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
-    ai_fallback = Column(Boolean, default=False, nullable=False)
+    ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -302,6 +325,39 @@ class WorkflowModel(Base):
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
     version = Column(Integer, default=1, nullable=False)
     is_saved_task = Column(Boolean, default=False, nullable=False)
+
+
+class WorkflowScheduleModel(Base):
+    __tablename__ = "workflow_schedules"
+    __table_args__ = (
+        Index(
+            "idx_workflow_schedules_org_workflow",
+            "organization_id",
+            "workflow_permanent_id",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index("idx_workflow_schedules_org_enabled", "organization_id", "enabled"),
+    )
+
+    workflow_schedule_id = Column(String, primary_key=True, default=generate_workflow_schedule_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+    cron_expression = Column(String, nullable=False)
+    timezone = Column(String, nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    parameters = Column(JSON, nullable=True)
+    temporal_schedule_id = Column(String, nullable=True)
+    name = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
 
 
 class WorkflowTemplateModel(Base):
@@ -347,13 +403,15 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
-    browser_address = Column(String, nullable=True)
+    browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
+    trigger_type = Column(String, nullable=True)
+    workflow_schedule_id = Column(String, nullable=True, index=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
@@ -717,6 +775,7 @@ class WorkflowRunBlockModel(Base):
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+    error_codes = Column(JSON, nullable=True)
     engine = Column(String, nullable=True)
 
     # for loop block
@@ -954,6 +1013,8 @@ class CredentialModel(Base):
     secret_label = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True)
     tested_url = Column(String, nullable=True)
+    user_context = Column(String(1000), nullable=True)
+    save_browser_session_intent = Column(Boolean, nullable=True, default=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1056,6 +1117,7 @@ class WorkflowScriptModel(Base):
         Index(
             "idx_workflow_scripts_wpid_cache_key_value", "workflow_permanent_id", "cache_key_value", "workflow_run_id"
         ),
+        Index("idx_workflow_scripts_org_script_id", "organization_id", "script_id"),
     )
 
     workflow_script_id = Column(String, primary_key=True, default=generate_workflow_script_id)
@@ -1067,6 +1129,11 @@ class WorkflowScriptModel(Base):
     cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
     cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
     status = Column(String, nullable=True, default="published")
+
+    # Script pinning
+    is_pinned = Column(Boolean, default=False, nullable=False, server_default="false")
+    pinned_at = Column(DateTime, nullable=True)
+    pinned_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

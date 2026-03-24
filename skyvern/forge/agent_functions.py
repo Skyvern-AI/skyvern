@@ -2,7 +2,7 @@ import asyncio
 import copy
 import hashlib
 from datetime import timedelta
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import structlog
 from playwright.async_api import Frame, Page
@@ -477,17 +477,26 @@ class AgentFunction:
         task: Task,
         step: Step,
         browser_state: BrowserState,
-    ) -> None:
+    ) -> list[Action] | None:
         """
         Get prepared for the step execution. It's called at the first beginning when step running.
+
+        Returns:
+            A list of actions to inject into the step (skipping LLM), or None for normal flow.
         """
-        return
+        return None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
         return
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
+
+    async def auto_solve_captchas(self, page: Page) -> bool:
+        """Proactively detect and solve captchas on the current page.
+        Returns True if a captcha was detected and solved.
+        Cloud override provides actual solving; OSS base is a no-op."""
+        return False
 
     async def generate_async_operations(
         self,
@@ -608,3 +617,50 @@ class AgentFunction:
 
     async def post_action_execution(self, action: Action) -> None:
         pass
+
+    def get_copilot_security_rules(self) -> str:
+        """Return security guardrails for the workflow copilot system prompt.
+
+        Override in cloud to inject prompt injection defenses.
+        OSS returns empty string (no hardening).
+        """
+        return ""
+
+    def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
+        """Detect if a URL belongs to a known ATS platform.
+
+        Returns a platform key (e.g., "lever") or None.
+        Override in cloud to provide platform detection.
+        """
+        return None
+
+    def match_field_to_canonical_category(self, field_label: str) -> Any:
+        """Match a form field label to a canonical category for zero-LLM matching.
+
+        Returns a CanonicalCategory object or None.
+        Override in cloud to provide canonical field matching.
+        """
+        return None
+
+    def get_canonical_category(self, name: str) -> Any:
+        """Look up a canonical category by name.
+
+        Returns a CanonicalCategory object or None.
+        Override in cloud to provide canonical category lookup.
+        """
+        return None
+
+    def build_ats_pipeline_block_fn(self, block: dict, ats_platform: str) -> Any:
+        """Build an ATS-optimized script block for a detected platform.
+
+        Returns a libcst FunctionDef or None.
+        Override in cloud to provide the pipeline code generator.
+        """
+        return None
+
+    def get_canonical_categories(self) -> list:
+        """Return the list of all canonical categories.
+
+        Returns an empty list in OSS. Override in cloud.
+        """
+        return []

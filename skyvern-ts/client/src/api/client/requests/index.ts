@@ -5,9 +5,13 @@ export type { CreateBrowserProfileRequest } from "./CreateBrowserProfileRequest.
 export type { CreateBrowserSessionRequest } from "./CreateBrowserSessionRequest.js";
 export type { CreateScriptRequest } from "./CreateScriptRequest.js";
 export type { CreateWorkflowRequest } from "./CreateWorkflowRequest.js";
+export type { DeleteFolderRequest } from "./DeleteFolderRequest.js";
 export type { DeployScriptRequest } from "./DeployScriptRequest.js";
 export type { DownloadFilesRequest } from "./DownloadFilesRequest.js";
+export type { FolderCreate } from "./FolderCreate.js";
+export type { FolderUpdate } from "./FolderUpdate.js";
 export type { GetCredentialsRequest } from "./GetCredentialsRequest.js";
+export type { GetFoldersRequest } from "./GetFoldersRequest.js";
 export type { GetRunArtifactsRequest } from "./GetRunArtifactsRequest.js";
 export type { GetScriptsRequest } from "./GetScriptsRequest.js";
 export type { GetWorkflowRequest } from "./GetWorkflowRequest.js";
@@ -20,3 +24,4 @@ export type { RunSdkActionRequest } from "./RunSdkActionRequest.js";
 export type { RunTaskRequest } from "./RunTaskRequest.js";
 export type { RunWorkflowRequest } from "./RunWorkflowRequest.js";
 export type { TotpCodeCreate } from "./TotpCodeCreate.js";
+export type { UpdateWorkflowFolderRequest } from "./UpdateWorkflowFolderRequest.js";

@@ -263,6 +263,12 @@ async def get_frame_text(iframe: Frame) -> str:
     return text
 
 
+def _should_use_page_ready_wait() -> bool:
+    """Check if the enhanced page-ready wait is enabled via context (set by agent before scraping)."""
+    context = skyvern_context.current()
+    return bool(context and context.enable_page_ready_wait)
+
+
 async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
@@ -298,10 +304,27 @@ async def scrape_web_unsafe(
     # clicking start my quote)
     url = page.url
     if url == "about:blank" and not support_empty_page:
-        raise ScrapingFailedBlankPage()
+        # Allow scraping if the page has child frames with meaningful content
+        # (e.g., Edge PDF interstitial pages render content via iframes on about:blank).
+        # Filter out empty/blank frames (ad iframes, tracking pixels, detached frames).
+        meaningful_frames = [f for f in page.main_frame.child_frames if f.url and f.url not in ("about:blank", "")]
+        if not meaningful_frames:
+            raise ScrapingFailedBlankPage()
+        LOG.info(
+            "about:blank page has meaningful child frames, proceeding with scraping",
+            frame_count=len(meaningful_frames),
+        )
 
     skyvern_frame = await SkyvernFrame.create_instance(page)
-    await skyvern_frame.safe_wait_for_animation_end()
+    if _should_use_page_ready_wait():
+        await skyvern_frame.wait_for_page_ready(
+            network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
+            loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
+            dom_stable_ms=settings.PAGE_READY_DOM_STABLE_MS,
+            dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
+        )
+    else:
+        await skyvern_frame.safe_wait_for_animation_end()
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
@@ -449,7 +472,15 @@ async def add_frame_interactable_elements(
 
     try:
         skyvern_frame = await SkyvernFrame.create_instance(frame)
-        await skyvern_frame.safe_wait_for_animation_end()
+        if _should_use_page_ready_wait():
+            await skyvern_frame.wait_for_page_ready(
+                network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
+                loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
+                dom_stable_ms=settings.PAGE_READY_DOM_STABLE_MS,
+                dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
+            )
+        else:
+            await skyvern_frame.safe_wait_for_animation_end()
 
         frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
             frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags

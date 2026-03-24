@@ -4,11 +4,14 @@ import { Tip } from "@/components/Tip";
 import {
   Status,
   Task,
+  TriggerType,
   WorkflowRunApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import { TriggerTypeBadge } from "@/components/TriggerTypeBadge";
+import { TriggerTypeFilterDropdown } from "@/components/TriggerTypeFilterDropdown";
 import {
   Pagination,
   PaginationContent,
@@ -27,7 +30,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import {
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  formatExecutionTime,
+} from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useState } from "react";
@@ -62,6 +69,9 @@ function RunHistory() {
     ? Number(searchParams.get("page_size"))
     : 10;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
+  const [triggerTypeFilters, setTriggerTypeFilters] = useState<
+    Array<TriggerType>
+  >([]);
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
@@ -69,13 +79,20 @@ function RunHistory() {
     page,
     pageSize: itemsPerPage,
     statusFilters,
+    triggerTypeFilters,
     search: debouncedSearch,
   });
   const navigate = useNavigate();
 
   const { data: nextPageRuns } = useQuery<Array<Task | WorkflowRunApiResponse>>(
     {
-      queryKey: ["runs", { statusFilters }, page + 1, itemsPerPage],
+      queryKey: [
+        "runs",
+        { statusFilters, triggerTypeFilters },
+        page + 1,
+        itemsPerPage,
+        debouncedSearch,
+      ],
       queryFn: async () => {
         const client = await getClient(credentialGetter);
         const params = new URLSearchParams();
@@ -85,6 +102,14 @@ function RunHistory() {
           statusFilters.forEach((status) => {
             params.append("status", status);
           });
+        }
+        if (triggerTypeFilters) {
+          triggerTypeFilters.forEach((triggerType) => {
+            params.append("trigger_type", triggerType);
+          });
+        }
+        if (debouncedSearch) {
+          params.append("search_key", debouncedSearch);
         }
         return client.get("/runs", { params }).then((res) => res.data);
       },
@@ -150,7 +175,7 @@ function RunHistory() {
       <header>
         <h1 className="text-2xl">Run History</h1>
       </header>
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex items-center gap-4">
         <TableSearchInput
           value={search}
           onChange={(value) => {
@@ -162,42 +187,63 @@ function RunHistory() {
           placeholder="Search by run ID or parameter..."
           className="w-48 lg:w-72"
         />
+        <TriggerTypeFilterDropdown
+          values={triggerTypeFilters}
+          onChange={(values) => {
+            setTriggerTypeFilters(values);
+            const params = new URLSearchParams(searchParams);
+            params.set("page", "1");
+            setSearchParams(params, { replace: true });
+          }}
+        />
         <StatusFilterDropdown
           values={statusFilters}
-          onChange={setStatusFilters}
+          onChange={(values) => {
+            setStatusFilters(values);
+            const params = new URLSearchParams(searchParams);
+            params.set("page", "1");
+            setSearchParams(params, { replace: true });
+          }}
         />
       </div>
       <div className="rounded-lg border">
         <Table>
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
-              <TableHead className="w-1/5 rounded-tl-lg text-slate-400">
+              <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
                 Run ID
               </TableHead>
-              <TableHead className="w-1/5 text-slate-400">Detail</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Status</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Created At</TableHead>
-              <TableHead className="w-1/5 rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
+              <TableHead className="w-[16%] text-slate-400">Status</TableHead>
+              <TableHead className="w-[16%] text-slate-400">
+                Created At
+              </TableHead>
+              <TableHead className="w-[16%] text-slate-400">Duration</TableHead>
+              <TableHead className="w-[12%] rounded-tr-lg text-slate-400"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isFetching ? (
               Array.from({ length: 10 }).map((_, index) => (
                 <TableRow key={index}>
-                  <TableCell colSpan={4}>
+                  <TableCell colSpan={6}>
                     <Skeleton className="h-4 w-full" />
                   </TableCell>
                 </TableRow>
               ))
             ) : runs?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={4}>
+                <TableCell colSpan={6}>
                   <div className="text-center">No runs found</div>
                 </TableCell>
               </TableRow>
             ) : (
               runs?.map((run) => {
                 if (isTask(run)) {
+                  const taskExecutionTime = formatExecutionTime(
+                    run.started_at ?? run.created_at,
+                    run.finished_at,
+                  );
                   return (
                     <TableRow
                       key={run.task_id}
@@ -221,23 +267,32 @@ function RunHistory() {
                       >
                         {basicLocalTimeFormat(run.created_at)}
                       </TableCell>
+                      <TableCell className="text-slate-400">
+                        {taskExecutionTime ?? "-"}
+                      </TableCell>
+                      {/* Align with workflow row's expand button column. */}
+                      <TableCell />
                     </TableRow>
                   );
                 }
 
-                const workflowTitle =
-                  run.script_run === true ? (
-                    <div className="flex items-center gap-2">
+                const workflowTitle = (
+                  <div className="flex items-center gap-2">
+                    <span className="truncate">{run.workflow_title ?? ""}</span>
+                    {run.script_run === true && (
                       <Tip content="Ran with code">
                         <LightningBoltIcon className="text-[gold]" />
                       </Tip>
-                      <span>{run.workflow_title ?? ""}</span>
-                    </div>
-                  ) : (
-                    run.workflow_title ?? ""
-                  );
+                    )}
+                    <TriggerTypeBadge triggerType={run.trigger_type} />
+                  </div>
+                );
 
                 const isExpanded = expandedRows.has(run.workflow_run_id);
+                const workflowExecutionTime = formatExecutionTime(
+                  run.started_at ?? run.created_at,
+                  run.finished_at,
+                );
 
                 return (
                   <React.Fragment key={run.workflow_run_id}>
@@ -272,9 +327,28 @@ function RunHistory() {
                       </TableCell>
                       <TableCell
                         className="max-w-0 truncate"
-                        title={basicTimeFormat(run.created_at)}
+                        title={
+                          run.trigger_type === TriggerType.Scheduled &&
+                          run.scheduled_for
+                            ? `Scheduled: ${basicTimeFormat(run.scheduled_for)}\nStarted: ${basicTimeFormat(run.created_at)}`
+                            : basicTimeFormat(run.created_at)
+                        }
                       >
-                        {basicLocalTimeFormat(run.created_at)}
+                        <div className="flex flex-col">
+                          <span>{basicLocalTimeFormat(run.created_at)}</span>
+                          {run.trigger_type === TriggerType.Scheduled &&
+                            run.schedule_name && (
+                              <span className="text-xs text-slate-400">
+                                {run.schedule_name}
+                                {run.schedule_cron
+                                  ? ` (${run.schedule_cron})`
+                                  : ""}
+                              </span>
+                            )}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-slate-400">
+                        {workflowExecutionTime ?? "-"}
                       </TableCell>
                       <TableCell>
                         <div className="flex justify-end">
@@ -309,7 +383,7 @@ function RunHistory() {
                     {isExpanded && (
                       <TableRow key={`${run.workflow_run_id}-params`}>
                         <TableCell
-                          colSpan={5}
+                          colSpan={6}
                           className="bg-slate-50 dark:bg-slate-900/50"
                         >
                           <WorkflowRunParametersInline
