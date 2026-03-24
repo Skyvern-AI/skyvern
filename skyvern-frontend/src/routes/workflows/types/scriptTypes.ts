@@ -132,4 +132,5 @@ export type ScriptRunsResponse = {
   runs: ScriptRunSummary[];
   total_count: number;
   status_counts: Record<string, number>;
+  avg_fallbacks_per_run: number | null;
 };
