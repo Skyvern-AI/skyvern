@@ -713,7 +713,7 @@ async def get_workflow_script_blocks(
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    include_main_script = bool(workflow.adaptive_caching)
+    include_main_script = True
     workflow_run_id = block_script_request.workflow_run_id
     if workflow_run_id:
         workflow_run = await app.DATABASE.get_workflow_run(

@@ -6,13 +6,20 @@ import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
-class WorkflowScheduleUpsertRequest(UniversalBaseModel):
-    cron_expression: str
-    timezone: str
-    enabled: typing.Optional[bool] = None
-    parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    name: typing.Optional[str] = None
-    description: typing.Optional[str] = None
+class ClearCacheResponse(UniversalBaseModel):
+    """
+    Response model for cache clearing operations.
+    """
+
+    deleted_count: int = pydantic.Field()
+    """
+    Number of cached entries deleted
+    """
+
+    message: str = pydantic.Field()
+    """
+    Status message
+    """
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

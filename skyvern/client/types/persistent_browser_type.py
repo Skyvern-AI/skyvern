@@ -2,4 +2,4 @@
 
 import typing
 
-PersistentBrowserType = typing.Union[typing.Literal["msedge", "chrome", "stealth-chromium"], typing.Any]
+PersistentBrowserType = typing.Union[typing.Literal["msedge", "chrome"], typing.Any]

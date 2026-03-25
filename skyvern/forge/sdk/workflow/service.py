@@ -615,16 +615,19 @@ class WorkflowService:
         if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
             workflow_request.extra_http_headers = workflow.extra_http_headers
 
-        # Force ai_fallback=True for adaptive caching (code_v2) runs.
+        # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
         # Adaptive caching requires AI fallback to self-heal when cached scripts break.
         # Without this, a caller sending ai_fallback=false would silently disable recovery.
-        if workflow_request.run_with == "code_v2" or (workflow_request.run_with is None and workflow.adaptive_caching):
+        effective_code_version = (
+            workflow.code_version if workflow.code_version is not None else (2 if workflow.adaptive_caching else None)
+        )
+        if (effective_code_version or 0) >= 2 and (workflow_request.run_with in ("code", None)):
             if workflow_request.ai_fallback is False:
                 LOG.info(
                     "Overriding ai_fallback to True for adaptive caching run",
                     workflow_permanent_id=workflow_permanent_id,
                     request_run_with=workflow_request.run_with,
-                    workflow_adaptive_caching=workflow.adaptive_caching,
+                    workflow_code_version=workflow.code_version,
                 )
                 workflow_request.ai_fallback = True
 
@@ -1307,7 +1310,7 @@ class WorkflowService:
                 LOG.error("Failed to load static script", exc_info=True)
 
         # Mark workflow as running, preserving the user's original run_with intent.
-        # The run_with field records what the user requested (e.g. "code_v2"),
+        # The run_with field records what the user requested (e.g. "code"),
         # not whether a script was actually found. Execution mode is determined
         # separately by is_script_run and script_mode below.
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=workflow_run.run_with)
@@ -2209,7 +2212,7 @@ class WorkflowService:
                 and block.label not in script_blocks_by_label
                 and workflow_run_block_result.status in cacheable_statuses
                 and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                # For traditional caching (adaptive_caching=False), only track blocks
+                # For traditional caching (code_version < 2), only track blocks
                 # for regeneration when actually running with code. Agent-mode runs
                 # should not trigger regeneration — doing so creates an infinite loop
                 # where every run deletes and regenerates the script because blocks
@@ -2687,6 +2690,7 @@ class WorkflowService:
         sequential_key: str | None = None,
         folder_id: str | None = None,
         adaptive_caching: bool = False,
+        code_version: int | None = None,
         generate_script_on_terminal: bool = False,
     ) -> Workflow:
         try:
@@ -2714,6 +2718,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 folder_id=folder_id,
                 adaptive_caching=adaptive_caching,
+                code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
             )
         except IntegrityError as e:
@@ -4403,6 +4408,7 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=existing_latest_workflow.folder_id,
                     adaptive_caching=request.adaptive_caching,
+                    code_version=request.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
                 )
             else:
@@ -4429,6 +4435,7 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=request.folder_id,
                     adaptive_caching=request.adaptive_caching,
+                    code_version=request.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
@@ -5200,20 +5207,22 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Priority: run-level run_with > workflow-level run_with > adaptive_caching fallback > default (agent).
-        When adaptive_caching is enabled at the workflow level and no explicit run_with
-        is set, the run defaults to code mode so cached scripts are actually used.
+        Priority: run-level run_with > workflow-level run_with > code_version fallback > default (agent).
+        When code_version >= 1 at the workflow level and no explicit run_with is set,
+        the run defaults to code mode so cached scripts are actually used.
         """
         if workflow_run.run_with in ("code", "code_v2"):
             return True
         if workflow_run.run_with == "agent":
             return False
-        if workflow.run_with in ("code", "code_v2"):
+        if workflow.run_with in ("code", "code_v2"):  # include legacy "code_v2" workflows
             return True
         if workflow.run_with == "agent":
             return False
         # No explicit run_with on either workflow or run — fall back to
-        # adaptive_caching: if the workflow has caching enabled, run code.
+        # code_version / adaptive_caching: if the workflow has caching enabled, run code.
+        if workflow.code_version is not None:
+            return workflow.code_version >= 1
         if workflow.adaptive_caching:
             return True
         return False

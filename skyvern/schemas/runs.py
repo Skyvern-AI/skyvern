@@ -521,9 +521,17 @@ class WorkflowRunRequest(BaseModel):
     )
     run_with: str | None = Field(
         default=None,
-        description="Whether to run the workflow with agent, code, or code_v2 (adaptive caching).",
-        examples=["agent", "code", "code_v2"],
+        description="Whether to run the workflow with agent or code.",
+        examples=["agent", "code"],
     )
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def normalize_run_with(cls, v: str | None) -> str | None:
+        """Normalize legacy 'code_v2' to 'code'."""
+        if v == "code_v2":
+            return "code"
+        return v
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
@@ -634,9 +642,18 @@ class WorkflowRunResponse(BaseRunResponse):
     run_type: Literal[RunType.workflow_run] = Field(description="Type of run - always workflow_run for workflow runs")
     run_with: str | None = Field(
         default=None,
-        description="Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching)",
-        examples=["agent", "code", "code_v2"],
+        description="Whether the workflow run was executed with agent or code",
+        examples=["agent", "code"],
     )
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def normalize_run_with(cls, v: str | None) -> str | None:
+        """Normalize legacy 'code_v2' to 'code' in API responses."""
+        if v == "code_v2":
+            return "code"
+        return v
+
     ai_fallback: bool | None = Field(
         default=None,
         description="Whether to fallback to AI if code run fails.",
