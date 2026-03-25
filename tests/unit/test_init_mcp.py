@@ -29,6 +29,8 @@ def test_setup_mcp_local_claude_code_uses_local_stdio(monkeypatch) -> None:
             "project": False,
             "global_config": False,
             "skip_skills": False,
+            "browser_type": None,
+            "browser_remote_debugging_url": None,
         }
     ]
 

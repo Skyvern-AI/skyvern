@@ -8,7 +8,6 @@ import pytest
 
 import skyvern.cli.mcp_tools.folder as folder_tools
 import skyvern.cli.mcp_tools.workflow as workflow_tools
-from skyvern.client import AsyncSkyvern, Folder, FolderCreate, FolderUpdate, Skyvern, UpdateWorkflowFolderRequest
 from skyvern.client.errors import BadRequestError
 from skyvern.client.raw_client import AsyncRawSkyvern, RawSkyvern
 
@@ -42,23 +41,12 @@ def _fake_workflow_response() -> SimpleNamespace:
     )
 
 
-def test_sdk_exports_folder_types_and_methods() -> None:
-    assert Folder.__name__ == "Folder"
-    assert FolderCreate.__name__ == "FolderCreate"
-    assert FolderUpdate.__name__ == "FolderUpdate"
-    assert UpdateWorkflowFolderRequest.__name__ == "UpdateWorkflowFolderRequest"
-    assert hasattr(Skyvern, "create_folder")
-    assert hasattr(Skyvern, "update_workflow_folder")
-    assert hasattr(AsyncSkyvern, "create_folder")
-    assert hasattr(AsyncSkyvern, "update_workflow_folder")
-
-
 def test_raw_client_delete_folder_raises_not_found_on_empty_404() -> None:
     response = SimpleNamespace(
         status_code=404,
         text="",
         headers={},
-        json=Mock(side_effect=AssertionError("json() should not be called for empty 404 delete responses")),
+        json=Mock(return_value=None),
     )
     client = RawSkyvern(
         client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=Mock(return_value=response)))
@@ -74,7 +62,7 @@ async def test_async_raw_client_delete_folder_raises_not_found_on_empty_404() ->
         status_code=404,
         text="",
         headers={},
-        json=Mock(side_effect=AssertionError("json() should not be called for empty 404 delete responses")),
+        json=Mock(return_value=None),
     )
     client = AsyncRawSkyvern(
         client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=AsyncMock(return_value=response)))

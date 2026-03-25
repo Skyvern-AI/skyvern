@@ -121,8 +121,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.utils.css_selector import compute_stable_selector
-from skyvern.webeye.actions.actions import Action
+from skyvern.utils.css_selector import build_action_summary  # shared with script_service
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -288,69 +287,6 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
                     queue.append(item)
 
     return workflow_dict
-
-
-# Attributes safe to pass to the script reviewer (excludes noisy/dynamic attrs)
-_REVIEWER_SAFE_ATTRS = frozenset(
-    {
-        "name",
-        "id",
-        "placeholder",
-        "aria-label",
-        "type",
-        "role",
-        "data-testid",
-        "data-test-id",
-        "data-cy",
-        "data-qa",
-        "href",
-        "for",
-        "alt",
-        "title",
-        "action",
-        "method",
-        "autocomplete",
-        "inputmode",
-        "pattern",
-        "maxlength",
-        "aria-describedby",
-        "aria-labelledby",
-        "aria-haspopup",
-        "value",  # useful for pre-selected state
-    }
-)
-
-
-def _build_action_summary(a: Action) -> dict:
-    """Build a rich action summary dict for the script reviewer.
-
-    Includes a computed CSS selector suggestion so the reviewer can write
-    reliable selectors without guessing from sparse attributes.
-    """
-    elem = a.skyvern_element_data or {}
-    attrs = elem.get("attributes") or {}
-
-    # Broad attribute set for the reviewer (filtered to safe, useful attrs)
-    useful_attrs = {k: v for k, v in attrs.items() if k in _REVIEWER_SAFE_ATTRS and v}
-
-    return {
-        "action_type": a.action_type,
-        "intention": a.intention,
-        "reasoning": a.reasoning,
-        "status": a.status,
-        "field": (a.input_or_select_context.field if a.input_or_select_context else None),
-        # Legacy: 6 core attributes (kept for backward compat with older templates)
-        "element_attributes": (
-            {k: v for k, v in attrs.items() if k in ("name", "id", "placeholder", "aria-label", "type", "role") and v}
-            if attrs
-            else None
-        ),
-        # New: element context for better selector generation
-        "element_tag": elem.get("tagName"),
-        "element_text": (elem.get("text") or "")[:100] or None,
-        "all_attributes": useful_attrs or None,
-        "css_suggestion": compute_stable_selector(elem),
-    }
 
 
 class WorkflowService:
@@ -676,6 +612,8 @@ class WorkflowService:
             workflow_request.proxy_location = workflow.proxy_location
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
+        if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
+            workflow_request.extra_http_headers = workflow.extra_http_headers
 
         # Force ai_fallback=True for adaptive caching (code_v2) runs.
         # Adaptive caching requires AI fallback to self-heal when cached scripts break.
@@ -1307,9 +1245,10 @@ class WorkflowService:
                         if spec and spec.loader:
                             loaded_script_module = importlib.util.module_from_spec(spec)
                             spec.loader.exec_module(loaded_script_module)
+                            param_cls = getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
                             await skyvern.setup(
                                 script_parameters,
-                                generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
+                                generated_parameter_cls=param_cls,
                             )
                             LOG.info(
                                 "Successfully loaded script module",
@@ -1332,6 +1271,40 @@ class WorkflowService:
                 )
                 script_blocks_by_label = {}
                 loaded_script_module = None
+
+        # If no cached script exists, check if a static pre-built script
+        # should be created for this platform (e.g., ATS).  This persists the
+        # script to DB (pinned) on first run so it shows in the Code tab.
+        if is_script_run and not script_blocks_by_label:
+            try:
+                static_result = await app.AGENT_FUNCTION.ensure_static_script(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization_id=organization_id,
+                )
+                if static_result:
+                    script, script_blocks_by_label, loaded_script_module = static_result
+                    is_script_run = True
+                    # Initialize RunContext with the browser page + parameters,
+                    # same as the normal script loading path at line 1310.
+                    parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    script_parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+                    param_cls = getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
+                    await skyvern.setup(
+                        script_parameters,
+                        generated_parameter_cls=param_cls,
+                    )
+                    LOG.info(
+                        "Static script loaded successfully",
+                        script_id=script.script_id if script else None,
+                        blocks=list(script_blocks_by_label.keys()),
+                    )
+                else:
+                    LOG.info("No static script available for this workflow")
+            except Exception:
+                LOG.error("Failed to load static script", exc_info=True)
 
         # Mark workflow as running, preserving the user's original run_with intent.
         # The run_with field records what the user requested (e.g. "code_v2"),
@@ -2110,7 +2083,7 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = [_build_action_summary(a) for a in actions[:20]]
+                                    agent_actions_summary["actions"] = [build_action_summary(a) for a in actions[:20]]
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",

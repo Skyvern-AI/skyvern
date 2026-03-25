@@ -59,7 +59,9 @@ from skyvern.forge.sdk.api.files import (
     download_file,
     get_download_dir,
     get_path_for_workflow_download_directory,
+    is_remote_url,
     parse_uri_to_path,
+    validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
@@ -2833,31 +2835,38 @@ class UploadToS3Block(Block):
                 organization_id=organization_id,
             )
 
-        if not self.path or not os.path.exists(self.path):
-            raise FileNotFoundError(f"UploadToS3Block: File not found at path: {self.path}")
+        if not self.path:
+            raise ValueError("UploadToS3Block: path is required")
+
+        context = skyvern_context.current()
+        run_id = context.run_id if context and context.run_id else workflow_run_id
+        resolved_path = validate_local_file_path(self.path, run_id)
+
+        if not os.path.exists(resolved_path):
+            raise FileNotFoundError(f"UploadToS3Block: File not found at path: {resolved_path}")
 
         s3_uris = []
         try:
             client = self.get_async_aws_client()
             # is the file path a file or a directory?
-            if os.path.isdir(self.path):
+            if os.path.isdir(resolved_path):
                 # get all files in the directory, if there are more than 25 files, we will not upload them
-                files = os.listdir(self.path)
+                files = os.listdir(resolved_path)
                 if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
                     # if the file is a directory, we will not upload it
-                    if os.path.isdir(os.path.join(self.path, file)):
+                    if os.path.isdir(os.path.join(resolved_path, file)):
                         LOG.warning("UploadToS3Block: Skipping directory", file=file)
                         continue
-                    file_path = os.path.join(self.path, file)
+                    file_path = os.path.join(resolved_path, file)
                     s3_uri = self._get_s3_uri(workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
             else:
-                s3_uri = self._get_s3_uri(workflow_run_id, self.path)
+                s3_uri = self._get_s3_uri(workflow_run_id, resolved_path)
                 s3_uris.append(s3_uri)
-                await client.upload_file_from_path(uri=s3_uri, file_path=self.path)
+                await client.upload_file_from_path(uri=s3_uri, file_path=resolved_path)
         except Exception as e:
             LOG.exception("UploadToS3Block: Failed to upload file to S3", file_path=self.path)
             raise e
@@ -3216,6 +3225,8 @@ class SendEmailBlock(Block):
 
     def _get_file_paths(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str) -> list[str]:
         file_paths = []
+        context = skyvern_context.current()
+        run_id = context.run_id if context and context.run_id else workflow_run_id
         for path in self.file_attachments:
             # if the file path is a parameter, get the value from the workflow run context first
             if workflow_run_context.has_parameter(path):
@@ -3231,12 +3242,7 @@ class SendEmailBlock(Block):
 
             if path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
                 # if the path is WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, use download directory for the workflow run
-                context = skyvern_context.current()
-                path = str(
-                    get_path_for_workflow_download_directory(
-                        context.run_id if context and context.run_id else workflow_run_id
-                    ).absolute()
-                )
+                path = str(get_path_for_workflow_download_directory(run_id).absolute())
                 LOG.info(
                     "SendEmailBlock: Using download directory for the workflow run",
                     workflow_run_id=workflow_run_id,
@@ -3244,6 +3250,8 @@ class SendEmailBlock(Block):
                 )
 
             path = self.format_block_parameter_template_from_workflow_run_context(path, workflow_run_context)
+            if not is_remote_url(path):
+                path = validate_local_file_path(path, run_id)
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
             if os.path.exists(path):
                 if os.path.isdir(path):
@@ -3256,14 +3264,7 @@ class SendEmailBlock(Block):
                 else:
                     # covers the case where the file path is a single file
                     file_paths.append(path)
-            # check if path is a url, or an S3 uri
-            elif (
-                path.startswith("http://")
-                or path.startswith("https://")
-                or path.startswith("s3://")
-                or path.startswith("azure://")
-                or path.startswith("www.")
-            ):
+            elif is_remote_url(path):
                 file_paths.append(path)
             else:
                 LOG.warning("SendEmailBlock: File not found", file_path=path)
@@ -5173,7 +5174,7 @@ class PrintPageBlock(Block):
         workflow_run_block_id: str,
         workflow_run_context: WorkflowRunContext,
         organization_id: str | None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         artifact_org_id = organization_id or workflow_run_context.organization_id
         if not artifact_org_id:
             LOG.warning(
@@ -5181,7 +5182,7 @@ class PrintPageBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
-            return None
+            return None, None
 
         try:
             workflow_run_block = await app.DATABASE.get_workflow_run_block(
@@ -5195,9 +5196,9 @@ class PrintPageBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=artifact_org_id,
             )
-            return None
+            return None, None
 
-        _, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
+        artifact_id, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
             workflow_run_block=workflow_run_block,
             artifact_type=ArtifactType.PDF,
             data=pdf_bytes,
@@ -5211,9 +5212,22 @@ class PrintPageBlock(Block):
                 workflow_run_block_id=workflow_run_block.workflow_run_block_id,
                 exc_info=True,
             )
-            return None
+            return None, None
 
-        return artifact_uri
+        # Generate a downloadable URL for the artifact
+        artifact_url = None
+        try:
+            artifact = await app.DATABASE.get_artifact_by_id(artifact_id, organization_id=artifact_org_id)
+            if artifact:
+                artifact_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock: Failed to generate artifact download URL",
+                artifact_id=artifact_id,
+                exc_info=True,
+            )
+
+        return artifact_uri, artifact_url
 
     async def execute(
         self,
@@ -5284,7 +5298,7 @@ class PrintPageBlock(Block):
             await f.write(pdf_bytes)
 
         # Upload to artifact storage for downstream block access (e.g., File Extraction Block)
-        artifact_uri = await self._upload_pdf_artifact(
+        artifact_uri, artifact_url = await self._upload_pdf_artifact(
             pdf_bytes=pdf_bytes,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
@@ -5297,6 +5311,7 @@ class PrintPageBlock(Block):
             "file_path": file_path,
             "size_bytes": len(pdf_bytes),
             "artifact_uri": artifact_uri,
+            "artifact_url": artifact_url,
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
 

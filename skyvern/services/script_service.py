@@ -78,6 +78,7 @@ from skyvern.schemas.scripts import (
 )
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.utils.css_selector import build_action_summary
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
@@ -1304,6 +1305,7 @@ async def _fallback_to_ai_run(
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus(task.status.value),
+                task_id=task_id,
                 failure_reason=failure_reason,
                 label=cache_key,
                 ai_fallback_triggered=True,
@@ -1351,24 +1353,12 @@ async def _fallback_to_ai_run(
                     agent_actions_summary["form_fields"] = form_fields_snapshot
                 if not fallback_succeeded and task.failure_reason:
                     agent_actions_summary["failure_reason"] = str(task.failure_reason)[:2000]
-                # Fetch actions from the AI step.
-                # NOTE: service.py uses _build_action_summary() which includes element
-                # attributes and CSS selectors. We can't import it here (circular import:
-                # service.py imports script_service). Core fields suffice for now.
                 try:
                     actions = await app.DATABASE.get_task_actions(
                         task_id=task_id,
                         organization_id=organization_id,
                     )
-                    agent_actions_summary["actions"] = [
-                        {
-                            "action_type": a.action_type,
-                            "intention": a.intention,
-                            "reasoning": a.reasoning,
-                            "status": a.status,
-                        }
-                        for a in actions[:20]
-                    ]
+                    agent_actions_summary["actions"] = [build_action_summary(a) for a in actions[:20]]
                 except Exception:
                     LOG.debug("Could not fetch actions for fallback episode", exc_info=True)
 

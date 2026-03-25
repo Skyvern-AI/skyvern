@@ -257,6 +257,10 @@ class ScriptRunsResponse(BaseModel):
     runs: list[ScriptRunSummary]
     total_count: int
     status_counts: dict[str, int] = Field(default_factory=dict)
+    avg_fallbacks_per_run: float | None = Field(
+        default=None,
+        description="Average number of AI fallback episodes per script run",
+    )
 
 
 class ClearCacheResponse(BaseModel):

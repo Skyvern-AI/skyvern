@@ -115,6 +115,8 @@ def _build_local_mcp_entry(
     base_url: str,
     use_python_path: bool = False,
     command: str | None = None,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> dict:
     """Build a stdio MCP entry for local self-hosted mode.
 
@@ -126,6 +128,10 @@ def _build_local_mcp_entry(
         env_block["SKYVERN_BASE_URL"] = base_url
     if api_key:
         env_block["SKYVERN_API_KEY"] = api_key
+    if browser_type:
+        env_block["BROWSER_TYPE"] = browser_type
+    if browser_remote_debugging_url:
+        env_block["BROWSER_REMOTE_DEBUGGING_URL"] = browser_remote_debugging_url
 
     _ = use_python_path
 
@@ -313,9 +319,17 @@ def _build_entry(
     use_python_path: bool,
     url: str | None,
     use_mcp_remote_bridge: bool = False,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> dict:
     if local:
-        return _build_local_mcp_entry(api_key, base_url, use_python_path=use_python_path)
+        return _build_local_mcp_entry(
+            api_key,
+            base_url,
+            use_python_path=use_python_path,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
+        )
     remote_url = url or _DEFAULT_REMOTE_URL
     parsed = urlparse(remote_url)
     if parsed.scheme not in ("http", "https"):
@@ -602,6 +616,8 @@ def _run_setup(
     url: str | None,
     *,
     use_mcp_remote_bridge: bool = False,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     if tool_name == "Claude Desktop" and not local and use_mcp_remote_bridge and not _has_node_runtime():
         console.print(f"[yellow]{_claude_desktop_bundle_message()}[/yellow]")
@@ -615,6 +631,8 @@ def _run_setup(
         use_python_path=use_python_path,
         url=url,
         use_mcp_remote_bridge=use_mcp_remote_bridge,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
     )
     _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
 
@@ -768,6 +786,9 @@ def setup_guided(
                     f"[yellow]Skipping Claude Desktop JSON setup.[/yellow] {_claude_desktop_bundle_message()}"
                 )
                 continue
+            # Pass browser config from env for local mode
+            env_browser_type = os.environ.get("BROWSER_TYPE") if local else None
+            env_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if local else None
             entry = _build_entry(
                 resolved_key,
                 env_url,
@@ -775,6 +796,8 @@ def setup_guided(
                 use_python_path=use_python_path,
                 url=url,
                 use_mcp_remote_bridge=use_bridge,
+                browser_type=env_browser_type,
+                browser_remote_debugging_url=env_browser_url,
             )
             _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
             if tool.name == "Claude Code":
@@ -839,6 +862,8 @@ def setup_claude(
     local: bool = _local_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Claude Desktop (remote mode requires Node.js; bundle is recommended otherwise)."""
     _run_setup(
@@ -851,6 +876,8 @@ def setup_claude(
         use_python_path,
         url,
         use_mcp_remote_bridge=not local,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
     )
 
 
@@ -864,7 +891,9 @@ def setup_claude_desktop_alias(
     url: str | None = _url_opt,
 ) -> None:
     """Backward-compatible alias for `skyvern setup claude`."""
-    setup_claude(api_key, dry_run, yes, local, use_python_path, url)
+    setup_claude(
+        api_key, dry_run, yes, local, use_python_path, url, browser_type=None, browser_remote_debugging_url=None
+    )
 
 
 @setup_app.command("claude-code")
@@ -884,13 +913,26 @@ def setup_claude_code(
         help="Write Claude Code MCP config to ~/.claude.json even if the current directory is a project",
     ),
     skip_skills: bool = typer.Option(False, "--skip-skills", help="Don't install Claude Code skills (e.g. /qa)"),
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Claude Code and install skills (remote by default)."""
     config_path, install_skills = _claude_code_config_target(project=project, global_config=global_config)
     if not project and not global_config:
         target_label = ".mcp.json in the current project" if install_skills else "~/.claude.json"
         console.print(f"[dim]Claude Code target: {target_label}[/dim]")
-    _run_setup("Claude Code", config_path, api_key, dry_run, yes, local, use_python_path, url)
+    _run_setup(
+        "Claude Code",
+        config_path,
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
 
     if not skip_skills:
         if install_skills:
@@ -910,9 +952,22 @@ def setup_cursor(
     local: bool = _local_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Cursor (remote by default)."""
-    _run_setup("Cursor", _cursor_config_path(), api_key, dry_run, yes, local, use_python_path, url)
+    _run_setup(
+        "Cursor",
+        _cursor_config_path(),
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
 
 
 @setup_app.command("windsurf")
@@ -923,6 +978,19 @@ def setup_windsurf(
     local: bool = _local_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Windsurf (remote by default)."""
-    _run_setup("Windsurf", _windsurf_config_path(), api_key, dry_run, yes, local, use_python_path, url)
+    _run_setup(
+        "Windsurf",
+        _windsurf_config_path(),
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
