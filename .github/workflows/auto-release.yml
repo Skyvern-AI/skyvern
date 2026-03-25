@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 2
+          persist-credentials: false
       - name: Check if version changed
         id: check
         run: |
@@ -54,6 +55,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Generate release notes
         id: release_notes
         run: |
