@@ -160,6 +160,26 @@ class RunCommandResult(BaseModel):
 
 class BitwardenService:
     @staticmethod
+    def _is_ignorable_login_stderr(stderr: str) -> bool:
+        lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        if not lines:
+            return True
+
+        ignorable_substrings = [
+            "You are already logged in as",
+        ]
+        ignorable_regexes = [
+            re.compile(r'^Could not find data file, ".+?/data\.json"; creating it instead\.$'),
+        ]
+        for line in lines:
+            if any(s in line for s in ignorable_substrings):
+                continue
+            if any(r.match(line) for r in ignorable_regexes):
+                continue
+            return False
+        return True
+
+    @staticmethod
     async def _apply_jitter() -> None:
         """Apply random jitter delay to spread out concurrent Bitwarden CLI requests."""
         max_jitter = settings.BITWARDEN_MAX_JITTER_SECONDS
@@ -602,7 +622,7 @@ class BitwardenService:
         if login_result.stdout and "You are logged in!" not in login_result.stdout:
             raise BitwardenLoginError(f"Failed to log in. stdout: {login_result.stdout} stderr: {login_result.stderr}")
 
-        if login_result.stderr and "You are already logged in as" not in login_result.stderr:
+        if login_result.stderr and not BitwardenService._is_ignorable_login_stderr(login_result.stderr):
             raise BitwardenLoginError(f"Failed to log in. stdout: {login_result.stdout} stderr: {login_result.stderr}")
 
         LOG.info("Bitwarden login successful")
