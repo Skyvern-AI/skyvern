@@ -34,11 +34,11 @@ def _minimal_workflow_json(**overrides: object) -> str:
 
 
 def test_defaults_injected_when_not_specified() -> None:
-    """When adaptive_caching and run_with are omitted, _inject_code_v2_defaults adds them."""
+    """When code_version and run_with are omitted, _inject_code_v2_defaults adds them."""
     definition = _minimal_workflow_json()
     result = _inject_code_v2_defaults(definition, "json")
     parsed = json.loads(result)
-    assert parsed["adaptive_caching"] is True
+    assert parsed["code_version"] == 2
     assert parsed["run_with"] == "code"
 
 
@@ -47,16 +47,16 @@ def test_defaults_injected_in_auto_mode() -> None:
     definition = _minimal_workflow_json()
     result = _inject_code_v2_defaults(definition, "auto")
     parsed = json.loads(result)
-    assert parsed["adaptive_caching"] is True
+    assert parsed["code_version"] == 2
     assert parsed["run_with"] == "code"
 
 
 def test_explicit_values_preserved() -> None:
     """When the user explicitly sets these fields, their values are preserved."""
-    definition = _minimal_workflow_json(adaptive_caching=False, run_with="agent")
+    definition = _minimal_workflow_json(code_version=1, run_with="agent")
     result = _inject_code_v2_defaults(definition, "json")
     parsed = json.loads(result)
-    assert parsed["adaptive_caching"] is False
+    assert parsed["code_version"] == 1
     assert parsed["run_with"] == "agent"
 
 
@@ -66,8 +66,8 @@ def test_explicit_null_run_with_preserved() -> None:
     result = _inject_code_v2_defaults(definition, "json")
     parsed = json.loads(result)
     assert parsed["run_with"] is None
-    # adaptive_caching was not set, so it gets the default
-    assert parsed["adaptive_caching"] is True
+    # code_version was not set, so it gets the default
+    assert parsed["code_version"] == 2
 
 
 def test_proxy_default_injected_when_not_specified_json() -> None:

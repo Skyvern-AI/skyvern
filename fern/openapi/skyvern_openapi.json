@@ -2668,6 +2668,254 @@
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.delete_credential(credential_id=\"cred_123\")\n"
               },
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of items per page",
+              "examples": [
+                10
+              ],
+              "openapi_extra": {
+                "x-fern-sdk-parameter-name": "page_size"
+              },
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of items per page"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CredentialResponse"
+                  },
+                  "title": "Response Get Credentials V1 Credentials Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_credentials",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredentials = await skyvern.get_credentials()\nprint(credentials)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst credentials = await skyvern.getCredentials();\nconsole.log(credentials);\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/credentials/{credential_id}/update": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Update credential",
+        "description": "Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.",
+        "operationId": "update_credential_v1_credentials__credential_id__update_post",
+        "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the credential to update",
+              "examples": [
+                "cred_1234567890"
+              ],
+              "openapi_extra": {
+                "x-fern-sdk-parameter-name": "credential_id"
+              },
+              "title": "Credential Id"
+            },
+            "description": "The unique identifier of the credential to update"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCredentialRequest",
+                "description": "The new credential data to store",
+                "examples": [
+                  {
+                    "name": "My Credential",
+                    "credential_type": "PASSWORD",
+                    "credential": {
+                      "username": "user@example.com",
+                      "password": "newpassword123"
+                    }
+                  }
+                ],
+                "openapi_extra": {
+                  "x-fern-sdk-parameter-name": "data"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_credential"
+      }
+    },
+    "/v1/credentials/{credential_id}/delete": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Delete credential",
+        "description": "Deletes a specific credential by its ID",
+        "operationId": "delete_credential_v1_credentials__credential_id__delete_post",
+        "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the credential to delete",
+              "examples": [
+                "cred_1234567890"
+              ],
+              "openapi_extra": {
+                "x-fern-sdk-parameter-name": "credential_id"
+              },
+              "title": "Credential Id"
+            },
+            "description": "The unique identifier of the credential to delete"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_credential",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.delete_credential(credential_id=\"cred_123\")\n"
+              },
               {
                 "sdk": "typescript",
                 "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.deleteCredential(\"cred_123\");\n"
@@ -2686,6 +2934,662 @@
         "description": "Retrieves a specific credential by its ID",
         "operationId": "get_credential_v1_credentials__credential_id__get",
         "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the credential",
+              "examples": [
+                "cred_1234567890"
+              ],
+              "openapi_extra": {
+                "x-fern-sdk-parameter-name": "credential_id"
+              },
+              "title": "Credential Id"
+            },
+            "description": "The unique identifier of the credential"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_credential",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredential = await skyvern.get_credential(credential_id=\"cred_123\")\nprint(credential)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst credential = await skyvern.getCredential(\"cred_123\");\nconsole.log(credential);\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/run/tasks/login": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Login Task",
+        "description": "Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
+        "operationId": "login_v1_run_tasks_login_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "login",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "# Login with password saved in Skyvern\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"skyvern\",\n    credential_id=\"cred_123\"),\n)\n"
+              },
+              {
+                "sdk": "python",
+                "code": "# Login with password saved in Bitwarden\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Login with a Bitwarden collection and website url filter\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"bitwarden\",\n    bitwarden_collection_id=\"BITWARDEN COLLECTION ID\",\n)\n\n# Login with a Bitwarden item\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"bitwarden\",\n    bitwarden_item_id=\"BITWARDEN ITEM ID\",\n)\n"
+              },
+              {
+                "sdk": "python",
+                "code": "# Login with password saved in 1Password\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"onepassword\",\n    onepassword_vault_id=\"1PASSWORD VAULT ID\",\n    onepassword_item_id=\"1PASSWORD ITEM ID\",\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "// Login with password saved in Skyvern\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"skyvern\",\n    credential_id: \"cred_123\"\n});\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "// Login with password saved in Bitwarden\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Login with a Bitwarden collection and website url filter\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"bitwarden\",\n    bitwarden_collection_id: \"BITWARDEN COLLECTION ID\"\n});\n\n// Login with a Bitwarden item\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"bitwarden\",\n    bitwarden_item_id: \"BITWARDEN ITEM ID\"\n});\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "// Login with password saved in 1Password\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"onepassword\",\n    onepassword_vault_id: \"1PASSWORD VAULT ID\",\n    onepassword_item_id: \"1PASSWORD ITEM ID\"\n});\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/run/tasks/download_files": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "File Download Task",
+        "description": "Download a file from a website by navigating and clicking download buttons",
+        "operationId": "download_files_v1_run_tasks_download_files_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DownloadFilesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "download_files",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.download_files(\n    url=\"https://example.com/downloads\",\n    navigation_goal=\"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix=\"report.pdf\"\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.downloadFiles({\n    url: \"https://example.com/downloads\",\n    navigation_goal: \"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix: \"report.pdf\"\n});\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/scripts": {
+      "post": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Create script",
+        "description": "Create a new script with optional files and metadata",
+        "operationId": "create_script_v1_scripts_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScriptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateScriptResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_script"
+      },
+      "get": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Get all scripts",
+        "description": "Retrieves a paginated list of scripts for the current organization",
+        "operationId": "get_scripts_v1_scripts_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number for pagination",
+              "examples": [
+                1
+              ],
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of items per page",
+              "examples": [
+                10
+              ],
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of items per page"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Script"
+                  },
+                  "title": "Response Get Scripts V1 Scripts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_scripts"
+      }
+    },
+    "/v1/scripts/{script_id}": {
+      "get": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Get script by ID",
+        "description": "Retrieves a specific script by its ID",
+        "operationId": "get_script_v1_scripts__script_id__get",
+        "parameters": [
+          {
+            "name": "script_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the script",
+              "examples": [
+                "s_abc123"
+              ],
+              "title": "Script Id"
+            },
+            "description": "The unique identifier of the script"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Script"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_script"
+      }
+    },
+    "/v1/scripts/{script_id}/deploy": {
+      "post": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Deploy script",
+        "description": "Deploy a script with updated files, creating a new version",
+        "operationId": "deploy_script_v1_scripts__script_id__deploy_post",
+        "parameters": [
+          {
+            "name": "script_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the script",
+              "examples": [
+                "s_abc123"
+              ],
+              "title": "Script Id"
+            },
+            "description": "The unique identifier of the script"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployScriptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateScriptResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "deploy_script"
+      }
+    },
+    "/v1/scripts/{script_id}/run": {
+      "post": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Run script",
+        "description": "Run a script",
+        "operationId": "run_script_v1_scripts__script_id__run_post",
+        "parameters": [
+          {
+            "name": "script_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the script",
+              "examples": [
+                "s_abc123"
+              ],
+              "title": "Script Id"
+            },
+            "description": "The unique identifier of the script"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/schedules": {
+      "get": {
+        "tags": [
+          "scheduler"
+        ],
+        "summary": "List Organization Schedules",
+        "operationId": "list_organization_schedules_api_v1_schedules_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 10,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "active",
+                    "paused"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by status: 'active' or 'paused'",
+              "title": "Status"
+            },
+            "description": "Filter by status: 'active' or 'paused'"
+          },
           {
             "name": "credential_id",
             "in": "path",
@@ -14729,6 +15633,25 @@
         ],
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
+      },
+      "UpdateWorkflowFolderRequest": {
+        "properties": {
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id",
+            "description": "Folder ID to assign workflow to. Set to null to remove from folder."
+          }
+        },
+        "type": "object",
+        "title": "UpdateWorkflowFolderRequest",
+        "description": "Request model for updating a workflow's folder assignment"
       },
       "UploadFileResponse": {
         "properties": {

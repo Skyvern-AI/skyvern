@@ -106,6 +106,7 @@ class Workflow(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
+    code_version: int | None = None
     generate_script_on_terminal: bool = False
     run_sequentially: bool | None = None
     sequential_key: str | None = None
@@ -188,11 +189,25 @@ class WorkflowRun(BaseModel):
 
 
 def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-    """Compute effective adaptive caching mode from run-level override or workflow setting."""
-    if workflow_run.run_with == "code_v2":
-        return True
-    if workflow_run.run_with in ("code", "agent"):
+    """Compute effective adaptive caching mode from run-level override or workflow setting.
+
+    Uses code_version >= 2 as the primary check. Falls back to the legacy
+    adaptive_caching bool for rows that haven't been backfilled yet
+    (code_version is None).
+    """
+    run_with = workflow_run.run_with or workflow.run_with
+    # Explicit agent mode → never adaptive
+    if run_with == "agent":
         return False
+    # When run_with is "code" (or legacy "code_v2"), check code_version
+    if run_with in ("code", "code_v2"):
+        if workflow.code_version is not None:
+            return workflow.code_version >= 2
+        return workflow.adaptive_caching
+    # run_with is None — check code_version as the implicit fallback
+    # (workflows with code_version >= 2 implicitly run as code)
+    if workflow.code_version is not None:
+        return workflow.code_version >= 2
     return workflow.adaptive_caching
 
 

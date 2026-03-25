@@ -600,10 +600,11 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  run_with: string | null; // 'agent', 'code', or 'code_v2'
+  run_with: string | null; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
   adaptive_caching: boolean | null;
+  code_version: number | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
@@ -617,7 +618,8 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: string | null; // 'agent', 'code', or 'code_v2'
+  runWith: string | null; // 'agent' or 'code'
+  codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
   runSequentially: boolean;

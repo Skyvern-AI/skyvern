@@ -13,6 +13,7 @@ export type WorkflowStartNodeData = {
   extraHttpHeaders: string | Record<string, unknown> | null;
   editable: boolean;
   runWith: string | null;
+  codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;
   runSequentially: boolean;
