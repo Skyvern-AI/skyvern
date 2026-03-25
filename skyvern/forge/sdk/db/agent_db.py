@@ -1939,6 +1939,7 @@ class AgentDB(BaseAlchemyDB):
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
+        code_version: int | None = None,
         generate_script_on_terminal: bool = False,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
@@ -1964,6 +1965,7 @@ class AgentDB(BaseAlchemyDB):
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
+                code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
@@ -7464,7 +7466,7 @@ class AgentDB(BaseAlchemyDB):
                 base_filters = [
                     WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
                     WorkflowRunModel.organization_id == organization_id,
-                    WorkflowRunModel.run_with.in_(["code", "code_v2"]),
+                    WorkflowRunModel.run_with.in_(["code", "code_v2"]),  # include legacy "code_v2" rows
                 ]
 
                 # Count statuses via GROUP BY (also gives us total_count)
@@ -7550,7 +7552,7 @@ class AgentDB(BaseAlchemyDB):
                         WorkflowScriptModel.deleted_at.is_(None),
                         WorkflowScriptModel.workflow_run_id.isnot(None),
                         WorkflowRunModel.organization_id == organization_id,
-                        WorkflowRunModel.run_with.in_(["code", "code_v2"]),
+                        WorkflowRunModel.run_with.in_(["code", "code_v2"]),  # include legacy "code_v2" rows
                     )
                     .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
                 )

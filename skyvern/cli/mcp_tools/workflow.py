@@ -475,7 +475,7 @@ def _validate_definition_structure(json_def: WorkflowCreateYamlRequest | None, a
 
 
 _CODE_V2_DEFAULTS: dict[str, Any] = {
-    "adaptive_caching": True,
+    "code_version": 2,
     "run_with": "code",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
@@ -603,7 +603,7 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
 
 
 def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults into a JSON definition string when not explicitly set.
+    """Inject Code 2.0 defaults (code_version=2, run_with=code) when not explicitly set.
 
     Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
     """
@@ -827,8 +827,8 @@ async def skyvern_workflow_create(
     """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
     a new automation workflow that can be run repeatedly with different parameters.
 
-    By default, workflows created via MCP use Code 2.0 (adaptive caching with run_with="code").
-    To disable this, explicitly set "adaptive_caching": false and/or "run_with": null in your definition.
+    By default, workflows created via MCP use Code 2.0 (code_version=2, run_with="code").
+    To disable this, explicitly set "code_version": 1 and/or "run_with": null in your definition.
 
     Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
     Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.

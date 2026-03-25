@@ -19,6 +19,7 @@ export type WorkflowCreateYAMLRequest = {
   cache_key?: string | null;
   ai_fallback?: boolean;
   adaptive_caching?: boolean;
+  code_version?: number | null;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;

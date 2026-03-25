@@ -82,10 +82,8 @@ function Debugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
-    runWith:
-      workflow.adaptive_caching && workflow.run_with === "code"
-        ? "code_v2"
-        : workflow.run_with,
+    runWith: workflow.run_with,
+    codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,
