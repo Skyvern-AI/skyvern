@@ -202,6 +202,11 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       onParametersChange={(parameterKeys) => {
                         update({ parameterKeys });
                       }}
+                      onCredentialTotpIdentifier={(totpIdentifier) => {
+                        if (!data.totpIdentifier?.trim()) {
+                          update({ totpIdentifier });
+                        }
+                      }}
                     />
                   </div>
                   <div className="flex items-center justify-between">
