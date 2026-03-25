@@ -1,0 +1,212 @@
+---
+title: AI Agents Quickstart
+subtitle: Give your AI coding assistant full browser automation in one command
+slug: getting-started/ai-agents-quickstart
+---
+
+Skyvern's MCP server and Skills let AI assistants (Claude Code, Cursor, Windsurf, Codex) control browsers, extract data, and run workflows through natural language. This page gets you set up.
+
+## Choose your path
+
+<CardGroup cols={2}>
+  <Card title="Cloud (30 seconds)" icon="cloud">
+    Already have a Skyvern Cloud account? Jump to the [MCP config](#cloud-setup) for your client below.
+  </Card>
+  <Card title="Local (2 minutes)" icon="terminal">
+    Want to self-host? Run `skyvern quickstart` and it handles everything. See [local setup](#local-setup).
+  </Card>
+</CardGroup>
+
+## Cloud setup
+
+Get your API key from [Settings](https://app.skyvern.com/settings) in the Skyvern dashboard, then pick your client.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
+```
+
+</Tab>
+<Tab title="Cursor">
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Windsurf">
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Claude Desktop">
+
+Add to your Claude Desktop config file:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://api.skyvern.com/mcp/",
+        "--header",
+        "x-api-key:YOUR_SKYVERN_API_KEY"
+      ]
+    }
+  }
+}
+```
+
+Requires Node.js >= 20 for [mcp-remote](https://www.npmjs.com/package/mcp-remote).
+
+</Tab>
+<Tab title="Codex">
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.skyvern]
+url = "https://api.skyvern.com/mcp/"
+
+[mcp_servers.skyvern.http_headers]
+x-api-key = "YOUR_SKYVERN_API_KEY"
+```
+
+</Tab>
+</Tabs>
+
+That's it. Ask your assistant to open a browser and navigate to any site.
+
+<Tip>
+Verify it works — paste this into your AI assistant: "Use Skyvern to create a browser session, go to news.ycombinator.com, and extract the title of the top post."
+</Tip>
+
+## Local setup
+
+`skyvern quickstart` is the one-command path for self-hosting. Run it from your project or repo root:
+
+```bash
+pip install skyvern
+skyvern quickstart
+```
+
+The interactive wizard will:
+- Set up a PostgreSQL database (detects local install or uses Docker)
+- Configure your LLM provider (OpenAI, Anthropic, Gemini, Ollama, etc.)
+- Write MCP config for your AI client (Claude Code, Cursor, Windsurf)
+- Install bundled Skills into `.claude/skills/` (Claude Code only)
+
+If you only want to configure without starting services, use `skyvern init` instead, then start the server manually:
+
+```bash
+skyvern run server
+```
+
+For the full local setup guide including browser modes and environment configuration, see [Run with a local browser](/getting-started/quickstart#run-with-a-local-browser).
+
+## What gets installed
+
+### MCP Server
+
+33 tools across 6 categories that your AI assistant calls automatically:
+
+| Category | What it does |
+|----------|-------------|
+| **Browser sessions** | Open, manage, and reuse browser instances |
+| **Browser actions** | Navigate, click, type, scroll — via natural language or selectors |
+| **Data extraction** | Pull structured data from pages, take screenshots, run JavaScript |
+| **Validation** | AI-powered checks on page state (returns true/false) |
+| **Credentials** | Look up stored credentials for login flows |
+| **Workflows** | Build and execute multi-step automations |
+
+Full reference: [MCP Server](/integrations/mcp)
+
+### Skills
+
+Markdown files that teach your AI assistant Skyvern patterns. Skills are **not** MCP tools — they're documentation your agent reads for context on how to use the CLI and API effectively.
+
+```bash
+skyvern skill list            # List available skills
+skyvern skill show skyvern    # Render a skill in the terminal
+```
+
+Full reference: [CLI & Skills](/integrations/cli#skills)
+
+## Try it
+
+Paste any of these into your AI assistant:
+
+| Prompt | What happens |
+|--------|-------------|
+| "Use Skyvern to go to news.ycombinator.com and extract the top 5 post titles as JSON" | Creates a session, navigates, extracts structured data, closes |
+| "Create a Skyvern browser session and take a screenshot of example.com" | Session creation + screenshot capture |
+| "Run a Skyvern workflow that navigates to [url] and fills out the contact form with name 'Jane Doe' and email 'jane@example.com'" | Multi-step workflow with form filling |
+| "List my Skyvern credentials and use one to log into [site]" | Credential lookup + authenticated login |
+
+## Tips for better results
+
+- Tell your agent to **use Skyvern MCP** explicitly when you want browser automation
+- Be specific: "extract the price from the product page" beats "get info from the site"
+- For multi-step flows, ask your agent to use **workflows** or **browser sessions** with persistent state
+- Don't hardcode passwords — use `skyvern credential` to store them securely
+- Use `--json` output when composing CLI commands in scripts
+
+## Next steps
+
+<CardGroup cols={3}>
+  <Card
+    title="Full MCP Reference"
+    icon="server"
+    href="/integrations/mcp"
+  >
+    All 33 tools, config options, local mode, and troubleshooting
+  </Card>
+  <Card
+    title="CLI & Skills"
+    icon="terminal"
+    href="/integrations/cli"
+  >
+    Browser commands, workflow management, and skill system
+  </Card>
+  <Card
+    title="API Quickstart"
+    icon="code"
+    href="/getting-started/quickstart"
+  >
+    Use the Python or TypeScript SDK directly
+  </Card>
+</CardGroup>

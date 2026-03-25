@@ -42,16 +42,22 @@
         "pages": ["index"]
       },
       {
-        "tab": "Documentation",
+        "tab": "Getting Started",
         "groups": [
           {
             "group": "Getting Started",
             "pages": [
               "getting-started/introduction",
+              "getting-started/core-concepts",
               "getting-started/quickstart",
-              "getting-started/core-concepts"
+              "getting-started/ai-agents-quickstart"
             ]
-          },
+          }
+        ]
+      },
+      {
+        "tab": "Developers",
+        "groups": [
           {
             "group": "Running Automations",
             "pages": [
@@ -66,7 +72,8 @@
               "multi-step-automations/build-a-workflow",
               "multi-step-automations/workflow-blocks-reference",
               "multi-step-automations/file-operations",
-              "multi-step-automations/workflow-parameters"
+              "multi-step-automations/workflow-parameters",
+              "multi-step-automations/scheduling-workflows"
             ]
           },
           {
@@ -132,7 +139,15 @@
               "cloud/building-workflows/manage-workflows",
               "cloud/building-workflows/add-parameters",
               "cloud/building-workflows/configure-blocks",
-              "cloud/building-workflows/run-a-workflow"
+              "cloud/building-workflows/run-a-workflow",
+              "cloud/building-workflows/scheduling"
+            ]
+          },
+          {
+            "group": "Re-using Browsers",
+            "pages": [
+              "cloud/browser-management/browser-sessions",
+              "cloud/browser-management/browser-profiles"
             ]
           },
           {
@@ -174,40 +189,6 @@
         ]
       },
       {
-        "tab": "SDKs",
-        "groups": [
-          {
-            "group": "Python SDK",
-            "pages": [
-              "sdk-reference/overview",
-              "sdk-reference/tasks",
-              "sdk-reference/workflows",
-              "sdk-reference/browser-sessions",
-              "sdk-reference/browser-profiles",
-              "sdk-reference/credentials",
-              "sdk-reference/helpers",
-              "sdk-reference/error-handling",
-              "sdk-reference/complete-reference"
-            ]
-          },
-          {
-            "group": "TypeScript SDK",
-            "pages": [
-              "ts-sdk-reference/overview",
-              "ts-sdk-reference/tasks",
-              "ts-sdk-reference/workflows",
-              "ts-sdk-reference/browser-sessions",
-              "ts-sdk-reference/browser-profiles",
-              "ts-sdk-reference/credentials",
-              "ts-sdk-reference/helpers",
-              "ts-sdk-reference/browser-automation",
-              "ts-sdk-reference/error-handling",
-              "ts-sdk-reference/complete-reference"
-            ]
-          }
-        ]
-      },
-      {
         "tab": "Cookbooks",
         "pages": [
           "cookbooks/overview",
@@ -223,6 +204,50 @@
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
+      },
+      {
+        "tab": "SDK Reference",
+        "versions": [
+          {
+            "version": "Python",
+            "groups": [
+              {
+                "group": "Python SDK",
+                "pages": [
+                  "sdk-reference/overview",
+                  "sdk-reference/tasks",
+                  "sdk-reference/workflows",
+                  "sdk-reference/browser-sessions",
+                  "sdk-reference/browser-profiles",
+                  "sdk-reference/credentials",
+                  "sdk-reference/helpers",
+                  "sdk-reference/error-handling",
+                  "sdk-reference/complete-reference"
+                ]
+              }
+            ]
+          },
+          {
+            "version": "TypeScript",
+            "groups": [
+              {
+                "group": "TypeScript SDK",
+                "pages": [
+                  "ts-sdk-reference/overview",
+                  "ts-sdk-reference/tasks",
+                  "ts-sdk-reference/workflows",
+                  "ts-sdk-reference/browser-sessions",
+                  "ts-sdk-reference/browser-profiles",
+                  "ts-sdk-reference/credentials",
+                  "ts-sdk-reference/helpers",
+                  "ts-sdk-reference/browser-automation",
+                  "ts-sdk-reference/error-handling",
+                  "ts-sdk-reference/complete-reference"
+                ]
+              }
+            ]
+          }
+        ]
       }
     ]
   },

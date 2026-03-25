@@ -1,0 +1,110 @@
+---
+title: Browser Profiles
+subtitle: Save and reuse login state across sessions
+slug: cloud/browser-management/browser-profiles
+---
+
+A **browser profile** is a saved snapshot of browser state — cookies, localStorage, and session files. Load a profile into a new [browser session](/cloud/browser-management/browser-sessions) and the browser starts with that saved state restored, skipping login flows you've already completed.
+
+Profiles are ideal when you:
+
+- Run the same automation repeatedly with the same account (daily reports, scheduled data extraction)
+- Want to skip login steps that consume credits and time
+- Need multiple workflows to share the same authenticated state
+
+<Note>
+Looking to manage profiles from code? See the [API & SDK guide](/optimization/browser-profiles) instead.
+</Note>
+
+---
+
+## How profiles are created
+
+Browser profiles are created automatically when you test a password credential with the **Save browser session** option enabled. There is no standalone "create profile" button — the profile is a byproduct of a successful login test.
+
+### Creating a profile from a credential
+
+<Steps>
+  <Step title="Go to the Credentials page">
+    Click **Credentials** in the left sidebar under **General**.
+  </Step>
+  <Step title="Create or edit a password credential">
+    Click **+ Add → Password** to create a new credential, or click the **pencil icon** on an existing one. Enter the username and password. See [Password Credentials](/cloud/managing-credentials/password-credentials) for details.
+
+    <img src="/images/cloud/credential-add-password-form.png" alt="Add password credential dialog with name, username, and password fields" />
+  </Step>
+  <Step title="Enable Save browser session">
+    Below the password fields, enable the **Save browser session** option. Enter the **login URL** for the site (e.g., `https://app.example.com/login`). You can also add optional context to help the AI navigate the login flow.
+  </Step>
+  <Step title="Test the credential">
+    Click **Test**. Skyvern opens a browser, navigates to the login URL, signs in with the credential, and — if the login succeeds — saves the browser state as a profile. The profile is linked to this credential automatically.
+  </Step>
+  <Step title="Confirm the profile was saved">
+    When the test completes, the credential row shows a **saved-profile** badge with the site hostname. This means the browser profile is ready to use.
+
+  <img src="/images/cloud/credential-save-profile.png" alt="Credential listed with a profile badge" />
+    
+  </Step>
+</Steps>
+
+<Tip>
+The **Save browser session** flow is the easiest way to create a profile. It handles the full lifecycle: open browser, log in, save state. No workflows or API calls required.
+</Tip>
+
+---
+
+## When to refresh profiles
+
+Cookies and session tokens expire. A profile that worked last week may not work today if the site's authentication tokens have a short lifespan.
+
+**Signs a profile needs refreshing:**
+
+- Tasks that use the profile start failing with login-related errors
+- The browser loads a login page instead of the authenticated dashboard
+- The site forces re-authentication after a set period
+
+**To refresh:** go back to the credential, click **Test** again with **Save browser session** enabled. The new profile replaces the old one.
+
+<Tip>
+For sites with short-lived sessions (banks, healthcare portals), refresh profiles before each batch of runs. For sites with long-lived cookies (most SaaS apps), weekly or monthly refreshes are usually sufficient.
+</Tip>
+
+---
+
+## Sessions vs profiles
+
+| | Browser Session | Browser Profile |
+|---|----------------|-----------------|
+| **What it is** | Live browser instance | Saved snapshot of browser state |
+| **Lifetime** | Minutes to hours | Days to months |
+| **State** | Current page, cookies, open connections | Cookies, localStorage, session files |
+| **Billing** | Charged while open | No cost when not in use |
+| **Best for** | Back-to-back tasks, human-in-the-loop | Repeated logins, scheduled workflows |
+
+---
+
+## What's next
+
+<CardGroup cols={3}>
+  <Card
+    title="Browser Sessions"
+    icon="browser"
+    href="/cloud/browser-management/browser-sessions"
+  >
+    Keep a browser open across multiple tasks
+  </Card>
+  <Card
+    title="Password Credentials"
+    icon="key"
+    href="/cloud/managing-credentials/password-credentials"
+  >
+    Store the login details that profiles are built from
+  </Card>
+  <Card
+    title="Browser Profiles (API)"
+    icon="code"
+    href="/optimization/browser-profiles"
+  >
+    Create and manage profiles programmatically
+  </Card>
+</CardGroup>
