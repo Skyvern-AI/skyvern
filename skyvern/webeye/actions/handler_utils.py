@@ -5,8 +5,9 @@ import structlog
 from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
-from skyvern.constants import TEXT_INPUT_DELAY, TEXT_PRESS_MAX_LENGTH
+from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.forge.sdk.api.files import download_file as download_file_api
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 
 LOG = structlog.get_logger()
 
@@ -35,8 +36,7 @@ async def input_sequentially(locator: Locator, text: str, timeout: float = setti
         await locator.fill(text[: length - TEXT_PRESS_MAX_LENGTH], timeout=timeout)
         text = text[length - TEXT_PRESS_MAX_LENGTH :]
 
-    for char in text:
-        await locator.type(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
+    await EventStrategyFactory.type_text(locator.page, locator, text)
 
 
 async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0) -> None:
@@ -95,18 +95,24 @@ async def drag(
     page: Page, start_x: int | None = None, start_y: int | None = None, path: list[tuple[int, int]] | None = None
 ) -> None:
     if start_x and start_y:
-        await page.mouse.move(start_x, start_y)
+        await EventStrategyFactory.move_cursor(page, start_x, start_y)
     await page.mouse.down()
     path = path or []
+    last_x: float = start_x if start_x is not None else 0.0
+    last_y: float = start_y if start_y is not None else 0.0
     for point in path:
-        x, y = point[0], point[1]
-        await page.mouse.move(x, y)
+        last_x, last_y = point[0], point[1]
+        await EventStrategyFactory.move_cursor(page, last_x, last_y)
     await page.mouse.up()
+    # Sync cursor strategy position to the final drag point so the next
+    # move_to() starts from the correct location.
+    if start_x is not None or path:
+        EventStrategyFactory.sync_cursor_position(page, last_x, last_y)
 
 
 async def left_mouse(page: Page, x: int | None, y: int | None, direction: Literal["down", "up"]) -> None:
     if x and y:
-        await page.mouse.move(x, y)
+        await EventStrategyFactory.move_cursor(page, x, y)
     if direction == "down":
         await page.mouse.down()
     elif direction == "up":

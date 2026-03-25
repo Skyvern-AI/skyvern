@@ -11,7 +11,7 @@ import structlog
 from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
+from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
@@ -26,6 +26,7 @@ from skyvern.exceptions import (
     SkyvernException,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
@@ -702,8 +703,8 @@ class SkyvernElement:
         await self.get_locator().press(key=key, timeout=timeout)
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        for char in text:
-            await self.get_locator().type(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
+        locator = self.get_locator()
+        await EventStrategyFactory.type_text(locator.page, locator, text)
 
     async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:
@@ -715,7 +716,8 @@ class SkyvernElement:
         await self.get_locator().fill(text, timeout=timeout)
 
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.get_locator().clear(timeout=timeout)
+        locator = self.get_locator()
+        await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
 
     async def check(
         self,
@@ -819,7 +821,7 @@ class SkyvernElement:
         if dest_x < 0 or dest_y < 0:
             raise ElementOutOfCurrentViewport(element_id=self.get_id())
 
-        await page.mouse.move(dest_x, dest_y)
+        await EventStrategyFactory.move_cursor(page, dest_x, dest_y)
 
         return dest_x, dest_y
 
@@ -833,6 +835,7 @@ class SkyvernElement:
         if await self.is_disabled(dynamic=True):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
+        await EventStrategyFactory.move_to_element(page, self.get_locator())
         try:
             await self.get_locator().click(timeout=timeout)
             return
