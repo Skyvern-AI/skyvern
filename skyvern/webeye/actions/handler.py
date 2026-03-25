@@ -70,6 +70,7 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
@@ -730,6 +731,7 @@ async def handle_click_action(
                 if await skyvern_element.navigate_to_a_href(page=page):
                     return [ActionSuccess()]
 
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
         elif action.repeat == 2:
@@ -1124,7 +1126,7 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     if not action.element_id:
         # This is a CUA type action
-        await page.keyboard.type(action.text)
+        await EventStrategyFactory.type_text(page, None, action.text)
         return [ActionSuccess()]
 
     dom = DomUtil(scraped_page, page)
@@ -1997,6 +1999,7 @@ async def handle_select_option_action(
         await skyvern_element.scroll_into_view()
 
         try:
+            await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
             await skyvern_element.get_locator().click(timeout=timeout)
         except Exception:
             LOG.info(
@@ -2106,6 +2109,7 @@ async def handle_hover_action(
     try:
         await skyvern_element.hover_to_reveal()
         await skyvern_element.get_locator().scroll_into_view_if_needed()
+        await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
         await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
 
         if action.hold_seconds and action.hold_seconds > 0:
@@ -2274,7 +2278,7 @@ async def handle_scroll_action(
             viewport = page.viewport_size
             center_x = viewport["width"] // 2 if viewport else 640
             center_y = viewport["height"] // 2 if viewport else 360
-            await page.mouse.move(center_x, center_y)
+            await EventStrategyFactory.move_cursor(page, center_x, center_y)
             wheel_delta = 500 if scroll_direction == "down" else -500
             # Dynamically compute iterations based on remaining scrollable distance
             # so we reach the bottom even on very long T&C pages.
@@ -2293,6 +2297,11 @@ async def handle_scroll_action(
                 iterations=iterations,
                 wheel_delta=wheel_delta,
             )
+            # Scroll per-iteration with page-reaction pauses between each chunk
+            # (e.g. lazy-load, infinite scroll, dynamically enabled buttons).
+            # Use raw page.mouse.wheel() here — the chunking + 100ms pauses already
+            # provide a natural pattern, and applying the custom event strategy
+            # per-iteration would add excessive latency per chunk.
             for _ in range(iterations):
                 await page.mouse.wheel(0, wheel_delta)
                 await page.wait_for_timeout(100)
@@ -2314,13 +2323,13 @@ async def handle_scroll_action(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
             )
-            await page.mouse.wheel(action.scroll_x, action.scroll_y)
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
-        await page.mouse.move(action.x, action.y)
-        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     else:
-        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
@@ -2344,7 +2353,7 @@ async def handle_move_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.x, action.y)
+    await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
 
@@ -2509,6 +2518,7 @@ async def chain_click(
     """
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
+            await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
@@ -3497,6 +3507,7 @@ async def select_from_dropdown(
             "Find an alternative option with the same value. Try to select the option.",
             value=value,
         )
+        await EventStrategyFactory.move_to_element(page, locator)
         await locator.click(timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
