@@ -35,7 +35,7 @@ class TotpType(StrEnum):
 class PasswordCredentialResponse(BaseModel):
     """Response model for password credentials — non-sensitive fields only.
 
-    SECURITY: Must NEVER include password, TOTP secret, or TOTP identifier.
+    SECURITY: Must NEVER include password or TOTP secret.
     """
 
     username: str = Field(..., description="The username associated with the credential", examples=["user@example.com"])

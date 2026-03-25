@@ -42,7 +42,9 @@ EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-acti
 
 # Text input constants
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
-TEXT_PRESS_MAX_LENGTH = 20
+# Number of trailing characters typed keystroke-by-keystroke (the rest use fill()).
+# 10 chars yield 9 inter-key intervals, balancing speed with realistic input cadence.
+TEXT_PRESS_MAX_LENGTH = 10
 
 # Script generation constants
 DEFAULT_SCRIPT_RUN_ID = "default"
