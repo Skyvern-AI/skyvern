@@ -10,11 +10,11 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           token: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
       - name: Update OpenAPI Spec
-        uses: fern-api/sync-openapi@v2
+        uses: fern-api/sync-openapi@8e936a4bac8ad11d698d7114f3074fa3397398ea # v2
         with:
           token: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
           branch: 'update-openapi-spec'

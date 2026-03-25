@@ -12,9 +12,10 @@ jobs:
     outputs:
       version_changed: ${{ steps.check.outputs.version_changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 2
+          persist-credentials: false
       - name: Check if version changed
         id: check
         run: |
@@ -42,12 +43,14 @@ jobs:
     if: needs.check-version-change.outputs.version_changed == 'true'
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       # If you wanted to use multiple Python versions, you'd have specify a matrix in the job and
       # reference the matrixe python version here.
       - name: Setup Python
         id: setup-python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.11"
       # Cache the installation of `uv` itself, e.g. the next step. This prevents the workflow
@@ -58,14 +61,14 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       # Cache uv's global cache (resolver/downloads) for speed
       - name: Cache uv cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/uv
           key: uv-cache-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
       # Cache the project venv (keyed by lockfile + Python)
       - name: Cache venv
         id: cache-venv
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version || '3.11' }}-${{ hashFiles('**/uv.lock') }}
