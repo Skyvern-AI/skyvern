@@ -159,6 +159,11 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       onParametersChange={(parameterKeys) => {
                         update({ parameterKeys });
                       }}
+                      onCredentialTotpIdentifier={(totpIdentifier) => {
+                        if (!data.totpIdentifier?.trim()) {
+                          update({ totpIdentifier });
+                        }
+                      }}
                     />
                   </div>
                 </div>

@@ -36,6 +36,10 @@ type Props = {
   onUrlAutoFill?: (url: string) => void;
   /** Current URL value of the login block — skip auto-fill if already set */
   currentUrl?: string;
+  /** Called when a credential with a totp_identifier is selected to auto-fill the 2FA identifier */
+  onTotpIdentifierAutoFill?: (totpIdentifier: string) => void;
+  /** Current totp_identifier value — skip auto-fill if already set */
+  currentTotpIdentifier?: string;
 };
 
 // Function to generate a unique credential parameter key
@@ -62,6 +66,8 @@ function LoginBlockCredentialSelector({
   onChange,
   onUrlAutoFill,
   currentUrl,
+  onTotpIdentifierAutoFill,
+  currentTotpIdentifier,
 }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
@@ -131,6 +137,11 @@ function LoginBlockCredentialSelector({
     type: "credential" as const,
     hasBrowserProfile: !!credential.browser_profile_id,
     browserProfileUrl: credential.tested_url ?? null,
+    totpIdentifier:
+      credential.credential_type === "password" &&
+      "totp_identifier" in credential.credential
+        ? credential.credential.totp_identifier ?? null
+        : null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
@@ -249,6 +260,16 @@ function LoginBlockCredentialSelector({
             selectedCredential.browserProfileUrl
           ) {
             onUrlAutoFill?.(selectedCredential.browserProfileUrl);
+          }
+
+          // Auto-fill the 2FA identifier from the credential's totp_identifier
+          // when the field is empty.
+          if (
+            selectedCredential &&
+            !currentTotpIdentifier?.trim() &&
+            selectedCredential.totpIdentifier
+          ) {
+            onTotpIdentifierAutoFill?.(selectedCredential.totpIdentifier);
           }
         }}
       >
