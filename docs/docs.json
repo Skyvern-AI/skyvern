@@ -42,15 +42,13 @@
         "pages": ["index"]
       },
       {
-        "tab": "Documentation",
+        "tab": "Developers",
         "groups": [
           {
             "group": "Getting Started",
             "pages": [
-              "getting-started/introduction",
               "getting-started/quickstart",
-              "getting-started/ai-agents-quickstart",
-              "getting-started/core-concepts"
+              "getting-started/ai-agents-quickstart"
             ]
           },
           {
@@ -184,7 +182,24 @@
         ]
       },
       {
-        "tab": "SDKs",
+        "tab": "Cookbooks",
+        "pages": [
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler",
+          "cookbooks/healthcare-portal-data"
+        ]
+      },
+      {
+        "tab": "Changelog",
+        "pages": ["changelog"]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.json"
+      },
+      {
+        "tab": "SDK Reference",
         "groups": [
           {
             "group": "Python SDK",
@@ -216,23 +231,6 @@
             ]
           }
         ]
-      },
-      {
-        "tab": "Cookbooks",
-        "pages": [
-          "cookbooks/overview",
-          "cookbooks/bulk-invoice-downloader",
-          "cookbooks/job-application-filler",
-          "cookbooks/healthcare-portal-data"
-        ]
-      },
-      {
-        "tab": "Changelog",
-        "pages": ["changelog"]
-      },
-      {
-        "tab": "API Reference",
-        "openapi": "api-reference/openapi.json"
       }
     ]
   },

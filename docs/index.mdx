@@ -4,158 +4,435 @@ slug: /
 mode: custom
 ---
 
-<div className="sk-page">
+<div className="fm-page">
+
+{/* ===== SIDE TOC ===== */}
+
+<nav className="fm-toc">
+  <span className="fm-toc-title">ON THIS PAGE</span>
+  <a href="#how-it-works" className="fm-toc-link">01 How it works</a>
+  <a href="#capabilities" className="fm-toc-link">02 Capabilities</a>
+  <a href="#concepts" className="fm-toc-link">03 Concepts</a>
+  <a href="#start-building" className="fm-toc-link">04 Get started</a>
+  <div className="fm-toc-divider"></div>
+  <a href="/getting-started/quickstart" className="fm-toc-link fm-toc-ext">Developer Docs ↗</a>
+  <a href="/cloud/getting-started/overview" className="fm-toc-link fm-toc-ext">Cloud UI Docs ↗</a>
+</nav>
 
 {/* ===== HERO ===== */}
 
-<div className="sk-hero">
-  <div className="sk-hero-inner">
-    <div className="sk-hero-left">
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>
-        <p className="sk-mono sk-label" style={{ margin: "0" }}>DOCUMENTATION</p>
-        <a href="/changelog" className="sk-version-badge">v1.0.22 — latest</a>
+<div className="fm-hero">
+  <div className="fm-hero-meta">
+    <a href="/changelog" className="fm-mono-link">v1.0.22</a>
+    <span className="fm-meta-sep">/</span>
+    <a href="https://github.com/Skyvern-AI/skyvern" className="fm-mono-link">github ↗</a>
+    <span className="fm-meta-sep">/</span>
+    <a href="https://discord.gg/skyvern" className="fm-mono-link">discord ↗</a>
+  </div>
+  <h1 className="fm-hero-title">Automate any<br />browser workflow<br />with AI.</h1>
+  <p className="fm-hero-sub">
+    Skyvern opens a real Chromium browser, screenshots the page, and uses an LLM to figure out what to do next, the same way you would. It doesn't rely on selectors or scripts, so your automations keep working when sites change.
+  </p>
+  <div className="fm-hero-toc">
+    <span className="fm-hero-toc-label">WHAT'S ON THIS PAGE</span>
+    <div className="fm-hero-toc-items">
+      <a href="#how-it-works" className="fm-hero-toc-item">How it works</a>
+      <a href="#capabilities" className="fm-hero-toc-item">Capabilities</a>
+      <a href="#concepts" className="fm-hero-toc-item">Core concepts</a>
+      <a href="#start-building" className="fm-hero-toc-item">Getting started</a>
+    </div>
+  </div>
+  <div className="fm-hero-ctas">
+    <a href="/getting-started/quickstart" className="fm-btn-primary">READ DEVELOPER DOCS</a>
+    <a href="/cloud/getting-started/overview" className="fm-btn-outline">READ UI DOCS</a>
+  </div>
+  <div className="fm-hero-nav">
+    <a href="/sdk-reference/overview" className="fm-hero-nav-link">SDK Reference →</a>
+    <span className="fm-meta-sep">/</span>
+    <a href="/api-reference" className="fm-hero-nav-link">API Reference →</a>
+    <span className="fm-meta-sep">/</span>
+    <a href="/cookbooks/overview" className="fm-hero-nav-link">Cookbooks →</a>
+  </div>
+</div>
+
+{/* ===== 01 — THE AGENT LOOP ===== */}
+
+<div className="fm-section" id="how-it-works">
+  <div className="fm-section-head">
+    <span className="fm-section-num">01</span>
+    <h2 className="fm-section-title">How it works</h2>
+  </div>
+
+  <p className="fm-prose">
+    Every Skyvern automation, whether you trigger it from the dashboard, the API, or a workflow integration, runs the same five-step loop. Each cycle through this loop is called a <strong>step</strong>, and a typical task completes in 2 to 10 steps. Because Skyvern reads the page visually instead of relying on hardcoded selectors, it works on sites it has never seen before and keeps working when those sites redesign.
+  </p>
+
+  <div className="fm-diagram">
+    <div className="fm-dia-row">
+      <div className="fm-dia-card">
+        <span className="fm-dia-num">01</span>
+        <strong className="fm-dia-label">SCREENSHOT</strong>
+        <p className="fm-dia-desc">Captures the viewport so the LLM can see buttons, forms, modals, and overall page layout.</p>
       </div>
-      <h1 className="sk-hero-title">
-        Automate any<br />browser workflow<br /><span className="sk-hero-accent">with AI.</span>
-      </h1>
-      <p className="sk-hero-sub">
-        Describe what you want in plain English. Skyvern opens a real browser, reads the page visually, and completes the task.
-      </p>
-      <div className="sk-hero-actions">
-        <a href="/getting-started/quickstart" className="sk-btn-primary">Get started with the API →</a>
-        <a href="/cloud/getting-started/overview" className="sk-btn-secondary">Use the dashboard</a>
+      <span className="fm-dia-arrow">→</span>
+      <div className="fm-dia-card">
+        <span className="fm-dia-num">02</span>
+        <strong className="fm-dia-label">EXTRACT DOM</strong>
+        <p className="fm-dia-desc">Parses the page into a tree of interactive elements with labels and positions that Playwright can target.</p>
+      </div>
+      <span className="fm-dia-arrow">→</span>
+      <div className="fm-dia-card">
+        <span className="fm-dia-num">03</span>
+        <strong className="fm-dia-label">LLM DECIDES</strong>
+        <p className="fm-dia-desc">Combines the screenshot, DOM, and your prompt to pick a target element and action: click, type, select, scroll, or extract.</p>
+      </div>
+      <span className="fm-dia-arrow">→</span>
+      <div className="fm-dia-card">
+        <span className="fm-dia-num">04</span>
+        <strong className="fm-dia-label">EXECUTE</strong>
+        <p className="fm-dia-desc">Playwright runs the action in real Chromium. Credentials are injected directly into browser fields, never exposed to the LLM.</p>
+      </div>
+      <span className="fm-dia-arrow">→</span>
+      <div className="fm-dia-card">
+        <span className="fm-dia-num">05</span>
+        <strong className="fm-dia-label">GOAL CHECK</strong>
+        <p className="fm-dia-desc">If the goal is met, return results. Otherwise, loop back to step 01 and screenshot the now-changed page.</p>
       </div>
     </div>
-    <div className="sk-hero-right">
-      <div className="sk-terminal">
-        <div className="sk-terminal-bar">
-          <span className="sk-dot sk-dot-red"></span>
-          <span className="sk-dot sk-dot-yellow"></span>
-          <span className="sk-dot sk-dot-green"></span>
-          <span className="sk-terminal-title">skyvern.log</span>
-        </div>
-        <div className="sk-terminal-body">
-          <p className="sk-mono">> Initializing browser session...</p>
-          <p className="sk-mono sk-t-teal">> Navigating to target URL... [OK]</p>
-          <p className="sk-mono sk-t-teal">> Analyzing page with vision... [OK]</p>
-          <p className="sk-mono">> Planning actions...</p>
-          <p className="sk-mono sk-t-orange">→ ACTIONS_PLANNED: 4</p>
-          <p className="sk-mono">> Executing: fill_form</p>
-          <p className="sk-mono">> Executing: click_submit</p>
-          <p className="sk-mono sk-t-teal">> Task completed successfully</p>
-          <p className="sk-mono sk-t-muted">→ DURATION: 3.2s</p>
-          <p className="sk-mono">> READY<span className="sk-cursor">▊</span></p>
-        </div>
+    <div className="fm-dia-return">
+      <span>↻ repeat until goal is met</span>
+    </div>
+  </div>
+
+  <div className="fm-rule"></div>
+
+  <h3 className="fm-h3">Planner, Agent, Validator</h3>
+  <p className="fm-prose">
+    For multi-page tasks, Skyvern 2.0 adds a coordination layer on top of the agent loop. Three components work together so that if something goes wrong partway through, the system detects the failure and retries rather than silently producing incomplete results.
+  </p>
+
+  <div className="fm-diagram">
+    <div className="fm-dia-row fm-dia-row-3">
+      <div className="fm-dia-card fm-dia-card-lg">
+        <strong className="fm-dia-label">PLANNER</strong>
+        <p className="fm-dia-desc">Takes your prompt and breaks it into an ordered sequence of sub-tasks. "Log in, find invoices, download each one" becomes three focused steps.</p>
+      </div>
+      <span className="fm-dia-arrow">→</span>
+      <div className="fm-dia-card fm-dia-card-lg">
+        <strong className="fm-dia-label">TASK AGENT</strong>
+        <p className="fm-dia-desc">Picks up each sub-task and runs the five-step loop above. Focusing on one thing at a time makes each step more reliable.</p>
+      </div>
+      <span className="fm-dia-arrow">→</span>
+      <div className="fm-dia-card fm-dia-card-lg">
+        <strong className="fm-dia-label">VALIDATOR</strong>
+        <p className="fm-dia-desc">Checks whether the overall goal was actually met. If something was missed, it feeds back to the Planner, which can re-sequence or retry.</p>
       </div>
     </div>
-  </div>
-</div>
-
-{/* ===== BENTO GRID — 3 PERSONA LANES ===== */}
-
-<div className="sk-bento-row sk-bento-3col">
-  <div className="sk-bento-cell">
-    <p className="sk-mono sk-label">01 — NO CODE</p>
-    <h3 className="sk-cell-title">Automate without code</h3>
-    <p className="sk-cell-desc">Use the dashboard to run tasks and build workflows visually.</p>
-    <div className="sk-cell-links">
-      <a href="/cloud/getting-started/overview" className="sk-cell-link">Dashboard overview <span className="sk-arrow">↗</span></a>
-      <a href="/cloud/getting-started/run-your-first-task" className="sk-cell-link">Run your first task <span className="sk-arrow">↗</span></a>
-      <a href="/cloud/building-workflows/build-a-workflow" className="sk-cell-link">Build a workflow <span className="sk-arrow">↗</span></a>
-      <a href="/integrations/zapier" className="sk-cell-link">Connect to Zapier <span className="sk-arrow">↗</span></a>
-    </div>
-  </div>
-  <div className="sk-bento-cell">
-    <p className="sk-mono sk-label">02 — API</p>
-    <h3 className="sk-cell-title">Build with the API</h3>
-    <p className="sk-cell-desc">Integrate browser automation into your product with Python, TypeScript, or REST.</p>
-    <div className="sk-cell-links">
-      <a href="/getting-started/quickstart" className="sk-cell-link">API quickstart <span className="sk-arrow">↗</span></a>
-      <a href="/sdk-reference/overview" className="sk-cell-link">Python SDK <span className="sk-arrow">↗</span></a>
-      <a href="/ts-sdk-reference/overview" className="sk-cell-link">TypeScript SDK <span className="sk-arrow">↗</span></a>
-      <a href="/api-reference" className="sk-cell-link">API reference <span className="sk-arrow">↗</span></a>
-    </div>
-  </div>
-  <div className="sk-bento-cell">
-    <p className="sk-mono sk-label">03 — SELF-HOST</p>
-    <h3 className="sk-cell-title">Self-host</h3>
-    <p className="sk-cell-desc">Run Skyvern on your own infrastructure with your own LLM keys.</p>
-    <div className="sk-cell-links">
-      <a href="/self-hosted/overview" className="sk-cell-link">Deployment overview <span className="sk-arrow">↗</span></a>
-      <a href="/self-hosted/docker" className="sk-cell-link">Docker setup <span className="sk-arrow">↗</span></a>
-      <a href="/self-hosted/llm-configuration" className="sk-cell-link">LLM configuration <span className="sk-arrow">↗</span></a>
-      <a href="/self-hosted/kubernetes" className="sk-cell-link">Kubernetes <span className="sk-arrow">↗</span></a>
+    <div className="fm-dia-return">
+      <span>← feedback loop if goal not met →</span>
     </div>
   </div>
 </div>
 
-{/* ===== BENTO GRID — 2 COL: HOW IT WORKS + CONCEPTS ===== */}
+{/* ===== 02 — CAPABILITIES ===== */}
 
-<div className="sk-bento-row sk-bento-2col">
-  <a href="/getting-started/introduction" className="sk-bento-cell sk-bento-cell-link">
-    <p className="sk-mono sk-label">ARCHITECTURE</p>
-    <h3 className="sk-cell-title">How Skyvern works</h3>
-    <p className="sk-cell-desc">The agent loop, Planner-Agent-Validator architecture, and what happens under the hood when you run a task.</p>
-    <span className="sk-mono sk-arrow-lg">↗</span>
-  </a>
-  <a href="/getting-started/core-concepts" className="sk-bento-cell sk-bento-cell-link">
-    <p className="sk-mono sk-label">REFERENCE</p>
-    <h3 className="sk-cell-title">Core concepts</h3>
-    <p className="sk-cell-desc">Tasks, workflows, blocks, runs, credentials, browser sessions, and engines.</p>
-    <span className="sk-mono sk-arrow-lg">↗</span>
-  </a>
-</div>
+<div className="fm-section" id="capabilities">
+  <div className="fm-section-head">
+    <span className="fm-section-num">02</span>
+    <h2 className="fm-section-title">Capabilities</h2>
+  </div>
 
-{/* ===== BENTO GRID — 4 COL: USE CASES ===== */}
-
-<p className="sk-mono sk-label" style={{ marginBottom: "24px", marginTop: "32px" }}>USE CASES</p>
-
-<div className="sk-bento-row sk-bento-4col">
-  <a href="/cookbooks/bulk-invoice-downloader" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-teal">
-    <h4 className="sk-cell-title-sm">Download invoices</h4>
-    <p className="sk-cell-desc-sm">Log into vendor portals, find invoices, download PDFs.</p>
-    <span className="sk-mono sk-arrow-sm">↗</span>
-  </a>
-  <a href="/cookbooks/job-application-filler" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-orange">
-    <h4 className="sk-cell-title-sm">Fill forms at scale</h4>
-    <p className="sk-cell-desc-sm">Submit applications, registrations, and compliance forms.</p>
-    <span className="sk-mono sk-arrow-sm">↗</span>
-  </a>
-  <a href="/running-automations/extract-structured-data" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-teal">
-    <h4 className="sk-cell-title-sm">Extract data</h4>
-    <p className="sk-cell-desc-sm">Pull structured data from any site without an API.</p>
-    <span className="sk-mono sk-arrow-sm">↗</span>
-  </a>
-  <a href="/cookbooks/healthcare-portal-data" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-orange">
-    <h4 className="sk-cell-title-sm">Healthcare portals</h4>
-    <p className="sk-cell-desc-sm">Extract patient demographics and billing from EHR portals.</p>
-    <span className="sk-mono sk-arrow-sm">↗</span>
-  </a>
-</div>
-
-{/* ===== FOOTER CTA ===== */}
-
-<div className="sk-footer-cta">
-  <div className="sk-footer-cta-inner">
-    <p className="sk-footer-cta-text flex items-center gap-2">
-      <span className="sk-mono" style={{ color: "var(--sk-blue)" }}>●</span>
-      <span className="w-full">Open source ·</span>
-      <iframe
-        src="https://ghbtns.com/github-btn.html?user=skyvern-ai&repo=skyvern&type=star&count=true"
-        frameBorder="0"
-        scrolling="no"
-        width="180"
-        height="20"
-        className="inline-block align-middle"
-        style={{ background: "transparent", colorScheme: "light" }}
-        title="GitHub">
-      </iframe>
-    </p>
-    <div className="sk-footer-cta-links">
-      <a href="https://github.com/Skyvern-AI/skyvern" className="sk-footer-link">GitHub ↗</a>
-      <a href="https://discord.gg/skyvern" className="sk-footer-link">Discord ↗</a>
+  <div className="fm-cap-grid">
+    <div className="fm-cap-cell">
+      <h4 className="fm-cap-name">Authentication</h4>
+      <p className="fm-cap-desc">Encrypted credential storage with direct browser injection. The LLM runs the login flow but never sees actual values. Supports Bitwarden, 1Password, and Azure Key Vault.</p>
+    </div>
+    <div className="fm-cap-cell">
+      <h4 className="fm-cap-name">CAPTCHAs</h4>
+      <p className="fm-cap-desc">Detected and solved automatically. No configuration, no third-party services.</p>
+    </div>
+    <div className="fm-cap-cell">
+      <h4 className="fm-cap-name">Data extraction</h4>
+      <p className="fm-cap-desc">Pass a JSON Schema for typed output, or let Skyvern infer structure from your prompt.</p>
+    </div>
+    <div className="fm-cap-cell">
+      <h4 className="fm-cap-name">File operations</h4>
+      <p className="fm-cap-desc">Download, upload, and parse PDFs, CSVs, and Excel files. Downloads return as signed URLs with checksums.</p>
+    </div>
+    <div className="fm-cap-cell">
+      <h4 className="fm-cap-name">Proxy and geolocation</h4>
+      <p className="fm-cap-desc">Residential IPs in 30+ countries. Set <code>proxy_location</code> per task to control where requests originate.</p>
+    </div>
+    <div className="fm-cap-cell">
+      <h4 className="fm-cap-name">Browser state</h4>
+      <p className="fm-cap-desc">Sessions keep a browser live for up to 24 hours across tasks. Profiles save cookies and tokens so you can skip login on future runs.</p>
+    </div>
+    <div className="fm-cap-cell fm-cap-wide">
+      <h4 className="fm-cap-name">Multi-step workflows</h4>
+      <p className="fm-cap-desc">Chain blocks together: navigate, login, loop, extract, branch, email. Build visually in the dashboard or define through the API.</p>
     </div>
   </div>
+</div>
+
+{/* ===== 03 — CONCEPTS ===== */}
+
+<div className="fm-section" id="concepts">
+  <div className="fm-section-head">
+    <span className="fm-section-num">03</span>
+    <h2 className="fm-section-title">Concepts</h2>
+    <p className="fm-section-sub">Eight building blocks for any automation. Select one to explore.</p>
+  </div>
+
+<Tabs>
+  <Tab title="Tasks">
+    A **Task** is a single automation job: you provide a prompt describing what you want done and the URL to start from, and Skyvern navigates the browser and returns structured results.
+
+    The example below extracts the top 3 posts from Hacker News. The `data_extraction_schema` tells Skyvern what shape of data to return, so you get typed JSON instead of freeform text.
+
+    ```python
+    from skyvern import Skyvern
+
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+
+    result = await skyvern.run_task(
+        prompt="Find the top 3 posts on the front page",
+        url="https://news.ycombinator.com",
+        data_extraction_schema={
+            "type": "object",
+            "properties": {
+                "posts": {"type": "array", "items": {"type": "string"}}
+            }
+        }
+    )
+
+    print(result.status)   # "completed"
+    print(result.output)
+    # {"posts": ["Show HN: AI Browser Agent", "Startup raises $50M", "New open-source framework"]}
+    ```
+
+    `prompt` and `url` are the only required fields. Add `data_extraction_schema` to get structured output, `max_steps` to cap cost during development, or `browser_session_id` to run the task inside an existing authenticated browser.
+
+    Use Tasks for one-off automations and data extraction. When you need something reusable with multiple steps, use a Workflow instead.
+
+    <CardGroup cols={2}>
+      <Card title="Run a Task (API)" icon="code" href="/running-automations/run-a-task" />
+      <Card title="Run a Task (UI)" icon="window-maximize" href="/cloud/getting-started/run-a-task" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Workflows">
+    A **Workflow** is a reusable, multi-step template composed of blocks. Unlike Tasks, Workflows can be versioned, shared across your team, and executed repeatedly with different parameters.
+
+    The example below runs a workflow that searches for products. Parameters like `search_query` and `max_price` are passed in at runtime and available to every block inside the workflow via Jinja templates (`{{search_query}}`).
+
+    ```python
+    result = await skyvern.run_workflow(
+        workflow_id="wpid_abc123",
+        parameters={
+            "search_query": "wireless headphones",
+            "max_price": 100
+        }
+    )
+
+    print(result.status)   # "completed"
+    print(result.output)
+    # {"products": [{"name": "Sony WH-1000XM5", "price": 89.99}, {"name": "Bose QC45", "price": 79.00}]}
+    ```
+
+    Blocks can also reference outputs from earlier blocks using `{{extract_block.product_name}}`, so data flows naturally through each step of the workflow.
+
+    <CardGroup cols={2}>
+      <Card title="Build a Workflow (API)" icon="code" href="/multi-step-automations/build-a-workflow" />
+      <Card title="Build a Workflow (UI)" icon="window-maximize" href="/cloud/building-workflows/build-a-workflow" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Blocks">
+    **Blocks** are the building units of Workflows. Each block handles one job, and they execute sequentially so each one can reference outputs from the blocks before it. There are 17 block types across four categories.
+
+    #### Navigation and interaction
+    AI-guided navigation toward a goal, single targeted actions (click, type, select), direct URL navigation, login with stored credentials, timed pauses, and manual intervention points.
+
+    #### Data and files
+    Structured data extraction from pages into JSON, file downloads and uploads, and parsing for PDFs, CSVs, and Excel files.
+
+    #### Logic and control flow
+    Conditional branching (if/else), for loops over lists, validation assertions that halt the workflow on failure, and a code block for custom Python or Playwright scripts.
+
+    #### Communication
+    Outbound HTTP requests to external APIs, text-only LLM prompts (no browser involved), and sending email.
+
+    <CardGroup cols={2}>
+      <Card title="Block Reference (API)" icon="code" href="/multi-step-automations/workflow-blocks-reference" />
+      <Card title="Configure Blocks (UI)" icon="window-maximize" href="/cloud/building-workflows/configure-blocks" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Runs">
+    Every time you execute a Task or Workflow, Skyvern creates a **Run** to track progress and store outputs.
+
+    **Lifecycle:** `created` → `queued` → `running` → `completed` | `failed` | `timed_out` | `canceled`
+
+    The run response includes everything you need to process results:
+
+    - `run_id` - Unique identifier (`tsk_*` for tasks, `wr_*` for workflows)
+    - `output` - Extracted data matching your schema
+    - `recording_url` - Full video of the session
+    - `screenshot_urls` - Captured after each action
+    - `downloaded_files` - Signed URLs with checksums
+    - `failure_reason` - Error details if the run failed
+
+    <Warning>You're billed per step. Use `max_steps` to cap costs during development.</Warning>
+
+    <CardGroup cols={2}>
+      <Card title="Run Details" icon="chart-line" href="/cloud/viewing-results/run-details" />
+      <Card title="Run History" icon="clock" href="/cloud/viewing-results/run-history" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Credentials">
+    Credentials store passwords, TOTP codes, and credit cards with encryption at rest and in transit. During execution, values are injected directly into browser fields. The LLM orchestrates the login flow but never sees the actual values.
+
+    **Supported types:** Passwords · TOTP (authenticator apps) · Credit cards
+
+    **Sources:** Skyvern (native) · Bitwarden · 1Password · Azure Key Vault
+
+    Once stored, credentials are referenced by ID in Login blocks or auto-matched when Skyvern detects a login page. The execution flow is: detect the login form, inject username and password into browser fields, then handle 2FA if a TOTP credential is attached.
+
+    <CardGroup cols={2}>
+      <Card title="Credentials Overview" icon="lock" href="/cloud/managing-credentials/credentials-overview" />
+      <Card title="TOTP Setup" icon="shield" href="/cloud/managing-credentials/totp-setup" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Sessions">
+    Skyvern offers two ways to persist browser state: **Sessions** and **Profiles**.
+
+    A **Browser Session** is a live browser instance that stays open across multiple tasks for up to 24 hours. Use sessions when you need to chain tasks in real time, for example logging in with one task and then extracting data with the next while the browser stays authenticated.
+
+    A **Browser Profile** is a saved snapshot of cookies, auth tokens, and local storage. Unlike sessions, profiles persist indefinitely and can be restored on future runs so you don't re-authenticate every time.
+
+    The example below creates a session, runs two tasks inside it (the second inherits the login state from the first), then cleans up.
+
+    ```python
+    session = await skyvern.create_browser_session(timeout=120)
+
+    await skyvern.run_task(
+        prompt="Log in",
+        url="https://example.com/login",
+        browser_session_id=session.browser_session_id
+    )
+    # Browser is now authenticated
+
+    result = await skyvern.run_task(
+        prompt="Extract the account balance",
+        browser_session_id=session.browser_session_id
+    )
+    print(result.output)  # {"balance": "$1,234.56"}
+    ```
+
+    <CardGroup cols={2}>
+      <Card title="Browser Sessions" icon="window" href="/optimization/browser-sessions" />
+      <Card title="Browser Profiles" icon="user-circle" href="/optimization/browser-profiles" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Artifacts">
+    Every run generates artifacts for debugging, observability, and audit trails.
+
+    - **Recordings** - End-to-end video of the entire run
+    - **Screenshots** - Captured after each action for step-by-step review
+    - **Downloaded files** - Signed URLs with checksums
+    - **Logs** - JSON-structured at step, task, and workflow levels
+    - **HAR files** - HTTP Archive data for network-level debugging
+
+    In the Cloud UI, go to **Runs**, click any run, and switch between the **Actions** and **Recording** tabs.
+
+    <CardGroup cols={2}>
+      <Card title="Using Artifacts" icon="bug" href="/debugging/using-artifacts" />
+      <Card title="Troubleshooting" icon="wrench" href="/debugging/troubleshooting-guide" />
+    </CardGroup>
+  </Tab>
+
+  <Tab title="Engines">
+    Choose which AI model runs your task:
+
+    - `skyvern-2.0` - Latest model, recommended for most use cases
+    - `skyvern-1.0` - Previous generation
+    - `openai-cua` - OpenAI Computer Use Agent
+    - `anthropic-cua` - Anthropic Computer Use Agent
+    - `ui-tars` - UI-TARS model
+
+    Set via the `engine` parameter in the SDK or the dropdown in the dashboard.
+
+    ```python
+    from skyvern.schemas.runs import RunEngine
+
+    result = await skyvern.run_task(
+        prompt="Extract pricing data",
+        url="https://example.com/pricing",
+        engine=RunEngine.skyvern_v2
+    )
+    print(result.output)
+    # {"monthly": 29, "annual": 290, "enterprise": "Contact sales"}
+    ```
+  </Tab>
+</Tabs>
+
+</div>
+
+{/* ===== 04 — GET STARTED ===== */}
+
+<div className="fm-section fm-section-last" id="start-building">
+  <div className="fm-section-head">
+    <span className="fm-section-num">04</span>
+    <h2 className="fm-section-title">Start building</h2>
+    <p className="fm-section-sub">Pick the path that fits how you work and jump straight into the docs.</p>
+  </div>
+
+  <div className="fm-path-grid">
+    <a href="/cloud/getting-started/overview" className="fm-path-card">
+      <span className="fm-path-label">NO CODE</span>
+      <strong className="fm-path-name">Use the dashboard →</strong>
+      <p className="fm-path-desc">Run tasks, build workflows in the visual editor, and monitor runs live. Connect to Zapier, Make, or n8n for integrations.</p>
+    </a>
+    <a href="/getting-started/quickstart" className="fm-path-card">
+      <span className="fm-path-label">DEVELOPERS</span>
+      <strong className="fm-path-name">Build with code →</strong>
+      <p className="fm-path-desc">Python or TypeScript SDK. Go from zero to a working automation in about 5 minutes.</p>
+    </a>
+    <a href="/getting-started/ai-agents-quickstart" className="fm-path-card">
+      <span className="fm-path-label">AI AGENTS</span>
+      <strong className="fm-path-name">Connect your AI assistant →</strong>
+      <p className="fm-path-desc">Give Claude Code, Cursor, or Windsurf browser automation through MCP.</p>
+    </a>
+    <a href="/self-hosted/overview" className="fm-path-card">
+      <span className="fm-path-label">SELF-HOST</span>
+      <strong className="fm-path-name">Deploy on your infra →</strong>
+      <p className="fm-path-desc">Fully open-source. Run with Docker, bring your own LLM keys, keep everything on your network.</p>
+    </a>
+  </div>
+</div>
+
+{/* ===== FOOTER ===== */}
+
+<div className="fm-footer">
+  <span className="fm-footer-left">
+    <iframe
+      src="https://ghbtns.com/github-btn.html?user=skyvern-ai&repo=skyvern&type=star&count=true"
+      frameBorder="0"
+      scrolling="no"
+      width="150"
+      height="20"
+      style={{ background: "transparent", colorScheme: "light", verticalAlign: "middle" }}
+      title="GitHub stars">
+    </iframe>
+  </span>
+  <span className="fm-footer-right">
+    <a href="https://github.com/Skyvern-AI/skyvern" className="fm-mono-link">github ↗</a>
+    <a href="https://discord.gg/skyvern" className="fm-mono-link">discord ↗</a>
+    <a href="/changelog" className="fm-mono-link">changelog ↗</a>
+  </span>
 </div>
 
 </div>
