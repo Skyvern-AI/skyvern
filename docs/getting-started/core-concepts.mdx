@@ -101,8 +101,8 @@ See [Workflow Blocks](/multi-step-automations/workflow-blocks-reference) for the
 A **Schedule** runs a workflow automatically on a recurring basis. You define a cron expression and timezone, and Skyvern triggers the workflow at each interval.
 
 ```python
-schedule = await skyvern.create_schedule(
-    workflow_id="wpid_abc123",
+result = await client.agent.create_workflow_schedule(
+    workflow_permanent_id="wpid_abc123",
     cron_expression="0 9 * * 1-5",  # Weekdays at 9 AM
     timezone="America/New_York",
     parameters={
@@ -117,9 +117,9 @@ schedule = await skyvern.create_schedule(
 | Property | Description |
 |----------|-------------|
 | `cron_expression` | 5-field cron expression defining the recurrence (minimum 5-minute interval) |
-| `timezone` | IANA timezone identifier (defaults to UTC) |
+| `timezone` | IANA timezone identifier (e.g., `America/New_York`) |
 | `parameters` | Workflow parameters passed to each scheduled run |
-| `status` | `active` or `paused` |
+| `enabled` | `true` (active) or `false` (paused) |
 
 **Use Schedules for:** recurring data extraction, periodic report generation, daily monitoring tasks, any workflow you want to run without manual intervention.
 
