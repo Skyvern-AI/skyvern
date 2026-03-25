@@ -1317,10 +1317,34 @@ class WorkflowService:
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
         # Only enable when we actually have a script to run
-        if script and is_script_run and script_blocks_by_label:
+        script_mode_active = bool(script and is_script_run and script_blocks_by_label)
+        if script_mode_active:
             ctx = skyvern_context.current()
             if ctx:
                 ctx.script_mode = True
+
+        # Single source-of-truth log for how this run will execute.
+        # execution_mode reflects the *effective* mode after script loading,
+        # not just the intent from should_run_script().
+        execution_mode = "code" if script_mode_active else "agent"
+        LOG.info(
+            "Workflow run execution mode resolved",
+            execution_mode=execution_mode,
+            workflow_run_id=workflow_run_id,
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            organization_id=organization_id,
+            run_level_run_with=workflow_run.run_with,
+            workflow_level_run_with=workflow.run_with,
+            code_version=workflow.code_version,
+            adaptive_caching=workflow.adaptive_caching,
+            ai_fallback=workflow_run.ai_fallback,
+            should_run_script=is_script_run,
+            has_script=script is not None,
+            script_id=script.script_id if script else None,
+            script_revision_id=script.script_revision_id if script else None,
+            script_block_count=len(script_blocks_by_label),
+        )
 
         if block_labels and len(block_labels):
             blocks: list[BlockTypeVar] = []

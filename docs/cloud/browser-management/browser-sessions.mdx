@@ -1,0 +1,173 @@
+---
+title: Browser Sessions
+subtitle: Keep a browser open across multiple tasks
+slug: cloud/browser-management/browser-sessions
+---
+
+A **browser session** is a live browser instance that stays open between runs. Cookies, login state, cart contents, and page context all persist — like keeping a browser tab open. Use sessions when you need back-to-back tasks to share state, or when you want to interact with the browser yourself between automated steps.
+
+<Note>
+Looking to use browser sessions from code? See the [API & SDK guide](/optimization/browser-sessions) instead.
+</Note>
+
+---
+
+## The Browsers page
+
+Click **Browsers** in the left sidebar to open the Browsers page. It lists all browser sessions in your organization.
+
+<img src="/images/cloud/browsers-page-overview.png" alt="Browsers page with the sessions table showing columns for ID, open status, occupied status, started time, timeout, and CDP URL" />
+
+Each row shows:
+
+| Column | What it shows |
+|--------|--------------|
+| **ID** | Session identifier (starts with `pbs_`) |
+| **Open** | Whether the browser is currently running |
+| **Occupied** | Whether a task or workflow is actively using the session |
+| **Started** | When the session launched |
+| **Timeout** | How long the session stays open before auto-closing |
+| **CDP URL** | Chrome DevTools Protocol address for direct connection |
+
+---
+
+## Creating a session
+
+Click the **Create Browser Session** button at the top of the Browsers page. A panel opens with the following settings:
+
+<Frame>
+<img src="/images/cloud/create-session-drawer.png" alt="Create Browser Session panel showing fields for timeout, proxy location, browser type, extensions, and browser profile" width="300" />
+</Frame>
+
+| Setting | What it does |
+|---------|-------------|
+| **Timeout** | How long the session stays open, in minutes. Min: 5, max: 1440 (24 hours). Default: 60. |
+| **Proxy Location** | Route the browser through a residential proxy in a specific country. Default: US. |
+| **Browser Type** | Chrome (default, widest compatibility) or Microsoft Edge. |
+| **Extensions** | Optional add-ons: **Ad Blocker** (removes overlay ads that interfere with clicks) and **Captcha Solver** (auto-solves CAPTCHAs). |
+| **Browser Profile** | Load a saved [browser profile](/cloud/browser-management/browser-profiles) to restore cookies and login state from a previous session. |
+
+Click **Create** to launch the session. It appears in the table within a few seconds.
+
+<Warning>
+Sessions bill while open, even when idle. Set the timeout to match your use case and close sessions when you're done.
+</Warning>
+
+---
+
+## Viewing a live session
+
+Click any session row in the table to open its detail page. The detail page has three tabs:
+
+### Stream
+
+A live view of the browser. You can watch pages load and actions fire in real time. 
+
+Click on <kbd>Take Control</kbd> to interact with the browser yourself. Use this to log in, dismiss a popup, solve a CAPTCHA.
+
+<img src="/images/cloud/session-detail-stream.png" alt="Browser session detail page with the Stream tab active, showing a live browser view and session controls" />
+
+### Recordings
+
+Video recordings of activity in the session. Each recording captures what happened during a task or workflow that ran inside this session.
+
+### Downloads
+
+Files downloaded by the browser during the session. Click any file to save it locally.
+
+<img src="/images/cloud/browser-session-downloads.png" alt="Browser session download page with the preview or download links for anything downloaded during the session" />
+
+---
+
+## Using a session with a task
+
+Once you have a running session, you can run tasks inside it from the [Discover page](/cloud/getting-started/run-a-task):
+
+1. Copy the session ID (`pbs_...`) from the Browsers page
+2. Go to the **Discover** page
+3. Click the **gear icon** to open Advanced Settings
+4. Paste the ID into the **Browser Session ID** field
+5. Write your prompt and run
+
+The task executes inside your existing session. Cookies, login state, and page context from previous tasks are still there.
+
+<img src="/images/cloud/discover-session-id-field.png" alt="Advanced settings panel on the Discover page with a pbs_ session ID entered in the Browser Session ID field" />
+
+---
+
+## Using a session with a workflow
+
+You can also run workflows inside an existing session:
+
+1. Copy the session ID from the Browsers page
+2. Go to **Workflows** and click **Run** on your workflow
+3. On the parameters page, scroll to **Run Settings**
+4. Paste the ID into the **Browser Session ID** field
+5. Click **Run Workflow**
+
+The workflow picks up where the browser left off — same page, same cookies, same form data.
+
+<img src="/images/cloud/workflow-run-session-id-field.png" alt="Workflow run settings panel with a pbs_ session ID entered in the Browser Session ID field" />
+
+---
+
+## Closing a session
+
+From the session detail page, click **Stop**. A confirmation dialog appears. The browser shuts down immediately and the session moves to `closed` status.
+
+<img src="/images/cloud/session-stop-confirmation.png" alt="Stop browser session confirmation dialog with Cancel and Stop buttons" />
+
+Sessions also close automatically when their timeout expires, **even if a task is still running**. Set timeouts with enough margin for your longest expected task.
+
+<Warning>
+Closed sessions cannot be reopened. If you need the same login state later, create a [browser profile](/cloud/browser-management/browser-profiles) before closing.
+</Warning>
+
+---
+
+## When to use sessions vs workflows
+
+If your steps run back-to-back with no pauses between them, a [workflow](/cloud/building-workflows/build-a-workflow) is more efficient. Workflow blocks share one browser instance with no inter-step startup cost.
+
+Sessions are the right choice when you need:
+
+- **Pauses between steps** — review results, get approval, or wait for external input before continuing
+- **Human-in-the-loop** — interact with the browser yourself between automated steps
+- **Ad-hoc sequences** — run different tasks one after another without pre-building a workflow
+
+---
+
+## Sessions vs profiles
+
+| | Browser Session | Browser Profile |
+|---|----------------|-----------------|
+| **What it is** | Live browser instance | Saved snapshot of browser state |
+| **Lifetime** | Minutes to hours | Days to months |
+| **State** | Current page, cookies, open connections | Cookies, localStorage, session files |
+| **Billing** | Charged while open | No cost when not in use |
+| **Best for** | Back-to-back tasks, human-in-the-loop | Repeated logins, scheduled workflows |
+
+<Tip>
+Use a session when you need a live browser right now. Use a [profile](/cloud/browser-management/browser-profiles) when you want to save login state and reuse it later.
+</Tip>
+
+---
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser Profiles"
+    icon="floppy-disk"
+    href="/cloud/browser-management/browser-profiles"
+  >
+    Save login state and reuse it across sessions
+  </Card>
+  <Card
+    title="Browser Sessions (API)"
+    icon="code"
+    href="/optimization/browser-sessions"
+  >
+    Create and manage sessions programmatically
+  </Card>
+</CardGroup>
