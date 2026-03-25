@@ -29,10 +29,10 @@ jobs:
           # Maps tcp port 5432 on service container to the host
           - 5432:5432
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
       # If you wanted to use multiple Python versions, you'd have specify a matrix in the job and
       # reference the matrixe python version here.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.11"
       # Install uv (fast, single-file binary)
@@ -42,14 +42,14 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       # Cache uv's download/resolve cache to speed up CI (optional but nice)
       - name: Cache uv global cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/uv
           key: uv-cache-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
       # Cache the project virtualenv (keyed by Python version + lockfile)
       - name: Cache venv
         id: cache-venv
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version || '3.11' }}-${{ hashFiles('**/uv.lock') }}
@@ -65,7 +65,7 @@ jobs:
         run: |
           uv sync --group dev
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -113,9 +113,9 @@ jobs:
         working-directory: ./skyvern-frontend
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
       - name: Install Node.js dependencies

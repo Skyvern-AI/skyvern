@@ -16,7 +16,7 @@ jobs:
       new_version: ${{ steps.check.outputs.new_version }}
       previous_version: ${{ steps.check.outputs.previous_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 2
       - name: Check if version changed
@@ -51,7 +51,7 @@ jobs:
       contents: write
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
       - name: Generate release notes
@@ -84,7 +84,7 @@ jobs:
           echo "Release notes generated"
           cat release_notes.md
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: v${{ needs.check-version-change.outputs.new_version }}
           name: Release v${{ needs.check-version-change.outputs.new_version }}
