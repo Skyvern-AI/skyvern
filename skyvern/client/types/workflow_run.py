@@ -8,7 +8,6 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .script_run_response import ScriptRunResponse
 from .workflow_run_proxy_location import WorkflowRunProxyLocation
 from .workflow_run_status import WorkflowRunStatus
-from .workflow_run_trigger_type import WorkflowRunTriggerType
 
 
 class WorkflowRun(UniversalBaseModel):
@@ -38,8 +37,9 @@ class WorkflowRun(UniversalBaseModel):
     sequential_key: typing.Optional[str] = None
     ai_fallback: typing.Optional[bool] = None
     code_gen: typing.Optional[bool] = None
-    trigger_type: typing.Optional[WorkflowRunTriggerType] = None
-    workflow_schedule_id: typing.Optional[str] = None
+    waiting_for_verification_code: typing.Optional[bool] = None
+    verification_code_identifier: typing.Optional[str] = None
+    verification_code_polling_started_at: typing.Optional[dt.datetime] = None
     queued_at: typing.Optional[dt.datetime] = None
     started_at: typing.Optional[dt.datetime] = None
     finished_at: typing.Optional[dt.datetime] = None

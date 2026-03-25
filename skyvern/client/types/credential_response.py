@@ -43,11 +43,6 @@ class CredentialResponse(UniversalBaseModel):
     Login page URL used during the credential test
     """
 
-    user_context: typing.Optional[str] = pydantic.Field(default=None)
-    """
-    User-provided context describing the login sequence (e.g., 'click SSO button first')
-    """
-
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:
