@@ -24,7 +24,7 @@ from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreat
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
-from ._validation import validate_folder_id
+from ._validation import validate_folder_id, validate_run_id, validate_workflow_id
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -45,7 +45,7 @@ def _serialize_workflow(wf: Any) -> dict[str, Any]:
 
     Uses Any to avoid tight coupling with Fern-generated client types.
     """
-    return {
+    data: dict[str, Any] = {
         "workflow_permanent_id": wf.workflow_permanent_id,
         "workflow_id": wf.workflow_id,
         "title": wf.title,
@@ -57,6 +57,11 @@ def _serialize_workflow(wf: Any) -> dict[str, Any]:
         "created_at": wf.created_at.isoformat() if wf.created_at else None,
         "modified_at": wf.modified_at.isoformat() if wf.modified_at else None,
     }
+    for caching_field in ("run_with", "code_version", "adaptive_caching"):
+        val = getattr(wf, caching_field, None)
+        if val is not None:
+            data[caching_field] = val
+    return data
 
 
 def _serialize_workflow_full(wf: Any) -> dict[str, Any]:
@@ -87,6 +92,7 @@ def _serialize_run(run: Any) -> dict[str, Any]:
         "app_url",
         "browser_session_id",
         "run_with",
+        "ai_fallback",
     ):
         val = getattr(run, field, None)
         if val is not None:
@@ -102,6 +108,10 @@ def _serialize_run(run: Any) -> dict[str, Any]:
         val = getattr(run, ts_field, None)
         if val is not None:
             data[ts_field] = val.isoformat()
+
+    script_run = getattr(run, "script_run", None)
+    if script_run is not None:
+        data["script_run"] = script_run.model_dump(mode="json") if hasattr(script_run, "model_dump") else script_run
 
     return data
 
@@ -288,6 +298,12 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
     if run_with:
         summary["run_with"] = run_with
 
+    script_run = _get_value(run, "script_run")
+    if script_run is not None:
+        sr = _jsonable(script_run)
+        if isinstance(sr, dict) and sr.get("ai_fallback_triggered") is not None:
+            summary["ai_fallback_triggered"] = sr["ai_fallback_triggered"]
+
     workflow_title = _get_value(run, "workflow_title")
     if workflow_title:
         summary["workflow_title"] = workflow_title
@@ -326,6 +342,8 @@ def _serialize_run_full(run: Any) -> dict[str, Any]:
         "browser_profile_id",
         "run_with",
         "total_steps",
+        "script_run",
+        "ai_fallback",
     ):
         value = _get_value(run, field)
         if value is not None:
@@ -366,56 +384,6 @@ async def _get_workflow_run_status(
             detail = response.text
         raise RuntimeError(f"HTTP {response.status_code}: {detail}")
     return response.json()
-
-
-def _validate_workflow_id(workflow_id: str, action: str) -> dict[str, Any] | None:
-    """Validate workflow_id format. Returns a make_result error dict or None if valid."""
-    if "/" in workflow_id or "\\" in workflow_id:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "workflow_id must not contain path separators",
-                "Provide a valid workflow permanent ID (starts with wpid_)",
-            ),
-        )
-    if not workflow_id.startswith("wpid_"):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid workflow_id format: {workflow_id!r}",
-                "Workflow IDs start with wpid_. Use skyvern_workflow_list to find valid IDs.",
-            ),
-        )
-    return None
-
-
-def _validate_run_id(run_id: str, action: str) -> dict[str, Any] | None:
-    """Validate run_id format. Returns a make_result error dict or None if valid."""
-    if "/" in run_id or "\\" in run_id:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "run_id must not contain path separators",
-                "Provide a valid run ID (starts with wr_ or tsk_v2_)",
-            ),
-        )
-    if not run_id.startswith("wr_") and not run_id.startswith("tsk_v2_"):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid run_id format: {run_id!r}",
-                "Run IDs start with wr_ (workflow runs) or tsk_v2_ (task runs). Check skyvern_workflow_run output.",
-            ),
-        )
-    return None
 
 
 async def _get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, Any]:
@@ -780,7 +748,7 @@ async def skyvern_workflow_get(
 ) -> dict[str, Any]:
     """Get the full definition of a specific workflow. Use when you need to inspect a workflow's
     blocks, parameters, and configuration before running or updating it."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_get"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_get"):
         return err
 
     with Timer() as timer:
@@ -937,7 +905,7 @@ async def skyvern_workflow_update(
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_update"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
         return err
 
     if format not in ("json", "yaml", "auto"):
@@ -1017,7 +985,7 @@ async def skyvern_workflow_delete(
 ) -> dict[str, Any]:
     """Delete a workflow permanently. Use when you need to remove a workflow that is no longer needed.
     Requires force=true to prevent accidental deletion."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_delete"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_delete"):
         return err
 
     if not force:
@@ -1077,7 +1045,7 @@ async def skyvern_workflow_update_folder(
     ] = None,
 ) -> dict[str, Any]:
     """Assign a workflow to a folder, or remove it from its current folder."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_update_folder"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_update_folder"):
         return err
     if folder_id is not None and (err := validate_folder_id(folder_id, "skyvern_workflow_update_folder")):
         return err
@@ -1152,7 +1120,7 @@ async def skyvern_workflow_run(
     Returns immediately by default (async) — set wait=true to block until completion.
     Default timeout is 300s (5 minutes). For longer workflows, increase timeout_seconds
     or use wait=false and poll with skyvern_workflow_status."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_run"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_run"):
         return err
 
     parsed_params: dict[str, Any] | None = None
@@ -1248,7 +1216,7 @@ async def skyvern_workflow_status(
 ) -> dict[str, Any]:
     """Check the status and progress of a workflow or task run. Use when you need to monitor
     a running workflow, check if it completed, or retrieve its output."""
-    if err := _validate_run_id(run_id, "skyvern_workflow_status"):
+    if err := validate_run_id(run_id, "skyvern_workflow_status"):
         return err
     if verbosity not in {"summary", "full"}:
         return make_result(
@@ -1307,7 +1275,7 @@ async def skyvern_workflow_cancel(
 ) -> dict[str, Any]:
     """Cancel a running workflow or task. Use when you need to stop a workflow that is taking
     too long, is stuck, or is no longer needed."""
-    if err := _validate_run_id(run_id, "skyvern_workflow_cancel"):
+    if err := validate_run_id(run_id, "skyvern_workflow_cancel"):
         return err
 
     skyvern = get_skyvern()

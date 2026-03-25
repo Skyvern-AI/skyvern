@@ -399,6 +399,34 @@ After extraction, check the returned data before using it:
 or what the data looks like), not the schema.
 - Use `skyvern_validate` for page-level assertions before extracting \
 ("Is this the search results page?" / "Are there at least 10 results visible?").
+
+## Caching Considerations
+
+Workflows created via MCP default to Code 2.0 (code_version=2, run_with="code").
+
+### What this means for workflow design
+
+- **First run**: The AI agent runs all blocks, recording actions. A cached script is generated afterward.
+- **Subsequent runs**: The script replays deterministically — 10-100x faster, no LLM costs.
+- **AI fallback**: If the script encounters an element it cannot find, it falls back to the AI agent \
+for that step. The fallback episode is recorded and used to improve the script.
+
+### Design for cacheability
+
+1. Use stable selectors: navigation goals that reference exact field labels cache better than vague \
+descriptions. "Fill in the 'Company Name' field" caches better than "fill in the first text box."
+2. Avoid dynamic page content in goals: if a page shows different content each time, the cached script \
+may need frequent AI fallbacks. Consider splitting dynamic sections into separate blocks.
+3. Parameterize all variable data: cached scripts substitute parameters at runtime. Hardcoded values \
+in navigation_goal become part of the script literally.
+
+### Overriding execution mode at run time
+
+Pass `run_with="agent"` to `skyvern_workflow_run` to force AI execution for a specific run without \
+changing the workflow definition. This is useful for:
+- First runs when no script exists yet (the system handles this automatically)
+- Debugging: comparing AI behavior vs script behavior
+- Sites that changed layout since the last successful script run
 """
 
 
