@@ -301,7 +301,7 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service()
+    credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
 
     credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
 
@@ -320,6 +320,7 @@ async def create_credential(
             credential_id=credential.credential_id,
             credential_type=data.credential_type,
             name=data.name,
+            vault_type=credential.vault_type,
         )
     elif data.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -331,6 +332,7 @@ async def create_credential(
             credential_id=credential.credential_id,
             credential_type=data.credential_type,
             name=data.name,
+            vault_type=credential.vault_type,
         )
     elif data.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=data.credential.secret_label)
@@ -339,6 +341,7 @@ async def create_credential(
             credential_id=credential.credential_id,
             credential_type=data.credential_type,
             name=data.name,
+            vault_type=credential.vault_type,
         )
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
@@ -1834,14 +1837,17 @@ async def update_custom_credential_service_config(
         ) from e
 
 
-async def _get_credential_vault_service() -> CredentialVaultService:
-    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN:
+async def _get_credential_vault_service(
+    vault_type_override: CredentialVaultType | None = None,
+) -> CredentialVaultService:
+    vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
+    if vault_type == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
-    elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.AZURE_VAULT:
+    elif vault_type == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
         return app.AZURE_CREDENTIAL_VAULT_SERVICE
-    elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.CUSTOM:
+    elif vault_type == CredentialVaultType.CUSTOM:
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
         return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
@@ -1868,6 +1874,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_id=credential.credential_id,
             credential_type=credential.credential_type,
             name=credential.name,
+            vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
@@ -1883,6 +1890,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_id=credential.credential_id,
             credential_type=credential.credential_type,
             name=credential.name,
+            vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
@@ -1895,6 +1903,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_id=credential.credential_id,
             credential_type=credential.credential_type,
             name=credential.name,
+            vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
