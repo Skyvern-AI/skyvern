@@ -178,7 +178,7 @@ if (run.status === "completed") {
 ```bash cURL
 # Poll workflow run until terminal state
 while true; do
-  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/workflow_runs/$WORKFLOW_RUN_ID" \
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$WORKFLOW_RUN_ID" \
     -H "x-api-key: $SKYVERN_API_KEY")
 
   STATUS=$(echo $RESPONSE | jq -r '.status')
@@ -289,7 +289,7 @@ if (["failed", "terminated"].includes(run.status)) {
 ```
 
 ```bash cURL
-RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/workflow_runs/$WORKFLOW_RUN_ID" \
+RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$WORKFLOW_RUN_ID" \
   -H "x-api-key: $SKYVERN_API_KEY")
 
 STATUS=$(echo $RESPONSE | jq -r '.status')

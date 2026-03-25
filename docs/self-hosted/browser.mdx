@@ -10,6 +10,11 @@ Skyvern uses Playwright with Chromium to execute browser automations.
 
 The `BROWSER_TYPE` setting controls how Skyvern runs the browser.
 
+- **[Headful](#headful-default)** — visible browser window (default)
+- **[Headless](#headless)** — no display, runs in the background
+- **[Use Your Own Chrome](#use-your-own-chrome)** — runs the installed Chrome app with your logged-in profile
+- **[CDP Connect](#cdp-connect-external-chrome)** — connects to an already-running Chrome instance
+
 ### Headful (default)
 
 ```bash .env
@@ -30,6 +35,20 @@ The browser runs without any display.
 Some websites detect and block headless browsers. If you encounter issues with bot detection, try headful mode with a virtual display.
 </Note>
 
+### Use Your Own Chrome
+
+```bash .env
+BROWSER_TYPE=cdp-connect
+CHROME_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+```
+
+Skyvern launches the Chrome app installed on your machine and connects to it automatically. Your existing Chrome profile (cookies, saved logins, extensions) is copied over so automations run in a browser environment that matches your real one.
+
+Useful for:
+- Running automations with your saved logins and cookies
+- Using your installed Chrome extensions
+- Avoiding bot detection by using a real Chrome installation
+
 ### CDP Connect (External Chrome)
 
 ```bash .env
@@ -41,6 +60,63 @@ Connect to an existing Chrome instance running with remote debugging enabled. Us
 - Using your existing browser profile with saved logins
 - Debugging with Chrome DevTools
 - Running automations on a browser with specific extensions
+
+---
+
+## Setting up Use Your Own Chrome
+
+Set `CHROME_EXECUTABLE_PATH` to your Chrome installation path and Skyvern handles the rest — no need to manually start Chrome with debugging flags.
+
+### Step 1: Find your Chrome path
+
+<CodeGroup>
+```bash macOS
+/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+```
+
+```powershell Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe"
+```
+
+```bash Linux
+# Usually one of:
+/usr/bin/google-chrome
+/usr/bin/chromium
+/usr/bin/chromium-browser
+```
+</CodeGroup>
+
+### Step 2: Configure Skyvern
+
+<CodeGroup>
+```bash macOS .env
+BROWSER_TYPE=cdp-connect
+CHROME_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+```
+
+```bash Windows .env
+BROWSER_TYPE=cdp-connect
+CHROME_EXECUTABLE_PATH="C:\Program Files\Google\Chrome\Application\chrome.exe"
+```
+
+```bash Linux .env
+BROWSER_TYPE=cdp-connect
+CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome
+```
+</CodeGroup>
+
+When Skyvern starts, it will:
+1. Copy your Chrome profile to a working directory (`./tmp/user_data_dir`)
+2. Launch Chrome with remote debugging on port 9222
+3. Connect via CDP automatically
+
+<Warning>
+All existing Chrome windows must be closed before Skyvern can launch Chrome with remote debugging. If Chrome is already running, Skyvern will return an error.
+</Warning>
+
+<Note>
+If port 9222 is already in use (e.g., from a previous session), Skyvern will connect to the existing instance instead of launching a new one.
+</Note>
 
 ---
 

@@ -27,9 +27,28 @@ Each row is one run. The columns:
 | **Run ID** | Workflow run (`wr_...`) or task (`tsk_...`) identifier. Hover for the full ID. |
 | **Detail** | Workflow title or task description. A lightning bolt icon means code generation was used. |
 | **Status** | Color-coded badge — green (completed), yellow (running/queued/created), red (failed/timed_out), orange (terminated/canceled). |
+| **Trigger** | How the run was started: **Manual**, **API**, or **Scheduled** (calendar icon). |
 | **Created At** | Start time in your local timezone. Hover for UTC. |
 
 Workflow runs have a **settings icon** in the last column. Click it to expand the row and see the parameters passed to that run. If your search matches something inside the parameters, the row auto-expands so you can see the match in context.
+
+## Trigger type
+
+Every run has a trigger type that indicates how it was started:
+
+| Trigger type | Description |
+|-------------|-------------|
+| **Manual** | Started by clicking **Run** in the Cloud UI |
+| **API** | Started via the REST API or SDK |
+| **Scheduled** | Started automatically by a [schedule](/cloud/building-workflows/scheduling) |
+
+Scheduled runs display a **calendar icon badge** next to the run ID. Click the run to see the schedule name and cron expression in the run details.
+
+### Filtering by trigger type
+
+Use the **Trigger Type** dropdown filter to show only runs of a specific type. For example, select **Scheduled** to see all runs triggered by cron schedules. This filter can be combined with the status filter and search.
+
+---
 
 ## Opening a run
 
