@@ -225,7 +225,7 @@ async def skyvern_console_messages(
     if clear:
         if has_filter:
             # Only remove matched entries — keep unmatched ones in the buffer
-            matched = set(id(e) for e in entries)
+            matched = {id(e) for e in entries}
             state.console_messages = type(state.console_messages)(
                 (e for e in state.console_messages if id(e) not in matched),
                 maxlen=state.console_messages.maxlen,
@@ -313,7 +313,7 @@ async def skyvern_network_requests(
 
     if clear:
         if has_filter:
-            matched = set(id(e) for e in entries)
+            matched = {id(e) for e in entries}
             state.network_requests = type(state.network_requests)(
                 (e for e in state.network_requests if id(e) not in matched),
                 maxlen=state.network_requests.maxlen,
