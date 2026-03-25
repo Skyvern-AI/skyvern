@@ -23,6 +23,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
@@ -3269,7 +3270,7 @@ class SkyvernPage(Page):
         y: int,
         **kwargs: Any,
     ) -> None:
-        await self.page.mouse.move(x, y)
+        await EventStrategyFactory.move_cursor(self.page, x, y)
 
     @action_wrap(ActionType.DRAG)
     async def drag(

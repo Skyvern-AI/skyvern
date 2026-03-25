@@ -313,6 +313,7 @@ async def create_credential(
         credential_response = PasswordCredentialResponse(
             username=data.credential.username,
             totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
+            totp_identifier=data.credential.totp_identifier if hasattr(data.credential, "totp_identifier") else None,
         )
         return CredentialResponse(
             credential=credential_response,
@@ -1860,6 +1861,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
         credential_response = PasswordCredentialResponse(
             username=credential.username or credential.credential_id,
             totp_type=credential.totp_type,
+            totp_identifier=credential.totp_identifier,
         )
         return CredentialResponse(
             credential=credential_response,
