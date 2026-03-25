@@ -162,6 +162,12 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     update({ url });
                   }
                 }}
+                currentTotpIdentifier={data.totpIdentifier ?? undefined}
+                onTotpIdentifierAutoFill={(totpIdentifier) => {
+                  if (editable) {
+                    update({ totpIdentifier });
+                  }
+                }}
               />
             </div>
           </div>
@@ -190,6 +196,11 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
                         update({ parameterKeys });
+                      }}
+                      onCredentialTotpIdentifier={(totpIdentifier) => {
+                        if (!data.totpIdentifier?.trim()) {
+                          update({ totpIdentifier });
+                        }
                       }}
                     />
                   </div>
