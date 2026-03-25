@@ -24,19 +24,17 @@ Browser profiles are created automatically when you test a password credential w
 
 ### Creating a profile from a credential
 
+<img src="/images/cloud/credential-add-password-form.png" alt="Add password credential dialog with name, username, and password fields" />
+
 <Steps>
   <Step title="Go to the Credentials page">
     Click **Credentials** in the left sidebar under **General**.
   </Step>
   <Step title="Create or edit a password credential">
     Click **+ Add → Password** to create a new credential, or click the **pencil icon** on an existing one. Enter the username and password. See [Password Credentials](/cloud/managing-credentials/password-credentials) for details.
-
-    <img src="/images/cloud/credential-add-password-form.png" alt="Add password credential dialog with name, username, and password fields" />
   </Step>
   <Step title="Enable Save browser session">
     Below the password fields, enable the **Save browser session** option. Enter the **login URL** for the site (e.g., `https://app.example.com/login`). You can also add optional context to help the AI navigate the login flow.
-
-    <img src="/images/cloud/credential-save-browser-session-toggle.png" alt="Save browser session toggle enabled with a login URL field and optional context field below it" />
   </Step>
   <Step title="Test the credential">
     Click **Test**. Skyvern opens a browser, navigates to the login URL, signs in with the credential, and — if the login succeeds — saves the browser state as a profile. The profile is linked to this credential automatically.
@@ -44,39 +42,14 @@ Browser profiles are created automatically when you test a password credential w
   <Step title="Confirm the profile was saved">
     When the test completes, the credential row shows a **saved-profile** badge with the site hostname. This means the browser profile is ready to use.
 
-    <img src="/images/cloud/credential-saved-profile-badge.png" alt="Credential row on the Credentials page showing a saved-profile badge with the tested site hostname" />
+  <img src="/images/cloud/credential-save-profile.png" alt="Credential listed with a profile badge" />
+    
   </Step>
 </Steps>
 
 <Tip>
 The **Save browser session** flow is the easiest way to create a profile. It handles the full lifecycle: open browser, log in, save state. No workflows or API calls required.
 </Tip>
-
----
-
-## Loading a profile into a session
-
-Once you have a saved profile, you can load it when creating a new browser session:
-
-1. Go to the **Browsers** page
-2. Click **Create Browser Session**
-3. In the creation panel, select your saved profile from the **Browser Profile** dropdown
-4. Configure timeout, proxy, and other settings as needed
-5. Click **Create**
-
-The session starts with the profile's cookies, localStorage, and session files restored. If the profile contains an authenticated state, the browser is already logged in — no need to run a login task.
-
-<img src="/images/cloud/create-session-with-profile.png" alt="Create Browser Session panel with a browser profile selected from the Browser Profile dropdown" />
-
-From there, you can [run tasks](/cloud/browser-management/browser-sessions#using-a-session-with-a-task) or [run workflows](/cloud/browser-management/browser-sessions#using-a-session-with-a-workflow) inside the session, and they'll start from the authenticated state.
-
----
-
-## Creating profiles via API
-
-You can also create profiles programmatically from workflow runs that have `persist_browser_session` enabled, or from closed browser sessions. This is useful for automated profile refresh pipelines.
-
-See the [Browser Profiles API guide](/optimization/browser-profiles) and [SDK reference](/sdk-reference/browser-profiles) for details.
 
 ---
 
