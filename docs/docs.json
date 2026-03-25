@@ -42,15 +42,22 @@
         "pages": ["index"]
       },
       {
-        "tab": "Developers",
+        "tab": "Getting Started",
         "groups": [
           {
             "group": "Getting Started",
             "pages": [
+              "getting-started/introduction",
+              "getting-started/core-concepts",
               "getting-started/quickstart",
               "getting-started/ai-agents-quickstart"
             ]
-          },
+          }
+        ]
+      },
+      {
+        "tab": "Developers",
+        "groups": [
           {
             "group": "Running Automations",
             "pages": [
