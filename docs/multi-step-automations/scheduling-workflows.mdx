@@ -52,7 +52,15 @@ Schedules use standard 5-field cron expressions:
 | `0 8,17 * * *` | Twice daily at 8:00 AM and 5:00 PM |
 
 <Warning>
-The minimum interval is **5 minutes**. Cron expressions that resolve to intervals shorter than 5 minutes will be rejected.
+The minimum interval is **5 minutes**. Cron expressions that resolve to intervals shorter than 5 minutes return a validation error:
+
+```json
+{
+  "detail": "Cron interval must be at least 5 minutes"
+}
+```
+
+Invalid cron syntax returns `"Invalid cron expression"`.
 </Warning>
 
 ### Timezone handling
@@ -107,6 +115,14 @@ curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules"
   }'
 ```
 </CodeGroup>
+
+<Info>
+All Python examples on this page assume you've initialized the client as shown above:
+
+```python
+client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+```
+</Info>
 
 ### Request body
 

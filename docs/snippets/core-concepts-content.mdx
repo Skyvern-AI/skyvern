@@ -1,4 +1,4 @@
-Skyvern has eight core concepts. Master these and you can build any browser automation.
+Skyvern has nine core concepts. Master these and you can build any browser automation.
 
 ---
 
@@ -181,6 +181,46 @@ print(result.output)   # {"heading": "Welcome"}
 <Warning>
 **Billing:** You're billed per step. A step is one AI decision + action cycle. Use `max_steps` to cap costs during development.
 </Warning>
+
+---
+
+## Schedules
+
+A **Schedule** runs a workflow automatically on a recurring basis. You define a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+
+<CodeGroup>
+```python Python
+result = await client.agent.create_workflow_schedule(
+    workflow_permanent_id="wpid_abc123",
+    cron_expression="0 9 * * 1-5",  # Weekdays at 9 AM
+    timezone="America/New_York",
+    parameters={
+        "url": "https://example.com/dashboard"
+    }
+)
+```
+
+```typescript TypeScript
+const result = await skyvern.agent.createWorkflowSchedule("wpid_abc123", {
+  cron_expression: "0 9 * * 1-5", // Weekdays at 9 AM
+  timezone: "America/New_York",
+  parameters: {
+    url: "https://example.com/dashboard",
+  },
+});
+```
+</CodeGroup>
+
+**Key properties:**
+
+| Property | Description |
+|----------|-------------|
+| `cron_expression` | 5-field cron expression defining the recurrence (minimum 5-minute interval) |
+| `timezone` | IANA timezone identifier (e.g., `America/New_York`) |
+| `parameters` | Workflow parameters passed to each scheduled run |
+| `enabled` | `true` (active) or `false` (paused) |
+
+**Use Schedules for:** recurring data extraction, periodic report generation, daily monitoring tasks, any workflow you want to run without manual intervention.
 
 ---
 
