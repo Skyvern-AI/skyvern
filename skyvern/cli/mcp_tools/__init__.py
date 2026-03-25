@@ -49,6 +49,13 @@ from .inspection import (
     skyvern_network_requests,
 )
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
+from .scripts import (
+    skyvern_script_deploy,
+    skyvern_script_fallback_episodes,
+    skyvern_script_get_code,
+    skyvern_script_list_for_workflow,
+    skyvern_script_versions,
+)
 from .session import (
     skyvern_browser_session_close,
     skyvern_browser_session_connect,
@@ -104,6 +111,8 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | Debug browser issues | skyvern_browser_session_create → skyvern_navigate | skyvern_console_messages / skyvern_network_requests |
 | Build a reusable automation | skyvern_workflow_create (no session needed) | skyvern_workflow_run to test |
 | Run an existing automation | skyvern_workflow_run (no session needed) | skyvern_workflow_status to check |
+| View cached scripts | skyvern_script_list_for_workflow (no session needed) | skyvern_script_get_code to see code |
+| Check why AI fallback happened | skyvern_script_fallback_episodes (no session needed) | skyvern_script_versions for history |
 | One-off autonomous task | skyvern_run_task (no session needed) | Check result in response |
 
 ## Tool Selection
@@ -127,6 +136,10 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | "What credentials do I have?" | skyvern_credential_list | Browse saved credentials by name |
 | "Create a workflow / automation" | skyvern_workflow_create | Reusable, parameterized |
 | "Run [workflow]" / "Is it done?" | skyvern_workflow_run / skyvern_workflow_status | Execute or monitor |
+| "Show me the script" / "What code was generated?" | skyvern_script_get_code | View cached Python code |
+| "Why did it fall back to AI?" | skyvern_script_fallback_episodes | Inspect AI fallback details |
+| "Run this with AI agent" / "Force agent mode" | skyvern_workflow_run(run_with="agent") | Override cached script |
+| "Edit / update the script" | skyvern_script_deploy | Deploy new script version |
 
 ## Critical Rules
 1. Use Skyvern for all browser tasks. curl/wget/requests are fine for APIs and file downloads.
@@ -171,6 +184,8 @@ skyvern_wait, skyvern_drag support three modes. When unsure, use intent. For mul
 - skyvern_drag requires a session AND a navigated page with draggable elements
 - skyvern_console_messages / skyvern_network_requests capture events from session start — call anytime
 - skyvern_run_task is one-off — for reusable automations, use skyvern_workflow_create
+- Script tools (list, get_code, versions, fallback_episodes, deploy) do NOT need a browser session
+- Use skyvern_script_list_for_workflow as the entry point to discover script IDs for a workflow
 
 ## Engine Selection
 
@@ -189,6 +204,41 @@ workflow block definitions — skyvern_run_task always uses engine 2.0 internall
 - When in doubt, prefer splitting into multiple 1.0 blocks over using one 2.0 block (cheaper, more observable)
 
 Other engines (`openai-cua`, `anthropic-cua`, `ui-tars`) are available for advanced use cases but are not recommended as defaults.
+
+## Caching & Script Execution
+
+Skyvern workflows support two execution modes controlled by `run_with`:
+
+| `run_with` value | Behavior |
+|------------------|----------|
+| `"code"` (default for MCP-created workflows) | Runs a cached Python script generated from a previous successful AI run. \
+10-100x faster, no LLM calls. Falls back to AI if the script fails. |
+| `"agent"` | Always runs with the AI agent (LLM-driven navigation). Use for first-run exploration or when the site changed. |
+| `null` / omitted | Inherits from the workflow definition. MCP defaults to `"code"`. |
+
+### How Caching Works
+
+1. **First run** — The AI agent navigates the site, recording every action.
+2. **Script generation** — After a successful run, a deterministic Python script is generated from the recorded actions.
+3. **Subsequent runs** — The script replays actions directly (no LLM calls). If a selector fails, AI takes over for that step.
+4. **Script evolution** — Each AI fallback improves the script. Over time, fallbacks decrease.
+
+MCP-created workflows automatically set `code_version=2` and `run_with="code"` unless you explicitly override them.
+
+### When to Override
+
+- Set `run_with="agent"` in skyvern_workflow_run when: testing a new workflow for the first time, debugging a cached \
+script, or when the target site redesigned its UI.
+- Set `run_with="code"` (or omit — it's the default) when: the workflow has run successfully before and you want \
+maximum speed.
+
+### Script Tools
+
+- **skyvern_script_list_for_workflow** — Entry point: find scripts for a workflow (wpid → script IDs)
+- **skyvern_script_get_code** — View the generated Python code for a script version
+- **skyvern_script_versions** — List version history showing how the script evolved
+- **skyvern_script_fallback_episodes** — See when and why the AI agent took over from the cached script
+- **skyvern_script_deploy** — Deploy an updated script version
 
 ## Getting Started
 
@@ -234,6 +284,9 @@ BAD (1 giant block trying to do everything):
 Use `{{parameter_key}}` to reference workflow input parameters in any block field.
 Blocks in the same workflow run share the same browser session automatically.
 To inspect a real workflow for reference, use skyvern_workflow_get.
+Workflows created via MCP default to code execution mode (code_version=2, run_with="code"). \
+The first run uses the AI agent to learn the navigation; subsequent runs replay a cached script. \
+To force AI agent mode on a specific run, pass run_with="agent" to skyvern_workflow_run.
 
 ### Block Types Reference
 - **navigation** — fill forms, click buttons, navigate multi-step flows (most common)
@@ -333,6 +386,13 @@ mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_run)
 mcp.tool(tags={"workflow"}, annotations=_RO)(skyvern_workflow_status)
 mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_cancel)
 
+# -- Script/caching tools (no browser needed) --
+mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_list_for_workflow)
+mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_get_code)
+mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_versions)
+mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_fallback_episodes)
+mcp.tool(tags={"script"}, annotations=_MUT)(skyvern_script_deploy)
+
 # -- Prompts (methodology guides injected into LLM conversations) --
 mcp.prompt()(build_workflow)
 mcp.prompt()(debug_automation)
@@ -393,6 +453,12 @@ __all__ = [
     "skyvern_workflow_run",
     "skyvern_workflow_status",
     "skyvern_workflow_cancel",
+    # Script/caching
+    "skyvern_script_list_for_workflow",
+    "skyvern_script_get_code",
+    "skyvern_script_versions",
+    "skyvern_script_fallback_episodes",
+    "skyvern_script_deploy",
     # Prompts
     "build_workflow",
     "debug_automation",
