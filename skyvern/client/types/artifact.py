@@ -21,7 +21,6 @@ class Artifact(UniversalBaseModel):
     artifact_id: str
     artifact_type: ArtifactType
     uri: str
-    bundle_key: typing.Optional[str] = None
     task_id: typing.Optional[str] = None
     step_id: typing.Optional[str] = None
     workflow_run_id: typing.Optional[str] = None

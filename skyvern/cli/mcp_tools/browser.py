@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
+import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
@@ -34,7 +35,11 @@ from ._common import (
 from ._localhost import is_localhost_url
 from ._session import BrowserNotAvailableError, get_page, no_browser_error
 
-LOG = logging.getLogger(__name__)
+LOG = structlog.get_logger(__name__)
+
+# Matches `await` as a keyword, not inside single-line comments or strings.
+_AWAIT_RE = re.compile(r"\bawait\b")
+_SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 
 
 async def skyvern_navigate(
@@ -226,6 +231,275 @@ async def skyvern_click(
         "skyvern_click",
         browser_context=ctx,
         data=data,
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_drag(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    source_intent: Annotated[
+        str | None,
+        Field(description="Natural language description of the element to drag"),
+    ] = None,
+    source_selector: Annotated[
+        str | None,
+        Field(description="CSS selector or XPath of the drag source element"),
+    ] = None,
+    target_intent: Annotated[
+        str | None,
+        Field(description="Natural language description of where to drop the element"),
+    ] = None,
+    target_selector: Annotated[
+        str | None,
+        Field(description="CSS selector or XPath of the drop target element"),
+    ] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for elements in ms. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
+) -> dict[str, Any]:
+    """Drag an element and drop it onto another element. Supports AI intent, CSS/XPath selectors, or both for source and target independently.
+
+    When both source and target have selectors (no intents), uses direct Playwright drag_and_drop for speed.
+    When any intent is provided, uses Skyvern's AI action pipeline to resolve elements.
+    """
+    if not source_intent and not source_selector:
+        return make_result(
+            "skyvern_drag",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide source_intent, source_selector, or both",
+                "Describe what to drag with source_intent or target it with source_selector",
+            ),
+        )
+    if not target_intent and not target_selector:
+        return make_result(
+            "skyvern_drag",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide target_intent, target_selector, or both",
+                "Describe where to drop with target_intent or target it with target_selector",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_drag", ok=False, error=no_browser_error())
+
+    use_selectors = source_selector and target_selector and not source_intent and not target_intent
+
+    with Timer() as timer:
+        try:
+            if use_selectors:
+                await page.page.drag_and_drop(
+                    source_selector,
+                    target_selector,
+                    timeout=timeout,  # type: ignore[arg-type]
+                )
+            else:
+                src = source_intent or source_selector
+                tgt = target_intent or target_selector
+                await do_act(page, f"Drag {src} and drop it onto {tgt}")
+            timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            return make_result(
+                "skyvern_drag",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SELECTOR_NOT_FOUND,
+                    str(e),
+                    "Verify source and target selectors match elements on the page",
+                ),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_drag",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The drag operation failed"),
+            )
+
+    return make_result(
+        "skyvern_drag",
+        browser_context=ctx,
+        data={
+            "source_selector": source_selector,
+            "source_intent": source_intent,
+            "target_selector": target_selector,
+            "target_intent": target_intent,
+            "mode": "selector" if use_selectors else "ai",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_file_upload(
+    file_paths: Annotated[
+        list[str],
+        Field(
+            description="List of file paths or URLs to upload. URLs are downloaded automatically. Max 50MB per file."
+        ),
+    ],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    intent: Annotated[
+        str | None,
+        Field(
+            description="Natural language description of the file input or upload button. "
+            "Be specific: 'the Choose File button' or 'the resume upload field'."
+        ),
+    ] = None,
+    selector: Annotated[
+        str | None,
+        Field(description="CSS selector or XPath of the file input or upload button"),
+    ] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for the element in ms. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
+) -> dict[str, Any]:
+    """Upload files by setting them on a file input element. Accepts local paths or URLs (URLs are downloaded automatically).
+
+    Uses the same upload pipeline as the Skyvern product — supports AI intent, CSS/XPath selectors, or both
+    to find the file input element. Works with both local and cloud browsers.
+    """
+    if not file_paths:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "file_paths must not be empty",
+                "Provide at least one file path or URL to upload",
+            ),
+        )
+
+    ai_mode, err = _resolve_ai_mode(selector, intent)
+    if err:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide intent, selector, or both to identify the file input element",
+                "Use intent='the file upload button' or selector='input[type=file]'",
+            ),
+        )
+
+    has_urls = any(fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
+    has_local = any(not fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
+
+    if has_urls and has_local:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot mix local file paths and URLs in a single upload",
+                "Upload local files and URLs in separate calls",
+            ),
+        )
+
+    if has_urls and len(file_paths) > 1:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Multiple URL uploads are not supported in a single call — each URL replaces the previous",
+                "Call skyvern_file_upload once per URL",
+            ),
+        )
+
+    if len(file_paths) > 1 and not selector:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Multiple file upload requires a selector — intent-only supports single file",
+                "Provide selector='input[type=file]' for multi-file uploads",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            if has_urls:
+                # URLs: SDK downloads the file then sets it on the input
+                fp = file_paths[0]
+                if ai_mode is not None:
+                    await page.upload_file(
+                        selector=selector,  # type: ignore[arg-type]
+                        files=fp,
+                        prompt=intent,
+                        ai=ai_mode,
+                        timeout=timeout,
+                    )
+                else:
+                    assert selector is not None
+                    await page.upload_file(selector=selector, files=fp, timeout=timeout)
+            elif ai_mode is not None and len(file_paths) == 1:
+                # Single local file + intent: use SDK for AI element resolution
+                await page.upload_file(
+                    selector=selector,  # type: ignore[arg-type]
+                    files=file_paths[0],
+                    prompt=intent,
+                    ai=ai_mode,
+                    timeout=timeout,
+                )
+            else:
+                # Local files + selector: set directly via Playwright
+                assert selector is not None
+                locator = page.page.locator(selector).first
+                await locator.set_input_files(file_paths, timeout=timeout)
+
+            timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            return make_result(
+                "skyvern_file_upload",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SELECTOR_NOT_FOUND,
+                    str(e),
+                    "Verify the selector matches the file input or upload button",
+                ),
+            )
+        except Exception as e:
+            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            return make_result(
+                "skyvern_file_upload",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(code, str(e), "File upload failed"),
+            )
+
+    return make_result(
+        "skyvern_file_upload",
+        browser_context=ctx,
+        data={"files_count": len(file_paths), "file_paths": file_paths},
         timing_ms=timer.timing_ms,
     )
 
@@ -879,12 +1153,32 @@ async def skyvern_wait(
     )
 
 
+def _wrap_async_iife(expression: str) -> str:
+    """Wrap expressions containing ``await`` in an async IIFE so page.evaluate() can run them.
+
+    Single-line: ``(async () => { return <expr> })()`` — implicit return.
+    Multi-line:  ``(async () => { <expr> })()`` — caller must use explicit return.
+    Already-wrapped or no ``await``: returned unchanged.
+    """
+    if expression.lstrip().startswith("(async"):
+        return expression
+    stripped = _SINGLE_LINE_COMMENT_RE.sub("", expression)
+    if not _AWAIT_RE.search(stripped):
+        return expression
+    if "\n" in expression:
+        return f"(async () => {{ {expression} }})()"
+    return f"(async () => {{ return {expression} }})()"
+
+
 async def skyvern_evaluate(
     expression: Annotated[str, "JavaScript expression to evaluate"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
     """Run JavaScript on the page to read DOM state, get URLs, check values, or discover CSS selectors for faster subsequent actions.
+
+    Supports ``await`` — async expressions are automatically wrapped in an async IIFE.
+    For multi-line expressions with ``await``, use explicit ``return`` for the value you want back.
 
     Security: This executes arbitrary JS in the page context. Only use with trusted expressions.
     """
@@ -900,6 +1194,8 @@ async def skyvern_evaluate(
             ),
         )
 
+    js = _wrap_async_iife(expression)
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -907,7 +1203,7 @@ async def skyvern_evaluate(
 
     with Timer() as timer:
         try:
-            result = await page.evaluate(expression)
+            result = await page.evaluate(js)
             timer.mark("sdk")
         except Exception as e:
             return make_result(

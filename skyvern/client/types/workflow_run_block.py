@@ -26,7 +26,6 @@ class WorkflowRunBlock(UniversalBaseModel):
     output: typing.Optional[WorkflowRunBlockOutput] = None
     continue_on_failure: typing.Optional[bool] = None
     failure_reason: typing.Optional[str] = None
-    error_codes: typing.Optional[typing.List[str]] = None
     engine: typing.Optional[RunEngine] = None
     task_id: typing.Optional[str] = None
     url: typing.Optional[str] = None

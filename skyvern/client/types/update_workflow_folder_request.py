@@ -4,11 +4,10 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .workflow_schedule import WorkflowSchedule
 
 
-class WorkflowScheduleListResponse(UniversalBaseModel):
-    schedules: typing.List[WorkflowSchedule]
+class UpdateWorkflowFolderRequest(UniversalBaseModel):
+    folder_id: typing.Optional[str] = pydantic.Field(default=None)
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
