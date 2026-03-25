@@ -4,11 +4,14 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .organization_schedule_item import OrganizationScheduleItem
 
 
-class FolderUpdate(UniversalBaseModel):
-    title: typing.Optional[str] = pydantic.Field(default=None)
-    description: typing.Optional[str] = pydantic.Field(default=None)
+class OrganizationScheduleListResponse(UniversalBaseModel):
+    schedules: typing.List[OrganizationScheduleItem]
+    total_count: int
+    page: int
+    page_size: int
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
