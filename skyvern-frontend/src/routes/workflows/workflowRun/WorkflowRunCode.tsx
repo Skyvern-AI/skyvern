@@ -77,9 +77,6 @@ function WorkflowRunCode(props?: Props) {
     workflowRunId: workflowRun?.workflow_run_id,
   });
 
-  const isAdaptiveCaching =
-    workflow?.adaptive_caching && workflow?.run_with === "code";
-
   useEffect(() => {
     const keys = Object.keys(blockScriptsPublished?.blocks ?? {});
     setHasPublishedCode(
@@ -127,15 +124,15 @@ function WorkflowRunCode(props?: Props) {
     ? selectedVersionCode
     : activeScripts;
 
-  // For non-adaptive-caching, use block labels from the displayed version
+  // Use block labels from the displayed version when viewing an older version
   // (older versions may have different blocks than the current run)
   const displayBlockLabels = isViewingOtherVersion
     ? Object.keys(displayScripts?.blocks ?? {})
     : orderedBlockLabels;
 
-  // For adaptive caching, prefer the full main.py script over stitched blocks
+  // Prefer the full main_script when available, fall back to stitched blocks
   const code = (
-    isAdaptiveCaching && displayScripts?.main_script
+    displayScripts?.main_script
       ? displayScripts.main_script
       : getCode(displayBlockLabels, displayScripts?.blocks).join("")
   ).trim();

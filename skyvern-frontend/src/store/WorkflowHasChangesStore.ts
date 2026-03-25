@@ -152,13 +152,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        run_with:
-          saveData.settings.runWith === "code_v2"
-            ? "code"
-            : saveData.settings.runWith,
+        run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
-        adaptive_caching: saveData.settings.runWith === "code_v2",
+        code_version:
+          saveData.settings.runWith === "code"
+            ? saveData.settings.codeVersion ?? 2
+            : undefined,
         workflow_definition: {
           version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,

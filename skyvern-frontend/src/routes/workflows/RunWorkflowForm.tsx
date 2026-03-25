@@ -190,7 +190,7 @@ type RunWorkflowRequestBody = {
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   browser_address?: string | null;
-  run_with?: "agent" | "code" | "code_v2";
+  run_with?: "agent" | "code";
   ai_fallback?: boolean;
 };
 
@@ -265,18 +265,17 @@ function transformToWorkflowRunRequest(
   return transformed;
 }
 
-const VALID_RUN_WITH = new Set(["agent", "code", "code_v2"]);
+const VALID_RUN_WITH = new Set(["agent", "code"]);
 
 function deriveRunWith(
   workflow?: WorkflowApiResponse,
   override?: string | null,
-): "agent" | "code" | "code_v2" {
+): "agent" | "code" {
   if (override && VALID_RUN_WITH.has(override))
-    return override as "agent" | "code" | "code_v2";
-  if (workflow?.run_with === "code_v2") return "code_v2";
-  if (workflow?.adaptive_caching && workflow?.run_with === "code")
-    return "code_v2";
+    return override as "agent" | "code";
+  if (workflow?.run_with === "agent") return "agent";
   if (workflow?.run_with === "code") return "code";
+  if ((workflow?.code_version ?? 0) >= 1) return "code";
   return "agent";
 }
 
@@ -287,7 +286,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: "agent" | "code" | "code_v2";
+  runWith: "agent" | "code";
   aiFallback: boolean | null;
 };
 
@@ -393,15 +392,6 @@ function RunWorkflowForm({
     workflowPermanentId,
     status: "published",
   });
-
-  const { data: blockScriptsV2 } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue: cacheKeyValue ? `${cacheKeyValue}:v2` : "v2",
-    workflowPermanentId,
-    status: "published",
-  });
-
-  const hasCodeV2 = Object.keys(blockScriptsV2 ?? {}).length > 0;
 
   const [hasCode, setHasCode] = useState(false);
 
@@ -569,25 +559,6 @@ function RunWorkflowForm({
                 } satisfies ApiCommandOptions;
               }}
             />
-            {hasCodeV2 && (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={
-                  runWorkflowMutation.isPending || hasLoginBlockValidationError
-                }
-                onClick={() => {
-                  form.setValue("runWith", "code_v2");
-                  form.handleSubmit(onSubmit, handleInvalid)();
-                }}
-              >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                Run with Code 2.0
-                <span className="ml-2 rounded bg-amber-500/20 px-1.5 py-0.5 text-xs font-semibold text-amber-400">
-                  Beta
-                </span>
-              </Button>
-            )}
             <Button
               type="submit"
               disabled={
@@ -910,12 +881,6 @@ function RunWorkflowForm({
                     generated).
                   </span>
                 ),
-                code_v2: (
-                  <span>
-                    Run this workflow with Code 2.0 (adaptive caching with
-                    self-healing scripts).
-                  </span>
-                ),
               };
               return (
                 <FormItem>
@@ -942,7 +907,6 @@ function RunWorkflowForm({
                           <SelectContent>
                             <SelectItem value="agent">Skyvern Agent</SelectItem>
                             <SelectItem value="code">Code</SelectItem>
-                            <SelectItem value="code_v2">Code 2.0</SelectItem>
                           </SelectContent>
                         </Select>
                       </FormControl>
