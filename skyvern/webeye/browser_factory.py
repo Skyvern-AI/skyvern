@@ -233,12 +233,16 @@ class BrowserContextFactory:
         return str(uuid.uuid4())
 
     @staticmethod
-    def update_chromium_browser_preferences(user_data_dir: str, download_dir: str) -> None:
+    def update_chromium_browser_preferences(
+        user_data_dir: str,
+        download_dir: str,
+        preference_template_path: str | None = None,
+    ) -> None:
         preference_dst_folder = f"{user_data_dir}/Default"
         os.makedirs(preference_dst_folder, exist_ok=True)
 
         preference_dst_file = f"{preference_dst_folder}/Preferences"
-        preference_template = f"{SKYVERN_DIR}/webeye/chromium_preferences.json"
+        preference_template = preference_template_path or f"{SKYVERN_DIR}/webeye/chromium_preferences.json"
 
         preference_file_content = ""
         with open(preference_template) as f:
