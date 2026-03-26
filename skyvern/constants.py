@@ -23,6 +23,22 @@ MAX_UPLOAD_FILE_COUNT = 50
 AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT = 50
 DEFAULT_MAX_SCREENSHOT_SCROLLS = 3
 
+# Default complete_criterion for LoginBlocks. Guides the LLM to check for actual
+# logged-in indicators rather than relying on page location, which fails on sites
+# that redirect to the homepage after successful login.
+DEFAULT_LOGIN_COMPLETE_CRITERION = (
+    "The login is successful. To verify, look for ANY of these logged-in indicators on the page: "
+    "(1) a user name, email, or account name displayed in the header/navigation bar, "
+    "(2) a 'Sign out', 'Log out', or 'Logout' button or link, "
+    "(3) an account/profile menu or avatar that was not present before login, "
+    "(4) a personalized greeting such as 'Welcome [Name]' or 'Hello [Name]', "
+    "(5) a 'My Account', 'My Dashboard', or similar authenticated-only link. "
+    "IMPORTANT: Being redirected to the homepage does NOT mean login failed — "
+    "many websites redirect to the homepage after a successful login. "
+    "Check the page elements carefully for the indicators listed above. "
+    "Do NOT assume login failed just because you are on the homepage or the same page as before."
+)
+
 # reserved fields for navigation payload
 SPECIAL_FIELD_VERIFICATION_CODE = "verification_code"
 

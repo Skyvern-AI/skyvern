@@ -7440,8 +7440,9 @@ class AgentDB(BaseAlchemyDB):
         """Get workflow runs associated with a script, with total count, status counts,
         and average AI fallbacks per run.
 
-        Only includes actual script runs (run_with='code'), excluding agent runs that
-        generated the script.
+        Includes actual script runs (run_with='code', 'code_v2', or NULL), excluding
+        explicit agent runs. run_with is NULL when the workflow ran in auto mode and
+        should_run_script() resolved to code via fallback (e.g. code_version >= 1).
 
         Returns (runs, total_count, status_counts, avg_fallbacks_per_run) where runs
         is limited by page_size, total_count is derived from the status_counts GROUP BY,
@@ -7473,11 +7474,19 @@ class AgentDB(BaseAlchemyDB):
                         WorkflowScriptModel.created_at < created_before,
                     )
 
-                # Base filter for workflow runs — only include actual script runs
+                # Base filter for workflow runs — only include actual script runs.
+                # run_with may be NULL when the workflow ran in auto mode and
+                # should_run_script() resolved to code mode via fallback (e.g.
+                # code_version >= 1 or adaptive_caching). NULL is therefore
+                # treated as a code run here; explicit "agent" runs are excluded
+                # by not appearing in the workflow_scripts join above.
                 base_filters = [
                     WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
                     WorkflowRunModel.organization_id == organization_id,
-                    WorkflowRunModel.run_with.in_(["code", "code_v2"]),  # include legacy "code_v2" rows
+                    or_(
+                        WorkflowRunModel.run_with.in_(["code", "code_v2"]),
+                        WorkflowRunModel.run_with.is_(None),
+                    ),
                 ]
 
                 # Count statuses via GROUP BY (also gives us total_count)
@@ -7563,7 +7572,12 @@ class AgentDB(BaseAlchemyDB):
                         WorkflowScriptModel.deleted_at.is_(None),
                         WorkflowScriptModel.workflow_run_id.isnot(None),
                         WorkflowRunModel.organization_id == organization_id,
-                        WorkflowRunModel.run_with.in_(["code", "code_v2"]),  # include legacy "code_v2" rows
+                        # Same NULL-inclusion logic as get_workflow_runs_for_script:
+                        # runs with NULL run_with executed in auto/code mode via fallback.
+                        or_(
+                            WorkflowRunModel.run_with.in_(["code", "code_v2"]),
+                            WorkflowRunModel.run_with.is_(None),
+                        ),
                     )
                     .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
                 )
