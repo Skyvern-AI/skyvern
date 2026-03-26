@@ -4108,6 +4108,26 @@ class WorkflowService:
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
+
+        # Look up child workflow runs (e.g. from task_v2 blocks) to flatten their
+        # tasks into the parent list for debug artifact persistence, and collect
+        # child workflow_run IDs so cleanup_for_workflow_run can pop their orphaned
+        # entries from self.pages (child skips clean_up_workflow).
+        child_workflow_runs = await app.DATABASE.get_workflow_runs_by_parent_workflow_run_id(
+            parent_workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
+        )
+        child_workflow_run_ids = [cwr.workflow_run_id for cwr in child_workflow_runs]
+        if child_workflow_runs:
+            LOG.info(
+                "Found child workflow runs for cleanup",
+                parent_workflow_run_id=workflow_run.workflow_run_id,
+                child_count=len(child_workflow_run_ids),
+            )
+            for child_run in child_workflow_runs:
+                child_tasks = await self.get_tasks_by_workflow_run_id(child_run.workflow_run_id)
+                tasks.extend(child_tasks)
+
         all_workflow_task_ids = [task.task_id for task in tasks]
         close_browser_on_completion = (
             close_browser_on_completion and browser_session_id is None and not workflow_run.browser_address
@@ -4118,6 +4138,7 @@ class WorkflowService:
             close_browser_on_completion=close_browser_on_completion,
             browser_session_id=browser_session_id,
             organization_id=workflow_run.organization_id,
+            child_workflow_run_ids=child_workflow_run_ids,
         )
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)

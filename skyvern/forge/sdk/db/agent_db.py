@@ -4182,6 +4182,7 @@ class AgentDB(BaseAlchemyDB):
                     select(WorkflowRunModel)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id == parent_workflow_run_id)
+                    .order_by(WorkflowRunModel.created_at.asc())  # intentional: clean_up_workflow uses tasks[-1]
                 )
                 workflow_runs = (await session.scalars(query)).all()
                 return [convert_to_workflow_run(run) for run in workflow_runs]
