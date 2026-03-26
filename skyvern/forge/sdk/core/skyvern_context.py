@@ -50,6 +50,7 @@ class SkyvernContext:
     action_order: int = 0
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
+    workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[dict[str, Any]] | None = None

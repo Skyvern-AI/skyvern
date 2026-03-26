@@ -678,6 +678,26 @@ class WorkflowService:
             )
         )
 
+        # Check artifact bundling flag at workflow level so it applies to both agent and cached paths.
+        # See also: skyvern/forge/agent.py Agent.agent_step() checks per-task for standalone task runs.
+        new_context = skyvern_context.current()
+        if new_context:
+            try:
+                new_context.use_artifact_bundling = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "USE_ARTIFACT_BUNDLING",
+                    workflow_run.workflow_run_id,
+                    properties={"organization_id": organization.organization_id},
+                )
+                LOG.debug(
+                    "USE_ARTIFACT_BUNDLING flag resolved for workflow",
+                    use_artifact_bundling=new_context.use_artifact_bundling,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                )
+            except Exception:
+                LOG.warning("Failed to check USE_ARTIFACT_BUNDLING flag for workflow", exc_info=True)
+                new_context.use_artifact_bundling = False
+
         # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
         all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
         try:
