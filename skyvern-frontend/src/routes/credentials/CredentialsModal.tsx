@@ -43,6 +43,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
 import { ExternalLinkIcon } from "@radix-ui/react-icons";
+import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -132,6 +133,10 @@ function CredentialsModal({
     type: urlType,
     setIsOpen: setUrlIsOpen,
   } = useCredentialModalState();
+  const { parsedConfig: customCredentialServiceConfig } =
+    useCustomCredentialServiceConfig();
+  const hasCustomCredentialService = !!customCredentialServiceConfig;
+  const [vaultType, setVaultType] = useState<"default" | "custom">("default");
 
   const isEditMode = !!editingCredential;
 
@@ -316,6 +321,7 @@ function CredentialsModal({
   }, [isOpen, credentials, isEditMode, editingCredential]);
 
   function reset() {
+    setVaultType("default");
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
     setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
@@ -850,6 +856,7 @@ function CredentialsModal({
           totp_type: passwordCredentialValues.totp_type,
           totp_identifier: totpIdentifier === "" ? null : totpIdentifier,
         },
+        ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
       const cardNumber = creditCardCredentialValues.cardNumber.trim();
@@ -906,6 +913,7 @@ function CredentialsModal({
           card_brand: cardBrand,
           card_holder_name: cardHolderName,
         },
+        ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     } else if (type === CredentialModalTypes.SECRET) {
       const secretValue = secretCredentialValues.secretValue.trim();
@@ -927,6 +935,7 @@ function CredentialsModal({
           secret_value: secretValue,
           secret_label: secretLabel === "" ? null : secretLabel,
         },
+        ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     }
   };
@@ -953,6 +962,27 @@ function CredentialsModal({
     return () => clearTimeout(timeout);
   }, [isTestInProgress, testMessageIndex]);
 
+  const customVaultCheckbox =
+    hasCustomCredentialService && !isEditMode ? (
+      <div className="flex items-center gap-3">
+        <Checkbox
+          id="use-custom-vault"
+          checked={vaultType === "custom"}
+          onCheckedChange={(checked) =>
+            setVaultType(checked === true ? "custom" : "default")
+          }
+          disabled={isTestInProgress}
+        />
+        <Label
+          htmlFor="use-custom-vault"
+          className="cursor-pointer text-sm font-medium"
+        >
+          Store in Custom Credential Service
+        </Label>
+        <HelpTooltip content="Store this credential in your external credential service instead of the default Skyvern vault." />
+      </div>
+    ) : undefined;
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -967,6 +997,7 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          beforeCredentialFields={customVaultCheckbox}
           afterUrl={
             <div className="space-y-3">
               <div className="flex items-center gap-3">
@@ -1076,6 +1107,7 @@ function CredentialsModal({
         <CreditCardCredentialContent
           values={creditCardCredentialValues}
           onChange={setCreditCardCredentialValues}
+          beforeCredentialFields={customVaultCheckbox}
           editMode={isEditMode}
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
@@ -1087,6 +1119,7 @@ function CredentialsModal({
       <SecretCredentialContent
         values={secretCredentialValues}
         onChange={setSecretCredentialValues}
+        beforeCredentialFields={customVaultCheckbox}
         editMode={isEditMode}
         editingGroups={editingGroups}
         onEnableEditName={handleEnableEditName}
