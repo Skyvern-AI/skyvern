@@ -847,6 +847,7 @@ class AgentDB(BaseAlchemyDB):
         errors: list[dict[str, Any]] | None = None,
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
         if (
             status is None
@@ -855,6 +856,7 @@ class AgentDB(BaseAlchemyDB):
             and errors is None
             and max_steps_per_run is None
             and webhook_failure_reason is None
+            and failure_category is None
         ):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
@@ -884,6 +886,8 @@ class AgentDB(BaseAlchemyDB):
                         task.max_steps_per_run = max_steps_per_run
                     if webhook_failure_reason is not None:
                         task.webhook_failure_reason = webhook_failure_reason
+                    if failure_category is not None:
+                        task.failure_category = failure_category
                     await session.commit()
                     updated_task = await self.get_task(task_id, organization_id=organization_id)
                     if not updated_task:
@@ -3629,6 +3633,7 @@ class AgentDB(BaseAlchemyDB):
         browser_profile_id: str | None | object = _UNSET,
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -3678,6 +3683,8 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run.verification_code_polling_started_at = None
                 if browser_profile_id is not _UNSET:
                     workflow_run.browser_profile_id = browser_profile_id
+                if failure_category is not None:
+                    workflow_run.failure_category = failure_category
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
@@ -5306,6 +5313,7 @@ class AgentDB(BaseAlchemyDB):
         output: dict[str, Any] | None = None,
         organization_id: str | None = None,
         webhook_failure_reason: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             task_v2 = (
@@ -5340,6 +5348,8 @@ class AgentDB(BaseAlchemyDB):
                     task_v2.output = output
                 if webhook_failure_reason is not None:
                     task_v2.webhook_failure_reason = webhook_failure_reason
+                if failure_category is not None:
+                    task_v2.failure_category = failure_category
                 await session.commit()
                 await session.refresh(task_v2)
                 return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)

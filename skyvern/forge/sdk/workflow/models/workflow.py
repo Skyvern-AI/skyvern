@@ -167,6 +167,7 @@ class WorkflowRun(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     failure_reason: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None

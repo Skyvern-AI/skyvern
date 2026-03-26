@@ -225,6 +225,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
+        failure_category=task_obj.failure_category,
     )
     return task
 
@@ -455,6 +456,7 @@ def convert_to_workflow_run(
         ai_fallback=workflow_run_model.ai_fallback,
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
+        failure_category=workflow_run_model.failure_category,
     )
 
 

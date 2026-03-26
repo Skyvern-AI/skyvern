@@ -122,6 +122,7 @@ class TaskModel(Base):
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
+    failure_category = Column(JSON, nullable=True)
 
 
 class StepModel(Base):
@@ -418,6 +419,7 @@ class WorkflowRunModel(Base):
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
+    failure_category = Column(JSON, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -860,6 +862,7 @@ class TaskV2Model(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     model = Column(JSON, nullable=True)
+    failure_category = Column(JSON, nullable=True)
 
 
 class ThoughtModel(Base):

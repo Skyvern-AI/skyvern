@@ -162,6 +162,7 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
             failure_reason=None,
             webhook_failure_reason=None,
             errors=None,
+            failure_category=None,
         ):
             updates = {}
             if status is not None:
@@ -170,6 +171,8 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
                 updates["failure_reason"] = failure_reason
             if errors is not None:
                 updates["errors"] = errors
+            if failure_category is not None:
+                updates["failure_category"] = failure_category
             return await mock_app.DATABASE.update_task(task.task_id, organization_id=task.organization_id, **updates)
 
         with patch.object(ForgeAgent, "summary_failure_reason_for_max_retries", mock_summary):
