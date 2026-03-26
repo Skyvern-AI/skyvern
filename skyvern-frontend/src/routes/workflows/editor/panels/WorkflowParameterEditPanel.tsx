@@ -828,6 +828,7 @@ function WorkflowParameterEditPanel({
               <CredentialParameterSourceSelector
                 value={credentialId}
                 onChange={(value) => setCredentialId(value)}
+                vault_type="custom"
               />
             </div>
           )}
