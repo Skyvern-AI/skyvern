@@ -1402,13 +1402,22 @@ async def get_credentials(
         examples=[10],
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
+    vault_type: CredentialVaultType | None = Query(
+        default=None,
+        description="Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+    ),
 ) -> list[CredentialResponse]:
     """Return non-sensitive metadata for all credentials (paginated).
 
     SECURITY: Like ``get_credential``, this endpoint never returns raw secret
     material. See the module docstring for the full security invariant.
     """
-    credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
+    credentials = await app.DATABASE.get_credentials(
+        current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        vault_type=vault_type.value if isinstance(vault_type, CredentialVaultType) else None,
+    )
     return [_convert_to_response(credential) for credential in credentials]
 
 
