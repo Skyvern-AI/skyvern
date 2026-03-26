@@ -5,6 +5,7 @@ from typing import Any, cast
 import structlog
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_LOGIN_COMPLETE_CRITERION
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -633,6 +634,13 @@ def block_yaml_to_block(
 
     elif block_yaml.block_type == BlockType.LOGIN:
         login_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        # Apply a default complete_criterion for login blocks when the user hasn't provided one.
+        # This guides the LLM to check for actual logged-in indicators (username in header,
+        # account menu, logout button) rather than relying on page location, which fails on sites
+        # that redirect to the homepage after successful login.
+        login_complete_criterion = block_yaml.complete_criterion
+        if not login_complete_criterion or not login_complete_criterion.strip():
+            login_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION
         return LoginBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -646,7 +654,7 @@ def block_yaml_to_block(
             totp_verification_url=block_yaml.totp_verification_url,
             totp_identifier=block_yaml.totp_identifier,
             disable_cache=block_yaml.disable_cache,
-            complete_criterion=block_yaml.complete_criterion,
+            complete_criterion=login_complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
         )

@@ -39,11 +39,26 @@ from skyvern.services import workflow_service
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 
 LOG = structlog.get_logger()
-DEFAULT_LOGIN_PROMPT = """If you're not on the login page, navigate to login page and login using the credentials given.
-First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page.
-If a 2-factor step appears, enter the authentication code.
-If you fail to login or can't find the login page after several trials, terminate.
-If the credentials are invalid, expired, or rejected by the website, terminate immediately and take no further actions.
+DEFAULT_LOGIN_PROMPT = """\
+If you're not on the login page, navigate to the login page first.
+First, dismiss any promotional popups or cookie prompts that could block interaction with the page.
+
+Log in using the credentials provided in the user details:
+1. Find the username/email input field and enter the username or email from the provided credentials.
+2. Find the password input field and enter the password from the provided credentials. \
+Some websites use a multi-step login flow where you enter the email first, click a "Continue" or "Next" button, \
+and then the password field appears on the next step. Handle this by entering the email, clicking continue, \
+then entering the password once the field is revealed.
+3. Click the login/sign-in button to submit the credentials.
+4. If a 2-factor authentication step appears, enter the authentication code.
+
+Make sure you enter the username and password separately — do not paste both into the same field.
+Use your action history to determine if you already attempted to log in. \
+If you have not clicked the login button since filling in the credentials, try submitting before assuming failure.
+
+If you fail to log in or can't find the login page after several trials, terminate.
+If the credentials are invalid, expired, or explicitly rejected by the website (e.g., "Invalid credentials", \
+"Wrong password"), terminate immediately and take no further actions.
 If login is completed, you're successful."""
 
 
