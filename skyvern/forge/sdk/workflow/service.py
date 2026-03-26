@@ -1324,9 +1324,17 @@ class WorkflowService:
                 ctx.script_mode = True
 
         # Single source-of-truth log for how this run will execute.
-        # execution_mode reflects the *effective* mode after script loading,
-        # not just the intent from should_run_script().
-        execution_mode = "code" if script_mode_active else "agent"
+        # Three modes:
+        #   "code"            — cached script loaded, executing code
+        #   "code_generation" — configured for code but no script yet,
+        #                       running as agent and will generate a script
+        #   "agent"           — not configured for code, pure agent run
+        if script_mode_active:
+            execution_mode = "code"
+        elif is_script_run:
+            execution_mode = "code_generation"
+        else:
+            execution_mode = "agent"
         LOG.info(
             "Workflow run execution mode resolved",
             execution_mode=execution_mode,
