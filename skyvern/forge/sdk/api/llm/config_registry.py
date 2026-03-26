@@ -35,6 +35,11 @@ class LLMConfigRegistry:
         cls._configs[llm_key] = config
 
     @classmethod
+    def deregister_config(cls, llm_key: str) -> None:
+        """Remove a registered LLM config. Idempotent — no-op if key doesn't exist."""
+        cls._configs.pop(llm_key, None)
+
+    @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
         if llm_key not in cls._configs:
             # If the key is not found in registered configs, treat it as a general model
