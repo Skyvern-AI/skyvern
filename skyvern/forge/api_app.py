@@ -25,11 +25,6 @@ from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
 
-try:
-    from cloud.observability.otel_setup import OTELSetup
-except ImportError:
-    OTELSetup = None  # type: ignore[assignment,misc]
-
 LOG = structlog.get_logger()
 
 
@@ -131,13 +126,23 @@ def create_api_app() -> FastAPI:
     """
     Start the agent server.
     """
-    # CRITICAL: Initialize OTEL FIRST, before any other code runs
+    # CRITICAL: Initialize OTEL FIRST, before any other code runs.
     # This must happen before start_forge_app() because that function
     # creates database connections. If we don't instrument the libraries
     # first, the DB spans won't be children of the HTTP request spans.
-    if settings.OTEL_ENABLED and OTELSetup is not None:
+    # NOTE: The cloud import is lazy (not at module level) to avoid triggering
+    # cloud/__init__.py side effects when skyvern is used in embedded mode.
+    otel_setup_cls: Any = None
+    if settings.OTEL_ENABLED:
         try:
-            otel = OTELSetup.get_instance()
+            from cloud.observability.otel_setup import OTELSetup  # noqa: PLC0415
+
+            otel_setup_cls = OTELSetup
+        except ImportError:
+            pass
+    if otel_setup_cls is not None:
+        try:
+            otel = otel_setup_cls.get_instance()
             otel.initialize_tracer_provider()
             LOG.info("OTEL tracer provider initialized before forge app creation")
         except Exception as e:

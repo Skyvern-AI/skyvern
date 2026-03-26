@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -12,21 +13,24 @@ from sqlalchemy import (
     cast,
     delete,
     distinct,
+    event,
     exists,
     func,
     literal,
+    literal_column,
     or_,
     pool,
     select,
     text,
-    tuple_,
     update,
 )
-from sqlalchemy.dialects.postgresql import JSONB, insert
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
@@ -206,17 +210,45 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-def _build_engine(database_string: str) -> Any:
+def _build_engine(database_string: str) -> AsyncEngine:
     """
     Build a SQLAlchemy async engine.
 
-    When DISABLE_CONNECTION_POOL=True (NullPool): enforce statement_timeout
-    and allow prepared statements.
+    Supports both PostgreSQL and SQLite (via aiosqlite) dialects.
 
-    When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
-    and do not set statement_timeout - set at role level in the database,
-    since the transaction pooler does not maintain session-level settings.
+    PostgreSQL behaviour:
+      When DISABLE_CONNECTION_POOL=True (NullPool): enforce statement_timeout
+      and allow prepared statements.
+      When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
+      and do not set statement_timeout - set at role level in the database,
+      since the transaction pooler does not maintain session-level settings.
+
+    SQLite behaviour:
+      For :memory: databases, uses StaticPool to keep the single connection alive.
+      For file-backed databases, enables WAL mode for concurrent read support.
+      Always enables foreign key enforcement via PRAGMA.
     """
+    if database_string.startswith("sqlite"):
+        is_memory = ":memory:" in database_string
+        engine_kwargs: dict[str, Any] = {
+            "json_serializer": _custom_json_serializer,
+        }
+        if is_memory:
+            engine_kwargs["poolclass"] = pool.StaticPool
+            engine_kwargs["connect_args"] = {"check_same_thread": False}
+        engine = create_async_engine(database_string, **engine_kwargs)
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_conn: Any, connection_record: Any) -> None:
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            if not is_memory:
+                cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
+        return engine
+
+    # PostgreSQL path (unchanged)
     connect_args: dict[str, Any] = {}
     if settings.DISABLE_CONNECTION_POOL:
         if "postgresql+psycopg" in database_string:
@@ -260,6 +292,12 @@ class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
         super().__init__(db_engine or _build_engine(database_string))
         self.debug_enabled = debug_enabled
+        # Global lock for SQLite schedule serialization. Unlike Postgres advisory locks
+        # (which are scoped per org:workflow via hashtext(key)), this serializes ALL
+        # schedule creates across all workflows. Acceptable for single-user embedded mode.
+        self._sqlite_schedule_lock: asyncio.Lock | None = (
+            asyncio.Lock() if self.engine.dialect.name == "sqlite" else None
+        )
 
     def is_retryable_error(self, error: SQLAlchemyError) -> bool:
         error_msg = str(error).lower()
@@ -564,11 +602,14 @@ class AgentDB(BaseAlchemyDB):
         """
         try:
             async with self.Session() as session:
-                query = (
-                    select(func.count(distinct(tuple_(StepModel.task_id, StepModel.order))))
+                subq = (
+                    select(StepModel.task_id, StepModel.order)
                     .where(StepModel.task_id.in_(task_ids))
                     .where(StepModel.organization_id == organization_id)
+                    .distinct()
+                    .subquery()
                 )
+                query = select(func.count()).select_from(subq)
                 return (await session.execute(query)).scalar()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -2131,52 +2172,61 @@ class AgentDB(BaseAlchemyDB):
     ) -> tuple[WorkflowSchedule, int]:
         """Create a schedule atomically with limit enforcement.
 
-        Uses a PostgreSQL advisory lock to serialize concurrent creates for the
-        same workflow, preventing TOCTOU races on the schedule count.
+        Uses a PostgreSQL advisory lock (or asyncio.Lock for SQLite) to serialize
+        concurrent creates for the same workflow, preventing TOCTOU races on the
+        schedule count.
 
         Returns (created_schedule, count_before_insert).
         Raises ScheduleLimitExceededError if count >= max_schedules.
         """
-        try:
-            async with self.Session() as session:
-                lock_key = f"schedule:{organization_id}:{workflow_permanent_id}"
+
+        async def _insert(session: AsyncSession) -> tuple[WorkflowSchedule, int]:
+            count = (
                 await session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-                    {"key": lock_key},
+                    select(func.count()).where(
+                        WorkflowScheduleModel.organization_id == organization_id,
+                        WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScheduleModel.deleted_at.is_(None),
+                    )
                 )
+            ).scalar_one()
 
-                count = (
-                    await session.execute(
-                        select(func.count()).where(
-                            WorkflowScheduleModel.organization_id == organization_id,
-                            WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id,
-                            WorkflowScheduleModel.deleted_at.is_(None),
-                        )
-                    )
-                ).scalar_one()
-
-                if max_schedules is not None and count >= max_schedules:
-                    raise ScheduleLimitExceededError(
-                        organization_id=organization_id,
-                        workflow_permanent_id=workflow_permanent_id,
-                        current_count=count,
-                        max_allowed=max_schedules,
-                    )
-
-                workflow_schedule = WorkflowScheduleModel(
+            if max_schedules is not None and count >= max_schedules:
+                raise ScheduleLimitExceededError(
                     organization_id=organization_id,
                     workflow_permanent_id=workflow_permanent_id,
-                    cron_expression=cron_expression,
-                    timezone=timezone,
-                    enabled=enabled,
-                    parameters=parameters,
-                    name=name,
-                    description=description,
+                    current_count=count,
+                    max_allowed=max_schedules,
                 )
-                session.add(workflow_schedule)
-                await session.commit()
-                await session.refresh(workflow_schedule)
-                return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled), count
+
+            workflow_schedule = WorkflowScheduleModel(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                cron_expression=cron_expression,
+                timezone=timezone,
+                enabled=enabled,
+                parameters=parameters,
+                name=name,
+                description=description,
+            )
+            session.add(workflow_schedule)
+            await session.commit()
+            await session.refresh(workflow_schedule)
+            return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled), count
+
+        try:
+            if self._sqlite_schedule_lock:
+                async with self._sqlite_schedule_lock:
+                    async with self.Session() as session:
+                        return await _insert(session)
+            else:
+                async with self.Session() as session:
+                    lock_key = f"schedule:{organization_id}:{workflow_permanent_id}"
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                        {"key": lock_key},
+                    )
+                    return await _insert(session)
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -4043,22 +4093,54 @@ class AgentDB(BaseAlchemyDB):
         )
         return query.where(or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match))
 
-    @staticmethod
-    def _apply_error_code_filter(query, error_code: str | None):  # type: ignore[no-untyped-def]
+    def _apply_error_code_filter(self, query, error_code: str | None):  # type: ignore[no-untyped-def]
         if not error_code:
             return query
-        error_code_in_tasks = exists(
-            select(1)
-            .select_from(TaskModel)
-            .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-            .where(cast(TaskModel.errors, JSONB).contains(literal([{"error_code": error_code}], type_=JSONB)))
-        )
-        error_code_in_blocks = exists(
-            select(1)
-            .select_from(WorkflowRunBlockModel)
-            .where(WorkflowRunBlockModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-            .where(cast(WorkflowRunBlockModel.error_codes, JSONB).contains(literal([error_code], type_=JSONB)))
-        )
+
+        dialect_name = self.engine.dialect.name
+
+        if dialect_name == "sqlite":
+            # Task errors: array of objects like [{"error_code": "timeout", ...}]
+            # Use json_each to iterate + json_extract to match the error_code field
+            error_code_in_tasks = exists(
+                select(1)
+                .select_from(TaskModel)
+                .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .where(
+                    exists(
+                        select(1)
+                        .select_from(func.json_each(TaskModel.errors))
+                        .where(func.json_extract(literal_column("json_each.value"), "$.error_code") == error_code)
+                    )
+                )
+            )
+            # Block errors: flat array of strings like ["timeout", "network_error"]
+            error_code_in_blocks = exists(
+                select(1)
+                .select_from(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .where(
+                    exists(
+                        select(1)
+                        .select_from(func.json_each(WorkflowRunBlockModel.error_codes))
+                        .where(literal_column("json_each.value") == error_code)
+                    )
+                )
+            )
+        else:
+            # PostgreSQL: native JSONB containment
+            error_code_in_tasks = exists(
+                select(1)
+                .select_from(TaskModel)
+                .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .where(cast(TaskModel.errors, JSONB).contains(literal([{"error_code": error_code}], type_=JSONB)))
+            )
+            error_code_in_blocks = exists(
+                select(1)
+                .select_from(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .where(cast(WorkflowRunBlockModel.error_codes, JSONB).contains(literal([error_code], type_=JSONB)))
+            )
         return query.where(or_(error_code_in_tasks, error_code_in_blocks))
 
     async def get_workflow_runs(
@@ -8007,7 +8089,9 @@ class AgentDB(BaseAlchemyDB):
         now = datetime.utcnow()
         try:
             async with self.Session() as session:
-                stmt = insert(ScriptBranchHitModel).values(
+                dialect_insert = sqlite_insert if self.engine.dialect.name == "sqlite" else pg_insert
+
+                stmt = dialect_insert(ScriptBranchHitModel).values(
                     organization_id=organization_id,
                     workflow_permanent_id=workflow_permanent_id,
                     block_label=block_label,
