@@ -532,7 +532,6 @@ class ScriptSkyvernPage(SkyvernPage):
             screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
 
             if screenshot:
-                # Create a minimal Step object for artifact creation
                 step = await app.DATABASE.get_step(
                     context.step_id,
                     organization_id=context.organization_id,
@@ -540,15 +539,29 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    data=screenshot,
-                )
+                if context.use_artifact_bundling:
+                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                        step=step,
+                        screenshots=[screenshot],
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        workflow_run_id=context.workflow_run_id,
+                        workflow_run_block_id=context.workflow_run_block_id,
+                        run_id=context.run_id,
+                    )
+                else:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        data=screenshot,
+                    )
 
         except Exception:
-            # If screenshot creation fails, don't block execution
-            pass
+            ctx = skyvern_context.current()
+            LOG.warning(
+                "Failed to create screenshot after action",
+                step_id=ctx.step_id if ctx else None,
+                exc_info=True,
+            )
 
     @classmethod
     async def _create_html_action_after_execution(cls) -> None:
@@ -582,11 +595,21 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.HTML_ACTION,
-                    data=html.encode("utf-8"),
-                )
+                html_bytes = html.encode("utf-8")
+                if context.use_artifact_bundling:
+                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(
+                        step=step,
+                        html_action=html_bytes,
+                        workflow_run_id=context.workflow_run_id,
+                        workflow_run_block_id=context.workflow_run_block_id,
+                        run_id=context.run_id,
+                    )
+                else:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.HTML_ACTION,
+                        data=html_bytes,
+                    )
 
         except Exception:
             LOG.warning("Failed to create HTML artifact after action", exc_info=True)
@@ -620,11 +643,21 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                    data=screenshot,
-                )
+                if context.use_artifact_bundling:
+                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                        step=step,
+                        screenshots=[screenshot],
+                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                        workflow_run_id=context.workflow_run_id,
+                        workflow_run_block_id=context.workflow_run_block_id,
+                        run_id=context.run_id,
+                    )
+                else:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                        data=screenshot,
+                    )
 
         except Exception:
             LOG.warning("Failed to create final screenshot", exc_info=True)

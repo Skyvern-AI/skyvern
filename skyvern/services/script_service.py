@@ -520,6 +520,9 @@ async def _create_workflow_block_run_and_task(
 
         context.step_id = step_id
         context.task_id = task_id
+        # Set for archive accumulator DB rows. Overwritten at the start of each block,
+        # so no explicit clear is needed between sequential blocks.
+        context.workflow_run_block_id = workflow_run_block_id
 
         return workflow_run_block_id, task_id, step_id
 
@@ -619,6 +622,17 @@ async def _update_workflow_block(
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.workflow_run_id or not context.workflow_id:
             return
+
+        # Flush accumulated step artifacts into a single ZIP before finalizing the step.
+        # This mirrors the agent path (agent.py flush_step_archive at step completion).
+        # Known limitation: if flush fails (e.g. S3 timeout), accumulated artifacts for
+        # this step are lost. This matches the agent path's behavior.
+        if context.use_artifact_bundling and step_id:
+            try:
+                await app.ARTIFACT_MANAGER.flush_step_archive(step_id)
+            except Exception:
+                LOG.warning("Failed to flush step archive for cached block", step_id=step_id, exc_info=True)
+
         final_output = output
         if task_id:
             if step_id:
