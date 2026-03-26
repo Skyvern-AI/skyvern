@@ -6293,18 +6293,23 @@ class AgentDB(BaseAlchemyDB):
                 return Credential.model_validate(credential)
             return None
 
-    async def get_credentials(self, organization_id: str, page: int = 1, page_size: int = 10) -> list[Credential]:
+    async def get_credentials(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        vault_type: str | None = None,
+    ) -> list[Credential]:
         async with self.Session() as session:
-            credentials = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                    .order_by(CredentialModel.created_at.desc())
-                    .offset((page - 1) * page_size)
-                    .limit(page_size)
-                )
-            ).all()
+            query = (
+                select(CredentialModel)
+                .filter_by(organization_id=organization_id)
+                .filter(CredentialModel.deleted_at.is_(None))
+            )
+            if vault_type is not None:
+                query = query.filter(CredentialModel.vault_type == vault_type)
+            query = query.order_by(CredentialModel.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+            credentials = (await session.scalars(query)).all()
             return [Credential.model_validate(credential) for credential in credentials]
 
     async def update_credential(
