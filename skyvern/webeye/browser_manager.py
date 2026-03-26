@@ -40,6 +40,7 @@ class BrowserManager(Protocol):
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
         organization_id: str | None = None,
+        child_workflow_run_ids: list[str] | None = None,
     ) -> BrowserState | None: ...
 
     async def get_or_create_for_script(
