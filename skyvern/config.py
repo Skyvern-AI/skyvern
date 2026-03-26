@@ -415,6 +415,7 @@ class Settings(BaseSettings):
 
     SVG_MAX_LENGTH: int = 100000
     SVG_MAX_PARSING_ELEMENT_CNT: int = 3000
+    ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = True
