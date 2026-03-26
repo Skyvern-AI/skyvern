@@ -616,6 +616,7 @@ export type CreateCredentialRequest = {
   name: string;
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
+  vault_type?: "custom";
 };
 
 export type PasswordCredential = {

@@ -45,6 +45,8 @@ type Props = {
   urlDisabled?: boolean;
   /** Slot rendered between URL and the separator before Username (e.g. browser profile checkbox) */
   afterUrl?: React.ReactNode;
+  /** Slot rendered right before the separator between Name/URL and Username/Password */
+  beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
@@ -59,6 +61,7 @@ function PasswordCredentialContent({
   urlRequired,
   urlDisabled,
   afterUrl,
+  beforeCredentialFields,
   editMode,
   editingGroups,
   onEnableEditName,
@@ -181,6 +184,7 @@ function PasswordCredentialContent({
           )}
         </div>
       </div>
+      {beforeCredentialFields}
 
       {onUrlChange !== undefined && (
         <>
