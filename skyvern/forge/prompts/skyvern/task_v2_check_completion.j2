@@ -10,7 +10,13 @@ Reply in JSON format with the following keys:
   "thoughts": str, // Think step by step. Would completing the tasks in the task history be good enough to achieve the user goal? If more tasks need to be completed to achieve the goal, what would be the next task? If the goal appears impossible, explain why.
   "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information and it has not been done, the user goal is not achieved. If info extraction is not required, use the task history, assisted by the screenshot to decide if the user goal has been achieved.
   "should_terminate": bool, // True ONLY if there is CLEAR, EXPLICIT, UNAMBIGUOUS evidence that the goal is IMPOSSIBLE. The page must explicitly state the action cannot be done. False if there's ANY chance the goal can still be achieved.
-  "termination_reason": str // If should_terminate is true, quote the EXACT error message or text from the page that proves impossibility. Null if should_terminate is false.
+  "termination_reason": str, // If should_terminate is true, quote the EXACT error message or text from the page that proves impossibility. Null if should_terminate is false.
+  "failure_categories": array // Only populate when should_terminate is true. Classify the root cause. Categories: ANTI_BOT_DETECTION (CAPTCHA, Cloudflare, bot detection), BROWSER_ERROR (crash, page closed), NAVIGATION_FAILURE (404, redirect), PAGE_LOAD_TIMEOUT (timeout), AUTH_FAILURE (login failed, MFA), LLM_REASONING_ERROR (wrong element, wrong action), CREDENTIAL_ERROR (missing credentials), ELEMENT_NOT_FOUND (target missing), WRONG_PAGE_STATE (unexpected page), DATA_EXTRACTION_FAILURE (extraction failed), INFRASTRUCTURE_ERROR (network, OOM), UNKNOWN (cannot determine). Return one or more categories ordered by likelihood.
+    [{
+        "category": str, // The category from the list above
+        "confidence_float": float, // 0.0 to 1.0
+        "reasoning": str // Brief explanation
+    }]
 }
 
 CRITICAL - Be very conservative about termination. Only terminate when:

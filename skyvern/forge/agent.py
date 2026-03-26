@@ -66,6 +66,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -734,7 +735,7 @@ class ForgeAgent:
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
             )
-            is_task_marked_as_failed = await self.fail_task(task, step, e.message, browser_state)
+            is_task_marked_as_failed = await self.fail_task(task, step, e.message, browser_state, exception=e)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -760,7 +761,7 @@ class ForgeAgent:
                 url=e.url,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -805,7 +806,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            await self.fail_task(task, step, e.message, browser_state)
+            await self.fail_task(task, step, e.message, browser_state, exception=e)
             await self.clean_up_task(
                 task=task,
                 last_step=step,
@@ -827,6 +828,7 @@ class ForgeAgent:
                 sfe.reason
                 or "Skyvern failed to load the website. The page may have navigated unexpectedly or become unresponsive during analysis.",
                 browser_state,
+                exception=sfe,
             )
             await self.clean_up_task(
                 task=task,
@@ -836,13 +838,14 @@ class ForgeAgent:
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
-        except MissingBrowserStatePage:
+        except MissingBrowserStatePage as e:
             LOG.warning("Missing browser state page, marking the task as failed")
             await self.fail_task(
                 task,
                 step,
                 "The browser does not have a valid page for skyvern to operate. This may be due to the website being empty or the browser crashing.",
                 browser_state,
+                exception=e,
             )
             await self.clean_up_task(
                 task=task,
@@ -857,7 +860,7 @@ class ForgeAgent:
 
             failure_reason = get_user_facing_exception_message(e)
 
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -876,7 +879,12 @@ class ForgeAgent:
             context.task_id = None
 
     async def fail_task(
-        self, task: Task, step: Step | None, reason: str | None, browser_state: BrowserState | None = None
+        self,
+        task: Task,
+        step: Step | None,
+        reason: str | None,
+        browser_state: BrowserState | None = None,
+        exception: Exception | None = None,
     ) -> bool:
         try:
             if step is not None:
@@ -886,10 +894,12 @@ class ForgeAgent:
                 )
 
             # Update task status first
+            failure_category = classify_from_failure_reason(reason, exception=exception)
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=reason,
+                failure_category=failure_category,
             )
 
             # Detect user-defined errors if error_code_mapping is provided
@@ -2297,6 +2307,7 @@ class ForgeAgent:
                 )
                 return TerminateAction(
                     reasoning=verification_result.thoughts,
+                    failure_categories=verification_result.failure_categories or [],
                 )
 
             # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
@@ -3875,6 +3886,7 @@ class ForgeAgent:
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
         errors: list[dict[str, Any]] | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
@@ -3891,6 +3903,8 @@ class ForgeAgent:
             updates["failure_reason"] = failure_reason
         if errors is not None:
             updates["errors"] = errors
+        if failure_category is not None:
+            updates["failure_category"] = failure_category
         update_comparison = {
             key: {"old": getattr(task, key), "new": value}
             for key, value in updates.items()
@@ -4053,11 +4067,13 @@ class ForgeAgent:
                 failure_reason = persisted_action.reasoning
                 if persisted_action.errors:
                     failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
+                failure_category = persisted_action.failure_categories or classify_from_failure_reason(failure_reason)
                 await self.update_task(
                     task,
                     status=TaskStatus.terminated,
                     failure_reason=failure_reason,
                     errors=task_errors,
+                    failure_category=failure_category,
                 )
                 return True, last_step, None
 
@@ -4146,6 +4162,9 @@ class ForgeAgent:
             errors = [ReachMaxStepsError().model_dump()] + [
                 error.model_dump() for error in generated_failure_reason.errors
             ]
+            failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
+                failure_reason
+            )
 
             await self._cancel_speculative_step(next_step)
 
@@ -4154,6 +4173,7 @@ class ForgeAgent:
                 status=TaskStatus.failed,
                 failure_reason=failure_reason,
                 errors=errors,
+                failure_category=failure_category,
             )
             return False, last_step, None
 
@@ -4208,13 +4228,17 @@ class ForgeAgent:
                     error_codes=[e.error_code for e in failure_response.errors],
                 )
 
+            failure_reason = (
+                f"Max retries per step ({max_retries_per_step}) exceeded."
+                f" Possible failure reasons: {failure_response.reasoning}"
+            )
+            failure_category = failure_response.failure_categories or classify_from_failure_reason(failure_reason)
             await self.update_task(
                 task,
                 TaskStatus.failed,
-                failure_reason=(
-                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_response.reasoning}"
-                ),
+                failure_reason=failure_reason,
                 errors=new_errors,
+                failure_category=failure_category,
             )
             return None
         else:
@@ -4556,7 +4580,13 @@ class ForgeAgent:
             )
             last_step = await self.update_step(step, is_last=True)
             failure_reason = await self.get_failure_reason_for_task(task)
-            await self.update_task(task, status=TaskStatus.terminated, failure_reason=failure_reason)
+            failure_category = classify_from_failure_reason(failure_reason)
+            await self.update_task(
+                task,
+                status=TaskStatus.terminated,
+                failure_reason=failure_reason,
+                failure_category=failure_category,
+            )
             return False, last_step, None
         # If the max steps are exceeded, mark the current step as the last step and conclude the task
         context = skyvern_context.current()
@@ -4602,12 +4632,16 @@ class ForgeAgent:
             errors = [ReachMaxStepsError().model_dump()] + [
                 error.model_dump() for error in generated_failure_reason.errors
             ]
+            failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
+                failure_reason
+            )
 
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=failure_reason,
                 errors=errors,
+                failure_category=failure_category,
             )
             return False, last_step, None
         else:
