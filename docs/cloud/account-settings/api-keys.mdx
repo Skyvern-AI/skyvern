@@ -21,7 +21,7 @@ Treat your API key like a password. Anyone with this key can create runs, read r
 Every Skyvern API request requires the `x-api-key` header:
 
 ```bash
-curl -X POST "https://api.skyvern.com/v1/runs" \
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
   -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "url": "https://example.com", "prompt": "Extract the pricing table" }'

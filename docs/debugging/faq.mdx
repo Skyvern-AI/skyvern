@@ -100,13 +100,12 @@ The AI will automatically fill the credential fields when it encounters a login 
 </Accordion>
 
 <Accordion title="Can I run workflows on a schedule?">
-Skyvern doesn't have built-in scheduling yet. Use external schedulers like:
+Yes. Skyvern has built-in cron-based scheduling for workflows. You define a cron expression and timezone, and Skyvern triggers the workflow automatically at each interval.
 
-- **Cron jobs** — Call the Skyvern API on a schedule
-- **Zapier/Make** — Trigger workflows from automation platforms
-- **Your backend** — Integrate scheduling into your application
+- **Cloud UI** — Create and manage schedules from the [Schedules page](/cloud/building-workflows/scheduling)
+- **API** — Use the [scheduling API](/multi-step-automations/scheduling-workflows) to create, update, enable/disable, and delete schedules programmatically
 
-Set up a [webhook](/going-to-production/webhooks) to get notified when scheduled runs complete.
+Scheduled runs appear in [Run History](/cloud/viewing-results/run-history) with a calendar icon badge. Set up a [webhook](/going-to-production/webhooks) to get notified when scheduled runs complete.
 </Accordion>
 
 <Accordion title="Why isn't my workflow using the parameter values I passed?">

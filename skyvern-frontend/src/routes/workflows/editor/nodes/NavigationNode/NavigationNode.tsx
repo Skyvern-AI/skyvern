@@ -347,6 +347,11 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                   onParametersChange={(parameterKeys) => {
                     update({ parameterKeys });
                   }}
+                  onCredentialTotpIdentifier={(totpIdentifier) => {
+                    if (!data.totpIdentifier?.trim()) {
+                      update({ totpIdentifier });
+                    }
+                  }}
                 />
               </div>
               <div className="space-y-2">

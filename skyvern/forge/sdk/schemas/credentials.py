@@ -35,7 +35,7 @@ class TotpType(StrEnum):
 class PasswordCredentialResponse(BaseModel):
     """Response model for password credentials — non-sensitive fields only.
 
-    SECURITY: Must NEVER include password, TOTP secret, or TOTP identifier.
+    SECURITY: Must NEVER include password or TOTP secret.
     """
 
     username: str = Field(..., description="The username associated with the credential", examples=["user@example.com"])
@@ -164,6 +164,12 @@ class CreateCredentialRequest(BaseModel):
         description="The credential data to store",
         examples=[{"username": "user@example.com", "password": "securepassword123"}],
     )
+    vault_type: CredentialVaultType | None = Field(
+        default=None,
+        description="Which vault to store this credential in. If omitted, uses the instance default. "
+        "Use this to mix Skyvern-hosted and custom credentials within the same organization.",
+        examples=["custom", "azure_vault", "bitwarden"],
+    )
 
 
 class CredentialResponse(BaseModel):
@@ -175,6 +181,10 @@ class CredentialResponse(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="Type of the credential")
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
+    vault_type: CredentialVaultType | None = Field(
+        default=None,
+        description="Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')",
+    )
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
     user_context: str | None = Field(

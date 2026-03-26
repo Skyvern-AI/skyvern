@@ -1,0 +1,134 @@
+---
+title: Schedule a Workflow
+subtitle: Set up recurring cron-based execution from the UI
+slug: cloud/scheduling
+---
+
+You can schedule any saved workflow to run automatically on a recurring basis. Schedules are configured with a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+
+Schedules are created as **active** by default: they start triggering runs immediately after creation.
+
+When creating a schedule you'll fill in these fields:
+
+- **Workflow** (required): The workflow to run. When creating from the workflow editor this is pre-selected.
+- **Cron Expression** (required): A standard 5-field cron expression that defines how often the workflow runs (e.g., `0 9 * * 1-5` for every weekday at 9 AM). The UI validates the expression in real time and shows a human-readable translation. Quick presets are available for common patterns like hourly, daily, and weekly.
+- **Timezone** (required): The IANA timezone the cron expression is evaluated in (e.g., `America/New_York`). Defaults to your browser's local timezone. The dropdown is searchable by city name.
+- **Name**: A human-readable label to identify this schedule in the table and run history.
+- **Description**: Optional notes about what this schedule does or why it exists.
+
+<Warning>
+The minimum interval between runs is **5 minutes**. Expressions that resolve to shorter intervals are rejected.
+</Warning>
+
+---
+
+## Creating a schedule
+
+<Tabs>
+  <Tab title="From the Schedules page">
+    <Steps>
+      <Step title="Open the Schedules page">
+        Click [**Schedules**](https://app.skyvern.com/schedules/) (calendar icon) in the left sidebar.
+      </Step>
+      <Step title="Click Create Schedule">
+        Click <kbd>Create Schedule</kbd> in the top right corner.
+        <img src="/images/cloud/create-schedule-button.png" alt="Schedules page with Create Schedule button in the top right corner" />
+      </Step>
+      <Step title="Select a workflow and configure the schedule">
+        Choose the workflow you want to schedule from the dropdown. Only saved workflows appear in this list. Then fill in the cron expression, timezone, and optionally a name and description. Check the **Next Scheduled Runs** preview to verify the upcoming execution times match your expectations.
+        <Frame>
+        <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with workflow dropdown, cron expression, timezone, name, and description fields" width="300" />
+        </Frame>
+      </Step>
+      <Step title="Create">
+        Click **Create Schedule**. The schedule starts in an **Active** state and triggers at the next scheduled time.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="From the workflow editor">
+    <Steps>
+      <Step title="Open the workflow">
+        Navigate to [**Workflows**](https://app.skyvern.com/workflows/) in the sidebar and click the workflow you want to schedule.
+      </Step>
+      <Step title="Click the Schedule button">
+        In the editor header bar, click the <kbd>Schedule</kbd> button (clock icon).
+        <img src="/images/cloud/wf-page-sched.png" alt="Workflow editor page with Schedule button (clock icon) in the header bar" />
+      </Step>
+      <Step title="Click Add and configure the schedule">
+        A panel opens showing any existing schedules for this workflow. Click <kbd>Add</kbd> to create a new one. Fill in the cron expression, timezone, and optionally a name and description. The workflow is already selected.
+        <Frame>
+        <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with cron expression, timezone, name, and description fields" width="300" />
+        </Frame>
+      </Step>
+      <Step title="Create">
+        Click **Create Schedule**. The schedule appears in the panel and starts immediately.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+---
+
+## The Schedules page
+
+Click **Schedules** in the left sidebar to see every schedule across all workflows.
+
+Each row shows:
+
+| Column | What it shows |
+|--------|--------------|
+| **Workflow** | The workflow this schedule triggers |
+| **Name** | Schedule name |
+| **Schedule** | Human-readable cron description (e.g., "Every weekday at 9:00 AM") |
+| **Next Run** | Next execution time in your local timezone |
+| **Status** | **Active** (green) or **Paused** (gray) |
+
+Use the search bar to filter by schedule name or workflow title. The status filter narrows to Active or Paused schedules.
+
+---
+
+## Editing a schedule
+
+Click a schedule row to open its detail page.
+
+<img src="/images/cloud/sched-page.png" alt="Schedule detail page showing configuration, details, and upcoming runs sections" />
+
+On this page, you can:
+
+- **Edit the schedule configuration**: Click the **Edit** button to change the frequency, timezone, cron expression, name, and description. Changes take effect immediately and the **Upcoming Runs** preview updates to reflect the new configuration.
+- **View schedule details**: See when the schedule was created and last modified.
+- **Preview upcoming runs**: Check the next 5 scheduled execution times in the **Upcoming Runs** section.
+- **Pause or resume**: Toggle the **Status** switch to pause the schedule. Paused schedules keep their configuration and can be resumed at any time: no runs are triggered while paused.
+- **Delete the schedule**: Use the delete button (trash icon) in the header. Deletion is permanent. Runs already triggered by the schedule are not affected.
+
+<Info>
+To change which workflow a schedule runs, delete the schedule and create a new one for the target workflow.
+</Info>
+
+---
+
+## What's next
+
+<CardGroup cols={3}>
+  <Card
+    title="Scheduling API"
+    icon="code"
+    href="/multi-step-automations/scheduling-workflows"
+  >
+    Create and manage schedules programmatically
+  </Card>
+  <Card
+    title="Run History"
+    icon="clock-rotate-left"
+    href="/cloud/viewing-results/run-history"
+  >
+    View and filter results from scheduled runs
+  </Card>
+  <Card
+    title="Cost Control"
+    icon="gauge"
+    href="/optimization/cost-control"
+  >
+    Manage costs for recurring automations
+  </Card>
+</CardGroup>

@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import re
+import time
 import urllib.parse
 from typing import Any, NamedTuple
 
@@ -216,6 +217,13 @@ async def get_workflow_script(
         if is_adaptive_caching(workflow, workflow_run):
             rendered_cache_key_value = f"{rendered_cache_key_value}:v2" if rendered_cache_key_value else "v2"
 
+        LOG.info(
+            "Resolved cache key for workflow script lookup",
+            cache_key_value=rendered_cache_key_value,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+
         if block_labels:
             # Do not generate script or run script if block_labels is provided
             return None, rendered_cache_key_value
@@ -230,13 +238,21 @@ async def get_workflow_script(
 
         if existing_script:
             LOG.info(
-                "Found cached script for workflow",
+                "Found cached script for workflow (cache hit)",
                 workflow_id=workflow.workflow_id,
+                script_id=existing_script.script_id,
                 cache_key_value=rendered_cache_key_value,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             return existing_script, rendered_cache_key_value
 
+        LOG.info(
+            "No cached script found for workflow (cache miss)",
+            workflow_id=workflow.workflow_id,
+            cache_key_value=rendered_cache_key_value,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+        )
         return None, rendered_cache_key_value
 
     except Exception as e:
@@ -393,6 +409,7 @@ async def generate_workflow_script(
     # is not cached (it's evaluated at runtime), but cacheable blocks in branches are
     # cached progressively as they execute. See workflow_has_conditionals() for the
     # regeneration logic that prevents unnecessary regeneration for unexecuted branches.
+    generation_start = time.monotonic()
     try:
         LOG.info(
             "Generating script for workflow",
@@ -422,6 +439,16 @@ async def generate_workflow_script(
         updated_block_labels.update(missing_labels)
         updated_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
+        LOG.info(
+            "Script generation block analysis",
+            workflow_run_id=workflow_run.workflow_run_id,
+            total_blocks=len(block_labels),
+            cached_blocks=len(cached_block_sources),
+            missing_blocks=len(missing_labels),
+            blocks_to_regenerate=len(updated_block_labels),
+            missing_labels=list(missing_labels),
+        )
+
         python_src = await generate_workflow_script_python_code(
             file_name=codegen_input.file_name,
             workflow_run_request=codegen_input.workflow_run,
@@ -439,8 +466,23 @@ async def generate_workflow_script(
             adaptive_caching=adaptive,
         )
     except Exception:
-        LOG.error("Failed to generate workflow script source", exc_info=True)
+        generation_duration_ms = (time.monotonic() - generation_start) * 1000
+        LOG.error(
+            "Failed to generate workflow script source",
+            duration_ms=round(generation_duration_ms, 1),
+            exc_info=True,
+        )
         return
+
+    generation_duration_ms = (time.monotonic() - generation_start) * 1000
+    LOG.info(
+        "Script generation completed",
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_id=workflow.workflow_id,
+        cache_key_value=rendered_cache_key_value,
+        duration_ms=round(generation_duration_ms, 1),
+        script_size_bytes=len(python_src.encode("utf-8")),
+    )
 
     # 3.5) Post-process: fix static actions inside for-loop blocks
     python_src = _fix_static_actions_in_for_loops(python_src)
