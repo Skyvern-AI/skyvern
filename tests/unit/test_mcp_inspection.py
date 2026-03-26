@@ -41,6 +41,9 @@ def _patch(monkeypatch: pytest.MonkeyPatch, state: SessionState) -> None:
 
     monkeypatch.setattr("skyvern.cli.mcp_tools.inspection.get_page", fake_get_page)
     monkeypatch.setattr("skyvern.cli.mcp_tools.inspection.get_current_session", lambda: state)
+    # Reset stateless HTTP mode — cloud_app.py sets this to True at startup when MCP_ENABLED,
+    # which causes inspection tools to short-circuit with ACTION_FAILED before reaching test logic.
+    monkeypatch.setattr("skyvern.cli.core.session_manager._stateless_http_mode", False)
 
 
 def _console_entry(level: str = "log", text: str = "msg") -> dict:
