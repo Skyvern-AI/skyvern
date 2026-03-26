@@ -1701,6 +1701,19 @@ class WorkflowService:
             next_label = None
             if block.block_type == BlockType.CONDITIONAL:
                 next_label = (branch_metadata or {}).get("next_block_label")
+                if not next_label:
+                    # SKY-8571: Fall back to the conditional block's own
+                    # next_block_label when the matched branch has no target
+                    # (e.g., default branch with no redirect, failed evaluation
+                    # with continue_on_failure, or finally-block stripping).
+                    next_label = default_next_map.get(block.label)
+                    if next_label:
+                        LOG.info(
+                            "Conditional branch has no next_block_label, falling back to block's own next_block_label",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            block_label=block.label,
+                            fallback_next_label=next_label,
+                        )
             else:
                 next_label = default_next_map.get(block.label)
 
@@ -2651,6 +2664,47 @@ class WorkflowService:
                 for idx, block in enumerate(blocks[:-1]):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
+
+        # SKY-8571: Connect terminal blocks in conditional branch chains to the
+        # conditional's successor (merge-point block).
+        #
+        # Bug scenario: nested conditionals where the inner conditional has no
+        # merge-point (next_block_label=null).  The outer conditional's branch
+        # chain ends at the inner conditional, whose own branches terminate
+        # without reconnecting to the outer merge-point.
+        #
+        # The fix iterates until convergence because patching an outer
+        # conditional may give an inner conditional a successor, which in turn
+        # lets the inner conditional's branch terminals be patched on the next
+        # pass.  E.g.:
+        #   Pass 1: outer_cond patches inner_cond.next → outer_merge
+        #   Pass 2: inner_cond (now has successor) patches block_57.next → outer_merge
+        changed = True
+        while changed:
+            changed = False
+            for block in all_blocks:
+                if not isinstance(block, ConditionalBlock):
+                    continue
+                successor = default_next_map.get(block.label)
+                if not successor:
+                    continue
+                for branch in block.ordered_branches:
+                    target = branch.next_block_label
+                    if not target or target == successor:
+                        continue
+                    # Trace the branch chain via default_next_map to find the terminal block.
+                    cur = target
+                    visited: set[str] = set()
+                    while cur and cur in label_to_block and cur not in visited:
+                        if cur == successor:
+                            break
+                        visited.add(cur)
+                        nxt = default_next_map.get(cur)
+                        if nxt is None:
+                            default_next_map[cur] = successor
+                            changed = True
+                            break
+                        cur = nxt
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
