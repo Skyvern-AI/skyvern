@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import textwrap
+import time
 import uuid
 from collections import deque
 from collections.abc import Sequence
@@ -138,6 +139,13 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.EXTRACTION,
     BlockType.LOGIN,
     BlockType.FILE_DOWNLOAD,
+    BlockType.FOR_LOOP,
+}
+
+# Wrapper block types whose cached code is structural (loop iteration, branch routing).
+# Their failure during cached execution reflects data/runtime issues, not bad script code.
+# Excluded from continue_on_failure regeneration to prevent infinite version loops (SKY-8554).
+WRAPPER_BLOCK_TYPES = {
     BlockType.FOR_LOOP,
 }
 
@@ -1897,11 +1905,25 @@ class WorkflowService:
                 is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
             )
             # requires_agent blocks must execute via agent, not code — skip code path
+            block_requires_agent = False
             if valid_to_run_code and script_blocks_by_label[block.label].requires_agent:
                 valid_to_run_code = False
+                block_requires_agent = True
+
+            # Log the execution mode decision for every block in a script run
+            if is_script_run and block.label:
+                LOG.info(
+                    "Block execution mode resolved",
+                    block_label=block.label,
+                    execution_mode="script" if valid_to_run_code else "ai",
+                    has_label=True,
+                    in_cache=block.label in script_blocks_by_label,
+                    disable_cache=block.disable_cache,
+                    requires_agent=block_requires_agent,
+                )
+
             fallback_episode_id: str | None = None
             form_fields_for_episode: list | None = None
-            block_requires_agent = False
             if valid_to_run_code:
                 script_block = script_blocks_by_label[block.label]
                 LOG.info(
@@ -1909,6 +1931,7 @@ class WorkflowService:
                     block_label=block.label,
                     run_signature=script_block.run_signature,
                 )
+                block_exec_start = time.monotonic()
                 try:
                     vars_dict = vars(loaded_script_module) if loaded_script_module else {}
                     exec_globals = {
@@ -1969,6 +1992,7 @@ class WorkflowService:
                         if workflow.generate_script_on_terminal:
                             script_success_statuses.add(BlockStatus.terminated)
 
+                        block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                         if workflow_run_block_result.status in script_success_statuses:
                             block_executed_with_code = True
                             LOG.info(
@@ -1976,6 +2000,7 @@ class WorkflowService:
                                 block_label=block.label,
                                 block_status=workflow_run_block_result.status,
                                 has_output=output_value is not None,
+                                duration_ms=block_exec_duration_ms,
                             )
                         else:
                             # Script ran but the task/block failed (e.g., wrong xpaths for a
@@ -1987,6 +2012,7 @@ class WorkflowService:
                                 block_label=block.label,
                                 block_status=workflow_run_block_result.status,
                                 failure_reason=workflow_run_block_result.failure_reason,
+                                duration_ms=block_exec_duration_ms,
                             )
                             # Reset the block result so AI fallback produces a fresh one
                             workflow_run_block_result = None
@@ -2005,16 +2031,21 @@ class WorkflowService:
                                     classify_result=context.last_classify_result if context else None,
                                 )
                     else:
+                        block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                         LOG.warning(
                             "Block executed with code but no workflow run block found",
                             block_label=block.label,
+                            duration_ms=block_exec_duration_ms,
                         )
                         block_executed_with_code = False
                 except Exception as e:
+                    block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                     LOG.warning(
                         "Failed to execute block with script code, falling back to AI",
                         block_label=block.label,
+                        error_type=type(e).__name__,
                         error=str(e),
+                        duration_ms=block_exec_duration_ms,
                         exc_info=True,
                     )
                     block_executed_with_code = False
@@ -2280,6 +2311,7 @@ class WorkflowService:
                 and block.continue_on_failure
                 and workflow_run_block_result.status != BlockStatus.completed
                 and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                and block.block_type not in WRAPPER_BLOCK_TYPES  # SKY-8554: structural wrappers don't need regen
                 and block.label in script_blocks_by_label
             ):
                 blocks_to_update.add(block.label)
@@ -4696,6 +4728,7 @@ class WorkflowService:
             block_labels,
         )
 
+        # Manages cached workflow script regeneration with conditional-aware locking and versioning
         if existing_script:
             cached_block_labels: set[str] = set()
             script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
