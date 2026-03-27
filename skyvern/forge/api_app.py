@@ -139,7 +139,12 @@ def create_api_app() -> FastAPI:
 
             otel_setup_cls = OTELSetup
         except ImportError:
-            pass
+            try:
+                from skyvern.forge.observability.otel_setup import OTELSetup  # noqa: PLC0415
+
+                otel_setup_cls = OTELSetup
+            except ImportError:
+                pass
     if otel_setup_cls is not None:
         try:
             otel = otel_setup_cls.get_instance()

@@ -181,12 +181,19 @@ When running Skyvern on your own infrastructure, you get deep server-side traces
 If you're running Skyvern on your own infrastructure, add these to your server's environment:
 
 ```bash .env
-LMNR_PROJECT_API_KEY=your-laminar-api-key
+OTEL_ENABLED=true
+LAMINAR_API_KEY=your-laminar-api-key
+LAMINAR_API_BASE=http://laminar:8443
 ```
 
-Skyvern's server includes a built-in `LaminarTrace` integration that initializes Laminar with the LiteLLM callback, capturing every LLM call, token count, and cost. It disables the automatic Skyvern/Patchright instrumentors (to avoid conflicts) and uses Laminar's `@observe` decorator on internal methods instead.
+You can also use Laminar-native variable names:
 
-No code changes needed — once the env var is set, traces appear in your Laminar project automatically.
+```bash .env
+LMNR_PROJECT_API_KEY=your-laminar-api-key
+LMNR_BASE_URL=http://laminar:8443
+```
+
+Under the hood, Skyvern exports OpenTelemetry traces to your Laminar OTLP endpoint (`/v1/traces`) and automatically maps the Laminar variables above to OTEL exporter settings. No code changes are needed.
 
 ---
 
