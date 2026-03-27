@@ -5109,22 +5109,19 @@ class WorkflowService:
                 )
                 return
 
-            # Determine if this is a failure-triggered review (script crashed, run failed)
-            # vs a fallback-triggered review (script failed but agent succeeded).
-            # Failure reviews are capped per wpid per day to prevent spam.
-            is_failure_review = pre_finally_status == WorkflowRunStatus.failed
-
-            if is_failure_review:
-                cap_exceeded = await self._check_failure_review_cap(
+            # Cap ALL script reviews (fallback + failure) per wpid per day to prevent
+            # runaway revision churn when the same issue repeats every run.
+            cap_exceeded = await self._check_script_review_cap(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+            )
+            if cap_exceeded:
+                LOG.info(
+                    "Skipping script review — daily cap exceeded for wpid",
                     workflow_permanent_id=workflow.workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    pre_finally_status=pre_finally_status,
                 )
-                if cap_exceeded:
-                    LOG.info(
-                        "Skipping failure-triggered script review — daily cap exceeded for wpid",
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                        workflow_run_id=workflow_run.workflow_run_id,
-                    )
-                    return
+                return
 
             # Non-blocking lock per script family
             cache = CacheFactory.get_cache()
@@ -5153,10 +5150,10 @@ class WorkflowService:
                 await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
                 review_ran = True
 
-            # Increment the failure review counter ONLY after a review actually ran.
+            # Increment the review counter ONLY after a review actually ran.
             # Skipped reviews (e.g., LockError) should not consume cap budget.
-            if is_failure_review and review_ran:
-                await self._increment_failure_review_counter(
+            if review_ran:
+                await self._increment_script_review_counter(
                     workflow_permanent_id=workflow.workflow_permanent_id,
                 )
         except Exception:
@@ -5167,13 +5164,13 @@ class WorkflowService:
             )
 
     @staticmethod
-    def _failure_review_cap_key(workflow_permanent_id: str) -> str:
-        """Build the Redis key for the daily failure-review counter."""
+    def _script_review_cap_key(workflow_permanent_id: str) -> str:
+        """Build the Redis key for the daily script-review counter."""
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        return f"script_reviewer:failure_cap:{workflow_permanent_id}:{today}"
+        return f"script_reviewer:daily_cap:{workflow_permanent_id}:{today}"
 
-    async def _check_failure_review_cap(self, workflow_permanent_id: str) -> bool:
-        """Check if the daily failure-review cap has been reached for this wpid.
+    async def _check_script_review_cap(self, workflow_permanent_id: str) -> bool:
+        """Check if the daily script-review cap has been reached for this wpid.
 
         Returns True if the cap is exceeded and the review should be skipped.
         Uses Redis get/set to maintain a per-wpid daily counter.
@@ -5182,18 +5179,18 @@ class WorkflowService:
             cache = CacheFactory.get_cache()
             if cache is None:
                 return False
-            cap_key = self._failure_review_cap_key(workflow_permanent_id)
+            cap_key = self._script_review_cap_key(workflow_permanent_id)
             raw_count = await cache.get(cap_key)
             if raw_count is not None:
                 count = int(raw_count)
-                if count >= settings.FAILURE_REVIEW_DAILY_CAP:
+                if count >= settings.SCRIPT_REVIEW_DAILY_CAP:
                     return True
         except Exception:
-            LOG.debug("Failed to check failure review cap, allowing review", exc_info=True)
+            LOG.debug("Failed to check script review cap, allowing review", exc_info=True)
         return False
 
-    async def _increment_failure_review_counter(self, workflow_permanent_id: str) -> None:
-        """Increment the daily failure-review counter for this wpid.
+    async def _increment_script_review_counter(self, workflow_permanent_id: str) -> None:
+        """Increment the daily script-review counter for this wpid.
 
         Uses Redis get+set with a 48-hour TTL (covers timezone edge cases).
         Note: get+set is not atomic, so concurrent reviews for the same wpid
@@ -5206,12 +5203,12 @@ class WorkflowService:
             cache = CacheFactory.get_cache()
             if cache is None:
                 return
-            cap_key = self._failure_review_cap_key(workflow_permanent_id)
+            cap_key = self._script_review_cap_key(workflow_permanent_id)
             raw_count = await cache.get(cap_key)
             new_count = (int(raw_count) + 1) if raw_count is not None else 1
             await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
         except Exception:
-            LOG.debug("Failed to increment failure review counter", exc_info=True)
+            LOG.debug("Failed to increment script review counter", exc_info=True)
 
     async def _run_reviewer_locked(
         self,
