@@ -1,10 +1,10 @@
-"""Tests for failure-triggered script review daily cap (SKY-8334).
+"""Tests for script review daily cap.
 
 Validates that:
-1. Failure reviews are capped at 3 per wpid per day
-2. AI fallback reviews (non-failure) are NOT capped
-3. Cap is keyed on wpid, not script_id (new script revision doesn't reset)
-4. Cap resets on a new day
+1. ALL script reviews (fallback + failure) are capped at SCRIPT_REVIEW_DAILY_CAP per wpid per day
+2. Cap is keyed on wpid, not script_id (new script revision doesn't reset)
+3. Cap resets on a new day
+4. Counter only increments after a review actually runs (not on LockError)
 """
 
 from datetime import UTC, datetime, timedelta
@@ -38,8 +38,8 @@ def _make_workflow_run(run_id: str = "wr_test1") -> MagicMock:
     return wr
 
 
-class TestCheckFailureReviewCap:
-    """Tests for _check_failure_review_cap."""
+class TestCheckScriptReviewCap:
+    """Tests for _check_script_review_cap."""
 
     @pytest.fixture(autouse=True)
     def setup(self) -> None:
@@ -52,63 +52,63 @@ class TestCheckFailureReviewCap:
 
     @pytest.mark.asyncio
     async def test_cap_not_reached_returns_false(self) -> None:
-        """When counter is below 3, review should proceed."""
-        self.mock_cache.get = AsyncMock(return_value="2")
-        result = await self.service._check_failure_review_cap("wpid_abc")
+        """When counter is below cap, review should proceed."""
+        self.mock_cache.get = AsyncMock(return_value="4")
+        result = await self.service._check_script_review_cap("wpid_abc")
         assert result is False
 
     @pytest.mark.asyncio
     async def test_cap_reached_returns_true(self) -> None:
-        """When counter is at 3 or above, review should be skipped."""
-        self.mock_cache.get = AsyncMock(return_value="3")
-        result = await self.service._check_failure_review_cap("wpid_abc")
+        """When counter is at cap (5), review should be skipped."""
+        self.mock_cache.get = AsyncMock(return_value="5")
+        result = await self.service._check_script_review_cap("wpid_abc")
         assert result is True
 
     @pytest.mark.asyncio
     async def test_cap_exceeded_returns_true(self) -> None:
-        """When counter is above 3, review should be skipped."""
-        self.mock_cache.get = AsyncMock(return_value="5")
-        result = await self.service._check_failure_review_cap("wpid_abc")
+        """When counter is above cap, review should be skipped."""
+        self.mock_cache.get = AsyncMock(return_value="10")
+        result = await self.service._check_script_review_cap("wpid_abc")
         assert result is True
 
     @pytest.mark.asyncio
     async def test_no_counter_returns_false(self) -> None:
         """When no counter exists (first review of the day), review should proceed."""
         self.mock_cache.get = AsyncMock(return_value=None)
-        result = await self.service._check_failure_review_cap("wpid_abc")
+        result = await self.service._check_script_review_cap("wpid_abc")
         assert result is False
 
     @pytest.mark.asyncio
     async def test_cache_error_allows_review(self) -> None:
         """When cache raises an error, review should still proceed (fail open)."""
         self.mock_cache.get = AsyncMock(side_effect=Exception("Redis down"))
-        result = await self.service._check_failure_review_cap("wpid_abc")
+        result = await self.service._check_script_review_cap("wpid_abc")
         assert result is False
 
     @pytest.mark.asyncio
     async def test_key_uses_wpid_not_script_id(self) -> None:
         """The cap key must use workflow_permanent_id, not script_id."""
-        self.mock_cache.get = AsyncMock(return_value="3")
+        self.mock_cache.get = AsyncMock(return_value="5")
         wpid = "wpid_specific_workflow"
-        await self.service._check_failure_review_cap(wpid)
+        await self.service._check_script_review_cap(wpid)
 
         call_args = self.mock_cache.get.call_args[0][0]
         assert wpid in call_args
-        assert "script_reviewer:failure_cap:" in call_args
+        assert "script_reviewer:daily_cap:" in call_args
 
     @pytest.mark.asyncio
     async def test_key_includes_date(self) -> None:
         """The cap key must include the current date for daily reset."""
         self.mock_cache.get = AsyncMock(return_value=None)
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        await self.service._check_failure_review_cap("wpid_abc")
+        await self.service._check_script_review_cap("wpid_abc")
 
         call_args = self.mock_cache.get.call_args[0][0]
         assert today in call_args
 
 
-class TestIncrementFailureReviewCounter:
-    """Tests for _increment_failure_review_counter."""
+class TestIncrementScriptReviewCounter:
+    """Tests for _increment_script_review_counter."""
 
     @pytest.fixture(autouse=True)
     def setup(self) -> None:
@@ -123,7 +123,7 @@ class TestIncrementFailureReviewCounter:
     async def test_first_increment(self) -> None:
         """First review of the day should set counter to 1."""
         self.mock_cache.get = AsyncMock(return_value=None)
-        await self.service._increment_failure_review_counter("wpid_abc")
+        await self.service._increment_script_review_counter("wpid_abc")
 
         self.mock_cache.set.assert_called_once()
         args, kwargs = self.mock_cache.set.call_args
@@ -134,7 +134,7 @@ class TestIncrementFailureReviewCounter:
     async def test_subsequent_increment(self) -> None:
         """Second review should increment counter from 1 to 2."""
         self.mock_cache.get = AsyncMock(return_value="1")
-        await self.service._increment_failure_review_counter("wpid_abc")
+        await self.service._increment_script_review_counter("wpid_abc")
 
         args, kwargs = self.mock_cache.set.call_args
         assert args[1] == "2"
@@ -144,11 +144,11 @@ class TestIncrementFailureReviewCounter:
         """Cache errors should not propagate."""
         self.mock_cache.get = AsyncMock(side_effect=Exception("Redis down"))
         # Should not raise
-        await self.service._increment_failure_review_counter("wpid_abc")
+        await self.service._increment_script_review_counter("wpid_abc")
 
 
-class TestTriggerScriptReviewerFailureCap:
-    """Integration tests for _trigger_script_reviewer failure cap logic."""
+class TestTriggerScriptReviewerCap:
+    """Integration tests for _trigger_script_reviewer daily cap logic."""
 
     @pytest.fixture(autouse=True)
     def setup(self) -> None:
@@ -178,8 +178,7 @@ class TestTriggerScriptReviewerFailureCap:
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
-        # Cap already at 3
-        self.mock_cache.get = AsyncMock(return_value="3")
+        self.mock_cache.get = AsyncMock(return_value="5")
 
         with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
             ctx = MagicMock()
@@ -187,14 +186,12 @@ class TestTriggerScriptReviewerFailureCap:
             ctx.script_id = "script_1"
             mock_ctx.return_value = ctx
 
-            # Mock _run_reviewer_locked to track if it gets called
             self.service._run_reviewer_locked = AsyncMock()
 
             await self.service._trigger_script_reviewer(
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
             )
 
-            # Should NOT have called _run_reviewer_locked
             self.service._run_reviewer_locked.assert_not_called()
 
     @pytest.mark.asyncio
@@ -203,7 +200,6 @@ class TestTriggerScriptReviewerFailureCap:
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
-        # Counter at 1, under cap
         self.mock_cache.get = AsyncMock(return_value="1")
 
         with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
@@ -218,17 +214,15 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
             )
 
-            # Should have called _run_reviewer_locked
             self.service._run_reviewer_locked.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_fallback_review_not_capped(self) -> None:
-        """AI fallback reviews (completed runs) should NEVER be capped."""
+    async def test_fallback_review_proceeds_when_under_cap(self) -> None:
+        """AI fallback review (completed run) should proceed when under the daily cap."""
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
-        # Even with counter at 100, fallback reviews should proceed
-        self.mock_cache.get = AsyncMock(return_value="100")
+        self.mock_cache.get = AsyncMock(return_value="1")
 
         with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
             ctx = MagicMock()
@@ -238,21 +232,42 @@ class TestTriggerScriptReviewerFailureCap:
 
             self.service._run_reviewer_locked = AsyncMock()
 
-            # completed status = fallback review, NOT failure review
             await self.service._trigger_script_reviewer(
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.completed
             )
 
-            # Should have called _run_reviewer_locked despite high counter
             self.service._run_reviewer_locked.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_terminated_review_not_capped(self) -> None:
-        """Terminated run reviews should NOT be capped (only failed runs are capped)."""
+    async def test_fallback_review_also_capped(self) -> None:
+        """AI fallback reviews (completed runs) should also be capped."""
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
-        self.mock_cache.get = AsyncMock(return_value="100")
+        self.mock_cache.get = AsyncMock(return_value="5")
+
+        with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
+            ctx = MagicMock()
+            ctx.script_revision_id = "rev_1"
+            ctx.script_id = "script_1"
+            mock_ctx.return_value = ctx
+
+            self.service._run_reviewer_locked = AsyncMock()
+
+            await self.service._trigger_script_reviewer(
+                workflow, workflow_run, pre_finally_status=WorkflowRunStatus.completed
+            )
+
+            # Should be skipped — fallback reviews are now capped too
+            self.service._run_reviewer_locked.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminated_review_also_capped(self) -> None:
+        """Terminated run reviews should also be capped."""
+        workflow = _make_workflow()
+        workflow_run = _make_workflow_run()
+
+        self.mock_cache.get = AsyncMock(return_value="5")
 
         with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
             ctx = MagicMock()
@@ -266,7 +281,7 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.terminated
             )
 
-            self.service._run_reviewer_locked.assert_called_once()
+            self.service._run_reviewer_locked.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cap_keyed_on_wpid_not_script_id(self) -> None:
@@ -275,19 +290,17 @@ class TestTriggerScriptReviewerFailureCap:
         workflow = _make_workflow(wpid=wpid)
         workflow_run = _make_workflow_run()
 
-        # Simulate cap at 3 for this wpid
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        expected_key = f"script_reviewer:failure_cap:{wpid}:{today}"
+        expected_key = f"script_reviewer:daily_cap:{wpid}:{today}"
 
         async def mock_get(key: str) -> str | None:
             if key == expected_key:
-                return "3"
+                return "5"
             return None
 
         self.mock_cache.get = AsyncMock(side_effect=mock_get)
 
         with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
-            # Even with a brand new script_id/revision, the cap should still apply
             ctx = MagicMock()
             ctx.script_revision_id = "rev_brand_new"
             ctx.script_id = "script_brand_new"
@@ -299,7 +312,6 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
             )
 
-            # Should be skipped because the wpid cap is at 3
             self.service._run_reviewer_locked.assert_not_called()
 
     @pytest.mark.asyncio
@@ -310,12 +322,11 @@ class TestTriggerScriptReviewerFailureCap:
         workflow_run = _make_workflow_run()
 
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        expected_key = f"script_reviewer:failure_cap:{wpid}:{today}"
+        expected_key = f"script_reviewer:daily_cap:{wpid}:{today}"
 
-        # Counter is None for today (even though yesterday may have been 3+)
         async def mock_get(key: str) -> str | None:
             if key == expected_key:
-                return None  # No counter for today
+                return None
             return None
 
         self.mock_cache.get = AsyncMock(side_effect=mock_get)
@@ -332,16 +343,14 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
             )
 
-            # Should proceed because today's counter is 0
             self.service._run_reviewer_locked.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_failure_review_increments_counter_after_success(self) -> None:
-        """After a successful failure review, the counter should be incremented."""
+    async def test_review_increments_counter_after_success(self) -> None:
+        """After a successful review, the counter should be incremented."""
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
-        # Start at 0
         self.mock_cache.get = AsyncMock(return_value=None)
 
         with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
@@ -356,14 +365,13 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
             )
 
-            # Counter should have been set to "1"
-            set_calls = [c for c in self.mock_cache.set.call_args_list if "failure_cap" in c[0][0]]
+            set_calls = [c for c in self.mock_cache.set.call_args_list if "daily_cap" in c[0][0]]
             assert len(set_calls) == 1
             assert set_calls[0][0][1] == "1"
 
     @pytest.mark.asyncio
-    async def test_fallback_review_does_not_increment_counter(self) -> None:
-        """AI fallback reviews should NOT increment the failure counter."""
+    async def test_fallback_review_also_increments_counter(self) -> None:
+        """AI fallback reviews should also increment the counter."""
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
@@ -381,9 +389,9 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.completed
             )
 
-            # No failure_cap set calls
-            set_calls = [c for c in self.mock_cache.set.call_args_list if "failure_cap" in str(c)]
-            assert len(set_calls) == 0
+            set_calls = [c for c in self.mock_cache.set.call_args_list if "daily_cap" in c[0][0]]
+            assert len(set_calls) == 1
+            assert set_calls[0][0][1] == "1"
 
     @pytest.mark.asyncio
     async def test_lock_error_does_not_increment_counter(self) -> None:
@@ -391,10 +399,8 @@ class TestTriggerScriptReviewerFailureCap:
         workflow = _make_workflow()
         workflow_run = _make_workflow_run()
 
-        # Counter at 0, under cap
         self.mock_cache.get = AsyncMock(return_value=None)
 
-        # Make the lock raise LockError to simulate contention
         mock_lock = AsyncMock()
         mock_lock.__aenter__ = AsyncMock(side_effect=LockError("Could not acquire lock"))
         mock_lock.__aexit__ = AsyncMock(return_value=False)
@@ -412,9 +418,7 @@ class TestTriggerScriptReviewerFailureCap:
                 workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
             )
 
-            # Review should NOT have run (lock contention)
             self.service._run_reviewer_locked.assert_not_called()
 
-            # Counter should NOT have been incremented
-            set_calls = [c for c in self.mock_cache.set.call_args_list if "failure_cap" in str(c)]
+            set_calls = [c for c in self.mock_cache.set.call_args_list if "daily_cap" in str(c)]
             assert len(set_calls) == 0
