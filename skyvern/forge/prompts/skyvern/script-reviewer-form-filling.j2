@@ -143,6 +143,13 @@ When the error or page text suggests the page wasn't ready for interaction, the 
 
 If the existing code already has a `page.wait()` and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
 
+3. **Before `fill_form()` when 0 fields are found** — If the error message says "fill_form found 0 form fields", the page hasn't finished rendering its form inputs. Add `await page.wait(timeout_ms=5000)` **before** the `fill_form()` call:
+   ```python
+   await page.goto(url)
+   await page.wait(timeout_ms=5000)  # wait for form fields to render
+   await page.fill_form(context.parameters, prompt='...')
+   ```
+
 ## What to do
 1. Compare the episode's form fields to the existing FIELD_MAP.
 2. For each field in the episode, first check if it matches a standard category listed above. If it does, do NOT add it to FIELD_MAP — canonical matching handles it automatically.

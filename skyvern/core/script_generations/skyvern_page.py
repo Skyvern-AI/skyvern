@@ -1145,10 +1145,16 @@ class SkyvernPage(Page):
     @action_wrap(ActionType.WAIT)
     async def wait(
         self,
-        seconds: float,
+        seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
-        await asyncio.sleep(seconds)
+        timeout_ms = kwargs.pop("timeout_ms", None)
+        if seconds is not None:
+            await asyncio.sleep(seconds)
+        elif timeout_ms is not None:
+            await asyncio.sleep(timeout_ms / 1000.0)
+        else:
+            await asyncio.sleep(0)
 
     @action_wrap(ActionType.NULL_ACTION)
     async def null_action(self, **kwargs: Any) -> None:
@@ -1873,6 +1879,13 @@ class SkyvernPage(Page):
             field_count=len(form_fields),
             data_keys=list(data.keys())[:10],
         )
+
+        if not form_fields:
+            raise RuntimeError(
+                "fill_form found 0 form fields on the page. "
+                "The page may not have finished rendering — try adding "
+                "await page.wait(timeout_ms=5000) before fill_form()."
+            )
 
         mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
 
