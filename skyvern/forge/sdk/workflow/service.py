@@ -3027,13 +3027,13 @@ class WorkflowService:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
     ) -> Workflow:
         workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
@@ -3078,7 +3078,7 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
     ) -> list[Workflow]:
         """
         Get all versions of a workflow by its permanent ID.
@@ -3087,7 +3087,7 @@ class WorkflowService:
         workflows = await app.DATABASE.get_workflow_versions_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
         return workflows
 
@@ -3095,12 +3095,12 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
     ) -> Workflow:
         workflow = await app.DATABASE.get_workflow_for_workflow_run(
             workflow_run_id,
             organization_id=organization_id,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
 
         if not workflow:
@@ -3113,14 +3113,14 @@ class WorkflowService:
         workflow_permanent_id: str,
         user_id: str,
         organization_id: str,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
         version: int | None = None,
     ) -> dict[str, dict[str, Any]]:
         workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
 
         if not workflow:
@@ -3238,7 +3238,7 @@ class WorkflowService:
         previous_valid_workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization_id=organization_id,
-            exclude_deleted=True,
+            filter_deleted=True,
             ignore_version=workflow.version,
         )
 
@@ -4581,7 +4581,7 @@ class WorkflowService:
             existing_latest_workflow = await self.get_workflow_by_permanent_id(
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
-                exclude_deleted=False,
+                filter_deleted=False,
             )
         else:
             existing_latest_workflow = None
