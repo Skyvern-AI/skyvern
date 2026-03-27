@@ -1145,10 +1145,16 @@ class SkyvernPage(Page):
     @action_wrap(ActionType.WAIT)
     async def wait(
         self,
-        seconds: float,
+        seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
-        await asyncio.sleep(seconds)
+        timeout_ms = kwargs.pop("timeout_ms", None)
+        if seconds is not None:
+            await asyncio.sleep(seconds)
+        elif timeout_ms is not None:
+            await asyncio.sleep(timeout_ms / 1000.0)
+        else:
+            await asyncio.sleep(0)
 
     @action_wrap(ActionType.NULL_ACTION)
     async def null_action(self, **kwargs: Any) -> None:
