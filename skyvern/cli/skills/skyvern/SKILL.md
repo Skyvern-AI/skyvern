@@ -6,8 +6,7 @@ allowed-tools: Bash(skyvern:*)
 
 # Skyvern Browser Automation -- CLI Reference
 
-Skyvern uses AI to navigate and interact with websites. This skill teaches the
-CLI commands. Every example is a runnable `skyvern <command>` invocation.
+Skyvern uses AI to navigate and interact with websites. Every example is a runnable `skyvern <command>` invocation.
 
 ## Setup
 
@@ -60,11 +59,14 @@ only.
 | `skyvern credential list` | List credentials (metadata) |
 | `skyvern credential get` | Get credential metadata |
 | `skyvern credential delete` | Delete a credential |
-| `skyvern credentials add` | Create a credential (interactive) |
+| `skyvern credentials add` | Create a credential (env vars or interactive) |
 | `skyvern block schema` | Get block type schema |
 | `skyvern block validate` | Validate a block definition |
+| `skyvern capabilities` | Discover all commands (agent-first) |
 
-All commands accept `--json` for machine-readable output (e.g. `skyvern browser session create --json`).
+All commands accept `--json` for structured output with a consistent envelope.
+**Agent mode:** `skyvern capabilities --json` for discovery, `SKYVERN_NON_INTERACTIVE=1`
+to prevent prompts, `--yes`/`--force` to skip confirmations. See `references/agent-mode.md`.
 
 ---
 
@@ -495,4 +497,4 @@ See `references/prompt-writing.md` for templates and anti-patterns.
 | `references/rerun-playbook.md` | Rerun procedures and comparison |
 | `references/complex-inputs.md` | Date pickers, uploads, dropdowns |
 | `references/tool-map.md` | Complete tool inventory by outcome |
-| `references/cli-parity.md` | CLI command to MCP tool mapping |
+| `references/cli-parity.md` | CLI/MCP mapping and agent-aware features |
