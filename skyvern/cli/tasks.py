@@ -13,6 +13,7 @@ from skyvern.client import Skyvern
 from skyvern.config import settings
 from skyvern.utils.env_paths import resolve_backend_env_path
 
+from .commands._output import output, output_error
 from .console import console
 
 tasks_app = typer.Typer(help="Manage Skyvern tasks and operations.")
@@ -29,7 +30,8 @@ def tasks_callback(
     ),
 ) -> None:
     """Store API key in Typer context."""
-    ctx.obj = {"api_key": api_key}
+    ctx.ensure_object(dict)
+    ctx.obj["api_key"] = api_key
 
 
 def _get_client(api_key: str | None = None) -> Skyvern:
@@ -54,8 +56,21 @@ def _list_workflow_tasks(client: Skyvern, run_id: str) -> list[dict]:
 def list_tasks(
     ctx: typer.Context,
     workflow_run_id: str = typer.Option(..., "--workflow-run-id", "-r", help="Workflow run ID"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
-    """List tasks for a workflow run."""
+    """List tasks for a workflow run.
+
+    Examples:
+      skyvern tasks list --workflow-run-id wr_abc123
+      skyvern tasks list --workflow-run-id wr_abc123 --json
+    """
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
-    tasks = _list_workflow_tasks(client, workflow_run_id)
-    console.print(Panel(json.dumps(tasks, indent=2), border_style="cyan"))
+    try:
+        tasks = _list_workflow_tasks(client, workflow_run_id)
+    except Exception as e:
+        output_error(f"Failed to list tasks: {e}", action="tasks.list", json_mode=json_output)
+
+    if json_output:
+        output(tasks, action="tasks.list", json_mode=True)
+    else:
+        console.print(Panel(json.dumps(tasks, indent=2), border_style="cyan"))

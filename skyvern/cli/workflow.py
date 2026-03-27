@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-import sys
-from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 import typer
 from dotenv import load_dotenv
@@ -14,7 +10,7 @@ from dotenv import load_dotenv
 from skyvern.config import settings
 from skyvern.utils.env_paths import resolve_backend_env_path
 
-from .commands._output import output, output_error
+from .commands._output import resolve_inline_or_file, run_tool
 from .mcp_tools.workflow import skyvern_workflow_cancel as tool_workflow_cancel
 from .mcp_tools.workflow import skyvern_workflow_create as tool_workflow_create
 from .mcp_tools.workflow import skyvern_workflow_delete as tool_workflow_delete
@@ -25,52 +21,6 @@ from .mcp_tools.workflow import skyvern_workflow_status as tool_workflow_status
 from .mcp_tools.workflow import skyvern_workflow_update as tool_workflow_update
 
 workflow_app = typer.Typer(help="Manage Skyvern workflows.", no_args_is_help=True)
-
-
-def _emit_tool_result(result: dict[str, Any], *, json_output: bool) -> None:
-    if json_output:
-        json.dump(result, sys.stdout, indent=2, default=str)
-        sys.stdout.write("\n")
-        if not result.get("ok", False):
-            raise SystemExit(1)
-        return
-
-    if result.get("ok", False):
-        output(result.get("data"), action=str(result.get("action", "")), json_mode=False)
-        return
-
-    err = result.get("error") or {}
-    output_error(str(err.get("message", "Unknown error")), hint=str(err.get("hint", "")), json_mode=False)
-
-
-def _run_tool(
-    runner: Callable[[], Coroutine[Any, Any, dict[str, Any]]],
-    *,
-    json_output: bool,
-    hint_on_exception: str,
-) -> None:
-    try:
-        result: dict[str, Any] = asyncio.run(runner())
-        _emit_tool_result(result, json_output=json_output)
-    except typer.BadParameter:
-        raise
-    except Exception as e:
-        output_error(str(e), hint=hint_on_exception, json_mode=json_output)
-
-
-def _resolve_inline_or_file(value: str | None, *, param_name: str) -> str | None:
-    if value is None or not value.startswith("@"):
-        return value
-
-    file_path = value[1:]
-    if not file_path:
-        raise typer.BadParameter(f"{param_name} file path cannot be empty after '@'.")
-
-    path = Path(file_path).expanduser()
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError as e:
-        raise typer.BadParameter(f"Unable to read {param_name} file '{path}': {e}") from e
 
 
 @workflow_app.callback()
@@ -114,7 +64,12 @@ def workflow_list(
             only_workflows=only_workflows,
         )
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check your API key and workflow list filters.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check your API key and workflow list filters.",
+        action="skyvern_workflow_list",
+    )
 
 
 @workflow_app.command("get")
@@ -128,7 +83,12 @@ def workflow_get(
     async def _run() -> dict[str, Any]:
         return await tool_workflow_get(workflow_id=workflow_id, version=version)
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check your API key and workflow ID.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check your API key and workflow ID.",
+        action="skyvern_workflow_get",
+    )
 
 
 @workflow_app.command("create")
@@ -149,15 +109,19 @@ def workflow_create(
     """Create a workflow."""
 
     async def _run() -> dict[str, Any]:
-        resolved_definition = _resolve_inline_or_file(definition, param_name="definition")
-        assert resolved_definition is not None
+        resolved_definition = resolve_inline_or_file(definition, param_name="definition")
         return await tool_workflow_create(
-            definition=resolved_definition,
+            definition=definition if resolved_definition is None else resolved_definition,
             format=definition_format,
             folder_id=folder_id,
         )
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check the workflow definition syntax.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the workflow definition syntax.",
+        action="skyvern_workflow_create",
+    )
 
 
 @workflow_app.command("update")
@@ -178,15 +142,19 @@ def workflow_update(
     """Update a workflow definition."""
 
     async def _run() -> dict[str, Any]:
-        resolved_definition = _resolve_inline_or_file(definition, param_name="definition")
-        assert resolved_definition is not None
+        resolved_definition = resolve_inline_or_file(definition, param_name="definition")
         return await tool_workflow_update(
             workflow_id=workflow_id,
-            definition=resolved_definition,
+            definition=definition if resolved_definition is None else resolved_definition,
             format=definition_format,
         )
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check the workflow ID and definition syntax.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the workflow ID and definition syntax.",
+        action="skyvern_workflow_update",
+    )
 
 
 @workflow_app.command("delete")
@@ -200,7 +168,12 @@ def workflow_delete(
     async def _run() -> dict[str, Any]:
         return await tool_workflow_delete(workflow_id=workflow_id, force=force)
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check the workflow ID and your permissions.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the workflow ID and your permissions.",
+        action="skyvern_workflow_delete",
+    )
 
 
 @workflow_app.command("run")
@@ -230,7 +203,7 @@ def workflow_run(
     """Run a workflow."""
 
     async def _run() -> dict[str, Any]:
-        resolved_params = _resolve_inline_or_file(params, param_name="params")
+        resolved_params = resolve_inline_or_file(params, param_name="params")
         return await tool_workflow_run(
             workflow_id=workflow_id,
             parameters=resolved_params,
@@ -242,7 +215,12 @@ def workflow_run(
             run_with=run_with,
         )
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check the workflow ID and run parameters.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the workflow ID and run parameters.",
+        action="skyvern_workflow_run",
+    )
 
 
 @workflow_app.command("status")
@@ -255,7 +233,12 @@ def workflow_status(
     async def _run() -> dict[str, Any]:
         return await tool_workflow_status(run_id=run_id, verbosity="full")
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check the run ID and API key.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the run ID and API key.",
+        action="skyvern_workflow_status",
+    )
 
 
 @workflow_app.command("cancel")
@@ -268,4 +251,9 @@ def workflow_cancel(
     async def _run() -> dict[str, Any]:
         return await tool_workflow_cancel(run_id=run_id)
 
-    _run_tool(_run, json_output=json_output, hint_on_exception="Check the run ID and API key.")
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the run ID and API key.",
+        action="skyvern_workflow_cancel",
+    )
