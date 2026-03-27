@@ -470,6 +470,9 @@ async def _create_workflow_block_run_and_task(
                 prompt = _render_template_with_label(prompt, label)
             if url:
                 url = _render_template_with_label(url, label)
+            # Include script parameters as navigation_payload so handlers
+            # (e.g. file upload) can find URLs like resume_link in the payload.
+            nav_payload = context.script_run_parameters or None
             task = await app.DATABASE.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
@@ -477,7 +480,7 @@ async def _create_workflow_block_run_and_task(
                 navigation_goal=prompt,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
-                navigation_payload=None,
+                navigation_payload=nav_payload,
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
@@ -1721,12 +1724,15 @@ async def run_task(
 
     context: skyvern_context.SkyvernContext | None = None
     if cache_key and cached_fn:
-        # Auto-create workflow block run and task if workflow_run_id is available
+        # Auto-create workflow block run and task if workflow_run_id is available.
+        # Use `label` (the workflow block label) for the block run so the
+        # framework can match it, and `cache_key` to look up the cached function.
+        block_label = label or cache_key
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.NAVIGATION,
             prompt=prompt,
             url=url,
-            label=cache_key,
+            label=block_label,
             model=model,
             created_by="script",
         )

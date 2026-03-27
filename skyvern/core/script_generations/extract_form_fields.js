@@ -79,7 +79,7 @@
     const elType = (el.getAttribute("type") || "").toLowerCase();
     const vis = elType === "file" ? "" : ":visible";
     if (el.name) return tag + '[name="' + el.name + '"]' + vis;
-    if (el.id) return "#" + el.id + vis;
+    if (el.id) return "#" + CSS.escape(el.id) + vis;
     // File inputs with no name/id: no name/id, use data-automation-id or type selector
     if (elType === "file") {
       const autoId = el.getAttribute("data-automation-id");
@@ -106,7 +106,7 @@
   }
 
   function buildOptionSelector(el) {
-    if (el.id) return "#" + el.id;
+    if (el.id) return "#" + CSS.escape(el.id);
     const tag = el.tagName.toLowerCase();
     const name = el.name;
     const value = el.value;
@@ -256,24 +256,23 @@
     if (["hidden", "submit", "button", "image", "reset"].includes(type))
       continue;
     // Skip inputs inside multiselect containers — platform extension handles those
-    if (
-      el.closest('[data-uxi-widget-type="multiselect"]') ||
-      el.closest('[role="combobox"][aria-autocomplete="list"]')
-    )
-      continue;
+    if (el.closest('[data-uxi-widget-type="multiselect"]')) continue;
     // Allow aria-checked inputs through even if visually hidden (hides
     // real radio/checkbox inputs behind styled overlays at opacity:0)
     const hasAriaChecked = el.hasAttribute("aria-checked");
     if (type !== "file" && !hasAriaChecked && !isVisible(el)) continue;
 
-    // Custom <input aria-checked> without type="radio" for custom radios.
-    // Detect these by the presence of aria-checked attribute.
+    // Detect special input types by ARIA attributes:
+    // - aria-checked → custom radio
+    // - role="combobox" → search dropdown (type to filter, click to select)
     const effectiveType =
       type === "checkbox" || type === "radio"
         ? type
         : el.hasAttribute("aria-checked")
           ? "radio"
-          : type;
+          : el.getAttribute("role") === "combobox"
+            ? "search-dropdown"
+            : type;
 
     if (effectiveType === "checkbox" || effectiveType === "radio") {
       if (el.name) {
@@ -395,7 +394,7 @@
       selector: selector,
       tag: el.tagName.toLowerCase(),
       type:
-        type ||
+        effectiveType ||
         (el.tagName.toLowerCase() === "select"
           ? "select"
           : el.tagName.toLowerCase() === "textarea"
@@ -461,7 +460,8 @@
                 "')";
             }
           }
-          if (!optSelector && optEl.id) optSelector = "#" + optEl.id;
+          if (!optSelector && optEl.id)
+            optSelector = "#" + CSS.escape(optEl.id);
           if (optSelector) {
             fallbackOptions.push({
               label: optLabel,
@@ -534,7 +534,7 @@
       const optSelector = r.getAttribute("data-automation-id")
         ? '[data-automation-id="' + r.getAttribute("data-automation-id") + '"]'
         : r.id
-          ? "#" + r.id
+          ? "#" + CSS.escape(r.id)
           : null;
       if (optSelector) {
         options.push({
@@ -597,7 +597,7 @@
             r.getAttribute("data-automation-id") +
             '"]'
           : r.id
-            ? "#" + r.id
+            ? "#" + CSS.escape(r.id)
             : null;
         if (optSelector) {
           options.push({
@@ -639,7 +639,7 @@
     const selector = cbId
       ? '[data-automation-id="' + cbId + '"]'
       : cb.id
-        ? "#" + cb.id
+        ? "#" + CSS.escape(cb.id)
         : null;
     if (selector) {
       fields.push({

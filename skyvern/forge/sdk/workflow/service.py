@@ -1276,17 +1276,39 @@ class WorkflowService:
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
                             loaded_script_module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(loaded_script_module)
-                            param_cls = getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
+                            try:
+                                spec.loader.exec_module(loaded_script_module)
+                            except Exception:
+                                # Static scripts may fail with spec_from_file_location
+                                # due to circular imports. Delegate to AgentFunction for
+                                # platform-specific fallback loading.
+                                LOG.warning("exec_module failed, trying import_module fallback", exc_info=True)
+                                loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+                            param_cls = (
+                                getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
+                                if loaded_script_module
+                                else None
+                            )
                             await skyvern.setup(
                                 script_parameters,
                                 generated_parameter_cls=param_cls,
                             )
-                            LOG.info(
-                                "Successfully loaded script module",
-                                script_id=script.script_id,
-                                block_count=len(script_blocks_by_label),
-                            )
+                            if loaded_script_module:
+                                # Mark static (pinned) scripts so complete() skips LLM verification
+                                if script.is_pinned:
+                                    pinned_ctx = skyvern_context.current()
+                                    if pinned_ctx:
+                                        pinned_ctx.is_static_script = True
+                                LOG.info(
+                                    "Successfully loaded script module",
+                                    script_id=script.script_id,
+                                    block_count=len(script_blocks_by_label),
+                                )
+                            else:
+                                LOG.warning(
+                                    "Script module failed to load, blocks will fall back to agent",
+                                    script_id=script.script_id,
+                                )
                     else:
                         LOG.warning(
                             "Script file not found at path",
@@ -1328,6 +1350,10 @@ class WorkflowService:
                         script_parameters,
                         generated_parameter_cls=param_cls,
                     )
+                    # Mark context so static scripts skip LLM completion verification
+                    static_ctx = skyvern_context.current()
+                    if static_ctx:
+                        static_ctx.is_static_script = True
                     LOG.info(
                         "Static script loaded successfully",
                         script_id=script.script_id if script else None,
@@ -1566,6 +1592,10 @@ class WorkflowService:
 
         context = skyvern_context.current()
         if not context or not context.generate_script:
+            return
+
+        # Skip script generation for static (pinned) scripts
+        if context.is_static_script:
             return
 
         disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
@@ -4823,6 +4853,19 @@ class WorkflowService:
 
         # Manages cached workflow script regeneration with conditional-aware locking and versioning
         if existing_script:
+            # Pinned static scripts (created by ensure_static_script) should
+            # never be regenerated — they are hand-written and authoritative.
+            # Only check for pinned scripts when running a static script (avoids
+            # an extra DB query for every non-static cached-script workflow).
+            ctx = skyvern_context.current()
+            if ctx and ctx.is_static_script:
+                LOG.info(
+                    "Skipping script generation for pinned static script",
+                    script_id=existing_script.script_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                return None
+
             cached_block_labels: set[str] = set()
             script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
                 script_revision_id=existing_script.script_revision_id,

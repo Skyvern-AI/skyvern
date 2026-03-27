@@ -650,6 +650,14 @@ class AgentFunction:
         """
         return None
 
+    def try_import_static_script(self, script_path: str) -> Any | None:
+        """Try to import a static script module as a fallback when spec_from_file_location fails.
+
+        Override in subclass for platform-specific import logic.
+        Returns the loaded module or None.
+        """
+        return None
+
     async def ensure_static_script(
         self,
         workflow: Any,

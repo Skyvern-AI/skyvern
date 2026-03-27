@@ -56,6 +56,8 @@ class SkyvernContext:
     loop_output_values: list[dict[str, Any]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
+    is_static_script: bool = False
+    sensitive_values: set[str] = field(default_factory=set)
     ai_mode_override: str | None = None
     script_llm_call_count: int = 0
     last_classify_result: str | None = None
