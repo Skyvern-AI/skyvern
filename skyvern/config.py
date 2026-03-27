@@ -495,9 +495,14 @@ class Settings(BaseSettings):
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
+    OTEL_EXPORTER_OTLP_HEADERS: str = ""
     OTEL_METRICS_ENABLED: bool = True
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
+    LMNR_PROJECT_API_KEY: str = ""
+    LMNR_BASE_URL: str = ""
+    LAMINAR_API_KEY: str = ""
+    LAMINAR_API_BASE: str = ""
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
@@ -606,6 +611,33 @@ class Settings(BaseSettings):
             }
 
         return mapping
+
+    def get_otel_exporter_endpoint(self) -> str:
+        """Return an OTLP traces endpoint from canonical or Laminar-compatible settings."""
+        endpoint = self.OTEL_EXPORTER_OTLP_ENDPOINT.strip()
+        if endpoint:
+            return endpoint
+
+        laminar_base = self.LMNR_BASE_URL.strip() or self.LAMINAR_API_BASE.strip()
+        if not laminar_base:
+            return ""
+
+        normalized = laminar_base.rstrip("/")
+        if normalized.endswith("/v1/traces"):
+            return normalized
+        return f"{normalized}/v1/traces"
+
+    def get_otel_exporter_headers(self) -> str:
+        """Return OTLP headers, deriving Laminar auth headers when needed."""
+        explicit_headers = self.OTEL_EXPORTER_OTLP_HEADERS.strip()
+        if explicit_headers:
+            return explicit_headers
+
+        api_key = self.LMNR_PROJECT_API_KEY.strip() or self.LAMINAR_API_KEY.strip()
+        if not api_key:
+            return ""
+
+        return f"authorization=Bearer {api_key},x-api-key={api_key}"
 
     def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
         super().model_post_init(__context)
