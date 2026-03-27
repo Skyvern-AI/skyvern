@@ -1011,6 +1011,22 @@ async def create_script_version_from_review(
         The new Script revision, or None if creation failed.
     """
     try:
+        # Defense-in-depth: refuse to create a correction for a pinned script.
+        # _trigger_script_reviewer() already gates on is_script_pinned(), but
+        # that check can be bypassed when the skyvern context is missing.
+        # Guard here so no code path can mutate a pinned script.
+        if await app.DATABASE.is_script_pinned(
+            organization_id=organization_id,
+            script_id=base_script.script_id,
+        ):
+            LOG.info(
+                "Skipping script correction — script is pinned",
+                organization_id=organization_id,
+                script_id=base_script.script_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
         # Create a new script version
         new_script = await app.DATABASE.create_script(
             organization_id=organization_id,

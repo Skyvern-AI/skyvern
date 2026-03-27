@@ -7300,43 +7300,70 @@ class AgentDB(BaseAlchemyDB):
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
     ) -> Script | None:
-        """Get latest script version linked to a workflow by a specific cache_key_value."""
+        """Get the best script version linked to a workflow by a specific cache_key_value.
+
+        Selection priority:
+        1. If a pinned workflow_script row exists, return the version that was
+           current when pinning occurred (i.e. the version the pinned row
+           points to).  This ensures pinned scripts are immutable.
+        2. Otherwise, return the latest version by version number.
+        """
         try:
             async with self.Session() as session:
                 # Build the query: join workflow_scripts with scripts
                 # Join on both script_id and organization_id to leverage uc_org_script_version index
-                query = (
-                    select(ScriptModel)
-                    .join(
-                        WorkflowScriptModel,
-                        and_(
-                            ScriptModel.organization_id == WorkflowScriptModel.organization_id,
-                            ScriptModel.script_id == WorkflowScriptModel.script_id,
-                        ),
-                    )
-                    .where(
-                        WorkflowScriptModel.organization_id == organization_id,
-                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
-                        WorkflowScriptModel.cache_key_value == cache_key_value,
-                        WorkflowScriptModel.deleted_at.is_(None),
-                    )
+                base_where = [
+                    WorkflowScriptModel.organization_id == organization_id,
+                    WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowScriptModel.cache_key_value == cache_key_value,
+                    WorkflowScriptModel.deleted_at.is_(None),
+                ]
+
+                base_join = and_(
+                    ScriptModel.organization_id == WorkflowScriptModel.organization_id,
+                    ScriptModel.script_id == WorkflowScriptModel.script_id,
                 )
 
-                if workflow_run_id:
-                    query = query.where(WorkflowScriptModel.workflow_run_id == workflow_run_id)
-                    # Pin to the script version that existed when this run's
-                    # workflow_script entry was created, not the latest version.
-                    query = query.where(ScriptModel.created_at <= WorkflowScriptModel.created_at)
-
+                # Filters shared by both pinned and latest queries
+                shared_where: list[Any] = []
                 if cache_key is not None:
-                    query = query.where(WorkflowScriptModel.cache_key == cache_key)
+                    shared_where.append(WorkflowScriptModel.cache_key == cache_key)
 
+                # Filters only for the latest-version (non-pinned) query.
+                # workflow_run_id scopes to the current run's row, which won't
+                # match the pinned row (it belongs to the run where pinning
+                # occurred).  statuses may also exclude a pinned row whose
+                # status has since changed; pinned scripts should always win.
+                latest_only_where: list[Any] = []
+                if workflow_run_id:
+                    latest_only_where.append(WorkflowScriptModel.workflow_run_id == workflow_run_id)
+                    latest_only_where.append(ScriptModel.created_at <= WorkflowScriptModel.created_at)
                 if statuses is not None and len(statuses) > 0:
-                    query = query.where(WorkflowScriptModel.status.in_(statuses))
+                    latest_only_where.append(WorkflowScriptModel.status.in_(statuses))
 
-                query = query.order_by(ScriptModel.version.desc()).limit(1)
+                # --- Try pinned version first ---
+                pinned_query = (
+                    select(ScriptModel)
+                    .join(WorkflowScriptModel, base_join)
+                    .where(*base_where, *shared_where, WorkflowScriptModel.is_pinned.is_(True))
+                    # Use the version that was active when the pinned row was created
+                    .where(ScriptModel.created_at <= WorkflowScriptModel.created_at)
+                    .order_by(ScriptModel.version.desc())
+                    .limit(1)
+                )
+                pinned = (await session.scalars(pinned_query)).first()
+                if pinned:
+                    return convert_to_script(pinned)
 
-                script = (await session.scalars(query)).first()
+                # --- Fall back to latest version ---
+                latest_query = (
+                    select(ScriptModel)
+                    .join(WorkflowScriptModel, base_join)
+                    .where(*base_where, *shared_where, *latest_only_where)
+                    .order_by(ScriptModel.version.desc())
+                    .limit(1)
+                )
+                script = (await session.scalars(latest_query)).first()
                 return convert_to_script(script) if script else None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
