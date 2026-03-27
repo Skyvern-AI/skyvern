@@ -692,6 +692,16 @@ class BaseTaskBlock(Block):
                 self.terminate_criterion, workflow_run_context
             )
 
+        if self.error_code_mapping:
+            self.error_code_mapping = {
+                self.format_block_parameter_template_from_workflow_run_context(error_code, workflow_run_context): (
+                    self.format_block_parameter_template_from_workflow_run_context(
+                        error_description, workflow_run_context
+                    )
+                )
+                for error_code, error_description in self.error_code_mapping.items()
+            }
+
     @staticmethod
     async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
         """
