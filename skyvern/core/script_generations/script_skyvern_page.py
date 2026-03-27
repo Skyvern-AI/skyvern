@@ -743,6 +743,11 @@ class ScriptSkyvernPage(SkyvernPage):
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
+                # Render Jinja templates (e.g. "{{identifier}}") to actual parameter values
+                if totp_identifier:
+                    totp_identifier = render_template(totp_identifier)
+                if totp_url:
+                    totp_url = render_template(totp_url)
                 totp_value = await poll_otp_value(
                     organization_id=organization_id,
                     task_id=task_id,
