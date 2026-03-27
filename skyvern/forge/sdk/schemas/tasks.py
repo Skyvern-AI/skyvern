@@ -18,7 +18,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ValidatedProxyLocationInput
 from skyvern.utils.url_validators import validate_url
 
 
@@ -69,10 +69,11 @@ class TaskBase(BaseModel):
             }
         ],
     )
-    proxy_location: ProxyLocationInput = Field(
+    proxy_location: ValidatedProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
     )
+
     extracted_information_schema: dict[str, Any] | list | str | None = Field(
         default=None,
         description="The requested schema of the extracted information.",

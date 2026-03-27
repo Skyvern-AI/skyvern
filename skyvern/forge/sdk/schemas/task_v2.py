@@ -81,7 +81,7 @@ class TaskV2(BaseModel):
             try:
                 return ProxyLocation(stripped)
             except ValueError:
-                return None
+                return stripped
 
         return proxy_location
 
