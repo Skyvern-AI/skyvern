@@ -3,11 +3,13 @@ Unit tests for ScriptSkyvernPage.
 
 Tests _wait_for_page_ready_before_action (regression test for self._page bug, PR #8425),
 _ensure_element_ids_on_page (injects unique_id attrs after page navigation),
-and terminate() (raises ScriptTerminationException for Code 2.0 cached execution).
+terminate() (raises ScriptTerminationException for Code 2.0 cached execution),
+and wait() (accepts both seconds= and timeout_ms= parameter styles).
 """
 
 import inspect
 import re
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -756,3 +758,103 @@ async def test_fill_autocomplete_value_none_proactive_unchanged(mock_scraped_pag
 
         assert result == "ai_value"
         script_page._ai.ai_input_text.assert_called_once()
+
+
+# =============================================================================
+# Tests for wait() — timeout_ms support
+# =============================================================================
+
+
+def _get_wait_inner_fn():
+    """Extract the inner wait function from the action_wrap closure.
+
+    action_wrap replaces the method with a wrapper. The original function
+    is stored in the closure as the 'fn' free variable.
+    """
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+    wrapper = SkyvernPage.wait
+    # closure vars are ('action', 'fn') per action_wrap implementation
+    for var_name, cell in zip(wrapper.__code__.co_freevars, wrapper.__closure__):
+        if var_name == "fn":
+            return cell.cell_contents
+    raise RuntimeError("Could not extract inner wait function from action_wrap closure")
+
+
+class TestWaitMethod:
+    """Tests for SkyvernPage.wait() accepting both seconds= and timeout_ms=.
+
+    The script reviewer prompt documents the API as page.wait(timeout_ms=5000),
+    but the original implementation only accepted wait(seconds=5). This mismatch
+    caused every LLM-generated wait call to raise TypeError at runtime, silently
+    triggering agent fallback instead of actually waiting.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wait_with_seconds_kwarg(self):
+        """wait(seconds=0.05) should sleep for ~0.05 seconds."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, seconds=0.05)
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.04, f"Expected ~0.05s sleep, got {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_with_seconds_positional(self):
+        """wait(0.05) should sleep for ~0.05 seconds (positional arg)."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, 0.05)
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.04, f"Expected ~0.05s sleep, got {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_with_timeout_ms_kwarg(self):
+        """wait(timeout_ms=50) should sleep for ~0.05 seconds."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, timeout_ms=50)
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.04, f"Expected ~0.05s sleep, got {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_with_timeout_ms_converts_correctly(self):
+        """wait(timeout_ms=100) should sleep ~0.1s, not 100 seconds."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, timeout_ms=100)
+        elapsed = time.monotonic() - t0
+        assert 0.08 <= elapsed <= 0.5, f"Expected ~0.1s, got {elapsed:.3f}s — ms→s conversion may be wrong"
+
+    @pytest.mark.asyncio
+    async def test_wait_seconds_takes_precedence_over_timeout_ms(self):
+        """When both seconds= and timeout_ms= are provided, seconds= wins."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, seconds=0.05, timeout_ms=10000)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, f"seconds= should take precedence, but waited {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_no_args_returns_immediately(self):
+        """wait() with no args should return immediately (sleep 0)."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.1, f"Expected immediate return, got {elapsed:.3f}s"
+
+    def test_wait_signature_allows_timeout_ms(self):
+        """The inner wait function must accept timeout_ms via **kwargs without TypeError.
+
+        This is the core regression test: the old signature was wait(self, seconds: float, **kwargs)
+        where seconds was required. Calling wait(timeout_ms=5000) raised TypeError because
+        seconds had no default. The fix makes seconds optional (default None).
+        """
+        fn = _get_wait_inner_fn()
+        sig = inspect.signature(fn)
+        seconds_param = sig.parameters.get("seconds")
+        assert seconds_param is not None, "wait() should have a 'seconds' parameter"
+        assert seconds_param.default is None, (
+            f"seconds should default to None so timeout_ms can be used instead, got default={seconds_param.default}"
+        )

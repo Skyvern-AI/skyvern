@@ -18,7 +18,12 @@ from fastapi import BackgroundTasks, HTTPException
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.constants import (
+    BROWSER_DOWNLOADING_SUFFIX,
+    DEFAULT_LOGIN_COMPLETE_CRITERION,
+    GET_DOWNLOADED_FILES_TIMEOUT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
+)
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
@@ -473,11 +478,17 @@ async def _create_workflow_block_run_and_task(
             # Include script parameters as navigation_payload so handlers
             # (e.g. file upload) can find URLs like resume_link in the payload.
             nav_payload = context.script_run_parameters or None
+            # Apply default complete_criterion for login blocks so cached scripts
+            # get the same rigorous LLM verification as the agent path (SKY-8540).
+            # Without this, the LLM only sees a generic navigation_goal and can
+            # falsely mark login as complete when credentials were never entered.
+            task_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION if block_type == BlockType.LOGIN else None
             task = await app.DATABASE.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
+                complete_criterion=task_complete_criterion,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
