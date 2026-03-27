@@ -183,6 +183,18 @@ LOG = structlog.get_logger()
 _UNSET = object()
 
 
+def _script_run_with_filter() -> Any:
+    """Build run_with filter for script-backed workflow runs.
+
+    Script runs can have run_with as explicit code modes ("code"/"code_v2")
+    or NULL when code mode is inferred via fallback logic.
+    """
+    return or_(
+        WorkflowRunModel.run_with.in_(["code", "code_v2"]),
+        WorkflowRunModel.run_with.is_(None),
+    )
+
+
 def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     """
     Serialize proxy_location for database storage.
@@ -7597,10 +7609,7 @@ class AgentDB(BaseAlchemyDB):
                 base_filters = [
                     WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
                     WorkflowRunModel.organization_id == organization_id,
-                    or_(
-                        WorkflowRunModel.run_with.in_(["code", "code_v2"]),
-                        WorkflowRunModel.run_with.is_(None),
-                    ),
+                    _script_run_with_filter(),
                 ]
 
                 # Count statuses via GROUP BY (also gives us total_count)
@@ -7688,10 +7697,7 @@ class AgentDB(BaseAlchemyDB):
                         WorkflowRunModel.organization_id == organization_id,
                         # Same NULL-inclusion logic as get_workflow_runs_for_script:
                         # runs with NULL run_with executed in auto/code mode via fallback.
-                        or_(
-                            WorkflowRunModel.run_with.in_(["code", "code_v2"]),
-                            WorkflowRunModel.run_with.is_(None),
-                        ),
+                        _script_run_with_filter(),
                     )
                     .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
                 )
