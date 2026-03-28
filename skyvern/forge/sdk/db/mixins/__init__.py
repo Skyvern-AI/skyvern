@@ -1,3 +1,8 @@
+# DEPRECATED: These mixin classes have been superseded by the repository pattern
+# in skyvern/forge/sdk/db/repositories/. AgentDB no longer inherits from these
+# mixins — it composes repository instances instead. These files are retained
+# temporarily to avoid breaking any downstream code that may import from here.
+# TODO(SKY-62): Remove after 2026-Q2 once all imports are verified migrated.
 from skyvern.forge.sdk.db.mixins.artifacts import ArtifactsMixin
 from skyvern.forge.sdk.db.mixins.base import BaseAlchemyDB, read_retry
 from skyvern.forge.sdk.db.mixins.browser_sessions import BrowserSessionsMixin

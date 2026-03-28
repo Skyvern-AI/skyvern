@@ -1,39 +1,45 @@
+"""Database operations for workflow schedules."""
+
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import exists, func, or_, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 
-from skyvern.forge.sdk.db._error_handling import db_operation
+from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
+from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError
-from skyvern.forge.sdk.db.models import (
-    WorkflowModel,
-    WorkflowRunModel,
-    WorkflowScheduleModel,
-)
+from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel, WorkflowScheduleModel
 from skyvern.forge.sdk.db.utils import convert_to_workflow_schedule
 from skyvern.forge.sdk.schemas.workflow_schedules import OrganizationScheduleItem, WorkflowSchedule
 from skyvern.forge.sdk.workflow.schedules import compute_next_run
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncEngine
-
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
+from . import _UNSET
+
 LOG = structlog.get_logger()
-_UNSET = object()
+
+register_passthrough_exception(ScheduleLimitExceededError)
 
 
-class SchedulesMixin:
+class SchedulesRepository(BaseRepository):
     """Database operations for workflow schedules."""
 
-    Session: _SessionFactory
-    engine: AsyncEngine
-    debug_enabled: bool
-    _sqlite_schedule_lock: asyncio.Lock | None
+    def __init__(
+        self,
+        session_factory: _SessionFactory,
+        debug_enabled: bool = False,
+        is_retryable_error_fn: Callable[[SQLAlchemyError], bool] | None = None,
+        sqlite_schedule_lock: asyncio.Lock | None = None,
+    ) -> None:
+        super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
+        self._sqlite_schedule_lock = sqlite_schedule_lock
 
     @db_operation("create_workflow_schedule")
     async def create_workflow_schedule(
@@ -91,9 +97,8 @@ class SchedulesMixin:
         """
         # SQLite: serialize via Python lock (no advisory locks available).
         # The lock is held across the count-check + insert to prevent TOCTOU.
-        sqlite_lock = getattr(self, "_sqlite_schedule_lock", None)
-        if sqlite_lock is not None:
-            async with sqlite_lock:
+        if self._sqlite_schedule_lock is not None:
+            async with self._sqlite_schedule_lock:
                 return await self._create_schedule_with_limit_inner(
                     organization_id,
                     workflow_permanent_id,
@@ -198,7 +203,7 @@ class SchedulesMixin:
                 return None
 
             workflow_schedule.temporal_schedule_id = temporal_schedule_id
-            workflow_schedule.modified_at = datetime.utcnow()
+            workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -240,7 +245,7 @@ class SchedulesMixin:
                 workflow_schedule.name = name
             if description is not _UNSET:
                 workflow_schedule.description = description
-            workflow_schedule.modified_at = datetime.utcnow()
+            workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -306,13 +311,11 @@ class SchedulesMixin:
         since: datetime,
     ) -> bool:
         """Check if a workflow_run exists for the given schedule since a timestamp."""
-        from sqlalchemy import exists as sa_exists
-
         async with self.Session() as session:
             row = (
                 await session.execute(
                     select(
-                        sa_exists().where(
+                        exists().where(
                             WorkflowRunModel.workflow_schedule_id == workflow_schedule_id,
                             WorkflowRunModel.created_at >= since,
                         )
@@ -341,7 +344,7 @@ class SchedulesMixin:
             if not workflow_schedule:
                 return None
             workflow_schedule.enabled = enabled
-            workflow_schedule.modified_at = datetime.utcnow()
+            workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -365,8 +368,8 @@ class SchedulesMixin:
             if not workflow_schedule:
                 return None
 
-            workflow_schedule.deleted_at = datetime.utcnow()
-            workflow_schedule.modified_at = datetime.utcnow()
+            workflow_schedule.deleted_at = datetime.now(UTC)
+            workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -392,7 +395,7 @@ class SchedulesMixin:
                 return None
 
             workflow_schedule.deleted_at = None
-            workflow_schedule.modified_at = datetime.utcnow()
+            workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -557,44 +560,6 @@ class SchedulesMixin:
 
         return schedules, total_count
 
-    @db_operation("soft_delete_workflow_and_schedules_by_permanent_id")
-    async def soft_delete_workflow_and_schedules_by_permanent_id(
-        self,
-        workflow_permanent_id: str,
-        organization_id: str | None = None,
-    ) -> list[str]:
-        """Soft-delete a workflow and its active schedules in a single DB transaction."""
-        async with self.Session() as session:
-            select_query = (
-                select(WorkflowScheduleModel.workflow_schedule_id)
-                .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowScheduleModel.deleted_at.is_(None))
-            )
-            if organization_id is not None:
-                select_query = select_query.where(WorkflowScheduleModel.organization_id == organization_id)
-            result = await session.execute(select_query)
-            schedule_ids = list(result.scalars().all())
-
-            deleted_at = datetime.utcnow()
-            if schedule_ids:
-                update_schedules_query = (
-                    update(WorkflowScheduleModel)
-                    .where(WorkflowScheduleModel.workflow_schedule_id.in_(schedule_ids))
-                    .values(deleted_at=deleted_at)
-                )
-                await session.execute(update_schedules_query)
-
-            update_workflow_query = (
-                update(WorkflowModel)
-                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowModel.deleted_at.is_(None))
-            )
-            if organization_id is not None:
-                update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
-            await session.execute(update_workflow_query.values(deleted_at=deleted_at))
-            await session.commit()
-            return schedule_ids
-
     @db_operation("soft_delete_orphaned_schedules")
     async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
         """Soft-delete orphaned schedules and return their identities.
@@ -626,7 +591,7 @@ class SchedulesMixin:
                     WorkflowScheduleModel.workflow_schedule_id.in_(select(orphaned_schedules.c.workflow_schedule_id))
                 )
                 .where(WorkflowScheduleModel.deleted_at.is_(None))
-                .values(deleted_at=datetime.utcnow())
+                .values(deleted_at=datetime.now(UTC))
                 .returning(
                     WorkflowScheduleModel.workflow_schedule_id,
                     WorkflowScheduleModel.workflow_permanent_id,
