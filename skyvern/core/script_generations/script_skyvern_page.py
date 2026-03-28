@@ -262,10 +262,12 @@ class ScriptSkyvernPage(SkyvernPage):
             call.error = e
             action_status = ActionStatus.failed
 
-            # Build a readable representation of the failed call
+            # Build a readable representation of the failed call.
+            # Only log the first positional arg (selector) — the second arg
+            # is often a value that could contain passwords or PII.
             call_parts = [f"page.{fn.__name__}("]
             if args:
-                call_parts.append(repr(args[0]) if len(args) == 1 else repr(args))
+                call_parts.append(repr(args[0]))
             key_kwargs = {k: v for k, v in kwargs.items() if k in ("selector", "prompt", "mode") and v is not None}
             if key_kwargs:
                 if args:
