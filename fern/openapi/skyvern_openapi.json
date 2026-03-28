@@ -2445,6 +2445,24 @@
             "description": "Number of items per page"
           },
           {
+            "name": "vault_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CredentialVaultType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "title": "Vault Type"
+            },
+            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -17132,6 +17150,21 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "failure_category": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Category"
           },
           "parent_workflow_run_id": {
             "anyOf": [
