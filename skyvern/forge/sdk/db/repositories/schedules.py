@@ -21,7 +21,7 @@ from skyvern.forge.sdk.workflow.schedules import compute_next_run
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
-from . import _UNSET
+from skyvern.forge.sdk.db._sentinels import _UNSET
 
 LOG = structlog.get_logger()
 

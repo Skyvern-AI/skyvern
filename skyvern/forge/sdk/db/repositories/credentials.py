@@ -5,13 +5,12 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from skyvern.forge.sdk.db._error_handling import db_operation
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
-
-from . import _UNSET
 
 
 class CredentialRepository(BaseRepository):

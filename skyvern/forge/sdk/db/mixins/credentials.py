@@ -14,7 +14,7 @@ from skyvern.forge.sdk.schemas.organization_bitwarden_collections import Organiz
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
-_UNSET = object()
+from skyvern.forge.sdk.db._sentinels import _UNSET
 
 
 class CredentialsMixin:

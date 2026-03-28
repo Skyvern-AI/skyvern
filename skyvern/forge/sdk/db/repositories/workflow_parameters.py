@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
@@ -62,8 +63,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.runs import RunType
 from skyvern.webeye.actions.actions import Action
-
-from . import _UNSET
 
 LOG = structlog.get_logger()
 
