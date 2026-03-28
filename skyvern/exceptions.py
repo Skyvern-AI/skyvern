@@ -656,6 +656,9 @@ class NoSelectableElementFound(SkyvernException):
 
 class HttpException(SkyvernException):
     def __init__(self, status_code: int, url: str, msg: str | None = None) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.error_message = msg
         super().__init__(f"HTTP Exception, status_code={status_code}, url={url}" + (f", msg={msg}" if msg else ""))
 
 

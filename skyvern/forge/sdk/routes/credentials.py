@@ -33,6 +33,7 @@ import structlog
 from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
 from skyvern.config import settings
+from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -303,7 +304,15 @@ async def create_credential(
 ) -> CredentialResponse:
     credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
 
-    credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
+    try:
+        credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
+    except SkyvernHttpException as e:
+        detail = (
+            f"Custom credential service returned {e.error_message}"
+            if e.error_message
+            else f"Custom credential service returned HTTP {e.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=detail)
 
     if credential.vault_type == CredentialVaultType.BITWARDEN:
         # Early resyncing the Bitwarden vault
@@ -1233,10 +1242,18 @@ async def update_credential(
 
     old_item_id = existing_credential.item_id
 
-    updated_credential = await credential_service.update_credential(
-        credential=existing_credential,
-        data=data,
-    )
+    try:
+        updated_credential = await credential_service.update_credential(
+            credential=existing_credential,
+            data=data,
+        )
+    except SkyvernHttpException as e:
+        detail = (
+            f"Custom credential service returned {e.error_message}"
+            if e.error_message
+            else f"Custom credential service returned HTTP {e.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=detail)
 
     # Schedule background cleanup of old vault item if the item_id changed
     if old_item_id != updated_credential.item_id:
@@ -1298,7 +1315,15 @@ async def delete_credential(
     if not credential_service:
         raise HTTPException(status_code=400, detail="Unsupported credential storage type")
 
-    await credential_service.delete_credential(credential)
+    try:
+        await credential_service.delete_credential(credential)
+    except SkyvernHttpException as e:
+        detail = (
+            f"Custom credential service returned {e.error_message}"
+            if e.error_message
+            else f"Custom credential service returned HTTP {e.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=detail)
 
     # Schedule background cleanup if the service implements it
     if vault_type != CredentialVaultType.CUSTOM:
