@@ -177,7 +177,7 @@ async def test_db_operation_log_errors_false_suppresses_logging() -> None:
 @pytest.mark.asyncio
 async def test_db_operation_schedule_limit_exceeded_is_passthrough() -> None:
     """ScheduleLimitExceededError should be treated as business logic, not unexpected."""
-    from skyvern.forge.sdk.db.mixins.schedules import ScheduleLimitExceededError
+    from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError
 
     class ScheduleDB:
         @db_operation("create_schedule")

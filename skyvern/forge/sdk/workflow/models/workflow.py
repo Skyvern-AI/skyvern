@@ -15,6 +15,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
@@ -102,7 +103,7 @@ class Workflow(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
-    run_with: str | None = None
+    run_with: str = "agent"
     ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
@@ -112,6 +113,11 @@ class Workflow(BaseModel):
     sequential_key: str | None = None
     folder_id: str | None = None
     import_error: str | None = None
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str:
+        return normalize_run_with(v)
 
     created_at: datetime
     modified_at: datetime
@@ -182,6 +188,14 @@ class WorkflowRun(BaseModel):
     trigger_type: WorkflowRunTriggerType | None = None
     workflow_schedule_id: str | None = None
 
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str | None:
+        """Normalize legacy 'code_v2' but preserve None (means 'inherit from workflow')."""
+        if v == "code_v2":
+            return "code"
+        return v
+
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -195,21 +209,19 @@ def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
     Uses code_version >= 2 as the primary check. Falls back to the legacy
     adaptive_caching bool for rows that haven't been backfilled yet
     (code_version is None).
+
+    WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
+    Workflow.run_with is always "code" or "agent" after normalization.
     """
     run_with = workflow_run.run_with or workflow.run_with
-    # Explicit agent mode → never adaptive
     if run_with == "agent":
         return False
-    # When run_with is "code" (or legacy "code_v2"), check code_version
-    if run_with in ("code", "code_v2"):
+    # run_with == "code": check code_version
+    if run_with == "code":
         if workflow.code_version is not None:
             return workflow.code_version >= 2
         return workflow.adaptive_caching
-    # run_with is None — check code_version as the implicit fallback
-    # (workflows with code_version >= 2 implicitly run as code)
-    if workflow.code_version is not None:
-        return workflow.code_version >= 2
-    return workflow.adaptive_caching
+    return False
 
 
 class WorkflowRunParameter(BaseModel):
@@ -256,9 +268,14 @@ class WorkflowRunResponseBase(BaseModel):
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
-    run_with: str | None = None
+    run_with: str = "agent"
     script_run: ScriptRunResponse | None = None
     errors: list[dict[str, Any]] | None = None
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str:
+        return normalize_run_with(v)
 
 
 class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):

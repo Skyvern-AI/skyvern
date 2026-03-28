@@ -5,13 +5,15 @@ Guards against:
 - Re-export contracts breaking (ScheduleLimitExceededError used by cloud/routes/)
 """
 
+from skyvern.forge.sdk.db.base_repository import BaseRepository
+
 
 def test_agent_db_exports_schedule_limit_exceeded_error() -> None:
     """ScheduleLimitExceededError must be importable from agent_db (re-export contract)."""
     from skyvern.forge.sdk.db.agent_db import ScheduleLimitExceededError
 
-    # Verify it's the canonical class, not a shadow
-    from skyvern.forge.sdk.db.mixins.schedules import ScheduleLimitExceededError as Original
+    # Verify it's the canonical class from exceptions.py, not a shadow
+    from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError as Original
 
     assert ScheduleLimitExceededError is Original
 
@@ -23,30 +25,35 @@ def test_agent_db_exports_agent_db_class() -> None:
     assert AgentDB is not None
 
 
-def test_all_mixins_in_agent_db_mro() -> None:
-    """All 14 domain mixins must appear in AgentDB's MRO.
+def test_all_repositories_on_agent_db() -> None:
+    """All 14 domain repositories must be present as typed attributes on AgentDB.
 
-    If someone re-introduces a late import for any mixin, this test
-    catches it because the mixin won't be in the class hierarchy.
+    After the mixin-to-repository refactor, AgentDB uses composition instead
+    of inheritance. This test verifies every domain repository is wired up
+    by checking that __init__ assigns BaseRepository instances to each expected name.
     """
     from skyvern.forge.sdk.db.agent_db import AgentDB
 
-    mro_names = {cls.__name__ for cls in AgentDB.__mro__}
-    expected_mixins = [
-        "TasksMixin",
-        "WorkflowsMixin",
-        "WorkflowRunsMixin",
-        "WorkflowParametersMixin",
-        "SchedulesMixin",
-        "ArtifactsMixin",
-        "BrowserSessionsMixin",
-        "ScriptsMixin",
-        "OTPMixin",
-        "CredentialsMixin",
-        "FoldersMixin",
-        "OrganizationsMixin",
-        "ObserverMixin",
-        "DebugMixin",
+    expected_repos = [
+        "tasks",
+        "workflows",
+        "workflow_runs",
+        "workflow_params",
+        "schedules",
+        "artifacts",
+        "browser_sessions",
+        "scripts",
+        "otp",
+        "credentials",
+        "folders",
+        "organizations",
+        "observer",
+        "debug",
     ]
-    for name in expected_mixins:
-        assert name in mro_names, f"{name} missing from AgentDB MRO"
+    # Instantiate with a dummy database string (sqlite in-memory)
+    db = AgentDB("sqlite+aiosqlite:///", debug_enabled=False)
+    for repo in expected_repos:
+        assert hasattr(db, repo), f"Repository '{repo}' missing from AgentDB instance"
+        assert isinstance(getattr(db, repo), BaseRepository), (
+            f"AgentDB.{repo} should be a BaseRepository, got {type(getattr(db, repo))}"
+        )

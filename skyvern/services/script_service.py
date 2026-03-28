@@ -427,6 +427,8 @@ async def _create_workflow_block_run_and_task(
     label: str | None = None,
     model: dict[str, Any] | None = None,
     created_by: str | None = None,
+    totp_verification_url: str | None = None,
+    totp_identifier: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Create a workflow block run and optionally a task if workflow_run_id is available in context.
@@ -492,6 +494,8 @@ async def _create_workflow_block_run_and_task(
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
@@ -1089,13 +1093,12 @@ async def _fallback_to_ai_run(
     script_step_id = context.step_id
     try:
         LOG.info(
-            "Script trying to fallback to AI run",
+            "Script block failed, checking AI fallback",
             cache_key=cache_key,
+            block_type=block_type.value if hasattr(block_type, "value") else str(block_type),
+            error=str(error) if error else None,
             organization_id=organization_id,
-            workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
-            task_id=task_id,
-            step_id=script_step_id,
         )
         # 1. fail the previous step
         previous_step = await app.DATABASE.update_step(
@@ -1125,8 +1128,8 @@ async def _fallback_to_ai_run(
         )
         if not effective_ai_fallback:
             LOG.info(
-                "AI fallback is not enabled for the workflow",
-                workflow_id=workflow_id,
+                "AI fallback disabled — script failure will not be retried by agent",
+                cache_key=cache_key,
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
             )
@@ -1278,8 +1281,9 @@ async def _fallback_to_ai_run(
                 parameter_type=ParameterType.OUTPUT,
             )
         LOG.info(
-            "Script starting to fallback to AI run",
+            "Falling back to agent for block — script failed, AI will re-run",
             cache_key=cache_key,
+            block_type=block_type.value if hasattr(block_type, "value") else str(block_type),
             organization_id=organization_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
@@ -1746,6 +1750,8 @@ async def run_task(
             label=block_label,
             model=model,
             created_by="script",
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -2120,6 +2126,8 @@ async def action(
             label=cache_key,
             model=model,
             created_by="script",
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -2197,6 +2205,11 @@ async def login(
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         # render template with label
+        prompt = _render_template_with_label(prompt, cache_key) if prompt else prompt
+        if totp_url:
+            totp_url = _render_template_with_label(totp_url, cache_key)
+        if totp_identifier:
+            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.LOGIN,
             prompt=prompt,
@@ -2204,12 +2217,9 @@ async def login(
             label=cache_key,
             model=model,
             created_by="script",
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
         )
-        prompt = _render_template_with_label(prompt, cache_key)
-        if totp_url:
-            totp_url = _render_template_with_label(totp_url, cache_key)
-        if totp_identifier:
-            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
 
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()

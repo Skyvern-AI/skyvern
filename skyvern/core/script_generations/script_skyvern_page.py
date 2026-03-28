@@ -261,13 +261,30 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception as e:
             call.error = e
             action_status = ActionStatus.failed
-            # Note: Action status would be updated to failed here if update method existed
 
-            # Print failure in script mode
-            if context and context.script_mode:
-                print(f"  ✗ Failed: {str(e)}")
+            # Build a readable representation of the failed call.
+            # Only log the first positional arg (selector) — the second arg
+            # is often a value that could contain passwords or PII.
+            call_parts = [f"page.{fn.__name__}("]
+            if args:
+                call_parts.append(repr(args[0]))
+            key_kwargs = {k: v for k, v in kwargs.items() if k in ("selector", "prompt", "mode") and v is not None}
+            if key_kwargs:
+                if args:
+                    call_parts.append(", ")
+                call_parts.append(", ".join(f"{k}={repr(v)}" for k, v in key_kwargs.items()))
+            call_parts.append(")")
+            call_repr = "".join(call_parts)
 
-            # LLM fallback hook could go here ...
+            LOG.warning(
+                "Script action failed",
+                action_type=action.value if hasattr(action, "value") else str(action),
+                call=call_repr,
+                error=str(e),
+                script_id=context.script_id if context else None,
+                workflow_run_id=context.workflow_run_id if context else None,
+            )
+
             raise
         finally:
             # Add a small buffer between cached actions to give slow pages time to settle
