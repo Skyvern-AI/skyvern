@@ -188,6 +188,9 @@ class WorkflowRunsRepository(BaseRepository):
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_address: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -220,6 +223,10 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                if browser_address:
+                    workflow_run.browser_address = browser_address
+                if extra_http_headers:
+                    workflow_run.extra_http_headers = extra_http_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
                     workflow_run.waiting_for_verification_code = waiting_for_verification_code
@@ -233,6 +240,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.verification_code_polling_started_at = None
                 if browser_profile_id is not _UNSET:
                     workflow_run.browser_profile_id = browser_profile_id
+                if failure_category is not None:
+                    workflow_run.failure_category = failure_category
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
