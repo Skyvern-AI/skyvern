@@ -623,6 +623,8 @@ class WorkflowService:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
         if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
             workflow_request.extra_http_headers = workflow.extra_http_headers
+        if workflow_request.run_with is None:
+            workflow_request.run_with = workflow.run_with
 
         # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
         # Adaptive caching requires AI fallback to self-heal when cached scripts break.
@@ -630,7 +632,7 @@ class WorkflowService:
         effective_code_version = (
             workflow.code_version if workflow.code_version is not None else (2 if workflow.adaptive_caching else None)
         )
-        if (effective_code_version or 0) >= 2 and (workflow_request.run_with in ("code", None)):
+        if (effective_code_version or 0) >= 2 and (workflow_request.run_with == "code"):
             if workflow_request.ai_fallback is False:
                 LOG.info(
                     "Overriding ai_fallback to True for adaptive caching run",
@@ -5425,22 +5427,11 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Priority: run-level run_with > workflow-level run_with > code_version fallback > default (agent).
-        When code_version >= 1 at the workflow level and no explicit run_with is set,
-        the run defaults to code mode so cached scripts are actually used.
+        Priority: run-level run_with (if set) > workflow-level run_with.
+        Workflow.run_with is always "code" or "agent" after normalization
+        (NULL and code_version fallback resolved at read time).
+        WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
         """
-        if workflow_run.run_with in ("code", "code_v2"):
-            return True
-        if workflow_run.run_with == "agent":
-            return False
-        if workflow.run_with in ("code", "code_v2"):  # include legacy "code_v2" workflows
-            return True
-        if workflow.run_with == "agent":
-            return False
-        # No explicit run_with on either workflow or run — fall back to
-        # code_version / adaptive_caching: if the workflow has caching enabled, run code.
-        if workflow.code_version is not None:
-            return workflow.code_version >= 1
-        if workflow.adaptive_caching:
-            return True
-        return False
+        if workflow_run.run_with is not None:
+            return workflow_run.run_with == "code"
+        return workflow.run_with == "code"
