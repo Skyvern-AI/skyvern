@@ -1113,7 +1113,10 @@ async def skyvern_workflow_run(
         int, Field(description="Max wait time in seconds when wait=true (default 300)", ge=10, le=3600)
     ] = 300,
     run_with: Annotated[
-        str | None, Field(description="Execution mode override (e.g., 'code' for cached script execution)")
+        str | None,
+        Field(
+            description="Execution mode override (e.g., 'code' for cached script execution). Null inherits from workflow setting."
+        ),
     ] = None,
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
