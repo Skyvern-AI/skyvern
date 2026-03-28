@@ -426,6 +426,7 @@ class TasksRepository(BaseRepository):
         errors: list[dict[str, Any]] | None = None,
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
         if (
             status is None
@@ -434,6 +435,7 @@ class TasksRepository(BaseRepository):
             and errors is None
             and max_steps_per_run is None
             and webhook_failure_reason is None
+            and failure_category is None
         ):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
@@ -462,6 +464,8 @@ class TasksRepository(BaseRepository):
                     task.max_steps_per_run = max_steps_per_run
                 if webhook_failure_reason is not None:
                     task.webhook_failure_reason = webhook_failure_reason
+                if failure_category is not None:
+                    task.failure_category = failure_category
                 await session.commit()
                 updated_task = await self.get_task(task_id, organization_id=organization_id)
                 if not updated_task:
