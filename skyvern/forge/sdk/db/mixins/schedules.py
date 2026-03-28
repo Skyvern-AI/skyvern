@@ -23,12 +23,22 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
+from skyvern.forge.sdk.db._sentinels import _UNSET
+
 LOG = structlog.get_logger()
-_UNSET = object()
 
 
 class SchedulesMixin:
-    """Database operations for workflow schedules."""
+    """Database operations for workflow schedules.
+
+    .. deprecated::
+        This mixin is part of the legacy database layer. New code should use the
+        repository classes in ``skyvern.forge.sdk.db.repositories`` instead.
+
+        Cross-mixin migrations already completed:
+        - ``soft_delete_workflow_and_schedules_by_permanent_id`` → ``WorkflowsRepository``
+          (operates on workflows as the primary entity, schedules are a side-effect).
+    """
 
     Session: _SessionFactory
     engine: AsyncEngine
@@ -563,7 +573,14 @@ class SchedulesMixin:
         workflow_permanent_id: str,
         organization_id: str | None = None,
     ) -> list[str]:
-        """Soft-delete a workflow and its active schedules in a single DB transaction."""
+        """Soft-delete a workflow and its active schedules in a single DB transaction.
+
+        .. deprecated::
+            Moved to ``WorkflowsRepository.soft_delete_workflow_and_schedules_by_permanent_id``
+            (skyvern/forge/sdk/db/repositories/workflows.py). The primary entity is the
+            workflow, not the schedule, so it belongs in the workflows repository.
+            This copy remains for backward compatibility with the legacy mixin layer.
+        """
         async with self.Session() as session:
             select_query = (
                 select(WorkflowScheduleModel.workflow_schedule_id)

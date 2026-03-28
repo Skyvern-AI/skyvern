@@ -65,8 +65,9 @@ from skyvern.webeye.actions.actions import Action
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
+from skyvern.forge.sdk.db._sentinels import _UNSET
+
 LOG = structlog.get_logger()
-_UNSET = object()
 
 
 class WorkflowParametersMixin:

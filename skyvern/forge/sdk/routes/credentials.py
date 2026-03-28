@@ -1633,7 +1633,7 @@ async def update_bitwarden_credential(
     """
     try:
         # Atomically invalidate old + create new in a single transaction
-        auth_token = await app.DATABASE.replace_org_auth_token(
+        auth_token = await app.DATABASE.organizations.replace_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.bitwarden_credential,
             token=request.credential,

@@ -18,6 +18,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.models import (
     TaskModel,
     WorkflowModel,
@@ -45,8 +46,6 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.runs import ProxyLocationInput
-
-from . import _UNSET
 
 LOG = structlog.get_logger()
 

@@ -36,7 +36,16 @@ LOG = structlog.get_logger()
 
 
 class BrowserSessionsMixin:
-    """Database operations for browser profiles and persistent browser sessions."""
+    """Database operations for browser profiles and persistent browser sessions.
+
+    .. deprecated::
+        This mixin is part of the legacy database layer. New code should use the
+        repository classes in ``skyvern.forge.sdk.db.repositories`` instead.
+
+        Cross-mixin migrations already completed:
+        - ``get_last_workflow_run_for_browser_session`` → ``WorkflowRunsRepository``
+          (queries workflow runs as the primary entity, browser session is just a filter).
+    """
 
     Session: _SessionFactory
 
@@ -46,6 +55,9 @@ class BrowserSessionsMixin:
         browser_session_id: str,
         organization_id: str | None = None,
     ) -> WorkflowRun | None:
+        # Deprecated: moved to WorkflowRunsRepository.get_last_workflow_run_for_browser_session
+        # (skyvern/forge/sdk/db/repositories/workflow_runs.py). The primary entity is the
+        # workflow run, not the browser session. This copy remains for legacy mixin compatibility.
         async with self.Session() as session:
             # check if there's a queued run
             query = select(WorkflowRunModel).filter_by(browser_session_id=browser_session_id)
