@@ -427,6 +427,8 @@ async def _create_workflow_block_run_and_task(
     label: str | None = None,
     model: dict[str, Any] | None = None,
     created_by: str | None = None,
+    totp_verification_url: str | None = None,
+    totp_identifier: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Create a workflow block run and optionally a task if workflow_run_id is available in context.
@@ -492,6 +494,8 @@ async def _create_workflow_block_run_and_task(
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
@@ -1746,6 +1750,8 @@ async def run_task(
             label=block_label,
             model=model,
             created_by="script",
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -2120,6 +2126,8 @@ async def action(
             label=cache_key,
             model=model,
             created_by="script",
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -2197,6 +2205,11 @@ async def login(
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         # render template with label
+        prompt = _render_template_with_label(prompt, cache_key) if prompt else prompt
+        if totp_url:
+            totp_url = _render_template_with_label(totp_url, cache_key)
+        if totp_identifier:
+            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.LOGIN,
             prompt=prompt,
@@ -2204,12 +2217,9 @@ async def login(
             label=cache_key,
             model=model,
             created_by="script",
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
         )
-        prompt = _render_template_with_label(prompt, cache_key)
-        if totp_url:
-            totp_url = _render_template_with_label(totp_url, cache_key)
-        if totp_identifier:
-            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
 
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
