@@ -1089,13 +1089,12 @@ async def _fallback_to_ai_run(
     script_step_id = context.step_id
     try:
         LOG.info(
-            "Script trying to fallback to AI run",
+            "Script block failed, checking AI fallback",
             cache_key=cache_key,
+            block_type=block_type.value if hasattr(block_type, "value") else str(block_type),
+            error=str(error) if error else None,
             organization_id=organization_id,
-            workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
-            task_id=task_id,
-            step_id=script_step_id,
         )
         # 1. fail the previous step
         previous_step = await app.DATABASE.update_step(
@@ -1125,8 +1124,8 @@ async def _fallback_to_ai_run(
         )
         if not effective_ai_fallback:
             LOG.info(
-                "AI fallback is not enabled for the workflow",
-                workflow_id=workflow_id,
+                "AI fallback disabled — script failure will not be retried by agent",
+                cache_key=cache_key,
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
             )
@@ -1278,8 +1277,9 @@ async def _fallback_to_ai_run(
                 parameter_type=ParameterType.OUTPUT,
             )
         LOG.info(
-            "Script starting to fallback to AI run",
+            "Falling back to agent for block — script failed, AI will re-run",
             cache_key=cache_key,
+            block_type=block_type.value if hasattr(block_type, "value") else str(block_type),
             organization_id=organization_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
