@@ -2445,6 +2445,24 @@
             "description": "Number of items per page"
           },
           {
+            "name": "vault_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CredentialVaultType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "title": "Vault Type"
+            },
+            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -13751,7 +13769,7 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether to run the task with agent or code.",
+            "description": "Whether to run the task with agent or code. Null means use the default.",
             "examples": [
               "agent",
               "code"
@@ -16076,15 +16094,9 @@
             "title": "Extra Http Headers"
           },
           "run_with": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run With"
+            "type": "string",
+            "title": "Run With",
+            "default": "agent"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -16327,15 +16339,9 @@
             "default": "published"
           },
           "run_with": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run With"
+            "type": "string",
+            "title": "Run With",
+            "default": "agent"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -17132,6 +17138,21 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "failure_category": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Category"
           },
           "parent_workflow_run_id": {
             "anyOf": [
@@ -17964,7 +17985,7 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether to run the workflow with agent or code.",
+            "description": "Whether to run the workflow with agent or code. Null inherits from the workflow setting.",
             "examples": [
               "agent",
               "code"
@@ -18238,16 +18259,10 @@
             "description": "Type of run - always workflow_run for workflow runs"
           },
           "run_with": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
             "title": "Run With",
             "description": "Whether the workflow run was executed with agent or code",
+            "default": "agent",
             "examples": [
               "agent",
               "code"
