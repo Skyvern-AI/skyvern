@@ -1476,7 +1476,7 @@ async def _regenerate_script_block_after_ai_fallback(
         if not cache_key_value:
             cache_key_value = cache_key  # Fallback
 
-        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
+        existing_script, _is_pinned = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=cache_key_value,

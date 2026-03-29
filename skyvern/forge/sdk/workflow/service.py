@@ -1032,7 +1032,9 @@ class WorkflowService:
 
         try:
             # Check if there's a related workflow script that should be used instead
-            workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
+            workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
+                workflow, workflow_run, block_labels
+            )
             current_context = skyvern_context.current()
             if current_context:
                 if workflow_script:
@@ -1048,6 +1050,7 @@ class WorkflowService:
                 block_labels=block_labels,
                 block_outputs=block_outputs,
                 script=workflow_script,
+                script_is_pinned=script_is_pinned,
             )
 
             # Check if there's a finally block configured
@@ -1223,6 +1226,7 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
         script: Script | None = None,
+        script_is_pinned: bool = False,
     ) -> tuple[WorkflowRun, set[str]]:
         organization_id = organization.organization_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -1297,7 +1301,7 @@ class WorkflowService:
                             )
                             if loaded_script_module:
                                 # Mark static (pinned) scripts so complete() skips LLM verification
-                                if script.is_pinned:
+                                if script_is_pinned:
                                     pinned_ctx = skyvern_context.current()
                                     if pinned_ctx:
                                         pinned_ctx.is_static_script = True
@@ -4847,7 +4851,7 @@ class WorkflowService:
             # request is not made
             return None
 
-        existing_script, rendered_cache_key_value = await workflow_script_service.get_workflow_script(
+        existing_script, rendered_cache_key_value, _is_pinned = await workflow_script_service.get_workflow_script(
             workflow,
             workflow_run,
             block_labels,
@@ -4941,7 +4945,7 @@ class WorkflowService:
                 to handle race conditions where another process regenerated while we waited.
                 """
                 # Double-check: another process may have regenerated while we waited for lock
-                fresh_script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+                fresh_script, _is_pinned = await workflow_script_service.get_workflow_script_by_cache_key_value(
                     organization_id=workflow.organization_id,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     cache_key_value=rendered_cache_key_value,

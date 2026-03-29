@@ -505,8 +505,13 @@ class ScriptsRepository(BaseRepository):
         workflow_run_id: str | None = None,
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
-    ) -> Script | None:
-        """Get latest script version linked to a workflow by a specific cache_key_value."""
+    ) -> tuple[Script | None, bool]:
+        """Get latest script version linked to a workflow by a specific cache_key_value.
+
+        Returns:
+            A tuple of (script, is_pinned). The repository implementation does not
+            support pinned queries, so is_pinned is always False.
+        """
         async with self.Session() as session:
             # Build the query: join workflow_scripts with scripts
             # Join on both script_id and organization_id to leverage uc_org_script_version index
@@ -539,7 +544,7 @@ class ScriptsRepository(BaseRepository):
             query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
 
             script = (await session.scalars(query)).first()
-            return convert_to_script(script) if script else None
+            return (convert_to_script(script), False) if script else (None, False)
 
     @db_operation("get_workflow_cache_key_count")
     async def get_workflow_cache_key_count(

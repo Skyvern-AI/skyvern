@@ -452,7 +452,7 @@ class ScriptsMixin:
         workflow_run_id: str | None = None,
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
-    ) -> Script | None:
+    ) -> tuple[Script | None, bool]:
         """Get the best script version linked to a workflow by a specific cache_key_value.
 
         Selection priority:
@@ -460,6 +460,10 @@ class ScriptsMixin:
            current when pinning occurred (i.e. the version the pinned row
            points to).  This ensures pinned scripts are immutable.
         2. Otherwise, return the latest version by version number.
+
+        Returns:
+            A tuple of (script, is_pinned) where is_pinned indicates whether
+            the returned script came from a pinned workflow_script row.
         """
         async with self.Session() as session:
             # Build the query: join workflow_scripts with scripts
@@ -505,7 +509,7 @@ class ScriptsMixin:
             )
             pinned = (await session.scalars(pinned_query)).first()
             if pinned:
-                return convert_to_script(pinned)
+                return convert_to_script(pinned), True
 
             # --- Fall back to latest version ---
             latest_query = (
@@ -516,7 +520,7 @@ class ScriptsMixin:
                 .limit(1)
             )
             script = (await session.scalars(latest_query)).first()
-            return convert_to_script(script) if script else None
+            return (convert_to_script(script), False) if script else (None, False)
 
     @db_operation("get_workflow_cache_key_count")
     async def get_workflow_cache_key_count(
