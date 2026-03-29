@@ -191,10 +191,10 @@ class WorkflowRun(BaseModel):
     @field_validator("run_with", mode="before")
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str | None:
-        """Normalize legacy 'code_v2' but preserve None (means 'inherit from workflow')."""
-        if v == "code_v2":
-            return "code"
-        return v
+        """Normalize legacy values but preserve None (means 'inherit from workflow')."""
+        if v is None:
+            return None
+        return normalize_run_with(v)
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
