@@ -215,6 +215,17 @@ async def _handle_task_v2_termination(
     )
 
     resolved_failure_category = failure_category or classify_from_failure_reason(termination_reason)
+    LOG.info(
+        "Task failure classified",
+        task_v2_id=task_v2_id,
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        task_status="terminated",
+        failure_category=resolved_failure_category,
+        primary_failure_category=resolved_failure_category[0].get("category") if resolved_failure_category else None,
+        failure_category_source="llm" if failure_category else "code_level",
+        failure_category_path="v2_terminate",
+    )
     task_v2 = await mark_task_v2_as_terminated(
         task_v2_id=task_v2_id,
         workflow_run_id=workflow_run_id,
@@ -1124,7 +1135,20 @@ async def run_task_v2_helper(
                 f' "x-max-steps-override" header with your desired number'
                 f" of steps in the API request."
             )
-            failure_category = llm_failure_categories or classify_from_failure_reason(full_failure_reason)
+            failure_category = llm_failure_categories or classify_from_failure_reason(
+                full_failure_reason, fallback_to_unknown=True
+            )
+            LOG.info(
+                "Task failure classified",
+                task_v2_id=task_v2_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                task_status="failed",
+                failure_category=failure_category,
+                primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                failure_category_source="llm" if llm_failure_categories else "code_level",
+                failure_category_path="v2_max_steps",
+            )
             task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
@@ -1135,16 +1159,34 @@ async def run_task_v2_helper(
             return workflow, workflow_run, task_v2
     else:
         # Loop completed without early exit - task exceeded max iterations
+        max_iterations_failure_reason = f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps."
+        max_iterations_failure_category = classify_from_failure_reason(
+            max_iterations_failure_reason, fallback_to_unknown=True
+        )
         LOG.info(
             "Task v2 failed - exceeded maximum iterations",
             max_iterations=DEFAULT_MAX_ITERATIONS,
             workflow_run_id=workflow_run_id,
         )
+        LOG.info(
+            "Task failure classified",
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            task_status="failed",
+            failure_category=max_iterations_failure_category,
+            primary_failure_category=max_iterations_failure_category[0].get("category")
+            if max_iterations_failure_category
+            else None,
+            failure_category_source="code_level",
+            failure_category_path="v2_max_iterations",
+        )
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
-            failure_reason=f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps.",
+            failure_reason=max_iterations_failure_reason,
             organization_id=organization_id,
+            failure_category=max_iterations_failure_category,
         )
 
     return workflow, workflow_run, task_v2

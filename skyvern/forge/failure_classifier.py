@@ -4,10 +4,17 @@ from __future__ import annotations
 def classify_from_failure_reason(
     failure_reason: str | None,
     exception: Exception | None = None,
+    fallback_to_unknown: bool = False,
 ) -> list[dict] | None:
     """Classify failure from failure_reason text and/or exception type.
 
     Returns list of categories sorted by confidence, or None if no classification.
+
+    When ``fallback_to_unknown`` is True and no keywords match, returns a single
+    UNKNOWN category instead of None.  Use True for paths that are *always* failures
+    (exception, max_steps, max_retries).  Use False (the default) for terminate paths
+    where the absence of a classification may simply mean the termination was
+    user-guided / expected.
 
     Categories:
         ANTI_BOT_DETECTION, BROWSER_ERROR, NAVIGATION_FAILURE, PAGE_LOAD_TIMEOUT,
@@ -161,6 +168,8 @@ def classify_from_failure_reason(
         )
 
     if not categories:
+        if fallback_to_unknown:
+            return [{"category": "UNKNOWN", "confidence_float": 0.5, "reasoning": "No keyword match found"}]
         return None
 
     # Sort by confidence descending

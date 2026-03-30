@@ -280,3 +280,36 @@ class TestExceptionOnlyClassification:
         result = classify_from_failure_reason(None, exception=BrowserCrashError())
         assert result is not None
         assert result[0]["category"] == "BROWSER_ERROR"
+
+
+class TestFallbackToUnknown:
+    def test_unrecognized_with_fallback_returns_unknown(self) -> None:
+        """When fallback_to_unknown=True and no keywords match, return UNKNOWN."""
+        result = classify_from_failure_reason("The Resume/CV field is required but empty", fallback_to_unknown=True)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["category"] == "UNKNOWN"
+        assert result[0]["confidence_float"] == 0.5
+
+    def test_unrecognized_without_fallback_returns_none(self) -> None:
+        """Default fallback_to_unknown=False preserves existing None behavior."""
+        result = classify_from_failure_reason("The Resume/CV field is required but empty")
+        assert result is None
+
+    def test_none_input_with_fallback_returns_none(self) -> None:
+        """None input returns None even with fallback_to_unknown=True (no data = no classification)."""
+        result = classify_from_failure_reason(None, fallback_to_unknown=True)
+        assert result is None
+
+    def test_empty_input_with_fallback_returns_none(self) -> None:
+        """Empty string returns None even with fallback_to_unknown=True."""
+        result = classify_from_failure_reason("", fallback_to_unknown=True)
+        assert result is None
+
+    def test_keyword_match_ignores_fallback(self) -> None:
+        """When keywords match, fallback_to_unknown has no effect on the result."""
+        result_with = classify_from_failure_reason("browser crash detected", fallback_to_unknown=True)
+        result_without = classify_from_failure_reason("browser crash detected", fallback_to_unknown=False)
+        assert result_with is not None
+        assert result_without is not None
+        assert result_with[0]["category"] == result_without[0]["category"] == "BROWSER_ERROR"

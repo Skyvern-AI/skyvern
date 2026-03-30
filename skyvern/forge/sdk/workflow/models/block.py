@@ -4638,6 +4638,7 @@ class TaskV2Block(Block):
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
+            "failure_category": task_v2.failure_category,
             "downloaded_files": [fi.model_dump() for fi in downloaded_files],
             "downloaded_file_urls": [fi.url for fi in downloaded_files],
             "task_screenshot_artifact_ids": [a.artifact_id for a in task_screenshot_artifacts],
@@ -4647,7 +4648,7 @@ class TaskV2Block(Block):
         return await self.build_block_result(
             success=success or self.continue_on_failure,
             failure_reason=failure_reason,
-            output_parameter_value=result_dict,
+            output_parameter_value=task_v2_output,
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
