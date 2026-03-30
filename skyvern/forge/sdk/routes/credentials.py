@@ -34,7 +34,9 @@ from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
 from skyvern.config import settings
 from skyvern.exceptions import HttpException as SkyvernHttpException
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -83,6 +85,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     CreateOnePasswordTokenResponse,
     CustomCredentialServiceConfigResponse,
     Organization,
+    TestConnectionResponse,
 )
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
@@ -99,6 +102,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services.otp_service import OTPValue, parse_otp_login
 from skyvern.services.run_service import cancel_workflow_run
+from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
 
@@ -1868,6 +1872,80 @@ async def update_custom_credential_service_config(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create or update custom credential service configuration: {e!s}",
+        ) from e
+
+
+@base_router.post(
+    "/credentials/custom_credential/test_connection",
+    summary="Test Custom Credential Service Connection",
+    description="Tests connectivity to the custom credential service API.",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/custom_credential/test_connection/",
+    include_in_schema=False,
+)
+async def test_custom_credential_service_connection(
+    request: CreateCustomCredentialServiceConfigRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TestConnectionResponse:
+    """
+    Test connectivity to the custom credential service API.
+
+    Makes a GET request to the api_base_url with the provided Bearer token
+    to verify the service is reachable and the token is valid.
+    Uses the shared URL validator for scheme/host validation (respects ALLOWED_HOSTS / BLOCKED_HOSTS).
+    """
+    api_base_url = request.config.api_base_url
+    api_token = request.config.api_token
+
+    try:
+        validated_url = validate_url(api_base_url)
+    except SkyvernHTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+
+    if not validated_url:
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    try:
+        status_code, _, _ = await aiohttp_request(
+            method="GET",
+            url=validated_url,
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=10,
+        )
+
+        if 200 <= status_code < 300:
+            LOG.info(
+                "Custom credential service connection test succeeded",
+                organization_id=current_org.organization_id,
+                api_base_url=api_base_url,
+                status_code=status_code,
+            )
+            return TestConnectionResponse(success=True)
+
+        LOG.warning(
+            "Custom credential service returned non-2xx status",
+            organization_id=current_org.organization_id,
+            api_base_url=api_base_url,
+            status_code=status_code,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Connection test failed: server returned HTTP {status_code}",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.warning(
+            "Custom credential service connection test failed",
+            organization_id=current_org.organization_id,
+            api_base_url=api_base_url,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Connection test failed: could not reach the specified URL",
         ) from e
 
 
