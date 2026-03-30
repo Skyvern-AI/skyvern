@@ -11,7 +11,7 @@ import smtplib
 import textwrap
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
@@ -3652,9 +3652,11 @@ class FileParserBlock(Block):
             for key, value in record.items():
                 if pd.isna(value) or value == "NaN" or value == "NaT":
                     record[key] = "nan"
-                elif isinstance(value, (pd.Timestamp, pd.DatetimeTZDtype)):
-                    # Convert pandas timestamps to ISO format strings
-                    record[key] = value.isoformat() if pd.notna(value) else "nan"
+                elif isinstance(value, (pd.Timestamp, datetime, date, time)):
+                    # NaT timestamps are already caught by pd.isna() above, so this is always valid
+                    record[key] = value.isoformat()
+                elif isinstance(value, pd.Timedelta):
+                    record[key] = str(value)
 
         return records
 
