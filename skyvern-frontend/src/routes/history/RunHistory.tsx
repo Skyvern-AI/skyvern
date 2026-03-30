@@ -207,7 +207,7 @@ function RunHistory() {
         />
       </div>
       <div className="rounded-lg border">
-        <Table>
+        <Table className="sm:table-fixed">
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
               <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
@@ -215,11 +215,11 @@ function RunHistory() {
               </TableHead>
               <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
               <TableHead className="w-[16%] text-slate-400">Status</TableHead>
-              <TableHead className="w-[16%] text-slate-400">
+              <TableHead className="w-[27%] text-slate-400">
                 Created At
               </TableHead>
-              <TableHead className="w-[16%] text-slate-400">Duration</TableHead>
-              <TableHead className="w-[12%] rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[8%] text-slate-400">Duration</TableHead>
+              <TableHead className="w-[8%] rounded-tr-lg text-slate-400"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -267,7 +267,7 @@ function RunHistory() {
                       >
                         {basicLocalTimeFormat(run.created_at)}
                       </TableCell>
-                      <TableCell className="text-slate-400">
+                      <TableCell className="truncate text-slate-400">
                         {taskExecutionTime ?? "-"}
                       </TableCell>
                       {/* Align with workflow row's expand button column. */}
@@ -347,7 +347,7 @@ function RunHistory() {
                             )}
                         </div>
                       </TableCell>
-                      <TableCell className="text-slate-400">
+                      <TableCell className="truncate text-slate-400">
                         {workflowExecutionTime ?? "-"}
                       </TableCell>
                       <TableCell>
