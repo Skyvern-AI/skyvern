@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
 
     # Script reviewer settings
-    FAILURE_REVIEW_DAILY_CAP: int = 3  # Max failure-triggered script reviews per wpid per day
+    SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
 
     ADDITIONAL_MODULES: list[str] = []
 

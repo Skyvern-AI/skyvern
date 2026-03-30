@@ -20,6 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
+from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
@@ -274,7 +275,9 @@ class FolderModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
-class WorkflowModel(Base):
+# TODO: ~22 other models with manual deleted_at columns could inherit SoftDeleteMixin.
+# WorkflowModel is the proof of concept; remaining models will be migrated in a follow-up PR.
+class WorkflowModel(SoftDeleteMixin, Base):
     __tablename__ = "workflows"
     __table_args__ = (
         UniqueConstraint(
@@ -322,13 +325,12 @@ class WorkflowModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
-    deleted_at = Column(DateTime, nullable=True)
-
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
     version = Column(Integer, default=1, nullable=False)
     is_saved_task = Column(Boolean, default=False, nullable=False)
 
 
+# TODO: Apply SoftDeleteMixin to WorkflowScheduleModel (requires migration + query audit)
 class WorkflowScheduleModel(Base):
     __tablename__ = "workflow_schedules"
     __table_args__ = (

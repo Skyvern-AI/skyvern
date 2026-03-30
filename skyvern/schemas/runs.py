@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
     ERROR_CODE_MAPPING_EXAMPLES,
@@ -447,9 +448,16 @@ class TaskRunRequest(BaseModel):
     )
     run_with: str | None = Field(
         default=None,
-        description="Whether to run the task with agent or code.",
+        description="Whether to run the task with agent or code. Null means use the default.",
         examples=["agent", "code"],
     )
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return normalize_run_with(v)
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod
@@ -521,17 +529,16 @@ class WorkflowRunRequest(BaseModel):
     )
     run_with: str | None = Field(
         default=None,
-        description="Whether to run the workflow with agent or code.",
+        description="Whether to run the workflow with agent or code. Null inherits from the workflow setting.",
         examples=["agent", "code"],
     )
 
     @field_validator("run_with", mode="before")
     @classmethod
-    def normalize_run_with(cls, v: str | None) -> str | None:
-        """Normalize legacy 'code_v2' to 'code'."""
-        if v == "code_v2":
-            return "code"
-        return v
+    def _normalize_run_with(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return normalize_run_with(v)
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
@@ -640,19 +647,16 @@ class TaskRunResponse(BaseRunResponse):
 
 class WorkflowRunResponse(BaseRunResponse):
     run_type: Literal[RunType.workflow_run] = Field(description="Type of run - always workflow_run for workflow runs")
-    run_with: str | None = Field(
-        default=None,
+    run_with: str = Field(
+        default="agent",
         description="Whether the workflow run was executed with agent or code",
         examples=["agent", "code"],
     )
 
     @field_validator("run_with", mode="before")
     @classmethod
-    def normalize_run_with(cls, v: str | None) -> str | None:
-        """Normalize legacy 'code_v2' to 'code' in API responses."""
-        if v == "code_v2":
-            return "code"
-        return v
+    def _normalize_run_with(cls, v: str | None) -> str:
+        return normalize_run_with(v)
 
     ai_fallback: bool | None = Field(
         default=None,

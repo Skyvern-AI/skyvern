@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, Coroutine, NoReturn
 
+import typer
 from rich.console import Console
 from rich.table import Table
 
 console = Console()
+
+ENVELOPE_SCHEMA_VERSION = "1.0"
 
 
 def output(
@@ -17,7 +22,17 @@ def output(
     json_mode: bool = False,
 ) -> None:
     if json_mode:
-        envelope: dict[str, Any] = {"ok": True, "action": action, "data": data, "error": None}
+        envelope: dict[str, Any] = {
+            "schema_version": ENVELOPE_SCHEMA_VERSION,
+            "ok": True,
+            "action": action,
+            "data": data,
+            "error": None,
+            "warnings": [],
+            "browser_context": None,
+            "artifacts": None,
+            "timing_ms": None,
+        }
         json.dump(envelope, sys.stdout, indent=2, default=str)
         sys.stdout.write("\n")
         return
@@ -35,13 +50,25 @@ def output(
         console.print(str(data))
 
 
-def output_error(message: str, *, hint: str = "", json_mode: bool = False, exit_code: int = 1) -> None:
+def output_error(
+    message: str,
+    *,
+    hint: str = "",
+    action: str = "",
+    json_mode: bool = False,
+    exit_code: int = 1,
+) -> NoReturn:
     if json_mode:
         envelope: dict[str, Any] = {
+            "schema_version": ENVELOPE_SCHEMA_VERSION,
             "ok": False,
-            "action": "",
+            "action": action,
             "data": None,
             "error": {"message": message, "hint": hint},
+            "warnings": [],
+            "browser_context": None,
+            "artifacts": None,
+            "timing_ms": None,
         }
         json.dump(envelope, sys.stdout, indent=2, default=str)
         sys.stdout.write("\n")
@@ -50,3 +77,64 @@ def output_error(message: str, *, hint: str = "", json_mode: bool = False, exit_
     if hint:
         console.print(f"[yellow]Hint: {hint}[/yellow]")
     raise SystemExit(exit_code)
+
+
+def emit_tool_result(result: dict[str, Any], *, json_output: bool) -> None:
+    """Emit an MCP tool result, preserving the full MCP envelope shape in JSON mode."""
+    if json_output:
+        envelope = {**result}
+        envelope.setdefault("schema_version", ENVELOPE_SCHEMA_VERSION)
+        envelope.setdefault("warnings", [])
+        envelope.setdefault("browser_context", None)
+        envelope.setdefault("artifacts", None)
+        envelope.setdefault("timing_ms", None)
+        json.dump(envelope, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+        if not result.get("ok", False):
+            raise SystemExit(1)
+        return
+
+    if result.get("ok", False):
+        output(result.get("data"), action=str(result.get("action", "")), json_mode=False)
+        return
+
+    err = result.get("error") or {}
+    output_error(
+        str(err.get("message") or "Unknown error"),
+        hint=str(err.get("hint") or ""),
+        action=str(result.get("action") or ""),
+        json_mode=False,
+    )
+
+
+def run_tool(
+    runner: Callable[[], Coroutine[Any, Any, dict[str, Any]]],
+    *,
+    json_output: bool,
+    hint_on_exception: str,
+    action: str = "",
+) -> None:
+    """Run an async MCP tool and emit the result."""
+    try:
+        result: dict[str, Any] = asyncio.run(runner())
+        emit_tool_result(result, json_output=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint=hint_on_exception, action=action, json_mode=json_output)
+
+
+def resolve_inline_or_file(value: str | None, *, param_name: str) -> str | None:
+    """Resolve a value that may be a literal string or an @file reference."""
+    if value is None or not value.startswith("@"):
+        return value
+
+    file_path = value[1:]
+    if not file_path:
+        raise typer.BadParameter(f"{param_name} file path cannot be empty after '@'.")
+
+    path = Path(file_path).expanduser()
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise typer.BadParameter(f"Unable to read {param_name} file '{path}': {e}") from e

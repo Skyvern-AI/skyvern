@@ -623,6 +623,8 @@ class WorkflowService:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
         if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
             workflow_request.extra_http_headers = workflow.extra_http_headers
+        if workflow_request.run_with is None:
+            workflow_request.run_with = workflow.run_with
 
         # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
         # Adaptive caching requires AI fallback to self-heal when cached scripts break.
@@ -630,7 +632,7 @@ class WorkflowService:
         effective_code_version = (
             workflow.code_version if workflow.code_version is not None else (2 if workflow.adaptive_caching else None)
         )
-        if (effective_code_version or 0) >= 2 and (workflow_request.run_with in ("code", None)):
+        if (effective_code_version or 0) >= 2 and (workflow_request.run_with == "code"):
             if workflow_request.ai_fallback is False:
                 LOG.info(
                     "Overriding ai_fallback to True for adaptive caching run",
@@ -1030,7 +1032,9 @@ class WorkflowService:
 
         try:
             # Check if there's a related workflow script that should be used instead
-            workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
+            workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
+                workflow, workflow_run, block_labels
+            )
             current_context = skyvern_context.current()
             if current_context:
                 if workflow_script:
@@ -1046,6 +1050,7 @@ class WorkflowService:
                 block_labels=block_labels,
                 block_outputs=block_outputs,
                 script=workflow_script,
+                script_is_pinned=script_is_pinned,
             )
 
             # Check if there's a finally block configured
@@ -1221,6 +1226,7 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
         script: Script | None = None,
+        script_is_pinned: bool = False,
     ) -> tuple[WorkflowRun, set[str]]:
         organization_id = organization.organization_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -1276,17 +1282,39 @@ class WorkflowService:
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
                             loaded_script_module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(loaded_script_module)
-                            param_cls = getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
+                            try:
+                                spec.loader.exec_module(loaded_script_module)
+                            except Exception:
+                                # Static scripts may fail with spec_from_file_location
+                                # due to circular imports. Delegate to AgentFunction for
+                                # platform-specific fallback loading.
+                                LOG.warning("exec_module failed, trying import_module fallback", exc_info=True)
+                                loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+                            param_cls = (
+                                getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
+                                if loaded_script_module
+                                else None
+                            )
                             await skyvern.setup(
                                 script_parameters,
                                 generated_parameter_cls=param_cls,
                             )
-                            LOG.info(
-                                "Successfully loaded script module",
-                                script_id=script.script_id,
-                                block_count=len(script_blocks_by_label),
-                            )
+                            if loaded_script_module:
+                                # Mark static (pinned) scripts so complete() skips LLM verification
+                                if script_is_pinned:
+                                    pinned_ctx = skyvern_context.current()
+                                    if pinned_ctx:
+                                        pinned_ctx.is_static_script = True
+                                LOG.info(
+                                    "Successfully loaded script module",
+                                    script_id=script.script_id,
+                                    block_count=len(script_blocks_by_label),
+                                )
+                            else:
+                                LOG.warning(
+                                    "Script module failed to load, blocks will fall back to agent",
+                                    script_id=script.script_id,
+                                )
                     else:
                         LOG.warning(
                             "Script file not found at path",
@@ -1328,6 +1356,10 @@ class WorkflowService:
                         script_parameters,
                         generated_parameter_cls=param_cls,
                     )
+                    # Mark context so static scripts skip LLM completion verification
+                    static_ctx = skyvern_context.current()
+                    if static_ctx:
+                        static_ctx.is_static_script = True
                     LOG.info(
                         "Static script loaded successfully",
                         script_id=script.script_id if script else None,
@@ -1566,6 +1598,10 @@ class WorkflowService:
 
         context = skyvern_context.current()
         if not context or not context.generate_script:
+            return
+
+        # Skip script generation for static (pinned) scripts
+        if context.is_static_script:
             return
 
         disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
@@ -2997,13 +3033,13 @@ class WorkflowService:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
     ) -> Workflow:
         workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
@@ -3048,7 +3084,7 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
     ) -> list[Workflow]:
         """
         Get all versions of a workflow by its permanent ID.
@@ -3057,7 +3093,7 @@ class WorkflowService:
         workflows = await app.DATABASE.get_workflow_versions_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
         return workflows
 
@@ -3065,12 +3101,12 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
     ) -> Workflow:
         workflow = await app.DATABASE.get_workflow_for_workflow_run(
             workflow_run_id,
             organization_id=organization_id,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
 
         if not workflow:
@@ -3083,14 +3119,14 @@ class WorkflowService:
         workflow_permanent_id: str,
         user_id: str,
         organization_id: str,
-        exclude_deleted: bool = True,
+        filter_deleted: bool = True,
         version: int | None = None,
     ) -> dict[str, dict[str, Any]]:
         workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
-            exclude_deleted=exclude_deleted,
+            filter_deleted=filter_deleted,
         )
 
         if not workflow:
@@ -3208,7 +3244,7 @@ class WorkflowService:
         previous_valid_workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization_id=organization_id,
-            exclude_deleted=True,
+            filter_deleted=True,
             ignore_version=workflow.version,
         )
 
@@ -4551,7 +4587,7 @@ class WorkflowService:
             existing_latest_workflow = await self.get_workflow_by_permanent_id(
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
-                exclude_deleted=False,
+                filter_deleted=False,
             )
         else:
             existing_latest_workflow = None
@@ -4815,7 +4851,7 @@ class WorkflowService:
             # request is not made
             return None
 
-        existing_script, rendered_cache_key_value = await workflow_script_service.get_workflow_script(
+        existing_script, rendered_cache_key_value, _is_pinned = await workflow_script_service.get_workflow_script(
             workflow,
             workflow_run,
             block_labels,
@@ -4823,6 +4859,19 @@ class WorkflowService:
 
         # Manages cached workflow script regeneration with conditional-aware locking and versioning
         if existing_script:
+            # Pinned static scripts (created by ensure_static_script) should
+            # never be regenerated — they are hand-written and authoritative.
+            # Only check for pinned scripts when running a static script (avoids
+            # an extra DB query for every non-static cached-script workflow).
+            ctx = skyvern_context.current()
+            if ctx and ctx.is_static_script:
+                LOG.info(
+                    "Skipping script generation for pinned static script",
+                    script_id=existing_script.script_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                return None
+
             cached_block_labels: set[str] = set()
             script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
                 script_revision_id=existing_script.script_revision_id,
@@ -4896,7 +4945,7 @@ class WorkflowService:
                 to handle race conditions where another process regenerated while we waited.
                 """
                 # Double-check: another process may have regenerated while we waited for lock
-                fresh_script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+                fresh_script, _is_pinned = await workflow_script_service.get_workflow_script_by_cache_key_value(
                     organization_id=workflow.organization_id,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     cache_key_value=rendered_cache_key_value,
@@ -5066,22 +5115,19 @@ class WorkflowService:
                 )
                 return
 
-            # Determine if this is a failure-triggered review (script crashed, run failed)
-            # vs a fallback-triggered review (script failed but agent succeeded).
-            # Failure reviews are capped per wpid per day to prevent spam.
-            is_failure_review = pre_finally_status == WorkflowRunStatus.failed
-
-            if is_failure_review:
-                cap_exceeded = await self._check_failure_review_cap(
+            # Cap ALL script reviews (fallback + failure) per wpid per day to prevent
+            # runaway revision churn when the same issue repeats every run.
+            cap_exceeded = await self._check_script_review_cap(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+            )
+            if cap_exceeded:
+                LOG.info(
+                    "Skipping script review — daily cap exceeded for wpid",
                     workflow_permanent_id=workflow.workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    pre_finally_status=pre_finally_status,
                 )
-                if cap_exceeded:
-                    LOG.info(
-                        "Skipping failure-triggered script review — daily cap exceeded for wpid",
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                        workflow_run_id=workflow_run.workflow_run_id,
-                    )
-                    return
+                return
 
             # Non-blocking lock per script family
             cache = CacheFactory.get_cache()
@@ -5110,10 +5156,10 @@ class WorkflowService:
                 await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
                 review_ran = True
 
-            # Increment the failure review counter ONLY after a review actually ran.
+            # Increment the review counter ONLY after a review actually ran.
             # Skipped reviews (e.g., LockError) should not consume cap budget.
-            if is_failure_review and review_ran:
-                await self._increment_failure_review_counter(
+            if review_ran:
+                await self._increment_script_review_counter(
                     workflow_permanent_id=workflow.workflow_permanent_id,
                 )
         except Exception:
@@ -5124,13 +5170,13 @@ class WorkflowService:
             )
 
     @staticmethod
-    def _failure_review_cap_key(workflow_permanent_id: str) -> str:
-        """Build the Redis key for the daily failure-review counter."""
+    def _script_review_cap_key(workflow_permanent_id: str) -> str:
+        """Build the Redis key for the daily script-review counter."""
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        return f"script_reviewer:failure_cap:{workflow_permanent_id}:{today}"
+        return f"script_reviewer:daily_cap:{workflow_permanent_id}:{today}"
 
-    async def _check_failure_review_cap(self, workflow_permanent_id: str) -> bool:
-        """Check if the daily failure-review cap has been reached for this wpid.
+    async def _check_script_review_cap(self, workflow_permanent_id: str) -> bool:
+        """Check if the daily script-review cap has been reached for this wpid.
 
         Returns True if the cap is exceeded and the review should be skipped.
         Uses Redis get/set to maintain a per-wpid daily counter.
@@ -5139,18 +5185,18 @@ class WorkflowService:
             cache = CacheFactory.get_cache()
             if cache is None:
                 return False
-            cap_key = self._failure_review_cap_key(workflow_permanent_id)
+            cap_key = self._script_review_cap_key(workflow_permanent_id)
             raw_count = await cache.get(cap_key)
             if raw_count is not None:
                 count = int(raw_count)
-                if count >= settings.FAILURE_REVIEW_DAILY_CAP:
+                if count >= settings.SCRIPT_REVIEW_DAILY_CAP:
                     return True
         except Exception:
-            LOG.debug("Failed to check failure review cap, allowing review", exc_info=True)
+            LOG.debug("Failed to check script review cap, allowing review", exc_info=True)
         return False
 
-    async def _increment_failure_review_counter(self, workflow_permanent_id: str) -> None:
-        """Increment the daily failure-review counter for this wpid.
+    async def _increment_script_review_counter(self, workflow_permanent_id: str) -> None:
+        """Increment the daily script-review counter for this wpid.
 
         Uses Redis get+set with a 48-hour TTL (covers timezone edge cases).
         Note: get+set is not atomic, so concurrent reviews for the same wpid
@@ -5163,12 +5209,12 @@ class WorkflowService:
             cache = CacheFactory.get_cache()
             if cache is None:
                 return
-            cap_key = self._failure_review_cap_key(workflow_permanent_id)
+            cap_key = self._script_review_cap_key(workflow_permanent_id)
             raw_count = await cache.get(cap_key)
             new_count = (int(raw_count) + 1) if raw_count is not None else 1
             await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
         except Exception:
-            LOG.debug("Failed to increment failure review counter", exc_info=True)
+            LOG.debug("Failed to increment script review counter", exc_info=True)
 
     async def _run_reviewer_locked(
         self,
@@ -5385,22 +5431,11 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Priority: run-level run_with > workflow-level run_with > code_version fallback > default (agent).
-        When code_version >= 1 at the workflow level and no explicit run_with is set,
-        the run defaults to code mode so cached scripts are actually used.
+        Priority: run-level run_with (if set) > workflow-level run_with.
+        Workflow.run_with is always "code" or "agent" after normalization
+        (NULL and code_version fallback resolved at read time).
+        WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
         """
-        if workflow_run.run_with in ("code", "code_v2"):
-            return True
-        if workflow_run.run_with == "agent":
-            return False
-        if workflow.run_with in ("code", "code_v2"):  # include legacy "code_v2" workflows
-            return True
-        if workflow.run_with == "agent":
-            return False
-        # No explicit run_with on either workflow or run — fall back to
-        # code_version / adaptive_caching: if the workflow has caching enabled, run code.
-        if workflow.code_version is not None:
-            return workflow.code_version >= 1
-        if workflow.adaptive_caching:
-            return True
-        return False
+        if workflow_run.run_with is not None:
+            return workflow_run.run_with == "code"
+        return workflow.run_with == "code"

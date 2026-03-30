@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -260,13 +261,30 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception as e:
             call.error = e
             action_status = ActionStatus.failed
-            # Note: Action status would be updated to failed here if update method existed
 
-            # Print failure in script mode
-            if context and context.script_mode:
-                print(f"  ✗ Failed: {str(e)}")
+            # Build a readable representation of the failed call.
+            # Only log the first positional arg (selector) — the second arg
+            # is often a value that could contain passwords or PII.
+            call_parts = [f"page.{fn.__name__}("]
+            if args:
+                call_parts.append(repr(args[0]))
+            key_kwargs = {k: v for k, v in kwargs.items() if k in ("selector", "prompt", "mode") and v is not None}
+            if key_kwargs:
+                if args:
+                    call_parts.append(", ")
+                call_parts.append(", ".join(f"{k}={repr(v)}" for k, v in key_kwargs.items()))
+            call_parts.append(")")
+            call_repr = "".join(call_parts)
 
-            # LLM fallback hook could go here ...
+            LOG.warning(
+                "Script action failed",
+                action_type=action.value if hasattr(action, "value") else str(action),
+                call=call_repr,
+                error=str(e),
+                script_id=context.script_id if context else None,
+                workflow_run_id=context.workflow_run_id if context else None,
+            )
+
             raise
         finally:
             # Add a small buffer between cached actions to give slow pages time to settle
@@ -306,12 +324,19 @@ class ScriptSkyvernPage(SkyvernPage):
                     pass  # Don't block if download detection fails
 
             self._record(call)
+            # Ensure selector is in kwargs for action recording (it may be a positional arg).
+            # Copy kwargs to avoid mutating the caller's dict.
+            recording_kwargs = dict(kwargs)
+            if "selector" not in recording_kwargs and args:
+                first_arg = args[0]
+                if isinstance(first_arg, str):
+                    recording_kwargs["selector"] = first_arg
             # Auto-create action after execution and store result
             await self._create_action_and_result_after_execution(
                 action_type=action,
                 intention=prompt,
                 status=action_status,
-                kwargs=kwargs,
+                kwargs=recording_kwargs,
                 call_result=call.result,
                 call_error=call.error,
                 download_triggered=download_triggered,
@@ -409,9 +434,16 @@ class ScriptSkyvernPage(SkyvernPage):
             select_option = None
             response: str | None = kwargs.get("response")
             file_url = kwargs.get("file_url")
+
+            # Mask sensitive values (passwords, etc.) by checking if the
+            # input value matches any registered sensitive value on the context.
+            selector = kwargs.get("selector", "")
+            sensitive = context.sensitive_values if context else set()
+            is_sensitive = bool(call_result and str(call_result) in sensitive)
+
             if not response:
                 if action_type == ActionType.INPUT_TEXT:
-                    text = str(call_result)
+                    text = "••••••••" if is_sensitive else str(call_result)
                     response = text
                 elif action_type == ActionType.SELECT_OPTION:
                     option_value = str(call_result) or ""
@@ -465,12 +497,34 @@ class ScriptSkyvernPage(SkyvernPage):
                 )
 
             created_action = await app.DATABASE.create_action(action)
-            # Skip LLM reasoning in script mode — use static string instead
+            # Skip LLM reasoning in script mode — use static string instead.
+            # Build a descriptive label from the selector for the timeline.
             if context and context.script_mode:
+                label = intention[:80] if intention else ""
+                if not label and selector:
+                    # Extract a human-readable name from the selector
+
+                    name_match = re.search(r'name="([^"]+)"', selector)
+                    id_match = re.search(r'id="([^"]+)"', selector) if not name_match else None
+                    auto_match = (
+                        re.search(r'data-automation-id="([^"]+)"', selector)
+                        if not name_match and not id_match
+                        else None
+                    )
+                    match = name_match or id_match or auto_match
+                    if match:
+                        raw = match.group(1)
+                        # Convert camelCase/kebab-case to readable: "legalName--firstName" → "First Name"
+                        readable = re.sub(r"[-_]+", " ", raw).strip()
+                        readable = re.sub(r"([a-z])([A-Z])", r"\1 \2", readable).title()
+                        label = readable
+                    else:
+                        label = selector[:60]
+                reasoning = f"Script execution: {label}" if label else "Script execution"
                 await app.DATABASE.update_action_reasoning(
                     organization_id=str(context.organization_id),
                     action_id=str(created_action.action_id),
-                    reasoning=f"Script execution: {intention[:80]}" if intention else "Script execution",
+                    reasoning=reasoning,
                 )
             else:
                 asyncio.create_task(
@@ -743,6 +797,11 @@ class ScriptSkyvernPage(SkyvernPage):
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
+                # Render Jinja templates (e.g. "{{identifier}}") to actual parameter values
+                if totp_identifier:
+                    totp_identifier = render_template(totp_identifier)
+                if totp_url:
+                    totp_url = render_template(totp_url)
                 totp_value = await poll_otp_value(
                     organization_id=organization_id,
                     task_id=task_id,
@@ -973,6 +1032,11 @@ class ScriptSkyvernPage(SkyvernPage):
                 step_id=context.step_id,
                 step_order=step.order,
                 action_order=context.action_order,
+                # Static (pinned) scripts verify page state themselves —
+                # skip LLM verification which can reject valid completions
+                # (e.g. sign-in page with pending email verification).
+                # AI-generated cached scripts still get LLM verification.
+                verified=bool(context.is_static_script),
             )
             # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
