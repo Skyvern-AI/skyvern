@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from skyvern.forge.sdk.db._error_handling import db_operation
-from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel
@@ -94,8 +93,10 @@ class CredentialRepository(BaseRepository):
         credential_id: str,
         organization_id: str,
         name: str | None = None,
-        browser_profile_id: str | None | object = _UNSET,
-        tested_url: str | None | object = _UNSET,
+        browser_profile_id: str | None = None,
+        tested_url: str | None = None,
+        user_context: str | None = None,
+        save_browser_session_intent: bool | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -110,10 +111,14 @@ class CredentialRepository(BaseRepository):
                 raise NotFoundError(f"Credential {credential_id} not found")
             if name is not None:
                 credential.name = name
-            if browser_profile_id is not _UNSET:
+            if browser_profile_id is not None:
                 credential.browser_profile_id = browser_profile_id
-            if tested_url is not _UNSET:
+            if tested_url is not None:
                 credential.tested_url = tested_url
+            if user_context is not None:
+                credential.user_context = user_context
+            if save_browser_session_intent is not None:
+                credential.save_browser_session_intent = save_browser_session_intent
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
