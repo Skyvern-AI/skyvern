@@ -2,4 +2,4 @@
 
 import typing
 
-WorkflowRunTriggerType = typing.Union[typing.Literal["manual", "api", "scheduled"], typing.Any]
+WorkflowRunTriggerType = typing.Union[typing.Literal["manual", "api", "scheduled", "webhook"], typing.Any]
