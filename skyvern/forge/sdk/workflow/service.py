@@ -2530,8 +2530,15 @@ class WorkflowService:
             )
             if not block.continue_on_failure:
                 failure_reason = f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
+                task_failure_category = (
+                    block_result.output_parameter_value.get("failure_category")
+                    if isinstance(block_result.output_parameter_value, dict)
+                    else None
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                    failure_category=task_failure_category,
                 )
                 return workflow_run, True
 
@@ -2560,8 +2567,15 @@ class WorkflowService:
 
             if not block.continue_on_failure:
                 failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
+                task_failure_category = (
+                    block_result.output_parameter_value.get("failure_category")
+                    if isinstance(block_result.output_parameter_value, dict)
+                    else None
+                )
                 workflow_run = await self.mark_workflow_run_as_terminated(
-                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                    failure_category=task_failure_category,
                 )
                 return workflow_run, True
 
@@ -2590,8 +2604,15 @@ class WorkflowService:
 
             if not block.continue_on_failure:
                 failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
+                task_failure_category = (
+                    block_result.output_parameter_value.get("failure_category")
+                    if isinstance(block_result.output_parameter_value, dict)
+                    else None
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                    failure_category=task_failure_category,
                 )
                 return workflow_run, True
 
@@ -3667,8 +3688,18 @@ class WorkflowService:
         otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.failed)
 
         # Auto-classify if no explicit category provided
+        failure_category_source = "inherited_from_task" if failure_category is not None else "code_level"
         if failure_category is None:
-            failure_category = classify_from_failure_reason(failure_reason)
+            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+
+        LOG.info(
+            "Workflow run failure classified",
+            workflow_run_id=workflow_run_id,
+            workflow_status="failed",
+            failure_category=failure_category,
+            primary_failure_category=failure_category[0].get("category") if failure_category else None,
+            failure_category_source=failure_category_source,
+        )
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
@@ -3716,9 +3747,21 @@ class WorkflowService:
         # Add workflow terminated tag to trace
         otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.terminated)
 
-        # Auto-classify if no explicit category provided
+        # Auto-classify if no explicit category provided.
+        # Intentionally uses fallback_to_unknown=False (the default) — terminated workflows
+        # may be user-guided (e.g. terminate_criterion matched), so None is acceptable.
+        failure_category_source = "inherited_from_task" if failure_category is not None else "code_level"
         if failure_category is None:
             failure_category = classify_from_failure_reason(failure_reason)
+
+        LOG.info(
+            "Workflow run failure classified",
+            workflow_run_id=workflow_run_id,
+            workflow_status="terminated",
+            failure_category=failure_category,
+            primary_failure_category=failure_category[0].get("category") if failure_category else None,
+            failure_category_source=failure_category_source,
+        )
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
@@ -3759,7 +3802,15 @@ class WorkflowService:
         # Add workflow timed out tag to trace
         otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.timed_out)
 
-        failure_category = classify_from_failure_reason(failure_reason)
+        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        LOG.info(
+            "Workflow run failure classified",
+            workflow_run_id=workflow_run_id,
+            workflow_status="timed_out",
+            failure_category=failure_category,
+            primary_failure_category=failure_category[0].get("category") if failure_category else None,
+            failure_category_source="code_level",
+        )
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,

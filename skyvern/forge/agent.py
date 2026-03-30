@@ -894,7 +894,18 @@ class ForgeAgent:
                 )
 
             # Update task status first
-            failure_category = classify_from_failure_reason(reason, exception=exception)
+            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            LOG.info(
+                "Task failure classified",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                organization_id=task.organization_id,
+                task_status="failed",
+                failure_category=failure_category,
+                primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                failure_category_source="code_level",
+                failure_category_path="exception",
+            )
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
@@ -4068,6 +4079,17 @@ class ForgeAgent:
                 if persisted_action.errors:
                     failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
                 failure_category = persisted_action.failure_categories or classify_from_failure_reason(failure_reason)
+                LOG.info(
+                    "Task failure classified",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    organization_id=task.organization_id,
+                    task_status="terminated",
+                    failure_category=failure_category,
+                    primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                    failure_category_source="llm" if persisted_action.failure_categories else "code_level",
+                    failure_category_path="terminate_check_goal",
+                )
                 await self.update_task(
                     task,
                     status=TaskStatus.terminated,
@@ -4163,7 +4185,18 @@ class ForgeAgent:
                 error.model_dump() for error in generated_failure_reason.errors
             ]
             failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
-                failure_reason
+                failure_reason, fallback_to_unknown=True
+            )
+            LOG.info(
+                "Task failure classified",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                organization_id=task.organization_id,
+                task_status="failed",
+                failure_category=failure_category,
+                primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                failure_category_source="llm" if generated_failure_reason.failure_categories else "code_level",
+                failure_category_path="max_steps",
             )
 
             await self._cancel_speculative_step(next_step)
@@ -4232,7 +4265,20 @@ class ForgeAgent:
                 f"Max retries per step ({max_retries_per_step}) exceeded."
                 f" Possible failure reasons: {failure_response.reasoning}"
             )
-            failure_category = failure_response.failure_categories or classify_from_failure_reason(failure_reason)
+            failure_category = failure_response.failure_categories or classify_from_failure_reason(
+                failure_reason, fallback_to_unknown=True
+            )
+            LOG.info(
+                "Task failure classified",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                organization_id=task.organization_id,
+                task_status="failed",
+                failure_category=failure_category,
+                primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                failure_category_source="llm" if failure_response.failure_categories else "code_level",
+                failure_category_path="max_retries",
+            )
             await self.update_task(
                 task,
                 TaskStatus.failed,
@@ -4581,6 +4627,17 @@ class ForgeAgent:
             last_step = await self.update_step(step, is_last=True)
             failure_reason = await self.get_failure_reason_for_task(task)
             failure_category = classify_from_failure_reason(failure_reason)
+            LOG.info(
+                "Task failure classified",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                organization_id=task.organization_id,
+                task_status="terminated",
+                failure_category=failure_category,
+                primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                failure_category_source="code_level",
+                failure_category_path="terminate_extract_action",
+            )
             await self.update_task(
                 task,
                 status=TaskStatus.terminated,
@@ -4633,7 +4690,18 @@ class ForgeAgent:
                 error.model_dump() for error in generated_failure_reason.errors
             ]
             failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
-                failure_reason
+                failure_reason, fallback_to_unknown=True
+            )
+            LOG.info(
+                "Task failure classified",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                organization_id=task.organization_id,
+                task_status="failed",
+                failure_category=failure_category,
+                primary_failure_category=failure_category[0].get("category") if failure_category else None,
+                failure_category_source="llm" if generated_failure_reason.failure_categories else "code_level",
+                failure_category_path="max_steps",
             )
 
             await self.update_task(
