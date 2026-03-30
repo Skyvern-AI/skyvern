@@ -5,6 +5,9 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
 import { useEffect, useRef, useState } from "react";
 import { useDebouncedCallback } from "use-debounce";
+import { useParameterAutocomplete } from "@/hooks/useParameterAutocomplete";
+import { ParameterAutocompleteDropdown } from "./ParameterAutocompleteDropdown";
+import { ParameterGhostText } from "./ParameterGhostText";
 
 import { ImprovePrompt } from "./ImprovePrompt";
 
@@ -77,6 +80,26 @@ function WorkflowBlockInputTextarea(props: Props) {
     doOnChange(value);
   };
 
+  const autocomplete = useParameterAutocomplete({
+    nodeId,
+    value: String(internalValue),
+    inputRef: textareaRef,
+    variant: "textarea",
+  });
+
+  const handleAutocompleteSelect = (key: string) => {
+    const { newValue, cursorPos } = autocomplete.buildSelectedValue(key);
+    setInternalValue(newValue);
+    doOnChange(newValue);
+    autocomplete.dismiss();
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(cursorPos, cursorPos);
+      }
+    }, 0);
+  };
+
   return (
     <div className="relative">
       <AutoResizingTextarea
@@ -91,8 +114,33 @@ function WorkflowBlockInputTextarea(props: Props) {
         }}
         onClick={handleTextareaSelect}
         onKeyUp={handleTextareaSelect}
+        onKeyDown={(e) => {
+          if (autocomplete.isOpen) {
+            const handled = autocomplete.handleKeyDown(e);
+            if (handled && (e.key === "Enter" || e.key === "Tab")) {
+              const param = autocomplete.getSelectedParameter();
+              if (param) {
+                handleAutocompleteSelect(param.key);
+              }
+            }
+          }
+        }}
         onSelect={handleTextareaSelect}
         className={cn(`${aiImprove ? "pr-12" : "pr-9"}`, props.className)}
+      />
+      <ParameterGhostText
+        ghostText={autocomplete.ghostText}
+        textBeforeCursor={autocomplete.textBeforeCursor}
+        inputRef={textareaRef}
+        variant="textarea"
+      />
+      <ParameterAutocompleteDropdown
+        items={autocomplete.filteredItems}
+        selectedIndex={autocomplete.selectedIndex}
+        anchorPosition={autocomplete.anchorPosition}
+        visible={autocomplete.isOpen}
+        onSelect={handleAutocompleteSelect}
+        onDismiss={autocomplete.dismiss}
       />
 
       <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
