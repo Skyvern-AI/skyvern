@@ -14,8 +14,6 @@ from skyvern.forge.sdk.schemas.organization_bitwarden_collections import Organiz
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
-from skyvern.forge.sdk.db._sentinels import _UNSET
-
 
 class CredentialsMixin:
     """Database operations for credential and Bitwarden collection management."""
@@ -100,8 +98,10 @@ class CredentialsMixin:
         credential_id: str,
         organization_id: str,
         name: str | None = None,
-        browser_profile_id: str | None | object = _UNSET,
-        tested_url: str | None | object = _UNSET,
+        browser_profile_id: str | None = None,
+        tested_url: str | None = None,
+        user_context: str | None = None,
+        save_browser_session_intent: bool | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -116,10 +116,14 @@ class CredentialsMixin:
                 raise NotFoundError(f"Credential {credential_id} not found")
             if name is not None:
                 credential.name = name
-            if browser_profile_id is not _UNSET:
+            if browser_profile_id is not None:
                 credential.browser_profile_id = browser_profile_id
-            if tested_url is not _UNSET:
+            if tested_url is not None:
                 credential.tested_url = tested_url
+            if user_context is not None:
+                credential.user_context = user_context
+            if save_browser_session_intent is not None:
+                credential.save_browser_session_intent = save_browser_session_intent
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
