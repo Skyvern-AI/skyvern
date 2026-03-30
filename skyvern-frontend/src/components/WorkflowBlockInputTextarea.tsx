@@ -26,7 +26,7 @@ type Props = Omit<
 };
 
 function WorkflowBlockInputTextarea(props: Props) {
-  const { aiImprove, nodeId, onChange, ...textAreaProps } = props;
+  const { aiImprove, nodeId, onChange, disabled, ...textAreaProps } = props;
   const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
@@ -104,6 +104,7 @@ function WorkflowBlockInputTextarea(props: Props) {
     <div className="relative">
       <AutoResizingTextarea
         {...textAreaProps}
+        disabled={disabled}
         value={internalValue}
         ref={textareaRef}
         onBlur={() => {
@@ -126,7 +127,10 @@ function WorkflowBlockInputTextarea(props: Props) {
           }
         }}
         onSelect={handleTextareaSelect}
-        className={cn(`${aiImprove ? "pr-12" : "pr-9"}`, props.className)}
+        className={cn(
+          !disabled && (aiImprove ? "pr-12" : "pr-9"),
+          props.className,
+        )}
       />
       <ParameterGhostText
         ghostText={autocomplete.ghostText}
@@ -143,35 +147,37 @@ function WorkflowBlockInputTextarea(props: Props) {
         onDismiss={autocomplete.dismiss}
       />
 
-      <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
-        <div className="flex items-center justify-center gap-1">
-          {aiImprove && (
-            <ImprovePrompt
-              context={aiImprove.context}
-              isVisible={Boolean(internalValue.trim())}
-              size="small"
-              prompt={internalValue}
-              onImprove={(prompt) => handleOnChange(prompt)}
-              useCase={aiImprove.useCase}
-            />
-          )}
-          <div className="cursor-pointer">
-            <Popover>
-              <PopoverTrigger asChild>
-                <div className="rounded p-1 hover:bg-muted">
-                  <PlusIcon className="size-4" />
-                </div>
-              </PopoverTrigger>
-              <PopoverContent className="w-fit max-w-sm">
-                <WorkflowBlockParameterSelect
-                  nodeId={nodeId}
-                  onAdd={insertParameterAtCursor}
-                />
-              </PopoverContent>
-            </Popover>
+      {!disabled && (
+        <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
+          <div className="flex items-center justify-center gap-1">
+            {aiImprove && (
+              <ImprovePrompt
+                context={aiImprove.context}
+                isVisible={Boolean(internalValue.trim())}
+                size="small"
+                prompt={internalValue}
+                onImprove={(prompt) => handleOnChange(prompt)}
+                useCase={aiImprove.useCase}
+              />
+            )}
+            <div className="cursor-pointer">
+              <Popover>
+                <PopoverTrigger asChild>
+                  <div className="rounded p-1 hover:bg-muted">
+                    <PlusIcon className="size-4" />
+                  </div>
+                </PopoverTrigger>
+                <PopoverContent className="w-fit max-w-sm">
+                  <WorkflowBlockParameterSelect
+                    nodeId={nodeId}
+                    onAdd={insertParameterAtCursor}
+                  />
+                </PopoverContent>
+              </Popover>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
