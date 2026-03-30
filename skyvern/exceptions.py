@@ -21,9 +21,35 @@ class SkyvernHTTPException(SkyvernException):
         super().__init__(message)
 
 
+_BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
+
+# Patterns that indicate a browser session connection failure (e.g. CDP WebSocket errors).
+# These errors contain internal URLs and raw HTML that should never be shown to end users.
+_BROWSER_CONNECTION_PATTERNS = (
+    "connect_over_cdp",
+    "WebSocket error",
+    "WebSocket was closed",
+    "ws connecting",
+    "ws unexpected response",
+    "ws error",
+)
+
+
+def _is_browser_connection_error(message: str) -> bool:
+    return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
+
+
 def get_user_facing_exception_message(exception: Exception) -> str:
     if isinstance(exception, SkyvernException):
         return exception.message or str(exception)
+
+    raw = str(exception)
+    if _is_browser_connection_error(raw):
+        return (
+            f"Failed to connect to the browser session. "
+            f"This is usually caused by high demand and is transient. {_BROWSER_CONNECTION_GUIDANCE}"
+        )
+
     return f"Unexpected error: {exception}"
 
 
