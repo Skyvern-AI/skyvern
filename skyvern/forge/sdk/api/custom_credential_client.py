@@ -3,7 +3,7 @@ from typing import Any
 import structlog
 
 from skyvern.exceptions import HttpException
-from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
@@ -68,6 +68,18 @@ class CustomCredentialAPIClient:
             return payload
         else:
             raise TypeError(f"Unsupported credential type: {type(credential)}")
+
+    @staticmethod
+    def _format_error_response(response_body: Any) -> str:
+        """Extract a human-readable error message from an HTTP error response body."""
+        if isinstance(response_body, dict):
+            for key in ["message", "error", "detail", "error_message"]:
+                if key in response_body and response_body[key]:
+                    return str(response_body[key])
+            return str(response_body)
+        if isinstance(response_body, str) and response_body.strip():
+            return response_body.strip()
+        return ""
 
     def _api_response_to_credential(self, credential_data: dict[str, Any], name: str, item_id: str) -> CredentialItem:
         """Convert API response to Skyvern CredentialItem."""
@@ -169,25 +181,38 @@ class CustomCredentialAPIClient:
         )
 
         try:
-            response = await aiohttp_post(
+            status_code, _, response_body = await aiohttp_request(
+                method="POST",
                 url=url,
-                data=payload,
                 headers=headers,
-                raise_exception=True,
+                data=payload,
             )
 
-            if not response:
-                raise HttpException(500, url, "Empty response from custom credential API")
+            if status_code < 200 or status_code >= 300:
+                error_detail = self._format_error_response(response_body)
+                msg = f"HTTP {status_code}"
+                if error_detail:
+                    msg += f": {error_detail}"
+                LOG.error(
+                    "Custom credential API returned error",
+                    url=url,
+                    status_code=status_code,
+                    response_body=response_body,
+                )
+                raise HttpException(status_code, url, msg)
+
+            if not response_body or not isinstance(response_body, dict):
+                raise HttpException(500, url, "Empty or invalid response from custom credential API")
 
             # Extract credential ID from response
-            credential_id = response.get("id")
+            credential_id = response_body.get("id")
             if not credential_id:
                 LOG.error(
                     "Custom credential API response missing id field",
                     url=url,
-                    response=response,
+                    response=response_body,
                 )
-                raise HttpException(500, url, "Invalid response format from custom credential API")
+                raise HttpException(500, url, "Invalid response format from custom credential API: missing 'id' field")
 
             LOG.info(
                 "Successfully created credential via custom API",
@@ -234,13 +259,26 @@ class CustomCredentialAPIClient:
         )
 
         try:
-            response = await aiohttp_get_json(
+            status_code, _, response_body = await aiohttp_request(
+                method="GET",
                 url=url,
                 headers=headers,
-                raise_exception=True,
             )
 
-            if not response:
+            if status_code < 200 or status_code >= 300:
+                error_detail = self._format_error_response(response_body)
+                msg = f"HTTP {status_code}"
+                if error_detail:
+                    msg += f": {error_detail}"
+                LOG.error(
+                    "Custom credential API returned error",
+                    url=url,
+                    status_code=status_code,
+                    response_body=response_body,
+                )
+                raise HttpException(status_code, url, msg)
+
+            if not response_body or not isinstance(response_body, dict):
                 raise HttpException(404, url, f"Credential not found: {credential_id}")
 
             LOG.info(
@@ -249,7 +287,7 @@ class CustomCredentialAPIClient:
                 credential_id=credential_id,
             )
 
-            return self._api_response_to_credential(response, name, credential_id)
+            return self._api_response_to_credential(response_body, name, credential_id)
 
         except HttpException:
             raise
@@ -283,11 +321,24 @@ class CustomCredentialAPIClient:
         )
 
         try:
-            await aiohttp_delete(
+            status_code, _, response_body = await aiohttp_request(
+                method="DELETE",
                 url=url,
                 headers=headers,
-                raise_exception=True,
             )
+
+            if status_code < 200 or status_code >= 300:
+                error_detail = self._format_error_response(response_body)
+                msg = f"HTTP {status_code}"
+                if error_detail:
+                    msg += f": {error_detail}"
+                LOG.error(
+                    "Custom credential API returned error on delete",
+                    url=url,
+                    status_code=status_code,
+                    response_body=response_body,
+                )
+                raise HttpException(status_code, url, msg)
 
             LOG.info(
                 "Successfully deleted credential via custom API",

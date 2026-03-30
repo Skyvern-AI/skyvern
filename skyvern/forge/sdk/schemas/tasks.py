@@ -284,6 +284,7 @@ class Task(TaskBase):
     retry: int | None = None
     max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
+    failure_category: list[dict[str, Any]] | None = None
     model: dict[str, Any] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None

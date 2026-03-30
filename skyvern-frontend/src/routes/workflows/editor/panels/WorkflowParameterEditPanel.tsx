@@ -32,6 +32,7 @@ import {
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -51,7 +52,12 @@ const workflowParameterTypeOptions = [
 ];
 
 type CredentialDataType = "password" | "secret" | "creditCard";
-type CredentialSource = "bitwarden" | "skyvern" | "onepassword" | "azurevault";
+type CredentialSource =
+  | "bitwarden"
+  | "skyvern"
+  | "onepassword"
+  | "azurevault"
+  | "custom";
 
 // When selecting from the Value Type dropdown, "credential" is a special value that triggers
 // credential-specific UI. This is separate from WorkflowParameterValueType which only includes
@@ -62,7 +68,17 @@ type ParameterTypeSelection = WorkflowParameterValueType | "credential";
 function getAvailableSourcesForDataType(
   dataType: CredentialDataType,
   isCloud: boolean,
+  hasCustomCredentialService: boolean,
 ): Array<{ value: CredentialSource; label: string }> {
+  const customOption = hasCustomCredentialService
+    ? [
+        {
+          value: "custom" as const,
+          label: "Custom Credential Service",
+        },
+      ]
+    : [];
+
   switch (dataType) {
     case "password":
       return [
@@ -70,17 +86,20 @@ function getAvailableSourcesForDataType(
         { value: "bitwarden" as const, label: "Bitwarden" },
         { value: "onepassword" as const, label: "1Password" },
         { value: "azurevault" as const, label: "Azure Key Vault" },
+        ...customOption,
       ];
     case "secret":
       return [
         ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
+        ...customOption,
       ];
     case "creditCard":
       return [
         ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         { value: "onepassword" as const, label: "1Password" },
+        ...customOption,
       ];
   }
 }
@@ -189,6 +208,9 @@ function WorkflowParameterEditPanel({
     "workflow_run_summary",
   ];
   const isCloud = useContext(CloudContext);
+  const { parsedConfig: customCredentialServiceConfig } =
+    useCustomCredentialServiceConfig();
+  const hasCustomCredentialService = customCredentialServiceConfig !== null;
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");
   const keyValidationError = validateParameterKey(key);
@@ -308,6 +330,7 @@ function WorkflowParameterEditPanel({
     const availableSources = getAvailableSourcesForDataType(
       newDataType,
       isCloud,
+      hasCustomCredentialService,
     );
     if (!availableSources.find((s) => s.value === credentialSource)) {
       setCredentialSource(availableSources[0]?.value ?? "bitwarden");
@@ -317,6 +340,7 @@ function WorkflowParameterEditPanel({
   const availableSources = getAvailableSourcesForDataType(
     credentialDataType,
     isCloud,
+    hasCustomCredentialService,
   );
 
   // Check if we're in unified add mode and credential is selected
@@ -344,6 +368,10 @@ function WorkflowParameterEditPanel({
     showCredentialFields && credentialSource === "azurevault";
   const showSkyvernCredentialSelector =
     showCredentialFields && credentialSource === "skyvern" && isCloud;
+  const showCustomCredentialSelector =
+    showCredentialFields &&
+    credentialSource === "custom" &&
+    hasCustomCredentialService;
 
   return (
     <ScrollArea>
@@ -536,7 +564,7 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <div className="flex gap-2">
                   <Label className="text-xs text-slate-300">Source</Label>
-                  <HelpTooltip content="Select where your credentials are stored. Skyvern uses managed credentials, while Bitwarden, 1Password, and Azure Key Vault connect directly to your vault." />
+                  <HelpTooltip content="Select the storage location for your credentials. Skyvern supports managed credentials such as Bitwarden, 1Password, and Azure Key Vault that connect directly to your vault. If you use a custom external credential service, you can add it here as well." />
                 </div>
                 <Select
                   value={credentialSource}
@@ -788,6 +816,23 @@ function WorkflowParameterEditPanel({
             </div>
           )}
 
+          {/* Custom Credential Service Selector */}
+          {showCustomCredentialSelector && (
+            <div className="space-y-1">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">
+                  Custom Credential
+                </Label>
+                <HelpTooltip content="Select a credential managed by your custom credential service. These credentials are stored in your external credential vault." />
+              </div>
+              <CredentialParameterSourceSelector
+                value={credentialId}
+                onChange={(value) => setCredentialId(value)}
+                vault_type="custom"
+              />
+            </div>
+          )}
+
           {type === "context" && (
             <div className="space-y-1">
               <Label className="text-xs text-slate-300">Source Parameter</Label>
@@ -902,8 +947,11 @@ function WorkflowParameterEditPanel({
 
                 // Handle credential parameters based on type + source combination
                 if (type === "credential" || isCredentialSelected) {
-                  // Skyvern managed credentials
-                  if (credentialSource === "skyvern") {
+                  // Skyvern managed credentials or Custom credential service
+                  if (
+                    credentialSource === "skyvern" ||
+                    credentialSource === "custom"
+                  ) {
                     if (!credentialId) {
                       toast({
                         variant: "destructive",

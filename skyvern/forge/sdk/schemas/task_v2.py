@@ -54,6 +54,7 @@ class TaskV2(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
 
     created_at: datetime
     modified_at: datetime

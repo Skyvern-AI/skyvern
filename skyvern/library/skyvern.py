@@ -121,6 +121,7 @@ class Skyvern(AsyncSkyvern):
         self._environment = environment
         self._api_key: str | None = api_key
         self._playwright: Playwright | None = None
+        self._embedded_client: httpx.AsyncClient | None = None
 
     @classmethod
     def local(
@@ -128,11 +129,9 @@ class Skyvern(AsyncSkyvern):
         *,
         llm_config: LLMRouterConfig | LLMConfig | None = None,
         settings: dict[str, Any] | None = None,
+        use_in_memory_db: bool = False,
     ) -> "Skyvern":
         """Local/embedded mode: Run Skyvern locally in-process.
-
-        Prerequisites:
-            Run `skyvern quickstart` first to set up your local environment and create a .env file
 
         Args:
             llm_config: Optional custom LLM configuration (LLMConfig or LLMRouterConfig).
@@ -149,7 +148,14 @@ class Skyvern(AsyncSkyvern):
                     skyvern = Skyvern.local()
                     ```
 
-                Example 2 - Custom LLM with environment variables:
+                Example 2 - Zero-config with in-memory database (no Postgres needed):
+                    ```python
+                    from skyvern import Skyvern
+
+                    skyvern = Skyvern.local(use_in_memory_db=True)
+                    ```
+
+                Example 3 - Custom LLM with environment variables:
                     ```python
                     from skyvern import Skyvern
                     from skyvern.forge.sdk.api.llm.models import LLMConfig
@@ -164,56 +170,59 @@ class Skyvern(AsyncSkyvern):
                         )
                     )
                     ```
-
-                Example 3 - Explicitly providing credentials:
-                    ```python
-                    from skyvern import Skyvern
-                    from skyvern.forge.sdk.api.llm.models import LLMConfig, LiteLLMParams
-
-                    skyvern = Skyvern.local(
-                        llm_config=LLMConfig(
-                            model_name="gpt-4o",
-                            required_env_vars=[],  # No env vars required
-                            supports_vision=True,
-                            add_assistant_prefix=False,
-                            litellm_params=LiteLLMParams(
-                                api_base="https://api.openai.com/v1",
-                                api_key="sk-...",  # Your API key
-                            ),
-                        )
-                    )
-                    ```
             settings: Optional dictionary of Skyvern settings to override.
                 These override the corresponding settings from your .env file.
                 Example: {"MAX_STEPS_PER_RUN": 100, "BROWSER_TYPE": "chromium-headful"}
+            use_in_memory_db: If True, use SQLite in-memory instead of PostgreSQL.
+                No .env file or running Postgres instance required. Defaults to False.
+
+                Zero-config mode supports:
+                - run_task(), extract(), click(), navigate() — full browser automation
+                - Workflow CRUD (create, list, search, get, run)
+                - Artifacts saved to local temp directory (file:// URIs)
+                - Any LLM provider supported by litellm
+
+                Not supported in zero-config mode (requires Skyvern Cloud or Postgres):
+                - Workflow scheduling (requires persistent database)
+                - Cloud browser sessions (requires S3/Azure storage)
+                - Rate limiting (cloud-only)
+                - Multi-worker / multi-process execution (requires Temporal)
+
+                Requirements: LLM API key and Playwright
+                (pip install playwright && playwright install chromium).
 
         Returns:
             Skyvern: A Skyvern instance running in local/embedded mode.
         """
         from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
 
-        if not os.path.exists(".env"):
-            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
+        if not use_in_memory_db:
+            if not os.path.exists(".env"):
+                raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
 
-        load_dotenv(".env")
-        api_key = os.getenv("SKYVERN_API_KEY")
-        if not api_key:
-            raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
+            load_dotenv(".env")
+            api_key = os.getenv("SKYVERN_API_KEY")
+            if not api_key:
+                raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
 
         obj = cls.__new__(cls)
+
+        embedded_client = create_embedded_server(
+            llm_config=llm_config,
+            settings_overrides=settings,
+            use_in_memory_db=use_in_memory_db,
+        )
 
         AsyncSkyvern.__init__(
             obj,
             environment=SkyvernEnvironment.LOCAL,
-            httpx_client=create_embedded_server(
-                llm_config=llm_config,
-                settings_overrides=settings,
-            ),
+            httpx_client=embedded_client,
         )
 
         obj._environment = SkyvernEnvironment.LOCAL
         obj._api_key = None
         obj._playwright = None
+        obj._embedded_client = embedded_client
 
         return obj
 
@@ -582,9 +591,17 @@ class Skyvern(AsyncSkyvern):
         return self._playwright
 
     async def aclose(self) -> None:
-        """Close Playwright and release resources."""
+        """Close Playwright, embedded server resources, and release all handles."""
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
             finally:
                 self._playwright = None
+
+        if self._embedded_client is not None:
+            from skyvern.library.embedded_server_factory import EmbeddedClient  # noqa: PLC0415
+
+            if isinstance(self._embedded_client, EmbeddedClient):
+                await self._embedded_client.embedded_transport.aclose()
+            await self._embedded_client.aclose()
+            self._embedded_client = None

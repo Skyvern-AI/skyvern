@@ -734,7 +734,7 @@ async def get_workflow_script_blocks(
                 statuses=[ScriptStatus.published],
             )
             if workflow_script:
-                published_script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+                published_script, _is_pinned = await workflow_script_service.get_workflow_script_by_cache_key_value(
                     organization_id=current_org.organization_id,
                     workflow_permanent_id=workflow_permanent_id,
                     cache_key_value=workflow_script.cache_key_value,
@@ -752,7 +752,7 @@ async def get_workflow_script_blocks(
                     )
 
             # Fall back to latest version (for runs without a workflow_script entry)
-            published_script, _ = await workflow_script_service.get_workflow_script(
+            published_script, _rendered_cache_key, _is_pinned = await workflow_script_service.get_workflow_script(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 status=ScriptStatus.published,
@@ -770,7 +770,7 @@ async def get_workflow_script_blocks(
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
     status = block_script_request.status
 
-    script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+    script, _is_pinned = await workflow_script_service.get_workflow_script_by_cache_key_value(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_run_id=block_script_request.workflow_run_id,

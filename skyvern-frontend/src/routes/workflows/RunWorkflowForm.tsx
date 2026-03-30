@@ -275,7 +275,6 @@ function deriveRunWith(
     return override as "agent" | "code";
   if (workflow?.run_with === "agent") return "agent";
   if (workflow?.run_with === "code") return "code";
-  if ((workflow?.code_version ?? 0) >= 1) return "code";
   return "agent";
 }
 

@@ -23,6 +23,12 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
 
+_SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
+    ArtifactType.SCREENSHOT_LLM: "screenshot_llm",
+    ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
+    ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
+}
+
 
 @dataclass
 class ArtifactBatchData:
@@ -930,6 +936,7 @@ class ArtifactManager:
                 step=step,
                 workflow_run_id=workflow_run_id or (context.workflow_run_id if context else None),
                 workflow_run_block_id=workflow_run_block_id
+                or (context.workflow_run_block_id if context else None)
                 or (context.parent_workflow_run_block_id if context else None),
                 run_id=run_id or (context.run_id if context else None),
             )
@@ -1052,7 +1059,7 @@ class ArtifactManager:
         (e.g. action.screenshot_artifact_id) before the archive is flushed.
         """
         acc = self._get_or_create_step_archive(step, workflow_run_id, workflow_run_block_id, run_id)
-        prefix = "screenshot_llm" if artifact_type == ArtifactType.SCREENSHOT_LLM else "screenshot_action"
+        prefix = _SCREENSHOT_PREFIX_MAP.get(artifact_type, "screenshot_action")
         artifact_ids: list[str] = []
         for screenshot_bytes in screenshots:
             idx = sum(1 for k in acc.entries if k.startswith(f"{prefix}_"))

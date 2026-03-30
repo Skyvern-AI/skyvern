@@ -4035,7 +4035,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
-    run_with: workflow.run_with,
+    run_with: workflow.run_with ?? "agent",
     adaptive_caching: workflow.adaptive_caching ?? undefined,
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,

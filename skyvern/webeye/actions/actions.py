@@ -56,6 +56,7 @@ class CompleteVerifyResult(BaseModel):
 
     thoughts: str
     page_info: str | None = None
+    failure_categories: list[dict] = []
 
     def __repr__(self) -> str:
         if self.status:
@@ -331,6 +332,7 @@ class HoverAction(WebAction):
 
 class TerminateAction(DecisiveAction):
     action_type: ActionType = ActionType.TERMINATE
+    failure_categories: list[dict] = []
 
 
 class CompleteAction(DecisiveAction):

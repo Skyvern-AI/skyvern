@@ -50,11 +50,14 @@ class SkyvernContext:
     action_order: int = 0
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
+    workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[dict[str, Any]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
+    is_static_script: bool = False
+    sensitive_values: set[str] = field(default_factory=set)
     ai_mode_override: str | None = None
     script_llm_call_count: int = 0
     last_classify_result: str | None = None

@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import re
+import time
 import urllib.parse
 from typing import Any, NamedTuple
 
@@ -83,7 +84,7 @@ def workflow_has_conditionals(workflow: Workflow) -> bool:
 
 
 # Cache for workflow scripts - only stores non-None results
-_workflow_script_cache: TTLCache[tuple, "Script"] = TTLCache(maxsize=128, ttl=60 * 60)
+_workflow_script_cache: TTLCache[tuple, tuple["Script", bool]] = TTLCache(maxsize=128, ttl=60 * 60)
 
 
 def _make_workflow_script_cache_key(
@@ -154,7 +155,7 @@ async def generate_or_update_pending_workflow_script(
             context.script_id = script.script_id
             context.script_revision_id = script.script_revision_id
 
-    _, rendered_cache_key_value = await get_workflow_script(
+    _script, rendered_cache_key_value, _is_pinned = await get_workflow_script(
         workflow=workflow,
         workflow_run=workflow_run,
         status=ScriptStatus.pending,
@@ -174,10 +175,10 @@ async def get_workflow_script(
     workflow_run: WorkflowRun,
     block_labels: list[str] | None = None,
     status: ScriptStatus = ScriptStatus.published,
-) -> tuple[Script | None, str]:
+) -> tuple[Script | None, str, bool]:
     """
     Check if there's a related workflow script that should be used instead of running the workflow.
-    Returns the tuple of (script, rendered_cache_key_value).
+    Returns the tuple of (script, rendered_cache_key_value, is_pinned).
     """
     cache_key = workflow.cache_key or ""
     rendered_cache_key_value = ""
@@ -216,12 +217,19 @@ async def get_workflow_script(
         if is_adaptive_caching(workflow, workflow_run):
             rendered_cache_key_value = f"{rendered_cache_key_value}:v2" if rendered_cache_key_value else "v2"
 
+        LOG.info(
+            "Resolved cache key for workflow script lookup",
+            cache_key_value=rendered_cache_key_value,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+
         if block_labels:
             # Do not generate script or run script if block_labels is provided
-            return None, rendered_cache_key_value
+            return None, rendered_cache_key_value, False
 
         # Check if there are existing cached scripts for this workflow + cache_key_value
-        existing_script = await get_workflow_script_by_cache_key_value(
+        existing_script, is_pinned = await get_workflow_script_by_cache_key_value(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=rendered_cache_key_value,
@@ -230,14 +238,23 @@ async def get_workflow_script(
 
         if existing_script:
             LOG.info(
-                "Found cached script for workflow",
+                "Found cached script for workflow (cache hit)",
                 workflow_id=workflow.workflow_id,
+                script_id=existing_script.script_id,
                 cache_key_value=rendered_cache_key_value,
                 workflow_run_id=workflow_run.workflow_run_id,
+                is_pinned=is_pinned,
             )
-            return existing_script, rendered_cache_key_value
+            return existing_script, rendered_cache_key_value, is_pinned
 
-        return None, rendered_cache_key_value
+        LOG.info(
+            "No cached script found for workflow (cache miss)",
+            workflow_id=workflow.workflow_id,
+            cache_key_value=rendered_cache_key_value,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+        )
+        return None, rendered_cache_key_value, False
 
     except Exception as e:
         LOG.warning(
@@ -247,7 +264,7 @@ async def get_workflow_script(
             error=str(e),
             exc_info=True,
         )
-        return None, rendered_cache_key_value
+        return None, rendered_cache_key_value, False
 
 
 async def get_workflow_script_by_cache_key_value(
@@ -258,7 +275,13 @@ async def get_workflow_script_by_cache_key_value(
     cache_key: str | None = None,
     statuses: list[ScriptStatus] | None = None,
     use_cache: bool = False,
-) -> Script | None:
+) -> tuple[Script | None, bool]:
+    """Look up the best script for a workflow + cache_key_value.
+
+    Returns:
+        A tuple of (script, is_pinned) where is_pinned indicates whether the
+        returned script came from a pinned workflow_script row.
+    """
     if use_cache:
         cache_key_tuple = _make_workflow_script_cache_key(
             organization_id=organization_id,
@@ -273,7 +296,7 @@ async def get_workflow_script_by_cache_key_value(
             return _workflow_script_cache[cache_key_tuple]
 
         # Cache miss - fetch from database
-        result = await app.DATABASE.get_workflow_script_by_cache_key_value(
+        script, is_pinned = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             cache_key_value=cache_key_value,
@@ -283,10 +306,10 @@ async def get_workflow_script_by_cache_key_value(
         )
 
         # Only cache non-None results
-        if result is not None:
-            _workflow_script_cache[cache_key_tuple] = result
+        if script is not None:
+            _workflow_script_cache[cache_key_tuple] = (script, is_pinned)
 
-        return result
+        return script, is_pinned
 
     return await app.DATABASE.get_workflow_script_by_cache_key_value(
         organization_id=organization_id,
@@ -393,6 +416,7 @@ async def generate_workflow_script(
     # is not cached (it's evaluated at runtime), but cacheable blocks in branches are
     # cached progressively as they execute. See workflow_has_conditionals() for the
     # regeneration logic that prevents unnecessary regeneration for unexecuted branches.
+    generation_start = time.monotonic()
     try:
         LOG.info(
             "Generating script for workflow",
@@ -422,6 +446,16 @@ async def generate_workflow_script(
         updated_block_labels.update(missing_labels)
         updated_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
+        LOG.info(
+            "Script generation block analysis",
+            workflow_run_id=workflow_run.workflow_run_id,
+            total_blocks=len(block_labels),
+            cached_blocks=len(cached_block_sources),
+            missing_blocks=len(missing_labels),
+            blocks_to_regenerate=len(updated_block_labels),
+            missing_labels=list(missing_labels),
+        )
+
         python_src = await generate_workflow_script_python_code(
             file_name=codegen_input.file_name,
             workflow_run_request=codegen_input.workflow_run,
@@ -439,8 +473,23 @@ async def generate_workflow_script(
             adaptive_caching=adaptive,
         )
     except Exception:
-        LOG.error("Failed to generate workflow script source", exc_info=True)
+        generation_duration_ms = (time.monotonic() - generation_start) * 1000
+        LOG.error(
+            "Failed to generate workflow script source",
+            duration_ms=round(generation_duration_ms, 1),
+            exc_info=True,
+        )
         return
+
+    generation_duration_ms = (time.monotonic() - generation_start) * 1000
+    LOG.info(
+        "Script generation completed",
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_id=workflow.workflow_id,
+        cache_key_value=rendered_cache_key_value,
+        duration_ms=round(generation_duration_ms, 1),
+        script_size_bytes=len(python_src.encode("utf-8")),
+    )
 
     # 3.5) Post-process: fix static actions inside for-loop blocks
     python_src = _fix_static_actions_in_for_loops(python_src)
@@ -969,6 +1018,22 @@ async def create_script_version_from_review(
         The new Script revision, or None if creation failed.
     """
     try:
+        # Defense-in-depth: refuse to create a correction for a pinned script.
+        # _trigger_script_reviewer() already gates on is_script_pinned(), but
+        # that check can be bypassed when the skyvern context is missing.
+        # Guard here so no code path can mutate a pinned script.
+        if await app.DATABASE.is_script_pinned(
+            organization_id=organization_id,
+            script_id=base_script.script_id,
+        ):
+            LOG.info(
+                "Skipping script correction — script is pinned",
+                organization_id=organization_id,
+                script_id=base_script.script_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
         # Create a new script version
         new_script = await app.DATABASE.create_script(
             organization_id=organization_id,
@@ -1136,7 +1201,7 @@ async def create_script_version_from_review(
 
         # Create the workflow script mapping for cache lookup
         if workflow_run:
-            _, rendered_cache_key_value = await get_workflow_script(
+            _script, rendered_cache_key_value, _is_pinned = await get_workflow_script(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 status=ScriptStatus.published,

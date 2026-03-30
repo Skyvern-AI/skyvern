@@ -217,6 +217,7 @@ class SkyvernPage(Page):
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
+        mode: str | None = None,
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -226,6 +227,7 @@ class SkyvernPage(Page):
         *,
         prompt: str,
         ai: str | None = "fallback",
+        mode: str | None = None,
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -236,6 +238,7 @@ class SkyvernPage(Page):
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
+        mode: str | None = None,
         **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
@@ -249,6 +252,9 @@ class SkyvernPage(Page):
             selector: CSS selector for the target element.
             prompt: Natural language description of which element to click.
             ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            mode: When ``"direct"``, perform a raw Playwright click with no AI
+                fallback or element preparation.  The action is still recorded
+                in the DB so it appears in the timeline.
             **kwargs: All Playwright click parameters (timeout, force, modifiers, etc.)
 
         Returns:
@@ -264,8 +270,20 @@ class SkyvernPage(Page):
 
             # Try selector first, fall back to AI if selector fails
             await page.click("#open-invoice-button", prompt="Click on the 'Open Invoice' button")
+
+            # Raw Playwright click (still recorded in the timeline)
+            await page.click('[data-automation-id="nextButton"]', mode="direct")
             ```
         """
+        # Direct mode: raw Playwright click, no AI fallback or element prep.
+        if mode == "direct":
+            if not selector:
+                raise ValueError("mode='direct' requires a selector.")
+            timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+            locator = self.page.locator(selector).first
+            await locator.click(timeout=timeout, **kwargs)
+            return selector
+
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -369,6 +387,7 @@ class SkyvernPage(Page):
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
+        mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         **kwargs: Any,
@@ -382,6 +401,7 @@ class SkyvernPage(Page):
         value: str | None = None,
         selector: str | None = None,
         ai: str | None = "fallback",
+        mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         **kwargs: Any,
@@ -395,6 +415,7 @@ class SkyvernPage(Page):
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
+        mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         **kwargs: Any,
@@ -411,6 +432,9 @@ class SkyvernPage(Page):
             value: The text value to input into the field.
             prompt: Natural language description of which field to fill and what value.
             ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            mode: When ``"direct"``, perform a raw Playwright fill with no AI
+                fallback or element preparation.  The action is still recorded
+                in the DB so it appears in the timeline.
             totp_identifier: TOTP identifier for time-based one-time password fields.
             totp_url: URL to fetch TOTP codes from for authentication.
 
@@ -431,8 +455,22 @@ class SkyvernPage(Page):
                 "user@example.com",
                 prompt="Fill the email address with user@example.com"
             )
+
+            # Raw Playwright fill (still recorded in the timeline)
+            await page.fill('input[data-automation-id="email"]', "user@example.com", mode="direct")
             ```
         """
+
+        # Direct mode: raw Playwright fill, no AI fallback or element prep.
+        if mode == "direct":
+            if not selector:
+                raise ValueError("mode='direct' requires a selector.")
+            if value is None:
+                raise ValueError("mode='direct' requires a value.")
+            timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+            locator = self.page.locator(selector).first
+            await locator.fill(value, timeout=timeout, **kwargs)
+            return value
 
         # Backward compatibility
         intention = kwargs.pop("intention", None)
@@ -1107,10 +1145,16 @@ class SkyvernPage(Page):
     @action_wrap(ActionType.WAIT)
     async def wait(
         self,
-        seconds: float,
+        seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
-        await asyncio.sleep(seconds)
+        timeout_ms = kwargs.pop("timeout_ms", None)
+        if seconds is not None:
+            await asyncio.sleep(seconds)
+        elif timeout_ms is not None:
+            await asyncio.sleep(timeout_ms / 1000.0)
+        else:
+            await asyncio.sleep(0)
 
     @action_wrap(ActionType.NULL_ACTION)
     async def null_action(self, **kwargs: Any) -> None:
@@ -1587,6 +1631,24 @@ class SkyvernPage(Page):
                                     max_steps=3,
                                 )
 
+                elif field_type in ("search-dropdown", "dropdown"):
+                    # Combobox / React Select: click to open, type to filter,
+                    # click the matching option.
+                    str_value = str(value)
+                    locator = self.page.locator(selector).first
+                    await locator.click(timeout=5000)
+                    await asyncio.sleep(0.3)
+                    await locator.fill("")
+                    search_text = str_value.split(",")[0].strip()[:25]
+                    await self.page.keyboard.type(search_text, delay=50)
+                    await asyncio.sleep(0.5)
+                    option = self.page.locator('[class*="select__option"]:visible').first
+                    try:
+                        await option.click(timeout=3000)
+                    except Exception:
+                        await self.page.keyboard.press("Enter")
+                    await asyncio.sleep(0.3)
+
                 else:
                     await self.fill(selector=selector, value=str(value), ai=None)
 
@@ -1818,6 +1880,13 @@ class SkyvernPage(Page):
             data_keys=list(data.keys())[:10],
         )
 
+        if not form_fields:
+            raise RuntimeError(
+                "fill_form found 0 form fields on the page. "
+                "The page may not have finished rendering — try adding "
+                "await page.wait(timeout_ms=5000) before fill_form()."
+            )
+
         mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
 
         if not await self.validate_mapping(form_fields, mapping, prompt):
@@ -1868,6 +1937,7 @@ class SkyvernPage(Page):
         start_time = time.monotonic()
         pages_filled = 0
         prev_field_signature: str | None = None
+        consecutive_validation_failures = 0
 
         for page_num in range(max_pages):
             elapsed = time.monotonic() - start_time
@@ -2025,13 +2095,24 @@ class SkyvernPage(Page):
                     return errs;
                 }""")
                 if post_click_errors:
+                    consecutive_validation_failures += 1
                     LOG.warning(
                         "fill_multipage_form: validation errors after Save and Continue",
                         page_num=page_num,
                         error_count=len(post_click_errors),
                         errors=post_click_errors[:5],
+                        consecutive_failures=consecutive_validation_failures,
                     )
                     await self._dump_html(debug_dir, f"p{page_num}_04_validation_errors")
+                    if consecutive_validation_failures >= 3:
+                        LOG.warning(
+                            "fill_multipage_form: too many consecutive validation failures, stopping",
+                            page_num=page_num,
+                            failures=consecutive_validation_failures,
+                        )
+                        break
+                else:
+                    consecutive_validation_failures = 0
             except Exception:
                 pass
 

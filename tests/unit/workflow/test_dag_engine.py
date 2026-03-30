@@ -15,7 +15,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -247,3 +247,354 @@ async def test_prompt_branch_uses_batched_evaluation(monkeypatch: pytest.MonkeyP
     assert metadata["branch_taken"] == "next"
     assert metadata["criteria_type"] == "prompt"
     prompt_eval_mock.assert_awaited_once()
+
+
+def test_build_workflow_graph_stores_conditional_own_next_block_label() -> None:
+    """Verify default_next_map stores the conditional block's own next_block_label.
+
+    SKY-8571: This is the prerequisite for the DAG fallback — when a matched
+    branch has next_block_label=None, the engine must be able to look up the
+    conditional block's own next_block_label in default_next_map.
+    """
+    service = WorkflowService()
+
+    conditional = _conditional_block(
+        "conditional",
+        branch_conditions=[
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ flag }}"), next_block_label="branch_target"),
+            BranchCondition(criteria=None, next_block_label=None, is_default=True),
+        ],
+        next_block_label="after_conditional",
+    )
+    branch_target = _navigation_block("branch_target", next_block_label="after_conditional")
+    after = _navigation_block("after_conditional")
+
+    _, _, default_next_map = service._build_workflow_graph([conditional, branch_target, after])
+
+    assert default_next_map["conditional"] == "after_conditional"
+
+
+def test_build_workflow_graph_patches_terminal_blocks_in_conditional_branches() -> None:
+    """SKY-8571: Terminal blocks at the end of a conditional branch chain
+    should be patched to point to the conditional's successor (merge-point).
+
+    This models the real customer bug: a conditional routes to a chain of blocks
+    (branch_start → middle → terminal), and the terminal block has no
+    next_block_label set.  The conditional's own next_block_label IS the
+    merge-point, so the terminal should be connected to it automatically.
+    """
+    service = WorkflowService()
+
+    conditional = _conditional_block(
+        "cond",
+        branch_conditions=[
+            BranchCondition(
+                criteria=JinjaBranchCriteria(expression="{{ flag }}"),
+                next_block_label="branch_start",
+            ),
+            # Default branch goes directly to merge point (no inner blocks)
+            BranchCondition(criteria=None, next_block_label="merge_point", is_default=True),
+        ],
+        next_block_label="merge_point",
+    )
+    # Branch chain: branch_start → middle → terminal (no next_block_label!)
+    branch_start = _navigation_block("branch_start", next_block_label="middle")
+    middle = _extraction_block("middle", next_block_label="terminal")
+    terminal = _navigation_block("terminal")  # No next_block_label
+    merge_point = _navigation_block("merge_point")
+
+    _, _, default_next_map = service._build_workflow_graph([conditional, branch_start, middle, terminal, merge_point])
+
+    # The terminal block should be patched to point to the merge point
+    assert default_next_map["terminal"] == "merge_point"
+    # Existing connections should be preserved
+    assert default_next_map["branch_start"] == "middle"
+    assert default_next_map["middle"] == "terminal"
+    assert default_next_map["merge_point"] is None
+
+
+def test_build_workflow_graph_patches_nested_conditional_no_merge_point() -> None:
+    """SKY-8571: This models the actual customer bug.
+
+    outer_cond (next=outer_merge) has a branch leading to:
+      block_29 → inner_cond (next=null)
+    inner_cond has NO merge point.  Its branches lead to:
+      branch 0 → loop → wait → validate (terminal)
+      default  → other_loop (terminal)
+
+    After iterative patching:
+      Pass 1: outer_cond patches inner_cond.next → outer_merge
+      Pass 2: inner_cond (now has successor) patches validate.next → outer_merge
+              AND other_loop.next → outer_merge
+    """
+    service = WorkflowService()
+
+    outer_cond = _conditional_block(
+        "outer_cond",
+        branch_conditions=[
+            BranchCondition(
+                criteria=JinjaBranchCriteria(expression="{{ flag }}"),
+                next_block_label="block_29",
+            ),
+            BranchCondition(criteria=None, next_block_label="outer_merge", is_default=True),
+        ],
+        next_block_label="outer_merge",
+    )
+    block_29 = _navigation_block("block_29", next_block_label="inner_cond")
+    inner_cond = _conditional_block(
+        "inner_cond",
+        branch_conditions=[
+            BranchCondition(
+                criteria=JinjaBranchCriteria(expression="{{ x }}"),
+                next_block_label="loop_block",
+            ),
+            BranchCondition(criteria=None, next_block_label="other_loop", is_default=True),
+        ],
+        next_block_label=None,  # No merge point!
+    )
+    loop_block = _navigation_block("loop_block", next_block_label="wait_block")
+    wait_block = _extraction_block("wait_block", next_block_label="validate")
+    validate = _navigation_block("validate")  # Terminal, next=None
+    other_loop = _navigation_block("other_loop")  # Terminal, next=None
+    outer_merge = _navigation_block("outer_merge")
+
+    _, _, default_next_map = service._build_workflow_graph(
+        [outer_cond, block_29, inner_cond, loop_block, wait_block, validate, other_loop, outer_merge]
+    )
+
+    # Pass 1: outer_cond patches inner_cond (terminal in its branch chain)
+    assert default_next_map["inner_cond"] == "outer_merge"
+    # Pass 2: inner_cond now has successor, patches its own branch terminals
+    assert default_next_map["validate"] == "outer_merge"
+    assert default_next_map["other_loop"] == "outer_merge"
+    # outer_merge itself stays terminal
+    assert default_next_map["outer_merge"] is None
+
+
+@pytest.mark.asyncio
+async def test_dag_conditional_fallback_to_own_next_block_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-8571: When a conditional block's matched branch has next_block_label=None,
+    the DAG should fall back to the conditional block's own next_block_label
+    instead of treating it as a terminal node and stopping execution.
+
+    Scenario: conditional has two branches — one that points to an inner block
+    and a default with no target. The conditional's own next_block_label serves
+    as the merge/continuation point. At runtime the default branch matches,
+    returning next_block_label=None. The engine should fall back.
+    """
+    from unittest.mock import MagicMock
+
+    from skyvern.forge.sdk.workflow.models.block import WaitBlock
+    from skyvern.schemas.workflows import BlockResult
+
+    service = WorkflowService()
+
+    # Workflow structure:
+    #   conditional ──branch_a──► inner_block ──► wait_block
+    #               └─default(None)              ▲
+    #               └─(own next_block_label)─────┘
+    # The default branch has next_block_label=None, but the conditional's
+    # own next_block_label points to wait_block as the merge point.
+    conditional = _conditional_block(
+        "conditional",
+        branch_conditions=[
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ flag }}"), next_block_label="inner_block"),
+            BranchCondition(criteria=None, next_block_label=None, is_default=True),
+        ],
+        next_block_label="wait_block",
+    )
+    inner = _navigation_block("inner_block", next_block_label="wait_block")
+    wait = WaitBlock(
+        label="wait_block",
+        output_parameter=_output_parameter("wait_output"),
+        wait_sec=1,
+    )
+
+    workflow = MagicMock()
+    workflow.workflow_definition = MagicMock()
+    workflow.workflow_definition.blocks = [conditional, inner, wait]
+    workflow.workflow_definition.finally_block_label = None
+    workflow.workflow_permanent_id = "wpid_test"
+    workflow.workflow_id = "wf_test"
+    workflow.generate_script_on_terminal = False
+
+    workflow_run = MagicMock()
+    workflow_run.workflow_run_id = "wr_test"
+
+    organization = MagicMock()
+    organization.organization_id = "org_test"
+
+    # Track which blocks were executed
+    executed_blocks: list[str] = []
+
+    async def mock_execute_single_block(
+        *,
+        workflow,
+        block,
+        block_idx,
+        blocks_cnt,
+        workflow_run,
+        organization,
+        workflow_run_id,
+        browser_session_id,
+        script_blocks_by_label,
+        loaded_script_module,
+        is_script_run,
+        blocks_to_update,
+        parent_workflow_run_block_id=None,
+    ):
+        executed_blocks.append(block.label)
+        branch_metadata = None
+        if block.block_type == BlockType.CONDITIONAL:
+            # Simulate: default branch matched → next_block_label is None
+            branch_metadata = {
+                "branch_taken": None,
+                "branch_index": 1,
+                "next_block_label": None,
+            }
+        block_result = BlockResult(
+            success=True,
+            output_parameter=block.output_parameter,
+            output_parameter_value=branch_metadata,
+            status=BlockStatus.completed,
+            workflow_run_block_id=f"wrb_{block.label}",
+        )
+        return workflow_run, blocks_to_update, block_result, False, branch_metadata
+
+    monkeypatch.setattr(service, "_execute_single_block", mock_execute_single_block)
+
+    result_run, _ = await service._execute_workflow_blocks_dag(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        organization=organization,
+        browser_session_id=None,
+        script_blocks_by_label={},
+        loaded_script_module=None,
+        is_script_run=False,
+        blocks_to_update=set(),
+    )
+
+    # The critical assertion: both blocks should have been executed.
+    # Before the fix, only "conditional" would be in the list because
+    # the DAG treated next_block_label=None as a terminal node.
+    assert executed_blocks == ["conditional", "wait_block"]
+
+
+@pytest.mark.asyncio
+async def test_dag_execution_continues_after_nested_conditional_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-8571: Models the actual customer bug — nested conditionals where the
+    inner conditional has no merge point.
+
+    Structure:
+      outer_cond (next=merge) → branch → nav → inner_cond (next=null)
+      inner_cond → branch → loop_block → validate (next=null)
+      merge (wait block)
+
+    Execution: outer_cond → nav → inner_cond → loop_block → validate → merge
+    Before the fix, execution stalls at validate because both validate and
+    inner_cond have next_block_label=null.
+    """
+    from unittest.mock import MagicMock
+
+    from skyvern.forge.sdk.workflow.models.block import WaitBlock
+    from skyvern.schemas.workflows import BlockResult
+
+    service = WorkflowService()
+
+    outer_cond = _conditional_block(
+        "outer_cond",
+        branch_conditions=[
+            BranchCondition(
+                criteria=JinjaBranchCriteria(expression="{{ flag }}"),
+                next_block_label="nav",
+            ),
+            BranchCondition(criteria=None, next_block_label="merge", is_default=True),
+        ],
+        next_block_label="merge",
+    )
+    nav = _navigation_block("nav", next_block_label="inner_cond")
+    inner_cond = _conditional_block(
+        "inner_cond",
+        branch_conditions=[
+            BranchCondition(
+                criteria=JinjaBranchCriteria(expression="{{ x }}"),
+                next_block_label="loop_block",
+            ),
+            BranchCondition(criteria=None, next_block_label="other_path", is_default=True),
+        ],
+        next_block_label=None,  # No merge point!
+    )
+    loop_block = _navigation_block("loop_block", next_block_label="validate")
+    validate = _extraction_block("validate")  # Terminal — next=None
+    other_path = _navigation_block("other_path")  # Terminal — next=None
+    merge = WaitBlock(
+        label="merge",
+        output_parameter=_output_parameter("merge_output"),
+        wait_sec=1,
+    )
+
+    workflow = MagicMock()
+    workflow.workflow_definition = MagicMock()
+    workflow.workflow_definition.blocks = [outer_cond, nav, inner_cond, loop_block, validate, other_path, merge]
+    workflow.workflow_definition.finally_block_label = None
+    workflow.workflow_permanent_id = "wpid_test"
+    workflow.workflow_id = "wf_test"
+    workflow.generate_script_on_terminal = False
+
+    workflow_run = MagicMock()
+    workflow_run.workflow_run_id = "wr_test"
+
+    organization = MagicMock()
+    organization.organization_id = "org_test"
+
+    executed_blocks: list[str] = []
+
+    # Map conditional labels to the branch_metadata they should return
+    branch_responses = {
+        "outer_cond": {"branch_taken": "nav", "branch_index": 0, "next_block_label": "nav"},
+        "inner_cond": {"branch_taken": "loop_block", "branch_index": 0, "next_block_label": "loop_block"},
+    }
+
+    async def mock_execute_single_block(
+        *,
+        workflow,
+        block,
+        block_idx,
+        blocks_cnt,
+        workflow_run,
+        organization,
+        workflow_run_id,
+        browser_session_id,
+        script_blocks_by_label,
+        loaded_script_module,
+        is_script_run,
+        blocks_to_update,
+        parent_workflow_run_block_id=None,
+    ):
+        executed_blocks.append(block.label)
+        branch_metadata = branch_responses.get(block.label)
+        block_result = BlockResult(
+            success=True,
+            output_parameter=block.output_parameter,
+            output_parameter_value=branch_metadata,
+            status=BlockStatus.completed,
+            workflow_run_block_id=f"wrb_{block.label}",
+        )
+        return workflow_run, blocks_to_update, block_result, False, branch_metadata
+
+    monkeypatch.setattr(service, "_execute_single_block", mock_execute_single_block)
+
+    result_run, _ = await service._execute_workflow_blocks_dag(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        organization=organization,
+        browser_session_id=None,
+        script_blocks_by_label={},
+        loaded_script_module=None,
+        is_script_run=False,
+        blocks_to_update=set(),
+    )
+
+    # All blocks should execute through to merge.
+    # Before the fix, execution stalled at validate (next=null).
+    assert executed_blocks == ["outer_cond", "nav", "inner_cond", "loop_block", "validate", "merge"]

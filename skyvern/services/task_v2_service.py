@@ -16,6 +16,7 @@ from skyvern.exceptions import (
     UrlGenerationFailure,
 )
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
@@ -94,7 +95,7 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
 
 async def _summarize_max_steps_failure_reason(
     task_v2: TaskV2, organization_id: str, browser_state: BrowserState | None
-) -> str:
+) -> tuple[str, list[dict] | None]:
     """
     Summarize the failure reason for the task v2.
     """
@@ -102,11 +103,11 @@ async def _summarize_max_steps_failure_reason(
         assert task_v2.workflow_run_id is not None
 
         if browser_state is None:
-            return "Failed to start browser"
+            return "Failed to start browser", None
 
         page = await browser_state.get_working_page()
         if page is None:
-            return "Failed to get the current browser page"
+            return "Failed to get the current browser page", None
 
         screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=str(task_v2.url), draw_boxes=False)
 
@@ -142,10 +143,10 @@ async def _summarize_max_steps_failure_reason(
             prompt_name="task_v2_summarize-max-steps-reason",
             thought=thought,
         )
-        return json_response.get("reasoning", "")
+        return json_response.get("reasoning", ""), json_response.get("failure_categories")
     except Exception:
         LOG.warning("Failed to summarize the failure reason for task v2", exc_info=True)
-        return ""
+        return "", None
 
 
 async def _handle_task_v2_termination(
@@ -157,6 +158,7 @@ async def _handle_task_v2_termination(
     termination_reason: str | None,
     iteration: int,
     source: str | None = None,
+    failure_category: list[dict] | None = None,
 ) -> TaskV2:
     """
     Handle task v2 termination by creating a termination thought and marking the task as terminated.
@@ -212,11 +214,13 @@ async def _handle_task_v2_termination(
         output=output,
     )
 
+    resolved_failure_category = failure_category or classify_from_failure_reason(termination_reason)
     task_v2 = await mark_task_v2_as_terminated(
         task_v2_id=task_v2_id,
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
         failure_reason=termination_reason or "Task goal is impossible to achieve",
+        failure_category=resolved_failure_category,
     )
 
     return task_v2
@@ -805,6 +809,7 @@ async def run_task_v2_helper(
             user_goal_achieved = task_v2_response.get("user_goal_achieved", False)
             should_terminate = task_v2_response.get("should_terminate", False)
             termination_reason = task_v2_response.get("termination_reason")
+            failure_categories = task_v2_response.get("failure_categories")
             observation = task_v2_response.get("page_info", "")
             thoughts: str = task_v2_response.get("thoughts", "")
             plan = task_v2_response.get("plan", "")
@@ -852,6 +857,7 @@ async def run_task_v2_helper(
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     termination_reason=termination_reason,
                     iteration=i,
+                    failure_category=failure_categories,
                 )
                 return workflow, workflow_run, task_v2
 
@@ -1052,6 +1058,7 @@ async def run_task_v2_helper(
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
             should_terminate = completion_resp.get("should_terminate", False)
             termination_reason = completion_resp.get("termination_reason")
+            completion_failure_categories = completion_resp.get("failure_categories")
             thought_content = completion_resp.get("thoughts", "")
             await app.DATABASE.update_thought(
                 thought_id=thought.observer_thought_id,
@@ -1094,6 +1101,7 @@ async def run_task_v2_helper(
                     termination_reason=termination_reason,
                     iteration=i,
                     source="completion_check",
+                    failure_category=completion_failure_categories,
                 )
                 return workflow, workflow_run, task_v2
 
@@ -1105,12 +1113,24 @@ async def run_task_v2_helper(
         )
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
-            failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
+            failure_reason, llm_failure_categories = await _summarize_max_steps_failure_reason(
+                task_v2, organization_id, browser_state
+            )
+            full_failure_reason = (
+                f"Reached the max number of {max_steps} steps."
+                f" Possible failure reasons: {failure_reason}"
+                f' If you need more steps, update the "Max Steps Override"'
+                f" configuration when running the task. Or add/update the"
+                f' "x-max-steps-override" header with your desired number'
+                f" of steps in the API request."
+            )
+            failure_category = llm_failure_categories or classify_from_failure_reason(full_failure_reason)
             task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
-                failure_reason=f'Reached the max number of {max_steps} steps. Possible failure reasons: {failure_reason} If you need more steps, update the "Max Steps Override" configuration when running the task. Or add/update the "x-max-steps-override" header with your desired number of steps in the API request.',
+                failure_reason=full_failure_reason,
                 organization_id=organization_id,
+                failure_category=failure_category,
             )
             return workflow, workflow_run, task_v2
     else:
@@ -1631,9 +1651,15 @@ async def _update_task_v2_status(
     organization_id: str | None = None,
     summary: str | None = None,
     output: dict[str, Any] | None = None,
+    failure_category: list[dict] | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.update_task_v2(
-        task_v2_id, organization_id=organization_id, status=status, summary=summary, output=output
+        task_v2_id,
+        organization_id=organization_id,
+        status=status,
+        summary=summary,
+        output=output,
+        failure_category=failure_category,
     )
     if status in [TaskV2Status.completed, TaskV2Status.failed, TaskV2Status.terminated]:
         start_time = (
@@ -1658,15 +1684,19 @@ async def mark_task_v2_as_failed(
     workflow_run_id: str | None = None,
     failure_reason: str | None = None,
     organization_id: str | None = None,
+    failure_category: list[dict] | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.failed,
+        failure_category=failure_category,
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-            workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
+            workflow_run_id,
+            failure_reason=failure_reason or "Skyvern task 2.0 failed",
+            failure_category=failure_category,
         )
 
     # Add task failure tag to trace
@@ -1725,14 +1755,20 @@ async def mark_task_v2_as_terminated(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     failure_reason: str | None = None,
+    failure_category: list[dict] | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.terminated,
+        failure_category=failure_category,
     )
     if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(
+            workflow_run_id,
+            failure_reason,
+            failure_category=failure_category,
+        )
 
     # Add task terminated tag to trace
     otel_trace.get_current_span().set_attribute("task.completion_status", "terminated")

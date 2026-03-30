@@ -544,7 +544,7 @@ class AgentFunction:
                         f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element."
                     )
                 disable_conversion = element_cnt > MAX_ELEMENT_CNT
-                if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None or not settings.ENABLE_CSS_SVG_PARSING:
                     disable_conversion = True
 
                 if queue_ele.get("frame_index") != current_frame_index:
@@ -647,6 +647,14 @@ class AgentFunction:
 
         Returns a CanonicalCategory object or None.
         Override in cloud to provide canonical category lookup.
+        """
+        return None
+
+    def try_import_static_script(self, script_path: str) -> Any | None:
+        """Try to import a static script module as a fallback when spec_from_file_location fails.
+
+        Override in subclass for platform-specific import logic.
+        Returns the loaded module or None.
         """
         return None
 

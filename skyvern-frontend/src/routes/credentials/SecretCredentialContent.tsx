@@ -16,6 +16,8 @@ type Props = {
     secretLabel: string;
     secretValue: string;
   }) => void;
+  /** Slot rendered right after Name, before the separator */
+  beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
@@ -25,6 +27,7 @@ type Props = {
 function SecretCredentialContent({
   values,
   onChange,
+  beforeCredentialFields,
   editMode,
   editingGroups,
   onEnableEditName,
@@ -63,6 +66,7 @@ function SecretCredentialContent({
           )}
         </div>
       </div>
+      {beforeCredentialFields}
       <Separator />
       <div className="space-y-2">
         <Label>Secret Label (optional)</Label>

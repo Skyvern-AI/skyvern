@@ -35,6 +35,7 @@ class MaxStepsReasonResponse(BaseModel):
     page_info: str
     reasoning: str
     errors: list[UserDefinedError] = []
+    failure_categories: list[dict] = []
 
 
 def load_prompt_with_elements(

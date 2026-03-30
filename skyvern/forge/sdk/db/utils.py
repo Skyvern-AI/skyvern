@@ -148,6 +148,33 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         return None
 
 
+def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
+    """
+    Serialize proxy_location for database storage.
+
+    Converts GeoTarget objects or dicts to JSON strings, passes through
+    ProxyLocation enum values as-is, and returns None for None.
+    """
+    result: str | None = None
+    if proxy_location is None:
+        result = None
+    elif isinstance(proxy_location, GeoTarget):
+        result = json.dumps(proxy_location.model_dump())
+    elif isinstance(proxy_location, dict):
+        result = json.dumps(proxy_location)
+    else:
+        # ProxyLocation enum - return the string value
+        result = str(proxy_location)
+
+    LOG.debug(
+        "Serializing proxy_location for DB",
+        input_type=type(proxy_location).__name__,
+        input_value=str(proxy_location),
+        serialized_value=result,
+    )
+    return result
+
+
 # Mapping of action types to their corresponding action classes
 ACTION_TYPE_TO_CLASS = {
     ActionType.CLICK: ClickAction,
@@ -225,6 +252,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
+        failure_category=task_obj.failure_category,
     )
     return task
 
@@ -455,6 +483,7 @@ def convert_to_workflow_run(
         ai_fallback=workflow_run_model.ai_fallback,
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
+        failure_category=workflow_run_model.failure_category,
     )
 
 
