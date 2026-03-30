@@ -5,42 +5,15 @@ import {
   getAvailableOutputParameterKeys,
   isNodeInsideForLoop,
 } from "../workflowEditorUtils";
+import {
+  GLOBAL_RESERVED_PARAMETERS,
+  LOOP_RESERVED_PARAMETERS,
+} from "../constants";
 import { PlusIcon } from "@radix-ui/react-icons";
 import { SwitchBar } from "@/components/SwitchBar";
 import { useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ScrollAreaViewport } from "@radix-ui/react-scroll-area";
-
-// Reserved parameters that are always available
-// See: skyvern/forge/sdk/workflow/models/parameter.py RESERVED_PARAMETER_KEYS
-const GLOBAL_RESERVED_PARAMETERS = [
-  { key: "current_date", description: "Current UTC date (YYYY-MM-DD format)" },
-  {
-    key: "workflow_run_outputs",
-    description: "JSON of all block outputs collected so far",
-  },
-  {
-    key: "workflow_run_summary",
-    description: "Merged summary of all block outputs",
-  },
-  { key: "workflow_run_id", description: "Unique ID of the current run" },
-  { key: "workflow_id", description: "The workflow's ID" },
-  {
-    key: "workflow_permanent_id",
-    description: "The workflow's permanent ID",
-  },
-  { key: "workflow_title", description: "The workflow's title" },
-];
-
-// Reserved parameters only available inside loop blocks
-const LOOP_RESERVED_PARAMETERS = [
-  { key: "current_value", description: "The current item being iterated" },
-  { key: "current_item", description: "Alias for current_value" },
-  {
-    key: "current_index",
-    description: "Zero-based index of the current iteration",
-  },
-];
 
 type Props = {
   nodeId: string;
