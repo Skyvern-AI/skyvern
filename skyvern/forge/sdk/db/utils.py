@@ -1,5 +1,6 @@
 import json
 import typing
+from urllib.parse import urlparse
 
 import pydantic.json
 import structlog
@@ -95,6 +96,17 @@ from skyvern.webeye.actions.actions import (
 LOG = structlog.get_logger()
 
 
+def _sanitize_proxy_url(url: str) -> str:
+    try:
+        p = urlparse(url)
+        if p.username or p.password:
+            netloc = f"<redacted>@{p.hostname}" + (f":{p.port}" if p.port else "")
+            return url.replace(p.netloc, netloc)
+    except Exception:
+        pass
+    return url
+
+
 def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
     if not raw:
         return None
@@ -143,9 +155,12 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         result = ProxyLocation(value)
         return result
     except ValueError:
-        # If all else fails, return as-is (shouldn't happen with valid data)
-        LOG.warning("Failed to deserialize proxy_location", db_value=value)
-        return None
+        # If all else fails, return as-is (custom proxy URL)
+        LOG.warning(
+            "Failed to deserialize proxy_location as enum, assuming it is a custom proxy url string",
+            db_value=_sanitize_proxy_url(value),
+        )
+        return value
 
 
 def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
