@@ -19,14 +19,14 @@ def mock_session():
 def agent_db(mock_session):
     db = AgentDB.__new__(AgentDB)
     db.Session = MagicMock(return_value=mock_session)
-    # Set up tasks repository (sync_task_run_status delegates to self.tasks)
-    from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+    # Set up workflow_params with the same session factory for delegation
+    from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 
-    tasks = TasksRepository.__new__(TasksRepository)
-    tasks.Session = MagicMock(return_value=mock_session)
-    tasks.debug_enabled = False
-    tasks._is_retryable_error_fn = None
-    db.tasks = tasks
+    wp = WorkflowParametersRepository.__new__(WorkflowParametersRepository)
+    wp.Session = MagicMock(return_value=mock_session)
+    wp.debug_enabled = False
+    wp._is_retryable_error_fn = None
+    db.workflow_params = wp
     return db
 
 
