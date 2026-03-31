@@ -20,6 +20,7 @@ _SOURCE_FILE = _repo_root() / "workers" / "cron_worker" / "task_runs_sync_activi
 pytestmark = pytest.mark.skipif(not _SOURCE_FILE.exists(), reason="cloud-only: workers/cron_worker/ not present")
 
 
+
 def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
     base = declarative_base()
 
