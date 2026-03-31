@@ -1654,6 +1654,27 @@ function getElements(
 
   // Create top-level edges based on next_block_label (not array order!)
   // We'll filter out conditional branch blocks below by checking conditionalNodeId
+  //
+  // Detect cycles by walking the next_block_label chain (not array order, since the
+  // two can differ). React Flow crashes when rendering cyclic edge graphs.
+  const cycleBackEdgeLabels = new Set<string>();
+  {
+    const visited = new Set<string>();
+    let current = blocks[0]?.label ?? null;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const block = blocksByLabel.get(current);
+      if (!block) break;
+      const next = block.next_block_label ?? null;
+      if (next && visited.has(next)) {
+        // This block's next_block_label closes a cycle — mark it
+        cycleBackEdgeLabels.add(current);
+        break;
+      }
+      current = next;
+    }
+  }
+
   blocks.forEach((block) => {
     const sourceNode = labelToNode.get(block.label);
     if (!sourceNode || !isWorkflowBlockNode(sourceNode)) {
@@ -1668,6 +1689,10 @@ function getElements(
     // Find target block using next_block_label
     const nextLabel = block.next_block_label;
     if (nextLabel) {
+      // Skip edges that close a cycle in the next_block_label chain
+      if (cycleBackEdgeLabels.has(block.label)) {
+        return;
+      }
       const targetNode = labelToNode.get(nextLabel);
       if (targetNode) {
         edges.push(edgeWithAddButton(sourceNode.id, targetNode.id));
@@ -1691,11 +1716,13 @@ function getElements(
   if (blocks.length === 0) {
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
-    // Find the last top-level block (one with next_block_label === null and not in a branch)
-    // There might be multiple blocks with next_block_label === null (e.g., last block in nested branches)
-    // We need the one that's NOT inside any conditional
+    // Find the last top-level block: one with next_block_label === null OR
+    // one whose back-edge was skipped (cycle broken), and not in a branch
     const lastBlock = blocks.find((block) => {
-      if (block.next_block_label !== null) {
+      if (
+        block.next_block_label !== null &&
+        !cycleBackEdgeLabels.has(block.label)
+      ) {
         return false;
       }
       const node = labelToNode.get(block.label);

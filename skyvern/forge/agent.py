@@ -106,7 +106,11 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.otp_service import (
+    extract_totp_from_navigation_inputs,
+    poll_otp_value,
+    try_generate_totp_from_credential,
+)
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -4826,13 +4830,17 @@ class ForgeAgent:
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
-        if (
-            place_to_enter_verification_code
-            and should_enter_verification_code
-            and (task.totp_verification_url or task.totp_identifier)
-            and task.organization_id
-        ):
-            LOG.info("Need verification code")
+        if not (place_to_enter_verification_code and should_enter_verification_code):
+            return json_response
+
+        LOG.info("Need verification code")
+        # 1. Check navigation payload first for inline OTP.
+        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+        # 2. Then try to generate TOTP from credential if payload has no OTP.
+        if not otp_value:
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
+        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             workflow_id = workflow_permanent_id = None
             if task.workflow_run_id:
                 workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
@@ -4848,38 +4856,38 @@ class ForgeAgent:
                 totp_verification_url=task.totp_verification_url,
                 totp_identifier=task.totp_identifier,
             )
-            if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
-                return json_response
 
-            current_context = skyvern_context.ensure_context()
-            current_context.totp_codes[task.task_id] = otp_value.value
+        if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
+            return json_response
 
-            extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
-                task,
-                step,
-                browser_state,
-                scraped_page,
-                verification_code_check=False,
-            )
-            llm_key_override = task.llm_key
-            if await service_utils.is_cua_task(task=task):
-                llm_key_override = None
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.LLM_API_HANDLER
-            )
-            # Add caching flag to context for monitoring
-            if use_caching:
-                context = skyvern_context.current()
-                if context:
-                    context.use_prompt_caching = True
+        current_context = skyvern_context.ensure_context()
+        current_context.totp_codes[task.task_id] = otp_value.value
 
-            return await llm_api_handler(
-                prompt=extract_action_prompt,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                prompt_name=prompt_name,
-            )
-        return json_response
+        extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
+            task,
+            step,
+            browser_state,
+            scraped_page,
+            verification_code_check=False,
+        )
+        llm_key_override = task.llm_key
+        if await service_utils.is_cua_task(task=task):
+            llm_key_override = None
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            llm_key_override, default=app.LLM_API_HANDLER
+        )
+        # Add caching flag to context for monitoring
+        if use_caching:
+            context = skyvern_context.current()
+            if context:
+                context.use_prompt_caching = True
+
+        return await llm_api_handler(
+            prompt=extract_action_prompt,
+            step=step,
+            screenshots=scraped_page.screenshots,
+            prompt_name=prompt_name,
+        )
 
     @staticmethod
     async def get_task_errors(task: Task) -> list[UserDefinedError]:
