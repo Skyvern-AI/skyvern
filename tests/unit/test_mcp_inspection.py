@@ -10,7 +10,7 @@ from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
 from skyvern.cli.mcp_tools.inspection import (
     _redact_url,
-    ensure_hooks_registered,
+    _register_hooks_on_page,
     skyvern_console_messages,
     skyvern_handle_dialog,
     skyvern_network_requests,
@@ -62,7 +62,7 @@ class TestEnsureHooks:
         state = _make_state()
         raw = MagicMock()
         raw.on = MagicMock()
-        ensure_hooks_registered(state, _make_page(raw))
+        _register_hooks_on_page(state, raw)
         assert raw.on.call_count == 3
         assert {c.args[0] for c in raw.on.call_args_list} == {"console", "response", "dialog"}
 
@@ -70,21 +70,23 @@ class TestEnsureHooks:
         state = _make_state()
         raw = MagicMock()
         raw.on = MagicMock()
-        page = _make_page(raw)
-        ensure_hooks_registered(state, page)
-        ensure_hooks_registered(state, page)
+        _register_hooks_on_page(state, raw)
+        _register_hooks_on_page(state, raw)
         assert raw.on.call_count == 3
 
-    def test_removes_old_listeners_on_switch(self) -> None:
+    def test_keeps_hooks_on_both_pages(self) -> None:
+        """Multi-page: hooks are registered on ALL pages, not removed on switch."""
         state = _make_state()
         raw1 = MagicMock()
         raw1.on = MagicMock()
         raw1.remove_listener = MagicMock()
         raw2 = MagicMock()
         raw2.on = MagicMock()
-        ensure_hooks_registered(state, _make_page(raw1))
-        ensure_hooks_registered(state, _make_page(raw2))
-        assert raw1.remove_listener.call_count == 3
+        _register_hooks_on_page(state, raw1)
+        _register_hooks_on_page(state, raw2)
+        # Both pages should have hooks registered — no removal
+        assert raw1.remove_listener.call_count == 0
+        assert raw1.on.call_count == 3
         assert raw2.on.call_count == 3
 
 
