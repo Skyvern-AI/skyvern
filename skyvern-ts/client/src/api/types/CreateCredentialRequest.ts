@@ -12,6 +12,8 @@ export interface CreateCredentialRequest {
     credential_type: Skyvern.SkyvernForgeSdkSchemasCredentialsCredentialType;
     /** The credential data to store */
     credential: CreateCredentialRequest.Credential;
+    /** Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization. */
+    vault_type?: Skyvern.CredentialVaultType;
 }
 
 export namespace CreateCredentialRequest {

@@ -19,26 +19,19 @@ from .errors.not_found_error import NotFoundError
 from .errors.unprocessable_entity_error import UnprocessableEntityError
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
-from .types.billing_state_response import BillingStateResponse
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
-from .types.change_tier_response import ChangeTierResponse
-from .types.checkout_session_response import CheckoutSessionResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
+from .types.credential_vault_type import CredentialVaultType
 from .types.extensions import Extensions
-from .types.folder import Folder
 from .types.get_run_response import GetRunResponse
 from .types.otp_type import OtpType
 from .types.persistent_browser_type import PersistentBrowserType
-from .types.plan_tier import PlanTier
-from .types.portal_session_response import PortalSessionResponse
 from .types.proxy_location import ProxyLocation
 from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
-from .types.run_sdk_action_request_action import RunSdkActionRequestAction
-from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
@@ -194,7 +187,7 @@ class RawSkyvern:
             The CDP address for the task.
 
         run_with : typing.Optional[str]
-            Whether to run the task with agent or code.
+            Whether to run the task with agent or code. Null means use the default.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -382,7 +375,7 @@ class RawSkyvern:
             Whether to fallback to AI if the workflow run fails.
 
         run_with : typing.Optional[str]
-            Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
+            Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -856,506 +849,6 @@ class RawSkyvern:
                     ),
                 )
                 return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def get_folders(
-        self,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        search: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[typing.List[Folder]]:
-        """
-        Get all folders for the organization
-
-        Parameters
-        ----------
-        page : typing.Optional[int]
-            Page number
-
-        page_size : typing.Optional[int]
-            Number of folders per page
-
-        search : typing.Optional[str]
-            Search folders by title or description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[typing.List[Folder]]
-            Successfully retrieved folders
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/folders",
-            method="GET",
-            params={
-                "page": page,
-                "page_size": page_size,
-                "search": search,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.List[Folder],
-                    parse_obj_as(
-                        type_=typing.List[Folder],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def create_folder(
-        self,
-        *,
-        title: str,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[Folder]:
-        """
-        Create a new folder to organize workflows
-
-        Parameters
-        ----------
-        title : str
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[Folder]
-            Successfully created folder
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/folders",
-            method="POST",
-            json={
-                "title": title,
-                "description": description,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Folder,
-                    parse_obj_as(
-                        type_=Folder,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def get_folder(
-        self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[Folder]:
-        """
-        Get a specific folder by ID
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[Folder]
-            Successfully retrieved folder
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/folders/{jsonable_encoder(folder_id)}",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Folder,
-                    parse_obj_as(
-                        type_=Folder,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def update_folder(
-        self,
-        folder_id: str,
-        *,
-        title: typing.Optional[str] = OMIT,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[Folder]:
-        """
-        Update a folder's title or description
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        title : typing.Optional[str]
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[Folder]
-            Successfully updated folder
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/folders/{jsonable_encoder(folder_id)}",
-            method="PUT",
-            json={
-                "title": title,
-                "description": description,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Folder,
-                    parse_obj_as(
-                        type_=Folder,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def delete_folder(
-        self,
-        folder_id: str,
-        *,
-        delete_workflows: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[typing.Dict[str, typing.Optional[typing.Any]]]:
-        """
-        Delete a folder. Optionally delete all workflows in the folder.
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        delete_workflows : typing.Optional[bool]
-            If true, also delete all workflows in this folder
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[typing.Dict[str, typing.Optional[typing.Any]]]
-            Successfully deleted folder
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/folders/{jsonable_encoder(folder_id)}",
-            method="DELETE",
-            params={
-                "delete_workflows": delete_workflows,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.Dict[str, typing.Optional[typing.Any]],
-                    parse_obj_as(
-                        type_=typing.Dict[str, typing.Optional[typing.Any]],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        *,
-        folder_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[Workflow]:
-        """
-        Update a workflow's folder assignment for the latest version
-
-        Parameters
-        ----------
-        workflow_permanent_id : str
-            Workflow permanent ID
-
-        folder_id : typing.Optional[str]
-            Folder ID to assign workflow to. Set to null to remove from folder.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[Workflow]
-            Successfully updated workflow folder
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/folder",
-            method="PUT",
-            json={
-                "folder_id": folder_id,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Workflow,
-                    parse_obj_as(
-                        type_=Workflow,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def get_artifact(
-        self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[Artifact]:
-        """
-        Get an artifact
-
-        Parameters
-        ----------
-        artifact_id : str
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[Artifact]
-            Successfully retrieved artifact
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/artifacts/{jsonable_encoder(artifact_id)}",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Artifact,
-                    parse_obj_as(
-                        type_=Artifact,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),
@@ -2532,6 +2025,7 @@ class RawSkyvern:
         *,
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
+        vault_type: typing.Optional[CredentialVaultType] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[CredentialResponse]]:
         """
@@ -2544,6 +2038,9 @@ class RawSkyvern:
 
         page_size : typing.Optional[int]
             Number of items per page
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2559,6 +2056,7 @@ class RawSkyvern:
             params={
                 "page": page,
                 "page_size": page_size,
+                "vault_type": vault_type,
             },
             request_options=request_options,
         )
@@ -2594,6 +2092,7 @@ class RawSkyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[CredentialResponse]:
         """
@@ -2609,6 +2108,9 @@ class RawSkyvern:
 
         credential : CreateCredentialRequestCredential
             The credential data to store
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2627,6 +2129,7 @@ class RawSkyvern:
                 "credential": convert_and_respect_annotation_metadata(
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
+                "vault_type": vault_type,
             },
             headers={
                 "content-type": "application/json",
@@ -2667,6 +2170,7 @@ class RawSkyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[CredentialResponse]:
         """
@@ -2686,6 +2190,9 @@ class RawSkyvern:
         credential : CreateCredentialRequestCredential
             The credential data to store
 
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2703,6 +2210,7 @@ class RawSkyvern:
                 "credential": convert_and_respect_annotation_metadata(
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
+                "vault_type": vault_type,
             },
             headers={
                 "content-type": "application/json",
@@ -3362,310 +2870,6 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    def run_sdk_action(
-        self,
-        *,
-        url: str,
-        action: RunSdkActionRequestAction,
-        browser_session_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
-        workflow_run_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[RunSdkActionResponse]:
-        """
-        Execute a single SDK action with the specified parameters
-
-        Parameters
-        ----------
-        url : str
-            The URL where the action should be executed
-
-        action : RunSdkActionRequestAction
-            The action to execute with its specific parameters
-
-        browser_session_id : typing.Optional[str]
-            The browser session ID
-
-        browser_address : typing.Optional[str]
-            The browser address
-
-        workflow_run_id : typing.Optional[str]
-            Optional workflow run ID to continue an existing workflow run
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunSdkActionResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/sdk/run_action",
-            method="POST",
-            json={
-                "url": url,
-                "browser_session_id": browser_session_id,
-                "browser_address": browser_address,
-                "workflow_run_id": workflow_run_id,
-                "action": convert_and_respect_annotation_metadata(
-                    object_=action, annotation=RunSdkActionRequestAction, direction="write"
-                ),
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunSdkActionResponse,
-                    parse_obj_as(
-                        type_=RunSdkActionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def create_checkout_session_api_v1billing_checkout_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[CheckoutSessionResponse]:
-        """
-        Create a Stripe Checkout Session for subscribing to a tier.
-
-        Frontend should redirect the user to the returned URL.
-        After successful checkout, Stripe will send a webhook that we handle
-        to store the subscription and initialize billing state.
-
-        Returns 400 if org already has an active subscription (use portal instead).
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[CheckoutSessionResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "api/v1/billing/checkout",
-            method="POST",
-            json={
-                "tier": tier,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CheckoutSessionResponse,
-                    parse_obj_as(
-                        type_=CheckoutSessionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def create_portal_session_api_v1billing_portal_post(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[PortalSessionResponse]:
-        """
-        Create a Stripe Customer Portal session for managing subscription.
-
-        Frontend should redirect the user to the returned URL.
-        The portal allows users to:
-        - Update payment methods
-        - Upgrade/downgrade plans
-        - Cancel subscription
-        - View invoices
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[PortalSessionResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "api/v1/billing/portal",
-            method="POST",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    PortalSessionResponse,
-                    parse_obj_as(
-                        type_=PortalSessionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def get_organization_billing_api_v1billing_state_get(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[typing.Optional[BillingStateResponse]]:
-        """
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[typing.Optional[BillingStateResponse]]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "api/v1/billing/state",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if _response is None or not _response.text.strip():
-                return HttpResponse(response=_response, data=None)
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.Optional[BillingStateResponse],
-                    parse_obj_as(
-                        type_=typing.Optional[BillingStateResponse],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def change_tier_api_v1billing_change_tier_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[ChangeTierResponse]:
-        """
-        Redirect to Stripe Portal for tier changes.
-        Portal handles proration based on configured settings:
-        - Upgrades: Immediate proration charge
-        - Downgrades: Apply at end of billing period
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[ChangeTierResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "api/v1/billing/change-tier",
-            method="POST",
-            json={
-                "tier": tier,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    ChangeTierResponse,
-                    parse_obj_as(
-                        type_=ChangeTierResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
 
 class AsyncRawSkyvern:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
@@ -3800,7 +3004,7 @@ class AsyncRawSkyvern:
             The CDP address for the task.
 
         run_with : typing.Optional[str]
-            Whether to run the task with agent or code.
+            Whether to run the task with agent or code. Null means use the default.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3988,7 +3192,7 @@ class AsyncRawSkyvern:
             Whether to fallback to AI if the workflow run fails.
 
         run_with : typing.Optional[str]
-            Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
+            Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4462,506 +3666,6 @@ class AsyncRawSkyvern:
                     ),
                 )
                 return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def get_folders(
-        self,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        search: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[typing.List[Folder]]:
-        """
-        Get all folders for the organization
-
-        Parameters
-        ----------
-        page : typing.Optional[int]
-            Page number
-
-        page_size : typing.Optional[int]
-            Number of folders per page
-
-        search : typing.Optional[str]
-            Search folders by title or description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[typing.List[Folder]]
-            Successfully retrieved folders
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/folders",
-            method="GET",
-            params={
-                "page": page,
-                "page_size": page_size,
-                "search": search,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.List[Folder],
-                    parse_obj_as(
-                        type_=typing.List[Folder],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def create_folder(
-        self,
-        *,
-        title: str,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[Folder]:
-        """
-        Create a new folder to organize workflows
-
-        Parameters
-        ----------
-        title : str
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[Folder]
-            Successfully created folder
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/folders",
-            method="POST",
-            json={
-                "title": title,
-                "description": description,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Folder,
-                    parse_obj_as(
-                        type_=Folder,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def get_folder(
-        self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[Folder]:
-        """
-        Get a specific folder by ID
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[Folder]
-            Successfully retrieved folder
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/folders/{jsonable_encoder(folder_id)}",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Folder,
-                    parse_obj_as(
-                        type_=Folder,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def update_folder(
-        self,
-        folder_id: str,
-        *,
-        title: typing.Optional[str] = OMIT,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[Folder]:
-        """
-        Update a folder's title or description
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        title : typing.Optional[str]
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[Folder]
-            Successfully updated folder
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/folders/{jsonable_encoder(folder_id)}",
-            method="PUT",
-            json={
-                "title": title,
-                "description": description,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Folder,
-                    parse_obj_as(
-                        type_=Folder,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def delete_folder(
-        self,
-        folder_id: str,
-        *,
-        delete_workflows: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[typing.Dict[str, typing.Optional[typing.Any]]]:
-        """
-        Delete a folder. Optionally delete all workflows in the folder.
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        delete_workflows : typing.Optional[bool]
-            If true, also delete all workflows in this folder
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[typing.Dict[str, typing.Optional[typing.Any]]]
-            Successfully deleted folder
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/folders/{jsonable_encoder(folder_id)}",
-            method="DELETE",
-            params={
-                "delete_workflows": delete_workflows,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.Dict[str, typing.Optional[typing.Any]],
-                    parse_obj_as(
-                        type_=typing.Dict[str, typing.Optional[typing.Any]],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        *,
-        folder_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[Workflow]:
-        """
-        Update a workflow's folder assignment for the latest version
-
-        Parameters
-        ----------
-        workflow_permanent_id : str
-            Workflow permanent ID
-
-        folder_id : typing.Optional[str]
-            Folder ID to assign workflow to. Set to null to remove from folder.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[Workflow]
-            Successfully updated workflow folder
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/folder",
-            method="PUT",
-            json={
-                "folder_id": folder_id,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Workflow,
-                    parse_obj_as(
-                        type_=Workflow,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def get_artifact(
-        self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[Artifact]:
-        """
-        Get an artifact
-
-        Parameters
-        ----------
-        artifact_id : str
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[Artifact]
-            Successfully retrieved artifact
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/artifacts/{jsonable_encoder(artifact_id)}",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    Artifact,
-                    parse_obj_as(
-                        type_=Artifact,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),
@@ -6138,6 +4842,7 @@ class AsyncRawSkyvern:
         *,
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
+        vault_type: typing.Optional[CredentialVaultType] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[CredentialResponse]]:
         """
@@ -6150,6 +4855,9 @@ class AsyncRawSkyvern:
 
         page_size : typing.Optional[int]
             Number of items per page
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6165,6 +4873,7 @@ class AsyncRawSkyvern:
             params={
                 "page": page,
                 "page_size": page_size,
+                "vault_type": vault_type,
             },
             request_options=request_options,
         )
@@ -6200,6 +4909,7 @@ class AsyncRawSkyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[CredentialResponse]:
         """
@@ -6215,6 +4925,9 @@ class AsyncRawSkyvern:
 
         credential : CreateCredentialRequestCredential
             The credential data to store
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6233,6 +4946,7 @@ class AsyncRawSkyvern:
                 "credential": convert_and_respect_annotation_metadata(
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
+                "vault_type": vault_type,
             },
             headers={
                 "content-type": "application/json",
@@ -6273,6 +4987,7 @@ class AsyncRawSkyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[CredentialResponse]:
         """
@@ -6292,6 +5007,9 @@ class AsyncRawSkyvern:
         credential : CreateCredentialRequestCredential
             The credential data to store
 
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -6309,6 +5027,7 @@ class AsyncRawSkyvern:
                 "credential": convert_and_respect_annotation_metadata(
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
+                "vault_type": vault_type,
             },
             headers={
                 "content-type": "application/json",
@@ -6948,310 +5667,6 @@ class AsyncRawSkyvern:
                     CreateScriptResponse,
                     parse_obj_as(
                         type_=CreateScriptResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def run_sdk_action(
-        self,
-        *,
-        url: str,
-        action: RunSdkActionRequestAction,
-        browser_session_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
-        workflow_run_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[RunSdkActionResponse]:
-        """
-        Execute a single SDK action with the specified parameters
-
-        Parameters
-        ----------
-        url : str
-            The URL where the action should be executed
-
-        action : RunSdkActionRequestAction
-            The action to execute with its specific parameters
-
-        browser_session_id : typing.Optional[str]
-            The browser session ID
-
-        browser_address : typing.Optional[str]
-            The browser address
-
-        workflow_run_id : typing.Optional[str]
-            Optional workflow run ID to continue an existing workflow run
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunSdkActionResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/sdk/run_action",
-            method="POST",
-            json={
-                "url": url,
-                "browser_session_id": browser_session_id,
-                "browser_address": browser_address,
-                "workflow_run_id": workflow_run_id,
-                "action": convert_and_respect_annotation_metadata(
-                    object_=action, annotation=RunSdkActionRequestAction, direction="write"
-                ),
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunSdkActionResponse,
-                    parse_obj_as(
-                        type_=RunSdkActionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def create_checkout_session_api_v1billing_checkout_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[CheckoutSessionResponse]:
-        """
-        Create a Stripe Checkout Session for subscribing to a tier.
-
-        Frontend should redirect the user to the returned URL.
-        After successful checkout, Stripe will send a webhook that we handle
-        to store the subscription and initialize billing state.
-
-        Returns 400 if org already has an active subscription (use portal instead).
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[CheckoutSessionResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "api/v1/billing/checkout",
-            method="POST",
-            json={
-                "tier": tier,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CheckoutSessionResponse,
-                    parse_obj_as(
-                        type_=CheckoutSessionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def create_portal_session_api_v1billing_portal_post(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[PortalSessionResponse]:
-        """
-        Create a Stripe Customer Portal session for managing subscription.
-
-        Frontend should redirect the user to the returned URL.
-        The portal allows users to:
-        - Update payment methods
-        - Upgrade/downgrade plans
-        - Cancel subscription
-        - View invoices
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[PortalSessionResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "api/v1/billing/portal",
-            method="POST",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    PortalSessionResponse,
-                    parse_obj_as(
-                        type_=PortalSessionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def get_organization_billing_api_v1billing_state_get(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[typing.Optional[BillingStateResponse]]:
-        """
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[typing.Optional[BillingStateResponse]]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "api/v1/billing/state",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if _response is None or not _response.text.strip():
-                return AsyncHttpResponse(response=_response, data=None)
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.Optional[BillingStateResponse],
-                    parse_obj_as(
-                        type_=typing.Optional[BillingStateResponse],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def change_tier_api_v1billing_change_tier_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[ChangeTierResponse]:
-        """
-        Redirect to Stripe Portal for tier changes.
-        Portal handles proration based on configured settings:
-        - Upgrades: Immediate proration charge
-        - Downgrades: Apply at end of billing period
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[ChangeTierResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "api/v1/billing/change-tier",
-            method="POST",
-            json={
-                "tier": tier,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    ChangeTierResponse,
-                    parse_obj_as(
-                        type_=ChangeTierResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )

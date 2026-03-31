@@ -56,7 +56,7 @@ following namespace:
 ```typescript
 import { Skyvern } from "@skyvern/client";
 
-const request: Skyvern.ListOrganizationSchedulesApiV1SchedulesGetRequest = {
+const request: Skyvern.RunTaskRequest = {
     ...
 };
 ```
