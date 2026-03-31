@@ -299,6 +299,9 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
 
 
 class WorkflowService:
+    # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
+    _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+
     @staticmethod
     def _determine_cache_invalidation(
         previous_blocks: list[dict[str, Any]],
@@ -1011,7 +1014,9 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                     workflow_run_id=workflow_run_id,
                 )
-                failure_reason = f"Failed to begin browser session for workflow run: {str(e)}"
+                failure_reason = (
+                    f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id,
                     failure_reason=failure_reason,
@@ -3623,7 +3628,50 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+        # Best-effort fire-and-forget write-through to task_runs table.
+        # Runs off the hot path so workflow status transitions stay fast.
+        bg = asyncio.create_task(
+            self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, status),
+        )
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
+
         return workflow_run
+
+    async def _sync_task_run_from_workflow_run(
+        self,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        """Fire-and-forget: propagate workflow_run status to task_runs."""
+        try:
+            await app.DATABASE.sync_task_run_status(
+                organization_id=workflow_run.organization_id,
+                run_id=workflow_run_id,
+                status=status.value,
+                started_at=workflow_run.started_at,
+                finished_at=workflow_run.finished_at,
+            )
+            # Also sync task_v2 if this workflow_run backs an observer_cruise
+            task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
+                workflow_run_id=workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+            if task_v2:
+                await app.DATABASE.sync_task_run_status(
+                    organization_id=workflow_run.organization_id,
+                    run_id=task_v2.observer_cruise_id,
+                    status=status.value,
+                    started_at=workflow_run.started_at,
+                    finished_at=workflow_run.finished_at,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to sync task_run status from workflow_run",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
         LOG.info(
