@@ -102,6 +102,14 @@ class SkyvernBrowser(BrowserContext):
         page = await self._browser_context.new_page()
         return await self._create_skyvern_page(page)
 
+    async def get_page_for(self, page: Page) -> SkyvernBrowserPage:
+        """Wrap an existing Playwright Page with Skyvern capabilities.
+
+        Use this to create a SkyvernBrowserPage for a specific tab when you
+        already have a reference to the raw Playwright Page object.
+        """
+        return await self._create_skyvern_page(page)
+
     async def _create_skyvern_page(self, page: Page) -> SkyvernBrowserPage:
         return SkyvernBrowserPage(self, page)
 
