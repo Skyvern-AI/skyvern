@@ -60,6 +60,10 @@ async def prepare_workflow(
         organization_id=organization.organization_id,
         run_id=workflow_run.workflow_run_id,
         title=workflow.title,
+        status=RunStatus.queued,
+        workflow_permanent_id=workflow_id,
+        parent_workflow_run_id=parent_workflow_run_id,
+        debug_session_id=debug_session_id,
     )
 
     if max_steps:

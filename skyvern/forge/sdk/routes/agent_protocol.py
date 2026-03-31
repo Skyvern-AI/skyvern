@@ -113,7 +113,9 @@ from skyvern.schemas.runs import (
     BlockRunResponse,
     RunEngine,
     RunResponse,
+    RunStatus,
     RunType,
+    TaskRunListItem,
     TaskRunRequest,
     TaskRunResponse,
     UploadFileResponse,
@@ -1082,7 +1084,6 @@ async def delete_workflow(
     "/folders",
     response_model=Folder,
     tags=["Workflow Folders"],
-    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "create_folder",
     },
@@ -1125,7 +1126,6 @@ async def create_folder(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflow Folders"],
-    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "get_folder",
     },
@@ -1170,7 +1170,6 @@ async def get_folder(
     "/folders",
     response_model=list[Folder],
     tags=["Workflow Folders"],
-    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "get_folders",
     },
@@ -1228,7 +1227,6 @@ async def get_folders(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflow Folders"],
-    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "update_folder",
     },
@@ -1275,7 +1273,6 @@ async def update_folder(
 @base_router.delete(
     "/folders/{folder_id}",
     tags=["Workflow Folders"],
-    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "delete_folder",
     },
@@ -1312,7 +1309,6 @@ async def delete_folder(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
     tags=["Workflow Folders"],
-    include_in_schema=False,
     openapi_extra={
         "x-fern-sdk-method-name": "update_workflow_folder",
     },
@@ -2145,6 +2141,48 @@ async def get_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
     return ORJSONResponse([run.model_dump() for run in runs])
+
+
+# NOTE: v2 returns TaskRunListItem from the unified task_runs table,
+# replacing the v1 response type (list[WorkflowRun | Task]) which
+# merged two separate queries. The v1 endpoint is preserved for
+# backwards compatibility until clients migrate.
+@base_router.get(
+    "/runs",
+    tags=["agent"],
+    response_model=list[TaskRunListItem],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_runs_v2",
+    },
+)
+@base_router.get(
+    "/runs/",
+    response_model=list[TaskRunListItem],
+    include_in_schema=False,
+)
+async def get_runs_v2(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(1, ge=1, le=100),
+    page_size: int = Query(10, ge=1, le=100),
+    status: Annotated[list[RunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        min_length=3,
+        description="Case-insensitive substring search (min 3 chars for trigram index).",
+        examples=["login_url", "wr_abc123"],
+    ),
+) -> Response:
+    analytics.capture("skyvern-oss-agent-runs-v2-get")
+
+    rows = await app.DATABASE.get_all_runs_v2(
+        current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        status=[s.value for s in status] if status else None,
+        search_key=search_key,
+    )
+    items = [TaskRunListItem.model_validate(row) for row in rows]
+    return ORJSONResponse([item.model_dump(mode="json") for item in items])
 
 
 @legacy_base_router.get(

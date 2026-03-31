@@ -24,7 +24,6 @@ from skyvern.forge.sdk.db.models import (
     OutputParameterModel,
     TaskGenerationModel,
     TaskModel,
-    TaskRunModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
     WorkflowParameterModel,
@@ -37,7 +36,6 @@ from skyvern.forge.sdk.db.utils import (
     hydrate_action,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -59,7 +57,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.schemas.runs import RunType
 from skyvern.webeye.actions.actions import Action
 
 if TYPE_CHECKING:
@@ -567,135 +564,3 @@ class WorkflowParametersMixin:
 
             actions = (await session.scalars(query)).all()
             return [Action.model_validate(action) for action in actions]
-
-    @db_operation("create_task_run")
-    async def create_task_run(
-        self,
-        task_run_type: RunType,
-        organization_id: str,
-        run_id: str,
-        title: str | None = None,
-        url: str | None = None,
-        url_hash: str | None = None,
-    ) -> Run:
-        async with self.Session() as session:
-            task_run = TaskRunModel(
-                task_run_type=task_run_type,
-                organization_id=organization_id,
-                run_id=run_id,
-                title=title,
-                url=url,
-                url_hash=url_hash,
-            )
-            session.add(task_run)
-            await session.commit()
-            await session.refresh(task_run)
-            return Run.model_validate(task_run)
-
-    @db_operation("update_task_run")
-    async def update_task_run(
-        self,
-        organization_id: str,
-        run_id: str,
-        title: str | None = None,
-        url: str | None = None,
-        url_hash: str | None = None,
-    ) -> None:
-        async with self.Session() as session:
-            task_run = (
-                await session.scalars(
-                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
-                )
-            ).first()
-            if not task_run:
-                raise NotFoundError(f"TaskRun {run_id} not found")
-
-            if title:
-                task_run.title = title
-            if url:
-                task_run.url = url
-            if url_hash:
-                task_run.url_hash = url_hash
-            await session.commit()
-
-    @db_operation("update_job_run_compute_cost")
-    async def update_job_run_compute_cost(
-        self,
-        organization_id: str,
-        run_id: str,
-        instance_type: str | None = None,
-        vcpu_millicores: int | None = None,
-        memory_mb: int | None = None,
-        duration_ms: int | None = None,
-        compute_cost: float | None = None,
-    ) -> None:
-        """Update compute cost metrics for a job run."""
-        async with self.Session() as session:
-            task_run = (
-                await session.scalars(
-                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
-                )
-            ).first()
-            if not task_run:
-                LOG.warning(
-                    "TaskRun not found for compute cost update",
-                    run_id=run_id,
-                    organization_id=organization_id,
-                )
-                return
-
-            if instance_type is not None:
-                task_run.instance_type = instance_type
-            if vcpu_millicores is not None:
-                task_run.vcpu_millicores = vcpu_millicores
-            if memory_mb is not None:
-                task_run.memory_mb = memory_mb
-            if duration_ms is not None:
-                task_run.duration_ms = duration_ms
-            if compute_cost is not None:
-                task_run.compute_cost = compute_cost
-            await session.commit()
-
-    @db_operation("cache_task_run")
-    async def cache_task_run(self, run_id: str, organization_id: str | None = None) -> Run:
-        async with self.Session() as session:
-            task_run = (
-                await session.scalars(
-                    select(TaskRunModel).filter_by(organization_id=organization_id).filter_by(run_id=run_id)
-                )
-            ).first()
-            if task_run:
-                task_run.cached = True
-                await session.commit()
-                await session.refresh(task_run)
-                return Run.model_validate(task_run)
-            raise NotFoundError(f"Run {run_id} not found")
-
-    @db_operation("get_cached_task_run")
-    async def get_cached_task_run(
-        self, task_run_type: RunType, url_hash: str | None = None, organization_id: str | None = None
-    ) -> Run | None:
-        async with self.Session() as session:
-            query = select(TaskRunModel)
-            if task_run_type:
-                query = query.filter_by(task_run_type=task_run_type)
-            if url_hash:
-                query = query.filter_by(url_hash=url_hash)
-            if organization_id:
-                query = query.filter_by(organization_id=organization_id)
-            query = query.filter_by(cached=True).order_by(TaskRunModel.created_at.desc())
-            task_run = (await session.scalars(query)).first()
-            return Run.model_validate(task_run) if task_run else None
-
-    @db_operation("get_run")
-    async def get_run(
-        self,
-        run_id: str,
-        organization_id: str | None = None,
-    ) -> Run | None:
-        async with self.Session() as session:
-            query = select(TaskRunModel).filter_by(run_id=run_id)
-            if organization_id:
-                query = query.filter_by(organization_id=organization_id)
-            task_run = (await session.scalars(query)).first()
-            return Run.model_validate(task_run) if task_run else None

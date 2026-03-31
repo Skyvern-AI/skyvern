@@ -766,7 +766,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise SkyvernContextWindowExceededError() from e
+                    raise SkyvernContextWindowExceededError(model=main_model_group, prompt_name=prompt_name) from e
                 except ValueError as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -1217,7 +1217,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise SkyvernContextWindowExceededError() from e
+                    raise SkyvernContextWindowExceededError(model=model_name, prompt_name=prompt_name) from e
                 except CancelledError:
                     # Speculative steps are intentionally cancelled when goal verification completes first,
                     # so we log at debug level. Non-speculative cancellations are unexpected errors.
@@ -1664,7 +1664,7 @@ class LLMCaller:
                     llm_key=self.llm_key,
                     model=self.llm_config.model_name,
                 )
-                raise SkyvernContextWindowExceededError() from e
+                raise SkyvernContextWindowExceededError(model=self.llm_config.model_name) from e
             except CancelledError:
                 # Speculative steps are intentionally cancelled when goal verification returns completed,
                 # so we log at debug level. Non-speculative cancellations are unexpected errors.
