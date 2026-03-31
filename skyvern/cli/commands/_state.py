@@ -17,6 +17,9 @@ class CLIState:
     cdp_url: str | None = None
     mode: str | None = None  # "cloud", "local", or "cdp"
     created_at: str | None = None
+    frame_selector: str | None = None
+    frame_name: str | None = None
+    frame_index: int | None = None
 
 
 def save_state(state: CLIState) -> None:

@@ -19,6 +19,9 @@ from .browser import (
     skyvern_evaluate,
     skyvern_extract,
     skyvern_file_upload,
+    skyvern_frame_list,
+    skyvern_frame_main,
+    skyvern_frame_switch,
     skyvern_hover,
     skyvern_login,
     skyvern_navigate,
@@ -383,6 +386,11 @@ mcp.tool(tags={"tab_management"}, annotations=_MUT)(skyvern_tab_switch)
 mcp.tool(tags={"tab_management"}, annotations=_DEST)(skyvern_tab_close)
 mcp.tool(tags={"tab_management"}, annotations=_RO)(skyvern_tab_wait_for_new)
 
+# -- Frame management (iframe switching) --
+mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_switch)
+mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_main)
+mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_frame_list)
+
 # -- Inspection tools (console, network, dialog) --
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_console_messages)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_requests)
@@ -461,6 +469,10 @@ __all__ = [
     "skyvern_tab_switch",
     "skyvern_tab_close",
     "skyvern_tab_wait_for_new",
+    # Frame management (iframe switching)
+    "skyvern_frame_switch",
+    "skyvern_frame_main",
+    "skyvern_frame_list",
     # Inspection (console, network, dialog)
     "skyvern_console_messages",
     "skyvern_network_requests",
