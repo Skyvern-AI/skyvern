@@ -3630,12 +3630,11 @@ class WorkflowService:
             )
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
-        # Hold a reference in _background_tasks so Python doesn't GC the task.
-        task = asyncio.create_task(
+        bg = asyncio.create_task(
             self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, status),
         )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
 
         return workflow_run
 
