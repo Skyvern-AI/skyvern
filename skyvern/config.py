@@ -1,12 +1,42 @@
 import logging
 import platform
+from pathlib import Path
 from typing import Any
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
 from skyvern.utils.env_paths import resolve_backend_env_path
+
+
+def _default_database_string() -> str:
+    """Return the default DATABASE_STRING.
+
+    Uses a SQLite file at ~/.skyvern/data.db so that ``skyvern run server``
+    works out of the box without Docker or Postgres.  Users who set
+    DATABASE_STRING in .env or the environment get Postgres automatically
+    (pydantic-settings reads env before the default_factory runs).
+
+    This is a pure string computation — no filesystem side effects.
+    The parent directory is created by _ensure_sqlite_dir() at engine
+    build time (agent_db.py) or server bootstrap time (api_app.py).
+    """
+    db_path = Path.home() / ".skyvern" / "data.db"
+    return f"sqlite+aiosqlite:///{db_path}"
+
+
+def _ensure_sqlite_dir(database_string: str) -> None:
+    """Create the parent directory for a file-backed SQLite database URL.
+
+    No-op for in-memory SQLite (`:memory:`) or non-SQLite URLs.
+    """
+    if not database_string.startswith("sqlite") or ":memory:" in database_string:
+        return
+    db_file = database_string.split("///", 1)[-1]
+    Path(db_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
 
 # NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
 # the process has changed dir to the desired project root by this time.
@@ -64,11 +94,7 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = (
-        "postgresql+asyncpg://skyvern@localhost/skyvern"
-        if platform.system() == "Windows"
-        else "postgresql+psycopg://skyvern@localhost/skyvern"
-    )
+    DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
@@ -629,6 +655,9 @@ class Settings(BaseSettings):
             "for compatibility with the Proactor event loop policy."
         )
         object.__setattr__(self, "DATABASE_STRING", updated_string)
+
+    def is_sqlite(self) -> bool:
+        return self.DATABASE_STRING.startswith("sqlite")
 
     def is_cloud_environment(self) -> bool:
         """

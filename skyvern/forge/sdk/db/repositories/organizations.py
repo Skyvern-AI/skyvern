@@ -129,9 +129,11 @@ class OrganizationsRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         max_retries_per_step: int | None = None,
         domain: str | None = None,
+        organization_id: str | None = None,
     ) -> Organization:
         async with self.Session() as session:
             org = OrganizationModel(
+                organization_id=organization_id,
                 organization_name=organization_name,
                 webhook_callback_url=webhook_callback_url,
                 max_steps_per_run=max_steps_per_run,
