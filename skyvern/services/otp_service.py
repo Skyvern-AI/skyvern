@@ -1,6 +1,8 @@
 import asyncio
+import re
 from datetime import datetime, timedelta
 
+import pyotp
 import structlog
 from pydantic import BaseModel, Field
 
@@ -14,6 +16,11 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
+
+_MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
+_NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
+
+MFANavigationPayload = dict | list | str | None
 
 
 class OTPValue(BaseModel):
@@ -53,6 +60,95 @@ async def parse_otp_login(
     otp_result = OTPResultParsedByLLM.model_validate(resp)
     if otp_result.otp_value_found and otp_result.otp_value:
         return OTPValue(value=otp_result.otp_value, type=otp_result.otp_type)
+    return None
+
+
+def _is_mfa_like_parameter_key(key: object) -> bool:
+    """Return True when a payload key appears to represent an MFA/OTP parameter."""
+    normalized_key = _NON_ALNUM_PATTERN.sub("", str(key).lower())
+    return any(hint in normalized_key for hint in _MFA_PARAMETER_KEY_HINTS)
+
+
+def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
+    """Extract TOTP from runtime navigation inputs.
+
+    Runtime inline OTP extraction is intentionally payload-only.
+    """
+    if not isinstance(navigation_payload, (dict, list)):
+        return None
+
+    traversal_stack: list[dict | list | str] = [navigation_payload]
+    visited_container_ids: set[int] = set()
+
+    while traversal_stack:
+        current_item = traversal_stack.pop()
+
+        if isinstance(current_item, str):
+            return OTPValue(value=current_item, type=OTPType.TOTP)
+
+        current_id = id(current_item)
+        if current_id in visited_container_ids:
+            continue
+        visited_container_ids.add(current_id)
+
+        if isinstance(current_item, list):
+            for item in reversed(current_item):
+                if isinstance(item, (dict, list)):
+                    traversal_stack.append(item)
+            continue
+
+        for key, value in reversed(list(current_item.items())):
+            if isinstance(value, (dict, list)):
+                traversal_stack.append(value)
+            if not _is_mfa_like_parameter_key(key):
+                continue
+            if not isinstance(value, str):
+                continue
+            candidate_value = value.strip()
+            if candidate_value:
+                traversal_stack.append(candidate_value)
+
+    return None
+
+
+def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue | None:
+    """Try to generate a TOTP code from a credential secret stored in the workflow run context.
+
+    Scans workflow_run_context.values for credential entries with a "totp" key
+    (e.g. Bitwarden, 1Password, Azure Key Vault credentials) and generates a
+    TOTP code using pyotp. This should be checked BEFORE poll_otp_value so that
+    credential-based TOTP takes priority over webhook (totp_url) and totp_identifier.
+    """
+    if not workflow_run_id:
+        return None
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if not workflow_run_context:
+        return None
+
+    for key, value in workflow_run_context.values.items():
+        if isinstance(value, dict) and "totp" in value:
+            totp_secret_id = value.get("totp")
+            if not totp_secret_id or not isinstance(totp_secret_id, str):
+                continue
+            totp_secret_key = workflow_run_context.totp_secret_value_key(totp_secret_id)
+            totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+            if totp_secret:
+                try:
+                    code = pyotp.TOTP(totp_secret).now()
+                    LOG.info(
+                        "Generated TOTP from credential secret",
+                        workflow_run_id=workflow_run_id,
+                        credential_key=key,
+                    )
+                    return OTPValue(value=code, type=OTPType.TOTP)
+                except Exception:
+                    LOG.warning(
+                        "Failed to generate TOTP from credential secret",
+                        workflow_run_id=workflow_run_id,
+                        credential_key=key,
+                        exc_info=True,
+                    )
     return None
 
 

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.db.agent_db import AgentDB
 
 
 @pytest.fixture
@@ -16,18 +16,24 @@ def mock_session():
 
 
 @pytest.fixture
-def tasks_repo(mock_session):
-    repo = TasksRepository.__new__(TasksRepository)
-    repo.Session = MagicMock(return_value=mock_session)
-    repo.debug_enabled = False
-    repo._is_retryable_error_fn = None
-    return repo
+def agent_db(mock_session):
+    db = AgentDB.__new__(AgentDB)
+    db.Session = MagicMock(return_value=mock_session)
+    # Set up tasks repository (sync_task_run_status delegates to self.tasks)
+    from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+
+    tasks = TasksRepository.__new__(TasksRepository)
+    tasks.Session = MagicMock(return_value=mock_session)
+    tasks.debug_enabled = False
+    tasks._is_retryable_error_fn = None
+    db.tasks = tasks
+    return db
 
 
 @pytest.mark.asyncio
-async def test_sync_task_run_status_updates_matching_row(tasks_repo, mock_session):
+async def test_sync_task_run_status_updates_matching_row(agent_db, mock_session):
     """sync_task_run_status should UPDATE task_runs where run_id matches."""
-    await tasks_repo.sync_task_run_status(
+    await agent_db.sync_task_run_status(
         organization_id="org_1",
         run_id="wr_123",
         status="failed",
@@ -41,11 +47,11 @@ async def test_sync_task_run_status_updates_matching_row(tasks_repo, mock_sessio
 
 
 @pytest.mark.asyncio
-async def test_sync_task_run_status_no_raise_on_error(tasks_repo, mock_session):
+async def test_sync_task_run_status_no_raise_on_error(agent_db, mock_session):
     """sync_task_run_status should swallow exceptions (best-effort)."""
     mock_session.execute.side_effect = Exception("DB error")
     # Should NOT raise
-    await tasks_repo.sync_task_run_status(
+    await agent_db.sync_task_run_status(
         organization_id="org_1",
         run_id="nonexistent",
         status="failed",
