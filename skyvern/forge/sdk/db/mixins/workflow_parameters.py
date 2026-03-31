@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -59,7 +59,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.schemas.runs import RunType
+from skyvern.schemas.runs import RunStatus, RunType
 from skyvern.webeye.actions.actions import Action
 
 if TYPE_CHECKING:
@@ -577,7 +577,14 @@ class WorkflowParametersMixin:
         title: str | None = None,
         url: str | None = None,
         url_hash: str | None = None,
+        status: RunStatus | None = None,
+        workflow_permanent_id: str | None = None,
+        parent_workflow_run_id: str | None = None,
+        debug_session_id: str | None = None,
+        # script_run, started_at, finished_at are intentionally omitted here —
+        # they are set via update_task_run() after the run starts/finishes (PRs 2-5).
     ) -> Run:
+        searchable_text = " ".join(filter(None, [title, url]))
         async with self.Session() as session:
             task_run = TaskRunModel(
                 task_run_type=task_run_type,
@@ -586,6 +593,11 @@ class WorkflowParametersMixin:
                 title=title,
                 url=url,
                 url_hash=url_hash,
+                status=status,
+                workflow_permanent_id=workflow_permanent_id,
+                parent_workflow_run_id=parent_workflow_run_id,
+                debug_session_id=debug_session_id,
+                searchable_text=searchable_text or None,
             )
             session.add(task_run)
             await session.commit()
@@ -600,6 +612,9 @@ class WorkflowParametersMixin:
         title: str | None = None,
         url: str | None = None,
         url_hash: str | None = None,
+        status: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
     ) -> None:
         async with self.Session() as session:
             task_run = (
@@ -610,13 +625,60 @@ class WorkflowParametersMixin:
             if not task_run:
                 raise NotFoundError(f"TaskRun {run_id} not found")
 
-            if title:
+            if title is not None:
                 task_run.title = title
-            if url:
+            if url is not None:
                 task_run.url = url
-            if url_hash:
+            if url_hash is not None:
                 task_run.url_hash = url_hash
+            if status is not None:
+                task_run.status = status
+            if started_at is not None:
+                task_run.started_at = started_at
+            if finished_at is not None:
+                task_run.finished_at = finished_at
+
+            # Recompute searchable_text when title or url changes
+            if title is not None or url is not None:
+                task_run.searchable_text = " ".join(filter(None, [task_run.title, task_run.url])) or None
+
             await session.commit()
+
+    async def sync_task_run_status(
+        self,
+        organization_id: str,
+        run_id: str,
+        status: str,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+    ) -> None:
+        """Best-effort write-through: propagate status from source table to task_runs.
+
+        Does NOT raise if the task_runs row is missing (race at creation time).
+        """
+        try:
+            async with self.Session() as session:
+                vals: dict[str, Any] = {"status": status}
+                if started_at is not None:
+                    vals["started_at"] = started_at
+                if finished_at is not None:
+                    vals["finished_at"] = finished_at
+                stmt = (
+                    update(TaskRunModel)
+                    .where(TaskRunModel.run_id == run_id)
+                    .where(TaskRunModel.organization_id == organization_id)
+                    .values(**vals)
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception:
+            LOG.warning(
+                "Best-effort task_run status sync failed",
+                run_id=run_id,
+                organization_id=organization_id,
+                status=status,
+                exc_info=True,
+            )
 
     @db_operation("update_job_run_compute_cost")
     async def update_job_run_compute_cost(

@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -362,7 +362,13 @@ class RunStatus(StrEnum):
     canceled = "canceled"
 
     def is_final(self) -> bool:
-        return self in [self.failed, self.terminated, self.canceled, self.timed_out, self.completed]
+        return self.value in TERMINAL_STATUSES
+
+
+# Statuses that are final — once a row reaches one of these, it never changes.
+# Single source of truth: used by the sync cron, the partial index, and any
+# code that needs to know whether a run is "done".
+TERMINAL_STATUSES = ("completed", "failed", "terminated", "canceled", "timed_out")
 
 
 class TaskRunRequest(BaseModel):
@@ -672,3 +678,31 @@ RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discr
 
 class BlockRunResponse(WorkflowRunResponse):
     block_labels: list[str] = Field(description="A whitelist of block labels; only these blocks will execute")
+
+
+class TaskRunListItem(BaseModel):
+    """Lightweight run-history item backed by the task_runs table."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    task_run_id: str
+    run_id: str
+    task_run_type: str
+    status: str
+    title: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+    workflow_permanent_id: str | None = None
+    script_run: bool = False
+    searchable_text: str | None = Field(default=None, exclude=True)
+
+    @field_validator("script_run", mode="before")
+    @classmethod
+    def coerce_script_run(cls, v: Any) -> bool:
+        """Intentionally lossy: collapse dict metadata / bool / None → bool for the list view.
+
+        The full script execution metadata (dict) is available via the detail
+        endpoint's Run.script_run field.  Do not rely on dict contents here.
+        """
+        return bool(v)
