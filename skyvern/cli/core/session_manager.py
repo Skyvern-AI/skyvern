@@ -17,7 +17,7 @@ from .result import BrowserContext, ErrorCode, make_error
 LOG = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
-    from playwright.async_api import Page
+    from playwright.async_api import Frame, Page
 
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
@@ -42,6 +42,8 @@ class SessionState:
     # -- Multi-page inspection hooks --
     _hooked_page_ids: set[int] = field(default_factory=set)
     _hooked_handlers_map: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # -- Iframe frame context --
+    _working_frame: Frame | None = None
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
@@ -241,6 +243,20 @@ async def get_page(
 
     # Install page event listener for tab_wait_for_new (once per session)
     _install_page_event_listener(state, browser)
+
+    # Propagate iframe frame context from session state to the page
+    if state._working_frame is not None:
+        # Guard against stale (detached) frame references
+        detached = False
+        try:
+            detached = state._working_frame.is_detached()
+        except AttributeError:
+            pass  # frame object doesn't support is_detached (e.g., test mocks)
+        if detached:
+            LOG.debug("Clearing detached _working_frame from session state")
+            state._working_frame = None
+        else:
+            page._working_frame = state._working_frame
 
     return page, ctx
 

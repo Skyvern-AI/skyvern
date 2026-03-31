@@ -17,7 +17,15 @@ import typer
 from skyvern.cli.commands._output import console, output, output_error
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
 from skyvern.cli.core.artifacts import save_artifact
-from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot
+from skyvern.cli.core.browser_ops import (
+    do_act,
+    do_extract,
+    do_frame_list,
+    do_frame_main,
+    do_frame_switch,
+    do_navigate,
+    do_screenshot,
+)
 from skyvern.cli.core.client import get_skyvern
 from skyvern.cli.core.guards import (
     CREDENTIAL_HINT,
@@ -37,7 +45,9 @@ from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 
 browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
+frame_app = typer.Typer(help="Manage iframe context.", no_args_is_help=True)
 browser_app.add_typer(session_app, name="session")
+browser_app.add_typer(frame_app, name="frame")
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,31 @@ def _resolve_ai_target(selector: str | None, intent: str | None, *, operation: s
             ),
         )
     return ai_mode
+
+
+async def _apply_cli_frame_state(page: Any) -> None:
+    """Re-apply saved frame state from CLIState to a fresh SkyvernBrowserPage.
+
+    CLI commands get a new page object each invocation. If the user previously
+    ran ``skyvern browser frame switch``, the target frame is persisted in
+    CLIState and must be re-entered before executing the action.
+    """
+    state = load_state()
+    if not state:
+        return
+    selector = state.frame_selector
+    name = state.frame_name
+    index = state.frame_index
+    if selector is None and name is None and index is None:
+        return
+    try:
+        await do_frame_switch(page, selector=selector, name=name, index=index)
+    except Exception as e:
+        console.print(f"[yellow]Warning: saved frame state is stale, clearing ({e})[/yellow]")
+        state.frame_selector = None
+        state.frame_name = None
+        state.frame_index = None
+        save_state(state)
 
 
 def _validate_wait_state(state: str) -> None:
@@ -294,6 +329,12 @@ def navigate(
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
         result = await do_navigate(page, url, timeout=timeout, wait_until=wait_until)
+        cli_state = load_state()
+        if cli_state:
+            cli_state.frame_selector = None
+            cli_state.frame_name = None
+            cli_state.frame_index = None
+            save_state(cli_state)
         return {"url": result.url, "title": result.title}
 
     try:
@@ -322,6 +363,7 @@ def screenshot(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await do_screenshot(page, full_page=full_page, selector=selector)
 
         if output_path:
@@ -365,6 +407,7 @@ def evaluate(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await page.evaluate(expression)
         return {"result": result}
 
@@ -398,6 +441,7 @@ def click(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         kwargs: dict[str, Any] = {"timeout": timeout}
         if button:
@@ -443,6 +487,7 @@ def hover(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if ai_mode is not None:
             locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
@@ -489,6 +534,7 @@ def type_text(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if selector:
             try:
@@ -554,6 +600,7 @@ def scroll(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if intent:
             ai_mode = "fallback" if selector else "proactive"
@@ -601,6 +648,7 @@ def select(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if ai_mode is not None:
             await page.select_option(selector=selector, value=value, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
@@ -639,6 +687,7 @@ def press_key(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if intent or selector:
             ai_mode, err = resolve_ai_mode(selector, intent)
@@ -694,6 +743,7 @@ def wait(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         waited_for = ""
         if time_ms is not None:
@@ -751,6 +801,7 @@ def act(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await do_act(page, prompt)
         return {"prompt": result.prompt, "completed": result.completed}
 
@@ -779,6 +830,7 @@ def extract(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await do_extract(page, prompt, schema=schema)
         return {"prompt": prompt, "extracted": result.extracted}
 
@@ -806,6 +858,7 @@ def validate(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         valid = await page.validate(prompt)
         return {"prompt": prompt, "valid": valid}
 
@@ -1378,3 +1431,91 @@ def _print_serve_instructions_unified(result: dict[str, Any], browser_path: str)
 
     console.print("[bold]Press Ctrl+C to stop.[/bold]")
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# Frame commands (iframe switching)
+# ---------------------------------------------------------------------------
+
+
+@frame_app.command("switch")
+def frame_switch(
+    selector: str | None = typer.Option(None, "--selector", "-s", help="CSS selector for the iframe element."),
+    name: str | None = typer.Option(None, "--name", "-n", help="Frame name attribute."),
+    index: int | None = typer.Option(None, "--index", "-i", help="Frame index (0 = main)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Switch into an iframe for subsequent commands."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await do_frame_switch(page, selector=selector, name=name, index=index)
+        state = load_state()
+        if state:
+            state.frame_selector = selector
+            state.frame_name = name
+            state.frame_index = index
+            save_state(state)
+        return {"frame_name": result.name, "frame_url": result.url}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="frame_switch", json_mode=json_output)
+    except (ValueError, GuardError) as e:
+        output_error(str(e), hint="Use 'skyvern browser frame list' to find frames.", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@frame_app.command("main")
+def frame_main_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Switch back to the main page frame."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        do_frame_main(page)
+        state = load_state()
+        if state:
+            state.frame_selector = None
+            state.frame_name = None
+            state.frame_index = None
+            save_state(state)
+        return {"status": "switched_to_main_frame"}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="frame_main", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@frame_app.command("list")
+def frame_list_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List all frames on the current page."""
+
+    async def _run() -> list:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        frames = await do_frame_list(page)
+        return [{"index": f.index, "name": f.name, "url": f.url, "is_main": f.is_main} for f in frames]
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="frame_list", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)

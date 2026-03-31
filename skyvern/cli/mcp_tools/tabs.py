@@ -141,6 +141,8 @@ async def skyvern_tab_new(
         try:
             new_page = await browser._browser_context.new_page()
             state._active_page = new_page
+            # New tab has no iframes yet — clear stale frame reference
+            state._working_frame = None
             # Drain the event that _on_new_page() buffered for this explicitly
             # created page, so tab_wait_for_new doesn't return it as a popup.
             state._page_events = deque(
@@ -237,6 +239,8 @@ async def skyvern_tab_switch(
         )
 
     state._active_page = target
+    # Switching tabs invalidates any iframe frame reference from the old tab
+    state._working_frame = None
 
     # bring_to_front is a no-op in headless but helps in headed mode
     try:
@@ -319,6 +323,8 @@ async def skyvern_tab_close(
     # Clear active page — get_working_page() will lazily pick the last remaining page
     if closing_active or (state._active_page is not None and state._active_page is target):
         state._active_page = None
+        # Closed tab's frame reference is no longer valid
+        state._working_frame = None
 
     # Clean up inspection hooks for the closed page
     state._hooked_page_ids.discard(target_id)
