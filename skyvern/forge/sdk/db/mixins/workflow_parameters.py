@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
