@@ -895,8 +895,14 @@ class FailedToGetTOTPVerificationCode(SkyvernException):
 
 
 class SkyvernContextWindowExceededError(SkyvernException):
-    def __init__(self) -> None:
-        message = "Context window exceeded. Please contact support@skyvern.com for help."
+    def __init__(self, model: str | None = None, prompt_name: str | None = None) -> None:
+        details = []
+        if model:
+            details.append(f"model: {model}")
+        if prompt_name:
+            details.append(f"prompt: {prompt_name}")
+        detail_str = f" ({', '.join(details)})" if details else ""
+        message = f"LLM context window exceeded{detail_str}. The page may have too much content for the AI model to process. Please try again or contact support@skyvern.com for help."
         super().__init__(message)
 
 
