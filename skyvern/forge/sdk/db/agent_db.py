@@ -240,7 +240,7 @@ class AgentDB(BaseAlchemyDB):
         status = kwargs.get("status")
         if status is not None:
             task = asyncio.create_task(
-                self.workflow_params.sync_task_run_status(
+                self.tasks.sync_task_run_status(
                     organization_id=updated_task.organization_id or "",
                     run_id=updated_task.task_id,
                     status=status.value,
@@ -477,9 +477,6 @@ class AgentDB(BaseAlchemyDB):
 
     async def sync_task_run_status(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.sync_task_run_status(*args, **kwargs)
-
-    async def sync_task_run_status(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.sync_task_run_status(*args, **kwargs)
 
     async def update_job_run_compute_cost(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.update_job_run_compute_cost(*args, **kwargs)
