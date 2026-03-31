@@ -16,6 +16,10 @@ def _repo_root() -> Path:
     raise AssertionError("Could not locate repository root")
 
 
+_SOURCE_FILE = _repo_root() / "workers" / "cron_worker" / "task_runs_sync_activity.py"
+pytestmark = pytest.mark.skipif(not _SOURCE_FILE.exists(), reason="cloud-only: workers/cron_worker/ not present")
+
+
 def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
     base = declarative_base()
 

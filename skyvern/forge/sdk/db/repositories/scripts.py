@@ -459,6 +459,7 @@ class ScriptsRepository(BaseRepository):
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
         status: ScriptStatus = ScriptStatus.published,
+        is_pinned: bool = False,
     ) -> None:
         """Create a workflow->script cache mapping entry."""
         async with self.Session() as session:
@@ -471,6 +472,7 @@ class ScriptsRepository(BaseRepository):
                 cache_key=cache_key,
                 cache_key_value=cache_key_value,
                 status=status,
+                is_pinned=is_pinned,
             )
             session.add(record)
             await session.commit()
