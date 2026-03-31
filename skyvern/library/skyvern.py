@@ -129,7 +129,7 @@ class Skyvern(AsyncSkyvern):
         *,
         llm_config: LLMRouterConfig | LLMConfig | None = None,
         settings: dict[str, Any] | None = None,
-        use_in_memory_db: bool = False,
+        use_in_memory_db: bool | None = None,
     ) -> "Skyvern":
         """Local/embedded mode: Run Skyvern locally in-process.
 
@@ -139,23 +139,36 @@ class Skyvern(AsyncSkyvern):
                 overriding the LLM_KEY setting from your .env file.
                 If not provided, uses the LLM configured via LLM_KEY in your .env file.
 
-                Example 1 - Using .env configuration (simplest, recommended):
+                Example 1 - Zero-config (simplest, recommended):
                     ```python
                     from skyvern import Skyvern
 
-                    # Uses LLM_KEY and other settings from your .env file
-                    # Created by running `skyvern quickstart`
+                    # Auto-detects: uses .env/Postgres if configured, else in-memory SQLite.
                     skyvern = Skyvern.local()
                     ```
 
-                Example 2 - Zero-config with in-memory database (no Postgres needed):
+                Example 2 - Force in-memory SQLite (no .env needed):
                     ```python
                     from skyvern import Skyvern
 
                     skyvern = Skyvern.local(use_in_memory_db=True)
                     ```
 
-                Example 3 - Custom LLM with environment variables:
+                Example 3 - Force persistent mode:
+                    ```python
+                    from skyvern import Skyvern
+
+                    # Works with env vars, .env, or explicit settings overrides.
+                    skyvern = Skyvern.local(
+                        use_in_memory_db=False,
+                        settings={
+                            "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
+                            "SKYVERN_API_KEY": "sk-...",
+                        },
+                    )
+                    ```
+
+                Example 4 - Custom LLM with environment variables:
                     ```python
                     from skyvern import Skyvern
                     from skyvern.forge.sdk.api.llm.models import LLMConfig
@@ -173,16 +186,22 @@ class Skyvern(AsyncSkyvern):
             settings: Optional dictionary of Skyvern settings to override.
                 These override the corresponding settings from your .env file.
                 Example: {"MAX_STEPS_PER_RUN": 100, "BROWSER_TYPE": "chromium-headful"}
-            use_in_memory_db: If True, use SQLite in-memory instead of PostgreSQL.
-                No .env file or running Postgres instance required. Defaults to False.
+            use_in_memory_db: Controls the database backend for embedded mode.
 
-                Zero-config mode supports:
+                - None (default): Auto-detect. If DATABASE_STRING is set in env, .env,
+                  or settings overrides, use persistent mode (Postgres). Otherwise use
+                  in-memory SQLite for zero-config operation.
+                - True: Force in-memory SQLite. No .env or Postgres required.
+                - False: Force persistent mode. Requires DATABASE_STRING and
+                  SKYVERN_API_KEY from env, .env, or settings overrides.
+
+                In-memory mode supports:
                 - run_task(), extract(), click(), navigate() — full browser automation
                 - Workflow CRUD (create, list, search, get, run)
                 - Artifacts saved to local temp directory (file:// URIs)
                 - Any LLM provider supported by litellm
 
-                Not supported in zero-config mode (requires Skyvern Cloud or Postgres):
+                Not supported in in-memory mode (requires Skyvern Cloud or Postgres):
                 - Workflow scheduling (requires persistent database)
                 - Cloud browser sessions (requires S3/Azure storage)
                 - Rate limiting (cloud-only)
@@ -194,16 +213,38 @@ class Skyvern(AsyncSkyvern):
         Returns:
             Skyvern: A Skyvern instance running in local/embedded mode.
         """
+        from dotenv import dotenv_values  # noqa: PLC0415
+
         from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
+        from skyvern.utils.env_paths import resolve_backend_env_path  # noqa: PLC0415
+
+        # Auto-detect mode when use_in_memory_db is not explicitly set.
+        # If DATABASE_STRING is configured anywhere, honor it (persistent mode).
+        # Otherwise fall back to zero-config in-memory SQLite.
+        if use_in_memory_db is None:
+            env_path = resolve_backend_env_path()
+            dotenv_config = dotenv_values(env_path) if env_path.exists() else {}
+            settings_overrides = settings or {}
+            explicit_db = (
+                settings_overrides.get("DATABASE_STRING")
+                or os.environ.get("DATABASE_STRING")
+                or dotenv_config.get("DATABASE_STRING")
+            )
+            use_in_memory_db = not bool(explicit_db)
 
         if not use_in_memory_db:
-            if not os.path.exists(".env"):
-                raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
+            env_path = resolve_backend_env_path()
+            if env_path.exists():
+                load_dotenv(env_path)
 
-            load_dotenv(".env")
-            api_key = os.getenv("SKYVERN_API_KEY")
+            settings_overrides = settings or {}
+            api_key = settings_overrides.get("SKYVERN_API_KEY") or os.getenv("SKYVERN_API_KEY")
             if not api_key:
-                raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
+                raise ValueError(
+                    "Persistent local mode requires SKYVERN_API_KEY. "
+                    "Set it in env/.env, pass settings={'SKYVERN_API_KEY': ...}, "
+                    "or use use_in_memory_db=True for ephemeral SQLite."
+                )
 
         obj = cls.__new__(cls)
 
