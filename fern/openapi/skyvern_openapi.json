@@ -1196,6 +1196,128 @@
         ]
       }
     },
+    "/v1/runs": {
+      "get": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Runs V2",
+        "operationId": "get_runs_v2_v1_runs_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 10,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunStatus"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 3
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive substring search (min 3 chars for trigram index).",
+              "examples": [
+                "login_url",
+                "wr_abc123"
+              ],
+              "title": "Search Key"
+            },
+            "description": "Case-insensitive substring search (min 3 chars for trigram index)."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TaskRunListItem"
+                  },
+                  "title": "Response Get Runs V2 V1 Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_runs_v2"
+      }
+    },
     "/v1/workflows/runs": {
       "get": {
         "tags": [
@@ -13496,6 +13618,92 @@
         ],
         "title": "TaskBlockYAML"
       },
+      "TaskRunListItem": {
+        "properties": {
+          "task_run_id": {
+            "type": "string",
+            "title": "Task Run Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "task_run_type": {
+            "type": "string",
+            "title": "Task Run Type"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "script_run": {
+            "type": "boolean",
+            "title": "Script Run",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_run_id",
+          "run_id",
+          "task_run_type",
+          "status",
+          "created_at"
+        ],
+        "title": "TaskRunListItem",
+        "description": "Lightweight run-history item backed by the task_runs table."
+      },
       "TaskRunRequest": {
         "properties": {
           "prompt": {
@@ -18382,9 +18590,11 @@
         "enum": [
           "manual",
           "api",
-          "scheduled"
+          "scheduled",
+          "webhook"
         ],
-        "title": "WorkflowRunTriggerType"
+        "title": "WorkflowRunTriggerType",
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
       },
       "WorkflowStatus": {
         "type": "string",
