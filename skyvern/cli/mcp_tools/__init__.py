@@ -63,6 +63,13 @@ from .session import (
     skyvern_browser_session_get,
     skyvern_browser_session_list,
 )
+from .tabs import (
+    skyvern_tab_close,
+    skyvern_tab_list,
+    skyvern_tab_new,
+    skyvern_tab_switch,
+    skyvern_tab_wait_for_new,
+)
 from .telemetry import MCPTelemetryMiddleware
 from .workflow import (
     skyvern_workflow_cancel,
@@ -114,6 +121,8 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | View cached scripts | skyvern_script_list_for_workflow (no session needed) | skyvern_script_get_code to see code |
 | Check why AI fallback happened | skyvern_script_fallback_episodes (no session needed) | skyvern_script_versions for history |
 | One-off autonomous task | skyvern_run_task (no session needed) | Check result in response |
+| Work with multiple tabs | skyvern_tab_list → skyvern_tab_switch | skyvern_tab_new to open more |
+| Wait for popup / new tab | skyvern_tab_wait_for_new | skyvern_tab_switch to activate it |
 
 ## Tool Selection
 
@@ -140,6 +149,11 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | "Why did it fall back to AI?" | skyvern_script_fallback_episodes | Inspect AI fallback details |
 | "Run this with AI agent" / "Force agent mode" | skyvern_workflow_run(run_with="agent") | Override cached script |
 | "Edit / update the script" | skyvern_script_deploy | Deploy new script version |
+| "List tabs" / "What tabs are open?" | skyvern_tab_list | See all open tabs |
+| "Open a new tab" / "New tab" | skyvern_tab_new | Opens tab, optionally navigates |
+| "Switch to [tab]" / "Go to tab [N]" | skyvern_tab_switch | Change active tab |
+| "Close tab" / "Close this tab" | skyvern_tab_close | Close tab by ID or index |
+| "Wait for popup" / "A new tab should open" | skyvern_tab_wait_for_new | Waits for popup/new tab |
 
 ## Critical Rules
 1. Use Skyvern for all browser tasks. curl/wget/requests are fine for APIs and file downloads.
@@ -165,7 +179,15 @@ No need for browser_snapshot to get element refs first.
 - **Reusable workflows** — skyvern_workflow_create saves automations as versioned, parameterized workflows.
 - **Cloud browsers with proxies** — skyvern_browser_session_create launches cloud browsers with geographic proxy support.
 
-Tab management (multi-tab) is coming soon — this is the only browser capability not yet available.
+## Tab Management (multi-tab)
+- **skyvern_tab_list** — List all open tabs with IDs, URLs, titles, and active status
+- **skyvern_tab_new** — Open a new tab (optionally navigate to a URL). New tab becomes active.
+- **skyvern_tab_switch** — Switch active tab by tab_id or index. All subsequent tools operate on this tab.
+- **skyvern_tab_close** — Close a tab. If last tab is closed, a blank tab is created automatically.
+- **skyvern_tab_wait_for_new** — Wait for a popup or new tab to open (e.g., after clicking a target=_blank link).
+
+Typical multi-tab flow: skyvern_tab_list → skyvern_tab_new or click a link that opens a popup → \
+skyvern_tab_wait_for_new → skyvern_tab_switch → work on the new tab → skyvern_tab_switch back.
 
 ## Tool Modes (precision tools)
 skyvern_click, skyvern_hover, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, \
@@ -354,6 +376,13 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_select_option)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_press_key)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_wait)
 
+# -- Tab management (multi-tab) --
+mcp.tool(tags={"tab_management"}, annotations=_RO)(skyvern_tab_list)
+mcp.tool(tags={"tab_management"}, annotations=_MUT)(skyvern_tab_new)
+mcp.tool(tags={"tab_management"}, annotations=_MUT)(skyvern_tab_switch)
+mcp.tool(tags={"tab_management"}, annotations=_DEST)(skyvern_tab_close)
+mcp.tool(tags={"tab_management"}, annotations=_RO)(skyvern_tab_wait_for_new)
+
 # -- Inspection tools (console, network, dialog) --
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_console_messages)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_requests)
@@ -426,6 +455,12 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    # Tab management
+    "skyvern_tab_list",
+    "skyvern_tab_new",
+    "skyvern_tab_switch",
+    "skyvern_tab_close",
+    "skyvern_tab_wait_for_new",
     # Inspection (console, network, dialog)
     "skyvern_console_messages",
     "skyvern_network_requests",
