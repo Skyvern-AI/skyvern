@@ -44,6 +44,22 @@ async def test_create_organization(agent_db: AgentDB) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_organization_with_explicit_id(agent_db: AgentDB) -> None:
+    organization = await agent_db.create_organization(
+        organization_id="o_test_org",
+        organization_name="Explicit Id Organization",
+        domain="explicit.test",
+    )
+
+    assert organization.organization_id == "o_test_org"
+
+    retrieved_org = await agent_db.get_organization("o_test_org")
+    assert retrieved_org is not None
+    assert retrieved_org.organization_name == "Explicit Id Organization"
+    assert retrieved_org.domain == "explicit.test"
+
+
+@pytest.mark.asyncio
 async def test_get_organization_not_found(agent_db: AgentDB) -> None:
     retrieved_org = await agent_db.get_organization("non_existent_id")
     assert retrieved_org is None

@@ -1,3 +1,4 @@
+import copy
 import os
 import tempfile
 from datetime import timedelta
@@ -15,6 +16,57 @@ from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 _EMBEDDED_ACTIVE: bool = False
 
 _BLOCKED_EMBEDDED_SETTINGS = frozenset({"OTEL_ENABLED", "ENABLE_CLEANUP_CRON"})
+_SQLITE_OVERRIDE_VALUES: dict[str, Any] = {
+    "DATABASE_STRING": "sqlite+aiosqlite:///:memory:",
+    "DATABASE_REPLICA_STRING": None,
+    "ADDITIONAL_MODULES": [],
+    "OTEL_ENABLED": False,
+    "ENABLE_CLEANUP_CRON": False,
+}
+_BOOTSTRAP_RUNTIME_SETTINGS = frozenset({"LLM_KEY", "BROWSER_LOGS_ENABLED", "SKYVERN_API_KEY"})
+
+# Keys mutated by _apply_sqlite_overrides and bootstrap-time request setup.
+# SQLite override keys are derived from the actual override mapping so that
+# snapshot coverage can't silently drift when new overrides are added.
+# OTEL_ENABLED and ENABLE_CLEANUP_CRON overlap with _BLOCKED_EMBEDDED_SETTINGS —
+# snapshotting them is a defensive no-op (blocked keys can't be mutated via
+# settings_overrides, but _apply_sqlite_overrides sets them directly).
+_SETTINGS_SNAPSHOT_KEYS = frozenset(_SQLITE_OVERRIDE_VALUES) | _BLOCKED_EMBEDDED_SETTINGS | _BOOTSTRAP_RUNTIME_SETTINGS
+
+
+def _snapshot_settings() -> dict[str, dict[str, Any]]:
+    """Capture current values of mutable settings keys across all targets."""
+    from skyvern.forge.sdk.settings_manager import SettingsManager  # noqa: PLC0415
+
+    snapshots: dict[str, dict[str, Any]] = {}
+    targets = {"settings": settings}
+    mgr = SettingsManager.get_settings()
+    if mgr is not settings:
+        targets["mgr"] = mgr
+
+    for label, target in targets.items():
+        snap: dict[str, Any] = {}
+        for key in _SETTINGS_SNAPSHOT_KEYS:
+            if hasattr(target, key):
+                val = getattr(target, key)
+                snap[key] = copy.deepcopy(val) if isinstance(val, (list, dict)) else val
+        snapshots[label] = snap
+    return snapshots
+
+
+def _restore_settings(snapshots: dict[str, dict[str, Any]]) -> None:
+    """Restore settings from a snapshot taken by _snapshot_settings."""
+    from skyvern.forge.sdk.settings_manager import SettingsManager  # noqa: PLC0415
+
+    targets = {"settings": settings}
+    mgr = SettingsManager.get_settings()
+    if mgr is not settings:
+        targets["mgr"] = mgr
+
+    for label, target in targets.items():
+        if label in snapshots:
+            for key, val in snapshots[label].items():
+                setattr(target, key, val)
 
 
 def create_embedded_server(
@@ -39,9 +91,28 @@ def create_embedded_server(
 
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             if self._transport is None:
+                snapshots = _snapshot_settings()
+                # Capture the current forge app instance so we can restore it
+                # if bootstrap fails partway through (after create_api_app sets
+                # a new instance but before bootstrap completes).
+                from skyvern.forge import app as forge_app_holder  # noqa: PLC0415
+
+                prev_app_inst = object.__getattribute__(forge_app_holder, "_inst")  # type: ignore[arg-type]
                 try:
                     await self._bootstrap(request)
-                except Exception:
+                except Exception as exc:
+                    import structlog  # noqa: PLC0415
+
+                    structlog.get_logger().exception(
+                        "Embedded bootstrap failed; restoring previous process state",
+                        error_type=type(exc).__name__,
+                    )
+                    # Restore settings so a retry (or subsequent tests in the
+                    # same process) sees the original values, not half-applied
+                    # SQLite overrides.
+                    _restore_settings(snapshots)
+                    # Restore the previous forge app instance
+                    forge_app_holder.set_app(prev_app_inst)  # type: ignore[attr-defined]
                     # Reset the single-client guard so the user can retry
                     # after fixing the issue (e.g., missing API key).
                     global _EMBEDDED_ACTIVE
@@ -82,7 +153,9 @@ def create_embedded_server(
                         raise ValueError(f"Invalid setting: {key}")
 
             if not use_in_memory_db:
-                self._api_key = os.getenv("SKYVERN_API_KEY")
+                self._api_key = (
+                    settings_overrides.get("SKYVERN_API_KEY") if settings_overrides is not None else None
+                ) or os.getenv("SKYVERN_API_KEY")
                 if not self._api_key:
                     raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
 
@@ -199,9 +272,7 @@ def _apply_sqlite_overrides() -> None:
     if mgr_settings is not settings:
         targets.append(mgr_settings)
     for target in targets:
-        target.DATABASE_STRING = "sqlite+aiosqlite:///:memory:"
-        target.DATABASE_REPLICA_STRING = None
-        target.ADDITIONAL_MODULES = []
-        target.OTEL_ENABLED = False
-        if hasattr(target, "ENABLE_CLEANUP_CRON"):
-            target.ENABLE_CLEANUP_CRON = False
+        for key, value in _SQLITE_OVERRIDE_VALUES.items():
+            if hasattr(target, key):
+                copied = copy.deepcopy(value) if isinstance(value, (list, dict)) else value
+                setattr(target, key, copied)
