@@ -51,7 +51,8 @@ class LLMProviderError(BaseLLMError):
 
 class LLMProviderErrorRetryableTask(LLMProviderError):
     def __init__(self, llm_key: str) -> None:
-        super().__init__(f"Retryable error while using LLMProvider {llm_key}")
+        # Call BaseLLMError directly to avoid double-formatting the message through LLMProviderError.__init__
+        BaseLLMError.__init__(self, f"Retryable error while using LLMProvider {llm_key}")
 
 
 class NoProviderEnabledError(BaseLLMError):

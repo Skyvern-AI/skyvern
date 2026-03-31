@@ -14,7 +14,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
-from skyvern.schemas.runs import RunEngine, RunType
+from skyvern.schemas.runs import RunEngine, RunStatus, RunType
 
 LOG = structlog.get_logger()
 
@@ -101,6 +101,7 @@ async def run_task(
         title=task.title,
         url=task.url,
         url_hash=url_hash,
+        status=RunStatus.queued,
     )
     if x_max_steps_override:
         LOG.info(
