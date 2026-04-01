@@ -159,11 +159,19 @@ class SkyvernElement:
             return True
 
         autocomplete: str | None = await self.get_attr("aria-autocomplete")
-        if autocomplete and autocomplete.lower() == "list":
+        if autocomplete and autocomplete.lower() in ("list", "both", "inline"):
             return True
 
         class_name: str | None = await self.get_attr("class")
         if class_name and "autocomplete-input" in class_name.lower():
+            return True
+
+        # Combobox inputs (role="combobox") present a list of options — treat as
+        # auto-completion so the agent uses the dropdown-selection flow instead of
+        # the Tab hack.  This covers account-search fields in many apps that use
+        # role="combobox" without setting aria-autocomplete.
+        role: str | None = await self.get_attr("role")
+        if role and role.lower() == "combobox":
             return True
 
         return False
