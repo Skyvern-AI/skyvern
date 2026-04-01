@@ -109,6 +109,8 @@ __all__ = ["AgentDB", "ScheduleLimitExceededError"]
 
 
 class AgentDB(BaseAlchemyDB):
+    _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
         super().__init__(db_engine or _build_engine(database_string))
         self.debug_enabled = debug_enabled
@@ -231,7 +233,25 @@ class AgentDB(BaseAlchemyDB):
         return await self.tasks.clear_task_failure_reason(*args, **kwargs)
 
     async def update_task(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.update_task(*args, **kwargs)
+        updated_task = await self.tasks.update_task(*args, **kwargs)
+
+        # Best-effort fire-and-forget write-through to task_runs.
+        # Mirrors the WorkflowService pattern — cron catches any missed syncs.
+        status = kwargs.get("status")
+        if status is not None:
+            task = asyncio.create_task(
+                self.workflow_params.sync_task_run_status(
+                    organization_id=updated_task.organization_id or "",
+                    run_id=updated_task.task_id,
+                    status=status.value,
+                    started_at=updated_task.started_at,
+                    finished_at=updated_task.finished_at,
+                ),
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        return updated_task
 
     async def update_task_2fa_state(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.update_task_2fa_state(*args, **kwargs)
@@ -450,25 +470,25 @@ class AgentDB(BaseAlchemyDB):
         return await self.workflow_params.retrieve_action_plan(*args, **kwargs)
 
     async def create_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.create_task_run(*args, **kwargs)
+        return await self.workflow_params.create_task_run(*args, **kwargs)
 
     async def update_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.update_task_run(*args, **kwargs)
+        return await self.workflow_params.update_task_run(*args, **kwargs)
 
     async def sync_task_run_status(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.sync_task_run_status(*args, **kwargs)
+        return await self.workflow_params.sync_task_run_status(*args, **kwargs)
 
     async def update_job_run_compute_cost(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.update_job_run_compute_cost(*args, **kwargs)
+        return await self.workflow_params.update_job_run_compute_cost(*args, **kwargs)
 
     async def cache_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.cache_task_run(*args, **kwargs)
+        return await self.workflow_params.cache_task_run(*args, **kwargs)
 
     async def get_cached_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.get_cached_task_run(*args, **kwargs)
+        return await self.workflow_params.get_cached_task_run(*args, **kwargs)
 
     async def get_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.tasks.get_run(*args, **kwargs)
+        return await self.workflow_params.get_run(*args, **kwargs)
 
     # -- Artifact delegates --
 
