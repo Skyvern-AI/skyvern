@@ -2377,6 +2377,31 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                 )
 
+            # Track uncached for-loop child blocks for regeneration.
+            # ForLoopBlock children execute via block.py's execute_loop_helper(),
+            # bypassing _execute_single_block. Without this, their labels never
+            # reach blocks_to_update and the script generator never produces
+            # cached functions for them (e.g., file_download inside a loop).
+            if (
+                isinstance(block, ForLoopBlock)
+                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+                and workflow_run_block_result.status in cacheable_statuses
+            ):
+                for loop_child in block.loop_blocks:
+                    if (
+                        loop_child.label
+                        and loop_child.label not in script_blocks_by_label
+                        and loop_child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                    ):
+                        blocks_to_update.add(loop_child.label)
+                        LOG.info(
+                            "For-loop child block marked for caching",
+                            parent_label=block.label,
+                            child_label=loop_child.label,
+                            child_block_type=loop_child.block_type,
+                            workflow_run_id=workflow_run_id,
+                        )
+
             workflow_run, should_stop = await self._handle_block_result_status(
                 block=block,
                 block_idx=block_idx,
