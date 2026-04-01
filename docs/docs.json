@@ -154,6 +154,14 @@
             ]
           },
           {
+            "group": "Handling Authentication",
+            "pages": [
+              "credentials/store-credentials",
+              "credentials/handle-2fa",
+              "credentials/troubleshooting-login"
+            ]
+          },
+          {
             "group": "Account & Settings",
             "pages": [
               "cloud/account-settings/api-keys",
