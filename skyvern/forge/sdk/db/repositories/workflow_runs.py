@@ -891,9 +891,42 @@ class WorkflowRunsRepository(BaseRepository):
                 value=value,
             )
             session.add(workflow_run_parameter)
+            await session.flush()
+            converted = convert_to_workflow_run_parameter(
+                workflow_run_parameter, workflow_parameter, self.debug_enabled
+            )
             await session.commit()
-            await session.refresh(workflow_run_parameter)
-            return convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
+            return converted
+
+    @db_operation("create_workflow_run_parameters")
+    async def create_workflow_run_parameters(
+        self,
+        workflow_run_id: str,
+        workflow_parameter_values: list[tuple[WorkflowParameter, Any]],
+    ) -> list[WorkflowRunParameter]:
+        if not workflow_parameter_values:
+            return []
+
+        workflow_run_parameters = [
+            WorkflowRunParameterModel(
+                workflow_run_id=workflow_run_id,
+                workflow_parameter_id=workflow_parameter.workflow_parameter_id,
+                value=value,
+            )
+            for workflow_parameter, value in workflow_parameter_values
+        ]
+
+        async with self.Session() as session:
+            session.add_all(workflow_run_parameters)
+            await session.flush()
+            converted = [
+                convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
+                for workflow_run_parameter, (workflow_parameter, _) in zip(
+                    workflow_run_parameters, workflow_parameter_values, strict=True
+                )
+            ]
+            await session.commit()
+            return converted
 
     @db_operation("get_workflow_run_parameters")
     async def get_workflow_run_parameters(

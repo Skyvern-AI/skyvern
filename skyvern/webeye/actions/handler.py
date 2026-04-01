@@ -420,6 +420,7 @@ class ActionHandler:
             )
         )
         initial_page_count = 0
+        page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
@@ -524,6 +525,25 @@ class ActionHandler:
                         LOG.warning("The extra page is the current page, closing it")
                     # close the extra page
                     await pages_after_download[-1].close()
+
+                # After a print/download action the working page sometimes navigates to
+                # about:blank (e.g. when the browser follows a download URL that yields no
+                # renderable content). Detect this and navigate back to the original URL so
+                # subsequent steps are not stuck on a blank page.
+                blank_page_urls = {"about:blank", ":"}
+                if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
+                    LOG.warning(
+                        "Working page navigated to blank after download action, navigating back to original URL",
+                        original_url=page_url_before_download,
+                    )
+                    try:
+                        await browser_state.navigate_to_url(page=page, url=page_url_before_download)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to navigate back to original URL after blank page from download",
+                            original_url=page_url_before_download,
+                            exc_info=True,
+                        )
 
             persisted_action = await app.DATABASE.create_action(action=action)
             action.action_id = persisted_action.action_id
@@ -2860,7 +2880,17 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
-        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        # Use SkyvernElement.click() so we get the full fallback chain
+        # (Playwright click → coordinate click → JavaScript click).  Plain
+        # locator.click() can fail when the item or one of its ancestors has
+        # pointer-events:none, which is common in React/Vue dropdown lists.
+        selected_element = SkyvernElement(
+            locator=locator,
+            frame=current_frame,
+            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+        )
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
         clear_input = False
         return result
 
