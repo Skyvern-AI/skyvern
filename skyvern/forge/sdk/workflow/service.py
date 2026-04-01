@@ -143,13 +143,6 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.FOR_LOOP,
 }
 
-# Wrapper block types whose cached code is structural (loop iteration, branch routing).
-# Their failure during cached execution reflects data/runtime issues, not bad script code.
-# Excluded from continue_on_failure regeneration to prevent infinite version loops (SKY-8554).
-WRAPPER_BLOCK_TYPES = {
-    BlockType.FOR_LOOP,
-}
-
 
 def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]:
     """Extract lightweight info from blocks for title generation (limit to first 5)."""
@@ -2359,23 +2352,11 @@ class WorkflowService:
             ):
                 blocks_to_update.add(block.label)
 
-            # Invalidate cache for blocks with continue_on_failure=True that failed
-            # This ensures the block runs fresh with AI on the next cached run
-            if (
-                block.label
-                and block.continue_on_failure
-                and workflow_run_block_result.status != BlockStatus.completed
-                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                and block.block_type not in WRAPPER_BLOCK_TYPES  # SKY-8554: structural wrappers don't need regen
-                and block.label in script_blocks_by_label
-            ):
-                blocks_to_update.add(block.label)
-                LOG.info(
-                    "Block with continue_on_failure failed during cached execution, marking for regeneration",
-                    block_label=block.label,
-                    block_status=workflow_run_block_result.status,
-                    workflow_run_id=workflow_run_id,
-                )
+            # NOTE: continue_on_failure block failures are handled by the Script
+            # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
+            # regenerating the entire script here. The fallback episode is already
+            # recorded and the reviewer will patch the specific block that failed.
+            # See _trigger_script_reviewer() for the capped reviewer flow.
 
             # Track uncached for-loop child blocks for regeneration.
             # ForLoopBlock children execute via block.py's execute_loop_helper(),
@@ -5453,8 +5434,12 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 for wf_param, run_param in run_param_tuples:
-                    if isinstance(run_param.value, str) and run_param.value:
-                        run_parameter_values[wf_param.key] = run_param.value
+                    if (
+                        run_param.value is not None
+                        and str(run_param.value).strip()
+                        and not wf_param.parameter_type.is_secret_or_credential()
+                    ):
+                        run_parameter_values[wf_param.key] = str(run_param.value)
             except Exception:
                 LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
 

@@ -117,7 +117,7 @@ def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "temporalio", temporalio_module)
     monkeypatch.setitem(sys.modules, "structlog", structlog_module)
 
-    module_path = _SOURCE_FILE
+    module_path = _repo_root() / "workers" / "cron_worker" / "task_runs_sync_activity.py"
     spec = importlib.util.spec_from_file_location("test_task_runs_sync_activity_module", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
