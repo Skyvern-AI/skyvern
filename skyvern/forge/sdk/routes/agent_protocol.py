@@ -39,7 +39,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -2120,6 +2120,7 @@ async def get_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    trigger_type: Annotated[list[WorkflowRunTriggerType] | None, Query()] = None,
     search_key: str | None = Query(
         None,
         description=(
@@ -2138,7 +2139,12 @@ async def get_runs(
         return []
 
     runs = await app.DATABASE.get_all_runs(
-        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+        current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        status=status,
+        trigger_type=trigger_type,
+        search_key=search_key,
     )
     return ORJSONResponse([run.model_dump() for run in runs])
 

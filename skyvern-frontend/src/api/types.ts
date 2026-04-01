@@ -426,7 +426,7 @@ export type WorkflowRunApiResponse = {
   finished_at: string | null; // ISO 8601
   modified_at: string;
   proxy_location: ProxyLocation | null;
-  script_run: boolean | null;
+  script_run: { ai_fallback_triggered: boolean } | null;
   status: Status;
   title?: string;
   trigger_type?: TriggerType | null;

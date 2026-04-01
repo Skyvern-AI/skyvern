@@ -298,6 +298,7 @@ class WorkflowRunsMixin:
         page: int = 1,
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
+        trigger_type: list[WorkflowRunTriggerType] | None = None,
         include_debugger_runs: bool = False,
         search_key: str | None = None,
     ) -> list[WorkflowRun | Task]:
@@ -357,6 +358,10 @@ class WorkflowRunsMixin:
 
             if status:
                 workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
+            if trigger_type:
+                workflow_run_query = workflow_run_query.filter(
+                    WorkflowRunModel.trigger_type.in_([t.value for t in trigger_type])
+                )
             workflow_run_query = workflow_run_query.order_by(WorkflowRunModel.created_at.desc()).limit(limit)
             workflow_run_query_result = (await session.execute(workflow_run_query)).all()
             workflow_runs = [
@@ -364,16 +369,20 @@ class WorkflowRunsMixin:
                 for run, title in workflow_run_query_result
             ]
 
-            task_query = (
-                select(TaskModel)
-                .filter(TaskModel.organization_id == organization_id)
-                .filter(TaskModel.workflow_run_id.is_(None))
-            )
-            if status:
-                task_query = task_query.filter(TaskModel.status.in_(status))
-            task_query = task_query.order_by(TaskModel.created_at.desc()).limit(limit)
-            task_query_result = (await session.scalars(task_query)).all()
-            tasks = [convert_to_task(task, debug_enabled=self.debug_enabled) for task in task_query_result]
+            # Tasks don't have trigger_type — skip them when filtering by trigger type
+            if trigger_type:
+                tasks: list[Task] = []
+            else:
+                task_query = (
+                    select(TaskModel)
+                    .filter(TaskModel.organization_id == organization_id)
+                    .filter(TaskModel.workflow_run_id.is_(None))
+                )
+                if status:
+                    task_query = task_query.filter(TaskModel.status.in_(status))
+                task_query = task_query.order_by(TaskModel.created_at.desc()).limit(limit)
+                task_query_result = (await session.scalars(task_query)).all()
+                tasks = [convert_to_task(task, debug_enabled=self.debug_enabled) for task in task_query_result]
 
             runs = workflow_runs + tasks
 
