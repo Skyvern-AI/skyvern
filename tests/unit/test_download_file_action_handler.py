@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.models import StepStatus
-from skyvern.webeye.actions.actions import DownloadFileAction
-from skyvern.webeye.actions.handler import handle_download_file_action
+from skyvern.webeye.actions.actions import ClickAction, DownloadFileAction
+from skyvern.webeye.actions.handler import ActionHandler, handle_download_file_action
 from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_organization, make_step, make_task
@@ -389,3 +389,155 @@ async def test_handle_download_file_action_download_url_err_aborted_swallowed() 
 
         assert len(result) == 1
         assert isinstance(result[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_navigates_back_from_blank_page_after_download() -> None:
+    """After a print/download click the working page sometimes navigates to about:blank.
+    handle_action should detect this and navigate back to the original URL so the
+    next step is not stuck on a blank page."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    original_url = "https://example.com/document/123"
+
+    # Page starts at a real URL; the mocked action will navigate it to about:blank
+    page = MagicMock()
+    page.url = original_url
+
+    browser_state = MagicMock()
+    # Same page count before and after (no extra tab opened by the print action)
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    browser_state.navigate_to_url = AsyncMock()
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="btn-print",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    # _handle_action simulates the page navigating to about:blank during the print download
+    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+        page.url = "about:blank"
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dummy_file = os.path.join(temp_dir, "doc.pdf")
+        with open(dummy_file, "w") as f:
+            f.write("dummy")
+
+        # list_files_in_directory: empty before action, one file after action
+        list_files_side_effect = [[], [dummy_file]]
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files_side_effect),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    # The blank-page recovery should have navigated back to the original URL
+    browser_state.navigate_to_url.assert_called_once_with(page=page, url=original_url)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_does_not_navigate_back_when_page_url_unchanged() -> None:
+    """When the page URL does not change to blank after a download, navigate_to_url should NOT be called."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    original_url = "https://example.com/document/123"
+
+    page = MagicMock()
+    page.url = original_url  # URL stays the same after download
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    browser_state.navigate_to_url = AsyncMock()
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="btn-print",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    # _handle_action does NOT change the page URL (normal case)
+    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dummy_file = os.path.join(temp_dir, "doc.pdf")
+        with open(dummy_file, "w") as f:
+            f.write("dummy")
+
+        list_files_side_effect = [[], [dummy_file]]
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files_side_effect),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    # Page URL is unchanged; no navigation back should occur
+    browser_state.navigate_to_url.assert_not_called()
