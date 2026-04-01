@@ -452,6 +452,9 @@ a.sk-bento-cell-link:hover .sk-arrow-sm {
    ============================================= */
 
 @media (max-width: 900px) {
+  .sk-hero {
+    margin-top: 130px;
+  }
   .sk-hero-inner {
     grid-template-columns: 1fr;
   }
