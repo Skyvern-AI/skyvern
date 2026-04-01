@@ -23,9 +23,11 @@ function useRunsQuery({
   statusFilters,
   triggerTypeFilters,
   search,
+  ...queryOptions
 }: Props) {
   const credentialGetter = useCredentialGetter();
   return useQuery<Array<Task | WorkflowRunApiResponse>>({
+    ...queryOptions,
     queryKey: [
       "runs",
       { statusFilters, triggerTypeFilters },

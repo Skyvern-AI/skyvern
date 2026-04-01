@@ -212,7 +212,7 @@ function WorkflowPage() {
               ) : (
                 workflowRuns?.map((workflowRun) => {
                   const workflowRunId =
-                    workflowRun.script_run === true ? (
+                    workflowRun.script_run != null ? (
                       <div className="flex items-center gap-2">
                         <Tip content="Ran with code">
                           <LightningBoltIcon className="text-[gold]" />
