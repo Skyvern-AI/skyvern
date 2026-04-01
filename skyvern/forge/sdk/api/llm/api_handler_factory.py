@@ -756,7 +756,7 @@ class LLMAPIHandlerFactory:
                                 fallback_model=response_model,
                             )
                 except litellm.exceptions.APIError as e:
-                    raise LLMProviderErrorRetryableTask(llm_key) from e
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -776,7 +776,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise LLMProviderErrorRetryableTask(llm_key) from e
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -786,7 +786,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise LLMProviderError(llm_key) from e
+                    raise LLMProviderError(llm_key, cause=e) from e
 
                 llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
@@ -1207,7 +1207,7 @@ class LLMAPIHandlerFactory:
                         **active_parameters,
                     )
                 except litellm.exceptions.APIError as e:
-                    raise LLMProviderErrorRetryableTask(llm_key) from e
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -1249,7 +1249,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise LLMProviderError(llm_key) from e
+                    raise LLMProviderError(llm_key, cause=e) from e
 
                 llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
@@ -1657,7 +1657,7 @@ class LLMCaller:
                     # only update message_history when the request is successful
                     self.message_history = messages
             except litellm.exceptions.APIError as e:
-                raise LLMProviderErrorRetryableTask(self.llm_key) from e
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
                 LOG.exception(
                     "Context window exceeded",
@@ -1687,7 +1687,7 @@ class LLMCaller:
                     raise LLMProviderError(self.llm_key) from None
             except Exception as e:
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
-                raise LLMProviderError(self.llm_key) from e
+                raise LLMProviderError(self.llm_key, cause=e) from e
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
