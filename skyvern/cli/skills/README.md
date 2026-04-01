@@ -40,20 +40,28 @@ CLI reference covering all browser automation capabilities:
 - Block schema discovery and validation
 - Debugging with screenshot + validate loops
 
+### smoke-test
+CI-oriented smoke testing via Skyvern browser tools. Reads your `git diff`, generates
+3-8 targeted smoke tests, runs each one via Skyvern browser tools (navigate, act,
+validate, screenshot), and reports a pass/fail table as a PR comment. Invoke with
+`/smoke-test` in Claude Code.
+
 ### testing
-Smoke-test skill for verifying Skyvern deployments.
+Deployment health check for verifying Skyvern installations.
 
 ## Structure
 
 ```
 qa/
   SKILL.md              Diff-driven frontend QA testing
+smoke-test/
+  SKILL.md              CI-oriented smoke testing via Skyvern browser tools
 skyvern/
   SKILL.md              Main skill file (CLI-first, all capabilities)
   references/           17 deep-dive reference files
   examples/             Workflow JSON examples
 testing/
-  SKILL.md              Deployment smoke testing
+  SKILL.md              Deployment health checking
 ```
 
 ## Manual Install

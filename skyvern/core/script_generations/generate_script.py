@@ -2222,6 +2222,95 @@ def _build_conditional_statement(
     return [conditional_call]
 
 
+def _build_workflow_trigger_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.trigger_workflow statement.
+
+    WorkflowTriggerBlock makes zero LLM calls — it's pure orchestration
+    (template resolution, workflow dispatch, output collection). Executed
+    as-is during cached script runs.
+    """
+    args = [
+        cst.Arg(
+            keyword=cst.Name("workflow_permanent_id"),
+            value=_value(block.get("workflow_permanent_id", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+    ]
+
+    if block.get("payload") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("payload"),
+                value=_value(block.get("payload")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("wait_for_completion") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("wait_for_completion"),
+                value=_value(block.get("wait_for_completion")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("use_parent_browser_session"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("use_parent_browser_session"),
+                value=_value(True),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("browser_session_id"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("browser_session_id"),
+                value=_value(block.get("browser_session_id")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    args.append(
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+            ),
+        ),
+    )
+
+    _mark_last_arg_as_comma(args)
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("trigger_workflow")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
 def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.For:
     """
     Build a for loop statement.
@@ -2515,6 +2604,8 @@ def _build_block_statement(
         stmt = _build_http_request_statement(block)
     elif block_type == "pdf_parser":
         stmt = _build_pdf_parser_statement(block)
+    elif block_type == "workflow_trigger":
+        stmt = _build_workflow_trigger_statement(block)
     elif block_type == "conditional":
         # Conditional blocks are evaluated at runtime by the workflow engine.
         # Generate a descriptive comment showing this is a runtime branch point.
