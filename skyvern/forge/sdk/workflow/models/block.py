@@ -2662,6 +2662,24 @@ class TextPromptBlock(Block):
         # get all parameters into a dictionary
         parameter_values = {}
         for parameter in self.parameters:
+            if not workflow_run_context.has_value(parameter.key):
+                LOG.warning(
+                    "TextPromptBlock missing required parameter",
+                    block_label=self.label,
+                    parameter_key=parameter.key,
+                    workflow_run_id=workflow_run_id,
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        f"Parameter '{parameter.key}' is not available in the workflow context. "
+                        f"An upstream block that produces this value may have failed or been skipped."
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
             value = workflow_run_context.get_value(parameter.key)
             secret_value = workflow_run_context.get_original_secret_value_or_none(value)
             if secret_value:
@@ -2669,13 +2687,29 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        response = await self.send_prompt(
-            self.prompt,
-            parameter_values,
-            workflow_run_id,
-            organization_id,
-            workflow_run_block_id=workflow_run_block_id,
-        )
+        try:
+            response = await self.send_prompt(
+                self.prompt,
+                parameter_values,
+                workflow_run_id,
+                organization_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+        except Exception as e:
+            LOG.exception(
+                "TextPromptBlock LLM call failed",
+                block_label=self.label,
+                workflow_run_id=workflow_run_id,
+                llm_key=self.override_llm_key or self.llm_key,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"LLM call failed: {e}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
