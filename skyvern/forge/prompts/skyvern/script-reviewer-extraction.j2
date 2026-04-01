@@ -34,6 +34,14 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 {% endfor %}
 For fields not covered by these parameters, use `ai='proactive'` with a descriptive prompt (see Rule 8b).
 {% endif %}
+{% if run_parameter_values %}
+
+## Current Run Parameter Values
+These are the ACTUAL values for this run. If any of these appear (even partially) in a selector or hardcoded string, that value is per-run and MUST be made dynamic — use `context.parameters['key']` or `ai='proactive'` with a prompt referencing the parameter.
+{% for key, value in run_parameter_values.items() %}
+- `{{ key }}` = `{{ value[:80] }}{% if value|length > 80 %}…{% endif %}`
+{% endfor %}
+{% endif %}
 
 ## Existing Cached Code (DO NOT REMOVE ANY EXISTING PATHS)
 ```python
@@ -93,9 +101,11 @@ The following failures occurred in PREVIOUS runs. Learn from these — do NOT re
 - **Error**: {{ h.error_message or "N/A" }}
 - **Reviewer fix applied**: {{ h.reviewer_output or "No fix recorded" }}
 - **Did the AI fallback succeed?**: {{ "Yes" if h.fallback_succeeded else ("No" if h.fallback_succeeded is sameas false else "Unknown") }}
+{% if h.run_parameters %}- **Run parameters**: {% for k, v in h.run_parameters.items() %}`{{ k }}={{ v[:60] }}{% if v|length > 60 %}…{% endif %}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
 {% endfor %}
 
-**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach.
+**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach. **If different past episodes show different values for the same parameter**, the block handles per-run data — any hardcoded reference to those values must be dynamic.
 {% endif %}
 
 {% if user_instructions %}

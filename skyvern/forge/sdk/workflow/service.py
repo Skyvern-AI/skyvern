@@ -3655,12 +3655,11 @@ class WorkflowService:
             )
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
-        # Hold a reference in _background_tasks so Python doesn't GC the task.
-        task = asyncio.create_task(
+        bg = asyncio.create_task(
             self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, status),
         )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
 
         return workflow_run
 
@@ -5454,8 +5453,12 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 for wf_param, run_param in run_param_tuples:
-                    if isinstance(run_param.value, str) and run_param.value:
-                        run_parameter_values[wf_param.key] = run_param.value
+                    if (
+                        run_param.value is not None
+                        and str(run_param.value).strip()
+                        and not wf_param.parameter_type.is_secret_or_credential()
+                    ):
+                        run_parameter_values[wf_param.key] = str(run_param.value)
             except Exception:
                 LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
 
