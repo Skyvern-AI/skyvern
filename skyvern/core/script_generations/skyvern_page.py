@@ -3444,25 +3444,40 @@ class RunContext:
     def download_selector(self) -> str | None:
         """Build a CSS selector targeting a download link from the current loop value.
 
-        Scans the loop_value dict for URL-like strings, extracts the filename,
-        and returns a selector like ``a[href*="filename.pdf"]``. Returns None
-        if no URL is found.
+        Tries strategies in order of reliability:
+        1. URL in values → a[href*="filename.pdf"] (most precise)
+        2. Title text → a:has-text("title") (works when title IS the link)
+
+        Returns the first viable selector, or None to fall back to AI.
         """
         value = self.loop_value
         if not value or not isinstance(value, dict):
             return None
+
+        texts: list[str] = []
         for v in value.values():
-            if not isinstance(v, str):
+            if not isinstance(v, str) or not v.strip():
                 continue
-            # Match URL-like strings (http/https or paths with file extensions)
+
+            # Strategy 1: URL-like values → href selector (most reliable)
             if re.match(r"https?://", v) or re.match(r"/.*\.\w+", v):
-                # Extract filename from URL path
-                filename = v.rstrip("/").rsplit("/", 1)[-1]
-                # Strip query params
-                filename = filename.split("?")[0]
+                filename = v.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
                 if filename and "." in filename:
-                    # Escape CSS special characters to avoid malformed selectors
                     filename = re.sub(r'["\[\]\\]', "", filename)
                     if filename:
                         return f'a[href*="{filename}"]'
+
+            texts.append(v.strip())
+
+        if not texts:
+            return None
+
+        # Strategy 2: Direct link text match — many sites make the document
+        # title clickable (e.g., <a href="...">Annual Report 2025</a>).
+        # Use the longest text (likely the title, which is more often the link text).
+        longest = max(texts, key=len)
+        escaped = longest.replace('"', '\\"')
+        if len(escaped) >= 3:
+            return f'a:has-text("{escaped}")'
+
         return None
