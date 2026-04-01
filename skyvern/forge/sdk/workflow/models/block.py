@@ -4285,6 +4285,9 @@ class HumanInteractionBlock(BaseTaskBlock):
 
         app_url = f"{settings.SKYVERN_APP_URL}/runs/{workflow_run_id}/overview"
         body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
+        if browser_session_id:
+            browser_session_url = f"{settings.SKYVERN_APP_URL}/browser-session/{browser_session_id}"
+            body += f"To interact with the browser session directly, visit {browser_session_url}\n\n"
         subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
 
         try:
