@@ -279,7 +279,7 @@ function RunHistory() {
                 const workflowTitle = (
                   <div className="flex items-center gap-2">
                     <span className="truncate">{run.workflow_title ?? ""}</span>
-                    {run.script_run != null && (
+                    {run.script_run === true && (
                       <Tip content="Ran with code">
                         <LightningBoltIcon className="text-[gold]" />
                       </Tip>
