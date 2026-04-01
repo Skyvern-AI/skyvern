@@ -65,7 +65,7 @@ export interface WorkflowRunRequest {
     browser_address?: string;
     /** Whether to fallback to AI if the workflow run fails. */
     ai_fallback?: boolean;
-    /** Whether to run the workflow with agent, code, or code_v2 (adaptive caching). */
+    /** Whether to run the workflow with agent or code. Null inherits from the workflow setting. */
     run_with?: string;
 }
 

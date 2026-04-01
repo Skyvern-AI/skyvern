@@ -13,30 +13,26 @@ from .environment import SkyvernEnvironment
 from .raw_client import AsyncRawSkyvern, RawSkyvern
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
-from .types.billing_state_response import BillingStateResponse
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
-from .types.change_tier_response import ChangeTierResponse
-from .types.checkout_session_response import CheckoutSessionResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
+from .types.credential_vault_type import CredentialVaultType
 from .types.extensions import Extensions
 from .types.folder import Folder
 from .types.get_run_response import GetRunResponse
 from .types.otp_type import OtpType
 from .types.persistent_browser_type import PersistentBrowserType
-from .types.plan_tier import PlanTier
-from .types.portal_session_response import PortalSessionResponse
 from .types.proxy_location import ProxyLocation
 from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
-from .types.run_sdk_action_request_action import RunSdkActionRequestAction
-from .types.run_sdk_action_response import RunSdkActionResponse
+from .types.run_status import RunStatus
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
+from .types.task_run_list_item import TaskRunListItem
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
 from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
@@ -52,7 +48,6 @@ from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
-    from .agent.client import AgentClient, AsyncAgentClient
     from .artifacts.client import ArtifactsClient, AsyncArtifactsClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
 # this is used as the default value for optional parameters
@@ -127,7 +122,6 @@ class Skyvern:
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[ArtifactsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
-        self._agent: typing.Optional[AgentClient] = None
 
     @property
     def with_raw_response(self) -> RawSkyvern:
@@ -269,7 +263,7 @@ class Skyvern:
             The CDP address for the task.
 
         run_with : typing.Optional[str]
-            Whether to run the task with agent or code.
+            Whether to run the task with agent or code. Null means use the default.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -422,7 +416,7 @@ class Skyvern:
             Whether to fallback to AI if the workflow run fails.
 
         run_with : typing.Optional[str]
-            Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
+            Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1007,36 +1001,6 @@ class Skyvern:
         )
         return _response.data
 
-    def get_artifact(self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Artifact:
-        """
-        Get an artifact
-
-        Parameters
-        ----------
-        artifact_id : str
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Artifact
-            Successfully retrieved artifact
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_artifact(
-            artifact_id="artifact_id",
-        )
-        """
-        _response = self._raw_client.get_artifact(artifact_id, request_options=request_options)
-        return _response.data
-
     def get_run_artifacts(
         self,
         run_id: str,
@@ -1149,6 +1113,53 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    def get_runs_v2(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[TaskRunListItem]:
+        """
+        Parameters
+        ----------
+        page : typing.Optional[int]
+
+        page_size : typing.Optional[int]
+
+        status : typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]]
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search (min 3 chars for trigram index).
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[TaskRunListItem]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_runs_v2(
+            page=1,
+            page_size=1,
+            search_key="search_key",
+        )
+        """
+        _response = self._raw_client.get_runs_v2(
+            page=page, page_size=page_size, status=status, search_key=search_key, request_options=request_options
+        )
         return _response.data
 
     def get_workflow_runs(
@@ -1768,6 +1779,7 @@ class Skyvern:
         *,
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
+        vault_type: typing.Optional[CredentialVaultType] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[CredentialResponse]:
         """
@@ -1780,6 +1792,9 @@ class Skyvern:
 
         page_size : typing.Optional[int]
             Number of items per page
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1799,9 +1814,12 @@ class Skyvern:
         client.get_credentials(
             page=1,
             page_size=10,
+            vault_type="bitwarden",
         )
         """
-        _response = self._raw_client.get_credentials(page=page, page_size=page_size, request_options=request_options)
+        _response = self._raw_client.get_credentials(
+            page=page, page_size=page_size, vault_type=vault_type, request_options=request_options
+        )
         return _response.data
 
     def create_credential(
@@ -1810,6 +1828,7 @@ class Skyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -1825,6 +1844,9 @@ class Skyvern:
 
         credential : CreateCredentialRequestCredential
             The credential data to store
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1851,7 +1873,11 @@ class Skyvern:
         )
         """
         _response = self._raw_client.create_credential(
-            name=name, credential_type=credential_type, credential=credential, request_options=request_options
+            name=name,
+            credential_type=credential_type,
+            credential=credential,
+            vault_type=vault_type,
+            request_options=request_options,
         )
         return _response.data
 
@@ -1862,6 +1888,7 @@ class Skyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -1880,6 +1907,9 @@ class Skyvern:
 
         credential : CreateCredentialRequestCredential
             The credential data to store
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1911,6 +1941,7 @@ class Skyvern:
             name=name,
             credential_type=credential_type,
             credential=credential,
+            vault_type=vault_type,
             request_options=request_options,
         )
         return _response.data
@@ -2383,204 +2414,6 @@ class Skyvern:
         _response = self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
         return _response.data
 
-    def run_sdk_action(
-        self,
-        *,
-        url: str,
-        action: RunSdkActionRequestAction,
-        browser_session_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
-        workflow_run_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunSdkActionResponse:
-        """
-        Execute a single SDK action with the specified parameters
-
-        Parameters
-        ----------
-        url : str
-            The URL where the action should be executed
-
-        action : RunSdkActionRequestAction
-            The action to execute with its specific parameters
-
-        browser_session_id : typing.Optional[str]
-            The browser session ID
-
-        browser_address : typing.Optional[str]
-            The browser address
-
-        workflow_run_id : typing.Optional[str]
-            Optional workflow run ID to continue an existing workflow run
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunSdkActionResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import RunSdkActionRequestAction_AiAct, Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.run_sdk_action(
-            url="url",
-            action=RunSdkActionRequestAction_AiAct(),
-        )
-        """
-        _response = self._raw_client.run_sdk_action(
-            url=url,
-            action=action,
-            browser_session_id=browser_session_id,
-            browser_address=browser_address,
-            workflow_run_id=workflow_run_id,
-            request_options=request_options,
-        )
-        return _response.data
-
-    def create_checkout_session_api_v1billing_checkout_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> CheckoutSessionResponse:
-        """
-        Create a Stripe Checkout Session for subscribing to a tier.
-
-        Frontend should redirect the user to the returned URL.
-        After successful checkout, Stripe will send a webhook that we handle
-        to store the subscription and initialize billing state.
-
-        Returns 400 if org already has an active subscription (use portal instead).
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CheckoutSessionResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.create_checkout_session_api_v1billing_checkout_post(
-            tier="free",
-        )
-        """
-        _response = self._raw_client.create_checkout_session_api_v1billing_checkout_post(
-            tier=tier, request_options=request_options
-        )
-        return _response.data
-
-    def create_portal_session_api_v1billing_portal_post(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> PortalSessionResponse:
-        """
-        Create a Stripe Customer Portal session for managing subscription.
-
-        Frontend should redirect the user to the returned URL.
-        The portal allows users to:
-        - Update payment methods
-        - Upgrade/downgrade plans
-        - Cancel subscription
-        - View invoices
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        PortalSessionResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.create_portal_session_api_v1billing_portal_post()
-        """
-        _response = self._raw_client.create_portal_session_api_v1billing_portal_post(request_options=request_options)
-        return _response.data
-
-    def get_organization_billing_api_v1billing_state_get(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.Optional[BillingStateResponse]:
-        """
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.Optional[BillingStateResponse]
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_organization_billing_api_v1billing_state_get()
-        """
-        _response = self._raw_client.get_organization_billing_api_v1billing_state_get(request_options=request_options)
-        return _response.data
-
-    def change_tier_api_v1billing_change_tier_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> ChangeTierResponse:
-        """
-        Redirect to Stripe Portal for tier changes.
-        Portal handles proration based on configured settings:
-        - Upgrades: Immediate proration charge
-        - Downgrades: Apply at end of billing period
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        ChangeTierResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.change_tier_api_v1billing_change_tier_post(
-            tier="free",
-        )
-        """
-        _response = self._raw_client.change_tier_api_v1billing_change_tier_post(
-            tier=tier, request_options=request_options
-        )
-        return _response.data
-
     @property
     def artifacts(self):
         if self._artifacts is None:
@@ -2596,14 +2429,6 @@ class Skyvern:
 
             self._scripts = ScriptsClient(client_wrapper=self._client_wrapper)
         return self._scripts
-
-    @property
-    def agent(self):
-        if self._agent is None:
-            from .agent.client import AgentClient  # noqa: E402
-
-            self._agent = AgentClient(client_wrapper=self._client_wrapper)
-        return self._agent
 
 
 class AsyncSkyvern:
@@ -2674,7 +2499,6 @@ class AsyncSkyvern:
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[AsyncArtifactsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
-        self._agent: typing.Optional[AsyncAgentClient] = None
 
     @property
     def with_raw_response(self) -> AsyncRawSkyvern:
@@ -2816,7 +2640,7 @@ class AsyncSkyvern:
             The CDP address for the task.
 
         run_with : typing.Optional[str]
-            Whether to run the task with agent or code.
+            Whether to run the task with agent or code. Null means use the default.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2977,7 +2801,7 @@ class AsyncSkyvern:
             Whether to fallback to AI if the workflow run fails.
 
         run_with : typing.Optional[str]
-            Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
+            Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3666,46 +3490,6 @@ class AsyncSkyvern:
         )
         return _response.data
 
-    async def get_artifact(
-        self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> Artifact:
-        """
-        Get an artifact
-
-        Parameters
-        ----------
-        artifact_id : str
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Artifact
-            Successfully retrieved artifact
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_artifact(
-                artifact_id="artifact_id",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_artifact(artifact_id, request_options=request_options)
-        return _response.data
-
     async def get_run_artifacts(
         self,
         run_id: str,
@@ -3842,6 +3626,61 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    async def get_runs_v2(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[TaskRunListItem]:
+        """
+        Parameters
+        ----------
+        page : typing.Optional[int]
+
+        page_size : typing.Optional[int]
+
+        status : typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]]
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search (min 3 chars for trigram index).
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[TaskRunListItem]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_runs_v2(
+                page=1,
+                page_size=1,
+                search_key="search_key",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_runs_v2(
+            page=page, page_size=page_size, status=status, search_key=search_key, request_options=request_options
+        )
         return _response.data
 
     async def get_workflow_runs(
@@ -4565,6 +4404,7 @@ class AsyncSkyvern:
         *,
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
+        vault_type: typing.Optional[CredentialVaultType] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[CredentialResponse]:
         """
@@ -4577,6 +4417,9 @@ class AsyncSkyvern:
 
         page_size : typing.Optional[int]
             Number of items per page
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4601,13 +4444,14 @@ class AsyncSkyvern:
             await client.get_credentials(
                 page=1,
                 page_size=10,
+                vault_type="bitwarden",
             )
 
 
         asyncio.run(main())
         """
         _response = await self._raw_client.get_credentials(
-            page=page, page_size=page_size, request_options=request_options
+            page=page, page_size=page_size, vault_type=vault_type, request_options=request_options
         )
         return _response.data
 
@@ -4617,6 +4461,7 @@ class AsyncSkyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -4632,6 +4477,9 @@ class AsyncSkyvern:
 
         credential : CreateCredentialRequestCredential
             The credential data to store
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4666,7 +4514,11 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.create_credential(
-            name=name, credential_type=credential_type, credential=credential, request_options=request_options
+            name=name,
+            credential_type=credential_type,
+            credential=credential,
+            vault_type=vault_type,
+            request_options=request_options,
         )
         return _response.data
 
@@ -4677,6 +4529,7 @@ class AsyncSkyvern:
         name: str,
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
+        vault_type: typing.Optional[CredentialVaultType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -4695,6 +4548,9 @@ class AsyncSkyvern:
 
         credential : CreateCredentialRequestCredential
             The credential data to store
+
+        vault_type : typing.Optional[CredentialVaultType]
+            Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4734,6 +4590,7 @@ class AsyncSkyvern:
             name=name,
             credential_type=credential_type,
             credential=credential,
+            vault_type=vault_type,
             request_options=request_options,
         )
         return _response.data
@@ -5272,248 +5129,6 @@ class AsyncSkyvern:
         _response = await self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
         return _response.data
 
-    async def run_sdk_action(
-        self,
-        *,
-        url: str,
-        action: RunSdkActionRequestAction,
-        browser_session_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
-        workflow_run_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunSdkActionResponse:
-        """
-        Execute a single SDK action with the specified parameters
-
-        Parameters
-        ----------
-        url : str
-            The URL where the action should be executed
-
-        action : RunSdkActionRequestAction
-            The action to execute with its specific parameters
-
-        browser_session_id : typing.Optional[str]
-            The browser session ID
-
-        browser_address : typing.Optional[str]
-            The browser address
-
-        workflow_run_id : typing.Optional[str]
-            Optional workflow run ID to continue an existing workflow run
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunSdkActionResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern, RunSdkActionRequestAction_AiAct
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.run_sdk_action(
-                url="url",
-                action=RunSdkActionRequestAction_AiAct(),
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.run_sdk_action(
-            url=url,
-            action=action,
-            browser_session_id=browser_session_id,
-            browser_address=browser_address,
-            workflow_run_id=workflow_run_id,
-            request_options=request_options,
-        )
-        return _response.data
-
-    async def create_checkout_session_api_v1billing_checkout_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> CheckoutSessionResponse:
-        """
-        Create a Stripe Checkout Session for subscribing to a tier.
-
-        Frontend should redirect the user to the returned URL.
-        After successful checkout, Stripe will send a webhook that we handle
-        to store the subscription and initialize billing state.
-
-        Returns 400 if org already has an active subscription (use portal instead).
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CheckoutSessionResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.create_checkout_session_api_v1billing_checkout_post(
-                tier="free",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.create_checkout_session_api_v1billing_checkout_post(
-            tier=tier, request_options=request_options
-        )
-        return _response.data
-
-    async def create_portal_session_api_v1billing_portal_post(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> PortalSessionResponse:
-        """
-        Create a Stripe Customer Portal session for managing subscription.
-
-        Frontend should redirect the user to the returned URL.
-        The portal allows users to:
-        - Update payment methods
-        - Upgrade/downgrade plans
-        - Cancel subscription
-        - View invoices
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        PortalSessionResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.create_portal_session_api_v1billing_portal_post()
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.create_portal_session_api_v1billing_portal_post(
-            request_options=request_options
-        )
-        return _response.data
-
-    async def get_organization_billing_api_v1billing_state_get(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.Optional[BillingStateResponse]:
-        """
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.Optional[BillingStateResponse]
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_organization_billing_api_v1billing_state_get()
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_organization_billing_api_v1billing_state_get(
-            request_options=request_options
-        )
-        return _response.data
-
-    async def change_tier_api_v1billing_change_tier_post(
-        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
-    ) -> ChangeTierResponse:
-        """
-        Redirect to Stripe Portal for tier changes.
-        Portal handles proration based on configured settings:
-        - Upgrades: Immediate proration charge
-        - Downgrades: Apply at end of billing period
-
-        Parameters
-        ----------
-        tier : PlanTier
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        ChangeTierResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.change_tier_api_v1billing_change_tier_post(
-                tier="free",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.change_tier_api_v1billing_change_tier_post(
-            tier=tier, request_options=request_options
-        )
-        return _response.data
-
     @property
     def artifacts(self):
         if self._artifacts is None:
@@ -5529,14 +5144,6 @@ class AsyncSkyvern:
 
             self._scripts = AsyncScriptsClient(client_wrapper=self._client_wrapper)
         return self._scripts
-
-    @property
-    def agent(self):
-        if self._agent is None:
-            from .agent.client import AsyncAgentClient  # noqa: E402
-
-            self._agent = AsyncAgentClient(client_wrapper=self._client_wrapper)
-        return self._agent
 
 
 def _get_base_url(*, base_url: typing.Optional[str] = None, environment: SkyvernEnvironment) -> str:
