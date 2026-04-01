@@ -7,6 +7,8 @@ mode: custom
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-of-march-30-2026" className="cl-sidebar-link">Week of Mar 30, 2026</a>
+    <a href="#week-of-march-23-2026" className="cl-sidebar-link">Week of Mar 23, 2026</a>
     <a href="#v1022--february-26-2026" className="cl-sidebar-link">v1.0.22 — Feb 26, 2026</a>
     <a href="#v1021--february-24-2026" className="cl-sidebar-link">v1.0.21 — Feb 24, 2026</a>
     <a href="#v1018--february-19-2026" className="cl-sidebar-link">v1.0.18 — Feb 19, 2026</a>
@@ -18,6 +20,71 @@ mode: custom
   <div className="cl-content">
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
+
+<Update label="Week of March 30, 2026" description="Zero-config server, webhook triggers, parameter autocomplete">
+
+## New features
+
+- **Zero-Config Local Server** — `skyvern run server` now starts with SQLite by default, requiring no database setup. Get a fully functional local Skyvern server running in seconds without any infrastructure configuration. ([#5302](https://github.com/Skyvern-AI/skyvern/pull/5302))
+
+- **Webhook Workflow Triggers** — Workflows can now be triggered via a dedicated webhook endpoint, enabling event-driven automations that start automatically when external systems send an HTTP request. ([#5292](https://github.com/Skyvern-AI/skyvern/pull/5292))
+
+- **Parameter Autocomplete in Workflow Blocks** — Text inputs in workflow blocks now suggest available parameter names as you type, reducing errors and speeding up workflow authoring. ([#5293](https://github.com/Skyvern-AI/skyvern/pull/5293))
+
+- **Test Connection for Custom Credential Services** — The custom credential service settings panel now includes a Test Connection button to verify your configuration is working before saving. ([#5299](https://github.com/Skyvern-AI/skyvern/pull/5299))
+
+## Bug fixes
+
+- Fixed Excel file parsing failures caused by native Python datetime values in spreadsheet cells. ([#5294](https://github.com/Skyvern-AI/skyvern/pull/5294))
+- Fixed `close_page` action type missing from the action hydration mapping, which could cause errors when workflows close tabs. ([#5295](https://github.com/Skyvern-AI/skyvern/pull/5295))
+- Improved browser connection error messages to be clearer and more actionable for end users. ([#5297](https://github.com/Skyvern-AI/skyvern/pull/5297))
+- Fixed the parameter insert popover and AI improve button incorrectly appearing on disabled text areas. ([#5298](https://github.com/Skyvern-AI/skyvern/pull/5298))
+- Fixed the Duration column being too wide, causing the Created At column to be truncated in run tables. ([#5296](https://github.com/Skyvern-AI/skyvern/pull/5296))
+- Fixed gaps in failure category reporting, including unknown fallback handling and proper inheritance across workflow runs. ([#5290](https://github.com/Skyvern-AI/skyvern/pull/5290))
+
+</Update>
+
+<Update label="Week of March 23, 2026" description="Custom credentials, failure categories, caching improvements">
+
+## New features
+
+- **Custom Credential Service** — Connect Skyvern to your own credential vault via a custom HTTP endpoint. Workflows can now pull secrets from HashiCorp Vault, AWS Secrets Manager, or any internal credential store without storing them in Skyvern. ([#5240](https://github.com/Skyvern-AI/skyvern/pull/5240), [#5250](https://github.com/Skyvern-AI/skyvern/pull/5250), [#5251](https://github.com/Skyvern-AI/skyvern/pull/5251), [#5259](https://github.com/Skyvern-AI/skyvern/pull/5259))
+
+- **Failure Categories on Tasks and Workflow Runs** — Tasks and workflow runs now include a structured `failure_category` field, making it easier to programmatically distinguish between different failure types and build targeted retry or alerting logic.
+
+- **Full-Stack Docker Development Environment** — A Docker Compose setup for the complete Skyvern stack is now available, letting developers spin up the entire platform locally with a single command. ([#5249](https://github.com/Skyvern-AI/skyvern/pull/5249))
+
+- **Agent-Aware CLI** — The CLI now detects TTY context, supports `--json` envelope output, and exposes a capabilities endpoint, making `skyvern` easier to embed in scripts and CI pipelines. ([#5271](https://github.com/Skyvern-AI/skyvern/pull/5271))
+
+- **Error Codes in Task Block Validation** — Validation blocks within task flows now return structured error codes alongside failure messages, enabling more precise error handling in downstream workflow logic. ([#5265](https://github.com/Skyvern-AI/skyvern/pull/5265))
+
+- **BotShield.js Captcha Bypass** — Added support for bypassing BotShield.js-protected pages via JavaScript token injection, expanding the range of sites Skyvern can automate reliably.
+
+## Improvements
+
+- Cached script execution now bundles artifacts, ensuring files generated during scripted runs are captured and available for download. ([#5247](https://github.com/Skyvern-AI/skyvern/pull/5247))
+- Conditional blocks now cache script revisions per branch, improving replay accuracy when the workflow structure changes over time. ([#5248](https://github.com/Skyvern-AI/skyvern/pull/5248))
+- Browser popup dialogs are no longer suppressed by default, allowing automations that need to interact with popups to proceed correctly. ([#5253](https://github.com/Skyvern-AI/skyvern/pull/5253))
+- HAR files and browser console logs are now correctly attached as artifacts for task v2 workflow runs. ([#5252](https://github.com/Skyvern-AI/skyvern/pull/5252))
+- Added `ENABLE_CSS_SVG_PARSING` environment variable to control SVG and CSS parsing, useful for tuning performance on workflows that don't require it. ([#5258](https://github.com/Skyvern-AI/skyvern/pull/5258))
+- Added `use_in_memory_db` option to `Skyvern.local()` for faster ephemeral test and development setups. ([#5260](https://github.com/Skyvern-AI/skyvern/pull/5260))
+- MCP now exposes script and caching tool endpoints, giving agents better visibility into cached execution state. ([#5243](https://github.com/Skyvern-AI/skyvern/pull/5243))
+
+## Bug fixes
+
+- Fixed an `AttributeError` on `Script.is_pinned` that was breaking all cached script execution. ([#5285](https://github.com/Skyvern-AI/skyvern/pull/5285))
+- Fixed legacy `run_with='ai'` values causing Pydantic validation errors after the execution mode migration. ([#5286](https://github.com/Skyvern-AI/skyvern/pull/5286))
+- Improved error messages when a custom credential service request fails to make failures easier to diagnose. ([#5281](https://github.com/Skyvern-AI/skyvern/pull/5281))
+- Fixed TOTP parameters not being forwarded to tasks when running in cached script execution mode, restoring 2FA support for cached flows. ([#5278](https://github.com/Skyvern-AI/skyvern/pull/5278))
+- Fixed cached login scripts incorrectly reporting completion when no form fields were found on the page. ([#5270](https://github.com/Skyvern-AI/skyvern/pull/5270))
+- Fixed script reviewer inserting wait steps in the wrong position; waits are now correctly placed after navigation and before page interactions. ([#5268](https://github.com/Skyvern-AI/skyvern/pull/5268), [#5269](https://github.com/Skyvern-AI/skyvern/pull/5269))
+- Fixed `totp_identifier` Jinja template variables not being rendered when running in cached code execution mode. ([#5263](https://github.com/Skyvern-AI/skyvern/pull/5263))
+- Fixed pinned scripts being overridden by auto-corrected versions; pinned scripts now always run the exact pinned revision. ([#5261](https://github.com/Skyvern-AI/skyvern/pull/5261))
+- Fixed workflows stalling indefinitely after a nested conditional block with no downstream merge point. ([#5257](https://github.com/Skyvern-AI/skyvern/pull/5257))
+- Fixed Login blocks incorrectly reporting success on some pages by requiring a configurable `complete_criterion` check. ([#5256](https://github.com/Skyvern-AI/skyvern/pull/5256))
+- Improved frontend security by replacing a vulnerable HTML sanitization library with DOMPurify for XSS protection.
+
+</Update>
 
 <Update label="v1.0.22 — February 26, 2026" description="Adaptive caching, Workflow Trigger block, CLI signup, and more">
 
