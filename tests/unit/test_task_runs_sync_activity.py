@@ -20,7 +20,6 @@ _SOURCE_FILE = _repo_root() / "workers" / "cron_worker" / "task_runs_sync_activi
 pytestmark = pytest.mark.skipif(not _SOURCE_FILE.exists(), reason="cloud-only: workers/cron_worker/ not present")
 
 
-
 def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
     base = declarative_base()
 
@@ -118,9 +117,7 @@ def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "temporalio", temporalio_module)
     monkeypatch.setitem(sys.modules, "structlog", structlog_module)
 
-    module_path = _repo_root() / "workers" / "cron_worker" / "task_runs_sync_activity.py"
-    if not module_path.exists():
-        pytest.skip(f"Cloud-only module not found: {module_path}")
+    module_path = _SOURCE_FILE
     spec = importlib.util.spec_from_file_location("test_task_runs_sync_activity_module", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
