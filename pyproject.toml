@@ -167,6 +167,9 @@ include = [
 "skyvern-frontend/tsconfig.node.json" = "skyvern-frontend/tsconfig.node.json"
 
 [tool.uv]
+# Supply chain quarantine: block packages published less than 7 days ago.
+# Override for urgent cases: uv add <pkg> --exclude-newer ""
+exclude-newer = "7 days"
 constraint-dependencies = [
     "authlib>=1.6.9",
     "flask>=3.1.3",

@@ -54,6 +54,9 @@ def _build_engine(database_string: str) -> AsyncEngine:
       Always enables foreign key enforcement via PRAGMA.
     """
     if database_string.startswith("sqlite"):
+        from skyvern.config import _ensure_sqlite_dir
+
+        _ensure_sqlite_dir(database_string)
         is_memory = ":memory:" in database_string
         engine_kwargs: dict[str, Any] = {
             "json_serializer": _custom_json_serializer,
@@ -327,6 +330,9 @@ class AgentDB(BaseAlchemyDB):
     async def get_all_runs(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_runs.get_all_runs(*args, **kwargs)
 
+    async def get_all_runs_v2(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.workflow_runs.get_all_runs_v2(*args, **kwargs)
+
     async def get_workflow_run(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_runs.get_workflow_run(*args, **kwargs)
 
@@ -444,22 +450,25 @@ class AgentDB(BaseAlchemyDB):
         return await self.workflow_params.retrieve_action_plan(*args, **kwargs)
 
     async def create_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_task_run(*args, **kwargs)
+        return await self.tasks.create_task_run(*args, **kwargs)
 
     async def update_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.update_task_run(*args, **kwargs)
+        return await self.tasks.update_task_run(*args, **kwargs)
+
+    async def sync_task_run_status(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.tasks.sync_task_run_status(*args, **kwargs)
 
     async def update_job_run_compute_cost(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.update_job_run_compute_cost(*args, **kwargs)
+        return await self.tasks.update_job_run_compute_cost(*args, **kwargs)
 
     async def cache_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.cache_task_run(*args, **kwargs)
+        return await self.tasks.cache_task_run(*args, **kwargs)
 
     async def get_cached_task_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_cached_task_run(*args, **kwargs)
+        return await self.tasks.get_cached_task_run(*args, **kwargs)
 
     async def get_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_run(*args, **kwargs)
+        return await self.tasks.get_run(*args, **kwargs)
 
     # -- Artifact delegates --
 

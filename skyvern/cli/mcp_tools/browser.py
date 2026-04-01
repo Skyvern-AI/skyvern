@@ -11,7 +11,16 @@ import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
-from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot, parse_extract_schema
+from skyvern.cli.core.browser_ops import (
+    do_act,
+    do_extract,
+    do_frame_list,
+    do_frame_main,
+    do_frame_switch,
+    do_navigate,
+    do_screenshot,
+    parse_extract_schema,
+)
 from skyvern.cli.core.guards import (
     CREDENTIAL_HINT,
     JS_PASSWORD_PATTERN,
@@ -33,7 +42,7 @@ from ._common import (
     save_artifact,
 )
 from ._localhost import is_localhost_url
-from ._session import BrowserNotAvailableError, get_page, no_browser_error
+from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
 
 LOG = structlog.get_logger(__name__)
 
@@ -91,6 +100,11 @@ async def skyvern_navigate(
                 "Or use `local=true` in skyvern_browser_session_create for a local browser.",
             ),
         )
+
+    # Any navigation attempt may destroy iframes — clear frame state upfront
+    # (even failed navigations can partially load and destroy existing frames)
+    state = get_current_session()
+    state._working_frame = None
 
     with Timer() as timer:
         try:
@@ -1633,6 +1647,151 @@ async def skyvern_login(
             "recording_url": response.recording_url,
             "app_url": response.app_url,
             "sdk_equivalent": f"await page.agent.login(credential_type=CredentialType.{cred_type.name})",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_frame_switch(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    selector: Annotated[
+        str | None,
+        Field(description="CSS selector for the iframe element (e.g., '#payment-frame', 'iframe[name=checkout]')"),
+    ] = None,
+    name: Annotated[str | None, Field(description="Frame name attribute")] = None,
+    index: Annotated[
+        int | None, Field(description="Frame index (0 = main). Use skyvern_frame_list to find indices")
+    ] = None,
+) -> dict[str, Any]:
+    """Switch into an iframe so subsequent browser actions (click, type, extract, etc.) target elements inside it.
+
+    Use this for embedded payment forms, embedded widgets, or any content inside an <iframe>.
+    Call skyvern_frame_list first to discover available frames. Provide exactly one of selector, name, or index.
+    Call skyvern_frame_main to switch back to the main page.
+    """
+    params = sum(p is not None for p in (selector, name, index))
+    if params != 1:
+        return make_result(
+            "skyvern_frame_switch",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Exactly one of selector, name, or index is required",
+                "Use skyvern_frame_list to discover frames, then pass selector, name, or index",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_frame_switch", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            result = await do_frame_switch(page, selector=selector, name=name, index=index)
+            timer.mark("sdk")
+
+            # Persist frame on session state for subsequent MCP calls
+            state = get_current_session()
+            state._working_frame = page._working_frame
+        except ValueError as e:
+            return make_result(
+                "skyvern_frame_switch",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use skyvern_frame_list to find valid frames"),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_frame_switch",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The iframe may not be loaded yet — try waiting"),
+            )
+
+    return make_result(
+        "skyvern_frame_switch",
+        browser_context=ctx,
+        data={
+            "frame_name": result.name,
+            "frame_url": result.url,
+            "switched_by": "selector" if selector else ("name" if name else "index"),
+            "sdk_equivalent": (
+                f'await page.frame_switch(selector="{selector}")'
+                if selector
+                else f'await page.frame_switch(name="{name}")'
+                if name
+                else f"await page.frame_switch(index={index})"
+            ),
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_frame_main(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Switch back to the main page frame after working inside an iframe.
+
+    Call this after skyvern_frame_switch when you're done interacting with iframe content
+    and want subsequent actions to target the main page again.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_frame_main", ok=False, error=no_browser_error())
+
+    do_frame_main(page)
+
+    # Clear frame on session state
+    state = get_current_session()
+    state._working_frame = None
+
+    return make_result(
+        "skyvern_frame_main",
+        browser_context=ctx,
+        data={"status": "switched_to_main_frame", "sdk_equivalent": "page.frame_main()"},
+    )
+
+
+async def skyvern_frame_list(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """List all frames (including iframes) on the current page.
+
+    Returns each frame's index, name, URL, and whether it's the main frame.
+    Use the index, name, or a CSS selector with skyvern_frame_switch to enter an iframe.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_frame_list", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            frames = await do_frame_list(page)
+            timer.mark("sdk")
+        except Exception as e:
+            return make_result(
+                "skyvern_frame_list",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Ensure a page is loaded first"),
+            )
+
+    return make_result(
+        "skyvern_frame_list",
+        browser_context=ctx,
+        data={
+            "frames": [{"index": f.index, "name": f.name, "url": f.url, "is_main": f.is_main} for f in frames],
+            "count": len(frames),
+            "sdk_equivalent": "await page.frame_list()",
         },
         timing_ms=timer.timing_ms,
     )

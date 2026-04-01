@@ -73,30 +73,8 @@ def _redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
-def ensure_hooks_registered(state: Any, page: Any) -> None:
-    """Register console/network/dialog event listeners on the Playwright page.
-
-    Idempotent: only registers when the underlying Playwright Page object changes
-    (tracked by id). On page switch, removes listeners from the old page to prevent
-    listener leaks and stale events mixing into the buffers.
-    """
-    raw_page = page.page  # SkyvernPage stores raw Playwright Page as self.page
-    page_id = id(raw_page)
-
-    if state._hooked_page_id == page_id:
-        return
-
-    # Remove listeners from the old page to prevent leaks
-    old_page = state._hooked_raw_page
-    old_handlers = state._hooked_handlers
-    if old_page is not None and old_handlers:
-        for event_name, handler in old_handlers.items():
-            try:
-                old_page.remove_listener(event_name, handler)
-            except Exception:
-                pass  # Old page may already be closed
-        state._hooked_raw_page = None
-        state._hooked_handlers = {}
+def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
+    """Create console/network/dialog handlers bound to a specific page."""
 
     def _on_console(msg: Any) -> None:
         try:
@@ -106,6 +84,7 @@ def ensure_hooks_registered(state: Any, page: Any) -> None:
                     "text": msg.text,
                     "timestamp": time.time(),
                     "page_url": raw_page.url,
+                    "tab_id": str(id(raw_page)),
                     "source_url": msg.location.get("url", "") if hasattr(msg, "location") and msg.location else "",
                     "line_number": msg.location.get("lineNumber", 0)
                     if hasattr(msg, "location") and msg.location
@@ -135,6 +114,7 @@ def ensure_hooks_registered(state: Any, page: Any) -> None:
                     "timing_ms": round(timing, 1),
                     "response_size": int(content_length) if content_length is not None else None,
                     "page_url": raw_page.url,
+                    "tab_id": str(id(raw_page)),
                 }
             )
         except Exception:
@@ -149,10 +129,9 @@ def ensure_hooks_registered(state: Any, page: Any) -> None:
                 "action_taken": "dismiss_pending",
                 "timestamp": time.time(),
                 "page_url": raw_page.url,
+                "tab_id": str(id(raw_page)),
             }
             state.dialog_events.append(event_record)
-            # Auto-dismiss to match Playwright defaults and prevent page lockup.
-            # dialog.dismiss() is async — schedule it and track the outcome.
             task = asyncio.create_task(dialog.dismiss())
             task.add_done_callback(lambda t: _dismiss_done(t, event_record))
         except Exception:
@@ -167,12 +146,44 @@ def ensure_hooks_registered(state: Any, page: Any) -> None:
         else:
             event_record["action_taken"] = "dismissed"
 
-    raw_page.on("console", _on_console)
-    raw_page.on("response", _on_response)
-    raw_page.on("dialog", _on_dialog)
-    state._hooked_page_id = page_id
-    state._hooked_raw_page = raw_page
-    state._hooked_handlers = {"console": _on_console, "response": _on_response, "dialog": _on_dialog}
+    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog}
+
+
+def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
+    """Register event listeners on a single page. Idempotent per page id."""
+    page_id = id(raw_page)
+    if page_id in state._hooked_page_ids:
+        return
+
+    handlers = _make_page_handlers(state, raw_page)
+    raw_page.on("console", handlers["console"])
+    raw_page.on("response", handlers["response"])
+    raw_page.on("dialog", handlers["dialog"])
+    state._hooked_page_ids.add(page_id)
+    state._hooked_handlers_map[page_id] = handlers
+
+
+def ensure_hooks_on_all_pages(state: Any, all_pages: list[Any]) -> None:
+    """Register inspection hooks on ALL open pages.
+
+    Idempotent per page — only registers on pages not yet hooked. This ensures
+    console/network/dialog events from background tabs (popups, target=_blank)
+    are captured alongside the active tab. Each event includes a tab_id field
+    for attribution.
+    """
+    for raw_page in all_pages:
+        try:
+            if not raw_page.is_closed():
+                _register_hooks_on_page(state, raw_page)
+        except Exception:
+            LOG.debug("Failed to register hooks on page", exc_info=True)
+
+    # Prune stale entries for closed pages
+    live_ids = {id(p) for p in all_pages}
+    stale = state._hooked_page_ids - live_ids
+    for pid in stale:
+        state._hooked_page_ids.discard(pid)
+        state._hooked_handlers_map.pop(pid, None)
 
 
 async def skyvern_console_messages(
@@ -196,7 +207,7 @@ async def skyvern_console_messages(
     Messages are buffered automatically — call this anytime to see what the page has logged.
     Use level='error' to find JavaScript errors. Use text='...' to search for specific messages.
     """
-    # Inline import: session_manager → inspection (ensure_hooks_registered) creates a
+    # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
@@ -270,7 +281,7 @@ async def skyvern_network_requests(
     No response headers dict or response bodies are captured — credential headers (Authorization,
     Cookie, Set-Cookie) are never exposed. Use skyvern_evaluate with fetch() if you need body content.
     """
-    # Inline import: session_manager → inspection (ensure_hooks_registered) creates a
+    # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
@@ -345,7 +356,7 @@ async def skyvern_handle_dialog(
     Dialogs are automatically dismissed by default to prevent page lockup.
     This tool lets you see what dialogs appeared and what action was taken.
     """
-    # Inline import: session_manager → inspection (ensure_hooks_registered) creates a
+    # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 

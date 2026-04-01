@@ -68,6 +68,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TextPromptBlock,
     UrlBlock,
     ValidationBlock,
+    WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
@@ -2888,6 +2889,46 @@ async def goto(
     except Exception:
         run_context = script_run_context_manager.ensure_run_context()
         await run_context.page.goto(url)
+
+
+async def trigger_workflow(
+    workflow_permanent_id: str,
+    payload: dict[str, Any] | None = None,
+    wait_for_completion: bool = True,
+    use_parent_browser_session: bool = False,
+    browser_session_id: str | None = None,
+    label: str | None = None,
+    parameters: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Execute a WorkflowTriggerBlock during cached script runs.
+
+    The trigger block makes zero LLM calls — it's pure orchestration
+    (template resolution, workflow dispatch, output collection). Safe to
+    execute as-is without caching.
+    """
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
+    workflow_permanent_id = _render_template_with_label(workflow_permanent_id, label)
+    if browser_session_id:
+        browser_session_id = _render_template_with_label(browser_session_id, label)
+    # payload is a dict; WorkflowTriggerBlock._render_templates_in_payload resolves templates internally
+    trigger_block = WorkflowTriggerBlock(
+        workflow_permanent_id=workflow_permanent_id,
+        payload=payload,
+        wait_for_completion=wait_for_completion,
+        use_parent_browser_session=use_parent_browser_session,
+        browser_session_id=browser_session_id,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=block_validation_output.input_parameters,
+    )
+    result = await trigger_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+    _append_to_loop_output(result.output_parameter_value, label)
+    return result.output_parameter_value
 
 
 async def prompt(

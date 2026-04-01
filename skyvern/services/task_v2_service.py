@@ -40,7 +40,15 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, RunEngine, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import (
+    ProxyLocation,
+    ProxyLocationInput,
+    RunEngine,
+    RunStatus,
+    RunType,
+    TaskRunRequest,
+    TaskRunResponse,
+)
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
@@ -334,6 +342,9 @@ async def initialize_task_v2(
                 organization_id=organization.organization_id,
                 run_id=task_v2.observer_cruise_id,
                 title=new_workflow.title,
+                url=task_v2.url,
+                url_hash=generate_url_hash(task_v2.url) if task_v2.url else None,
+                status=RunStatus.queued,
             )
     except Exception:
         LOG.warning("Failed to update task 2.0", exc_info=True)

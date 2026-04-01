@@ -143,13 +143,6 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.FOR_LOOP,
 }
 
-# Wrapper block types whose cached code is structural (loop iteration, branch routing).
-# Their failure during cached execution reflects data/runtime issues, not bad script code.
-# Excluded from continue_on_failure regeneration to prevent infinite version loops (SKY-8554).
-WRAPPER_BLOCK_TYPES = {
-    BlockType.FOR_LOOP,
-}
-
 
 def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]:
     """Extract lightweight info from blocks for title generation (limit to first 5)."""
@@ -299,6 +292,9 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
 
 
 class WorkflowService:
+    # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
+    _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+
     @staticmethod
     def _determine_cache_invalidation(
         previous_blocks: list[dict[str, Any]],
@@ -1011,7 +1007,9 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                     workflow_run_id=workflow_run_id,
                 )
-                failure_reason = f"Failed to begin browser session for workflow run: {str(e)}"
+                failure_reason = (
+                    f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id,
                     failure_reason=failure_reason,
@@ -2354,23 +2352,36 @@ class WorkflowService:
             ):
                 blocks_to_update.add(block.label)
 
-            # Invalidate cache for blocks with continue_on_failure=True that failed
-            # This ensures the block runs fresh with AI on the next cached run
+            # NOTE: continue_on_failure block failures are handled by the Script
+            # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
+            # regenerating the entire script here. The fallback episode is already
+            # recorded and the reviewer will patch the specific block that failed.
+            # See _trigger_script_reviewer() for the capped reviewer flow.
+
+            # Track uncached for-loop child blocks for regeneration.
+            # ForLoopBlock children execute via block.py's execute_loop_helper(),
+            # bypassing _execute_single_block. Without this, their labels never
+            # reach blocks_to_update and the script generator never produces
+            # cached functions for them (e.g., file_download inside a loop).
             if (
-                block.label
-                and block.continue_on_failure
-                and workflow_run_block_result.status != BlockStatus.completed
-                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                and block.block_type not in WRAPPER_BLOCK_TYPES  # SKY-8554: structural wrappers don't need regen
-                and block.label in script_blocks_by_label
+                isinstance(block, ForLoopBlock)
+                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+                and workflow_run_block_result.status in cacheable_statuses
             ):
-                blocks_to_update.add(block.label)
-                LOG.info(
-                    "Block with continue_on_failure failed during cached execution, marking for regeneration",
-                    block_label=block.label,
-                    block_status=workflow_run_block_result.status,
-                    workflow_run_id=workflow_run_id,
-                )
+                for loop_child in block.loop_blocks:
+                    if (
+                        loop_child.label
+                        and loop_child.label not in script_blocks_by_label
+                        and loop_child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                    ):
+                        blocks_to_update.add(loop_child.label)
+                        LOG.info(
+                            "For-loop child block marked for caching",
+                            parent_label=block.label,
+                            child_label=loop_child.label,
+                            child_block_type=loop_child.block_type,
+                            workflow_run_id=workflow_run_id,
+                        )
 
             workflow_run, should_stop = await self._handle_block_result_status(
                 block=block,
@@ -3623,7 +3634,50 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+        # Best-effort fire-and-forget write-through to task_runs table.
+        # Runs off the hot path so workflow status transitions stay fast.
+        bg = asyncio.create_task(
+            self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, status),
+        )
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
+
         return workflow_run
+
+    async def _sync_task_run_from_workflow_run(
+        self,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        """Fire-and-forget: propagate workflow_run status to task_runs."""
+        try:
+            await app.DATABASE.sync_task_run_status(
+                organization_id=workflow_run.organization_id,
+                run_id=workflow_run_id,
+                status=status.value,
+                started_at=workflow_run.started_at,
+                finished_at=workflow_run.finished_at,
+            )
+            # Also sync task_v2 if this workflow_run backs an observer_cruise
+            task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
+                workflow_run_id=workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+            if task_v2:
+                await app.DATABASE.sync_task_run_status(
+                    organization_id=workflow_run.organization_id,
+                    run_id=task_v2.observer_cruise_id,
+                    status=status.value,
+                    started_at=workflow_run.started_at,
+                    finished_at=workflow_run.finished_at,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to sync task_run status from workflow_run",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
         LOG.info(
@@ -5380,8 +5434,12 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 for wf_param, run_param in run_param_tuples:
-                    if isinstance(run_param.value, str) and run_param.value:
-                        run_parameter_values[wf_param.key] = run_param.value
+                    if (
+                        run_param.value is not None
+                        and str(run_param.value).strip()
+                        and not wf_param.parameter_type.is_secret_or_credential()
+                    ):
+                        run_parameter_values[wf_param.key] = str(run_param.value)
             except Exception:
                 LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
 

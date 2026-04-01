@@ -85,3 +85,49 @@ async def do_extract(
     parsed_schema = parse_extract_schema(schema)
     extracted = await page.extract(prompt=prompt, schema=parsed_schema)
     return ExtractResult(extracted=extracted)
+
+
+# -- Frame operations --
+
+
+@dataclass
+class FrameInfo:
+    index: int
+    name: str
+    url: str
+    is_main: bool
+
+
+@dataclass
+class FrameSwitchResult:
+    name: str | None
+    url: str | None
+    selector: str | None = None
+    requested_name: str | None = None
+    index: int | None = None
+
+
+async def do_frame_switch(
+    page: Any,
+    *,
+    selector: str | None = None,
+    name: str | None = None,
+    index: int | None = None,
+) -> FrameSwitchResult:
+    result = await page.frame_switch(selector=selector, name=name, index=index)
+    return FrameSwitchResult(
+        name=result.get("name"),
+        url=result.get("url"),
+        selector=selector,
+        requested_name=name,
+        index=index,
+    )
+
+
+def do_frame_main(page: Any) -> None:
+    page.frame_main()
+
+
+async def do_frame_list(page: Any) -> list[FrameInfo]:
+    frames = await page.frame_list()
+    return [FrameInfo(index=f["index"], name=f["name"], url=f["url"], is_main=f["is_main"]) for f in frames]

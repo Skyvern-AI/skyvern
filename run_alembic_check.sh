@@ -1,4 +1,10 @@
 #!/bin/sh
+# Alembic migrations are PostgreSQL-specific. Default to PostgreSQL when
+# DATABASE_STRING is not set (e.g. OSS CI), so we don't pick up the new
+# SQLite default from Settings._default_database_string().
+: "${DATABASE_STRING:=postgresql+asyncpg://skyvern@localhost/skyvern}"
+export DATABASE_STRING
+
 # first apply migrations
 export PATH="${PATH}:.venv/bin"
 alembic upgrade head

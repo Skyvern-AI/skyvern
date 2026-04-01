@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import structlog
-from playwright.async_api import Locator, Page
+from playwright.async_api import Frame, Locator, Page
 
 from skyvern.config import settings
 from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
@@ -81,6 +81,7 @@ class SkyvernPage(Page):
         self.page = page
         self.current_label: str | None = None
         self._ai = ai
+        self._working_frame: Frame | None = None
 
     def __getattribute__(self, name: str) -> Any:
         page = object.__getattribute__(self, "page")
@@ -93,6 +94,18 @@ class SkyvernPage(Page):
             return getattr(page, name)
 
         return object.__getattribute__(self, name)
+
+    @property
+    def _locator_scope(self) -> Page | Frame:
+        """Return the current locator scope: the working iframe if set, otherwise the page.
+
+        Use for element interaction (locator, click, fill). Keep self.page for
+        page-level operations (goto, keyboard, url, title, evaluate, reload, content).
+        """
+        frame = object.__getattribute__(self, "_working_frame")
+        if frame is not None:
+            return frame
+        return object.__getattribute__(self, "page")
 
     async def _decorate_call(
         self,
@@ -280,7 +293,7 @@ class SkyvernPage(Page):
             if not selector:
                 raise ValueError("mode='direct' requires a selector.")
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
-            locator = self.page.locator(selector).first
+            locator = self._locator_scope.locator(selector).first
             await locator.click(timeout=timeout, **kwargs)
             return selector
 
@@ -303,7 +316,7 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector:
                 try:
-                    locator = self.page.locator(selector).first
+                    locator = self._locator_scope.locator(selector).first
                     await self._prepare_element(locator, timeout=timeout)
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
@@ -314,7 +327,7 @@ class SkyvernPage(Page):
                     try:
                         await self.page.keyboard.press("Escape")
                         await asyncio.sleep(0.3)
-                        locator = self.page.locator(selector).first
+                        locator = self._locator_scope.locator(selector).first
                         await locator.click(timeout=timeout, **kwargs)
                         LOG.info(
                             "CSS selector click succeeded after dismissing overlay",
@@ -353,7 +366,7 @@ class SkyvernPage(Page):
                 )
 
         if selector:
-            locator = self.page.locator(selector)
+            locator = self._locator_scope.locator(selector)
             await locator.click(timeout=timeout, **kwargs)
 
         return selector
@@ -372,7 +385,7 @@ class SkyvernPage(Page):
         if not selector:
             raise ValueError("Hover requires a selector.")
 
-        locator = self.page.locator(selector, **kwargs)
+        locator = self._locator_scope.locator(selector, **kwargs)
         await locator.scroll_into_view_if_needed()
         await locator.hover(timeout=timeout)
         if hold_seconds and hold_seconds > 0:
@@ -468,7 +481,7 @@ class SkyvernPage(Page):
             if value is None:
                 raise ValueError("mode='direct' requires a value.")
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
-            locator = self.page.locator(selector).first
+            locator = self._locator_scope.locator(selector).first
             await locator.fill(value, timeout=timeout, **kwargs)
             return value
 
@@ -711,7 +724,7 @@ class SkyvernPage(Page):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
         """Type into an autocomplete input and click the best matching dropdown option."""
-        locator = self.page.locator(selector).first
+        locator = self._locator_scope.locator(selector).first
 
         # Clear existing value and type character-by-character to trigger autocomplete
         await locator.clear(timeout=timeout)
@@ -802,7 +815,7 @@ class SkyvernPage(Page):
 
         for sel in selectors_to_try:
             try:
-                locator = self.page.locator(sel)
+                locator = self._locator_scope.locator(sel)
                 count = await locator.count()
                 if count > 0:
                     return [locator.nth(i) for i in range(min(count, 10))]  # cap at 10
@@ -881,7 +894,7 @@ class SkyvernPage(Page):
                         totp_identifier=totp_identifier,
                         totp_url=totp_url,
                     )
-                    locator = self.page.locator(selector).first
+                    locator = self._locator_scope.locator(selector).first
                     await self._prepare_element(locator, timeout=timeout)
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
@@ -926,7 +939,7 @@ class SkyvernPage(Page):
         if not selector:
             raise ValueError("Selector is required but was not provided")
 
-        locator = self.page.locator(selector).first
+        locator = self._locator_scope.locator(selector).first
         await locator.fill(value, timeout=timeout)
         return value
 
@@ -987,7 +1000,7 @@ class SkyvernPage(Page):
                         files,
                         organization_id=context.organization_id if context else None,
                     )
-                    locator = self.page.locator(selector)
+                    locator = self._locator_scope.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
                 except Exception as e:
                     error_to_raise = e
@@ -1022,7 +1035,7 @@ class SkyvernPage(Page):
             raise ValueError("Parameter 'files' is required but was not provided")
 
         file_path = await download_file_from_url(files, organization_id=context.organization_id if context else None)
-        locator = self.page.locator(selector)
+        locator = self._locator_scope.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
 
@@ -1110,7 +1123,7 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector:
                 try:
-                    locator = self.page.locator(selector)
+                    locator = self._locator_scope.locator(selector)
                     await locator.select_option(value, timeout=timeout, **kwargs)
                     return value
                 except Exception as e:
@@ -1138,7 +1151,7 @@ class SkyvernPage(Page):
                 timeout=timeout,
             )
         if selector:
-            locator = self.page.locator(selector)
+            locator = self._locator_scope.locator(selector)
             await locator.select_option(value, timeout=timeout, **kwargs)
         return value
 
@@ -1561,7 +1574,7 @@ class SkyvernPage(Page):
                                 )
 
                 elif field_tag == "select":
-                    locator = self.page.locator(selector)
+                    locator = self._locator_scope.locator(selector)
                     try:
                         await locator.select_option(label=str(value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                     except Exception:
@@ -1635,14 +1648,14 @@ class SkyvernPage(Page):
                     # Combobox / React Select: click to open, type to filter,
                     # click the matching option.
                     str_value = str(value)
-                    locator = self.page.locator(selector).first
+                    locator = self._locator_scope.locator(selector).first
                     await locator.click(timeout=5000)
                     await asyncio.sleep(0.3)
                     await locator.fill("")
                     search_text = str_value.split(",")[0].strip()[:25]
                     await self.page.keyboard.type(search_text, delay=50)
                     await asyncio.sleep(0.5)
-                    option = self.page.locator('[class*="select__option"]:visible').first
+                    option = self._locator_scope.locator('[class*="select__option"]:visible').first
                     try:
                         await option.click(timeout=3000)
                     except Exception:
@@ -2786,7 +2799,7 @@ class SkyvernPage(Page):
             elif method == "select_option":
                 # Planned values are typically option labels (display text) from the batch planner.
                 # Try matching by label first, then fall back to value attribute.
-                locator = self.page.locator(selector)
+                locator = self._locator_scope.locator(selector)
                 try:
                     await locator.select_option(label=str(planned_value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                 except Exception:
@@ -2813,7 +2826,7 @@ class SkyvernPage(Page):
                     if method == "fill_autocomplete":
                         await self.fill_autocomplete(selector=alt_selector, value=str(planned_value), ai=None)
                     elif method == "select_option":
-                        locator = self.page.locator(alt_selector)
+                        locator = self._locator_scope.locator(alt_selector)
                         try:
                             await locator.select_option(
                                 label=str(planned_value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS
@@ -2854,7 +2867,7 @@ class SkyvernPage(Page):
         # Post-fill validation for text fields: detect essays in short-text fields
         if method in ("fill", "fill_autocomplete") and hint == "short text":
             try:
-                actual = await self.page.locator(selector).input_value(timeout=2000)
+                actual = await self._locator_scope.locator(selector).input_value(timeout=2000)
                 if actual and len(actual) > 100:
                     LOG.warning(
                         "fill_with_planned_value: value too long for short text field, re-filling with AI",
@@ -2937,8 +2950,12 @@ class SkyvernPage(Page):
                     )
                     return False
 
-            # Check for visible error messages
-            error_count = await self.page.locator(
+            # Check for visible error messages.
+            # NOTE: When a frame is active, this only detects errors inside that
+            # frame (e.g. payment form errors). Main-page error badges are not
+            # visible from within an iframe — this is intentional for frame-scoped
+            # validation but callers should be aware of the scoping.
+            error_count = await self._locator_scope.locator(
                 "[class*='error']:visible, [class*='invalid']:visible, "
                 "[role='alert']:visible, [aria-invalid='true']:visible"
             ).count()
@@ -3293,7 +3310,7 @@ class SkyvernPage(Page):
                 )
 
             if selector:
-                return self.page.locator(selector, **kwargs)
+                return self._locator_scope.locator(selector, **kwargs)
 
             if prompt:
                 return AILocator(
@@ -3317,7 +3334,7 @@ class SkyvernPage(Page):
                 )
 
         if selector:
-            return self.page.locator(selector, **kwargs)
+            return self._locator_scope.locator(selector, **kwargs)
 
         raise ValueError("Selector is required but was not provided")
 
@@ -3427,25 +3444,40 @@ class RunContext:
     def download_selector(self) -> str | None:
         """Build a CSS selector targeting a download link from the current loop value.
 
-        Scans the loop_value dict for URL-like strings, extracts the filename,
-        and returns a selector like ``a[href*="filename.pdf"]``. Returns None
-        if no URL is found.
+        Tries strategies in order of reliability:
+        1. URL in values → a[href*="filename.pdf"] (most precise)
+        2. Title text → a:has-text("title") (works when title IS the link)
+
+        Returns the first viable selector, or None to fall back to AI.
         """
         value = self.loop_value
         if not value or not isinstance(value, dict):
             return None
+
+        texts: list[str] = []
         for v in value.values():
-            if not isinstance(v, str):
+            if not isinstance(v, str) or not v.strip():
                 continue
-            # Match URL-like strings (http/https or paths with file extensions)
+
+            # Strategy 1: URL-like values → href selector (most reliable)
             if re.match(r"https?://", v) or re.match(r"/.*\.\w+", v):
-                # Extract filename from URL path
-                filename = v.rstrip("/").rsplit("/", 1)[-1]
-                # Strip query params
-                filename = filename.split("?")[0]
+                filename = v.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
                 if filename and "." in filename:
-                    # Escape CSS special characters to avoid malformed selectors
                     filename = re.sub(r'["\[\]\\]', "", filename)
                     if filename:
                         return f'a[href*="{filename}"]'
+
+            texts.append(v.strip())
+
+        if not texts:
+            return None
+
+        # Strategy 2: Direct link text match — many sites make the document
+        # title clickable (e.g., <a href="...">Annual Report 2025</a>).
+        # Use the longest text (likely the title, which is more often the link text).
+        longest = max(texts, key=len)
+        escaped = longest.replace('"', '\\"')
+        if len(escaped) >= 3:
+            return f'a:has-text("{escaped}")'
+
         return None

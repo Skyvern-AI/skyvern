@@ -76,6 +76,7 @@ const BROWSER_TYPE_OPTIONS: Array<{
 }> = [
   { value: "msedge", label: "Microsoft Edge" },
   { value: "chrome", label: "Google Chrome" },
+  { value: "stealth-chromium", label: "Stealth Chromium" },
 ];
 
 const EXTENSION_OPTIONS: Array<{

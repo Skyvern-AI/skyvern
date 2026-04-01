@@ -13,6 +13,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.mixins.base import read_retry
 from skyvern.forge.sdk.db.models import (
     TaskModel,
+    TaskRunModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -382,6 +383,36 @@ class WorkflowRunsMixin:
             upper = page * page_size
 
             return runs[lower:upper]
+
+    @read_retry()
+    async def get_all_runs_v2(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[str] | None = None,
+        search_key: str | None = None,
+    ) -> list[TaskRunModel]:
+        async with self.Session() as session:
+            query = (
+                select(TaskRunModel)
+                .filter(TaskRunModel.organization_id == organization_id)
+                .filter(TaskRunModel.status.isnot(None))
+                .filter(TaskRunModel.parent_workflow_run_id.is_(None))
+                .filter(TaskRunModel.debug_session_id.is_(None))
+            )
+
+            if status:
+                query = query.filter(TaskRunModel.status.in_(status))
+
+            if search_key:
+                query = query.filter(TaskRunModel.searchable_text.icontains(search_key, autoescape=True))
+
+            offset = (page - 1) * page_size
+            query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
+
+            result = await session.scalars(query)
+            return list(result.all())
 
     @read_retry()
     @db_operation("get_workflow_run", log_errors=False)
