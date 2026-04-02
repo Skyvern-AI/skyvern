@@ -52,7 +52,7 @@ class CustomCredentialVaultService(CredentialVaultService):
 
         # Otherwise, get organization-specific configuration
         try:
-            auth_token = await app.DATABASE.get_valid_org_auth_token(
+            auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
                 organization_id=organization_id,
                 token_type=OrganizationAuthTokenType.custom_credential_service.value,
             )
@@ -278,7 +278,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             await client.delete_credential(credential.item_id)
 
             # Delete from Skyvern database after successful external deletion
-            await app.DATABASE.delete_credential(credential.credential_id, credential.organization_id)
+            await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
 
             LOG.info(
                 "Successfully deleted credential from custom vault",

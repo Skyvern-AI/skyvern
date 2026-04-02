@@ -164,7 +164,9 @@ async def poll_otp_value(
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
-    org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api.value)
+    org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id, OrganizationAuthTokenType.api.value
+    )
     if not org_token:
         LOG.error("Failed to get organization token when trying to get otp value")
         return None
@@ -278,7 +280,7 @@ async def _get_otp_value_from_db(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
 ) -> OTPValue | None:
-    totp_codes = await app.DATABASE.get_otp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
+    totp_codes = await app.DATABASE.otp.get_otp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
     for totp_code in totp_codes:
         if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:
             continue

@@ -27,7 +27,6 @@ class WorkflowRun(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
-    failure_category: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     parent_workflow_run_id: typing.Optional[str] = None
     workflow_title: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None

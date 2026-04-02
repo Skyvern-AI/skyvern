@@ -41,7 +41,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     session. The browser_session that could not be renewed will be closed.
     """
 
-    debug_session = await app.DATABASE.get_debug_session(
+    debug_session = await app.DATABASE.debug.get_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
@@ -129,7 +129,7 @@ async def new_debug_session(
     """
 
     if current_user_id:
-        debug_session = await app.DATABASE.get_latest_debug_session_for_user(
+        debug_session = await app.DATABASE.debug.get_latest_debug_session_for_user(
             organization_id=current_org.organization_id,
             user_id=current_user_id,
             workflow_permanent_id=workflow_permanent_id,
@@ -153,7 +153,7 @@ async def new_debug_session(
                 )
                 return debug_session
 
-    completed_debug_sessions = await app.DATABASE.complete_debug_sessions(
+    completed_debug_sessions = await app.DATABASE.debug.complete_debug_sessions(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
@@ -232,7 +232,7 @@ async def new_debug_session(
         proxy_location=ProxyLocation.RESIDENTIAL,
     )
 
-    debug_session = await app.DATABASE.create_debug_session(
+    debug_session = await app.DATABASE.debug.create_debug_session(
         browser_session_id=new_browser_session.persistent_browser_session_id,
         organization_id=current_org.organization_id,
         user_id=current_user_id,
@@ -293,7 +293,7 @@ async def get_debug_session_runs(
         organization_id=current_org.organization_id,
     )
 
-    debug_session = await app.DATABASE.get_debug_session_by_id(
+    debug_session = await app.DATABASE.debug.get_debug_session_by_id(
         debug_session_id=debug_session_id,
         organization_id=current_org.organization_id,
     )
@@ -301,7 +301,7 @@ async def get_debug_session_runs(
     if not debug_session:
         raise HTTPException(status_code=404, detail="Debug session not found")
 
-    runs = await app.DATABASE.get_workflow_runs_by_debug_session_id(
+    runs = await app.DATABASE.debug.get_workflow_runs_by_debug_session_id(
         debug_session_id=debug_session.debug_session_id,
         organization_id=current_org.organization_id,
     )
