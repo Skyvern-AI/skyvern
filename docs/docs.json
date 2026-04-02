@@ -39,7 +39,16 @@
     "tabs": [
       {
         "tab": "Home",
-        "pages": ["index"]
+        "pages": [
+          "index",
+          "nav/getting-started",
+          "nav/cloud-ui",
+          "nav/developers",
+          "nav/cookbooks",
+          "nav/changelog",
+          "nav/api-reference",
+          "nav/sdk-reference"
+        ]
       },
       {
         "tab": "Getting Started",
