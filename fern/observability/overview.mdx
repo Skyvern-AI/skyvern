@@ -18,18 +18,24 @@ Copy of this guide is available in the [Laminar documentation](https://docs.lmnr
 
 ## Quickstart
 
-To trace Skyvern workflows with Laminar, **initialize Laminar at the top of your project**. This will automatically instrument LiteLLM and capture all LLM calls, browser session recordings, and workflow execution details. No manual callback setup is needed.
+To trace Skyvern workflows with Laminar, **initialize Laminar and configure LiteLLM callbacks at the top of your project**. This will automatically capture all LLM calls, browser session recordings, and workflow execution details.
 
-```python {3} {7-8}
+```python {3-4} {8-12} {14-15}
 from skyvern import Skyvern
 import asyncio
-from lmnr import Laminar
+import litellm
+from lmnr import Laminar, LaminarLiteLLMCallback, Instruments
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize Laminar — automatically instruments LiteLLM
-Laminar.initialize()
+# Initialize Laminar
+# This will automatically trace all Skyvern functions
+# Disable OpenAI to avoid double instrumentation of LLM calls
+Laminar.initialize(disabled_instruments=set([Instruments.OPENAI]))
+
+# Configure LiteLLM to trace all LLM calls made by Skyvern
+litellm.callbacks = [LaminarLiteLLMCallback()]
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 
@@ -42,10 +48,6 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
-
-<Warning>
-`LaminarLiteLLMCallback` and manually setting `litellm.callbacks` are deprecated. `Laminar.initialize()` handles LiteLLM instrumentation automatically.
-</Warning>
 
 ## Viewing Traces
 
