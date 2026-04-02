@@ -38,7 +38,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunTriggerType,
 )
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocationInput, RunType
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -392,10 +392,32 @@ class WorkflowRunsMixin:
         page_size: int = 10,
         status: list[str] | None = None,
         search_key: str | None = None,
-    ) -> list[TaskRunModel]:
+    ) -> list[dict[str, Any]]:
         async with self.Session() as session:
+            effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
             query = (
-                select(TaskRunModel)
+                select(
+                    TaskRunModel.task_run_id.label("task_run_id"),
+                    TaskRunModel.run_id.label("run_id"),
+                    TaskRunModel.task_run_type.label("task_run_type"),
+                    effective_status.label("status"),
+                    TaskRunModel.title.label("title"),
+                    TaskRunModel.started_at.label("started_at"),
+                    TaskRunModel.finished_at.label("finished_at"),
+                    TaskRunModel.created_at.label("created_at"),
+                    TaskRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    TaskRunModel.script_run.label("script_run"),
+                    TaskRunModel.searchable_text.label("searchable_text"),
+                )
+                .select_from(TaskRunModel)
+                .outerjoin(
+                    WorkflowRunModel,
+                    and_(
+                        TaskRunModel.task_run_type == RunType.workflow_run,
+                        WorkflowRunModel.workflow_run_id == TaskRunModel.run_id,
+                        WorkflowRunModel.organization_id == TaskRunModel.organization_id,
+                    ),
+                )
                 .filter(TaskRunModel.organization_id == organization_id)
                 .filter(TaskRunModel.status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
@@ -403,7 +425,7 @@ class WorkflowRunsMixin:
             )
 
             if status:
-                query = query.filter(TaskRunModel.status.in_(status))
+                query = query.filter(effective_status.in_(status))
 
             if search_key:
                 query = query.filter(TaskRunModel.searchable_text.icontains(search_key, autoescape=True))
@@ -411,8 +433,8 @@ class WorkflowRunsMixin:
             offset = (page - 1) * page_size
             query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
 
-            result = await session.scalars(query)
-            return list(result.all())
+            result = await session.execute(query)
+            return [dict(row) for row in result.mappings().all()]
 
     @read_retry()
     @db_operation("get_workflow_run", log_errors=False)
