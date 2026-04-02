@@ -1526,7 +1526,7 @@ class SkyvernPage(Page):
                         field_index=idx,
                         value=str(value)[:50],
                         options_count=len(field.get("options", [])),
-                        option_labels=[o.get("label", "?")[:30] for o in field.get("options", [])],
+                        option_labels=[(o.get("label") or "?")[:30] for o in field.get("options", [])],
                     )
                     if isinstance(value, str):
                         try:
