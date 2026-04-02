@@ -1,4 +1,3 @@
-import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -115,7 +114,7 @@ async def _bootstrap_sqlite() -> None:
         )
 
     organization = await ensure_local_org()
-    existing_token = await db.get_valid_org_auth_token(organization.organization_id, "api")
+    existing_token = await db.organizations.get_valid_org_auth_token(organization.organization_id, "api")
     if existing_token is not None:
         LOG.info("SQLite database already bootstrapped", organization_id=organization.organization_id)
         return
@@ -211,25 +210,6 @@ def create_api_app() -> FastAPI:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
     forge_app_instance = start_forge_app()
-
-    # Initialize Laminar tracing after ForgeApp so auto-instrumentation works.
-    lmnr_api_key = os.environ.get("LMNR_PROJECT_API_KEY")
-    if lmnr_api_key:
-        try:
-            from lmnr import Laminar  # noqa: PLC0415
-
-            lmnr_base_url = os.environ.get("LMNR_BASE_URL", "http://localhost")
-            lmnr_grpc_port = int(os.environ.get("LMNR_GRPC_PORT", "8001"))
-            lmnr_http_port = int(os.environ.get("LMNR_HTTP_PORT", "8000"))
-            Laminar.initialize(
-                project_api_key=lmnr_api_key,
-                base_url=lmnr_base_url,
-                grpc_port=lmnr_grpc_port,
-                http_port=lmnr_http_port,
-            )
-            LOG.info("Laminar tracing initialized", base_url=lmnr_base_url, grpc_port=lmnr_grpc_port)
-        except Exception as e:
-            LOG.warning("Failed to initialize Laminar tracing", error=str(e))
 
     fastapi_app = FastAPI(lifespan=lifespan)
 
