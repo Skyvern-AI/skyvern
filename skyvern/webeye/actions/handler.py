@@ -531,11 +531,7 @@ class ActionHandler:
                 # renderable content). Detect this and navigate back to the original URL so
                 # subsequent steps are not stuck on a blank page.
                 blank_page_urls = {"about:blank", ":"}
-                if (
-                    not page.is_closed()
-                    and page.url in blank_page_urls
-                    and page_url_before_download not in blank_page_urls
-                ):
+                if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
                     LOG.warning(
                         "Working page navigated to blank after download action, navigating back to original URL",
                         original_url=page_url_before_download,

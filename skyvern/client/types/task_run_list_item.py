@@ -7,20 +7,21 @@ import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
-class WorkflowSchedule(UniversalBaseModel):
-    workflow_schedule_id: str
-    organization_id: str
-    workflow_permanent_id: str
-    cron_expression: str
-    timezone: str
-    enabled: bool
-    parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    temporal_schedule_id: typing.Optional[str] = None
-    name: typing.Optional[str] = None
-    description: typing.Optional[str] = None
+class TaskRunListItem(UniversalBaseModel):
+    """
+    Lightweight run-history item backed by the task_runs table.
+    """
+
+    task_run_id: str
+    run_id: str
+    task_run_type: str
+    status: str
+    title: typing.Optional[str] = None
+    started_at: typing.Optional[dt.datetime] = None
+    finished_at: typing.Optional[dt.datetime] = None
     created_at: dt.datetime
-    modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    workflow_permanent_id: typing.Optional[str] = None
+    script_run: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

@@ -926,6 +926,14 @@ class MissingBrowserAddressError(SkyvernException):
         super().__init__(f"Browser session {browser_session_id} does not have an address.")
 
 
+class BrowserSessionClosed(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} is closed.",
+            status_code=status.HTTP_410_GONE,
+        )
+
+
 class BrowserSessionNotFound(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(

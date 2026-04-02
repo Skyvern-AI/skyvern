@@ -35,6 +35,7 @@ class Workflow(UniversalBaseModel):
     ai_fallback: typing.Optional[bool] = None
     cache_key: typing.Optional[str] = None
     adaptive_caching: typing.Optional[bool] = None
+    code_version: typing.Optional[int] = None
     generate_script_on_terminal: typing.Optional[bool] = None
     run_sequentially: typing.Optional[bool] = None
     sequential_key: typing.Optional[str] = None

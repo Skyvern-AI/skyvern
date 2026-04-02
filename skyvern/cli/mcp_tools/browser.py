@@ -14,6 +14,7 @@ from pydantic import Field
 from skyvern.cli.core.browser_ops import (
     do_act,
     do_extract,
+    do_find,
     do_frame_list,
     do_frame_main,
     do_frame_switch,
@@ -1792,6 +1793,72 @@ async def skyvern_frame_list(
             "frames": [{"index": f.index, "name": f.name, "url": f.url, "is_main": f.is_main} for f in frames],
             "count": len(frames),
             "sdk_equivalent": "await page.frame_list()",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_find(
+    by: Annotated[
+        str,
+        Field(description="Locator type: role, text, label, placeholder, alt, testid"),
+    ],
+    value: Annotated[
+        str,
+        Field(description="The text, role, label, placeholder, alt text, or test ID to match"),
+    ],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Find elements using Playwright's semantic locator API.
+
+    Locates elements by accessibility role, visible text, label, placeholder, alt text, or test ID.
+    Returns the match count, first element's text content, and visibility status.
+    Use this to verify elements exist before interacting with them, or to inspect element state.
+
+    Locator types:
+    - role: ARIA role (button, link, heading, textbox, etc.)
+    - text: Visible text content
+    - label: Associated label text (for form inputs)
+    - placeholder: Placeholder attribute text
+    - alt: Alt text (for images)
+    - testid: data-testid attribute value
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_find", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            result = await do_find(page, by=by, value=value)
+            timer.mark("find")
+        except GuardError as e:
+            return make_result(
+                "skyvern_find",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_find",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check the locator type and value"),
+            )
+
+    return make_result(
+        "skyvern_find",
+        browser_context=ctx,
+        data={
+            "selector": result.selector,
+            "count": result.count,
+            "first_text": result.first_text,
+            "first_visible": result.first_visible,
+            "sdk_equivalent": f"page.{result.selector}",
         },
         timing_ms=timer.timing_ms,
     )
