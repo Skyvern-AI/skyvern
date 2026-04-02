@@ -184,9 +184,18 @@ If you're running Skyvern on your own infrastructure, add these to your server's
 LMNR_PROJECT_API_KEY=your-laminar-api-key
 ```
 
-Skyvern's server includes a built-in `LaminarTrace` integration that initializes Laminar with the LiteLLM callback, capturing every LLM call, token count, and cost. It disables the automatic Skyvern/Patchright instrumentors (to avoid conflicts) and uses Laminar's `@observe` decorator on internal methods instead.
+Skyvern's server initializes Laminar at startup, which auto-instruments LiteLLM to capture every LLM call, token count, and cost. No manual callback setup is needed.
 
-No code changes needed — once the env var is set, traces appear in your Laminar project automatically.
+If you're running a self-hosted Laminar instance, also set the base URL and ports:
+
+```bash .env
+LMNR_PROJECT_API_KEY=your-laminar-api-key
+LMNR_BASE_URL=http://localhost
+LMNR_GRPC_PORT=8011
+LMNR_HTTP_PORT=8010
+```
+
+No code changes needed — once the env vars are set, traces appear in your Laminar project automatically.
 
 ---
 
