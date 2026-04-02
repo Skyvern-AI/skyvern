@@ -108,7 +108,7 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     run_with: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
+    Whether to run the workflow with agent or code. Null inherits from the workflow setting.
     """
 
     if IS_PYDANTIC_V2:
