@@ -420,9 +420,9 @@ class TestMultiPageInspectionHooks:
         # Both pages should have hooks
         assert id(page_a) in state._hooked_page_ids
         assert id(page_b) in state._hooked_page_ids
-        # 3 events per page: console, response, dialog
-        assert page_a.on.call_count == 3
-        assert page_b.on.call_count == 3
+        # 4 events per page: console, response, dialog, pageerror
+        assert page_a.on.call_count == 4
+        assert page_b.on.call_count == 4
 
     def test_hooks_idempotent(self) -> None:
         from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
@@ -437,7 +437,7 @@ class TestMultiPageInspectionHooks:
         ensure_hooks_on_all_pages(state, [page_a])
 
         # Should only register once
-        assert page_a.on.call_count == 3
+        assert page_a.on.call_count == 4
 
     def test_stale_pages_pruned(self) -> None:
         from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
