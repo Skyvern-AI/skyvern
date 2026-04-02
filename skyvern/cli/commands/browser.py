@@ -25,6 +25,8 @@ from skyvern.cli.core.browser_ops import (
     do_frame_switch,
     do_navigate,
     do_screenshot,
+    do_state_load,
+    do_state_save,
 )
 from skyvern.cli.core.client import get_skyvern
 from skyvern.cli.core.guards import (
@@ -46,8 +48,12 @@ from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
 frame_app = typer.Typer(help="Manage iframe context.", no_args_is_help=True)
+state_app = typer.Typer(help="Save and load browser auth state.", no_args_is_help=True)
+storage_app = typer.Typer(help="Read, write, and clear web storage.", no_args_is_help=True)
 browser_app.add_typer(session_app, name="session")
 browser_app.add_typer(frame_app, name="frame")
+browser_app.add_typer(state_app, name="state")
+browser_app.add_typer(storage_app, name="storage")
 
 
 @dataclass(frozen=True)
@@ -1517,5 +1523,178 @@ def frame_list_cmd(
     try:
         data = asyncio.run(_run())
         output(data, action="frame_list", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── State persistence commands ──────────────────────────────────────
+
+
+@state_app.command("save")
+def state_save_cmd(
+    file_path: str = typer.Argument(help="Path to save state file (JSON)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Save browser auth state (cookies + localStorage + sessionStorage) to a file."""
+    from skyvern.cli.mcp_tools.state import _validate_state_path
+
+    async def _run() -> dict:
+        resolved = _validate_state_path(file_path)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await do_state_save(page.page, browser, resolved)
+        return {
+            "file_path": result.file_path,
+            "cookie_count": result.cookie_count,
+            "local_storage_count": result.local_storage_count,
+            "session_storage_count": result.session_storage_count,
+            "url": result.url,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="state_save", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@state_app.command("load")
+def state_load_cmd(
+    file_path: str = typer.Argument(help="Path to state file (JSON) from state save."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Load browser auth state (cookies + localStorage + sessionStorage) from a file."""
+    from urllib.parse import urlparse
+
+    from skyvern.cli.mcp_tools.state import _validate_state_path
+
+    async def _run() -> dict:
+        resolved = _validate_state_path(file_path, must_exist=True)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        current_domain = urlparse(page.page.url).hostname or ""
+        result = await do_state_load(page.page, browser, resolved, current_domain)
+        return {
+            "cookie_count": result.cookie_count,
+            "local_storage_count": result.local_storage_count,
+            "session_storage_count": result.session_storage_count,
+            "source_url": result.source_url,
+            "skipped_cookies": result.skipped_cookies,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="state_load", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── Web storage commands ────────────────────────────────────────────
+
+
+@storage_app.command("get-session")
+def storage_get_session_cmd(
+    keys: list[str] | None = typer.Argument(None, help="Specific keys to retrieve. Omit for all."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read sessionStorage values from the current page."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        if keys:
+            items = {}
+            for key in keys:
+                val = await page.page.evaluate(f"() => window.sessionStorage.getItem({json.dumps(key)})")
+                if val is not None:
+                    items[key] = val
+        else:
+            items = await page.page.evaluate("() => Object.fromEntries(Object.entries(window.sessionStorage))")
+        return {"items": items, "count": len(items)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("set-session")
+def storage_set_session_cmd(
+    key: str = typer.Argument(help="The key to set."),
+    value: str = typer.Argument(help="The value to store."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Set a sessionStorage key-value pair."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        await page.page.evaluate("(args) => window.sessionStorage.setItem(args[0], args[1])", [key, value])
+        return {"key": key, "value_length": len(value)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="set_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("clear-session")
+def storage_clear_session_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Clear all sessionStorage entries."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        count = await page.page.evaluate(
+            "() => { const n = window.sessionStorage.length; window.sessionStorage.clear(); return n; }"
+        )
+        return {"cleared_count": count}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="clear_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("clear-local")
+def storage_clear_local_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Clear all localStorage entries."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        count = await page.page.evaluate(
+            "() => { const n = window.localStorage.length; window.localStorage.clear(); return n; }"
+        )
+        return {"cleared_count": count}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="clear_local_storage", json_mode=json_output)
     except Exception as e:
         output_error(str(e), json_mode=json_output)

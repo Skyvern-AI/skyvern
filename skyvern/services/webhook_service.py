@@ -455,7 +455,7 @@ async def _build_workflow_payload(
 
 
 async def _get_api_key(organization_id: str) -> str:
-    api_key_obj = await app.DATABASE.get_valid_org_auth_token(
+    api_key_obj = await app.DATABASE.organizations.get_valid_org_auth_token(
         organization_id,
         OrganizationAuthTokenType.api.value,
     )
