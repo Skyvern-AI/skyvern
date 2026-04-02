@@ -164,13 +164,19 @@ class ArtifactsMixin:
         if sort_by not in allowed_sort_fields:
             raise ValueError(f"sort_by must be one of {allowed_sort_fields}")
         run = await self.get_run(run_id, organization_id=organization_id)
-        if not run:
-            return []
 
         async with self.Session() as session:
             query = select(ArtifactModel).filter_by(organization_id=organization_id)
 
-            query = query.filter_by(workflow_run_id=run.workflow_run_id)
+            if run:
+                # Workflow run — filter by workflow_run_id
+                query = query.filter_by(workflow_run_id=run.workflow_run_id)
+            elif run_id.startswith("tsk_"):
+                # Task run — get_run only handles workflow runs,
+                # so fall back to filtering by task_id for task-based artifacts
+                query = query.filter_by(task_id=run_id)
+            else:
+                return []
 
             if artifact_types:
                 query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))

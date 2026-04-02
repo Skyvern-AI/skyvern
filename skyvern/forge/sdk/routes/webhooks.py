@@ -129,7 +129,7 @@ async def test_webhook(
 
     # Get the organization's API key to sign the webhook
     # For testing, we use a placeholder if no API key is available
-    api_key_obj = await app.DATABASE.get_valid_org_auth_token(
+    api_key_obj = await app.DATABASE.organizations.get_valid_org_auth_token(
         current_org.organization_id,
         OrganizationAuthTokenType.api.value,
     )

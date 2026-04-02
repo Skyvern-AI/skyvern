@@ -211,7 +211,7 @@ async def resolve_org_from_api_key(
             detail="Auth token is expired",
         )
 
-    organization = await db.get_organization(organization_id=api_key_data.sub)
+    organization = await db.organizations.get_organization(organization_id=api_key_data.sub)
     if not organization:
         LOG.warning("Organization not found", organization_id=api_key_data.sub, **payload)
         raise HTTPException(status_code=404, detail="Organization not found")
@@ -219,7 +219,7 @@ async def resolve_org_from_api_key(
     api_key_db_obj: OrganizationAuthToken | None = None
     # Try token types in priority order and stop at the first valid match.
     for token_type in token_types:
-        api_key_db_obj = await db.validate_org_auth_token(
+        api_key_db_obj = await db.organizations.validate_org_auth_token(
             organization_id=organization.organization_id,
             token_type=token_type,
             token=x_api_key,
