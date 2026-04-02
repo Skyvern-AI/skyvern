@@ -45,14 +45,16 @@ class InvalidLLMConfigError(BaseLLMError):
 
 
 class LLMProviderError(BaseLLMError):
-    def __init__(self, llm_key: str) -> None:
-        super().__init__(f"Error while using LLMProvider {llm_key}")
+    def __init__(self, llm_key: str, cause: Exception | None = None) -> None:
+        detail = f" — {type(cause).__name__}: {cause}" if cause else ""
+        super().__init__(f"Error while using LLMProvider {llm_key}{detail}")
 
 
 class LLMProviderErrorRetryableTask(LLMProviderError):
-    def __init__(self, llm_key: str) -> None:
-        # Call BaseLLMError directly to avoid double-formatting the message through LLMProviderError.__init__
-        BaseLLMError.__init__(self, f"Retryable error while using LLMProvider {llm_key}")
+    def __init__(self, llm_key: str, cause: Exception | None = None) -> None:
+        detail = f" — {type(cause).__name__}: {cause}" if cause else ""
+        # Skip LLMProviderError.__init__ to set our own message prefix
+        SkyvernException.__init__(self, f"Retryable error while using LLMProvider {llm_key}{detail}")
 
 
 class NoProviderEnabledError(BaseLLMError):

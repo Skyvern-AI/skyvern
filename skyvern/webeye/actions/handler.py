@@ -420,6 +420,7 @@ class ActionHandler:
             )
         )
         initial_page_count = 0
+        page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
@@ -524,6 +525,25 @@ class ActionHandler:
                         LOG.warning("The extra page is the current page, closing it")
                     # close the extra page
                     await pages_after_download[-1].close()
+
+                # After a print/download action the working page sometimes navigates to
+                # about:blank (e.g. when the browser follows a download URL that yields no
+                # renderable content). Detect this and navigate back to the original URL so
+                # subsequent steps are not stuck on a blank page.
+                blank_page_urls = {"about:blank", ":"}
+                if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
+                    LOG.warning(
+                        "Working page navigated to blank after download action, navigating back to original URL",
+                        original_url=page_url_before_download,
+                    )
+                    try:
+                        await browser_state.navigate_to_url(page=page, url=page_url_before_download)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to navigate back to original URL after blank page from download",
+                            original_url=page_url_before_download,
+                            exc_info=True,
+                        )
 
             persisted_action = await app.DATABASE.create_action(action=action)
             action.action_id = persisted_action.action_id
@@ -2607,22 +2627,27 @@ async def chain_click(
             dom=DomUtil(scraped_page=scraped_page, page=page)
         )
         if blocking_element is None:
-            if not blocked:
+            if blocked:
                 LOG.info(
-                    "Chain click: exit since the element is not blocking by any element",
+                    "Chain click: element is blocked by a non-interactable element, try to click by the coordinates",
                     action=action,
                     element=str(skyvern_element),
                     locator=locator,
                 )
-                return action_results
+            else:
+                # Element is visible and elementFromPoint returns the target itself,
+                # but Playwright's click still failed (e.g. element transiently
+                # unstable due to React re-render or CSS animation).  Fall through
+                # to coordinate click which bypasses Playwright's actionability
+                # checks while still dispatching a real mouse event.
+                LOG.info(
+                    "Chain click: element is visible and not blocked, but Playwright click failed — trying coordinate click",
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
 
             try:
-                LOG.info(
-                    "Chain click: element is blocked by an non-interactable element, try to click by the coordinates",
-                    action=action,
-                    element=str(skyvern_element),
-                    locator=locator,
-                )
                 await skyvern_element.coordinate_click(page=page)
                 action_results.append(ActionSuccess())
                 return action_results
@@ -2632,7 +2657,7 @@ async def chain_click(
                 )
 
             LOG.info(
-                "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
+                "Chain click: coordinate click failed, going to use javascript click instead of playwright click",
                 action=action,
                 element=str(skyvern_element),
                 locator=locator,
@@ -2860,7 +2885,17 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
-        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        # Use SkyvernElement.click() so we get the full fallback chain
+        # (Playwright click → coordinate click → JavaScript click).  Plain
+        # locator.click() can fail when the item or one of its ancestors has
+        # pointer-events:none, which is common in React/Vue dropdown lists.
+        selected_element = SkyvernElement(
+            locator=locator,
+            frame=current_frame,
+            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+        )
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
         clear_input = False
         return result
 

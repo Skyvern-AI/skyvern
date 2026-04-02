@@ -177,7 +177,7 @@ class ArtifactsRepository(BaseRepository):
         async with self.Session() as session:
             query = select(ArtifactModel).filter_by(organization_id=organization_id)
 
-            query = query.filter_by(run_id=run.run_id)
+            query = query.filter_by(workflow_run_id=run.workflow_run_id)
 
             if artifact_types:
                 query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))

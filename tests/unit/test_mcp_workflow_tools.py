@@ -721,6 +721,238 @@ async def test_workflow_update_preserves_credential_parameters_when_omitted(
 
 
 @pytest.mark.asyncio
+async def test_workflow_update_injects_credential_key_into_block_parameter_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the update definition omits the credential parameter key from a login
+    block's parameter_keys, the key should be injected from the existing workflow."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                    {
+                        "parameter_type": "workflow",
+                        "key": "url_input",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://example.com",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                        "navigation_goal": "Login",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude regenerated the login block WITHOUT the credential key in parameter_keys
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "url_input",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://new-url.com",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": [],
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    # Verify credential parameter was injected
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+    assert cred_params[0].credential_id == "cred_abc123"
+
+    # Verify the login block now references the credential parameter key
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "label", None) == "login_block")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_injects_credential_key_when_parameter_keys_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the update definition omits parameter_keys entirely from the block,
+    credential keys should still be injected."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude regenerated the login block WITHOUT parameter_keys at all
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    # Verify credential parameter was injected
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+
+    # Verify the login block now has the credential key
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "label", None) == "login_block")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_block_credential_when_param_already_included(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the update already includes the credential parameter but the block omits
+    the key from parameter_keys, the key should still be injected into the block."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude included the credential param but omitted it from the block's parameter_keys
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "credential",
+                    "key": "credentials",
+                    "credential_id": "cred_abc123",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": [],
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "label", None) == "login_block")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in pkeys
+
+    # Should not duplicate the credential parameter
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+
+
+@pytest.mark.asyncio
 async def test_workflow_update_does_not_duplicate_existing_credential_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

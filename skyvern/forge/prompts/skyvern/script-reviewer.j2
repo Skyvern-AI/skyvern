@@ -30,6 +30,21 @@ You are a script reviewer for a browser automation system. Your job is to update
 11. **FOR-LOOP BLOCKS**: When code runs inside a for-loop (e.g. by iterating over extracted items), every `page.click()`, `page.goto()`, or `page.download_file()` call MUST use per-iteration data to target the specific item. Never use a static selector or generic prompt that would resolve to the same element on every iteration.
     - **File download blocks**: Use `context.download_selector()` which builds a CSS selector (e.g. `a[href*="filename.pdf"]`) from URL-like fields in the current loop value. Combine with `context.prompt` for AI fallback: `await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")`. If `download_selector()` returns `None` (no URL in loop value), fall back to a text-based selector using `context.loop_value`.
     - **Other blocks**: Use `context.loop_value` (dict) to build selectors. Prefer `page.goto(context.loop_value["url"])` for direct URLs, or include the item's title/identifier in the selector: `selector=f'a:has-text("{context.loop_value["title"]}")'`.
+12. **NEVER HARDCODE PER-RUN VALUES IN SELECTORS OR PROMPTS**. If a selector or prompt contains a value that varies per run (a person's name, an ID, an address, a company name), it MUST be dynamic — never a literal string. This applies even when the page shows an abbreviated form (e.g., "J. Smith") that doesn't exactly match the parameter ("John H. Smith").
+    - **How to detect**: Check the **Current Run Parameter Values** and **Past Episode Parameters** sections below. If different episodes show different values for the same parameter (e.g., `full_name: "John Smith"` in one run, `full_name: "Jane Doe"` in another), any selector referencing that name is per-run and must be dynamic.
+    - **Wrong** (hardcodes a name that changes every run):
+      ```python
+      await page.click(selector='a[aria-label="John Smith select for details"]', ai='fallback', prompt='Click provider')
+      ```
+    - **Correct — option A** (dynamic selector via f-string, with AI fallback for fuzzy matching):
+      ```python
+      await page.click(selector=f'a:has-text("{context.parameters["full_name"]}")', ai='fallback', prompt=f"Click on the entry for {context.parameters['full_name']}")
+      ```
+    - **Correct — option B** (AI-only, best when the page abbreviates or reformats the name):
+      ```python
+      await page.click(ai='proactive', prompt=f"Click on the provider entry that matches {context.parameters['full_name']}")
+      ```
+    - Use **option A** when the page shows the exact parameter value (fast, no LLM call if selector hits). Use **option B** when the page reformats/abbreviates names — the AI handles fuzzy matching that a static selector cannot.
 
 ## Block Navigation Goal
 ```
@@ -43,6 +58,14 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 - `{{ key }}`
 {% endfor %}
 For fields not covered by these parameters: use Python code if the value is deterministic (see "Deterministic Logic"), or `ai='proactive'` if it requires subjective judgment (see Rule 9c).
+{% endif %}
+{% if run_parameter_values %}
+
+## Current Run Parameter Values
+These are the ACTUAL values for this run. If any of these appear (even partially) in a selector or hardcoded string, that value is per-run and MUST be made dynamic (see Rule 12).
+{% for key, value in run_parameter_values.items() %}
+- `{{ key }}` = `{{ value[:80] }}{% if value|length > 80 %}…{% endif %}`
+{% endfor %}
 {% endif %}
 
 ## Existing Cached Code
@@ -110,9 +133,11 @@ The following failures occurred in PREVIOUS runs and were already reviewed. Lear
 - **Error**: {{ h.error_message or "N/A" }}
 - **Reviewer fix applied**: {{ h.reviewer_output or "No fix recorded" }}
 - **Did the AI fallback succeed?**: {{ "Yes" if h.fallback_succeeded else ("No" if h.fallback_succeeded is sameas false else "Unknown") }}
+{% if h.run_parameters %}- **Run parameters**: {% for k, v in h.run_parameters.items() %}`{{ k }}={{ v[:60] }}{% if v|length > 60 %}…{% endif %}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
 {% endfor %}
 
-**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach instead of repeating the same pattern.
+**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach instead of repeating the same pattern. **If different past episodes show different values for the same parameter** (e.g., different names, different IDs), the block handles per-run data — any selector or hardcoded string referencing those values must be dynamic (see Rule 12).
 {% endif %}
 
 {% if user_instructions %}

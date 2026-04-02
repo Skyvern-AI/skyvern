@@ -46,7 +46,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
 
@@ -401,10 +401,32 @@ class WorkflowRunsRepository(BaseRepository):
         page_size: int = 10,
         status: list[str] | None = None,
         search_key: str | None = None,
-    ) -> list[TaskRunModel]:
+    ) -> list[dict[str, Any]]:
         async with self.Session() as session:
+            effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
             query = (
-                select(TaskRunModel)
+                select(
+                    TaskRunModel.task_run_id.label("task_run_id"),
+                    TaskRunModel.run_id.label("run_id"),
+                    TaskRunModel.task_run_type.label("task_run_type"),
+                    effective_status.label("status"),
+                    TaskRunModel.title.label("title"),
+                    TaskRunModel.started_at.label("started_at"),
+                    TaskRunModel.finished_at.label("finished_at"),
+                    TaskRunModel.created_at.label("created_at"),
+                    TaskRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    TaskRunModel.script_run.label("script_run"),
+                    TaskRunModel.searchable_text.label("searchable_text"),
+                )
+                .select_from(TaskRunModel)
+                .outerjoin(
+                    WorkflowRunModel,
+                    and_(
+                        TaskRunModel.task_run_type == RunType.workflow_run,
+                        WorkflowRunModel.workflow_run_id == TaskRunModel.run_id,
+                        WorkflowRunModel.organization_id == TaskRunModel.organization_id,
+                    ),
+                )
                 .filter(TaskRunModel.organization_id == organization_id)
                 .filter(TaskRunModel.status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
@@ -412,7 +434,7 @@ class WorkflowRunsRepository(BaseRepository):
             )
 
             if status:
-                query = query.filter(TaskRunModel.status.in_(status))
+                query = query.filter(effective_status.in_(status))
 
             if search_key:
                 query = query.filter(TaskRunModel.searchable_text.icontains(search_key, autoescape=True))
@@ -420,8 +442,8 @@ class WorkflowRunsRepository(BaseRepository):
             offset = (page - 1) * page_size
             query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
 
-            result = await session.scalars(query)
-            return list(result.all())
+            result = await session.execute(query)
+            return [dict(row) for row in result.mappings().all()]
 
     @read_retry()
     @db_operation("get_workflow_run", log_errors=False)
@@ -891,9 +913,42 @@ class WorkflowRunsRepository(BaseRepository):
                 value=value,
             )
             session.add(workflow_run_parameter)
+            await session.flush()
+            converted = convert_to_workflow_run_parameter(
+                workflow_run_parameter, workflow_parameter, self.debug_enabled
+            )
             await session.commit()
-            await session.refresh(workflow_run_parameter)
-            return convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
+            return converted
+
+    @db_operation("create_workflow_run_parameters")
+    async def create_workflow_run_parameters(
+        self,
+        workflow_run_id: str,
+        workflow_parameter_values: list[tuple[WorkflowParameter, Any]],
+    ) -> list[WorkflowRunParameter]:
+        if not workflow_parameter_values:
+            return []
+
+        workflow_run_parameters = [
+            WorkflowRunParameterModel(
+                workflow_run_id=workflow_run_id,
+                workflow_parameter_id=workflow_parameter.workflow_parameter_id,
+                value=value,
+            )
+            for workflow_parameter, value in workflow_parameter_values
+        ]
+
+        async with self.Session() as session:
+            session.add_all(workflow_run_parameters)
+            await session.flush()
+            converted = [
+                convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
+                for workflow_run_parameter, (workflow_parameter, _) in zip(
+                    workflow_run_parameters, workflow_parameter_values, strict=True
+                )
+            ]
+            await session.commit()
+            return converted
 
     @db_operation("get_workflow_run_parameters")
     async def get_workflow_run_parameters(
