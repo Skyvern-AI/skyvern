@@ -1056,7 +1056,7 @@ class ScriptReviewer:
         goals: dict[str, str] = {}
         parameter_keys: list[str] = []
         try:
-            workflow = await app.DATABASE.get_workflow_by_permanent_id(
+            workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
             )

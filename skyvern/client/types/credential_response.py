@@ -6,7 +6,6 @@ import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .credential_response_credential import CredentialResponseCredential
 from .credential_type_output import CredentialTypeOutput
-from .credential_vault_type import CredentialVaultType
 
 
 class CredentialResponse(UniversalBaseModel):
@@ -34,11 +33,6 @@ class CredentialResponse(UniversalBaseModel):
     Name of the credential
     """
 
-    vault_type: typing.Optional[CredentialVaultType] = pydantic.Field(default=None)
-    """
-    Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')
-    """
-
     browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     Browser profile ID linked to this credential
@@ -52,11 +46,6 @@ class CredentialResponse(UniversalBaseModel):
     user_context: typing.Optional[str] = pydantic.Field(default=None)
     """
     User-provided context describing the login sequence (e.g., 'click SSO button first')
-    """
-
-    save_browser_session_intent: typing.Optional[bool] = pydantic.Field(default=None)
-    """
-    Whether the user intends to save a browser session, regardless of test outcome
     """
 
     if IS_PYDANTIC_V2:

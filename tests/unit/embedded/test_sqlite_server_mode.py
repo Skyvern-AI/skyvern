@@ -109,10 +109,12 @@ async def test_sqlite_bootstrap_creates_tables_and_org(sqlite_bootstrap_db, patc
 
     await _bootstrap_sqlite()
 
-    org = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    org = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     assert org is not None
     assert org.organization_name == "Skyvern-local"
-    token = await sqlite_bootstrap_db.get_valid_org_auth_token(org.organization_id, OrganizationAuthTokenType.api)
+    token = await sqlite_bootstrap_db.organizations.get_valid_org_auth_token(
+        org.organization_id, OrganizationAuthTokenType.api
+    )
     assert token is not None
 
 
@@ -128,16 +130,18 @@ async def test_sqlite_bootstrap_is_idempotent(sqlite_bootstrap_db, patched_env_w
         await conn.run_sync(Base.metadata.create_all)
 
     await _bootstrap_sqlite()
-    org1 = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    org1 = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
 
     # Second call should detect existing org and skip
     await _bootstrap_sqlite()
-    org2 = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    org2 = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
 
     assert org1 is not None
     assert org2 is not None
     assert org1.organization_id == org2.organization_id
-    token = await sqlite_bootstrap_db.get_valid_org_auth_token(org1.organization_id, OrganizationAuthTokenType.api)
+    token = await sqlite_bootstrap_db.organizations.get_valid_org_auth_token(
+        org1.organization_id, OrganizationAuthTokenType.api
+    )
     assert token is not None
 
 
@@ -155,7 +159,7 @@ async def test_sqlite_bootstrap_from_empty_db(sqlite_bootstrap_db, patched_env_w
 
     await _bootstrap_sqlite()
 
-    org = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    org = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     assert org is not None
     assert org.organization_name == "Skyvern-local"
 
@@ -183,10 +187,12 @@ async def test_sqlite_bootstrap_syncs_existing_env_api_key(
 
     await _bootstrap_sqlite()
 
-    org = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    org = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     assert org is not None
     assert org.organization_id == expected_org_id
-    token = await sqlite_bootstrap_db.get_valid_org_auth_token(org.organization_id, OrganizationAuthTokenType.api)
+    token = await sqlite_bootstrap_db.organizations.get_valid_org_auth_token(
+        org.organization_id, OrganizationAuthTokenType.api
+    )
     assert token is not None
     assert token.token == existing_api_key
     validation = await resolve_org_from_api_key(existing_api_key, sqlite_bootstrap_db)
@@ -224,14 +230,17 @@ async def test_sqlite_bootstrap_repairs_existing_org_without_token(
     org = await ensure_local_org_with_id(expected_org_id)
     assert org.organization_id
     assert (
-        await sqlite_bootstrap_db.get_valid_org_auth_token(org.organization_id, OrganizationAuthTokenType.api) is None
+        await sqlite_bootstrap_db.organizations.get_valid_org_auth_token(
+            org.organization_id, OrganizationAuthTokenType.api
+        )
+        is None
     )
 
     await _bootstrap_sqlite()
 
-    repaired_org = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    repaired_org = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     assert repaired_org is not None
-    token = await sqlite_bootstrap_db.get_valid_org_auth_token(
+    token = await sqlite_bootstrap_db.organizations.get_valid_org_auth_token(
         repaired_org.organization_id, OrganizationAuthTokenType.api
     )
     assert token is not None
@@ -259,9 +268,11 @@ async def test_sqlite_bootstrap_regenerates_invalid_existing_env_api_key(
 
     await _bootstrap_sqlite()
 
-    org = await sqlite_bootstrap_db.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    org = await sqlite_bootstrap_db.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     assert org is not None
-    token = await sqlite_bootstrap_db.get_valid_org_auth_token(org.organization_id, OrganizationAuthTokenType.api)
+    token = await sqlite_bootstrap_db.organizations.get_valid_org_auth_token(
+        org.organization_id, OrganizationAuthTokenType.api
+    )
     assert token is not None
     assert token.token != "existing-test-key"
     validation = await resolve_org_from_api_key(token.token, sqlite_bootstrap_db)

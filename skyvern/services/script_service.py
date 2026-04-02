@@ -594,7 +594,7 @@ async def _record_output_parameter_value(
     # TODO support this in the future
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     # get the workflow
-    workflow = await app.DATABASE.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+    workflow = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
     if not workflow:
         return
 
@@ -1109,13 +1109,15 @@ async def _fallback_to_ai_run(
             status=StepStatus.failed,
         )
         # 2. run execute_step
-        organization = await app.DATABASE.get_organization(organization_id=organization_id)
+        organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
         if not organization:
             raise Exception(f"Organization is missing organization_id={organization_id}")
         task = await app.DATABASE.get_task(task_id=context.task_id, organization_id=organization_id)
         if not task:
             raise Exception(f"Task is missing task_id={context.task_id}")
-        workflow = await app.DATABASE.get_workflow(workflow_id=context.workflow_id, organization_id=organization_id)
+        workflow = await app.DATABASE.workflows.get_workflow(
+            workflow_id=context.workflow_id, organization_id=organization_id
+        )
         if not workflow:
             return
         workflow_run = await app.DATABASE.get_workflow_run(
@@ -2628,7 +2630,7 @@ async def _validate_and_get_output_parameter(
         raise Exception("Workflow run ID is required")
     if not organization_id:
         raise Exception("Organization ID is required")
-    workflow = await app.DATABASE.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+    workflow = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
     if not workflow:
         raise Exception("Workflow not found")
     label = label or f"block_{uuid.uuid4()}"
