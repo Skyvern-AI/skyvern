@@ -144,6 +144,14 @@
             ]
           },
           {
+            "group": "Handling Authentication",
+            "pages": [
+              "credentials/store-credentials",
+              "credentials/handle-2fa",
+              "credentials/troubleshooting-login"
+            ]
+          },
+          {
             "group": "Multi-Step Automations",
             "pages": [
               "multi-step-automations/build-a-workflow",
