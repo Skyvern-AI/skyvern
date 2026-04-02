@@ -266,50 +266,6 @@ class AgentDB(BaseAlchemyDB):
     async def delete_task_actions(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.delete_task_actions(*args, **kwargs)
 
-    # -- Workflow delegates --
-
-    async def create_workflow(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.create_workflow(*args, **kwargs)
-
-    async def soft_delete_workflow_by_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.soft_delete_workflow_by_id(*args, **kwargs)
-
-    async def get_workflow(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_workflow(*args, **kwargs)
-
-    async def get_workflow_by_permanent_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_workflow_by_permanent_id(*args, **kwargs)
-
-    async def get_workflow_for_workflow_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_workflow_for_workflow_run(*args, **kwargs)
-
-    async def get_workflow_versions_by_permanent_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_workflow_versions_by_permanent_id(*args, **kwargs)
-
-    async def get_workflows_by_permanent_ids(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_workflows_by_permanent_ids(*args, **kwargs)
-
-    async def get_workflows_by_organization_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_workflows_by_organization_id(*args, **kwargs)
-
-    async def update_workflow(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.update_workflow(*args, **kwargs)
-
-    async def soft_delete_workflow_and_schedules_by_permanent_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.soft_delete_workflow_and_schedules_by_permanent_id(*args, **kwargs)
-
-    async def add_workflow_template(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.add_workflow_template(*args, **kwargs)
-
-    async def remove_workflow_template(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.remove_workflow_template(*args, **kwargs)
-
-    async def get_org_template_permanent_ids(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.get_org_template_permanent_ids(*args, **kwargs)
-
-    async def is_workflow_template(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflows.is_workflow_template(*args, **kwargs)
-
     # -- Workflow run delegates --
 
     async def get_running_workflow_runs_info_globally(self, *args: Any, **kwargs: Any) -> Any:
@@ -757,110 +713,6 @@ class AgentDB(BaseAlchemyDB):
     async def get_stale_branches(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.get_stale_branches(*args, **kwargs)
 
-    # -- OTP delegates --
-
-    async def get_otp_codes(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.otp.get_otp_codes(*args, **kwargs)
-
-    async def get_otp_codes_by_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.otp.get_otp_codes_by_run(*args, **kwargs)
-
-    async def get_recent_otp_codes(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.otp.get_recent_otp_codes(*args, **kwargs)
-
-    async def create_otp_code(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.otp.create_otp_code(*args, **kwargs)
-
-    # -- Credential delegates --
-
-    async def create_credential(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.create_credential(*args, **kwargs)
-
-    async def get_credential(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.get_credential(*args, **kwargs)
-
-    async def get_credentials(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.get_credentials(*args, **kwargs)
-
-    async def update_credential(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.update_credential(*args, **kwargs)
-
-    async def update_credential_vault_data(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.update_credential_vault_data(*args, **kwargs)
-
-    async def delete_credential(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.delete_credential(*args, **kwargs)
-
-    async def create_organization_bitwarden_collection(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.create_organization_bitwarden_collection(*args, **kwargs)
-
-    async def get_organization_bitwarden_collection(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.credentials.get_organization_bitwarden_collection(*args, **kwargs)
-
-    # -- Folder delegates --
-
-    async def create_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.create_folder(*args, **kwargs)
-
-    async def get_folders(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.get_folders(*args, **kwargs)
-
-    async def get_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.get_folder(*args, **kwargs)
-
-    async def update_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.update_folder(*args, **kwargs)
-
-    async def get_workflow_permanent_ids_in_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.get_workflow_permanent_ids_in_folder(*args, **kwargs)
-
-    async def soft_delete_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.soft_delete_folder(*args, **kwargs)
-
-    async def get_folder_workflow_count(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.get_folder_workflow_count(*args, **kwargs)
-
-    async def get_folder_workflow_counts_batch(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.get_folder_workflow_counts_batch(*args, **kwargs)
-
-    async def update_workflow_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.folders.update_workflow_folder(*args, **kwargs)
-
-    # -- Organization delegates --
-
-    async def get_active_verification_requests(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.get_active_verification_requests(*args, **kwargs)
-
-    async def get_all_organizations(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.get_all_organizations(*args, **kwargs)
-
-    async def get_organization(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.get_organization(*args, **kwargs)
-
-    async def get_organization_by_domain(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.get_organization_by_domain(*args, **kwargs)
-
-    async def create_organization(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.create_organization(*args, **kwargs)
-
-    async def update_organization(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.update_organization(*args, **kwargs)
-
-    async def get_valid_org_auth_token(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.get_valid_org_auth_token(*args, **kwargs)
-
-    async def get_valid_org_auth_tokens(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.get_valid_org_auth_tokens(*args, **kwargs)
-
-    async def validate_org_auth_token(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.validate_org_auth_token(*args, **kwargs)
-
-    async def create_org_auth_token(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.create_org_auth_token(*args, **kwargs)
-
-    async def invalidate_org_auth_tokens(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.invalidate_org_auth_tokens(*args, **kwargs)
-
     # -- Observer delegates --
 
     async def get_task_v2(self, *args: Any, **kwargs: Any) -> Any:
@@ -908,39 +760,7 @@ class AgentDB(BaseAlchemyDB):
     async def get_workflow_run_blocks(self, *args: Any, **kwargs: Any) -> Any:
         return await self.observer.get_workflow_run_blocks(*args, **kwargs)
 
-    # -- Debug delegates --
-
-    async def get_debug_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_debug_session(*args, **kwargs)
-
-    async def get_latest_block_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_latest_block_run(*args, **kwargs)
-
-    async def get_latest_completed_block_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_latest_completed_block_run(*args, **kwargs)
-
-    async def create_block_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.create_block_run(*args, **kwargs)
-
-    async def get_latest_debug_session_for_user(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_latest_debug_session_for_user(*args, **kwargs)
-
-    async def get_debug_session_by_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_debug_session_by_id(*args, **kwargs)
-
-    async def get_workflow_runs_by_debug_session_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_workflow_runs_by_debug_session_id(*args, **kwargs)
-
-    async def complete_debug_sessions(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.complete_debug_sessions(*args, **kwargs)
-
-    async def create_debug_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.create_debug_session(*args, **kwargs)
-
-    # -- NEW delegate methods (missing from branch) --
+    # -- Artifact delegates --
 
     async def get_artifact_by_id_no_org(self, *args: Any, **kwargs: Any) -> Any:
         return await self.artifacts.get_artifact_by_id_no_org(*args, **kwargs)
-
-    async def replace_org_auth_token(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.organizations.replace_org_auth_token(*args, **kwargs)

@@ -406,6 +406,7 @@ async def test_handle_action_navigates_back_from_blank_page_after_download() -> 
     # Page starts at a real URL; the mocked action will navigate it to about:blank
     page = MagicMock()
     page.url = original_url
+    page.is_closed.return_value = False
 
     browser_state = MagicMock()
     # Same page count before and after (no extra tab opened by the print action)

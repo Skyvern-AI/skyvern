@@ -32,7 +32,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         **kwargs: dict,
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
-        organization = await app.DATABASE.get_organization(organization_id)
+        organization = await app.DATABASE.organizations.get_organization(organization_id)
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
@@ -132,7 +132,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
             task_v2_id=task_v2_id,
         )
 
-        organization = await app.DATABASE.get_organization(organization_id)
+        organization = await app.DATABASE.organizations.get_organization(organization_id)
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
