@@ -3907,69 +3907,6 @@
           }
         }
       }
-    },
-    "/v1/sdk/run_action": {
-      "post": {
-        "tags": [
-          "SDK"
-        ],
-        "summary": "Run an SDK action",
-        "description": "Execute a single SDK action with the specified parameters",
-        "operationId": "run_sdk_action_v1_sdk_run_action_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RunSdkActionRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunSdkActionResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "run_sdk_action"
-      }
     }
   },
   "components": {
@@ -4077,41 +4014,6 @@
           "aws_key"
         ],
         "title": "AWSSecretParameterYAML"
-      },
-      "ActAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_act",
-            "title": "Type",
-            "default": "ai_act"
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "Natural language prompt for the action",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          }
-        },
-        "type": "object",
-        "title": "ActAction",
-        "description": "AI act action parameters."
       },
       "Action": {
         "properties": {
@@ -6451,60 +6353,6 @@
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
       },
-      "ClickAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_click",
-            "title": "Type",
-            "default": "ai_click"
-          },
-          "selector": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the click",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 10000
-          }
-        },
-        "type": "object",
-        "title": "ClickAction",
-        "description": "Click action parameters."
-      },
       "ClickContext": {
         "properties": {
           "thought": {
@@ -7893,88 +7741,6 @@
           "captcha-solver"
         ],
         "title": "Extensions"
-      },
-      "ExtractAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "extract",
-            "title": "Type",
-            "default": "extract"
-          },
-          "prompt": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "Extraction prompt",
-            "default": ""
-          },
-          "extract_schema": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "items": {},
-                "type": "array"
-              },
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extract Schema",
-            "description": "Schema for extraction"
-          },
-          "error_code_mapping": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Error Code Mapping",
-            "description": "Error code mapping for extraction"
-          },
-          "intention": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Intention",
-            "description": "The intention or goal of the extraction"
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          }
-        },
-        "type": "object",
-        "title": "ExtractAction",
-        "description": "Extract data action parameters."
       },
       "ExtractionBlock": {
         "properties": {
@@ -11010,97 +10776,6 @@
         "type": "object",
         "title": "InputOrSelectContext"
       },
-      "InputTextAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_input_text",
-            "title": "Type",
-            "default": "ai_input_text"
-          },
-          "selector": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "value": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Value",
-            "description": "Value to input",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the input",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier",
-            "description": "TOTP identifier for input_text actions"
-          },
-          "totp_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Url",
-            "description": "TOTP URL for input_text actions"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 10000
-          }
-        },
-        "type": "object",
-        "title": "InputTextAction",
-        "description": "Input text action parameters."
-      },
       "JinjaBranchCriteria": {
         "properties": {
           "criteria_type": {
@@ -11131,25 +10806,6 @@
         ],
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
-      },
-      "LocateElementAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "locate_element",
-            "title": "Type",
-            "default": "locate_element"
-          },
-          "prompt": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "Natural language prompt to locate an element",
-            "default": ""
-          }
-        },
-        "type": "object",
-        "title": "LocateElementAction",
-        "description": "Locate element action parameters."
       },
       "LoginBlock": {
         "properties": {
@@ -13203,53 +12859,6 @@
         ],
         "title": "PrintPageBlockYAML"
       },
-      "PromptAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "prompt",
-            "title": "Type",
-            "default": "prompt"
-          },
-          "prompt": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "The prompt to send to the LLM"
-          },
-          "response_schema": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Response Schema",
-            "description": "Optional JSON schema to structure the response"
-          },
-          "model": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Model",
-            "description": "Optional model configuration"
-          }
-        },
-        "type": "object",
-        "required": [
-          "prompt"
-        ],
-        "title": "PromptAction",
-        "description": "Prompt action parameters."
-      },
       "PromptBranchCriteria": {
         "properties": {
           "criteria_type": {
@@ -13342,130 +12951,6 @@
           "ui-tars"
         ],
         "title": "RunEngine"
-      },
-      "RunSdkActionRequest": {
-        "properties": {
-          "url": {
-            "type": "string",
-            "title": "Url",
-            "description": "The URL where the action should be executed"
-          },
-          "browser_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Session Id",
-            "description": "The browser session ID"
-          },
-          "browser_address": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Address",
-            "description": "The browser address"
-          },
-          "workflow_run_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Workflow Run Id",
-            "description": "Optional workflow run ID to continue an existing workflow run"
-          },
-          "action": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ClickAction"
-              },
-              {
-                "$ref": "#/components/schemas/InputTextAction"
-              },
-              {
-                "$ref": "#/components/schemas/SelectOptionAction"
-              },
-              {
-                "$ref": "#/components/schemas/UploadFileAction"
-              },
-              {
-                "$ref": "#/components/schemas/ActAction"
-              },
-              {
-                "$ref": "#/components/schemas/ExtractAction"
-              },
-              {
-                "$ref": "#/components/schemas/LocateElementAction"
-              },
-              {
-                "$ref": "#/components/schemas/ValidateAction"
-              },
-              {
-                "$ref": "#/components/schemas/PromptAction"
-              }
-            ],
-            "title": "Action",
-            "description": "The action to execute with its specific parameters",
-            "discriminator": {
-              "propertyName": "type",
-              "mapping": {
-                "ai_act": "#/components/schemas/ActAction",
-                "ai_click": "#/components/schemas/ClickAction",
-                "ai_input_text": "#/components/schemas/InputTextAction",
-                "ai_select_option": "#/components/schemas/SelectOptionAction",
-                "ai_upload_file": "#/components/schemas/UploadFileAction",
-                "extract": "#/components/schemas/ExtractAction",
-                "locate_element": "#/components/schemas/LocateElementAction",
-                "prompt": "#/components/schemas/PromptAction",
-                "validate": "#/components/schemas/ValidateAction"
-              }
-            }
-          }
-        },
-        "type": "object",
-        "required": [
-          "url",
-          "action"
-        ],
-        "title": "RunSdkActionRequest",
-        "description": "Request to run a single SDK action."
-      },
-      "RunSdkActionResponse": {
-        "properties": {
-          "workflow_run_id": {
-            "type": "string",
-            "title": "Workflow Run Id",
-            "description": "The workflow run ID used for this action"
-          },
-          "result": {
-            "anyOf": [
-              {},
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Result",
-            "description": "The result from the action (e.g., selector, value, extracted data)"
-          }
-        },
-        "type": "object",
-        "required": [
-          "workflow_run_id"
-        ],
-        "title": "RunSdkActionResponse",
-        "description": "Response from running an SDK action."
       },
       "RunStatus": {
         "type": "string",
@@ -13692,73 +13177,6 @@
         },
         "type": "object",
         "title": "SelectOption"
-      },
-      "SelectOptionAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_select_option",
-            "title": "Type",
-            "default": "ai_select_option"
-          },
-          "selector": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "value": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Value",
-            "description": "Value to select",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the selection",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 10000
-          }
-        },
-        "type": "object",
-        "title": "SelectOptionAction",
-        "description": "Select option action parameters."
       },
       "SendEmailBlock": {
         "properties": {
@@ -16191,73 +15609,6 @@
         "title": "UpdateWorkflowFolderRequest",
         "description": "Request model for updating a workflow's folder assignment"
       },
-      "UploadFileAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_upload_file",
-            "title": "Type",
-            "default": "ai_upload_file"
-          },
-          "selector": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "file_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "File Url",
-            "description": "File URL for upload",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the upload",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 10000
-          }
-        },
-        "type": "object",
-        "title": "UploadFileAction",
-        "description": "Upload file action parameters."
-      },
       "UploadFileResponse": {
         "properties": {
           "s3_uri": {
@@ -16792,40 +16143,6 @@
           "confidence_float"
         ],
         "title": "UserDefinedError"
-      },
-      "ValidateAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "validate",
-            "title": "Type",
-            "default": "validate"
-          },
-          "prompt": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "Validation criteria or condition to check"
-          },
-          "model": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Model",
-            "description": "Optional model configuration"
-          }
-        },
-        "type": "object",
-        "required": [
-          "prompt"
-        ],
-        "title": "ValidateAction",
-        "description": "Validate action parameters."
       },
       "ValidationBlock": {
         "properties": {
