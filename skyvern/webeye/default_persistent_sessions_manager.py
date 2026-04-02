@@ -10,7 +10,7 @@ import structlog
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import BrowserSessionClosed, BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
@@ -221,6 +221,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         if persistent_browser_session is None:
             raise Exception(f"Persistent browser session not found for {browser_session_id}")
+
+        if is_final_status(persistent_browser_session.status):
+            raise BrowserSessionClosed(browser_session_id)
 
         await self.occupy_browser_session(
             session_id=browser_session_id,
