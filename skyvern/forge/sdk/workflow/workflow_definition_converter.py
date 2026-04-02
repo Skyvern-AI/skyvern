@@ -5,7 +5,7 @@ from typing import Any, cast
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_LOGIN_COMPLETE_CRITERION
+from skyvern.constants import DEFAULT_LOGIN_COMPLETE_CRITERION, DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -638,6 +638,9 @@ def block_yaml_to_block(
         # This guides the LLM to check for actual logged-in indicators (username in header,
         # account menu, logout button) rather than relying on page location, which fails on sites
         # that redirect to the homepage after successful login.
+        login_navigation_goal = block_yaml.navigation_goal
+        if not login_navigation_goal or not login_navigation_goal.strip():
+            login_navigation_goal = DEFAULT_LOGIN_PROMPT
         login_complete_criterion = block_yaml.complete_criterion
         if not login_complete_criterion or not login_complete_criterion.strip():
             login_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION
@@ -647,7 +650,7 @@ def block_yaml_to_block(
             title=block_yaml.title,
             engine=block_yaml.engine,
             parameters=login_block_parameters,
-            navigation_goal=block_yaml.navigation_goal,
+            navigation_goal=login_navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
             max_steps_per_run=block_yaml.max_steps_per_run,
             max_retries=block_yaml.max_retries,

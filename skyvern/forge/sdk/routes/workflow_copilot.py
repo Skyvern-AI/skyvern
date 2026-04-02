@@ -11,6 +11,7 @@ from fastapi import Depends, HTTPException, Request, status
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
 
+from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -19,7 +20,6 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
-from skyvern.forge.sdk.routes.run_blocks import DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
