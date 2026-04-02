@@ -33,11 +33,15 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         async def get_credential_item(self, _db_credential: object) -> FakeCredentialItem:
             return FakeCredentialItem()
 
-    class FakeDatabase:
+    class FakeCredentialRepo:
         async def get_credential(self, credential_id: str, organization_id: str) -> object:
             assert credential_id == "cred-1"
             assert organization_id == "org-1"
             return db_credential
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.credentials = FakeCredentialRepo()
 
     fake_app = SimpleNamespace(
         DATABASE=FakeDatabase(),
