@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import re
 from typing import Literal, Sequence
@@ -14,6 +15,66 @@ from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.schemas.scripts import ScriptBranchHit, ScriptFallbackEpisode
 
 LOG = structlog.get_logger()
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockReviewResult:
+    """Result of reviewing a single block, carrying the code and LLM artifacts."""
+
+    code: str
+    original_prompt: str
+    """The initial prompt sent to the LLM, containing full fallback episode context,
+    DOM snapshots, and review instructions."""
+    final_prompt: str
+    """The prompt that produced the accepted code. Same as original_prompt on first
+    attempt; on retry this is the retry prompt with validation error context."""
+    llm_response_raw: str
+
+
+async def store_review_artifacts(
+    organization_id: str,
+    script_id: str,
+    script_version: int,
+    review_results: dict[str, BlockReviewResult],
+) -> None:
+    """Store reviewer prompt/response artifacts for each reviewed block.
+
+    Failures are logged as warnings but never propagate — artifact persistence
+    must not block the review pipeline.
+    """
+    for block_label, result in review_results.items():
+        try:
+            await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                organization_id=organization_id,
+                script_id=script_id,
+                script_version=script_version,
+                file_path=f"review/{block_label}_prompt.txt",
+                data=result.original_prompt.encode("utf-8"),
+            )
+            # Store retry prompt separately if the reviewer retried (validation failure)
+            if result.final_prompt != result.original_prompt:
+                await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    script_version=script_version,
+                    file_path=f"review/{block_label}_retry_prompt.txt",
+                    data=result.final_prompt.encode("utf-8"),
+                )
+            await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                organization_id=organization_id,
+                script_id=script_id,
+                script_version=script_version,
+                file_path=f"review/{block_label}_response.json",
+                data=result.llm_response_raw.encode("utf-8"),
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to store reviewer artifacts",
+                block_label=block_label,
+                script_id=script_id,
+                exc_info=True,
+            )
+
 
 # Exhaustive allowlist of valid page.* API references.
 # Anything not in this set that appears as `page.<name>` in generated code is an error.
@@ -86,10 +147,10 @@ class ScriptReviewer:
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
         run_parameter_values: dict[str, str] | None = None,
         user_instructions: str | None = None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, BlockReviewResult] | None:
         """Review fallback episodes and generate updated code for affected blocks.
 
-        Returns {block_label: updated_code} or None if review fails.
+        Returns {block_label: BlockReviewResult} or None if review fails.
         """
         if not episodes:
             return None
@@ -173,11 +234,11 @@ class ScriptReviewer:
                 episodes_by_block[episode.block_label] = []
             episodes_by_block[episode.block_label].append(episode)
 
-        updated_blocks: dict[str, str] = {}
+        updated_blocks: dict[str, BlockReviewResult] = {}
 
         for block_label, block_episodes in episodes_by_block.items():
             try:
-                updated_code = await self._review_block(
+                result = await self._review_block(
                     organization_id=organization_id,
                     workflow_permanent_id=workflow_permanent_id,
                     script_revision_id=script_revision_id,
@@ -191,8 +252,8 @@ class ScriptReviewer:
                     user_instructions=user_instructions,
                     historical_run_params=historical_run_params,
                 )
-                if updated_code:
-                    updated_blocks[block_label] = updated_code
+                if result:
+                    updated_blocks[block_label] = result
             except Exception:
                 LOG.exception(
                     "ScriptReviewer: failed to review block",
@@ -213,14 +274,14 @@ class ScriptReviewer:
         user_instructions: str,
         episodes: list[ScriptFallbackEpisode] | None = None,
         run_parameter_values: dict[str, str] | None = None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, BlockReviewResult] | None:
         """Review script blocks using user-provided instructions.
 
         When episodes are available, they are included as context for the LLM.
         When no episodes are available, the reviewer works from the existing code
         and the user's instructions alone.
 
-        Returns {block_label: updated_code} or None if review fails.
+        Returns {block_label: BlockReviewResult} or None if review fails.
         """
         if episodes:
             return await self.review_fallback_episodes(
@@ -249,10 +310,10 @@ class ScriptReviewer:
             )
             return None
 
-        updated_blocks: dict[str, str] = {}
+        updated_blocks: dict[str, BlockReviewResult] = {}
         for block_label, existing_code in block_codes.items():
             try:
-                updated_code = await self._review_block(
+                result = await self._review_block(
                     organization_id=organization_id,
                     workflow_permanent_id=workflow_permanent_id,
                     script_revision_id=script_revision_id,
@@ -264,8 +325,8 @@ class ScriptReviewer:
                     user_instructions=user_instructions,
                     preloaded_code=existing_code,
                 )
-                if updated_code:
-                    updated_blocks[block_label] = updated_code
+                if result:
+                    updated_blocks[block_label] = result
             except Exception:
                 LOG.exception(
                     "ScriptReviewer: failed to review block with instructions",
@@ -559,8 +620,12 @@ class ScriptReviewer:
         user_instructions: str | None = None,
         preloaded_code: str | None = None,
         historical_run_params: dict[str, dict[str, str]] | None = None,
-    ) -> str | None:
-        """Review a single block's fallback episodes and generate updated code."""
+    ) -> BlockReviewResult | None:
+        """Review a single block's fallback episodes and generate updated code.
+
+        Returns a BlockReviewResult with the code, prompt, and raw LLM response,
+        or None if review fails.
+        """
         LOG.info(
             "ScriptReviewer: starting block review",
             block_label=block_label,
@@ -870,13 +935,60 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, hardcoded_error, function_signature)
                     continue
 
+                # Validate ai='proactive' misuse (should be 'fallback' on interaction methods)
+                proactive_error = self._validate_proactive_misuse(updated_code)
+                if proactive_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: proactive misuse detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=proactive_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, proactive_error, function_signature)
+                    continue
+
+                # Validate fragile auto-generated selectors
+                fragile_error = self._validate_fragile_selectors(updated_code)
+                if fragile_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: fragile selector detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=fragile_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, fragile_error, function_signature)
+                    continue
+
+                # Validate hardcoded run-specific data in selectors/prompts
+                run_data_error = self._validate_hardcoded_run_data(updated_code)
+                if run_data_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: hardcoded run data detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=run_data_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, run_data_error, function_signature)
+                    continue
+
                 LOG.info(
                     "ScriptReviewer: generated updated code for block",
                     block_label=block_label,
                     attempt=attempt,
                     code_length=len(updated_code),
                 )
-                return updated_code
+                return BlockReviewResult(
+                    code=updated_code,
+                    original_prompt=reviewer_prompt,
+                    final_prompt=current_prompt,
+                    llm_response_raw=json.dumps(
+                        llm_response if not isinstance(llm_response, str) else {"raw": llm_response},
+                        default=str,
+                    ),
+                )
 
             except Exception:
                 LOG.exception(
@@ -1843,6 +1955,216 @@ class ScriptReviewer:
             f"These values will break when the workflow runs with different parameters. "
             f"Found {len(hardcoded)} hardcoded value(s): {examples}. "
             f"Replace ALL hardcoded parameter values with context.parameters['key'] references."
+        )
+
+    # Methods whose primary purpose is interaction — ai='proactive' on these
+    # defeats caching by always invoking the LLM even when the selector works.
+    _INTERACTION_METHODS: frozenset[str] = frozenset({"click", "fill", "fill_autocomplete", "type", "select_option"})
+
+    # Regex to find page.<method>( calls
+    _PAGE_CALL_RE: re.Pattern[str] = re.compile(r"""\bpage\.(\w+)\s*\(""")
+
+    def _validate_proactive_misuse(self, code: str) -> str | None:
+        """Flag ai='proactive' on interaction methods (click, fill, type, select_option).
+
+        Using ai='proactive' means the LLM is always invoked even when the selector
+        works, defeating the zero-LLM-cost goal of caching. These should almost always
+        use ai='fallback' instead.
+
+        Returns an error message or None if no issues found.
+        """
+        issues: list[str] = []
+        lines = code.split("\n")
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                i += 1
+                continue
+            match = self._PAGE_CALL_RE.search(lines[i])
+            if match and match.group(1) in self._INTERACTION_METHODS:
+                # Gather the full call (may span multiple lines)
+                call_text = lines[i]
+                end_line = self._find_call_end(lines, i)
+                if end_line > i:
+                    call_text = "\n".join(lines[i : end_line + 1])
+                if re.search(r"""\bai\s*=\s*['"]proactive['"]""", call_text):
+                    issues.append(f"page.{match.group(1)}() on line {i + 1}")
+                i = end_line + 1
+            else:
+                i += 1
+
+        if not issues:
+            return None
+
+        return (
+            f"ai='proactive' used on interaction methods: {', '.join(issues[:5])}. "
+            f"Using ai='proactive' on interaction methods ({'/'.join(sorted(self._INTERACTION_METHODS))}) means the LLM is "
+            f"ALWAYS invoked even when the selector works, defeating the zero-LLM-cost "
+            f"goal of caching. Change to ai='fallback' — this tries the selector first "
+            f"and only invokes the LLM if the selector fails."
+        )
+
+    # Known auto-generated ID patterns from popular web frameworks.
+    # These IDs change across deployments/sessions and break cached selectors.
+    _FRAGILE_ID_PATTERNS: list[re.Pattern[str]] = [
+        re.compile(r"#dnn_\w+"),  # DotNetNuke
+        re.compile(r"#ember[\-_]?\d+"),  # Ember.js
+        re.compile(r"#react-select-\d+"),  # React Select
+        re.compile(r"\[data-reactid=['\"][\d.]+['\"]\]"),  # React (legacy)
+        re.compile(r"#ext-gen-?\d+"),  # ExtJS
+        re.compile(r"\.css-[a-z0-9]{4,}"),  # CSS-in-JS (Emotion, styled-components)
+        re.compile(r"\.MuiButton-root|\.Mui\w+-\w+", re.IGNORECASE),  # Material UI
+        re.compile(r"#__next\w+"),  # Next.js internal
+        re.compile(r"\[data-v-[a-f0-9]+\]"),  # Vue scoped styles
+    ]
+
+    # Regex to find selector= string values in page.* calls.
+    # Handles nested quotes: selector='a:has-text("X")' or selector="a:has-text('X')"
+    _SELECTOR_SINGLE_RE: re.Pattern[str] = re.compile(r"""\bselector\s*=\s*f?'([^']*(?:"[^"]*"[^']*)*)'""")
+    _SELECTOR_DOUBLE_RE: re.Pattern[str] = re.compile(r'''\bselector\s*=\s*f?"([^"]*(?:'[^']*'[^"]*)*)"''')
+
+    def _find_selector_values(self, text: str) -> list[str]:
+        """Extract selector string values from text (single or multi-line), handling nested quotes."""
+        results = []
+        for m in self._SELECTOR_SINGLE_RE.finditer(text):
+            results.append(m.group(1))
+        for m in self._SELECTOR_DOUBLE_RE.finditer(text):
+            results.append(m.group(1))
+        return results
+
+    def _validate_fragile_selectors(self, code: str) -> str | None:
+        """Flag selectors using auto-generated IDs from web frameworks.
+
+        Auto-generated IDs (e.g., #dnn_ctl00_xxx, #ember-123, .css-1a2b3c) change
+        across deployments and are a leading cause of selector breakage and AI fallbacks.
+
+        Uses multi-line call gathering so selectors split across lines are still caught.
+
+        Returns an error message or None if no issues found.
+        """
+        issues: list[str] = []
+        lines = code.split("\n")
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                i += 1
+                continue
+            # Gather full call text for page.* calls that may span multiple lines
+            match = self._PAGE_CALL_RE.search(lines[i])
+            if match:
+                end_line = self._find_call_end(lines, i)
+                call_text = "\n".join(lines[i : end_line + 1]) if end_line > i else lines[i]
+                line_num = i + 1  # report the starting line
+            else:
+                call_text = lines[i]
+                line_num = i + 1
+            for selector_val in self._find_selector_values(call_text):
+                for pattern in self._FRAGILE_ID_PATTERNS:
+                    if pattern.search(selector_val):
+                        issues.append(
+                            f"line {line_num}: selector='{selector_val[:60]}' matches fragile pattern {pattern.pattern}"
+                        )
+                        break  # one match per selector is enough
+            i = end_line + 1 if match and end_line > i else i + 1
+
+        if not issues:
+            return None
+
+        return (
+            f"Fragile auto-generated selectors detected: {'; '.join(issues[:3])}. "
+            f"These IDs are generated by web frameworks (DotNetNuke, Ember, React, MUI, etc.) "
+            f"and change across deployments. Replace with stable selectors: "
+            f"aria-label, placeholder, name, role, data-testid, or :has-text() with stable text. "
+            f"If no stable selector exists, use ai='fallback' with a descriptive prompt and NO selector."
+        )
+
+    # Regex for dates in common formats (MM/DD/YYYY, M/D/YYYY, YYYY-MM-DD)
+    # TODO: Could tighten month/day ranges to reduce false positives on URL-like strings,
+    # but in practice LLM-generated selectors rarely contain such values.
+    _DATE_RE: re.Pattern[str] = re.compile(r"\b(?:\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})\b")
+
+    # Regex for :has-text("X") where X is very short (1-2 chars) — likely hardcoded run data
+    _SHORT_HAS_TEXT_RE: re.Pattern[str] = re.compile(r""":has-text\(\s*['"](.{1,2})['"]\s*\)""")
+
+    # TODO: prompt extraction regex won't handle triple-quoted or multi-line prompt values.
+    # Acceptable for now since LLM-generated code rarely uses triple-quoted prompts.
+    _PROMPT_RE: re.Pattern[str] = re.compile(r"""\bprompt\s*=\s*(?:f?['"])(.*?)(?:['"])""", re.DOTALL)
+
+    def _validate_hardcoded_run_data(self, code: str) -> str | None:
+        """Flag selectors and prompts containing hardcoded run-specific data.
+
+        Catches:
+        1. Date literals (MM/DD/YYYY, YYYY-MM-DD) in selector= or prompt= values
+           that should use context.parameters instead
+        2. Very short :has-text() values (1-2 chars) that are likely meaningless
+           data from the original recording (e.g., a:has-text("6"))
+
+        Uses multi-line call gathering so selectors/prompts split across lines are still caught.
+
+        Returns an error message or None if no issues found.
+        """
+        issues: list[str] = []
+        lines = code.split("\n")
+
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                i += 1
+                continue
+
+            # Gather full call text for page.* calls that may span multiple lines
+            match = self._PAGE_CALL_RE.search(lines[i])
+            if match:
+                end_line = self._find_call_end(lines, i)
+                call_text = "\n".join(lines[i : end_line + 1]) if end_line > i else lines[i]
+            else:
+                call_text = lines[i]
+            line_num = i + 1  # report the starting line
+
+            # Check selectors for hardcoded dates
+            for selector_val in self._find_selector_values(call_text):
+                # Check for dates in selectors
+                date_match = self._DATE_RE.search(selector_val)
+                if date_match:
+                    issues.append(
+                        f"line {line_num}: selector contains hardcoded date '{date_match.group()}' — "
+                        f"use context.parameters for date values"
+                    )
+
+                # Check for very short :has-text() values
+                for ht_match in self._SHORT_HAS_TEXT_RE.finditer(selector_val):
+                    short_text = ht_match.group(1)
+                    # Allow common stable short texts
+                    if short_text.lower() not in {"ok", "no", "x", "✓", "→", "←"}:
+                        issues.append(
+                            f'line {line_num}: selector has :has-text("{short_text}") — '
+                            f"a 1-2 character :has-text() value is almost certainly "
+                            f"hardcoded data from the recording run, not a stable selector"
+                        )
+
+            # Check prompts for hardcoded dates (only in prompt= kwargs, not general strings)
+            prompt_match = self._PROMPT_RE.search(call_text)
+            if prompt_match:
+                prompt_val = prompt_match.group(1)
+                date_match = self._DATE_RE.search(prompt_val)
+                if date_match:
+                    issues.append(
+                        f"line {line_num}: prompt contains hardcoded date '{date_match.group()}' — "
+                        f"use a parameter reference like context.parameters['download_start_date']"
+                    )
+            i = end_line + 1 if match and end_line > i else i + 1
+
+        if not issues:
+            return None
+
+        return (
+            f"Hardcoded run-specific data detected: {'; '.join(issues[:3])}. "
+            f"Dates, invoice numbers, and other per-run values must NOT be hardcoded in "
+            f"selectors or prompts. Use context.parameters['key'] for dynamic values, "
+            f"or use ai='fallback' with a generic prompt that describes the intent."
         )
 
     # Regexes for extracting branch return values from generated conditional code.

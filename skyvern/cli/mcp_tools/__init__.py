@@ -48,7 +48,13 @@ from .folder import (
 )
 from .inspection import (
     skyvern_console_messages,
+    skyvern_get_errors,
+    skyvern_get_html,
+    skyvern_get_styles,
+    skyvern_get_value,
     skyvern_handle_dialog,
+    skyvern_har_start,
+    skyvern_har_stop,
     skyvern_network_requests,
 )
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
@@ -65,6 +71,13 @@ from .session import (
     skyvern_browser_session_create,
     skyvern_browser_session_get,
     skyvern_browser_session_list,
+)
+from .state import skyvern_state_load, skyvern_state_save
+from .storage import (
+    skyvern_clear_local_storage,
+    skyvern_clear_session_storage,
+    skyvern_get_session_storage,
+    skyvern_set_session_storage,
 )
 from .tabs import (
     skyvern_tab_close,
@@ -157,6 +170,8 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | "Switch to [tab]" / "Go to tab [N]" | skyvern_tab_switch | Change active tab |
 | "Close tab" / "Close this tab" | skyvern_tab_close | Close tab by ID or index |
 | "Wait for popup" / "A new tab should open" | skyvern_tab_wait_for_new | Waits for popup/new tab |
+| "Save login state" / "Remember this session" | skyvern_state_save | Persists cookies + storage to file |
+| "Restore login" / "Load saved state" | skyvern_state_load | Restores cookies + storage from file |
 
 ## Critical Rules
 1. Use Skyvern for all browser tasks. curl/wget/requests are fine for APIs and file downloads.
@@ -391,10 +406,26 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_switch)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_main)
 mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_frame_list)
 
-# -- Inspection tools (console, network, dialog) --
+# -- Auth state persistence --
+mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_save)
+mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_load)
+
+# -- Inspection tools (console, network, dialog, page errors, DOM) --
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_console_messages)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_requests)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_handle_dialog)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_errors)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_start)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_stop)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_html)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_value)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_styles)
+
+# -- Web storage (sessionStorage + localStorage) --
+mcp.tool(tags={"storage"}, annotations=_RO)(skyvern_get_session_storage)
+mcp.tool(tags={"storage"}, annotations=_MUT)(skyvern_set_session_storage)
+mcp.tool(tags={"storage"}, annotations=_DEST)(skyvern_clear_session_storage)
+mcp.tool(tags={"storage"}, annotations=_DEST)(skyvern_clear_local_storage)
 
 # -- Block discovery + validation (no browser needed) --
 mcp.tool(tags={"block_discovery"}, annotations=_RO)(skyvern_block_schema)
@@ -473,10 +504,21 @@ __all__ = [
     "skyvern_frame_switch",
     "skyvern_frame_main",
     "skyvern_frame_list",
-    # Inspection (console, network, dialog)
+    # Inspection (console, network, dialog, page errors, DOM)
     "skyvern_console_messages",
     "skyvern_network_requests",
     "skyvern_handle_dialog",
+    "skyvern_get_errors",
+    "skyvern_har_start",
+    "skyvern_har_stop",
+    "skyvern_get_html",
+    "skyvern_get_value",
+    "skyvern_get_styles",
+    # Web storage
+    "skyvern_get_session_storage",
+    "skyvern_set_session_storage",
+    "skyvern_clear_session_storage",
+    "skyvern_clear_local_storage",
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
@@ -506,6 +548,9 @@ __all__ = [
     "skyvern_script_versions",
     "skyvern_script_fallback_episodes",
     "skyvern_script_deploy",
+    # Auth state persistence
+    "skyvern_state_save",
+    "skyvern_state_load",
     # Prompts
     "build_workflow",
     "debug_automation",

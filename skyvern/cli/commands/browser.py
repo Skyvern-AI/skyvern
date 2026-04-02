@@ -23,8 +23,13 @@ from skyvern.cli.core.browser_ops import (
     do_frame_list,
     do_frame_main,
     do_frame_switch,
+    do_get_html,
+    do_get_styles,
+    do_get_value,
     do_navigate,
     do_screenshot,
+    do_state_load,
+    do_state_save,
 )
 from skyvern.cli.core.client import get_skyvern
 from skyvern.cli.core.guards import (
@@ -42,12 +47,17 @@ from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
+from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
 
 browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
 frame_app = typer.Typer(help="Manage iframe context.", no_args_is_help=True)
+state_app = typer.Typer(help="Save and load browser auth state.", no_args_is_help=True)
+storage_app = typer.Typer(help="Read, write, and clear web storage.", no_args_is_help=True)
 browser_app.add_typer(session_app, name="session")
 browser_app.add_typer(frame_app, name="frame")
+browser_app.add_typer(state_app, name="state")
+browser_app.add_typer(storage_app, name="storage")
 
 
 @dataclass(frozen=True)
@@ -1517,5 +1527,324 @@ def frame_list_cmd(
     try:
         data = asyncio.run(_run())
         output(data, action="frame_list", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── State persistence commands ──────────────────────────────────────
+
+
+@state_app.command("save")
+def state_save_cmd(
+    file_path: str = typer.Argument(help="Path to save state file (JSON)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Save browser auth state (cookies + localStorage + sessionStorage) to a file."""
+    from skyvern.cli.mcp_tools.state import _validate_state_path
+
+    async def _run() -> dict:
+        resolved = _validate_state_path(file_path)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await do_state_save(page.page, browser, resolved)
+        return {
+            "file_path": result.file_path,
+            "cookie_count": result.cookie_count,
+            "local_storage_count": result.local_storage_count,
+            "session_storage_count": result.session_storage_count,
+            "url": result.url,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="state_save", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@state_app.command("load")
+def state_load_cmd(
+    file_path: str = typer.Argument(help="Path to state file (JSON) from state save."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Load browser auth state (cookies + localStorage + sessionStorage) from a file."""
+    from urllib.parse import urlparse
+
+    from skyvern.cli.mcp_tools.state import _validate_state_path
+
+    async def _run() -> dict:
+        resolved = _validate_state_path(file_path, must_exist=True)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        current_domain = urlparse(page.page.url).hostname or ""
+        result = await do_state_load(page.page, browser, resolved, current_domain)
+        return {
+            "cookie_count": result.cookie_count,
+            "local_storage_count": result.local_storage_count,
+            "session_storage_count": result.session_storage_count,
+            "source_url": result.source_url,
+            "skipped_cookies": result.skipped_cookies,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="state_load", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── Web storage commands ────────────────────────────────────────────
+
+
+@storage_app.command("get-session")
+def storage_get_session_cmd(
+    keys: list[str] | None = typer.Argument(None, help="Specific keys to retrieve. Omit for all."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read sessionStorage values from the current page."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        if keys:
+            items = {}
+            for key in keys:
+                val = await page.page.evaluate(f"() => window.sessionStorage.getItem({json.dumps(key)})")
+                if val is not None:
+                    items[key] = val
+        else:
+            items = await page.page.evaluate("() => Object.fromEntries(Object.entries(window.sessionStorage))")
+        return {"items": items, "count": len(items)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("set-session")
+def storage_set_session_cmd(
+    key: str = typer.Argument(help="The key to set."),
+    value: str = typer.Argument(help="The value to store."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Set a sessionStorage key-value pair."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        await page.page.evaluate("(args) => window.sessionStorage.setItem(args[0], args[1])", [key, value])
+        return {"key": key, "value_length": len(value)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="set_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("clear-session")
+def storage_clear_session_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Clear all sessionStorage entries."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        count = await page.page.evaluate(
+            "() => { const n = window.sessionStorage.length; window.sessionStorage.clear(); return n; }"
+        )
+        return {"cleared_count": count}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="clear_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("clear-local")
+def storage_clear_local_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Clear all localStorage entries."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        count = await page.page.evaluate(
+            "() => { const n = window.localStorage.length; window.localStorage.clear(); return n; }"
+        )
+        return {"cleared_count": count}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="clear_local_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── Page JS errors command ───────────────────────────────────────────
+
+
+@browser_app.command("get-errors")
+def get_errors_cmd(
+    text: str | None = typer.Option(None, "--text", help="Filter by substring match (case-insensitive)."),
+    clear: bool = typer.Option(False, "--clear", help="Clear the buffer after reading."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read uncaught JavaScript errors from the browser page."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_get_errors
+
+    async def _run() -> dict:
+        return await skyvern_get_errors(text=text, clear=clear, session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="get_errors", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── HAR recording commands ───────────────────────────────────────────
+
+
+@browser_app.command("har-start")
+def har_start_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Start recording network traffic in HAR format."""
+
+    async def _run() -> dict:
+        return await skyvern_har_start(session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="har_start", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("har-stop")
+def har_stop_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Stop HAR recording and return captured traffic."""
+
+    async def _run() -> dict:
+        return await skyvern_har_stop(session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="har_stop", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── DOM Inspection commands ──────────────────────────────────────────
+
+
+@browser_app.command("get-html")
+def get_html_cmd(
+    selector: str = typer.Argument(help="CSS or XPath selector for the element."),
+    outer: bool = typer.Option(False, "--outer", help="Return outerHTML instead of innerHTML."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get the HTML content of a DOM element."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        html = await do_get_html(page.page, selector, outer=outer)
+        return {"html": html, "selector": selector, "outer": outer, "length": len(html)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_html", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("get-value")
+def get_value_cmd(
+    selector: str = typer.Argument(help="CSS or XPath selector for the input element."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get the current value of a form input element."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        value = await do_get_value(page.page, selector)
+        return {"value": value, "selector": selector}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_value", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("get-styles")
+def get_styles_cmd(
+    selector: str = typer.Argument(help="CSS or XPath selector for the element."),
+    properties: list[str] | None = typer.Argument(None, help="Specific CSS properties (e.g. color font-size)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get computed CSS styles from a DOM element."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        styles = await do_get_styles(page.page, selector, properties=properties)
+        return {"styles": styles, "selector": selector, "count": len(styles)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_styles", json_mode=json_output)
     except Exception as e:
         output_error(str(e), json_mode=json_output)

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
+from urllib.parse import parse_qsl, urlparse
 
 import structlog
 from pydantic import Field
@@ -31,6 +33,9 @@ _SECRET_QUERY_PARAMS = frozenset(
         "auth",
     }
 )
+
+_REDACTED_HEADERS = frozenset({"authorization", "cookie", "set-cookie", "proxy-authorization"})
+_SECRET_QS_NAMES = frozenset(p.lower() for p in _SECRET_QUERY_PARAMS)
 
 _STATELESS_ERROR_MSG = (
     "Inspection tools are not supported in stateless HTTP mode. "
@@ -74,7 +79,7 @@ def _redact_url(url: str) -> str:
 
 
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
-    """Create console/network/dialog handlers bound to a specific page."""
+    """Create console/network/dialog/pageerror handlers bound to a specific page."""
 
     def _on_console(msg: Any) -> None:
         try:
@@ -105,6 +110,10 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
                 pass
 
             content_length = response.headers.get("content-length")
+            try:
+                response_size = int(content_length) if content_length is not None else None
+            except (ValueError, TypeError):
+                response_size = None
             state.network_requests.append(
                 {
                     "url": _redact_url(response.url),
@@ -112,11 +121,72 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
                     "status": response.status,
                     "content_type": response.headers.get("content-type", ""),
                     "timing_ms": round(timing, 1),
-                    "response_size": int(content_length) if content_length is not None else None,
+                    "response_size": response_size,
                     "page_url": raw_page.url,
                     "tab_id": str(id(raw_page)),
                 }
             )
+
+            # HAR recording: capture enhanced entry when enabled
+            if state.har_enabled:
+                req_headers = []
+                try:
+                    for k, v in response.request.headers.items():
+                        if k.lower() not in _REDACTED_HEADERS:
+                            req_headers.append({"name": k, "value": v})
+                except Exception:
+                    pass
+
+                resp_headers = []
+                try:
+                    for k, v in response.headers.items():
+                        if k.lower() not in _REDACTED_HEADERS:
+                            resp_headers.append({"name": k, "value": v})
+                except Exception:
+                    pass
+
+                # Approximate request start from response time minus elapsed
+                started = datetime.now(timezone.utc) - timedelta(milliseconds=timing)
+                qs = [
+                    {"name": n, "value": "REDACTED" if n.lower() in _SECRET_QS_NAMES else v}
+                    for n, v in parse_qsl(urlparse(response.url).query)
+                ]
+
+                state._har_entries.append(
+                    {
+                        "startedDateTime": started.isoformat(),
+                        "time": round(timing, 1),
+                        "request": {
+                            "method": response.request.method,
+                            "url": _redact_url(response.url),
+                            "httpVersion": "HTTP/1.1",
+                            "headers": req_headers,
+                            "queryString": qs,
+                            "cookies": [],
+                            "headersSize": -1,
+                            "bodySize": -1,
+                        },
+                        "response": {
+                            "status": response.status,
+                            "statusText": response.status_text if hasattr(response, "status_text") else "",
+                            "httpVersion": "HTTP/1.1",
+                            "headers": resp_headers,
+                            "content": {
+                                "size": response_size if response_size is not None else -1,
+                                "mimeType": response.headers.get("content-type", ""),
+                            },
+                            "redirectURL": "",
+                            "headersSize": -1,
+                            "bodySize": -1,
+                            "cookies": [],
+                        },
+                        "timings": {
+                            "send": -1,
+                            "wait": round(timing, 1),
+                            "receive": -1,
+                        },
+                    }
+                )
         except Exception:
             pass
 
@@ -146,7 +216,24 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         else:
             event_record["action_taken"] = "dismissed"
 
-    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog}
+    def _on_pageerror(error: Any) -> None:
+        try:
+            try:
+                message = str(error)
+            except Exception:
+                message = "<unserializable error>"
+            state.page_errors.append(
+                {
+                    "message": message,
+                    "timestamp": time.time(),
+                    "page_url": raw_page.url,
+                    "tab_id": str(id(raw_page)),
+                }
+            )
+        except Exception:
+            pass
+
+    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog, "pageerror": _on_pageerror}
 
 
 def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
@@ -159,6 +246,7 @@ def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
     raw_page.on("console", handlers["console"])
     raw_page.on("response", handlers["response"])
     raw_page.on("dialog", handlers["dialog"])
+    raw_page.on("pageerror", handlers["pageerror"])
     state._hooked_page_ids.add(page_id)
     state._hooked_handlers_map[page_id] = handlers
 
@@ -386,3 +474,306 @@ async def skyvern_handle_dialog(
             "count": len(entries),
         },
     )
+
+
+# -- Page JS error tool --
+
+
+async def skyvern_get_errors(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    text: Annotated[
+        str | None,
+        Field(description="Filter by substring match in error message. Case-insensitive."),
+    ] = None,
+    clear: Annotated[
+        bool,
+        Field(description="Clear the buffer after reading. Default false."),
+    ] = False,
+) -> dict[str, Any]:
+    """Read uncaught JavaScript errors (exceptions) from the browser page.
+
+    Captures unhandled errors thrown by page scripts (window onerror / unhandledrejection).
+    These are distinct from console.error() messages — use skyvern_console_messages(level='error') for those.
+    Use text='...' to search for specific error messages.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_get_errors",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_get_errors", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+    has_filter = text is not None
+    entries = list(state.page_errors)
+
+    if text:
+        text_lower = text.lower()
+        entries = [e for e in entries if text_lower in e.get("message", "").lower()]
+
+    if clear:
+        if has_filter:
+            matched = {id(e) for e in entries}
+            state.page_errors = type(state.page_errors)(
+                (e for e in state.page_errors if id(e) not in matched),
+                maxlen=state.page_errors.maxlen,
+            )
+        else:
+            state.page_errors.clear()
+
+    return make_result(
+        "skyvern_get_errors",
+        browser_context=ctx,
+        data={
+            "errors": entries,
+            "count": len(entries),
+            "buffer_size": len(state.page_errors),
+        },
+    )
+
+
+# -- HAR recording tools --
+
+
+async def skyvern_har_start(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Start recording network traffic in HAR format.
+
+    All HTTP requests/responses will be captured until skyvern_har_stop is called.
+    The HAR buffer is cleared on start. Only one recording can be active at a time.
+    Use skyvern_har_stop to retrieve the HAR data.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_har_start",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_har_start", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+
+    if state.har_enabled:
+        return make_result(
+            "skyvern_har_start",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.ACTION_FAILED,
+                "HAR recording is already active",
+                "Call skyvern_har_stop first to stop the current recording",
+            ),
+        )
+
+    state._har_entries.clear()
+    state.har_enabled = True
+
+    return make_result(
+        "skyvern_har_start",
+        browser_context=ctx,
+        data={
+            "recording": True,
+            "message": "HAR recording started. Network traffic is being captured.",
+        },
+    )
+
+
+async def skyvern_har_stop(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Stop HAR recording and return the captured traffic as HAR 1.2 JSON.
+
+    Returns a complete HAR archive with all HTTP requests/responses captured since skyvern_har_start.
+    The HAR data can be imported into browser DevTools, Charles Proxy, or other HTTP analysis tools.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_har_stop",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_har_stop", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+
+    if not state.har_enabled:
+        return make_result(
+            "skyvern_har_stop",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.ACTION_FAILED,
+                "No active HAR recording",
+                "Call skyvern_har_start first to begin recording",
+            ),
+        )
+
+    entries = list(state._har_entries)
+    state.har_enabled = False
+    state._har_entries.clear()
+
+    har = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "Skyvern", "version": "1.0"},
+            "pages": [],
+            "entries": entries,
+        },
+    }
+
+    return make_result(
+        "skyvern_har_stop",
+        browser_context=ctx,
+        data={
+            "har": har,
+            "entry_count": len(entries),
+        },
+    )
+
+
+# -- DOM inspection tools --
+
+
+async def skyvern_get_html(
+    selector: Annotated[str, Field(description="CSS or XPath selector for the element.")],
+    outer: Annotated[
+        bool,
+        Field(description="If true, return outerHTML (includes the element itself). Default false (innerHTML)."),
+    ] = False,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Get the HTML content of a DOM element.
+
+    Returns innerHTML by default (children only). Set outer=true for outerHTML (includes the element tag).
+    Useful for inspecting page structure, checking rendered content, or debugging element contents.
+    """
+    from skyvern.cli.core.browser_ops import do_get_html
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_get_html", ok=False, error=no_browser_error())
+
+    try:
+        html = await do_get_html(page, selector, outer=outer)
+        return make_result(
+            "skyvern_get_html",
+            browser_context=ctx,
+            data={
+                "html": html,
+                "selector": selector,
+                "outer": outer,
+                "length": len(html),
+            },
+        )
+    except Exception as e:
+        return make_result(
+            "skyvern_get_html",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page"),
+        )
+
+
+async def skyvern_get_value(
+    selector: Annotated[str, Field(description="CSS or XPath selector for the input element.")],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Get the current value of a form input element.
+
+    Works with <input>, <textarea>, and <select> elements.
+    Returns the current value (what the user typed or selected), not the placeholder or label.
+    """
+    from skyvern.cli.core.browser_ops import do_get_value
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_get_value", ok=False, error=no_browser_error())
+
+    try:
+        value = await do_get_value(page, selector)
+        return make_result(
+            "skyvern_get_value",
+            browser_context=ctx,
+            data={
+                "value": value,
+                "selector": selector,
+            },
+        )
+    except Exception as e:
+        return make_result(
+            "skyvern_get_value",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an input/textarea/select element"
+            ),
+        )
+
+
+async def skyvern_get_styles(
+    selector: Annotated[str, Field(description="CSS or XPath selector for the element.")],
+    properties: Annotated[
+        list[str] | None,
+        Field(description="Specific CSS properties to retrieve (e.g. ['color', 'font-size']). Omit for all (max 100)."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Get computed CSS styles from a DOM element.
+
+    Returns the browser's computed style values (after CSS cascade + inheritance).
+    Specify properties for targeted lookup, or omit to get the first 100 computed properties.
+    Useful for verifying visual styling, checking visibility, or debugging layout issues.
+    """
+    from skyvern.cli.core.browser_ops import do_get_styles
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_get_styles", ok=False, error=no_browser_error())
+
+    try:
+        styles = await do_get_styles(page, selector, properties=properties)
+        return make_result(
+            "skyvern_get_styles",
+            browser_context=ctx,
+            data={
+                "styles": styles,
+                "selector": selector,
+                "count": len(styles),
+            },
+        )
+    except Exception as e:
+        return make_result(
+            "skyvern_get_styles",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page"),
+        )

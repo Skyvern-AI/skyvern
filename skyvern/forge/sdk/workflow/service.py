@@ -5438,7 +5438,7 @@ class WorkflowService:
         historical_episodes: list | None = None,
     ) -> None:
         """Run the AI Script Reviewer and create a new script version if successful."""
-        from skyvern.services.script_reviewer import ScriptReviewer
+        from skyvern.services.script_reviewer import BlockReviewResult, ScriptReviewer, store_review_artifacts
         from skyvern.services.workflow_script_service import create_script_version_from_review
 
         LOG.info(
@@ -5474,8 +5474,8 @@ class WorkflowService:
             regular_episodes = [ep for ep in episodes if ep.fallback_type != "conditional_agent"]
             conditional_episodes = [ep for ep in episodes if ep.fallback_type == "conditional_agent"]
 
-            updated_blocks: dict[str, str] = {}
-            conditional_blocks: dict[str, str] = {}
+            review_results: dict[str, BlockReviewResult] = {}
+            conditional_code: dict[str, str] = {}
 
             # Review regular fallback episodes (code failures, new page variants)
             if regular_episodes:
@@ -5489,7 +5489,7 @@ class WorkflowService:
                     run_parameter_values=run_parameter_values,
                 )
                 if regular_updates:
-                    updated_blocks.update(regular_updates)
+                    review_results.update(regular_updates)
 
             # Review conditional blocks that ran via agent — try to convert to code
             if conditional_episodes:
@@ -5500,8 +5500,11 @@ class WorkflowService:
                     run_parameter_values=run_parameter_values,
                 )
                 if conditional_updates:
-                    conditional_blocks.update(conditional_updates)
-                    updated_blocks.update(conditional_updates)
+                    conditional_code.update(conditional_updates)
+
+            # Build code-only dicts for create_script_version_from_review
+            updated_blocks: dict[str, str] = {label: r.code for label, r in review_results.items()}
+            updated_blocks.update(conditional_code)
 
             if not updated_blocks:
                 LOG.info(
@@ -5534,7 +5537,7 @@ class WorkflowService:
                     updated_blocks=updated_blocks,
                     workflow=workflow,
                     workflow_run=workflow_run,
-                    conditional_blocks=conditional_blocks,
+                    conditional_blocks=conditional_code,
                 )
 
                 if new_script:
@@ -5542,7 +5545,15 @@ class WorkflowService:
                         "Script reviewer created new version",
                         workflow_permanent_id=workflow.workflow_permanent_id,
                         new_version=new_script.version,
-                        conditional_coded=list(conditional_blocks.keys()) if conditional_blocks else [],
+                        conditional_coded=list(conditional_code.keys()) if conditional_code else [],
+                    )
+
+                    # Store reviewer prompt/response artifacts alongside the new script version
+                    await store_review_artifacts(
+                        organization_id=workflow.organization_id,
+                        script_id=new_script.script_id,
+                        script_version=new_script.version,
+                        review_results=review_results,
                     )
 
             # Mark all episodes as reviewed
