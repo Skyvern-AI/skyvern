@@ -1883,3 +1883,51 @@ def find_cmd(
         output(data, action="find", json_mode=json_output)
     except Exception as e:
         output_error(str(e), json_mode=json_output)
+
+
+# ---------------------------------------------------------------------------
+
+
+@browser_app.command("clipboard-read")
+def clipboard_read_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read text from the browser clipboard."""
+    from skyvern.cli.mcp_tools.browser import skyvern_clipboard_read
+
+    async def _run() -> dict:
+        return await skyvern_clipboard_read(session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="clipboard_read", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("clipboard-write")
+def clipboard_write_cmd(
+    text: str = typer.Argument(..., help="Text to write to the clipboard."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Write text to the browser clipboard."""
+    from skyvern.cli.mcp_tools.browser import skyvern_clipboard_write
+
+    async def _run() -> dict:
+        return await skyvern_clipboard_write(text=text, session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="clipboard_write", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
