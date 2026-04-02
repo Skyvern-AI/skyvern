@@ -1,6 +1,4 @@
 export type { BodyUploadFileV1UploadFilePost } from "./BodyUploadFileV1UploadFilePost.js";
-export type { ChangeTierRequest } from "./ChangeTierRequest.js";
-export type { CheckoutSubscriptionRequest } from "./CheckoutSubscriptionRequest.js";
 export type { CreateBrowserProfileRequest } from "./CreateBrowserProfileRequest.js";
 export type { CreateBrowserSessionRequest } from "./CreateBrowserSessionRequest.js";
 export type { CreateScriptRequest } from "./CreateScriptRequest.js";
@@ -13,6 +11,7 @@ export type { FolderUpdate } from "./FolderUpdate.js";
 export type { GetCredentialsRequest } from "./GetCredentialsRequest.js";
 export type { GetFoldersRequest } from "./GetFoldersRequest.js";
 export type { GetRunArtifactsRequest } from "./GetRunArtifactsRequest.js";
+export type { GetRunsV2Request } from "./GetRunsV2Request.js";
 export type { GetScriptsRequest } from "./GetScriptsRequest.js";
 export type { GetWorkflowRequest } from "./GetWorkflowRequest.js";
 export type { GetWorkflowRunsRequest } from "./GetWorkflowRunsRequest.js";
