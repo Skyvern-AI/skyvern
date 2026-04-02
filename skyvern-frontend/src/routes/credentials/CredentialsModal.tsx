@@ -753,10 +753,10 @@ function CredentialsModal({
     ? updateCredentialMutation
     : createCredentialMutation;
 
-  const handleRenameOnly = (name: string, hasMetadataChanges: boolean) => {
+  const handleRenameOnly = (name: string) => {
     if (!editingCredential) return;
-    // Skip the API call if nothing actually changed
-    if (name === editingCredential.name && !hasMetadataChanges) {
+    // Skip the API call if the name hasn't actually changed
+    if (name === editingCredential.name) {
       reset();
       setIsOpen(false);
       return;
@@ -764,9 +764,6 @@ function CredentialsModal({
     renameCredentialMutation.mutate({
       id: editingCredential.credential_id,
       name,
-      tested_url: testUrl.trim() || undefined,
-      user_context: userContext.trim() || null,
-      save_browser_session_intent: testAndSave,
     });
   };
 
@@ -788,26 +785,14 @@ function CredentialsModal({
 
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
-      const hasMetadataChanges =
-        testUrl.trim() !== (editingCredential.tested_url ?? "") ||
-        testAndSave !==
-          (editingCredential.save_browser_session_intent ??
-            !!editingCredential.browser_profile_id) ||
-        userContext.trim() !== (editingCredential.user_context ?? "");
-
       if (!editingGroups.name && !editingGroups.values) {
-        if (!hasMetadataChanges) {
-          // Nothing was edited — close silently
-          reset();
-          setIsOpen(false);
-          return;
-        }
-        // Only metadata changed (no auth values edited) — save via PATCH
-        handleRenameOnly(name, hasMetadataChanges);
+        // Nothing was edited — close silently
+        reset();
+        setIsOpen(false);
         return;
       }
       if (editingGroups.name && !editingGroups.values) {
-        handleRenameOnly(name, hasMetadataChanges);
+        handleRenameOnly(name);
         return;
       }
     }
