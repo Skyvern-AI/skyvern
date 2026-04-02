@@ -609,6 +609,19 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
 _AUTO_MANAGED_PARAMETER_TYPES = frozenset({"credential"})
 
 
+def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return all block dicts from a block list, recursing into for_loop nested blocks."""
+    result: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        result.append(block)
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            result.extend(_iter_blocks_flat(loop_blocks))
+    return result
+
+
 async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> str:
     """Preserve auto-managed parameters (e.g. credential) when MCP update omits them.
 
@@ -637,7 +650,9 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
 
     existing_params: list[dict[str, Any]] = existing_wf_def.get("parameters", [])
 
-    injected = False
+    modified = False
+
+    # --- Step 1: Inject missing credential parameters into the parameters list ---
     for param in existing_params:
         if not isinstance(param, dict):
             continue
@@ -654,9 +669,45 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
             if ptype == "credential" and param.get("credential_id"):
                 injected_param["credential_id"] = param["credential_id"]
             update_params.append(injected_param)
-            injected = True
+            modified = True
 
-    if not injected:
+    # --- Step 2: Inject missing credential parameter keys into blocks ---
+    # Collect all auto-managed parameter keys from the existing workflow
+    all_cred_keys: set[str] = set()
+    for p in existing_params:
+        if isinstance(p, dict) and p.get("parameter_type") in _AUTO_MANAGED_PARAMETER_TYPES and p.get("key"):
+            all_cred_keys.add(p["key"])
+
+    if all_cred_keys:
+        existing_blocks: list[dict[str, Any]] = existing_wf_def.get("blocks", [])
+        update_blocks: list[dict[str, Any]] = wf_def.get("blocks", [])
+
+        # Map existing block labels to the credential parameter keys they reference
+        existing_block_cred_keys: dict[str, list[str]] = {}
+        for block in _iter_blocks_flat(existing_blocks):
+            label = block.get("label")
+            if not label:
+                continue
+            existing_pkeys = block.get("parameter_keys") or []
+            cred_keys = [k for k in existing_pkeys if k in all_cred_keys]
+            if cred_keys:
+                existing_block_cred_keys[label] = cred_keys
+
+        # Inject credential parameter keys into matching update blocks
+        if existing_block_cred_keys:
+            for block in _iter_blocks_flat(update_blocks):
+                label = block.get("label")
+                if not label or label not in existing_block_cred_keys:
+                    continue
+                block_pkeys: list[str] = list(block.get("parameter_keys") or [])
+                current_keys = set(block_pkeys)
+                for cred_key in existing_block_cred_keys[label]:
+                    if cred_key not in current_keys:
+                        block_pkeys.append(cred_key)
+                        modified = True
+                block["parameter_keys"] = block_pkeys
+
+    if not modified:
         return definition
 
     wf_def["parameters"] = update_params
