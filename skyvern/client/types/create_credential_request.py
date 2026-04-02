@@ -5,7 +5,6 @@ import typing
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .create_credential_request_credential import CreateCredentialRequestCredential
-from .credential_vault_type import CredentialVaultType
 from .skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 
 
@@ -27,11 +26,6 @@ class CreateCredentialRequest(UniversalBaseModel):
     credential: CreateCredentialRequestCredential = pydantic.Field()
     """
     The credential data to store
-    """
-
-    vault_type: typing.Optional[CredentialVaultType] = pydantic.Field(default=None)
-    """
-    Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
     """
 
     if IS_PYDANTIC_V2:

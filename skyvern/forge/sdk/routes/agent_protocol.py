@@ -840,7 +840,7 @@ async def import_workflow_from_pdf(
         raise
 
     # Validation passed! Create empty workflow v1 with status='importing'
-    empty_workflow = await app.DATABASE.create_workflow(
+    empty_workflow = await app.DATABASE.workflows.create_workflow(
         title=f"Importing {file_name}",
         workflow_definition={"parameters": [], "blocks": []},
         organization_id=current_org.organization_id,
@@ -862,7 +862,7 @@ async def import_workflow_from_pdf(
             )
 
             # Update v1 status to published (v1 won't show in list since v2 is latest version)
-            await app.DATABASE.update_workflow(
+            await app.DATABASE.workflows.update_workflow(
                 workflow_id=empty_workflow.workflow_id,
                 organization_id=current_org.organization_id,
                 status=WorkflowStatus.published,
@@ -886,7 +886,7 @@ async def import_workflow_from_pdf(
             sanitized_error = "Import failed. Please verify the PDF content and try again."
 
             # Mark v1 as import_failed with sanitized error
-            await app.DATABASE.update_workflow(
+            await app.DATABASE.workflows.update_workflow(
                 workflow_id=empty_workflow.workflow_id,
                 organization_id=current_org.organization_id,
                 status=WorkflowStatus.import_failed,
@@ -1100,12 +1100,12 @@ async def create_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Folder:
     analytics.capture("skyvern-oss-folder-create")
-    folder_model = await app.DATABASE.create_folder(
+    folder_model = await app.DATABASE.folders.create_folder(
         organization_id=current_org.organization_id,
         title=data.title,
         description=data.description,
     )
-    workflow_count = await app.DATABASE.get_folder_workflow_count(
+    workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder_model.folder_id,
         organization_id=current_org.organization_id,
     )
@@ -1141,14 +1141,14 @@ async def get_folder(
     folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Folder:
-    folder = await app.DATABASE.get_folder(
+    folder = await app.DATABASE.folders.get_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
     )
     if not folder:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
-    workflow_count = await app.DATABASE.get_folder_workflow_count(
+    workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
     )
@@ -1186,7 +1186,7 @@ async def get_folders(
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[Folder]:
-    folders = await app.DATABASE.get_folders(
+    folders = await app.DATABASE.folders.get_folders(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
@@ -1196,7 +1196,7 @@ async def get_folders(
     # Get workflow counts for all folders in a single query
     if folders:
         folder_ids = [folder.folder_id for folder in folders]
-        workflow_counts = await app.DATABASE.get_folder_workflow_counts_batch(
+        workflow_counts = await app.DATABASE.folders.get_folder_workflow_counts_batch(
             folder_ids=folder_ids,
             organization_id=current_org.organization_id,
         )
@@ -1243,7 +1243,7 @@ async def update_folder(
     data: FolderUpdate = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Folder:
-    folder = await app.DATABASE.update_folder(
+    folder = await app.DATABASE.folders.update_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
         title=data.title,
@@ -1252,7 +1252,7 @@ async def update_folder(
     if not folder:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
-    workflow_count = await app.DATABASE.get_folder_workflow_count(
+    workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
     )
@@ -1290,7 +1290,7 @@ async def delete_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict:
     analytics.capture("skyvern-oss-folder-delete")
-    success = await app.DATABASE.soft_delete_folder(
+    success = await app.DATABASE.folders.soft_delete_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
         delete_workflows=delete_workflows,
@@ -1327,7 +1327,7 @@ async def update_workflow_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     try:
-        workflow = await app.DATABASE.update_workflow_folder(
+        workflow = await app.DATABASE.folders.update_workflow_folder(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=current_org.organization_id,
             folder_id=data.folder_id,
@@ -3020,7 +3020,7 @@ async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
-    return await app.DATABASE.update_organization(
+    return await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
     )
@@ -3061,7 +3061,9 @@ async def get_api_keys(
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
     api_keys = []
-    org_auth_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api.value)
+    org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id, OrganizationAuthTokenType.api.value
+    )
     if org_auth_token:
         api_keys.append(org_auth_token)
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)

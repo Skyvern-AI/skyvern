@@ -65,7 +65,7 @@ async def run_sdk_action(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Workflow run {action_request.workflow_run_id} not found",
             )
-        workflow = await app.DATABASE.get_workflow(
+        workflow = await app.DATABASE.workflows.get_workflow(
             workflow_id=workflow_run.workflow_id,
             organization_id=organization_id,
         )

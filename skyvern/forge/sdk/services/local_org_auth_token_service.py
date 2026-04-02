@@ -36,11 +36,11 @@ def fingerprint_token(value: str) -> str:
 
 async def ensure_local_org() -> Organization:
     """Ensure the local development organization exists and return it."""
-    organization = await app.DATABASE.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    organization = await app.DATABASE.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     if organization:
         return organization
 
-    return await app.DATABASE.create_organization(
+    return await app.DATABASE.organizations.create_organization(
         organization_name=SKYVERN_LOCAL_ORG,
         domain=SKYVERN_LOCAL_DOMAIN,
         max_steps_per_run=10,
@@ -54,11 +54,11 @@ async def ensure_local_org_with_id(organization_id: str) -> Organization:
     If a local org already exists for the shared local domain, this returns that
     org unchanged even when its organization_id differs from the requested one.
     """
-    organization = await app.DATABASE.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    organization = await app.DATABASE.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     if organization:
         return organization
 
-    return await app.DATABASE.create_organization(
+    return await app.DATABASE.organizations.create_organization(
         organization_id=organization_id,
         organization_name=SKYVERN_LOCAL_ORG,
         domain=SKYVERN_LOCAL_DOMAIN,
@@ -96,7 +96,7 @@ async def ensure_local_api_key(api_key: str) -> tuple[str, str] | None:
         LOG.warning("Existing local API key is expired; regenerating", fingerprint=fingerprint_token(api_key))
         return None
 
-    organization = await app.DATABASE.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    organization = await app.DATABASE.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     if organization is None:
         organization = await ensure_local_org_with_id(payload.sub)
     elif organization.organization_id != payload.sub:
@@ -109,13 +109,13 @@ async def ensure_local_api_key(api_key: str) -> tuple[str, str] | None:
         return None
 
     org_id = organization.organization_id
-    existing_token = await app.DATABASE.validate_org_auth_token(
+    existing_token = await app.DATABASE.organizations.validate_org_auth_token(
         organization_id=org_id,
         token_type=OrganizationAuthTokenType.api,
         token=api_key,
     )
     if existing_token is None:
-        await app.DATABASE.replace_org_auth_token(
+        await app.DATABASE.organizations.replace_org_auth_token(
             organization_id=org_id,
             token_type=OrganizationAuthTokenType.api,
             token=api_key,
@@ -140,13 +140,13 @@ async def regenerate_local_api_key() -> tuple[str, str, str, str | None]:
     organization = await ensure_local_org()
     org_id = organization.organization_id
 
-    await app.DATABASE.invalidate_org_auth_tokens(
+    await app.DATABASE.organizations.invalidate_org_auth_tokens(
         organization_id=org_id,
         token_type=OrganizationAuthTokenType.api,
     )
 
     api_key = security.create_access_token(org_id, expires_delta=API_KEY_LIFETIME)
-    await app.DATABASE.create_org_auth_token(
+    await app.DATABASE.organizations.create_org_auth_token(
         organization_id=org_id,
         token=api_key,
         token_type=OrganizationAuthTokenType.api,

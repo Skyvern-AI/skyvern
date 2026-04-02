@@ -35,6 +35,7 @@ if typing.TYPE_CHECKING:
     from .azure_secret_parameter import AzureSecretParameter
     from .azure_vault_credential_parameter import AzureVaultCredentialParameter
     from .azure_vault_credential_parameter_yaml import AzureVaultCredentialParameterYaml
+    from .billing_state_response import BillingStateResponse
     from .bitwarden_credit_card_data_parameter import BitwardenCreditCardDataParameter
     from .bitwarden_credit_card_data_parameter_yaml import BitwardenCreditCardDataParameterYaml
     from .bitwarden_login_credential_parameter import BitwardenLoginCredentialParameter
@@ -53,6 +54,8 @@ if typing.TYPE_CHECKING:
     from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
     from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
+    from .change_tier_response import ChangeTierResponse
+    from .checkout_session_response import CheckoutSessionResponse
     from .click_action import ClickAction
     from .click_action_data import ClickActionData
     from .click_context import ClickContext
@@ -99,7 +102,6 @@ if typing.TYPE_CHECKING:
     from .credential_response import CredentialResponse
     from .credential_response_credential import CredentialResponseCredential
     from .credential_type_output import CredentialTypeOutput
-    from .credential_vault_type import CredentialVaultType
     from .credit_card_credential_response import CreditCardCredentialResponse
     from .download_to_s3block import DownloadToS3Block
     from .download_to_s3block_yaml import DownloadToS3BlockYaml
@@ -311,6 +313,8 @@ if typing.TYPE_CHECKING:
     from .non_empty_password_credential import NonEmptyPasswordCredential
     from .one_password_credential_parameter import OnePasswordCredentialParameter
     from .one_password_credential_parameter_yaml import OnePasswordCredentialParameterYaml
+    from .organization_schedule_item import OrganizationScheduleItem
+    from .organization_schedule_list_response import OrganizationScheduleListResponse
     from .otp_type import OtpType
     from .output_parameter import OutputParameter
     from .output_parameter_yaml import OutputParameterYaml
@@ -319,6 +323,8 @@ if typing.TYPE_CHECKING:
     from .pdf_parser_block import PdfParserBlock
     from .pdf_parser_block_yaml import PdfParserBlockYaml
     from .persistent_browser_type import PersistentBrowserType
+    from .plan_tier import PlanTier
+    from .portal_session_response import PortalSessionResponse
     from .print_page_block import PrintPageBlock
     from .print_page_block_parameters_item import (
         PrintPageBlockParametersItem,
@@ -384,7 +390,6 @@ if typing.TYPE_CHECKING:
     )
     from .task_block_yaml import TaskBlockYaml
     from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
-    from .task_run_list_item import TaskRunListItem
     from .task_run_request import TaskRunRequest
     from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
     from .task_run_request_proxy_location import TaskRunRequestProxyLocation
@@ -579,6 +584,10 @@ if typing.TYPE_CHECKING:
     from .workflow_run_timeline import WorkflowRunTimeline
     from .workflow_run_timeline_type import WorkflowRunTimelineType
     from .workflow_run_trigger_type import WorkflowRunTriggerType
+    from .workflow_schedule import WorkflowSchedule
+    from .workflow_schedule_list_response import WorkflowScheduleListResponse
+    from .workflow_schedule_response import WorkflowScheduleResponse
+    from .workflow_schedule_upsert_request import WorkflowScheduleUpsertRequest
     from .workflow_status import WorkflowStatus
     from .workflow_trigger_block import WorkflowTriggerBlock
     from .workflow_trigger_block_parameters_item import (
@@ -624,6 +633,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "AzureSecretParameter": ".azure_secret_parameter",
     "AzureVaultCredentialParameter": ".azure_vault_credential_parameter",
     "AzureVaultCredentialParameterYaml": ".azure_vault_credential_parameter_yaml",
+    "BillingStateResponse": ".billing_state_response",
     "BitwardenCreditCardDataParameter": ".bitwarden_credit_card_data_parameter",
     "BitwardenCreditCardDataParameterYaml": ".bitwarden_credit_card_data_parameter_yaml",
     "BitwardenLoginCredentialParameter": ".bitwarden_login_credential_parameter",
@@ -640,6 +650,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BranchCriteriaYamlCriteriaType": ".branch_criteria_yaml_criteria_type",
     "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
+    "ChangeTierResponse": ".change_tier_response",
+    "CheckoutSessionResponse": ".checkout_session_response",
     "ClickAction": ".click_action",
     "ClickActionData": ".click_action_data",
     "ClickContext": ".click_context",
@@ -682,7 +694,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CredentialResponse": ".credential_response",
     "CredentialResponseCredential": ".credential_response_credential",
     "CredentialTypeOutput": ".credential_type_output",
-    "CredentialVaultType": ".credential_vault_type",
     "CreditCardCredentialResponse": ".credit_card_credential_response",
     "DownloadToS3Block": ".download_to_s3block",
     "DownloadToS3BlockYaml": ".download_to_s3block_yaml",
@@ -874,6 +885,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "NonEmptyPasswordCredential": ".non_empty_password_credential",
     "OnePasswordCredentialParameter": ".one_password_credential_parameter",
     "OnePasswordCredentialParameterYaml": ".one_password_credential_parameter_yaml",
+    "OrganizationScheduleItem": ".organization_schedule_item",
+    "OrganizationScheduleListResponse": ".organization_schedule_list_response",
     "OtpType": ".otp_type",
     "OutputParameter": ".output_parameter",
     "OutputParameterYaml": ".output_parameter_yaml",
@@ -882,6 +895,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "PdfParserBlock": ".pdf_parser_block",
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
     "PersistentBrowserType": ".persistent_browser_type",
+    "PlanTier": ".plan_tier",
+    "PortalSessionResponse": ".portal_session_response",
     "PrintPageBlock": ".print_page_block",
     "PrintPageBlockParametersItem": ".print_page_block_parameters_item",
     "PrintPageBlockParametersItem_AwsSecret": ".print_page_block_parameters_item",
@@ -941,7 +956,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "TaskBlockParametersItem_Workflow": ".task_block_parameters_item",
     "TaskBlockYaml": ".task_block_yaml",
     "TaskBlockYamlDataSchema": ".task_block_yaml_data_schema",
-    "TaskRunListItem": ".task_run_list_item",
     "TaskRunRequest": ".task_run_request",
     "TaskRunRequestDataExtractionSchema": ".task_run_request_data_extraction_schema",
     "TaskRunRequestProxyLocation": ".task_run_request_proxy_location",
@@ -1120,6 +1134,10 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowRunTimeline": ".workflow_run_timeline",
     "WorkflowRunTimelineType": ".workflow_run_timeline_type",
     "WorkflowRunTriggerType": ".workflow_run_trigger_type",
+    "WorkflowSchedule": ".workflow_schedule",
+    "WorkflowScheduleListResponse": ".workflow_schedule_list_response",
+    "WorkflowScheduleResponse": ".workflow_schedule_response",
+    "WorkflowScheduleUpsertRequest": ".workflow_schedule_upsert_request",
     "WorkflowStatus": ".workflow_status",
     "WorkflowTriggerBlock": ".workflow_trigger_block",
     "WorkflowTriggerBlockParametersItem": ".workflow_trigger_block_parameters_item",
@@ -1187,6 +1205,7 @@ __all__ = [
     "AzureSecretParameter",
     "AzureVaultCredentialParameter",
     "AzureVaultCredentialParameterYaml",
+    "BillingStateResponse",
     "BitwardenCreditCardDataParameter",
     "BitwardenCreditCardDataParameterYaml",
     "BitwardenLoginCredentialParameter",
@@ -1203,6 +1222,8 @@ __all__ = [
     "BranchCriteriaYamlCriteriaType",
     "BrowserProfile",
     "BrowserSessionResponse",
+    "ChangeTierResponse",
+    "CheckoutSessionResponse",
     "ClickAction",
     "ClickActionData",
     "ClickContext",
@@ -1245,7 +1266,6 @@ __all__ = [
     "CredentialResponse",
     "CredentialResponseCredential",
     "CredentialTypeOutput",
-    "CredentialVaultType",
     "CreditCardCredentialResponse",
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
@@ -1437,6 +1457,8 @@ __all__ = [
     "NonEmptyPasswordCredential",
     "OnePasswordCredentialParameter",
     "OnePasswordCredentialParameterYaml",
+    "OrganizationScheduleItem",
+    "OrganizationScheduleListResponse",
     "OtpType",
     "OutputParameter",
     "OutputParameterYaml",
@@ -1445,6 +1467,8 @@ __all__ = [
     "PdfParserBlock",
     "PdfParserBlockYaml",
     "PersistentBrowserType",
+    "PlanTier",
+    "PortalSessionResponse",
     "PrintPageBlock",
     "PrintPageBlockParametersItem",
     "PrintPageBlockParametersItem_AwsSecret",
@@ -1504,7 +1528,6 @@ __all__ = [
     "TaskBlockParametersItem_Workflow",
     "TaskBlockYaml",
     "TaskBlockYamlDataSchema",
-    "TaskRunListItem",
     "TaskRunRequest",
     "TaskRunRequestDataExtractionSchema",
     "TaskRunRequestProxyLocation",
@@ -1683,6 +1706,10 @@ __all__ = [
     "WorkflowRunTimeline",
     "WorkflowRunTimelineType",
     "WorkflowRunTriggerType",
+    "WorkflowSchedule",
+    "WorkflowScheduleListResponse",
+    "WorkflowScheduleResponse",
+    "WorkflowScheduleUpsertRequest",
     "WorkflowStatus",
     "WorkflowTriggerBlock",
     "WorkflowTriggerBlockParametersItem",
