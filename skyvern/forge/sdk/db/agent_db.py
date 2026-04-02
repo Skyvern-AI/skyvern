@@ -381,6 +381,9 @@ class AgentDB(BaseAlchemyDB):
     async def create_workflow_run_parameter(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_runs.create_workflow_run_parameter(*args, **kwargs)
 
+    async def create_workflow_run_parameters(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.workflow_runs.create_workflow_run_parameters(*args, **kwargs)
+
     async def get_workflow_run_parameters(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_runs.get_workflow_run_parameters(*args, **kwargs)
 

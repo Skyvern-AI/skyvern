@@ -56,71 +56,6 @@
         ]
       },
       {
-        "tab": "Developers",
-        "groups": [
-          {
-            "group": "Running Automations",
-            "pages": [
-              "running-automations/run-a-task",
-              "running-automations/task-parameters",
-              "running-automations/extract-structured-data"
-            ]
-          },
-          {
-            "group": "Multi-Step Automations",
-            "pages": [
-              "multi-step-automations/build-a-workflow",
-              "multi-step-automations/workflow-blocks-reference",
-              "multi-step-automations/file-operations",
-              "multi-step-automations/workflow-parameters",
-              "multi-step-automations/scheduling-workflows"
-            ]
-          },
-          {
-            "group": "Optimization",
-            "pages": [
-              "optimization/browser-sessions",
-              "optimization/browser-profiles",
-              "optimization/cost-control"
-            ]
-          },
-          {
-            "group": "Going to Production",
-            "pages": [
-              "going-to-production/webhooks",
-              "going-to-production/proxy-geolocation",
-              "going-to-production/error-handling",
-              "going-to-production/reliability-tips",
-              "going-to-production/captcha-bot-detection",
-              "integrations/mcp",
-              "integrations/cli"
-            ]
-          },
-          {
-            "group": "Debugging",
-            "pages": [
-              "debugging/using-artifacts",
-              "debugging/troubleshooting-guide",
-              "debugging/observability-with-laminar",
-              "debugging/faq"
-            ]
-          },
-          {
-            "group": "Self-Hosted Deployment",
-            "pages": [
-              "self-hosted/overview",
-              "self-hosted/docker",
-              "self-hosted/llm-configuration",
-              "self-hosted/browser",
-              "self-hosted/proxy",
-              "self-hosted/kubernetes",
-              "self-hosted/storage",
-              "integrations/local-llms"
-            ]
-          }
-        ]
-      },
-      {
         "tab": "Cloud UI",
         "groups": [
           {
@@ -184,6 +119,71 @@
               "integrations/make",
               "integrations/n8n",
               "integrations/workato"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Developers",
+        "groups": [
+          {
+            "group": "Running Automations",
+            "pages": [
+              "running-automations/run-a-task",
+              "running-automations/task-parameters",
+              "running-automations/extract-structured-data"
+            ]
+          },
+          {
+            "group": "Multi-Step Automations",
+            "pages": [
+              "multi-step-automations/build-a-workflow",
+              "multi-step-automations/workflow-blocks-reference",
+              "multi-step-automations/file-operations",
+              "multi-step-automations/workflow-parameters",
+              "multi-step-automations/scheduling-workflows"
+            ]
+          },
+          {
+            "group": "Optimization",
+            "pages": [
+              "optimization/browser-sessions",
+              "optimization/browser-profiles",
+              "optimization/cost-control"
+            ]
+          },
+          {
+            "group": "Going to Production",
+            "pages": [
+              "going-to-production/webhooks",
+              "going-to-production/proxy-geolocation",
+              "going-to-production/error-handling",
+              "going-to-production/reliability-tips",
+              "going-to-production/captcha-bot-detection",
+              "integrations/mcp",
+              "integrations/cli"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide",
+              "debugging/observability-with-laminar",
+              "debugging/faq"
+            ]
+          },
+          {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "self-hosted/overview",
+              "self-hosted/docker",
+              "self-hosted/llm-configuration",
+              "self-hosted/browser",
+              "self-hosted/proxy",
+              "self-hosted/kubernetes",
+              "self-hosted/storage",
+              "integrations/local-llms"
             ]
           }
         ]
@@ -414,6 +414,146 @@
     {
       "source": "/integrations/ollama-litellm",
       "destination": "/integrations/local-llms"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/run-task",
+      "destination": "/api-reference/agent/run-a-task"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/get-run",
+      "destination": "/api-reference/agent/get-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/cancel-run",
+      "destination": "/api-reference/agent/cancel-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/retry-run-webhook",
+      "destination": "/api-reference/agent/retry-run-webhook"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/login",
+      "destination": "/api-reference/agent/login-task"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/get-run-timeline",
+      "destination": "/api-reference/agent/get-run-timeline"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/get-workflows",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/create-workflow",
+      "destination": "/api-reference/workflows/create-a-new-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/get-workflow",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/get-workflow-versions",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/update-workflow",
+      "destination": "/api-reference/workflows/update-a-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/delete-workflow",
+      "destination": "/api-reference/workflows/delete-a-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/run-workflow",
+      "destination": "/api-reference/workflows/run-a-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/get-workflow-runs",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/get-run",
+      "destination": "/api-reference/agent/get-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/cancel-run",
+      "destination": "/api-reference/agent/cancel-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/retry-run-webhook",
+      "destination": "/api-reference/agent/retry-run-webhook"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/get-run-timeline",
+      "destination": "/api-reference/agent/get-run-timeline"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/create-browser-session",
+      "destination": "/api-reference/browser-sessions/create-a-session"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/get-browser-session",
+      "destination": "/api-reference/browser-sessions/get-a-session"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/close-browser-session",
+      "destination": "/api-reference/browser-sessions/close-a-session"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/get-browser-sessions",
+      "destination": "/api-reference/browser-sessions/get-active-browser-sessions"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/create-browser-profile",
+      "destination": "/api-reference/browser-profiles/create-a-browser-profile"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/list-browser-profiles",
+      "destination": "/api-reference/browser-profiles/list-browser-profiles"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/get-browser-profile",
+      "destination": "/api-reference/browser-profiles/get-browser-profile"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/delete-browser-profile",
+      "destination": "/api-reference/browser-profiles/delete-browser-profile"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/create-credential",
+      "destination": "/api-reference/credentials/create-credential"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/get-credential",
+      "destination": "/api-reference/credentials/get-credential-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/update-credential",
+      "destination": "/api-reference/credentials/create-credential"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/delete-credential",
+      "destination": "/api-reference/credentials/delete-credential"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/get-credentials",
+      "destination": "/api-reference/credentials/get-all-credentials"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/send-totp-code",
+      "destination": "/api-reference/credentials/send-totp-code"
+    },
+    {
+      "source": "/api-reference/api-reference/artifacts/get-run-artifacts",
+      "destination": "/api-reference/artifacts/get-artifacts-for-a-run"
+    },
+    {
+      "source": "/api-reference/api-reference/artifacts/get-artifact-content-v-1-artifacts-artifact-id-content-get",
+      "destination": "/api-reference/artifacts/get-an-artifact"
+    },
+    {
+      "source": "/api-reference/api-reference/files/upload-file",
+      "destination": "/api-reference/files/upload-file"
     }
   ]
 }

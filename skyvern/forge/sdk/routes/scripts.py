@@ -1330,8 +1330,12 @@ async def review_script_with_instructions(
                 workflow_run_id=data.workflow_run_id,
             )
             for wf_param, run_param in run_param_tuples:
-                if isinstance(run_param.value, str) and run_param.value:
-                    run_parameter_values[wf_param.key] = run_param.value
+                if (
+                    run_param.value is not None
+                    and str(run_param.value).strip()
+                    and not wf_param.parameter_type.is_secret_or_credential()
+                ):
+                    run_parameter_values[wf_param.key] = str(run_param.value)
         except Exception:
             LOG.warning("Failed to load run parameter values", exc_info=True)
 

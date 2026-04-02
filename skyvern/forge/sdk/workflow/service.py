@@ -143,13 +143,6 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.FOR_LOOP,
 }
 
-# Wrapper block types whose cached code is structural (loop iteration, branch routing).
-# Their failure during cached execution reflects data/runtime issues, not bad script code.
-# Excluded from continue_on_failure regeneration to prevent infinite version loops (SKY-8554).
-WRAPPER_BLOCK_TYPES = {
-    BlockType.FOR_LOOP,
-}
-
 
 def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]:
     """Extract lightweight info from blocks for title generation (limit to first 5)."""
@@ -716,6 +709,7 @@ class WorkflowService:
         all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
         try:
             missing_parameters: list[str] = []
+            workflow_parameter_values: list[tuple[WorkflowParameter, Any]] = []
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
@@ -730,19 +724,7 @@ class WorkflowService:
                         if not isinstance(request_body_value, str):
                             raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
                         await self._validate_credential_id(request_body_value, organization)
-                    try:
-                        await self.create_workflow_run_parameter(
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            workflow_parameter=workflow_parameter,
-                            value=request_body_value,
-                        )
-                    except SQLAlchemyError as parameter_error:
-                        raise WorkflowRunParameterPersistenceError(
-                            parameter_key=workflow_parameter.key,
-                            workflow_id=workflow.workflow_permanent_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            reason=self._format_parameter_persistence_error(parameter_error),
-                        ) from parameter_error
+                    workflow_parameter_values.append((workflow_parameter, request_body_value))
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         if not isinstance(workflow_parameter.default_value, str):
@@ -750,19 +732,7 @@ class WorkflowService:
                                 f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
                             )
                         await self._validate_credential_id(workflow_parameter.default_value, organization)
-                    try:
-                        await self.create_workflow_run_parameter(
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            workflow_parameter=workflow_parameter,
-                            value=workflow_parameter.default_value,
-                        )
-                    except SQLAlchemyError as parameter_error:
-                        raise WorkflowRunParameterPersistenceError(
-                            parameter_key=workflow_parameter.key,
-                            workflow_id=workflow.workflow_permanent_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            reason=self._format_parameter_persistence_error(parameter_error),
-                        ) from parameter_error
+                    workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
                 else:
                     missing_parameters.append(workflow_parameter.key)
 
@@ -773,6 +743,35 @@ class WorkflowService:
                     workflow_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+            if workflow_parameter_values:
+                try:
+                    await self.create_workflow_run_parameters(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_parameter_values=workflow_parameter_values,
+                    )
+                except SQLAlchemyError as batch_error:
+                    # Batch failed — retry one-by-one to identify the exact failing parameter
+                    for workflow_parameter, value in workflow_parameter_values:
+                        try:
+                            await self.create_workflow_run_parameter(
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                workflow_parameter=workflow_parameter,
+                                value=value,
+                            )
+                        except SQLAlchemyError as parameter_error:
+                            raise WorkflowRunParameterPersistenceError(
+                                parameter_key=workflow_parameter.key,
+                                workflow_id=workflow.workflow_permanent_id,
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                reason=self._format_parameter_persistence_error(parameter_error),
+                            ) from parameter_error
+                    # All individual inserts succeeded — the batch failure was transient
+                    LOG.warning(
+                        "Batch parameter insert failed but individual inserts succeeded",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        batch_error=str(batch_error),
+                    )
         except Exception as e:
             LOG.exception(
                 f"Error while setting up workflow run {workflow_run.workflow_run_id}",
@@ -1411,7 +1410,6 @@ class WorkflowService:
             run_level_run_with=workflow_run.run_with,
             workflow_level_run_with=workflow.run_with,
             code_version=workflow.code_version,
-            adaptive_caching=workflow.adaptive_caching,
             ai_fallback=workflow_run.ai_fallback,
             should_run_script=is_script_run,
             has_script=script is not None,
@@ -2359,23 +2357,36 @@ class WorkflowService:
             ):
                 blocks_to_update.add(block.label)
 
-            # Invalidate cache for blocks with continue_on_failure=True that failed
-            # This ensures the block runs fresh with AI on the next cached run
+            # NOTE: continue_on_failure block failures are handled by the Script
+            # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
+            # regenerating the entire script here. The fallback episode is already
+            # recorded and the reviewer will patch the specific block that failed.
+            # See _trigger_script_reviewer() for the capped reviewer flow.
+
+            # Track uncached for-loop child blocks for regeneration.
+            # ForLoopBlock children execute via block.py's execute_loop_helper(),
+            # bypassing _execute_single_block. Without this, their labels never
+            # reach blocks_to_update and the script generator never produces
+            # cached functions for them (e.g., file_download inside a loop).
             if (
-                block.label
-                and block.continue_on_failure
-                and workflow_run_block_result.status != BlockStatus.completed
-                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                and block.block_type not in WRAPPER_BLOCK_TYPES  # SKY-8554: structural wrappers don't need regen
-                and block.label in script_blocks_by_label
+                isinstance(block, ForLoopBlock)
+                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+                and workflow_run_block_result.status in cacheable_statuses
             ):
-                blocks_to_update.add(block.label)
-                LOG.info(
-                    "Block with continue_on_failure failed during cached execution, marking for regeneration",
-                    block_label=block.label,
-                    block_status=workflow_run_block_result.status,
-                    workflow_run_id=workflow_run_id,
-                )
+                for loop_child in block.loop_blocks:
+                    if (
+                        loop_child.label
+                        and loop_child.label not in script_blocks_by_label
+                        and loop_child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                    ):
+                        blocks_to_update.add(loop_child.label)
+                        LOG.info(
+                            "For-loop child block marked for caching",
+                            parent_label=block.label,
+                            child_label=loop_child.label,
+                            child_block_type=loop_child.block_type,
+                            workflow_run_id=workflow_run_id,
+                        )
 
             workflow_run, should_stop = await self._handle_block_result_status(
                 block=block,
@@ -3914,15 +3925,35 @@ class WorkflowService:
         workflow_parameter: WorkflowParameter,
         value: Any,
     ) -> WorkflowRunParameter:
-        value = json.dumps(value) if isinstance(value, (dict, list)) else value
-        # InvalidWorkflowParameter will be raised if the validation fails
-        workflow_parameter.workflow_parameter_type.convert_value(value)
+        value = self._serialize_workflow_run_parameter_value(workflow_parameter, value)
 
         return await app.DATABASE.create_workflow_run_parameter(
             workflow_run_id=workflow_run_id,
             workflow_parameter=workflow_parameter,
             value=value,
         )
+
+    async def create_workflow_run_parameters(
+        self,
+        workflow_run_id: str,
+        workflow_parameter_values: list[tuple[WorkflowParameter, Any]],
+    ) -> list[WorkflowRunParameter]:
+        serialized_workflow_parameter_values = [
+            (workflow_parameter, self._serialize_workflow_run_parameter_value(workflow_parameter, value))
+            for workflow_parameter, value in workflow_parameter_values
+        ]
+
+        return await app.DATABASE.create_workflow_run_parameters(
+            workflow_run_id=workflow_run_id,
+            workflow_parameter_values=serialized_workflow_parameter_values,
+        )
+
+    @staticmethod
+    def _serialize_workflow_run_parameter_value(workflow_parameter: WorkflowParameter, value: Any) -> Any:
+        value = json.dumps(value) if isinstance(value, (dict, list)) else value
+        # InvalidWorkflowParameter will be raised if the validation fails
+        workflow_parameter.workflow_parameter_type.convert_value(value)
+        return value
 
     async def get_workflow_run_parameter_tuples(
         self, workflow_run_id: str
@@ -5437,8 +5468,12 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 for wf_param, run_param in run_param_tuples:
-                    if isinstance(run_param.value, str) and run_param.value:
-                        run_parameter_values[wf_param.key] = run_param.value
+                    if (
+                        run_param.value is not None
+                        and str(run_param.value).strip()
+                        and not wf_param.parameter_type.is_secret_or_credential()
+                    ):
+                        run_parameter_values[wf_param.key] = str(run_param.value)
             except Exception:
                 LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
 

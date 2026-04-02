@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Literal, Sequence
@@ -113,6 +114,33 @@ class ScriptReviewer:
                 history_by_block[ep.block_label] = []
             history_by_block[ep.block_label].append(ep)
 
+        # Batch-load parameter values for historical episodes so the reviewer
+        # can detect per-run values (e.g., different provider names across runs).
+        # Passed explicitly to _review_block to avoid implicit instance state.
+        historical_run_params: dict[str, dict[str, str]] = {}
+        if historical_episodes:
+            unique_run_ids = list({ep.workflow_run_id for ep in historical_episodes if ep.workflow_run_id})[:20]
+
+            async def _load_run_params(run_id: str) -> tuple[str, dict[str, str]]:
+                try:
+                    param_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=run_id)
+                    params = {
+                        wf_param.key: str(run_param.value)
+                        for wf_param, run_param in param_tuples
+                        if run_param.value is not None
+                        and str(run_param.value).strip()
+                        and not wf_param.parameter_type.is_secret_or_credential()
+                    }
+                    return run_id, params
+                except Exception:
+                    LOG.warning(
+                        "Failed to load params for historical episode run", workflow_run_id=run_id, exc_info=True
+                    )
+                    return run_id, {}
+
+            results = await asyncio.gather(*[_load_run_params(rid) for rid in unique_run_ids])
+            historical_run_params = {rid: params for rid, params in results if params}
+
         # Triage failed episodes — skip non-code-fixable failures.
         # When user provides explicit instructions, skip triage entirely.
         if user_instructions:
@@ -161,6 +189,7 @@ class ScriptReviewer:
                     historical_episodes=history_by_block.get(block_label),
                     run_parameter_values=run_parameter_values,
                     user_instructions=user_instructions,
+                    historical_run_params=historical_run_params,
                 )
                 if updated_code:
                     updated_blocks[block_label] = updated_code
@@ -529,6 +558,7 @@ class ScriptReviewer:
         run_parameter_values: dict[str, str] | None = None,
         user_instructions: str | None = None,
         preloaded_code: str | None = None,
+        historical_run_params: dict[str, dict[str, str]] | None = None,
     ) -> str | None:
         """Review a single block's fallback episodes and generate updated code."""
         LOG.info(
@@ -604,16 +634,20 @@ class ScriptReviewer:
         goal_param_keys = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", navigation_goal))
         parameter_keys = sorted(goal_param_keys | set(all_parameter_keys or []))
 
-        # Build historical episode summaries for cross-run context
+        # Build historical episode summaries for cross-run context.
+        # Include per-run parameter values so the reviewer can detect that
+        # different runs had different names/IDs (→ selectors must be dynamic).
         history_summaries = []
         for ep in historical_episodes or []:
-            history_summaries.append(
-                {
-                    "error_message": ep.error_message,
-                    "reviewer_output": (ep.reviewer_output or "")[:500],
-                    "fallback_succeeded": ep.fallback_succeeded,
-                }
-            )
+            summary: dict[str, object] = {
+                "error_message": ep.error_message,
+                "reviewer_output": (ep.reviewer_output or "")[:500],
+                "fallback_succeeded": ep.fallback_succeeded,
+            }
+            ep_params = (historical_run_params or {}).get(ep.workflow_run_id)
+            if ep_params:
+                summary["run_parameters"] = ep_params
+            history_summaries.append(summary)
 
         # Build the reviewer prompt
         reviewer_prompt = prompt_engine.load_prompt(
@@ -636,6 +670,7 @@ class ScriptReviewer:
             stale_branches=stale_branch_info,
             parameter_keys=parameter_keys,
             historical_episodes=history_summaries,
+            run_parameter_values=run_parameter_values,
             user_instructions=user_instructions,
         )
 

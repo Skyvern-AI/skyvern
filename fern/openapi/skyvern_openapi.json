@@ -871,6 +871,485 @@
         ]
       }
     },
+    "/v1/folders": {
+      "post": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Create folder",
+        "description": "Create a new folder to organize workflows",
+        "operationId": "create_folder_v1_folders_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FolderCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully created folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_folder"
+      },
+      "get": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Get folders",
+        "description": "Get all folders for the organization",
+        "operationId": "get_folders_v1_folders_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Number of folders per page",
+              "default": 100,
+              "title": "Page Size"
+            },
+            "description": "Number of folders per page"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Search folders by title or description",
+              "title": "Search"
+            },
+            "description": "Search folders by title or description"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved folders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Folder"
+                  },
+                  "title": "Response Get Folders V1 Folders Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_folders"
+      }
+    },
+    "/v1/folders/{folder_id}": {
+      "get": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Get folder",
+        "description": "Get a specific folder by ID",
+        "operationId": "get_folder_v1_folders__folder_id__get",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_folder"
+      },
+      "put": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Update folder",
+        "description": "Update a folder's title or description",
+        "operationId": "update_folder_v1_folders__folder_id__put",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FolderUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_folder"
+      },
+      "delete": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Delete folder",
+        "description": "Delete a folder. Optionally delete all workflows in the folder.",
+        "operationId": "delete_folder_v1_folders__folder_id__delete",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "delete_workflows",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "If true, also delete all workflows in this folder",
+              "default": false,
+              "title": "Delete Workflows"
+            },
+            "description": "If true, also delete all workflows in this folder"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Folder V1 Folders  Folder Id  Delete"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_folder"
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/folder": {
+      "put": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Update workflow folder",
+        "description": "Update a workflow's folder assignment for the latest version",
+        "operationId": "update_workflow_folder_v1_workflows__workflow_permanent_id__folder_put",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowFolderRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated workflow folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workflow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_workflow_folder"
+      }
+    },
     "/v1/artifacts/{artifact_id}/content": {
       "get": {
         "tags": [
@@ -1194,6 +1673,128 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/runs": {
+      "get": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Runs V2",
+        "operationId": "get_runs_v2_v1_runs_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 10,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunStatus"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 3
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive substring search (min 3 chars for trigram index).",
+              "examples": [
+                "login_url",
+                "wr_abc123"
+              ],
+              "title": "Search Key"
+            },
+            "description": "Case-insensitive substring search (min 3 chars for trigram index)."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TaskRunListItem"
+                  },
+                  "title": "Response Get Runs V2 V1 Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_runs_v2"
       }
     },
     "/v1/workflows/runs": {
@@ -3306,6 +3907,69 @@
           }
         }
       }
+    },
+    "/v1/sdk/run_action": {
+      "post": {
+        "tags": [
+          "SDK"
+        ],
+        "summary": "Run an SDK action",
+        "description": "Execute a single SDK action with the specified parameters",
+        "operationId": "run_sdk_action_v1_sdk_run_action_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunSdkActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSdkActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "run_sdk_action"
+      }
     }
   },
   "components": {
@@ -3413,6 +4077,41 @@
           "aws_key"
         ],
         "title": "AWSSecretParameterYAML"
+      },
+      "ActAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_act",
+            "title": "Type",
+            "default": "ai_act"
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "Natural language prompt for the action",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "type": "object",
+        "title": "ActAction",
+        "description": "AI act action parameters."
       },
       "Action": {
         "properties": {
@@ -5752,6 +6451,60 @@
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
       },
+      "ClickAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_click",
+            "title": "Type",
+            "default": "ai_click"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the click",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "ClickAction",
+        "description": "Click action parameters."
+      },
       "ClickContext": {
         "properties": {
           "thought": {
@@ -7140,6 +7893,88 @@
           "captcha-solver"
         ],
         "title": "Extensions"
+      },
+      "ExtractAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "extract",
+            "title": "Type",
+            "default": "extract"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Extraction prompt",
+            "default": ""
+          },
+          "extract_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extract Schema",
+            "description": "Schema for extraction"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping",
+            "description": "Error code mapping for extraction"
+          },
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention",
+            "description": "The intention or goal of the extraction"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "type": "object",
+        "title": "ExtractAction",
+        "description": "Extract data action parameters."
       },
       "ExtractionBlock": {
         "properties": {
@@ -8660,6 +9495,125 @@
         ],
         "title": "FileUploadBlockYAML"
       },
+      "Folder": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          },
+          "folder_id": {
+            "type": "string",
+            "title": "Folder Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "description": "Number of workflows in this folder",
+            "default": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "folder_id",
+          "organization_id",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Folder",
+        "description": "Response model for a folder"
+      },
+      "FolderCreate": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "title": "FolderCreate",
+        "description": "Request model for creating a folder"
+      },
+      "FolderUpdate": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          }
+        },
+        "type": "object",
+        "title": "FolderUpdate",
+        "description": "Request model for updating a folder"
+      },
       "ForLoopBlock": {
         "properties": {
           "label": {
@@ -10056,6 +11010,97 @@
         "type": "object",
         "title": "InputOrSelectContext"
       },
+      "InputTextAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_input_text",
+            "title": "Type",
+            "default": "ai_input_text"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Value to input",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the input",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "TOTP identifier for input_text actions"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL for input_text actions"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "InputTextAction",
+        "description": "Input text action parameters."
+      },
       "JinjaBranchCriteria": {
         "properties": {
           "criteria_type": {
@@ -10086,6 +11131,25 @@
         ],
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
+      },
+      "LocateElementAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "locate_element",
+            "title": "Type",
+            "default": "locate_element"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Natural language prompt to locate an element",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "LocateElementAction",
+        "description": "Locate element action parameters."
       },
       "LoginBlock": {
         "properties": {
@@ -12139,6 +13203,53 @@
         ],
         "title": "PrintPageBlockYAML"
       },
+      "PromptAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Type",
+            "default": "prompt"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "The prompt to send to the LLM"
+          },
+          "response_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Schema",
+            "description": "Optional JSON schema to structure the response"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "PromptAction",
+        "description": "Prompt action parameters."
+      },
       "PromptBranchCriteria": {
         "properties": {
           "criteria_type": {
@@ -12231,6 +13342,130 @@
           "ui-tars"
         ],
         "title": "RunEngine"
+      },
+      "RunSdkActionRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url",
+            "description": "The URL where the action should be executed"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "The browser session ID"
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The browser address"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id",
+            "description": "Optional workflow run ID to continue an existing workflow run"
+          },
+          "action": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClickAction"
+              },
+              {
+                "$ref": "#/components/schemas/InputTextAction"
+              },
+              {
+                "$ref": "#/components/schemas/SelectOptionAction"
+              },
+              {
+                "$ref": "#/components/schemas/UploadFileAction"
+              },
+              {
+                "$ref": "#/components/schemas/ActAction"
+              },
+              {
+                "$ref": "#/components/schemas/ExtractAction"
+              },
+              {
+                "$ref": "#/components/schemas/LocateElementAction"
+              },
+              {
+                "$ref": "#/components/schemas/ValidateAction"
+              },
+              {
+                "$ref": "#/components/schemas/PromptAction"
+              }
+            ],
+            "title": "Action",
+            "description": "The action to execute with its specific parameters",
+            "discriminator": {
+              "propertyName": "type",
+              "mapping": {
+                "ai_act": "#/components/schemas/ActAction",
+                "ai_click": "#/components/schemas/ClickAction",
+                "ai_input_text": "#/components/schemas/InputTextAction",
+                "ai_select_option": "#/components/schemas/SelectOptionAction",
+                "ai_upload_file": "#/components/schemas/UploadFileAction",
+                "extract": "#/components/schemas/ExtractAction",
+                "locate_element": "#/components/schemas/LocateElementAction",
+                "prompt": "#/components/schemas/PromptAction",
+                "validate": "#/components/schemas/ValidateAction"
+              }
+            }
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "action"
+        ],
+        "title": "RunSdkActionRequest",
+        "description": "Request to run a single SDK action."
+      },
+      "RunSdkActionResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id",
+            "description": "The workflow run ID used for this action"
+          },
+          "result": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result",
+            "description": "The result from the action (e.g., selector, value, extracted data)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id"
+        ],
+        "title": "RunSdkActionResponse",
+        "description": "Response from running an SDK action."
       },
       "RunStatus": {
         "type": "string",
@@ -12457,6 +13692,73 @@
         },
         "type": "object",
         "title": "SelectOption"
+      },
+      "SelectOptionAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_select_option",
+            "title": "Type",
+            "default": "ai_select_option"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Value to select",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the selection",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "SelectOptionAction",
+        "description": "Select option action parameters."
       },
       "SendEmailBlock": {
         "properties": {
@@ -13495,6 +14797,92 @@
           "label"
         ],
         "title": "TaskBlockYAML"
+      },
+      "TaskRunListItem": {
+        "properties": {
+          "task_run_id": {
+            "type": "string",
+            "title": "Task Run Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "task_run_type": {
+            "type": "string",
+            "title": "Task Run Type"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "script_run": {
+            "type": "boolean",
+            "title": "Script Run",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_run_id",
+          "run_id",
+          "task_run_type",
+          "status",
+          "created_at"
+        ],
+        "title": "TaskRunListItem",
+        "description": "Lightweight run-history item backed by the task_runs table."
       },
       "TaskRunRequest": {
         "properties": {
@@ -14784,6 +16172,92 @@
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
       },
+      "UpdateWorkflowFolderRequest": {
+        "properties": {
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id",
+            "description": "Folder ID to assign workflow to. Set to null to remove from folder."
+          }
+        },
+        "type": "object",
+        "title": "UpdateWorkflowFolderRequest",
+        "description": "Request model for updating a workflow's folder assignment"
+      },
+      "UploadFileAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_upload_file",
+            "title": "Type",
+            "default": "ai_upload_file"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Url",
+            "description": "File URL for upload",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the upload",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "UploadFileAction",
+        "description": "Upload file action parameters."
+      },
       "UploadFileResponse": {
         "properties": {
           "s3_uri": {
@@ -15318,6 +16792,40 @@
           "confidence_float"
         ],
         "title": "UserDefinedError"
+      },
+      "ValidateAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "validate",
+            "title": "Type",
+            "default": "validate"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Validation criteria or condition to check"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "ValidateAction",
+        "description": "Validate action parameters."
       },
       "ValidationBlock": {
         "properties": {
@@ -18382,9 +19890,11 @@
         "enum": [
           "manual",
           "api",
-          "scheduled"
+          "scheduled",
+          "webhook"
         ],
-        "title": "WorkflowRunTriggerType"
+        "title": "WorkflowRunTriggerType",
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
       },
       "WorkflowStatus": {
         "type": "string",
