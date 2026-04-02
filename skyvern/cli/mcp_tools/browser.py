@@ -1862,3 +1862,90 @@ async def skyvern_find(
         },
         timing_ms=timer.timing_ms,
     )
+
+
+async def _ensure_clipboard_permissions(page: Any) -> None:
+    """Grant clipboard permissions on the browser context (lazy, idempotent)."""
+    try:
+        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    except Exception:
+        LOG.debug("clipboard_permission_grant_skipped", exc_info=True)
+
+
+async def skyvern_clipboard_read(
+    session_id: Annotated[str | None, Field(description="Browser session ID.")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
+) -> dict[str, Any]:
+    """Read text from the browser clipboard (whatever was last copied via Ctrl+C or clipboard_write).
+
+    Returns the current clipboard text content. Requires secure context
+    (HTTPS or localhost). Clipboard permissions are granted automatically
+    on first use.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            await _ensure_clipboard_permissions(page)
+            text = await page.evaluate("() => navigator.clipboard.readText()")
+            timer.mark("clipboard_read")
+        except Exception as e:
+            return make_result(
+                "skyvern_clipboard_read",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)"
+                ),
+            )
+
+    return make_result(
+        "skyvern_clipboard_read",
+        browser_context=ctx,
+        data={"text": text},
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_clipboard_write(
+    text: Annotated[str, Field(description="Text to write to the clipboard.")],
+    session_id: Annotated[str | None, Field(description="Browser session ID.")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
+) -> dict[str, Any]:
+    """Copy text to the browser clipboard (as if the user pressed Ctrl+C).
+
+    The text can then be pasted into form fields or read back with
+    clipboard_read. Requires secure context (HTTPS or localhost).
+    Clipboard permissions are granted automatically on first use.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            await _ensure_clipboard_permissions(page)
+            await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
+            timer.mark("clipboard_write")
+        except Exception as e:
+            return make_result(
+                "skyvern_clipboard_write",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)"
+                ),
+            )
+
+    return make_result(
+        "skyvern_clipboard_write",
+        browser_context=ctx,
+        data={"written": True, "length": len(text)},
+        timing_ms=timer.timing_ms,
+    )

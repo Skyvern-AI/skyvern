@@ -15,6 +15,8 @@ from .blocks import (
 from .browser import (
     skyvern_act,
     skyvern_click,
+    skyvern_clipboard_read,
+    skyvern_clipboard_write,
     skyvern_drag,
     skyvern_evaluate,
     skyvern_extract,
@@ -152,6 +154,8 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | "Search for X on [site]" / "Look up X" | skyvern_act | Natural language actions |
 | "Verify / check / confirm something on [site]" | skyvern_validate | AI assertion |
 | "Fill out / submit a form" | skyvern_act | Multi-step form interaction |
+| "Read clipboard" / "Paste from clipboard" | skyvern_clipboard_read | Read text from the browser clipboard |
+| "Copy to clipboard" / "Write clipboard" | skyvern_clipboard_write | Write text to the browser clipboard |
 | "Click [element]" / "Type [text]" | skyvern_click / skyvern_type | Precision targeting |
 | "Hover over [menu]" | skyvern_hover | Reveal dropdowns |
 | "Drag [element] to [target]" | skyvern_drag | AI or selector-based drag-and-drop |
@@ -385,6 +389,10 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_navigate)
 mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_screenshot)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_evaluate)
 
+# -- Clipboard --
+mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_clipboard_read)
+mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_clipboard_write)
+
 # -- Precision tools (selector/intent-based browser primitives) --
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_click)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_drag)
@@ -487,6 +495,9 @@ __all__ = [
     "skyvern_navigate",
     "skyvern_screenshot",
     "skyvern_evaluate",
+    # Clipboard
+    "skyvern_clipboard_read",
+    "skyvern_clipboard_write",
     # Precision (selector/intent browser primitives)
     "skyvern_click",
     "skyvern_drag",
