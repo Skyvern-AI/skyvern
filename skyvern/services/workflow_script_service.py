@@ -147,10 +147,12 @@ async def generate_or_update_pending_workflow_script(
     script_id = context.script_id
     script = None
     if script_id:
-        script = await app.DATABASE.get_script(script_id=script_id, organization_id=organization_id)
+        script = await app.DATABASE.scripts.get_script(script_id=script_id, organization_id=organization_id)
 
     if not script:
-        script = await app.DATABASE.create_script(organization_id=organization_id, run_id=workflow_run.workflow_run_id)
+        script = await app.DATABASE.scripts.create_script(
+            organization_id=organization_id, run_id=workflow_run.workflow_run_id
+        )
         if context:
             context.script_id = script.script_id
             context.script_revision_id = script.script_revision_id
@@ -184,7 +186,7 @@ async def get_workflow_script(
     rendered_cache_key_value = ""
 
     try:
-        parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+        parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
             workflow_run_id=workflow_run.workflow_run_id,
         )
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
@@ -296,7 +298,7 @@ async def get_workflow_script_by_cache_key_value(
             return _workflow_script_cache[cache_key_tuple]
 
         # Cache miss - fetch from database
-        script, is_pinned = await app.DATABASE.get_workflow_script_by_cache_key_value(
+        script, is_pinned = await app.DATABASE.scripts.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             cache_key_value=cache_key_value,
@@ -311,7 +313,7 @@ async def get_workflow_script_by_cache_key_value(
 
         return script, is_pinned
 
-    return await app.DATABASE.get_workflow_script_by_cache_key_value(
+    return await app.DATABASE.scripts.get_workflow_script_by_cache_key_value(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         cache_key_value=cache_key_value,
@@ -331,7 +333,7 @@ async def get_latest_published_script(
     variants), this returns the script with the highest version number to ensure
     the most recently reviewed code is selected.
     """
-    workflow_scripts = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+    workflow_scripts = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         statuses=[ScriptStatus.published],
@@ -344,7 +346,7 @@ async def get_latest_published_script(
     # TODO: add a bulk get_latest_script_versions() if this becomes a bottleneck.
     best: Script | None = None
     for ws in workflow_scripts:
-        script = await app.DATABASE.get_latest_script_version(
+        script = await app.DATABASE.scripts.get_latest_script_version(
             script_id=ws.script_id,
             organization_id=organization_id,
         )
@@ -362,7 +364,7 @@ async def _load_cached_script_block_sources(
     """
     cached_blocks: dict[str, ScriptBlockSource] = {}
 
-    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+    script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
         script_revision_id=script.script_revision_id,
         organization_id=organization_id,
     )
@@ -373,13 +375,13 @@ async def _load_cached_script_block_sources(
 
         code_str: str | None = None
         if script_block.script_file_id:
-            script_file = await app.DATABASE.get_script_file_by_id(
+            script_file = await app.DATABASE.scripts.get_script_file_by_id(
                 script_revision_id=script.script_revision_id,
                 file_id=script_block.script_file_id,
                 organization_id=organization_id,
             )
             if script_file and script_file.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                 if artifact:
                     file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
                     if isinstance(file_content, bytes):
@@ -539,7 +541,7 @@ async def generate_workflow_script(
     status = ScriptStatus.published
     if pending:
         status = ScriptStatus.pending
-        existing_pending_workflow_script = await app.DATABASE.get_workflow_script(
+        existing_pending_workflow_script = await app.DATABASE.scripts.get_workflow_script(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run.workflow_run_id,
@@ -547,7 +549,7 @@ async def generate_workflow_script(
         )
     if not existing_pending_workflow_script:
         # Record the workflow->script mapping for cache lookup
-        await app.DATABASE.create_workflow_script(
+        await app.DATABASE.scripts.create_workflow_script(
             organization_id=workflow.organization_id,
             script_id=script.script_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
@@ -965,13 +967,13 @@ async def _find_main_py_content(script_id: str, organization_id: str, base_revis
     """
 
     async def _load_main_py_from_revision(revision_id: str) -> str | None:
-        files = await app.DATABASE.get_script_files(
+        files = await app.DATABASE.scripts.get_script_files(
             script_revision_id=revision_id,
             organization_id=organization_id,
         )
         for f in files:
             if f.file_path == "main.py" and f.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(f.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(f.artifact_id, organization_id)
                 if artifact:
                     content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
                     if content:
@@ -984,7 +986,7 @@ async def _find_main_py_content(script_id: str, organization_id: str, base_revis
         return result
 
     # Fall back to v1 (bootstrapping: base was created before this fix)
-    v1_script = await app.DATABASE.get_script(
+    v1_script = await app.DATABASE.scripts.get_script(
         script_id=script_id,
         organization_id=organization_id,
         version=1,
@@ -1022,7 +1024,7 @@ async def create_script_version_from_review(
         # _trigger_script_reviewer() already gates on is_script_pinned(), but
         # that check can be bypassed when the skyvern context is missing.
         # Guard here so no code path can mutate a pinned script.
-        if await app.DATABASE.is_script_pinned(
+        if await app.DATABASE.scripts.is_script_pinned(
             organization_id=organization_id,
             script_id=base_script.script_id,
         ):
@@ -1035,7 +1037,7 @@ async def create_script_version_from_review(
             return None
 
         # Create a new script version
-        new_script = await app.DATABASE.create_script(
+        new_script = await app.DATABASE.scripts.create_script(
             organization_id=organization_id,
             script_id=base_script.script_id,
             version=base_script.version + 1,
@@ -1043,7 +1045,7 @@ async def create_script_version_from_review(
         )
 
         # Copy existing script blocks from the base revision
-        existing_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+        existing_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
             script_revision_id=base_script.script_revision_id,
             organization_id=organization_id,
         )
@@ -1066,7 +1068,7 @@ async def create_script_version_from_review(
                     file_path=file_path,
                     data=content_bytes,
                 )
-                new_file = await app.DATABASE.create_script_file(
+                new_file = await app.DATABASE.scripts.create_script_file(
                     script_revision_id=new_script.script_revision_id,
                     script_id=new_script.script_id,
                     organization_id=organization_id,
@@ -1090,7 +1092,7 @@ async def create_script_version_from_review(
                 )
 
                 # Create script block entry pointing to the new file
-                await app.DATABASE.create_script_block(
+                await app.DATABASE.scripts.create_script_block(
                     organization_id=organization_id,
                     script_id=new_script.script_id,
                     script_revision_id=new_script.script_revision_id,
@@ -1103,7 +1105,7 @@ async def create_script_version_from_review(
                 )
             else:
                 # Copy existing block as-is
-                await app.DATABASE.create_script_block(
+                await app.DATABASE.scripts.create_script_block(
                     organization_id=organization_id,
                     script_id=new_script.script_id,
                     script_revision_id=new_script.script_revision_id,
@@ -1136,7 +1138,7 @@ async def create_script_version_from_review(
                 file_path="main.py",
                 data=patched_bytes,
             )
-            await app.DATABASE.create_script_file(
+            await app.DATABASE.scripts.create_script_file(
                 script_revision_id=new_script.script_revision_id,
                 script_id=new_script.script_id,
                 organization_id=organization_id,
@@ -1158,19 +1160,19 @@ async def create_script_version_from_review(
 
             # Copy non-block files (e.g., .skyvern metadata) from the base revision
             # or v1 — whichever has the full file set
-            source_files = await app.DATABASE.get_script_files(
+            source_files = await app.DATABASE.scripts.get_script_files(
                 script_revision_id=base_script.script_revision_id,
                 organization_id=organization_id,
             )
             if not any(f.file_path != "main.py" and not f.file_path.startswith("blocks/") for f in source_files):
                 # Base revision has no non-block files, fall back to v1
-                v1_script = await app.DATABASE.get_script(
+                v1_script = await app.DATABASE.scripts.get_script(
                     script_id=base_script.script_id,
                     organization_id=organization_id,
                     version=1,
                 )
                 if v1_script:
-                    source_files = await app.DATABASE.get_script_files(
+                    source_files = await app.DATABASE.scripts.get_script_files(
                         script_revision_id=v1_script.script_revision_id,
                         organization_id=organization_id,
                     )
@@ -1180,7 +1182,7 @@ async def create_script_version_from_review(
                 # Skip main.py (already patched) and updated block files (already created)
                 if f.file_path == "main.py" or f.file_path in updated_block_file_paths:
                     continue
-                await app.DATABASE.create_script_file(
+                await app.DATABASE.scripts.create_script_file(
                     script_revision_id=new_script.script_revision_id,
                     script_id=new_script.script_id,
                     organization_id=organization_id,
@@ -1208,7 +1210,7 @@ async def create_script_version_from_review(
             )
         else:
             # No workflow run — look up the existing cache key value from the base script
-            existing_ws = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+            existing_ws = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
                 statuses=[ScriptStatus.published],
@@ -1219,7 +1221,7 @@ async def create_script_version_from_review(
                     rendered_cache_key_value = ws.cache_key_value
                     break
 
-        await app.DATABASE.create_workflow_script(
+        await app.DATABASE.scripts.create_workflow_script(
             organization_id=organization_id,
             script_id=new_script.script_id,
             workflow_permanent_id=workflow_permanent_id,

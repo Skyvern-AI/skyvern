@@ -55,7 +55,7 @@ async def prepare_workflow(
         version=version,
     )
 
-    await app.DATABASE.create_task_run(
+    await app.DATABASE.tasks.create_task_run(
         task_run_type=RunType.workflow_run,
         organization_id=organization.organization_id,
         run_id=workflow_run.workflow_run_id,
@@ -120,7 +120,7 @@ async def run_workflow(
 async def get_workflow_run_response(
     workflow_run_id: str, organization_id: str | None = None
 ) -> WorkflowRunResponse | None:
-    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id=organization_id)
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         return None
     workflow_run_resp = await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(

@@ -184,7 +184,7 @@ class ScriptReviewer:
 
             async def _load_run_params(run_id: str) -> tuple[str, dict[str, str]]:
                 try:
-                    param_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=run_id)
+                    param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=run_id)
                     params = {
                         wf_param.key: str(run_param.value)
                         for wf_param, run_param in param_tuples
@@ -213,7 +213,7 @@ class ScriptReviewer:
                     triaged_episodes.append(episode)
                 else:
                     # Mark as reviewed so we don't re-triage on every run
-                    await app.DATABASE.mark_episode_reviewed(
+                    await app.DATABASE.scripts.mark_episode_reviewed(
                         episode_id=episode.episode_id,
                         organization_id=organization_id,
                         reviewer_output="TRIAGE: not_code_fixable — skipped",
@@ -1081,20 +1081,20 @@ class ScriptReviewer:
             return None
 
         try:
-            script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+            script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
                 script_revision_id=script_revision_id,
                 organization_id=organization_id,
             )
             for sb in script_blocks:
                 if sb.script_block_label == block_label and sb.script_file_id:
                     # Load the code from the script file
-                    script_file = await app.DATABASE.get_script_file_by_id(
+                    script_file = await app.DATABASE.scripts.get_script_file_by_id(
                         script_revision_id=script_revision_id,
                         file_id=sb.script_file_id,
                         organization_id=organization_id,
                     )
                     if script_file and script_file.artifact_id:
-                        artifact = await app.DATABASE.get_artifact_by_id(
+                        artifact = await app.DATABASE.artifacts.get_artifact_by_id(
                             artifact_id=script_file.artifact_id,
                             organization_id=organization_id,
                         )
@@ -1124,7 +1124,7 @@ class ScriptReviewer:
         if not script_revision_id:
             return {}
         try:
-            script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+            script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
                 script_revision_id=script_revision_id,
                 organization_id=organization_id,
             )
@@ -1132,13 +1132,13 @@ class ScriptReviewer:
             for sb in script_blocks:
                 if not sb.script_file_id:
                     continue
-                script_file = await app.DATABASE.get_script_file_by_id(
+                script_file = await app.DATABASE.scripts.get_script_file_by_id(
                     script_revision_id=script_revision_id,
                     file_id=sb.script_file_id,
                     organization_id=organization_id,
                 )
                 if script_file and script_file.artifact_id:
-                    artifact = await app.DATABASE.get_artifact_by_id(
+                    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
                         artifact_id=script_file.artifact_id,
                         organization_id=organization_id,
                     )

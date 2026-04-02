@@ -409,7 +409,7 @@ class ActionHandler:
                 page=page,
                 action=action,
             )
-            persisted_action = await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
 
@@ -545,7 +545,7 @@ class ActionHandler:
                             exc_info=True,
                         )
 
-            persisted_action = await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
     @staticmethod

@@ -163,7 +163,7 @@ async def send_totp_code(
     )
     # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
     if data.task_id:
-        task = await app.DATABASE.get_task(data.task_id, curr_org.organization_id)
+        task = await app.DATABASE.tasks.get_task(data.task_id, curr_org.organization_id)
         if not task:
             raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
     if data.workflow_id:
@@ -171,7 +171,7 @@ async def send_totp_code(
         if not workflow:
             raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
     if data.workflow_run_id:
-        workflow_run = await app.DATABASE.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
@@ -679,7 +679,7 @@ async def test_credential(
     # Check if the credential already has a browser profile
     existing_browser_profile_id = credential.browser_profile_id
     if existing_browser_profile_id:
-        profile = await app.DATABASE.get_browser_profile(
+        profile = await app.DATABASE.browser_sessions.get_browser_profile(
             profile_id=existing_browser_profile_id,
             organization_id=organization_id,
         )
@@ -891,7 +891,9 @@ async def get_test_credential_status(
 ) -> TestCredentialStatusResponse:
     organization_id = current_org.organization_id
 
-    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
     if not workflow_run:
         raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
 
@@ -1054,7 +1056,7 @@ async def _create_browser_profile_after_workflow(
 
     try:
         for _ in range(max_polls):
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id, organization_id=organization_id
             )
             if not workflow_run:
@@ -1130,7 +1132,7 @@ async def _create_browser_profile_after_workflow(
 
             # Create the browser profile in DB
             profile_name = f"Profile - {credential_name} ({credential_id})"
-            profile = await app.DATABASE.create_browser_profile(
+            profile = await app.DATABASE.browser_sessions.create_browser_profile(
                 organization_id=organization_id,
                 name=profile_name,
                 description=f"Browser profile from credential test for {credential_name}",

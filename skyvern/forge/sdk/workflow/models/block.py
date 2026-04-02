@@ -207,7 +207,7 @@ class Block(BaseModel, abc.ABC):
             parameter=self.output_parameter,
             value=value,
         )
-        await app.DATABASE.create_or_update_workflow_run_output_parameter(
+        await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
             value=value,
@@ -238,7 +238,7 @@ class Block(BaseModel, abc.ABC):
             output_parameter_value = {"value": output_parameter_value}
 
         if workflow_run_block_id:
-            await app.DATABASE.update_workflow_run_block(
+            await app.DATABASE.observer.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 output=output_parameter_value,
                 status=status,
@@ -495,7 +495,7 @@ class Block(BaseModel, abc.ABC):
             LOG.exception("Failed to generate description for the workflow run block", error=e)
 
         if description:
-            await app.DATABASE.update_workflow_run_block(
+            await app.DATABASE.observer.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 description=description,
                 organization_id=organization_id,
@@ -522,7 +522,7 @@ class Block(BaseModel, abc.ABC):
             if isinstance(self, BaseTaskBlock):
                 engine = self.engine
 
-            workflow_run_block = await app.DATABASE.create_workflow_run_block(
+            workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 parent_workflow_run_block_id=parent_workflow_run_block_id,
@@ -707,7 +707,9 @@ class BaseTaskBlock(Block):
         """
         Returns the order and retry for the next task in the workflow run as a tuple.
         """
-        last_task_for_workflow_run = await app.DATABASE.get_last_task_for_workflow_run(workflow_run_id=workflow_run_id)
+        last_task_for_workflow_run = await app.DATABASE.tasks.get_last_task_for_workflow_run(
+            workflow_run_id=workflow_run_id
+        )
         # If there is no previous task, the order will be 0 and the retry will be 0.
         if last_task_for_workflow_run is None:
             return 0, 0
@@ -746,7 +748,7 @@ class BaseTaskBlock(Block):
         This helper method consolidates the error detection logic that was previously
         duplicated across multiple exception handlers in the execute method.
         """
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task.task_id,
             status=TaskStatus.failed,
             organization_id=organization_id,
@@ -764,7 +766,7 @@ class BaseTaskBlock(Block):
                 if detected_errors:
                     # Only pass new errors — update_task() appends to existing errors
                     new_errors = [error.model_dump() for error in detected_errors]
-                    await app.DATABASE.update_task(
+                    await app.DATABASE.tasks.update_task(
                         task_id=task.task_id,
                         organization_id=organization_id,
                         errors=new_errors,
@@ -867,7 +869,7 @@ class BaseTaskBlock(Block):
                 task_order=task_order,
                 task_retry=task_retry,
             )
-            workflow_run_block = await app.DATABASE.update_workflow_run_block(
+            workflow_run_block = await app.DATABASE.observer.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
@@ -1011,7 +1013,7 @@ class BaseTaskBlock(Block):
                 current_context.task_id = None
 
             # Check task status
-            updated_task = await app.DATABASE.get_task(
+            updated_task = await app.DATABASE.tasks.get_task(
                 task_id=task.task_id, organization_id=workflow_run.organization_id
             )
             if not updated_task:
@@ -1941,7 +1943,7 @@ class ForLoopBlock(Block):
                 )
                 try:
                     if block_output.workflow_run_block_id:
-                        await app.DATABASE.update_workflow_run_block(
+                        await app.DATABASE.observer.update_workflow_run_block(
                             workflow_run_block_id=block_output.workflow_run_block_id,
                             organization_id=organization_id,
                             current_value=str(loop_over_value),
@@ -2106,7 +2108,7 @@ class ForLoopBlock(Block):
                 organization_id=organization_id,
             )
 
-        await app.DATABASE.update_workflow_run_block(
+        await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             loop_values=loop_over_values,
@@ -2586,7 +2588,9 @@ class TextPromptBlock(Block):
         artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
         if workflow_run_block_id:
             try:
-                workflow_run_block = await app.DATABASE.get_workflow_run_block(workflow_run_block_id, organization_id)
+                workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                    workflow_run_block_id, organization_id
+                )
                 if workflow_run_block:
                     artifacts_to_persist.append((ArtifactType.LLM_PROMPT, prompt.encode("utf-8")))
             except Exception as e:
@@ -2645,7 +2649,7 @@ class TextPromptBlock(Block):
         )
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        await app.DATABASE.update_workflow_run_block(
+        await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             prompt=self.prompt,
@@ -3444,7 +3448,7 @@ class SendEmailBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        await app.DATABASE.update_workflow_run_block(
+        await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             recipients=self.recipients,
@@ -4140,7 +4144,7 @@ class WaitBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
-        await app.DATABASE.update_workflow_run_block(
+        await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             wait_sec=self.wait_sec,
@@ -4246,7 +4250,7 @@ class HumanInteractionBlock(BaseTaskBlock):
                 organization_id=organization_id,
             )
 
-        await app.DATABASE.update_workflow_run_block(
+        await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             recipients=self.recipients,
@@ -4265,12 +4269,12 @@ class HumanInteractionBlock(BaseTaskBlock):
             browser_session_id=browser_session_id,
         )
 
-        await app.DATABASE.update_workflow_run(
+        await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.paused,
         )
 
-        workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
@@ -4372,7 +4376,7 @@ class HumanInteractionBlock(BaseTaskBlock):
                     organization_id=organization_id,
                 )
 
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
@@ -4574,7 +4578,7 @@ class TaskV2Block(Block):
         organization = await app.DATABASE.organizations.get_organization(organization_id)
         if not organization:
             raise ValueError(f"Organization not found {organization_id}")
-        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id)
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
         try:
@@ -4588,15 +4592,15 @@ class TaskV2Block(Block):
                 totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             )
-            await app.DATABASE.update_task_v2(
+            await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
             )
             if task_v2.workflow_run_id:
-                await app.DATABASE.update_workflow_run(
+                await app.DATABASE.workflow_runs.update_workflow_run(
                     workflow_run_id=task_v2.workflow_run_id,
                     status=WorkflowRunStatus.queued,
                 )
-                await app.DATABASE.update_workflow_run_block(
+                await app.DATABASE.observer.update_workflow_run_block(
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                     block_workflow_run_id=task_v2.workflow_run_id,
@@ -4642,7 +4646,9 @@ class TaskV2Block(Block):
         failure_reason: str | None = None
         task_v2_workflow_run_id = task_v2.workflow_run_id
         if task_v2_workflow_run_id:
-            task_v2_workflow_run = await app.DATABASE.get_workflow_run(task_v2_workflow_run_id, organization_id)
+            task_v2_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                task_v2_workflow_run_id, organization_id
+            )
             if task_v2_workflow_run:
                 failure_reason = task_v2_workflow_run.failure_reason
 
@@ -5237,7 +5243,7 @@ class PrintPageBlock(Block):
             return None, None
 
         try:
-            workflow_run_block = await app.DATABASE.get_workflow_run_block(
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
                 workflow_run_block_id,
                 organization_id=artifact_org_id,
             )
@@ -5269,7 +5275,7 @@ class PrintPageBlock(Block):
         # Generate a downloadable URL for the artifact
         artifact_url = None
         try:
-            artifact = await app.DATABASE.get_artifact_by_id(artifact_id, organization_id=artifact_org_id)
+            artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id=artifact_org_id)
             if artifact:
                 artifact_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
         except Exception:
@@ -6575,7 +6581,7 @@ class WorkflowTriggerBlock(Block):
                     f"Workflow trigger depth exceeds maximum of {self.MAX_TRIGGER_DEPTH}. "
                     "This may indicate a circular workflow trigger chain."
                 )
-            run = await app.DATABASE.get_workflow_run(current_run_id)
+            run = await app.DATABASE.workflow_runs.get_workflow_run(current_run_id)
             if not run or not run.parent_workflow_run_id:
                 break
             current_run_id = run.parent_workflow_run_id
@@ -6721,7 +6727,7 @@ class WorkflowTriggerBlock(Block):
         elif self.wait_for_completion:
             # Sync mode: child runs inline in the same process, so it needs
             # its own persistent session to avoid sharing the parent's browser.
-            parent_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id)
+            parent_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
             proxy_location = parent_workflow_run.proxy_location if parent_workflow_run else None
             try:
                 child_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
