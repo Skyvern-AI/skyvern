@@ -873,7 +873,9 @@ class BaseTaskBlock(Block):
                 organization_id=organization_id,
             )
             current_running_task = task
-            organization = await app.DATABASE.get_organization(organization_id=workflow_run.organization_id)
+            organization = await app.DATABASE.organizations.get_organization(
+                organization_id=workflow_run.organization_id
+            )
             if not organization:
                 raise Exception(f"Organization is missing organization_id={workflow_run.organization_id}")
 
@@ -4569,7 +4571,7 @@ class TaskV2Block(Block):
         if not organization_id:
             raise ValueError("Running TaskV2Block requires organization_id")
 
-        organization = await app.DATABASE.get_organization(organization_id)
+        organization = await app.DATABASE.organizations.get_organization(organization_id)
         if not organization:
             raise ValueError(f"Organization not found {organization_id}")
         workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
@@ -6694,7 +6696,7 @@ class WorkflowTriggerBlock(Block):
         # 3. Get the organization
         if not organization_id:
             return await _fail("organization_id is required for WorkflowTriggerBlock")
-        organization = await app.DATABASE.get_organization(organization_id)
+        organization = await app.DATABASE.organizations.get_organization(organization_id)
         if not organization:
             return await _fail(f"Organization {organization_id} not found")
 

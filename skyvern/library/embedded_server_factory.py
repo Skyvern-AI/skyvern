@@ -204,9 +204,9 @@ def create_embedded_server(
             async with db.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
 
-            org = await db.create_organization(organization_name="local")
+            org = await db.organizations.create_organization(organization_name="local")
             token = create_access_token(org.organization_id, expires_delta=timedelta(days=365 * 10))
-            await db.create_org_auth_token(
+            await db.organizations.create_org_auth_token(
                 organization_id=org.organization_id,
                 token_type=OrganizationAuthTokenType.api,
                 token=token,

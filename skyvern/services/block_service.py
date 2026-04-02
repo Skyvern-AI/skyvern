@@ -25,7 +25,7 @@ async def validate_block_labels(
     Validate that all block labels exist in the workflow.
     This should be called BEFORE creating a workflow run to prevent orphaned runs.
     """
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
@@ -91,7 +91,7 @@ async def execute_blocks(
     Runs one or more blocks of a workflow.
     """
 
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_id,
         organization_id=organization.organization_id,
     )
@@ -110,7 +110,7 @@ async def execute_blocks(
         block_output_parameters[block_label] = output_parameter
 
     for block_label, output_parameter in block_output_parameters.items():
-        await app.DATABASE.create_block_run(
+        await app.DATABASE.debug.create_block_run(
             organization_id=organization.organization_id,
             user_id=user_id,
             block_label=block_label,
