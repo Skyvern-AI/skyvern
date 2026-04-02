@@ -163,7 +163,7 @@ ig_*
 browser_sessions/
 videos/
 skyvern/artifacts/
-artifacts/
+/artifacts/
 traces/
 *.pkl
 har/
