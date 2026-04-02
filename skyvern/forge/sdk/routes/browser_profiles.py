@@ -368,7 +368,7 @@ async def _create_profile_from_workflow_run(
         )
         raise WorkflowRunNotFound(workflow_run_id)
 
-    workflow = await app.DATABASE.get_workflow(
+    workflow = await app.DATABASE.workflows.get_workflow(
         workflow_id=workflow_run.workflow_id,
         organization_id=organization_id,
     )

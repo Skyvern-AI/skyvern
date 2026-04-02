@@ -367,6 +367,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         context = skyvern_context.ensure_context()
         files = files or ""
+        original_files = files
         action: UploadFileAction | None = None
         organization_id = context.organization_id
         task_id = context.task_id
@@ -444,6 +445,15 @@ class RealSkyvernPageAi(SkyvernPageAi):
                             files = action.file_url
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
+
+        if action and original_files and action.file_url and action.file_url != original_files:
+            LOG.warning(
+                "LLM returned a different file url than the user provided, using the original",
+                llm_file_url=action.file_url[:20],
+                original_file_url=original_files[:20],
+            )
+            action.file_url = original_files
+            files = original_files
 
         if public_url_only and not validate_download_url(files, organization_id=organization_id):
             raise Exception("Only public URLs are allowed")

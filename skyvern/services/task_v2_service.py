@@ -417,7 +417,7 @@ async def initialize_task_v2_metadata(
 
     # update workflow & tasks with the inferred title and url
     try:
-        await app.DATABASE.update_workflow(
+        await app.DATABASE.workflows.update_workflow(
             workflow_id=workflow.workflow_id,
             organization_id=organization.organization_id,
             title=metadata.workflow_title,
@@ -2040,7 +2040,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
     organization_id = task_v2.organization_id
     if not organization_id:
         return
-    api_key = await app.DATABASE.get_valid_org_auth_token(
+    api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
         organization_id,
         OrganizationAuthTokenType.api.value,
     )
