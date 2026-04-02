@@ -41,7 +41,7 @@ from skyvern.schemas.scripts import (
     WorkflowScriptSummary,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.services.script_reviewer import ScriptReviewer
+from skyvern.services.script_reviewer import ScriptReviewer, store_review_artifacts
 from skyvern.services.workflow_script_service import create_script_version_from_review
 
 LOG = structlog.get_logger()
@@ -705,7 +705,7 @@ async def get_workflow_script_blocks(
     empty = ScriptBlocksResponse(blocks={})
     cache_key_value = block_script_request.cache_key_value
 
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
@@ -882,7 +882,7 @@ async def list_workflow_scripts(
     organization_id = current_org.organization_id
 
     # Verify workflow exists (consistent with other script endpoints)
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
@@ -1054,7 +1054,7 @@ async def delete_workflow_cache_key_value(
     )
 
     # Verify workflow exists
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
@@ -1121,7 +1121,7 @@ async def clear_workflow_cache(
     )
 
     # Verify workflow exists
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
@@ -1178,7 +1178,7 @@ async def pin_workflow_script(
         cache_key_value=data.cache_key_value,
     )
 
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
@@ -1226,7 +1226,7 @@ async def unpin_workflow_script(
         cache_key_value=data.cache_key_value,
     )
 
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
@@ -1286,7 +1286,7 @@ async def review_script_with_instructions(
             raise HTTPException(status_code=403, detail="Script editing is not enabled for this organization")
 
     # Load the workflow
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
@@ -1350,7 +1350,7 @@ async def review_script_with_instructions(
 
     # Run the reviewer
     reviewer = ScriptReviewer()
-    updated_blocks = await reviewer.review_with_user_instructions(
+    review_results = await reviewer.review_with_user_instructions(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         script_revision_id=latest_script.script_revision_id,
@@ -1360,13 +1360,16 @@ async def review_script_with_instructions(
         run_parameter_values=run_parameter_values or None,
     )
 
-    if not updated_blocks:
+    if not review_results:
         return ReviewScriptResponse(
             script_id=latest_script.script_id,
             version=latest_script.version,
             updated_blocks=[],
             message="No changes were needed — the current code already satisfies your instructions.",
         )
+
+    # Extract code-only dict for creating the script version
+    updated_blocks = {label: r.code for label, r in review_results.items()}
 
     # Create a new script version with the updated blocks
     new_script = await create_script_version_from_review(
@@ -1381,19 +1384,27 @@ async def review_script_with_instructions(
     if not new_script:
         raise HTTPException(status_code=500, detail="Failed to create new script version")
 
+    # Store reviewer artifacts (prompt + LLM response) for each block
+    await store_review_artifacts(
+        organization_id=organization_id,
+        script_id=new_script.script_id,
+        script_version=new_script.version,
+        review_results=review_results,
+    )
+
     LOG.info(
         "Script reviewed with user instructions",
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         script_id=new_script.script_id,
         version=new_script.version,
-        updated_blocks=list(updated_blocks.keys()),
+        updated_blocks=list(review_results.keys()),
     )
 
     return ReviewScriptResponse(
         script_id=new_script.script_id,
         version=new_script.version,
-        updated_blocks=list(updated_blocks.keys()),
+        updated_blocks=list(review_results.keys()),
     )
 
 
@@ -1418,7 +1429,7 @@ async def get_fallback_episodes(
     fallback_type: str | None = Query(None, description="Filter by fallback type"),
 ) -> FallbackEpisodeListResponse:
     # Verify workflow exists
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
@@ -1467,7 +1478,7 @@ async def get_fallback_episode(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ScriptFallbackEpisode:
     # Verify workflow exists
-    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )

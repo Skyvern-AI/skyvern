@@ -516,7 +516,9 @@ class WorkflowService:
         return value
 
     async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
-        credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=organization.organization_id
+        )
         if credential is None:
             raise InvalidCredentialId(credential_id)
 
@@ -2478,7 +2480,7 @@ class WorkflowService:
             if not organization_id:
                 continue
             try:
-                db_cred = await app.DATABASE.get_credential(
+                db_cred = await app.DATABASE.credentials.get_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
                 )
@@ -2906,7 +2908,7 @@ class WorkflowService:
         generate_script_on_terminal: bool = False,
     ) -> Workflow:
         try:
-            return await app.DATABASE.create_workflow(
+            return await app.DATABASE.workflows.create_workflow(
                 title=title,
                 workflow_definition=workflow_definition.model_dump(mode="json"),
                 organization_id=organization_id,
@@ -3060,7 +3062,7 @@ class WorkflowService:
         return new_workflow
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
-        workflow = await app.DATABASE.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+        workflow = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
         if not workflow:
             raise WorkflowNotFound(workflow_id=workflow_id)
         return workflow
@@ -3072,7 +3074,7 @@ class WorkflowService:
         version: int | None = None,
         filter_deleted: bool = True,
     ) -> Workflow:
-        workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
@@ -3105,12 +3107,12 @@ class WorkflowService:
         )
 
         if is_template:
-            await app.DATABASE.add_workflow_template(
+            await app.DATABASE.workflows.add_workflow_template(
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
             )
         else:
-            await app.DATABASE.remove_workflow_template(
+            await app.DATABASE.workflows.remove_workflow_template(
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
             )
@@ -3127,7 +3129,7 @@ class WorkflowService:
         Get all versions of a workflow by its permanent ID.
         Returns an empty list if no workflow is found with that permanent ID.
         """
-        workflows = await app.DATABASE.get_workflow_versions_by_permanent_id(
+        workflows = await app.DATABASE.workflows.get_workflow_versions_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             filter_deleted=filter_deleted,
@@ -3140,7 +3142,7 @@ class WorkflowService:
         organization_id: str | None = None,
         filter_deleted: bool = True,
     ) -> Workflow:
-        workflow = await app.DATABASE.get_workflow_for_workflow_run(
+        workflow = await app.DATABASE.workflows.get_workflow_for_workflow_run(
             workflow_run_id,
             organization_id=organization_id,
             filter_deleted=filter_deleted,
@@ -3159,7 +3161,7 @@ class WorkflowService:
         filter_deleted: bool = True,
         version: int | None = None,
     ) -> dict[str, dict[str, Any]]:
-        workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
@@ -3174,7 +3176,7 @@ class WorkflowService:
         for block in workflow.workflow_definition.blocks:
             label = block.label
 
-            block_run = await app.DATABASE.get_latest_completed_block_run(
+            block_run = await app.DATABASE.debug.get_latest_completed_block_run(
                 organization_id=organization_id,
                 user_id=user_id,
                 block_label=label,
@@ -3210,7 +3212,7 @@ class WorkflowService:
         search_key: str = "",
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
-        return await app.DATABASE.get_workflows_by_permanent_ids(
+        return await app.DATABASE.workflows.get_workflows_by_permanent_ids(
             workflow_permanent_ids,
             organization_id=organization_id,
             page=page,
@@ -3238,7 +3240,7 @@ class WorkflowService:
             search_key: Unified search term for title, folder name, and parameter metadata.
             folder_id: Filter workflows by folder ID.
         """
-        return await app.DATABASE.get_workflows_by_organization_id(
+        return await app.DATABASE.workflows.get_workflows_by_organization_id(
             organization_id=organization_id,
             page=page,
             page_size=page_size,
@@ -3258,7 +3260,7 @@ class WorkflowService:
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
     ) -> Workflow:
-        updated_workflow = await app.DATABASE.update_workflow(
+        updated_workflow = await app.DATABASE.workflows.update_workflow(
             workflow_id=workflow_id,
             title=title,
             organization_id=organization_id,
@@ -3278,7 +3280,7 @@ class WorkflowService:
         if workflow_definition:
             workflow_definition.validate()
 
-        previous_valid_workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        previous_valid_workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization_id=organization_id,
             filter_deleted=True,
@@ -3419,7 +3421,7 @@ class WorkflowService:
     ) -> None:
         # Delete workflow and schedules in one DB transaction so we do not leave
         # the workflow active if a process exits between separate commits.
-        deleted_schedule_ids = await app.DATABASE.soft_delete_workflow_and_schedules_by_permanent_id(
+        deleted_schedule_ids = await app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
@@ -3441,7 +3443,7 @@ class WorkflowService:
         # save/update flows. It must stay version-scoped and non-cascading because
         # schedules belong to the permanent workflow and should remain attached to
         # the previously valid version if the new version creation fails.
-        await app.DATABASE.soft_delete_workflow_by_id(
+        await app.DATABASE.workflows.soft_delete_workflow_by_id(
             workflow_id=workflow_id,
             organization_id=organization_id,
         )
@@ -5436,7 +5438,7 @@ class WorkflowService:
         historical_episodes: list | None = None,
     ) -> None:
         """Run the AI Script Reviewer and create a new script version if successful."""
-        from skyvern.services.script_reviewer import ScriptReviewer
+        from skyvern.services.script_reviewer import BlockReviewResult, ScriptReviewer, store_review_artifacts
         from skyvern.services.workflow_script_service import create_script_version_from_review
 
         LOG.info(
@@ -5472,8 +5474,8 @@ class WorkflowService:
             regular_episodes = [ep for ep in episodes if ep.fallback_type != "conditional_agent"]
             conditional_episodes = [ep for ep in episodes if ep.fallback_type == "conditional_agent"]
 
-            updated_blocks: dict[str, str] = {}
-            conditional_blocks: dict[str, str] = {}
+            review_results: dict[str, BlockReviewResult] = {}
+            conditional_code: dict[str, str] = {}
 
             # Review regular fallback episodes (code failures, new page variants)
             if regular_episodes:
@@ -5487,7 +5489,7 @@ class WorkflowService:
                     run_parameter_values=run_parameter_values,
                 )
                 if regular_updates:
-                    updated_blocks.update(regular_updates)
+                    review_results.update(regular_updates)
 
             # Review conditional blocks that ran via agent — try to convert to code
             if conditional_episodes:
@@ -5498,8 +5500,11 @@ class WorkflowService:
                     run_parameter_values=run_parameter_values,
                 )
                 if conditional_updates:
-                    conditional_blocks.update(conditional_updates)
-                    updated_blocks.update(conditional_updates)
+                    conditional_code.update(conditional_updates)
+
+            # Build code-only dicts for create_script_version_from_review
+            updated_blocks: dict[str, str] = {label: r.code for label, r in review_results.items()}
+            updated_blocks.update(conditional_code)
 
             if not updated_blocks:
                 LOG.info(
@@ -5532,7 +5537,7 @@ class WorkflowService:
                     updated_blocks=updated_blocks,
                     workflow=workflow,
                     workflow_run=workflow_run,
-                    conditional_blocks=conditional_blocks,
+                    conditional_blocks=conditional_code,
                 )
 
                 if new_script:
@@ -5540,7 +5545,15 @@ class WorkflowService:
                         "Script reviewer created new version",
                         workflow_permanent_id=workflow.workflow_permanent_id,
                         new_version=new_script.version,
-                        conditional_coded=list(conditional_blocks.keys()) if conditional_blocks else [],
+                        conditional_coded=list(conditional_code.keys()) if conditional_code else [],
+                    )
+
+                    # Store reviewer prompt/response artifacts alongside the new script version
+                    await store_review_artifacts(
+                        organization_id=workflow.organization_id,
+                        script_id=new_script.script_id,
+                        script_version=new_script.version,
+                        review_results=review_results,
                     )
 
             # Mark all episodes as reviewed

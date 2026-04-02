@@ -74,7 +74,7 @@ def _redact_url(url: str) -> str:
 
 
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
-    """Create console/network/dialog handlers bound to a specific page."""
+    """Create console/network/dialog/pageerror handlers bound to a specific page."""
 
     def _on_console(msg: Any) -> None:
         try:
@@ -146,7 +146,24 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         else:
             event_record["action_taken"] = "dismissed"
 
-    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog}
+    def _on_pageerror(error: Any) -> None:
+        try:
+            try:
+                message = str(error)
+            except Exception:
+                message = "<unserializable error>"
+            state.page_errors.append(
+                {
+                    "message": message,
+                    "timestamp": time.time(),
+                    "page_url": raw_page.url,
+                    "tab_id": str(id(raw_page)),
+                }
+            )
+        except Exception:
+            pass
+
+    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog, "pageerror": _on_pageerror}
 
 
 def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
@@ -159,6 +176,7 @@ def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
     raw_page.on("console", handlers["console"])
     raw_page.on("response", handlers["response"])
     raw_page.on("dialog", handlers["dialog"])
+    raw_page.on("pageerror", handlers["pageerror"])
     state._hooked_page_ids.add(page_id)
     state._hooked_handlers_map[page_id] = handlers
 
@@ -384,5 +402,69 @@ async def skyvern_handle_dialog(
         data={
             "dialogs": entries,
             "count": len(entries),
+        },
+    )
+
+
+# -- Page JS error tool --
+
+
+async def skyvern_get_errors(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    text: Annotated[
+        str | None,
+        Field(description="Filter by substring match in error message. Case-insensitive."),
+    ] = None,
+    clear: Annotated[
+        bool,
+        Field(description="Clear the buffer after reading. Default false."),
+    ] = False,
+) -> dict[str, Any]:
+    """Read uncaught JavaScript errors (exceptions) from the browser page.
+
+    Captures unhandled errors thrown by page scripts (window onerror / unhandledrejection).
+    These are distinct from console.error() messages — use skyvern_console_messages(level='error') for those.
+    Use text='...' to search for specific error messages.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_get_errors",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_get_errors", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+    has_filter = text is not None
+    entries = list(state.page_errors)
+
+    if text:
+        text_lower = text.lower()
+        entries = [e for e in entries if text_lower in e.get("message", "").lower()]
+
+    if clear:
+        if has_filter:
+            matched = {id(e) for e in entries}
+            state.page_errors = type(state.page_errors)(
+                (e for e in state.page_errors if id(e) not in matched),
+                maxlen=state.page_errors.maxlen,
+            )
+        else:
+            state.page_errors.clear()
+
+    return make_result(
+        "skyvern_get_errors",
+        browser_context=ctx,
+        data={
+            "errors": entries,
+            "count": len(entries),
+            "buffer_size": len(state.page_errors),
         },
     )
