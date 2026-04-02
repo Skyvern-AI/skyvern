@@ -144,7 +144,7 @@ class TaskRunRequest(UniversalBaseModel):
 
     run_with: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Whether to run the task with agent or code. Null means use the default.
+    Whether to run the task with agent or code.
     """
 
     if IS_PYDANTIC_V2:
