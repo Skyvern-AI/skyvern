@@ -31,8 +31,10 @@ class SessionState:
     console_messages: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    page_errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     tracing_active: bool = False
     har_enabled: bool = False
+    _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
     # -- Active page tracking (tab management) --
     _active_page: Page | None = None
     # -- Page event buffer for tab_wait_for_new --
