@@ -336,7 +336,7 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
-        mock_app.DATABASE.get_workflow_run_blocks = AsyncMock(
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
             return_value=[
                 mock_forloop_run_block,
                 mock_child_run_block,
@@ -345,8 +345,8 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
         # B1 optimization: Mock batch methods instead of individual queries
         mock_task.task_id = "task_extraction_789"
         mock_action.task_id = "task_extraction_789"
-        mock_app.DATABASE.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
-        mock_app.DATABASE.get_tasks_actions = AsyncMock(return_value=[mock_action])
+        mock_app.DATABASE.tasks.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
+        mock_app.DATABASE.tasks.get_tasks_actions = AsyncMock(return_value=[mock_action])
 
         # Call the transformation
         result = await transform_workflow_run_to_code_gen_input(

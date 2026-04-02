@@ -20,7 +20,7 @@ async def test_org_email_bitwarden_auth_falls_back_to_global_credentials(
         )
     )
 
-    class FakeOrgRepo:
+    class FakeOrganizationsRepo:
         async def get_valid_org_auth_token(self, organization_id: str, token_type: str) -> object:
             assert organization_id == "org-1"
             assert token_type == "bitwarden_credential"
@@ -28,7 +28,7 @@ async def test_org_email_bitwarden_auth_falls_back_to_global_credentials(
 
     class FakeDatabase:
         def __init__(self) -> None:
-            self.organizations = FakeOrgRepo()
+            self.organizations = FakeOrganizationsRepo()
 
     fake_app = SimpleNamespace(DATABASE=FakeDatabase())
     monkeypatch.setattr(cm, "app", fake_app)

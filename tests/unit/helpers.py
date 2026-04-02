@@ -242,10 +242,10 @@ def setup_parallel_verification_mocks(
     extract_action: Any | None = None,
 ) -> ParallelVerificationMocks:
     create_step_mock = AsyncMock(return_value=next_step)
-    monkeypatch.setattr(app.DATABASE, "create_step", create_step_mock)
+    monkeypatch.setattr(app.DATABASE.tasks, "create_step", create_step_mock)
 
     get_task_steps_mock = AsyncMock(return_value=[step])
-    monkeypatch.setattr(app.DATABASE, "get_task_steps", get_task_steps_mock)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", get_task_steps_mock)
 
     sleep_mock = AsyncMock(return_value=None)
     monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)

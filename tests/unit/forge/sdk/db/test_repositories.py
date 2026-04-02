@@ -196,7 +196,10 @@ def test_agent_db_has_typed_repo_attributes():
         assert isinstance(db.tasks, TasksRepository)
         assert isinstance(db.credentials, CredentialRepository)
         assert hasattr(db, "get_task")  # backward compat delegate
-        assert hasattr(db, "workflows")
+        # Migrated domains no longer have delegates on AgentDB:
+        assert not hasattr(db, "create_workflow")
+        assert not hasattr(db, "get_organization")
+        assert not hasattr(db, "get_credential")
 
 
 def test_agent_db_delegates_route_to_repositories():
