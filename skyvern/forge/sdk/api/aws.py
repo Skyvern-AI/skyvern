@@ -1,3 +1,6 @@
+import io
+import time
+from collections.abc import Callable
 from enum import StrEnum
 from mimetypes import add_type, guess_type
 from typing import IO, Any
@@ -18,6 +21,7 @@ add_type("application/json", ".har")
 add_type("text/plain", ".log")
 add_type("application/zstd", ".zst")
 
+_S3_OPERATION_MAX_ATTEMPTS = 2
 LOG = structlog.get_logger()
 
 
@@ -53,11 +57,59 @@ class AsyncAWSClient:
     ) -> None:
         self.region_name = region_name or settings.AWS_REGION
         self._endpoint_url = endpoint_url
+        self._aws_access_key_id = aws_access_key_id
+        self._aws_secret_access_key = aws_secret_access_key
+        self._profile_name = profile_name
+        self._create_session()
+
+    def _create_session(self) -> None:
         self.session = aioboto3.Session(
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            profile_name=profile_name,
+            aws_access_key_id=self._aws_access_key_id,
+            aws_secret_access_key=self._aws_secret_access_key,
+            profile_name=self._profile_name,
         )
+
+    def refresh_session(self) -> None:
+        """Recreate the session to pick up refreshed credentials (e.g., rotated web identity tokens)."""
+        LOG.info("Refreshing AWS session to pick up new credentials")
+        self._create_session()
+
+    async def _s3_with_retry(
+        self,
+        op_name: str,
+        operation: Callable[[S3Client], Any],
+        *,
+        before_retry: Callable[[], bool | None] | None = None,
+        **log_kwargs: Any,
+    ) -> Any:
+        """Execute an S3 operation with automatic retry on expired AWS token.
+
+        Args:
+            op_name: Human-readable name for logging (e.g. "upload", "download").
+            operation: Async callable(client) that performs the S3 operation.
+            before_retry: Optional callable invoked before retrying. Return False to abort the retry.
+            **log_kwargs: Extra fields passed to the warning log on retry.
+
+        Raises the original exception on non-token errors or when retry is exhausted / aborted.
+        """
+        last_exception: Exception | None = None
+        for attempt in range(_S3_OPERATION_MAX_ATTEMPTS):
+            try:
+                async with self._s3_client() as client:
+                    return await operation(client)
+            except client.exceptions.ExpiredTokenException as e:
+                last_exception = e
+                if attempt > 0:
+                    raise
+                LOG.warning(
+                    "AWS token expired, refreshing session and retrying",
+                    op_name=op_name,
+                    **log_kwargs,
+                )
+                self.refresh_session()
+                if before_retry is not None and before_retry() is False:
+                    raise
+        raise last_exception  # type: ignore[misc]
 
     def _ecs_client(self) -> ECSClient:
         return self.session.client(AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url)
@@ -130,18 +182,21 @@ class AsyncAWSClient:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/put_object.html
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
+
+        async def _op(client: S3Client) -> str:
+            parsed_uri = S3Uri(uri)
+            extra_args = {"Tagging": self._create_tag_string(tags)} if tags else {}
+            await client.put_object(
+                Body=data,
+                Bucket=parsed_uri.bucket,
+                Key=parsed_uri.key,
+                StorageClass=str(storage_class),
+                **extra_args,
+            )
+            return uri
+
         try:
-            async with self._s3_client() as client:
-                parsed_uri = S3Uri(uri)
-                extra_args = {"Tagging": self._create_tag_string(tags)} if tags else {}
-                await client.put_object(
-                    Body=data,
-                    Bucket=parsed_uri.bucket,
-                    Key=parsed_uri.key,
-                    StorageClass=str(storage_class),
-                    **extra_args,
-                )
-                return uri
+            return await self._s3_with_retry("upload", _op, uri=uri)
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
             return None
@@ -156,20 +211,31 @@ class AsyncAWSClient:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/upload_fileobj.html#upload-fileobj
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
+
+        async def _op(client: S3Client) -> str:
+            parsed_uri = S3Uri(uri)
+            extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
+            if tags:
+                extra_args["Tagging"] = self._create_tag_string(tags)
+            await client.upload_fileobj(
+                file_obj,
+                parsed_uri.bucket,
+                parsed_uri.key,
+                ExtraArgs=extra_args,
+            )
+            LOG.debug("Upload file stream success", uri=uri)
+            return uri
+
+        def _rewind_stream() -> bool | None:
+            try:
+                file_obj.seek(0)
+            except (OSError, io.UnsupportedOperation):
+                LOG.warning("Cannot rewind stream for retry, failing upload", uri=uri)
+                return False
+            return None
+
         try:
-            async with self._s3_client() as client:
-                parsed_uri = S3Uri(uri)
-                extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
-                if tags:
-                    extra_args["Tagging"] = self._create_tag_string(tags)
-                await client.upload_fileobj(
-                    file_obj,
-                    parsed_uri.bucket,
-                    parsed_uri.key,
-                    ExtraArgs=extra_args,
-                )
-                LOG.debug("Upload file stream success", uri=uri)
-                return uri
+            return await self._s3_with_retry("stream upload", _op, before_retry=_rewind_stream, uri=uri)
         except Exception:
             LOG.exception("S3 upload stream failed.", uri=uri)
             return None
@@ -179,32 +245,34 @@ class AsyncAWSClient:
         uri: str,
         file_path: str,
         storage_class: S3StorageClass = S3StorageClass.STANDARD,
-        metadata: dict | None = None,
+        metadata: dict[str, str] | None = None,
         raise_exception: bool = False,
         tags: dict[str, str] | None = None,
         content_type: str | None = None,
     ) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/upload_file.html
+        async def _op(client: S3Client) -> None:
+            parsed_uri = S3Uri(uri)
+            extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
+            if metadata:
+                extra_args["Metadata"] = metadata
+            if tags:
+                extra_args["Tagging"] = self._create_tag_string(tags)
+            if content_type:
+                extra_args["ContentType"] = content_type
+            else:
+                guessed_type, _ = guess_type(file_path)
+                if guessed_type:
+                    extra_args["ContentType"] = guessed_type
+            await client.upload_file(
+                Filename=file_path,
+                Bucket=parsed_uri.bucket,
+                Key=parsed_uri.key,
+                ExtraArgs=extra_args,
+            )
+
         try:
-            async with self._s3_client() as client:
-                parsed_uri = S3Uri(uri)
-                extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
-                if metadata:
-                    extra_args["Metadata"] = metadata
-                if tags:
-                    extra_args["Tagging"] = self._create_tag_string(tags)
-                if content_type:
-                    extra_args["ContentType"] = content_type
-                else:
-                    guessed_type, _ = guess_type(file_path)
-                    if guessed_type:
-                        extra_args["ContentType"] = guessed_type
-                await client.upload_file(
-                    Filename=file_path,
-                    Bucket=parsed_uri.bucket,
-                    Key=parsed_uri.key,
-                    ExtraArgs=extra_args,
-                )
+            await self._s3_with_retry("upload", _op, uri=uri)
         except Exception as e:
             LOG.exception("S3 upload failed.", uri=uri)
             if raise_exception:
@@ -212,13 +280,13 @@ class AsyncAWSClient:
 
     async def download_file(self, uri: str, log_exception: bool = True) -> bytes | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/get_object.html
-        try:
-            async with self._s3_client() as client:
-                parsed_uri = S3Uri(uri)
+        async def _op(client: S3Client) -> bytes:
+            parsed_uri = S3Uri(uri)
+            response = await client.get_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+            return await response["Body"].read()
 
-                # Get full object including body
-                response = await client.get_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
-                return await response["Body"].read()
+        try:
+            return await self._s3_with_retry("download", _op, uri=uri)
         except Exception:
             if log_exception:
                 LOG.exception("S3 download failed", uri=uri)
@@ -226,25 +294,29 @@ class AsyncAWSClient:
 
     async def delete_file(self, uri: str, log_exception: bool = True) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
+        async def _op(client: S3Client) -> None:
+            parsed_uri = S3Uri(uri)
+            await client.delete_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+
         try:
-            async with self._s3_client() as client:
-                parsed_uri = S3Uri(uri)
-                await client.delete_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+            await self._s3_with_retry("delete", _op, uri=uri)
         except Exception:
             if log_exception:
                 LOG.exception("S3 delete failed", uri=uri)
 
-    async def get_object_info(self, uri: str) -> dict:
-        async with self._s3_client() as client:
+    async def get_object_info(self, uri: str) -> dict[str, Any]:
+        async def _op(client: S3Client) -> dict[str, Any]:
             parsed_uri = S3Uri(uri)
             # Only get object metadata without the body
             return await client.head_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+
+        return await self._s3_with_retry("head_object", _op, uri=uri)
 
     async def get_file_metadata(
         self,
         uri: str,
         log_exception: bool = True,
-    ) -> dict | None:
+    ) -> dict[str, str] | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/head_object.html
         """
         Retrieves only the metadata of a file without downloading its content.
@@ -267,28 +339,29 @@ class AsyncAWSClient:
 
     async def create_presigned_urls(self, uris: list[str]) -> list[str] | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
-        presigned_urls = []
-        try:
-            async with self._s3_client() as client:
-                for uri in uris:
-                    parsed_uri = S3Uri(uri)
-                    url = await client.generate_presigned_url(
-                        "get_object",
-                        Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
-                        ExpiresIn=settings.PRESIGNED_URL_EXPIRATION,
-                    )
-                    presigned_urls.append(url)
+        async def _op(client: S3Client) -> list[str]:
+            presigned_urls = []
+            for uri in uris:
+                parsed_uri = S3Uri(uri)
+                url = await client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
+                    ExpiresIn=settings.PRESIGNED_URL_EXPIRATION,
+                )
+                presigned_urls.append(url)
+            return presigned_urls
 
-                return presigned_urls
+        try:
+            return await self._s3_with_retry("presigned URL generation", _op)
         except Exception:
             LOG.exception("Failed to create presigned url for S3 objects.", uris=uris)
             return None
 
     async def list_files(self, uri: str) -> list[str]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/paginator/ListObjectsV2.html
-        object_keys: list[str] = []
-        parsed_uri = S3Uri(uri)
-        async with self._s3_client() as client:
+        async def _op(client: S3Client) -> list[str]:
+            object_keys: list[str] = []
+            parsed_uri = S3Uri(uri)
             async for page in client.get_paginator("list_objects_v2").paginate(
                 Bucket=parsed_uri.bucket, Prefix=parsed_uri.key
             ):
@@ -296,6 +369,8 @@ class AsyncAWSClient:
                     for obj in page["Contents"]:
                         object_keys.append(obj["Key"])
             return object_keys
+
+        return await self._s3_with_retry("list_files", _op, uri=uri)
 
     async def delete_files(self, bucket: str, keys: list[str]) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_objects.html
@@ -309,29 +384,27 @@ class AsyncAWSClient:
         if not keys:
             return
 
+        async def _op(client: S3Client) -> None:
+            objects = [{"Key": key} for key in keys]
+            response = await client.delete_objects(
+                Bucket=bucket,
+                Delete={
+                    "Objects": objects,
+                    "Quiet": False,
+                },
+            )
+            if "Errors" in response:
+                for error in response["Errors"]:
+                    LOG.error(
+                        "Failed to delete object from S3",
+                        bucket=bucket,
+                        key=error.get("Key"),
+                        code=error.get("Code"),
+                        message=error.get("Message"),
+                    )
+
         try:
-            async with self._s3_client() as client:
-                # Format the objects for the delete_objects call
-                objects = [{"Key": key} for key in keys]
-
-                response = await client.delete_objects(
-                    Bucket=bucket,
-                    Delete={
-                        "Objects": objects,
-                        "Quiet": False,  # Set to True to suppress response details
-                    },
-                )
-
-                # Log any errors that occurred during deletion
-                if "Errors" in response:
-                    for error in response["Errors"]:
-                        LOG.error(
-                            "Failed to delete object from S3",
-                            bucket=bucket,
-                            key=error.get("Key"),
-                            code=error.get("Code"),
-                            message=error.get("Message"),
-                        )
+            await self._s3_with_retry("delete_files", _op, bucket=bucket)
         except Exception as e:
             LOG.exception("Failed to delete files from S3", bucket=bucket, keys_count=len(keys))
             raise e
@@ -347,11 +420,14 @@ class AsyncAWSClient:
             days: Number of days to keep the restored object available (default: 1)
             tier: Restoration tier - "Standard" (3-5 hours) or "Expedited" (1-5 minutes)
         """
+
+        async def _op(client: S3Client) -> None:
+            await client.restore_object(
+                Bucket=bucket, Key=key, RestoreRequest={"Days": days, "GlacierJobParameters": {"Tier": tier}}
+            )
+
         try:
-            async with self._s3_client() as client:
-                await client.restore_object(
-                    Bucket=bucket, Key=key, RestoreRequest={"Days": days, "GlacierJobParameters": {"Tier": tier}}
-                )
+            await self._s3_with_retry("restore_object", _op, bucket=bucket, key=key)
         except Exception as e:
             LOG.exception("Failed to restore S3 object", bucket=bucket, key=key, tier=tier)
             raise e
@@ -365,7 +441,7 @@ class AsyncAWSClient:
         security_groups: list[str],
         assign_public_ip: str = "DISABLED",
         enable_execute_command: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/run_task.html
         async with self._ecs_client() as client:
             return await client.run_task(
@@ -382,45 +458,45 @@ class AsyncAWSClient:
                 enableExecuteCommand=enable_execute_command,
             )
 
-    async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict:
+    async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/stop_task.html
         async with self._ecs_client() as client:
             return await client.stop_task(cluster=cluster, task=task, reason=reason)
 
-    async def describe_tasks(self, cluster: str, tasks: list[str]) -> dict:
+    async def describe_tasks(self, cluster: str, tasks: list[str]) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_tasks.html
         async with self._ecs_client() as client:
             return await client.describe_tasks(cluster=cluster, tasks=tasks)
 
-    async def list_tasks(self, cluster: str) -> dict:
+    async def list_tasks(self, cluster: str) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/list_tasks.html
         async with self._ecs_client() as client:
             return await client.list_tasks(cluster=cluster)
 
-    async def describe_task_definition(self, task_definition: str) -> dict:
+    async def describe_task_definition(self, task_definition: str) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_task_definition.html
         async with self._ecs_client() as client:
             return await client.describe_task_definition(taskDefinition=task_definition)
 
-    async def deregister_task_definition(self, task_definition: str) -> dict:
+    async def deregister_task_definition(self, task_definition: str) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/deregister_task_definition.html
         async with self._ecs_client() as client:
             return await client.deregister_task_definition(taskDefinition=task_definition)
 
     ###### EC2 ######
-    async def describe_network_interfaces(self, network_interface_ids: list[str]) -> dict:
+    async def describe_network_interfaces(self, network_interface_ids: list[str]) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2/client/describe_network_interfaces.html
         async with self._ec2_client() as client:
             return await client.describe_network_interfaces(NetworkInterfaceIds=network_interface_ids)
 
     ###### Batch ######
-    async def describe_job(self, job_id: str) -> dict:
+    async def describe_job(self, job_id: str) -> dict[str, Any]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/batch/client/describe_jobs.html
         async with self._batch_client() as client:
             response = await client.describe_jobs(jobs=[job_id])
             return response["jobs"][0] if response["jobs"] else {}
 
-    async def list_jobs(self, job_queue: str, job_status: str) -> list[dict]:
+    async def list_jobs(self, job_queue: str, job_status: str) -> list[dict[str, Any]]:
         # NOTE: AWS batch only records the latest 7 days jobs by default
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/batch/client/list_jobs.html
         async with self._batch_client() as client:
@@ -436,10 +512,10 @@ class AsyncAWSClient:
         job_name: str,
         job_queue: str,
         job_definition: str,
-        params: dict,
+        params: dict[str, str],
         job_priority: int | None = None,
         share_identifier: str | None = None,
-        container_overrides: dict | None = None,
+        container_overrides: dict[str, Any] | None = None,
         depends_on_ids: list[str] | None = None,
     ) -> str | None:
         container_overrides = container_overrides or {}
@@ -523,10 +599,16 @@ def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
 
 
 _aws_client: AsyncAWSClient | None = None
+_aws_client_created_at: float = 0.0
+_AWS_CLIENT_TTL_SECONDS: float = 45 * 60  # 45 mins - before the 1-hour projected token expiry
 
 
 def get_aws_client() -> AsyncAWSClient:
-    global _aws_client
-    if _aws_client is None:
+    global _aws_client, _aws_client_created_at
+    now = time.monotonic()
+    if _aws_client is None or (now - _aws_client_created_at) > _AWS_CLIENT_TTL_SECONDS:
+        if _aws_client is not None:
+            LOG.info("Recreating AWS client (TTL expired)", ttl_seconds=_AWS_CLIENT_TTL_SECONDS)
         _aws_client = AsyncAWSClient()
+        _aws_client_created_at = now
     return _aws_client
