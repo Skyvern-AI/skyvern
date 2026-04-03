@@ -8,16 +8,18 @@ The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Code
 
 ## What you can do
 
-The MCP server exposes 33 tools across 6 categories:
+The MCP server exposes 75+ tools across many categories. Here are the key ones:
 
 | Category | Key tools | What they do |
 |----------|-----------|--------------|
-| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions |
-| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language or CSS/XPath selectors |
-| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured data from pages, capture screenshots, run JavaScript |
-| **Validation** | `skyvern_validate` | Check page conditions using AI (returns true/false) |
-| **Credentials** | `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Look up stored credentials for login flows |
-| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete` | Build and execute multi-step automations |
+| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions — including connecting to a local browser via CDP |
+| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language, CSS/XPath selectors, or both (hybrid mode) |
+| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured JSON from pages, capture screenshots, run JavaScript |
+| **Validation** | `skyvern_validate` | Assert page conditions in natural language (returns true/false with reasoning) |
+| **Credentials & login** | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
+| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types |
+
+Additional tools cover tab management, iframe switching, drag-and-drop, file upload, clipboard access, network/console inspection, HAR recording, web storage, auth state persistence, folder management, and cached script management.
 
 Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_browser_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_browser_session_close` automatically.
 
@@ -45,8 +47,21 @@ claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/"
 
 </Tab>
 <Tab title="Claude Desktop">
+**macOS / Windows (recommended, no Node.js required)**
 
-Add to your Claude Desktop config file:
+1. Download [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb).
+2. Double-click the downloaded `.mcpb` file.
+3. When Claude Desktop opens the Skyvern installer preview, click **Install**.
+4. In the **Configure Skyvern** dialog, paste your Skyvern API key.
+5. Leave **Skyvern MCP URL** set to `https://api.skyvern.com/mcp/` unless you are connecting to a different deployment, then click **Save**.
+
+If double-clicking is blocked by your system, you can instead open **Claude Desktop > Settings > Extensions > Install Extension** and select the downloaded file manually.
+
+The bundle defaults to `https://api.skyvern.com/mcp/` and removes the separate Node.js requirement.
+
+**Linux, self-hosted, or advanced fallback (requires Node.js >= 20)**
+
+Add this manual bridge to your Claude Desktop config file:
 
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
@@ -68,7 +83,7 @@ Add to your Claude Desktop config file:
 }
 ```
 
-This uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio. Requires Node.js >= 20.
+This fallback uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio. It still requires Node.js >= 20.
 
 </Tab>
 <Tab title="Cursor">
@@ -131,7 +146,11 @@ x-api-key = "SKYVERN_API_KEY"
 </Tab>
 </Tabs>
 
-That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the connection (requires Node.js >= 20).
+That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
+
+<Tip>
+Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
+</Tip>
 
 ## Switch an existing MCP config
 
@@ -160,7 +179,11 @@ If a config file exists but does not already contain a Skyvern entry, run `skyve
 
 ## Alternative: Local mode (self-hosted)
 
-Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a lightweight Python process on your machine that connects to your local Skyvern server. Requires Python 3.11, 3.12, or 3.13.
+Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a lightweight Python process on your machine that connects to your local Skyvern server.
+
+<Tip title="Supported Python Versions" icon="fa-brands fa-python">
+Local mode requires Python 3.11, 3.12, or 3.13.
+</Tip>
 
 ```bash
 pip install skyvern
@@ -297,6 +320,58 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 <video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
   <source src="https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7" type="video/mp4" />
 </video>
+
+## Connect to your local browser
+
+You can point your AI assistant at a browser running on your machine instead of a cloud browser. This lets you automate internal tools on localhost, reuse existing login sessions, and verify local dev changes — all through the same MCP tools.
+
+Start a local browser with a tunnel so Skyvern Cloud can reach it:
+
+```bash
+skyvern browser serve --tunnel --use-local-profile
+```
+
+This launches Chrome with your existing cookies and logins, and creates an ngrok tunnel. Your AI assistant can then connect to it:
+
+> "Connect to my local browser and check if the dashboard at localhost:3000 renders correctly"
+
+The `--use-local-profile` flag clones auth-relevant data from your default Chrome profile (cookies, saved passwords, local storage) so the browser starts pre-authenticated. Your original profile is never modified.
+
+<Tip>
+This is especially powerful during development: make a code change, then ask your AI assistant to navigate to `localhost:3000` and verify it works — fix code and validate in the same prompt.
+</Tip>
+
+<Warning>
+Always use `--api-key` when exposing your browser via tunnel. Without it, anyone with the ngrok URL has full browser control.
+</Warning>
+
+<Accordion title="Claude Desktop bundle updates">
+Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb) again, then reinstall it by double-clicking the bundle or using **Settings > Extensions**.
+</Accordion>
+
+## QA your frontend changes
+
+For the local self-hosted path, run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills — including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+
+```bash
+pip install skyvern
+skyvern quickstart
+# or: skyvern init
+```
+
+Then make a frontend change and type `/qa` in Claude Code. It will:
+
+1. Read your `git diff` and the full source of each changed file
+2. Generate targeted test cases (plus regression tests for adjacent behavior)
+3. Open a browser against your running dev server
+4. Run the tests — navigate, click, fill forms, check the DOM
+5. Report pass/fail with screenshots
+
+For localhost testing, start your local Skyvern backend and frontend. You do not need `skyvern browser serve --tunnel` for this path.
+
+<Tip>
+The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff — no test files to maintain.
+</Tip>
 
 ## Troubleshooting
 
