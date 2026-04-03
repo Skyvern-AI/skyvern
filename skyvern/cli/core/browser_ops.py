@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .guards import GuardError
 
@@ -329,4 +330,163 @@ async def do_get_styles(page: Any, selector: str, properties: list[str] | None =
             }
             return result;
         }"""
+    )
+
+
+# ---------------------------------------------------------------------------
+# Network operations
+# ---------------------------------------------------------------------------
+
+# Fields stripped from list view to reduce payload. The detail tool returns
+# the full entry dict (including these fields) via do_network_request_detail.
+_LIST_STRIP_KEYS = frozenset({"response_headers"})
+
+
+@dataclass
+class NetworkRequestsResult:
+    requests: list[dict[str, Any]]
+    count: int
+    error: dict[str, Any] | None = None
+
+
+@dataclass
+class NetworkRequestDetailResult:
+    request: dict[str, Any] | None = None
+    body: str | None = None
+    found: bool = False
+
+
+@dataclass
+class NetworkRouteResult:
+    url_pattern: str = ""
+    action: str = ""
+    active_routes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NetworkUnrouteResult:
+    url_pattern: str = ""
+    removed: bool = False
+    active_routes: list[str] = field(default_factory=list)
+
+
+def do_network_requests(
+    state: Any,
+    *,
+    url_pattern: str | None = None,
+    status_code: int | None = None,
+    method: str | None = None,
+    resource_type: str | None = None,
+) -> NetworkRequestsResult:
+    """Filter and return network request entries from state. Sync — no Playwright calls."""
+    entries = list(state.network_requests)
+
+    if url_pattern:
+        try:
+            compiled = re.compile(url_pattern)
+            entries = [e for e in entries if compiled.search(e.get("url", ""))]
+        except re.error:
+            from .result import ErrorCode, make_error
+
+            return NetworkRequestsResult(
+                requests=[],
+                count=0,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Invalid regex pattern: {url_pattern}",
+                    "Provide a valid Python regex pattern",
+                ),
+            )
+    if status_code is not None:
+        entries = [e for e in entries if e.get("status") == status_code]
+    if method:
+        method_upper = method.upper()
+        entries = [e for e in entries if e.get("method") == method_upper]
+    if resource_type:
+        rt_lower = resource_type.lower()
+        entries = [e for e in entries if e.get("resource_type", "").lower() == rt_lower]
+
+    # Strip heavy fields for list view
+    display = [{k: v for k, v in e.items() if k not in _LIST_STRIP_KEYS} for e in entries]
+    return NetworkRequestsResult(requests=display, count=len(display))
+
+
+def do_network_request_detail(state: Any, request_id: int) -> NetworkRequestDetailResult:
+    """Look up a single request by ID and return full metadata + body."""
+    for entry in state.network_requests:
+        if entry.get("request_id") == request_id:
+            body = state.get_response_body(request_id)
+            return NetworkRequestDetailResult(request=dict(entry), body=body, found=True)
+    return NetworkRequestDetailResult()
+
+
+async def do_network_route(
+    raw_page: Any,
+    state: Any,
+    *,
+    url_pattern: str,
+    action: Literal["abort", "mock"],
+    mock_status: int = 200,
+    mock_body: str | None = None,
+    mock_content_type: str | None = None,
+) -> NetworkRouteResult:
+    """Register a route handler on the Playwright page and track in SessionState."""
+
+    async def _handler(route: Any) -> None:
+        try:
+            if action == "abort":
+                await route.abort()
+            elif action == "mock":
+                headers: dict[str, str] = {}
+                if mock_content_type:
+                    headers["content-type"] = mock_content_type
+                elif mock_body is not None:
+                    headers["content-type"] = "application/json"
+                await route.fulfill(
+                    status=mock_status,
+                    headers=headers if headers else None,
+                    body=mock_body or "",
+                )
+            else:
+                await route.abort()
+        except Exception:
+            try:
+                await route.abort()
+            except Exception:
+                pass
+
+    page_id = id(raw_page)
+    page_routes = state.active_routes.setdefault(page_id, set())
+
+    # Re-register: unroute existing handler for this pattern first
+    if url_pattern in page_routes:
+        try:
+            await raw_page.unroute(url_pattern)
+            page_routes.discard(url_pattern)
+        except Exception:
+            pass
+
+    await raw_page.route(url_pattern, _handler)
+    page_routes.add(url_pattern)
+
+    return NetworkRouteResult(
+        url_pattern=url_pattern,
+        action=action,
+        active_routes=sorted(page_routes),
+    )
+
+
+async def do_network_unroute(raw_page: Any, state: Any, url_pattern: str) -> NetworkUnrouteResult:
+    """Remove a route handler and update SessionState tracking."""
+    page_id = id(raw_page)
+    page_routes = state.active_routes.get(page_id, set())
+    removed = url_pattern in page_routes
+    if removed:
+        await raw_page.unroute(url_pattern)
+        page_routes.discard(url_pattern)
+
+    return NetworkUnrouteResult(
+        url_pattern=url_pattern,
+        removed=removed,
+        active_routes=sorted(page_routes),
     )

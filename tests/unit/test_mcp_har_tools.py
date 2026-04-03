@@ -30,14 +30,22 @@ def _make_skyvern_page(page: MagicMock) -> MagicMock:
 
 
 def _make_session_state(**overrides):
+    import asyncio
+    import itertools
+
     defaults = {
         "har_enabled": False,
         "_har_entries": deque(maxlen=5000),
         "console_messages": deque(maxlen=1000),
         "network_requests": deque(maxlen=1000),
         "dialog_events": deque(maxlen=1000),
+        "page_errors": deque(maxlen=1000),
         "_hooked_page_ids": set(),
         "_hooked_handlers_map": {},
+        "_request_id_counter": itertools.count(),
+        "_body_store": {},
+        "_body_semaphore": asyncio.Semaphore(5),
+        "_pending_tasks": set(),
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

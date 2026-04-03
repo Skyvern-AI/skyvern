@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from skyvern.cli.core.browser_launcher import LocalBrowserInfo
@@ -55,10 +55,12 @@ session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
 frame_app = typer.Typer(help="Manage iframe context.", no_args_is_help=True)
 state_app = typer.Typer(help="Save and load browser auth state.", no_args_is_help=True)
 storage_app = typer.Typer(help="Read, write, and clear web storage.", no_args_is_help=True)
+network_app = typer.Typer(help="Network inspection and interception.", no_args_is_help=True)
 browser_app.add_typer(session_app, name="session")
 browser_app.add_typer(frame_app, name="frame")
 browser_app.add_typer(state_app, name="state")
 browser_app.add_typer(storage_app, name="storage")
+browser_app.add_typer(network_app, name="network")
 
 
 @dataclass(frozen=True)
@@ -316,6 +318,133 @@ def session_get(
         output(data, action="session_get", json_mode=json_output)
     except Exception as e:
         output_error(str(e), hint="Verify the session ID exists and is accessible.", json_mode=json_output)
+
+
+# ---------------------------------------------------------------------------
+# Network commands
+# ---------------------------------------------------------------------------
+
+
+@network_app.command("requests")
+def network_requests_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    url_pattern: str | None = typer.Option(None, "--url", help="Filter by URL regex pattern."),
+    status_code: int | None = typer.Option(None, "--status", help="Filter by HTTP status code."),
+    method: str | None = typer.Option(None, "--method", help="Filter by HTTP method."),
+    resource_type: str | None = typer.Option(None, "--type", help="Filter by resource type (xhr, fetch, script, etc)."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List captured network requests."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_requests
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_requests(
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+            url_pattern=url_pattern,
+            status_code=status_code,
+            method=method,
+            resource_type=resource_type,
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_requests")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+@network_app.command("detail")
+def network_detail_cmd(
+    request_id: int = typer.Argument(..., help="Request ID from network requests output."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show full details (headers + body) for a specific network request."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_request_detail
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_request_detail(
+            request_id=request_id,
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_detail")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+@network_app.command("route")
+def network_route_cmd(
+    url_pattern: str = typer.Argument(..., help="URL glob pattern to intercept. Example: '**/api/*'"),
+    action: str = typer.Option("abort", help="Action: 'abort' or 'mock'."),
+    mock_status: int = typer.Option(200, "--mock-status", help="HTTP status for mock responses."),
+    mock_body: str | None = typer.Option(None, "--mock-body", help="Response body for mock action."),
+    mock_content_type: str | None = typer.Option(None, "--mock-content-type", help="Content-Type for mock responses."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Intercept network requests matching a URL pattern (abort or mock)."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_route
+
+    if action not in ("abort", "mock"):
+        output_error(f"Invalid action: {action!r}", hint="Use 'abort' or 'mock'.", json_mode=json_output)
+        return
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_route(
+            url_pattern=url_pattern,
+            action=cast(Literal["abort", "mock"], action),
+            mock_status=mock_status,
+            mock_body=mock_body,
+            mock_content_type=mock_content_type,
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_route")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+@network_app.command("unroute")
+def network_unroute_cmd(
+    url_pattern: str = typer.Argument(..., help="URL pattern to stop intercepting."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Remove a network interception rule."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_unroute
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_unroute(
+            url_pattern=url_pattern,
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_unroute")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
 
 
 # ---------------------------------------------------------------------------
