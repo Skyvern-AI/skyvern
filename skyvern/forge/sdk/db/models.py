@@ -1133,6 +1133,7 @@ class ScriptFileModel(Base):
     __tablename__ = "script_files"
     __table_args__ = (
         Index("file_script_path_index", "script_revision_id", "file_path"),
+        Index("ix_script_files_dedup", "script_id", "organization_id", "content_hash"),
         UniqueConstraint("script_revision_id", "file_path", name="unique_script_file_path"),
     )
 
