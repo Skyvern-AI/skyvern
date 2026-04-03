@@ -937,6 +937,16 @@ class WorkflowService:
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
+        # Guard: if the run was canceled while queued (before Temporal picked it up),
+        # don't overwrite the canceled status with running.
+        if workflow_run.status == WorkflowRunStatus.canceled:
+            LOG.info(
+                "Workflow run was canceled before execution started, skipping",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            return workflow_run
+
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
 
@@ -1282,6 +1292,7 @@ class WorkflowService:
             context = skyvern_context.ensure_context()
             context.script_id = script.script_id
             context.script_revision_id = script.script_revision_id
+            context.code_version = workflow.code_version
             try:
                 script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
                     script_revision_id=script.script_revision_id,

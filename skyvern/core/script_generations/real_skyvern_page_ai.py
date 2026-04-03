@@ -163,8 +163,18 @@ class RealSkyvernPageAi(SkyvernPageAi):
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str | None:
-        """Click an element using AI to locate it based on intention."""
+        """Click an element using AI to locate it based on intention.
+
+        Args:
+            failed_selector: The original CSS selector that failed before falling
+                back to AI. Used to record an element-level fallback episode so
+                the script reviewer can fix the selector. Only set when called from
+                the ai='fallback' path in skyvern_page.py.
+            block_label: The cached block label (from SkyvernPage.current_label).
+        """
         try:
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
@@ -210,6 +220,20 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     raise Exception(result[-1].exception_message)
                 xpath = action.get_xpath()
                 selector = f"xpath={xpath}" if xpath else selector
+
+                # Record element-level fallback episode for the script reviewer (code_v2 only).
+                # This fires when a cached script's selector failed (or was missing) and
+                # ai_click succeeded. The episode gives the reviewer the AI-found action data
+                # so it can write a proper selector.
+                await self._record_element_fallback_episode(
+                    context=context,
+                    action_type="click",
+                    failed_selector=failed_selector,
+                    intention=intention,
+                    action=action,
+                    block_label=block_label,
+                )
+
                 return selector
         except Exception:
             LOG.exception(
@@ -233,6 +257,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
 
@@ -349,6 +375,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
+            await self._record_element_fallback_episode(
+                context=context,
+                action_type="fill",
+                failed_selector=failed_selector,
+                intention=intention,
+                action=action,
+                block_label=block_label,
+            )
         else:
             locator = self.page.locator(selector)
             await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
@@ -644,6 +678,94 @@ class RealSkyvernPageAi(SkyvernPageAi):
         await self._record_branch_hit(result)
         self._store_classify_result(result)
         return result
+
+    async def _record_element_fallback_episode(
+        self,
+        context: skyvern_context.SkyvernContext,
+        action_type: str,
+        failed_selector: str | None,
+        intention: str,
+        action: Any,
+        block_label: str | None = None,
+    ) -> None:
+        """Record an element-level fallback episode when ai_click/ai_input_text fires
+        because a CSS selector failed or was missing. Gated on code_version >= 2.
+
+        This gives the script reviewer the signal AND the action data (css_suggestion,
+        element attributes) it needs to write a proper selector for the next script version.
+        """
+        if failed_selector is None:
+            # None means the caller didn't pass failed_selector — this is a direct
+            # ai_click call (not from the ai='fallback' path), so don't record.
+            return
+        if (context.code_version or 0) < 2:
+            return
+        if not context.workflow_run_id or not context.workflow_permanent_id:
+            return
+        try:
+            # Build agent_actions data for the reviewer
+            action_data: dict[str, Any] = {
+                "action_type": action_type,
+                "intention": intention,
+                "failed_selector": failed_selector if failed_selector else "(missing — no selector= argument)",
+            }
+            if hasattr(action, "element_id"):
+                action_data["element_id"] = action.element_id
+            if hasattr(action, "skyvern_element_data") and action.skyvern_element_data:
+                # This contains xpath, tag, text, attributes — the data the reviewer
+                # needs to derive a stable selector
+                el_data = action.skyvern_element_data
+                action_data["element_tag"] = el_data.get("tag", "")
+                action_data["element_text"] = el_data.get("text", "")[:200]
+                action_data["all_attributes"] = {
+                    k: v
+                    for k, v in el_data.items()
+                    if k
+                    in (
+                        "id",
+                        "name",
+                        "class",
+                        "aria-label",
+                        "placeholder",
+                        "type",
+                        "role",
+                        "data-testid",
+                        "href",
+                        "value",
+                        "title",
+                    )
+                }
+                xpath = action.get_xpath() if hasattr(action, "get_xpath") else None
+                if xpath:
+                    action_data["css_suggestion"] = f"xpath={xpath}"
+            if hasattr(action, "reasoning"):
+                action_data["reasoning"] = action.reasoning
+
+            error_msg = (
+                f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
+                f"AI fallback succeeded. "
+                f"Original selector: {failed_selector or '(none)'}. "
+                f"Intention: {intention}"
+            )
+            await app.DATABASE.scripts.create_fallback_episode(
+                organization_id=context.organization_id or "",
+                workflow_permanent_id=context.workflow_permanent_id,
+                workflow_run_id=context.workflow_run_id,
+                block_label=block_label or self.current_label or "unknown",
+                fallback_type="element",
+                script_revision_id=context.script_revision_id,
+                error_message=error_msg,
+                page_url=self.page.url,
+                agent_actions=action_data,
+            )
+            LOG.info(
+                "Recorded element fallback episode for selector failure",
+                block_label=block_label or self.current_label,
+                action_type=action_type,
+                failed_selector=failed_selector,
+            )
+        except Exception:
+            LOG.warning("Failed to record element fallback episode for selector failure", exc_info=True)
 
     @staticmethod
     def _store_classify_result(result: str) -> None:
