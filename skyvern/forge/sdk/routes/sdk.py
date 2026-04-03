@@ -56,7 +56,7 @@ async def run_sdk_action(
 
     # Use existing workflow_run_id if provided, otherwise create a new one
     if action_request.workflow_run_id:
-        workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=action_request.workflow_run_id,
             organization_id=organization_id,
         )
@@ -90,12 +90,12 @@ async def run_sdk_action(
             organization=organization,
             version=None,
         )
-        workflow_run = await app.DATABASE.update_workflow_run(
+        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run.workflow_run_id,
             status=WorkflowRunStatus.completed,
         )
 
-    task = await app.DATABASE.create_task(
+    task = await app.DATABASE.tasks.create_task(
         organization_id=organization_id,
         url=action_request.url,
         navigation_goal=action.get_navigation_goal(),
@@ -107,14 +107,14 @@ async def run_sdk_action(
         browser_address=browser_address,
     )
 
-    step = await app.DATABASE.create_step(
+    step = await app.DATABASE.tasks.create_step(
         task.task_id,
         order=0,
         retry_index=0,
         organization_id=organization.organization_id,
     )
 
-    await app.DATABASE.create_workflow_run_block(
+    await app.DATABASE.observer.create_workflow_run_block(
         workflow_run_id=workflow_run.workflow_run_id,
         organization_id=organization_id,
         block_type=BlockType.ACTION,
@@ -221,13 +221,13 @@ async def run_sdk_action(
                 model=action.model,
             )
             result = prompt_result
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=organization_id,
             status=TaskStatus.completed,
         )
     except ScrapingFailed as e:
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=organization_id,
             status=TaskStatus.failed,
@@ -240,7 +240,7 @@ async def run_sdk_action(
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.reason or str(e))
     except Exception as e:
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=organization_id,
             status=TaskStatus.failed,

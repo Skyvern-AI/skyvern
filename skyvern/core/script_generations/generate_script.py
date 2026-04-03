@@ -3296,13 +3296,13 @@ async def create_or_update_script_block(
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
         # Step 3: Create script block in database
-        script_block = await app.DATABASE.get_script_block_by_label(
+        script_block = await app.DATABASE.scripts.get_script_block_by_label(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
             script_block_label=block_label,
         )
         if not script_block:
-            script_block = await app.DATABASE.create_script_block(
+            script_block = await app.DATABASE.scripts.create_script_block(
                 script_revision_id=script_revision_id,
                 script_id=script_id,
                 organization_id=organization_id,
@@ -3318,7 +3318,7 @@ async def create_or_update_script_block(
             for value in [run_signature, workflow_run_id, workflow_run_block_id, input_fields, requires_agent]
         ):
             # Update metadata when new values are provided
-            script_block = await app.DATABASE.update_script_block(
+            script_block = await app.DATABASE.scripts.update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 run_signature=run_signature,
@@ -3336,13 +3336,13 @@ async def create_or_update_script_block(
         # Create artifact and upload to S3
         artifact_id = None
         if update and script_block.script_file_id:
-            script_file = await app.DATABASE.get_script_file_by_id(
+            script_file = await app.DATABASE.scripts.get_script_file_by_id(
                 script_revision_id,
                 script_block.script_file_id,
                 organization_id,
             )
             if script_file and script_file.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                 if artifact:
                     asyncio.create_task(app.STORAGE.store_artifact(artifact, block_code_bytes))
             else:
@@ -3357,7 +3357,7 @@ async def create_or_update_script_block(
             )
 
             # Create script file record
-            script_file = await app.DATABASE.create_script_file(
+            script_file = await app.DATABASE.scripts.create_script_file(
                 script_revision_id=script_revision_id,
                 script_id=script_id,
                 organization_id=organization_id,
@@ -3371,7 +3371,7 @@ async def create_or_update_script_block(
             )
 
             # update script block with script file id
-            await app.DATABASE.update_script_block(
+            await app.DATABASE.scripts.update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 script_file_id=script_file.file_id,

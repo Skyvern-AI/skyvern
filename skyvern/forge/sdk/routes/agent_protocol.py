@@ -304,7 +304,7 @@ async def run_task(
             max_steps_override=run_request.max_steps,
             browser_session_id=run_request.browser_session_id,
         )
-        refreshed_task_v2 = await app.DATABASE.get_task_v2(
+        refreshed_task_v2 = await app.DATABASE.observer.get_task_v2(
             task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
         )
         task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
@@ -1416,7 +1416,7 @@ async def get_artifact(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Artifact:
     analytics.capture("skyvern-oss-artifact-get")
-    artifact = await app.DATABASE.get_artifact_by_id(
+    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
         artifact_id=artifact_id,
         organization_id=current_org.organization_id,
     )
@@ -1488,14 +1488,14 @@ async def get_artifact_content(
                 status_code=http_status.HTTP_403_FORBIDDEN,
                 detail="Invalid or expired artifact URL",
             )
-        artifact = await app.DATABASE.get_artifact_by_id_no_org(artifact_id=artifact_id)
+        artifact = await app.DATABASE.artifacts.get_artifact_by_id_no_org(artifact_id=artifact_id)
     else:
         # Standard org-auth path (existing behaviour).
         current_org = await org_auth_service.get_current_org(
             x_api_key=x_api_key,
             authorization=authorization,
         )
-        artifact = await app.DATABASE.get_artifact_by_id(
+        artifact = await app.DATABASE.artifacts.get_artifact_by_id(
             artifact_id=artifact_id,
             organization_id=current_org.organization_id,
         )
@@ -1542,7 +1542,7 @@ async def get_run_artifacts(
 ) -> Response:
     analytics.capture("skyvern-oss-run-artifacts-get")
     # Get artifacts as a list (not grouped by type)
-    artifacts = await app.DATABASE.get_artifacts_for_run(
+    artifacts = await app.DATABASE.artifacts.get_artifacts_for_run(
         run_id=run_id,
         organization_id=current_org.organization_id,
         artifact_types=artifact_type,
@@ -1642,7 +1642,9 @@ async def get_run_timeline(
 
     # Handle task_v2 runs by getting their associated workflow_run_id
     if run_response.run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(task_v2_id=run_id, organization_id=current_org.organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(
+            task_v2_id=run_id, organization_id=current_org.organization_id
+        )
         if not task_v2:
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
@@ -1902,7 +1904,7 @@ async def cancel_task(
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     analytics.capture("skyvern-oss-agent-task-get")
-    task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
+    task_obj = await app.DATABASE.tasks.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -1914,7 +1916,7 @@ async def cancel_task(
 
 
 async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api_key: str | None = None) -> None:
-    workflow_run = await app.DATABASE.get_workflow_run(
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
@@ -1929,7 +1931,7 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
         await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(workflow_run.browser_session_id, organization_id)
 
     # get all the child workflow runs and cancel them
-    child_workflow_runs = await app.DATABASE.get_workflow_runs_by_parent_workflow_run_id(
+    child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
         parent_workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
@@ -1949,7 +1951,7 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
 
 
 async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> None:
-    workflow_run = await app.DATABASE.get_workflow_run(
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
         status=WorkflowRunStatus.paused,
@@ -2028,7 +2030,7 @@ async def retry_webhook(
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-retry-webhook")
-    task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
+    task_obj = await app.DATABASE.tasks.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -2036,7 +2038,7 @@ async def retry_webhook(
         )
 
     # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
+    latest_step = await app.DATABASE.tasks.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
         return await app.agent.build_task_response(task=task_obj)
 
@@ -2088,7 +2090,7 @@ async def get_tasks(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="only_standalone_tasks and workflow_run_id cannot be used together",
         )
-    tasks = await app.DATABASE.get_tasks(
+    tasks = await app.DATABASE.tasks.get_tasks(
         page,
         page_size,
         task_status=task_status,
@@ -2137,7 +2139,7 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.get_all_runs(
+    runs = await app.DATABASE.workflow_runs.get_all_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
     return ORJSONResponse([run.model_dump() for run in runs])
@@ -2174,7 +2176,7 @@ async def get_runs_v2(
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
 
-    rows = await app.DATABASE.get_all_runs_v2(
+    rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
         current_org.organization_id,
         page=page,
         page_size=page_size,
@@ -2208,7 +2210,7 @@ async def get_steps(
     :return: List of steps for a task with pagination.
     """
     analytics.capture("skyvern-oss-agent-task-steps-get")
-    steps = await app.DATABASE.get_task_steps(task_id, organization_id=current_org.organization_id)
+    steps = await app.DATABASE.tasks.get_task_steps(task_id, organization_id=current_org.organization_id)
     return ORJSONResponse([step.model_dump(exclude_none=True) for step in steps])
 
 
@@ -2255,7 +2257,10 @@ async def get_artifacts(
     params = {
         entity_type_to_param[entity_type]: entity_id,
     }
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
+    artifacts = await app.DATABASE.artifacts.get_artifacts_by_entity_id(
+        organization_id=current_org.organization_id,
+        **params,  # type: ignore[arg-type]
+    )
 
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
     for i, artifact in enumerate(artifacts):
@@ -2289,7 +2294,7 @@ async def get_step_artifacts(
     :return: List of artifacts for a list of steps.
     """
     analytics.capture("skyvern-oss-agent-task-step-artifacts-get")
-    artifacts = await app.DATABASE.get_artifacts_for_task_step(
+    artifacts = await app.DATABASE.artifacts.get_artifacts_for_task_step(
         task_id,
         step_id,
         organization_id=current_org.organization_id,
@@ -2318,7 +2323,7 @@ async def get_actions(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[Action]:
     analytics.capture("skyvern-oss-agent-task-actions-get")
-    actions = await app.DATABASE.get_task_actions(task_id, organization_id=current_org.organization_id)
+    actions = await app.DATABASE.tasks.get_task_actions(task_id, organization_id=current_org.organization_id)
     return actions
 
 
@@ -2602,7 +2607,7 @@ async def get_workflow_run_with_workflow_id(
     )
     return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
-    browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
@@ -2966,7 +2971,7 @@ async def suggest(
         )
 
     try:
-        new_ai_suggestion = await app.DATABASE.create_ai_suggestion(
+        new_ai_suggestion = await app.DATABASE.workflow_params.create_ai_suggestion(
             organization_id=current_org.organization_id,
             ai_suggestion_type=ai_suggestion_type,
         )
@@ -3239,7 +3244,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     """
 
     # get task v2 by workflow run id
-    task_v2_obj = await app.DATABASE.get_task_v2_by_workflow_run_id(
+    task_v2_obj = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError  # noqa: F401
+from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
@@ -169,9 +170,6 @@ class AgentDB(BaseAlchemyDB):
 
     # ======================================================================
     # Backward-compatible delegate methods
-    # TODO(SKY-62): These delegates erase type information (*args: Any -> Any).
-    # Migrate callers to use typed repository attributes directly
-    # (e.g., db.tasks.get_task(...) instead of db.get_task(...)), then remove.
     # ======================================================================
 
     # -- Task delegates --
@@ -529,17 +527,17 @@ class AgentDB(BaseAlchemyDB):
     async def close_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
         return await self.browser_sessions.close_persistent_browser_session(*args, **kwargs)
 
-    async def get_all_active_persistent_browser_sessions(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_all_active_persistent_browser_sessions(*args, **kwargs)
+    async def get_all_active_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
+        return await self.browser_sessions.get_all_active_persistent_browser_sessions()
 
     async def archive_browser_session_address(self, *args: Any, **kwargs: Any) -> Any:
         return await self.browser_sessions.archive_browser_session_address(*args, **kwargs)
 
-    async def get_uncompleted_persistent_browser_sessions(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_uncompleted_persistent_browser_sessions(*args, **kwargs)
+    async def get_uncompleted_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
+        return await self.browser_sessions.get_uncompleted_persistent_browser_sessions()
 
     async def get_debug_session_by_browser_session_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_debug_session_by_browser_session_id(*args, **kwargs)
+        return await self.debug.get_debug_session_by_browser_session_id(*args, **kwargs)
 
     # -- Schedule delegates --
 

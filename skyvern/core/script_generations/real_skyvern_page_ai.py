@@ -174,7 +174,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
             organization_id = context.organization_id if context else None
             step_id = context.step_id if context else None
-            step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+            step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
             single_click_prompt = prompt_engine.load_prompt(
                 template="single-click-action",
                 navigation_goal=intention,
@@ -199,7 +199,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     "The element may not exist on the current page."
                 )
             task_id = context.task_id if context else None
-            task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
+            task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
             if organization_id and task and step:
                 actions = parse_actions(
                     task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
@@ -244,8 +244,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         task_id = context.task_id
         step_id = context.step_id
         workflow_run_id = context.workflow_run_id
-        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+        task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
 
         if intention:
             try:
@@ -373,8 +373,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         task_id = context.task_id
         step_id = context.step_id
         workflow_run_id = context.workflow_run_id
-        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+        task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
 
         if intention:
             try:
@@ -478,8 +478,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         option_value = value or ""
         context = skyvern_context.current()
         if context and context.task_id and context.step_id and context.organization_id:
-            task = await app.DATABASE.get_task(context.task_id, organization_id=context.organization_id)
-            step = await app.DATABASE.get_step(context.step_id, organization_id=context.organization_id)
+            task = await app.DATABASE.tasks.get_task(context.task_id, organization_id=context.organization_id)
+            step = await app.DATABASE.tasks.get_step(context.step_id, organization_id=context.organization_id)
             if intention and task and step:
                 try:
                     prompt = context.prompt if context else None
@@ -610,7 +610,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         step = None
         organization_id = context.organization_id if context else None
         if context and context.organization_id and context.step_id:
-            step = await app.DATABASE.get_step(
+            step = await app.DATABASE.tasks.get_step(
                 step_id=context.step_id,
                 organization_id=context.organization_id,
             )
@@ -662,7 +662,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if not context or not context.organization_id or not context.workflow_permanent_id:
                 return
             block_label = self.current_label or "unknown"
-            await app.DATABASE.record_branch_hit(
+            await app.DATABASE.scripts.record_branch_hit(
                 organization_id=context.organization_id,
                 workflow_permanent_id=context.workflow_permanent_id,
                 block_label=block_label,
@@ -734,7 +734,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         # Record an element fallback episode for the feedback loop
         if context.workflow_run_id and context.workflow_permanent_id:
             try:
-                await app.DATABASE.create_fallback_episode(
+                await app.DATABASE.scripts.create_fallback_episode(
                     organization_id=context.organization_id,
                     workflow_permanent_id=context.workflow_permanent_id,
                     workflow_run_id=context.workflow_run_id,
@@ -792,7 +792,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         )
         step = None
         if context and context.organization_id and context.task_id and context.step_id:
-            step = await app.DATABASE.get_step(
+            step = await app.DATABASE.tasks.get_step(
                 step_id=context.step_id,
                 organization_id=context.organization_id,
             )
@@ -868,7 +868,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         step = None
         if context.organization_id and context.task_id and context.step_id:
-            step = await app.DATABASE.get_step(
+            step = await app.DATABASE.tasks.get_step(
                 step_id=context.step_id,
                 organization_id=context.organization_id,
             )
@@ -944,8 +944,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         task_id = context.task_id
         step_id = context.step_id
 
-        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+        task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
 
         if not task or not step:
             LOG.warning("ai_act: missing task or step", task_id=task_id, step_id=step_id)

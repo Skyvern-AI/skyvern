@@ -847,7 +847,7 @@ async def generate_cua_fallback_actions(
             assistant_message=assistant_message,
             reasoning=reasoning,
         )
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             extracted_information=assistant_message,

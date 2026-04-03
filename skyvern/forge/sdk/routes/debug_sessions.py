@@ -71,7 +71,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     )
 
     # Skip renewal for sessions that haven't started yet (browser still launching)
-    session = await app.DATABASE.get_persistent_browser_session(
+    session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         debug_session.browser_session_id,
         current_org.organization_id,
     )
@@ -129,7 +129,7 @@ async def new_debug_session(
     """
 
     if current_user_id:
-        debug_session = await app.DATABASE.debug.get_latest_debug_session_for_user(
+        debug_session = await app.DATABASE.debug.get_debug_session(
             organization_id=current_org.organization_id,
             user_id=current_user_id,
             workflow_permanent_id=workflow_permanent_id,
@@ -172,7 +172,7 @@ async def new_debug_session(
 
         for debug_session in completed_debug_sessions:
             try:
-                browser_session = await app.DATABASE.get_persistent_browser_session(
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
                     debug_session.browser_session_id,
                     current_org.organization_id,
                 )

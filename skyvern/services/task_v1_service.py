@@ -25,11 +25,11 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
     user_prompt_hash = hash_object.hexdigest()
     # check if there's a same user_prompt within the past x Hours
     # in the future, we can use vector db to fetch similar prompts
-    existing_task_generation = await app.DATABASE.get_task_generation_by_prompt_hash(
+    existing_task_generation = await app.DATABASE.workflow_params.get_task_generation_by_prompt_hash(
         user_prompt_hash=user_prompt_hash, query_window_hours=settings.PROMPT_CACHE_WINDOW_HOURS
     )
     if existing_task_generation:
-        new_task_generation = await app.DATABASE.create_task_generation(
+        new_task_generation = await app.DATABASE.workflow_params.create_task_generation(
             organization_id=organization.organization_id,
             user_prompt=user_prompt,
             user_prompt_hash=user_prompt_hash,
@@ -53,7 +53,7 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
         parsed_task_generation_obj = TaskGenerationBase.model_validate(llm_response)
 
         # generate a TaskGenerationModel
-        task_generation = await app.DATABASE.create_task_generation(
+        task_generation = await app.DATABASE.workflow_params.create_task_generation(
             organization_id=organization.organization_id,
             user_prompt=user_prompt,
             user_prompt_hash=user_prompt_hash,
@@ -94,7 +94,7 @@ async def run_task(
         run_type = RunType.anthropic_cua
     elif engine == RunEngine.ui_tars:
         run_type = RunType.ui_tars
-    await app.DATABASE.create_task_run(
+    await app.DATABASE.tasks.create_task_run(
         task_run_type=run_type,
         organization_id=organization.organization_id,
         run_id=created_task.task_id,
@@ -123,15 +123,15 @@ async def run_task(
 
 
 async def get_task_v1_response(task_id: str, organization_id: str | None = None) -> TaskResponse:
-    task_obj = await app.DATABASE.get_task(task_id, organization_id=organization_id)
+    task_obj = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
     if not task_obj:
         raise TaskNotFound(task_id=task_id)
 
     # get step count efficiently via COUNT query
-    step_count = await app.DATABASE.get_task_step_count(task_id, organization_id)
+    step_count = await app.DATABASE.tasks.get_task_step_count(task_id, organization_id)
 
     # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=organization_id)
+    latest_step = await app.DATABASE.tasks.get_latest_step(task_id, organization_id=organization_id)
     if not latest_step:
         return await app.agent.build_task_response(task=task_obj, step_count=step_count)
 

@@ -348,7 +348,7 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
     monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
-    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.create_action", AsyncMock())
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", AsyncMock())
     monkeypatch.setattr(
         "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached",
         AsyncMock(return_value=False),
