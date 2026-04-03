@@ -58,7 +58,10 @@ from .inspection import (
     skyvern_handle_dialog,
     skyvern_har_start,
     skyvern_har_stop,
+    skyvern_network_request_detail,
     skyvern_network_requests,
+    skyvern_network_route,
+    skyvern_network_unroute,
 )
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .scripts import (
@@ -424,6 +427,9 @@ mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_load)
 # -- Inspection tools (console, network, dialog, page errors, DOM) --
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_console_messages)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_requests)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_request_detail)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_network_route)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_network_unroute)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_handle_dialog)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_errors)
 mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_start)
@@ -522,6 +528,9 @@ __all__ = [
     # Inspection (console, network, dialog, page errors, DOM)
     "skyvern_console_messages",
     "skyvern_network_requests",
+    "skyvern_network_request_detail",
+    "skyvern_network_route",
+    "skyvern_network_unroute",
     "skyvern_handle_dialog",
     "skyvern_get_errors",
     "skyvern_har_start",
