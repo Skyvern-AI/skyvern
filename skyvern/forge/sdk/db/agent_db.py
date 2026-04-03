@@ -627,6 +627,9 @@ class AgentDB(BaseAlchemyDB):
     async def get_script_file_by_path(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.get_script_file_by_path(*args, **kwargs)
 
+    async def get_script_file_by_content_hash(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.scripts.get_script_file_by_content_hash(*args, **kwargs)
+
     async def update_script_file(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.update_script_file(*args, **kwargs)
 
