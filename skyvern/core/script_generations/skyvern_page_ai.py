@@ -14,6 +14,8 @@ class SkyvernPageAi(Protocol):
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention."""
         ...
@@ -27,6 +29,8 @@ class SkyvernPageAi(Protocol):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
         ...

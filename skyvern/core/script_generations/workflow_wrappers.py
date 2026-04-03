@@ -21,8 +21,6 @@ def workflow(
 
 def cached(cache_key: str) -> Callable:
     def decorator(func: Callable) -> Callable:
-        script_run_context_manager.set_cached_fn(cache_key, func)
-
         async def wrapper(page: SkyvernPage, context: RunContext, *args: Any, **kwargs: Any) -> Any:
             # Store the function in context.cached_fns
             page.current_label = cache_key
@@ -31,6 +29,8 @@ def cached(cache_key: str) -> Callable:
             finally:
                 page.current_label = None
 
+        # Register the wrapper (not func) so callers get the label-setting behaviour
+        script_run_context_manager.set_cached_fn(cache_key, wrapper)
         return wrapper
 
     return decorator

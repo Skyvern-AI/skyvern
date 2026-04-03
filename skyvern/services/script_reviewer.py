@@ -948,6 +948,21 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, proactive_error, function_signature)
                     continue
 
+                # Validate missing selectors on ai='fallback' interaction methods
+                missing_selector_error = self._validate_missing_selectors(updated_code)
+                if missing_selector_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: missing selector detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=missing_selector_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(
+                            updated_code, missing_selector_error, function_signature
+                        )
+                    continue
+
                 # Validate fragile auto-generated selectors
                 fragile_error = self._validate_fragile_selectors(updated_code)
                 if fragile_error is not None:
@@ -2008,6 +2023,48 @@ class ScriptReviewer:
             f"and only invokes the LLM if the selector fails."
         )
 
+    def _validate_missing_selectors(self, code: str) -> str | None:
+        """Flag interaction methods that have ai='fallback' but no selector= argument.
+
+        When page.click(ai='fallback', prompt='...') has no selector, the CSS-try
+        block is skipped entirely and AI click fires as the primary path on every run,
+        burning LLM tokens silently. The block "succeeds" via AI so no fallback episode
+        is created and the reviewer never gets a signal to fix it.
+
+        Returns an error message or None if no issues found.
+        """
+        issues: list[str] = []
+        lines = code.split("\n")
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                i += 1
+                continue
+            match = self._PAGE_CALL_RE.search(lines[i])
+            if match and match.group(1) in self._INTERACTION_METHODS:
+                end_line = self._find_call_end(lines, i)
+                call_text = "\n".join(lines[i : end_line + 1]) if end_line > i else lines[i]
+                has_fallback = bool(re.search(r"""\bai\s*=\s*['"]fallback['"]""", call_text))
+                has_selector = bool(re.search(r"""\bselector\s*=""", call_text))
+                if has_fallback and not has_selector:
+                    issues.append(f"page.{match.group(1)}() on line {i + 1}")
+                i = end_line + 1
+            else:
+                i += 1
+
+        if not issues:
+            return None
+
+        return (
+            f"Missing selector on interaction methods with ai='fallback': {', '.join(issues[:5])}. "
+            f"When ai='fallback' is set but no selector= is provided, the CSS-try block is "
+            f"skipped entirely and AI click fires as the PRIMARY path on every run, burning "
+            f"LLM tokens silently with no fallback episode created. Add a selector= argument "
+            f"with a stable CSS selector (aria-label, placeholder, name, role, :has-text()) "
+            f"so the element is found without an LLM call. Keep ai='fallback' as a safety net."
+        )
+
     # Known auto-generated ID patterns from popular web frameworks.
     # These IDs change across deployments/sessions and break cached selectors.
     _FRAGILE_ID_PATTERNS: list[re.Pattern[str]] = [
@@ -2089,6 +2146,14 @@ class ScriptReviewer:
     # but in practice LLM-generated selectors rarely contain such values.
     _DATE_RE: re.Pattern[str] = re.compile(r"\b(?:\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})\b")
 
+    # Regex for email addresses in text_patterns (PII that should not be in cached scripts)
+    _EMAIL_RE: re.Pattern[str] = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+    # Regex to extract text_patterns dict values from page.classify() calls.
+    # Matches: text_patterns={"key": "value with PII", ...}
+    # Uses a simple approach: find text_patterns={, then extract all string values.
+    _TEXT_PATTERN_VALUE_RE: re.Pattern[str] = re.compile(r"""["']([^"']{10,})["']""")
+
     # Regex for :has-text("X") where X is very short (1-2 chars) — likely hardcoded run data
     _SHORT_HAS_TEXT_RE: re.Pattern[str] = re.compile(r""":has-text\(\s*['"](.{1,2})['"]\s*\)""")
 
@@ -2161,14 +2226,45 @@ class ScriptReviewer:
                     )
             i = end_line + 1 if match and end_line > i else i + 1
 
+        # Check text_patterns in page.classify() calls for PII (email addresses).
+        # text_patterns are baked into the script and stored in S3/DB — PII should not leak.
+        tp_start = code.find("text_patterns")
+        while tp_start != -1:
+            # Find the closing brace of the text_patterns dict
+            brace_depth = 0
+            tp_end = tp_start
+            for j in range(tp_start, len(code)):
+                if code[j] == "{":
+                    brace_depth += 1
+                elif code[j] == "}":
+                    brace_depth -= 1
+                    if brace_depth == 0:
+                        tp_end = j + 1
+                        break
+            # Guard: if no brace was found (e.g. text_patterns in a comment or
+            # variable name), advance past this occurrence to avoid infinite loop
+            if tp_end == tp_start:
+                tp_end = tp_start + len("text_patterns")
+            tp_block = code[tp_start:tp_end]
+            tp_line = code[:tp_start].count("\n") + 1
+            # Check for email addresses
+            for email_match in self._EMAIL_RE.finditer(tp_block):
+                issues.append(
+                    f"line {tp_line}: text_patterns contains email address '{email_match.group()}' — "
+                    f"remove PII from text_patterns, use generic page indicators instead"
+                )
+                break  # one email per text_patterns block is enough
+            tp_start = code.find("text_patterns", tp_end)
+
         if not issues:
             return None
 
         return (
             f"Hardcoded run-specific data detected: {'; '.join(issues[:3])}. "
-            f"Dates, invoice numbers, and other per-run values must NOT be hardcoded in "
-            f"selectors or prompts. Use context.parameters['key'] for dynamic values, "
-            f"or use ai='fallback' with a generic prompt that describes the intent."
+            f"Dates, invoice numbers, email addresses, and other per-run or per-user values must NOT "
+            f"be hardcoded in selectors, prompts, or text_patterns. Use context.parameters['key'] for "
+            f"dynamic values, or use generic page structure indicators (form labels, button text, "
+            f"navigation links) in text_patterns."
         )
 
     # Regexes for extracting branch return values from generated conditional code.
