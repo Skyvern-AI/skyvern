@@ -374,12 +374,34 @@ class ScriptsRepository(BaseRepository):
             ).first()
             return convert_to_script_file(script_file) if script_file else None
 
+    @db_operation("get_script_file_by_content_hash")
+    async def get_script_file_by_content_hash(
+        self,
+        script_id: str,
+        organization_id: str,
+        content_hash: str,
+    ) -> ScriptFile | None:
+        """Find the most recent ScriptFile with a matching content_hash across all revisions of a script."""
+        async with self.Session() as session:
+            script_file = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_id=script_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(content_hash=content_hash)
+                    .order_by(ScriptFileModel.created_at.desc())
+                    .limit(1)
+                )
+            ).first()
+            return convert_to_script_file(script_file) if script_file else None
+
     @db_operation("update_script_file")
     async def update_script_file(
         self,
         script_file_id: str,
         organization_id: str,
         artifact_id: str | None = None,
+        content_hash: str | None = None,
     ) -> ScriptFile:
         async with self.Session() as session:
             script_file = (
@@ -390,6 +412,8 @@ class ScriptsRepository(BaseRepository):
             if script_file:
                 if artifact_id:
                     script_file.artifact_id = artifact_id
+                if content_hash is not None:
+                    script_file.content_hash = content_hash
                 await session.commit()
                 await session.refresh(script_file)
                 return convert_to_script_file(script_file)

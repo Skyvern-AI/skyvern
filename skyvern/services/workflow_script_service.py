@@ -10,7 +10,10 @@ from cachetools import TTLCache
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.core.script_generations.generate_script import ScriptBlockSource, generate_workflow_script_python_code
+from skyvern.core.script_generations.generate_script import (
+    ScriptBlockSource,
+    generate_workflow_script_python_code,
+)
 from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
@@ -458,7 +461,7 @@ async def generate_workflow_script(
             missing_labels=list(missing_labels),
         )
 
-        python_src = await generate_workflow_script_python_code(
+        codegen_result = await generate_workflow_script_python_code(
             file_name=codegen_input.file_name,
             workflow_run_request=codegen_input.workflow_run,
             workflow=codegen_input.workflow,
@@ -483,6 +486,10 @@ async def generate_workflow_script(
         )
         return
 
+    python_src = codegen_result.source_code
+    blocks_created = codegen_result.blocks_created
+    blocks_failed = codegen_result.blocks_failed
+
     generation_duration_ms = (time.monotonic() - generation_start) * 1000
     LOG.info(
         "Script generation completed",
@@ -491,7 +498,28 @@ async def generate_workflow_script(
         cache_key_value=rendered_cache_key_value,
         duration_ms=round(generation_duration_ms, 1),
         script_size_bytes=len(python_src.encode("utf-8")),
+        blocks_created=blocks_created,
+        blocks_failed=blocks_failed,
     )
+
+    if blocks_failed > 0 and blocks_created > 0:
+        LOG.warning(
+            "Partial script block creation failure — some blocks were not persisted",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            script_id=script.script_id,
+            blocks_created=blocks_created,
+            blocks_failed=blocks_failed,
+        )
+
+    # Guard: if every block creation failed, do not persist a zero-block script
+    if blocks_created == 0 and blocks_failed > 0:
+        LOG.error(
+            "All script block creations failed — skipping WorkflowScript creation",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            script_id=script.script_id,
+            blocks_failed=blocks_failed,
+        )
+        return
 
     # 3.5) Post-process: fix static actions inside for-loop blocks
     python_src = _fix_static_actions_in_for_loops(python_src)
