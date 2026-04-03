@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any
-from urllib.parse import parse_qsl, urlparse
+from typing import Annotated, Any, Literal
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import structlog
 from pydantic import Field
+
+from skyvern.cli.core.browser_ops import (
+    do_network_request_detail,
+    do_network_requests,
+    do_network_route,
+    do_network_unroute,
+)
 
 from ._common import ErrorCode, make_error, make_result
 from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
@@ -50,9 +56,50 @@ _STATELESS_HINT = (
 
 LOG = structlog.get_logger(__name__)
 
-# Network entries only capture content-type and content-length inline (not a full
-# headers dict), so credential headers (Authorization, Cookie, Set-Cookie) are
-# never included. If headers are added later, use an allowlist approach.
+# Response headers that are safe to expose (no credentials, no auth tokens).
+_SAFE_RESPONSE_HEADERS = frozenset(
+    {
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "cache-control",
+        "etag",
+        "last-modified",
+        "date",
+        "server",
+        "x-request-id",
+        "x-correlation-id",
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "vary",
+        "x-powered-by",
+        "x-frame-options",
+        "content-security-policy",
+        "strict-transport-security",
+    }
+)
+
+# Content types worth capturing bodies for (debugging value). Binary types skipped.
+# Standard text-based content types worth capturing. Vendor-specific variants
+# (e.g. application/vnd.api+json, application/hal+json) are intentionally
+# excluded to keep the allowlist tight — add them here if needed.
+_CAPTURABLE_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "text/plain",
+        "text/html",
+        "text/xml",
+        "application/xml",
+        "text/javascript",
+        "application/javascript",
+        "application/x-www-form-urlencoded",
+        "application/ld+json",
+        "application/graphql-response+json",
+    }
+)
+
+_MAX_BODY_BYTES = 256 * 1024  # 256 KB per body
+_BODY_STORE_MAX = 100  # max bodies in memory
 
 
 def _redact_url(url: str) -> str:
@@ -61,8 +108,6 @@ def _redact_url(url: str) -> str:
     Params like ?token=xxx, ?api_key=xxx, and AWS signed URL params are replaced
     with ?token=REDACTED. Non-secret params are left intact.
     """
-    from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
-
     parts = urlsplit(url)
     if not parts.query:
         return url
@@ -76,6 +121,54 @@ def _redact_url(url: str) -> str:
         return url
     new_query = urlencode(params, doseq=True)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Filter response headers to an allowlist — never expose auth/cookie headers."""
+    return {k: v for k, v in headers.items() if k.lower() in _SAFE_RESPONSE_HEADERS}
+
+
+def _should_capture_body(content_type: str, content_length: str | None) -> bool:
+    """Decide whether a response body is worth capturing based on content type and size."""
+    if not content_type:
+        return False
+    ct_base = content_type.lower().split(";")[0].strip()
+    if ct_base not in _CAPTURABLE_CONTENT_TYPES:
+        # Also match vendor-specific suffixes like application/vnd.api+json, application/hal+json
+        if not (ct_base.endswith("+json") or ct_base.endswith("+xml")):
+            return False
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_BODY_BYTES:
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+async def _capture_body(response: Any, request_id: int, state: Any) -> None:
+    """Download response body via CDP and store in state._body_store with FIFO eviction."""
+    async with state._body_semaphore:
+        body_bytes = await asyncio.wait_for(response.body(), timeout=10.0)
+        was_truncated = len(body_bytes) > _MAX_BODY_BYTES
+        if was_truncated:
+            body_bytes = body_bytes[:_MAX_BODY_BYTES]
+        body_text = body_bytes.decode("utf-8", errors="replace")
+        if was_truncated:
+            body_text += "...[truncated]"
+        # FIFO eviction — earliest-captured entries removed first (limit is approximate
+        # under concurrency: up to _BODY_SEMAPHORE_LIMIT extra entries may exist momentarily)
+        while len(state._body_store) >= _BODY_STORE_MAX:
+            try:
+                oldest_key = next(iter(state._body_store))
+                del state._body_store[oldest_key]
+            except (StopIteration, KeyError):
+                break
+        # Guard against stale writes: if clear was called while this task was
+        # in-flight, the request_id is no longer in network_requests — skip the write.
+        if not any(e.get("request_id") == request_id for e in state.network_requests):
+            return
+        state._body_store[request_id] = body_text
 
 
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
@@ -109,23 +202,46 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
             except Exception:
                 pass
 
+            request_id = next(state._request_id_counter)
+
+            content_type = response.headers.get("content-type", "")
             content_length = response.headers.get("content-length")
+
+            resource_type = ""
+            try:
+                resource_type = response.request.resource_type
+            except Exception:
+                pass
+
             try:
                 response_size = int(content_length) if content_length is not None else None
             except (ValueError, TypeError):
                 response_size = None
             state.network_requests.append(
                 {
+                    "request_id": request_id,
                     "url": _redact_url(response.url),
                     "method": response.request.method,
                     "status": response.status,
-                    "content_type": response.headers.get("content-type", ""),
+                    "content_type": content_type,
+                    "resource_type": resource_type,
                     "timing_ms": round(timing, 1),
                     "response_size": response_size,
+                    "response_headers": _safe_headers(response.headers),
                     "page_url": raw_page.url,
                     "tab_id": str(id(raw_page)),
                 }
             )
+
+            if _should_capture_body(content_type, content_length):
+                try:
+                    task = asyncio.create_task(_capture_body(response, request_id, state))
+                    state._pending_tasks.add(task)
+                    task.add_done_callback(state._pending_tasks.discard)
+                    redacted_url = _redact_url(response.url)
+                    task.add_done_callback(lambda t: _body_capture_done(t, request_id, redacted_url))
+                except Exception:
+                    LOG.warning("Body capture task creation failed", request_id=request_id, exc_info=True)
 
             # HAR recording: capture enhanced entry when enabled
             if state.har_enabled:
@@ -190,6 +306,10 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         except Exception:
             pass
 
+    def _body_capture_done(task: asyncio.Task[None], request_id: int, url: str) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            LOG.debug("Body capture failed", request_id=request_id, url=url, error=str(task.exception()))
+
     def _on_dialog(dialog: Any) -> None:
         try:
             event_record: dict[str, Any] = {
@@ -203,6 +323,8 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
             }
             state.dialog_events.append(event_record)
             task = asyncio.create_task(dialog.dismiss())
+            state._pending_tasks.add(task)
+            task.add_done_callback(state._pending_tasks.discard)
             task.add_done_callback(lambda t: _dismiss_done(t, event_record))
         except Exception:
             pass
@@ -358,6 +480,13 @@ async def skyvern_network_requests(
         str | None,
         Field(description="Filter by HTTP method: GET, POST, PUT, DELETE, etc."),
     ] = None,
+    resource_type: Annotated[
+        str | None,
+        Field(
+            description="Filter by resource type: document, stylesheet, image, media, font, "
+            "script, xhr, fetch, websocket, manifest, other."
+        ),
+    ] = None,
     clear: Annotated[
         bool,
         Field(description="Clear the buffer after reading. Default false."),
@@ -365,9 +494,9 @@ async def skyvern_network_requests(
 ) -> dict[str, Any]:
     """Read network requests/responses from the browser. Captures all HTTP traffic the page generates.
 
-    Each entry includes: url, method, status, content_type, timing_ms, response_size, and page_url.
-    No response headers dict or response bodies are captured — credential headers (Authorization,
-    Cookie, Set-Cookie) are never exposed. Use skyvern_evaluate with fetch() if you need body content.
+    Each entry includes: request_id, url, method, status, content_type, resource_type, timing_ms,
+    response_size, and page_url. Use request_id with skyvern_network_request_detail to get full
+    headers and response body. Use skyvern_network_route to intercept (abort/mock) requests.
     """
     # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
@@ -386,46 +515,45 @@ async def skyvern_network_requests(
         return make_result("skyvern_network_requests", ok=False, error=no_browser_error())
 
     state = get_current_session()
-    has_filter = url_pattern is not None or status_code is not None or method is not None
-    entries = list(state.network_requests)
-
-    if url_pattern:
-        try:
-            pattern = re.compile(url_pattern)
-            entries = [e for e in entries if pattern.search(e.get("url", ""))]
-        except re.error:
-            return make_result(
-                "skyvern_network_requests",
-                ok=False,
-                browser_context=ctx,
-                error=make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Invalid regex pattern: {url_pattern}",
-                    "Provide a valid Python regex pattern",
-                ),
-            )
-    if status_code is not None:
-        entries = [e for e in entries if e.get("status") == status_code]
-    if method:
-        method_upper = method.upper()
-        entries = [e for e in entries if e.get("method") == method_upper]
+    result = do_network_requests(
+        state,
+        url_pattern=url_pattern,
+        status_code=status_code,
+        method=method,
+        resource_type=resource_type,
+    )
+    if result.error:
+        return make_result(
+            "skyvern_network_requests",
+            ok=False,
+            browser_context=ctx,
+            error=result.error,
+        )
 
     if clear:
+        has_filter = (
+            url_pattern is not None or status_code is not None or method is not None or resource_type is not None
+        )
         if has_filter:
-            matched = {id(e) for e in entries}
+            matched_ids = {e.get("request_id") for e in result.requests}
             state.network_requests = type(state.network_requests)(
-                (e for e in state.network_requests if id(e) not in matched),
+                (e for e in state.network_requests if e.get("request_id") not in matched_ids),
                 maxlen=state.network_requests.maxlen,
             )
+            # Prune orphaned bodies for cleared requests
+            for rid in matched_ids:
+                if rid is not None:
+                    state._body_store.pop(rid, None)
         else:
             state.network_requests.clear()
+            state._body_store.clear()
 
     return make_result(
         "skyvern_network_requests",
         browser_context=ctx,
         data={
-            "requests": entries,
-            "count": len(entries),
+            "requests": result.requests,
+            "count": result.count,
             "buffer_size": len(state.network_requests),
         },
     )
@@ -777,3 +905,168 @@ async def skyvern_get_styles(
             browser_context=ctx,
             error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page"),
         )
+
+
+async def skyvern_network_request_detail(
+    request_id: Annotated[int, Field(description="The request_id from skyvern_network_requests output.")],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Get full details for a specific network request: filtered response headers and captured body.
+
+    First call skyvern_network_requests to get request_ids, then use this tool to inspect
+    a specific request. Bodies are only available for JSON/text/HTML/XML responses under 256KB.
+    Response headers are filtered to an allowlist — credential headers are never exposed.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_network_request_detail",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_network_request_detail", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+    result = do_network_request_detail(state, request_id)
+    if not result.found:
+        return make_result(
+            "skyvern_network_request_detail",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Request ID {request_id} not found in buffer",
+                "Call skyvern_network_requests first to see available request_ids",
+            ),
+        )
+
+    return make_result(
+        "skyvern_network_request_detail",
+        browser_context=ctx,
+        data={
+            "request": result.request,
+            "body": result.body,
+            "body_available": result.body is not None,
+        },
+    )
+
+
+async def skyvern_network_route(
+    url_pattern: Annotated[str, Field(description="URL glob pattern to intercept. Example: '**/api/*' or '*.png'")],
+    action: Annotated[
+        Literal["abort", "mock"],
+        Field(description="Action: 'abort' blocks matched requests, 'mock' returns a fake response."),
+    ] = "abort",
+    mock_status: Annotated[int, Field(description="HTTP status for mock responses. Default 200.")] = 200,
+    mock_body: Annotated[str | None, Field(description="Response body for mock action.")] = None,
+    mock_content_type: Annotated[
+        str | None,
+        Field(
+            description="Content-Type header for mock responses. Defaults to 'application/json' when mock_body is provided."
+        ),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Intercept network requests matching a URL pattern. Block them (abort) or return fake data (mock).
+
+    Use 'abort' to block analytics, ads, or unwanted requests. Use 'mock' to return controlled
+    test data. Patterns use glob syntax: '**/api/*' matches any URL with /api/ in the path.
+    Re-routing an existing pattern silently replaces the previous handler.
+    Call skyvern_network_unroute to remove interceptions.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_network_route",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_network_route", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+    raw_page = page.page
+    try:
+        result = await do_network_route(
+            raw_page,
+            state,
+            url_pattern=url_pattern,
+            action=action,
+            mock_status=mock_status,
+            mock_body=mock_body,
+            mock_content_type=mock_content_type,
+        )
+    except Exception as exc:
+        return make_result(
+            "skyvern_network_route",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, str(exc), "Check the URL pattern syntax"),
+        )
+
+    return make_result(
+        "skyvern_network_route",
+        browser_context=ctx,
+        data={
+            "url_pattern": result.url_pattern,
+            "action": result.action,
+            "active_routes": result.active_routes,
+        },
+    )
+
+
+async def skyvern_network_unroute(
+    url_pattern: Annotated[str, Field(description="URL pattern to stop intercepting. Must match a previous route.")],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Remove a previously set network interception rule. Requests matching the pattern will flow normally again.
+
+    Call skyvern_network_requests or check active_routes from skyvern_network_route to see current routes.
+    """
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    if is_stateless_http_mode():
+        return make_result(
+            "skyvern_network_unroute",
+            ok=False,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_ERROR_MSG, _STATELESS_HINT),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_network_unroute", ok=False, error=no_browser_error())
+
+    state = get_current_session()
+    raw_page = page.page
+    try:
+        result = await do_network_unroute(raw_page, state, url_pattern)
+    except Exception as exc:
+        return make_result(
+            "skyvern_network_unroute",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, str(exc), "Check the URL pattern"),
+        )
+
+    return make_result(
+        "skyvern_network_unroute",
+        browser_context=ctx,
+        data={
+            "url_pattern": result.url_pattern,
+            "removed": result.removed,
+            "active_routes": result.active_routes,
+        },
+    )
