@@ -43,7 +43,7 @@ def _make_session(status: str) -> PersistentBrowserSession:
 async def test_rejects_update_when_already_final(desired_status: str):
     """A finalized session must not accept any status update."""
     db = AsyncMock()
-    db.get_persistent_browser_session.return_value = _make_session(
+    db.browser_sessions.get_persistent_browser_session.return_value = _make_session(
         PersistentBrowserSessionStatus.completed,
     )
 
