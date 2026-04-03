@@ -322,3 +322,122 @@ async def block_fn(page, context):
 """
         # f-string selectors won't match the date regex in the selector value
         assert self.reviewer._validate_hardcoded_run_data(code) is None
+
+    def test_email_in_text_patterns_flagged(self) -> None:
+        """Email addresses in text_patterns are PII that should not be in cached scripts."""
+        code = """
+async def block_fn(page, context):
+    state = await page.classify(
+        options={"login": "login page", "dashboard": "dashboard"},
+        text_patterns={
+            "login": "Welcome to Portal, Username, Password, Sign in",
+            "dashboard": "Logout, cmt.acme@example.com, John Smith, Billing",
+        },
+    )
+"""
+        error = self.reviewer._validate_hardcoded_run_data(code)
+        assert error is not None
+        assert "email" in error.lower()
+
+    def test_text_patterns_without_email_ok(self) -> None:
+        """Generic text_patterns without PII should pass."""
+        code = """
+async def block_fn(page, context):
+    state = await page.classify(
+        options={"login": "login page", "dashboard": "dashboard"},
+        text_patterns={
+            "login": "Welcome, Username, Password, Sign in",
+            "dashboard": "Logout, Billing & Payments, Service Management",
+        },
+    )
+"""
+        assert self.reviewer._validate_hardcoded_run_data(code) is None
+
+
+class TestValidateMissingSelectors:
+    """Tests for _validate_missing_selectors."""
+
+    def setup_method(self) -> None:
+        self.reviewer = ScriptReviewer()
+
+    def test_fallback_with_selector_is_fine(self) -> None:
+        code = """
+async def block_fn(page, context):
+    await page.click(selector='button:has-text("Submit")', ai='fallback', prompt='submit')
+"""
+        assert self.reviewer._validate_missing_selectors(code) is None
+
+    def test_fallback_without_selector_flagged(self) -> None:
+        """ai='fallback' with no selector= silently uses AI as primary path."""
+        code = """
+async def block_fn(page, context):
+    await page.click(ai='fallback', prompt='Click Billing & Payments')
+"""
+        error = self.reviewer._validate_missing_selectors(code)
+        assert error is not None
+        assert "page.click()" in error
+        assert "Missing selector" in error
+
+    def test_fill_without_selector_flagged(self) -> None:
+        code = """
+async def block_fn(page, context):
+    await page.fill(ai='fallback', prompt='Enter username', value='test')
+"""
+        error = self.reviewer._validate_missing_selectors(code)
+        assert error is not None
+        assert "page.fill()" in error
+
+    def test_no_ai_arg_not_flagged(self) -> None:
+        """Calls without ai='fallback' are not our concern here."""
+        code = """
+async def block_fn(page, context):
+    await page.click(prompt='Click something')
+"""
+        assert self.reviewer._validate_missing_selectors(code) is None
+
+    def test_proactive_without_selector_not_flagged(self) -> None:
+        """ai='proactive' without selector is caught by _validate_proactive_misuse, not this validator."""
+        code = """
+async def block_fn(page, context):
+    await page.click(ai='proactive', prompt='Click something')
+"""
+        assert self.reviewer._validate_missing_selectors(code) is None
+
+    def test_multiline_call_flagged(self) -> None:
+        code = """
+async def block_fn(page, context):
+    await page.click(
+        ai='fallback',
+        prompt='Click Billing & Payments',
+    )
+"""
+        error = self.reviewer._validate_missing_selectors(code)
+        assert error is not None
+        assert "page.click()" in error
+
+    def test_multiline_with_selector_ok(self) -> None:
+        code = """
+async def block_fn(page, context):
+    await page.click(
+        selector='a:has-text("Billing")',
+        ai='fallback',
+        prompt='Click billing link',
+    )
+"""
+        assert self.reviewer._validate_missing_selectors(code) is None
+
+    def test_comments_ignored(self) -> None:
+        code = """
+async def block_fn(page, context):
+    # await page.click(ai='fallback', prompt='old code')
+    await page.click(selector='button', ai='fallback', prompt='submit')
+"""
+        assert self.reviewer._validate_missing_selectors(code) is None
+
+    def test_non_interaction_methods_ignored(self) -> None:
+        """Methods like page.wait, page.complete are not interaction methods."""
+        code = """
+async def block_fn(page, context):
+    await page.wait(ai='fallback', prompt='wait for page')
+"""
+        assert self.reviewer._validate_missing_selectors(code) is None
