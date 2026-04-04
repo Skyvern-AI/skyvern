@@ -1126,7 +1126,8 @@ class WorkflowService:
                 )
 
             # Trigger AI Script Reviewer for adaptive caching workflows
-            # Include terminated and failed runs (triage will filter non-code-fixable failures)
+            # Include terminated and failed runs — the reviewer filters to only
+            # episodes where the AI fallback succeeded (actionable signal).
             # Skip canceled (user stopped) and timed_out (infrastructure issue)
             # Only trigger if the script was actually executed this run — reviewing based on
             # agent-only runs provides no signal about script quality and wastes LLM tokens.
@@ -5413,12 +5414,26 @@ class WorkflowService:
     ) -> None:
         """Run the script reviewer inside a lock. Episodes are scoped to the script version."""
         # Double-check: re-query episodes after acquiring lock (another process may have reviewed them)
-        episodes = await app.DATABASE.scripts.get_unreviewed_episodes(
+        all_episodes = await app.DATABASE.scripts.get_unreviewed_episodes(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization_id=workflow.organization_id,
             script_revision_id=script_revision_id,
         )
+        if not all_episodes:
+            return
+
+        # Only review episodes where the AI fallback succeeded — those carry
+        # actionable signal (working selectors, agent actions) the reviewer can
+        # learn from.  When both the script AND the AI fail, there's nothing to
+        # improve and reviewing wastes LLM tokens.
+        episodes = [ep for ep in all_episodes if ep.fallback_succeeded is not False]
         if not episodes:
+            LOG.info(
+                "Skipping script review — all fallback episodes failed (no actionable signal)",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                total_episodes=len(all_episodes),
+                failed_labels=[ep.block_label for ep in all_episodes][:20],
+            )
             return
 
         LOG.info(
