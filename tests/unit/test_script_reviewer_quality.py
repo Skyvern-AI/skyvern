@@ -441,3 +441,89 @@ async def block_fn(page, context):
     await page.wait(ai='fallback', prompt='wait for page')
 """
         assert self.reviewer._validate_missing_selectors(code) is None
+
+
+class TestExtractCachedBlocks:
+    """Tests for the shared block extraction utilities."""
+
+    def test_extract_all_blocks(self):
+        from skyvern.services.workflow_script_service import extract_cached_blocks_from_source
+
+        source = """import skyvern
+
+@skyvern.cached(cache_key = 'login')
+async def login(page, context):
+    await page.goto('https://example.com')
+    await page.complete()
+
+
+@skyvern.cached(cache_key = 'block_1')
+async def block_1(page, context):
+    await page.click(selector='button')
+    await page.complete()
+"""
+        result = extract_cached_blocks_from_source(source)
+        assert set(result.keys()) == {"login", "block_1"}
+        assert "page.goto" in result["login"]
+        assert "page.click" in result["block_1"]
+        # login block should NOT contain block_1 code
+        assert "page.click" not in result["login"]
+
+    def test_extract_single_block(self):
+        from skyvern.services.workflow_script_service import extract_single_cached_block
+
+        source = """import skyvern
+
+@skyvern.cached(cache_key = 'login')
+async def login(page, context):
+    await page.goto('https://example.com')
+
+
+@skyvern.cached(cache_key = 'block_1')
+async def block_1(page, context):
+    await page.click(selector='button')
+"""
+        result = extract_single_cached_block(source, "block_1")
+        assert result is not None
+        assert "page.click" in result
+        assert "page.goto" not in result
+
+    def test_extract_first_block(self):
+        from skyvern.services.workflow_script_service import extract_single_cached_block
+
+        source = """import skyvern
+
+@skyvern.cached(cache_key = 'login')
+async def login(page, context):
+    await page.goto('https://example.com')
+
+
+@skyvern.cached(cache_key = 'block_1')
+async def block_1(page, context):
+    await page.click(selector='button')
+"""
+        result = extract_single_cached_block(source, "login")
+        assert result is not None
+        assert "page.goto" in result
+        assert "page.click" not in result
+
+    def test_extract_single_block_not_found(self):
+        from skyvern.services.workflow_script_service import extract_single_cached_block
+
+        source = "@skyvern.cached(cache_key = 'login')\nasync def login(page, context): pass\n"
+        result = extract_single_cached_block(source, "nonexistent")
+        assert result is None
+
+    def test_extract_empty_source(self):
+        from skyvern.services.workflow_script_service import extract_cached_blocks_from_source
+
+        assert extract_cached_blocks_from_source("") == {}
+        assert extract_cached_blocks_from_source("import skyvern\n") == {}
+
+    def test_extract_last_block_goes_to_eof(self):
+        from skyvern.services.workflow_script_service import extract_cached_blocks_from_source
+
+        source = "@skyvern.cached(cache_key = 'only_block')\nasync def only(page, ctx):\n    pass\n"
+        result = extract_cached_blocks_from_source(source)
+        assert "only_block" in result
+        assert "pass" in result["only_block"]
