@@ -2837,6 +2837,17 @@ async function getIncrementElements(wait_until_finished = true) {
   for (let idx = 0; idx < sortedDepth.length; idx++) {
     const depth = sortedDepth[idx];
     const treeList = window.globalDomDepthMap.get(depth);
+    if (!treeList) {
+      _jsConsoleError(
+        "getIncrementElements: treeList is undefined for depth",
+        depth,
+        "mapSize=",
+        window.globalDomDepthMap.size,
+        "sortedDepth=",
+        sortedDepth,
+      );
+      continue;
+    }
 
     const removeDupAndConcatChildren = async (element) => {
       let children = element.children;

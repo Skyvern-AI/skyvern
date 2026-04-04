@@ -99,7 +99,7 @@ class TestScreenshotAfterExecutionBundling:
         ):
             mock_ctx.ensure_context.return_value = context
             mock_get_bs.return_value = mock_browser_state
-            mock_app.DATABASE.get_step = AsyncMock(return_value=step)
+            mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=step)
             mock_app.ARTIFACT_MANAGER = mock_manager
 
             await ScriptSkyvernPage._create_screenshot_after_execution()
@@ -132,7 +132,7 @@ class TestScreenshotAfterExecutionBundling:
         ):
             mock_ctx.ensure_context.return_value = context
             mock_get_bs.return_value = mock_browser_state
-            mock_app.DATABASE.get_step = AsyncMock(return_value=step)
+            mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=step)
             mock_app.ARTIFACT_MANAGER = mock_manager
 
             await ScriptSkyvernPage._create_screenshot_after_execution()
@@ -170,7 +170,7 @@ class TestHtmlActionAfterExecutionBundling:
         ):
             mock_ctx.ensure_context.return_value = context
             mock_get_bs.return_value = mock_browser_state
-            mock_app.DATABASE.get_step = AsyncMock(return_value=step)
+            mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=step)
             mock_app.ARTIFACT_MANAGER = mock_manager
 
             mock_frame = MagicMock()
@@ -210,7 +210,7 @@ class TestHtmlActionAfterExecutionBundling:
         ):
             mock_ctx.ensure_context.return_value = context
             mock_get_bs.return_value = mock_browser_state
-            mock_app.DATABASE.get_step = AsyncMock(return_value=step)
+            mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=step)
             mock_app.ARTIFACT_MANAGER = mock_manager
 
             mock_frame = MagicMock()
@@ -249,7 +249,7 @@ class TestFinalScreenshotBundling:
         ):
             mock_ctx.ensure_context.return_value = context
             mock_get_bs.return_value = mock_browser_state
-            mock_app.DATABASE.get_step = AsyncMock(return_value=step)
+            mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=step)
             mock_app.ARTIFACT_MANAGER = mock_manager
 
             await ScriptSkyvernPage._create_final_screenshot()
@@ -283,7 +283,7 @@ class TestFinalScreenshotBundling:
         ):
             mock_ctx.ensure_context.return_value = context
             mock_get_bs.return_value = mock_browser_state
-            mock_app.DATABASE.get_step = AsyncMock(return_value=step)
+            mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=step)
             mock_app.ARTIFACT_MANAGER = mock_manager
 
             await ScriptSkyvernPage._create_final_screenshot()
@@ -317,9 +317,9 @@ class TestUpdateWorkflowBlockFlush:
         ):
             mock_ctx.current.return_value = context
             mock_app.ARTIFACT_MANAGER = mock_manager
-            mock_app.DATABASE.update_step = AsyncMock()
-            mock_app.DATABASE.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
-            mock_app.DATABASE.update_workflow_run_block = AsyncMock()
+            mock_app.DATABASE.tasks.update_step = AsyncMock()
+            mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
             mock_app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
             mock_app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
@@ -348,9 +348,9 @@ class TestUpdateWorkflowBlockFlush:
         ):
             mock_ctx.current.return_value = context
             mock_app.ARTIFACT_MANAGER = mock_manager
-            mock_app.DATABASE.update_step = AsyncMock()
-            mock_app.DATABASE.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
-            mock_app.DATABASE.update_workflow_run_block = AsyncMock()
+            mock_app.DATABASE.tasks.update_step = AsyncMock()
+            mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
             mock_app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
             mock_app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
@@ -379,7 +379,7 @@ class TestUpdateWorkflowBlockFlush:
         ):
             mock_ctx.current.return_value = context
             mock_app.ARTIFACT_MANAGER = mock_manager
-            mock_app.DATABASE.update_workflow_run_block = AsyncMock()
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             mock_app.WORKFLOW_SERVICE.send_workflow_response = AsyncMock()
             mock_run_ctx.get_run_context.return_value = None
 
@@ -407,9 +407,9 @@ class TestUpdateWorkflowBlockFlush:
         ):
             mock_ctx.current.return_value = context
             mock_app.ARTIFACT_MANAGER = mock_manager
-            mock_app.DATABASE.update_step = AsyncMock()
-            mock_app.DATABASE.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
-            mock_app.DATABASE.update_workflow_run_block = AsyncMock()
+            mock_app.DATABASE.tasks.update_step = AsyncMock()
+            mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
             mock_app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
             mock_app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])

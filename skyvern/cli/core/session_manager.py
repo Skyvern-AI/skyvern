@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -15,6 +16,8 @@ from .client import get_active_api_key, get_skyvern
 from .result import BrowserContext, ErrorCode, make_error
 
 LOG = structlog.get_logger(__name__)
+
+_BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
 
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
@@ -31,8 +34,10 @@ class SessionState:
     console_messages: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    page_errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     tracing_active: bool = False
     har_enabled: bool = False
+    _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
     # -- Active page tracking (tab management) --
     _active_page: Page | None = None
     # -- Page event buffer for tab_wait_for_new --
@@ -42,8 +47,22 @@ class SessionState:
     # -- Multi-page inspection hooks --
     _hooked_page_ids: set[int] = field(default_factory=set)
     _hooked_handlers_map: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Per-request network state: ID counter, body cache, concurrency limiter, route interceptions
+    _request_id_counter: itertools.count[int] = field(default_factory=itertools.count)
+    # Body store keyed by request_id. Evicts by completion order (FIFO on dict insertion),
+    # capped at _BODY_STORE_MAX. Entries may outlive their network_requests deque counterparts
+    # (deque maxlen=1000 vs store max=100) — bounded at ~25MB worst case, acceptable.
+    _body_store: dict[int, str] = field(default_factory=dict)
+    _body_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_BODY_SEMAPHORE_LIMIT))
+    _pending_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
+    active_routes: dict[int, set[str]] = field(default_factory=dict)
     # -- Iframe frame context --
     _working_frame: Frame | None = None
+
+    def get_response_body(self, request_id: int) -> str | None:
+        """Public accessor for cached response bodies (keyed by request_id)."""
+        return self._body_store.get(request_id)
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
@@ -200,6 +219,12 @@ async def close_current_session() -> None:
                     session_id=current.context.session_id,
                     exc_info=True,
                 )
+        # Cancel pending body-capture tasks before closing the browser to avoid
+        # "target closed" noise from CDP calls against a defunct context.
+        for task in current._pending_tasks:
+            task.cancel()
+        current._pending_tasks.clear()
+        current.active_routes.clear()
         if current.browser is not None:
             await current.browser.close()
     finally:

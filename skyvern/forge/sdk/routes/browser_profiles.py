@@ -143,7 +143,7 @@ async def list_browser_profiles(
         include_deleted=include_deleted,
     )
 
-    profiles = await app.DATABASE.list_browser_profiles(
+    profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
         organization_id=organization_id,
         include_deleted=include_deleted,
     )
@@ -199,7 +199,7 @@ async def get_browser_profile(
         browser_profile_id=profile_id,
     )
 
-    profile = await app.DATABASE.get_browser_profile(
+    profile = await app.DATABASE.browser_sessions.get_browser_profile(
         profile_id=profile_id,
         organization_id=organization_id,
     )
@@ -264,7 +264,7 @@ async def delete_browser_profile(
     )
 
     try:
-        await app.DATABASE.delete_browser_profile(
+        await app.DATABASE.browser_sessions.delete_browser_profile(
             profile_id=profile_id,
             organization_id=organization_id,
         )
@@ -290,7 +290,9 @@ async def _create_profile_from_session(
     description: str | None,
     browser_session_id: str,
 ) -> BrowserProfile:
-    browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        browser_session_id, organization_id
+    )
     if browser_session is None:
         LOG.warning(
             "Browser session not found for profile creation",
@@ -318,7 +320,7 @@ async def _create_profile_from_session(
         )
 
     try:
-        profile = await app.DATABASE.create_browser_profile(
+        profile = await app.DATABASE.browser_sessions.create_browser_profile(
             organization_id=organization_id,
             name=name,
             description=description,
@@ -334,7 +336,9 @@ async def _create_profile_from_session(
         )
     except Exception:
         # Rollback: delete the profile if storage fails
-        await app.DATABASE.delete_browser_profile(profile.browser_profile_id, organization_id=organization_id)
+        await app.DATABASE.browser_sessions.delete_browser_profile(
+            profile.browser_profile_id, organization_id=organization_id
+        )
         LOG.error(
             "Failed to store browser profile artifacts, rolled back profile creation",
             organization_id=organization_id,
@@ -359,7 +363,7 @@ async def _create_profile_from_workflow_run(
     description: str | None,
     workflow_run_id: str,
 ) -> BrowserProfile:
-    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id=organization_id)
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         LOG.warning(
             "Workflow run not found for profile creation",
@@ -368,7 +372,7 @@ async def _create_profile_from_workflow_run(
         )
         raise WorkflowRunNotFound(workflow_run_id)
 
-    workflow = await app.DATABASE.get_workflow(
+    workflow = await app.DATABASE.workflows.get_workflow(
         workflow_id=workflow_run.workflow_id,
         organization_id=organization_id,
     )
@@ -421,7 +425,7 @@ async def _create_profile_from_workflow_run(
         )
 
     try:
-        profile = await app.DATABASE.create_browser_profile(
+        profile = await app.DATABASE.browser_sessions.create_browser_profile(
             organization_id=organization_id,
             name=name,
             description=description,
@@ -443,7 +447,9 @@ async def _create_profile_from_workflow_run(
         )
     except Exception:
         # Rollback: delete the profile if storage fails
-        await app.DATABASE.delete_browser_profile(profile.browser_profile_id, organization_id=organization_id)
+        await app.DATABASE.browser_sessions.delete_browser_profile(
+            profile.browser_profile_id, organization_id=organization_id
+        )
         LOG.error(
             "Failed to store browser profile artifacts, rolled back profile creation",
             organization_id=organization_id,

@@ -186,8 +186,8 @@ async def test_evaluate_conditional_block_records_branch_metadata(monkeypatch: p
     ctx.values["flag"] = True
     monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", lambda workflow_run_id: ctx)
 
-    app.DATABASE.update_workflow_run_block.reset_mock()
-    app.DATABASE.create_or_update_workflow_run_output_parameter.reset_mock()
+    app.DATABASE.observer.update_workflow_run_block.reset_mock()
+    app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter.reset_mock()
 
     result = await block.execute(
         workflow_run_id="run-1",
@@ -202,7 +202,7 @@ async def test_evaluate_conditional_block_records_branch_metadata(monkeypatch: p
     assert ctx.blocks_metadata["cond"]["branch_taken"] == "next"
 
     # Get the actual call arguments
-    call_args = app.DATABASE.update_workflow_run_block.call_args
+    call_args = app.DATABASE.observer.update_workflow_run_block.call_args
     assert call_args.kwargs["workflow_run_block_id"] == "wrb-1"
     assert call_args.kwargs["output"] == metadata
     assert call_args.kwargs["status"] == BlockStatus.completed

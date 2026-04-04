@@ -111,27 +111,20 @@ class DebugRepository(BaseRepository):
 
             await session.commit()
 
-    @db_operation("get_latest_debug_session_for_user")
-    async def get_latest_debug_session_for_user(
+    @db_operation("get_debug_session_by_browser_session_id")
+    async def get_debug_session_by_browser_session_id(
         self,
-        *,
+        browser_session_id: str,
         organization_id: str,
-        user_id: str,
-        workflow_permanent_id: str,
     ) -> DebugSession | None:
         async with self.Session() as session:
             query = (
                 select(DebugSessionModel)
+                .filter_by(browser_session_id=browser_session_id)
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
-                .filter_by(status="created")
-                .filter_by(user_id=user_id)
-                .filter_by(workflow_permanent_id=workflow_permanent_id)
-                .order_by(DebugSessionModel.created_at.desc())
             )
-
             model = (await session.scalars(query)).first()
-
             return DebugSession.model_validate(model) if model else None
 
     @db_operation("get_debug_session_by_id")

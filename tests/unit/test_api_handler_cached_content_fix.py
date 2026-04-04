@@ -41,8 +41,8 @@ async def test_cached_content_removed_from_non_extract_prompts() -> None:
     # Ensure app dependencies referenced inside the handler resolve to async mocks.
     forge_module.app.ARTIFACT_MANAGER = MagicMock()
     forge_module.app.DATABASE = MagicMock()
-    forge_module.app.DATABASE.update_step = AsyncMock()
-    forge_module.app.DATABASE.update_thought = AsyncMock()
+    forge_module.app.DATABASE.tasks.update_step = AsyncMock()
+    forge_module.app.DATABASE.observer.update_thought = AsyncMock()
 
     with (
         patch("skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.get_config", return_value=mock_config),

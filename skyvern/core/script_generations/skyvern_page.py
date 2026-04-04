@@ -314,6 +314,7 @@ class SkyvernPage(Page):
         if ai == "fallback":
             # try to click the element with the original selector first
             error_to_raise = None
+            original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
                     locator = self._locator_scope.locator(selector).first
@@ -351,6 +352,8 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    failed_selector=original_selector or "",
+                    block_label=self.current_label,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -887,6 +890,7 @@ class SkyvernPage(Page):
         if ai == "fallback":
             error_to_raise = None
             original_value = value
+            original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
                     value = await self.get_actual_value(
@@ -920,6 +924,8 @@ class SkyvernPage(Page):
                     totp_identifier=totp_identifier,
                     totp_url=totp_url,
                     timeout=timeout,
+                    failed_selector=original_selector or "",
+                    block_label=self.current_label,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -1526,7 +1532,7 @@ class SkyvernPage(Page):
                         field_index=idx,
                         value=str(value)[:50],
                         options_count=len(field.get("options", [])),
-                        option_labels=[o.get("label", "?")[:30] for o in field.get("options", [])],
+                        option_labels=[(o.get("label") or "?")[:30] for o in field.get("options", [])],
                     )
                     if isinstance(value, str):
                         try:

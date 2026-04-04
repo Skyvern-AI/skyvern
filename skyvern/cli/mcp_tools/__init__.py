@@ -15,10 +15,13 @@ from .blocks import (
 from .browser import (
     skyvern_act,
     skyvern_click,
+    skyvern_clipboard_read,
+    skyvern_clipboard_write,
     skyvern_drag,
     skyvern_evaluate,
     skyvern_extract,
     skyvern_file_upload,
+    skyvern_find,
     skyvern_frame_list,
     skyvern_frame_main,
     skyvern_frame_switch,
@@ -48,8 +51,17 @@ from .folder import (
 )
 from .inspection import (
     skyvern_console_messages,
+    skyvern_get_errors,
+    skyvern_get_html,
+    skyvern_get_styles,
+    skyvern_get_value,
     skyvern_handle_dialog,
+    skyvern_har_start,
+    skyvern_har_stop,
+    skyvern_network_request_detail,
     skyvern_network_requests,
+    skyvern_network_route,
+    skyvern_network_unroute,
 )
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .scripts import (
@@ -65,6 +77,13 @@ from .session import (
     skyvern_browser_session_create,
     skyvern_browser_session_get,
     skyvern_browser_session_list,
+)
+from .state import skyvern_state_load, skyvern_state_save
+from .storage import (
+    skyvern_clear_local_storage,
+    skyvern_clear_session_storage,
+    skyvern_get_session_storage,
+    skyvern_set_session_storage,
 )
 from .tabs import (
     skyvern_tab_close,
@@ -138,6 +157,8 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | "Search for X on [site]" / "Look up X" | skyvern_act | Natural language actions |
 | "Verify / check / confirm something on [site]" | skyvern_validate | AI assertion |
 | "Fill out / submit a form" | skyvern_act | Multi-step form interaction |
+| "Read clipboard" / "Paste from clipboard" | skyvern_clipboard_read | Read text from the browser clipboard |
+| "Copy to clipboard" / "Write clipboard" | skyvern_clipboard_write | Write text to the browser clipboard |
 | "Click [element]" / "Type [text]" | skyvern_click / skyvern_type | Precision targeting |
 | "Hover over [menu]" | skyvern_hover | Reveal dropdowns |
 | "Drag [element] to [target]" | skyvern_drag | AI or selector-based drag-and-drop |
@@ -157,6 +178,9 @@ targeted test cases, open a browser against the dev server, and report pass/fail
 | "Switch to [tab]" / "Go to tab [N]" | skyvern_tab_switch | Change active tab |
 | "Close tab" / "Close this tab" | skyvern_tab_close | Close tab by ID or index |
 | "Wait for popup" / "A new tab should open" | skyvern_tab_wait_for_new | Waits for popup/new tab |
+| "Save login state" / "Remember this session" | skyvern_state_save | Persists cookies + storage to file |
+| "Restore login" / "Load saved state" | skyvern_state_load | Restores cookies + storage from file |
+| "Find button" / "Locate element by role/text" | skyvern_find | Semantic locator: find by role, text, label, placeholder, alt, testid |
 
 ## Critical Rules
 1. Use Skyvern for all browser tasks. curl/wget/requests are fine for APIs and file downloads.
@@ -368,6 +392,10 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_navigate)
 mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_screenshot)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_evaluate)
 
+# -- Clipboard --
+mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_clipboard_read)
+mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_clipboard_write)
+
 # -- Precision tools (selector/intent-based browser primitives) --
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_click)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_drag)
@@ -378,6 +406,7 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_scroll)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_select_option)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_press_key)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_wait)
+mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_find)
 
 # -- Tab management (multi-tab) --
 mcp.tool(tags={"tab_management"}, annotations=_RO)(skyvern_tab_list)
@@ -391,10 +420,29 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_switch)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_main)
 mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_frame_list)
 
-# -- Inspection tools (console, network, dialog) --
+# -- Auth state persistence --
+mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_save)
+mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_load)
+
+# -- Inspection tools (console, network, dialog, page errors, DOM) --
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_console_messages)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_requests)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_request_detail)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_network_route)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_network_unroute)
 mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_handle_dialog)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_errors)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_start)
+mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_stop)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_html)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_value)
+mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_styles)
+
+# -- Web storage (sessionStorage + localStorage) --
+mcp.tool(tags={"storage"}, annotations=_RO)(skyvern_get_session_storage)
+mcp.tool(tags={"storage"}, annotations=_MUT)(skyvern_set_session_storage)
+mcp.tool(tags={"storage"}, annotations=_DEST)(skyvern_clear_session_storage)
+mcp.tool(tags={"storage"}, annotations=_DEST)(skyvern_clear_local_storage)
 
 # -- Block discovery + validation (no browser needed) --
 mcp.tool(tags={"block_discovery"}, annotations=_RO)(skyvern_block_schema)
@@ -453,6 +501,9 @@ __all__ = [
     "skyvern_navigate",
     "skyvern_screenshot",
     "skyvern_evaluate",
+    # Clipboard
+    "skyvern_clipboard_read",
+    "skyvern_clipboard_write",
     # Precision (selector/intent browser primitives)
     "skyvern_click",
     "skyvern_drag",
@@ -463,6 +514,7 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    "skyvern_find",
     # Tab management
     "skyvern_tab_list",
     "skyvern_tab_new",
@@ -473,10 +525,24 @@ __all__ = [
     "skyvern_frame_switch",
     "skyvern_frame_main",
     "skyvern_frame_list",
-    # Inspection (console, network, dialog)
+    # Inspection (console, network, dialog, page errors, DOM)
     "skyvern_console_messages",
     "skyvern_network_requests",
+    "skyvern_network_request_detail",
+    "skyvern_network_route",
+    "skyvern_network_unroute",
     "skyvern_handle_dialog",
+    "skyvern_get_errors",
+    "skyvern_har_start",
+    "skyvern_har_stop",
+    "skyvern_get_html",
+    "skyvern_get_value",
+    "skyvern_get_styles",
+    # Web storage
+    "skyvern_get_session_storage",
+    "skyvern_set_session_storage",
+    "skyvern_clear_session_storage",
+    "skyvern_clear_local_storage",
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
@@ -506,6 +572,9 @@ __all__ = [
     "skyvern_script_versions",
     "skyvern_script_fallback_episodes",
     "skyvern_script_deploy",
+    # Auth state persistence
+    "skyvern_state_save",
+    "skyvern_state_load",
     # Prompts
     "build_workflow",
     "debug_automation",

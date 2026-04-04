@@ -6,7 +6,6 @@ Generate a runnable Skyvern workflow script.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import keyword
 import re
@@ -43,6 +42,15 @@ class ScriptBlockSource:
     workflow_run_block_id: str | None
     input_fields: list[str] | None
     requires_agent: bool | None = None
+
+
+@dataclass
+class CodeGenResult:
+    """Result of generate_workflow_script_python_code() with block-creation telemetry."""
+
+    source_code: str
+    blocks_created: int
+    blocks_failed: int
 
 
 def _build_existing_field_assignments(
@@ -2724,15 +2732,19 @@ async def generate_workflow_script_python_code(
     updated_block_labels: set[str] | None = None,
     use_semantic_selectors: bool = False,
     adaptive_caching: bool = False,
-) -> str:
+) -> CodeGenResult:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
 
     Cached script blocks can be reused by providing them via `cached_blocks`. Any labels present in
     `updated_block_labels` will be regenerated from the latest workflow run execution data.
+
+    Returns a CodeGenResult containing the source code and block-creation success/failure counts.
     """
     cached_blocks = cached_blocks or {}
     updated_block_labels = set(updated_block_labels or [])
+    blocks_created = 0
+    blocks_failed = 0
 
     # Drop cached entries that do not have usable source
     cached_blocks = {label: source for label, source in cached_blocks.items() if source.code}
@@ -2872,21 +2884,22 @@ async def generate_workflow_script_python_code(
             block_workflow_run_block_id = task.get("workflow_run_block_id")
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=block_code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=block_name,
-                    update=pending,
-                    run_signature=run_signature,
-                    workflow_run_id=block_workflow_run_id,
-                    workflow_run_block_id=block_workflow_run_block_id,
-                    input_fields=input_fields,
-                )
-            except Exception as e:
-                LOG.error("Failed to create script block", error=str(e), exc_info=True)
+            ok = await create_or_update_script_block(
+                block_code=block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=block_name,
+                update=pending,
+                run_signature=run_signature,
+                workflow_run_id=block_workflow_run_id,
+                workflow_run_block_id=block_workflow_run_block_id,
+                input_fields=input_fields,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         append_block_code(block_code)
 
@@ -2945,21 +2958,22 @@ async def generate_workflow_script_python_code(
             run_signature = cst.Module(body=[task_v2_stmt]).code.strip()
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=block_code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=task_v2_label,
-                    update=pending,
-                    run_signature=run_signature,
-                    workflow_run_id=block_workflow_run_id,
-                    workflow_run_block_id=block_workflow_run_block_id,
-                    input_fields=input_fields,
-                )
-            except Exception as e:
-                LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
+            ok = await create_or_update_script_block(
+                block_code=block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=task_v2_label,
+                update=pending,
+                run_signature=run_signature,
+                workflow_run_id=block_workflow_run_id,
+                workflow_run_block_id=block_workflow_run_block_id,
+                input_fields=input_fields,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         append_block_code(block_code)
 
@@ -2989,21 +3003,22 @@ async def generate_workflow_script_python_code(
             run_signature = block_code.strip()
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=block_code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=for_loop_label,
-                    update=pending,
-                    run_signature=run_signature,
-                    workflow_run_id=block_workflow_run_id,
-                    workflow_run_block_id=block_workflow_run_block_id,
-                    input_fields=None,
-                )
-            except Exception as e:
-                LOG.error("Failed to create for_loop script block", error=str(e), exc_info=True)
+            ok = await create_or_update_script_block(
+                block_code=block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=for_loop_label,
+                update=pending,
+                run_signature=run_signature,
+                workflow_run_id=block_workflow_run_id,
+                workflow_run_block_id=block_workflow_run_block_id,
+                input_fields=None,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         # NOTE: Do NOT call append_block_code() for for_loop blocks.
         # Unlike task blocks (which produce function definitions valid at module level),
@@ -3055,29 +3070,25 @@ async def generate_workflow_script_python_code(
 
             # Create script_block entry for preservation across regenerations
             if script_id and script_revision_id and organization_id:
-                try:
-                    inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
-                    if not inner_input_fields and cached_inner and cached_inner.input_fields:
-                        inner_input_fields = cached_inner.input_fields
-                    await create_or_update_script_block(
-                        block_code=inner_block_code,
-                        script_revision_id=script_revision_id,
-                        script_id=script_id,
-                        organization_id=organization_id,
-                        block_label=inner_label,
-                        update=pending,
-                        run_signature=inner_run_signature,
-                        workflow_run_id=inner_wri,
-                        workflow_run_block_id=inner_wrbi,
-                        input_fields=inner_input_fields,
-                    )
-                except Exception as e:
-                    LOG.error(
-                        "Failed to create for_loop inner block script block",
-                        error=str(e),
-                        block_label=inner_label,
-                        exc_info=True,
-                    )
+                inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
+                if not inner_input_fields and cached_inner and cached_inner.input_fields:
+                    inner_input_fields = cached_inner.input_fields
+                ok = await create_or_update_script_block(
+                    block_code=inner_block_code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=inner_label,
+                    update=pending,
+                    run_signature=inner_run_signature,
+                    workflow_run_id=inner_wri,
+                    workflow_run_block_id=inner_wrbi,
+                    input_fields=inner_input_fields,
+                )
+                if ok:
+                    blocks_created += 1
+                else:
+                    blocks_failed += 1
 
             append_block_code(inner_block_code)
 
@@ -3097,39 +3108,41 @@ async def generate_workflow_script_python_code(
             if cached_source and cached_source.run_signature and not cached_source.requires_agent:
                 # Reviewer upgraded this block to code — preserve it
                 if script_id and script_revision_id and organization_id:
-                    try:
-                        await create_or_update_script_block(
-                            block_code=cached_source.code,
-                            script_revision_id=script_revision_id,
-                            script_id=script_id,
-                            organization_id=organization_id,
-                            block_label=arb_label,
-                            update=pending,
-                            run_signature=cached_source.run_signature,
-                            workflow_run_id=cached_source.workflow_run_id,
-                            workflow_run_block_id=cached_source.workflow_run_block_id,
-                            requires_agent=False,
-                        )
-                    except Exception as e:
-                        LOG.error("Failed to preserve coded agent block", error=str(e), exc_info=True)
+                    ok = await create_or_update_script_block(
+                        block_code=cached_source.code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=arb_label,
+                        update=pending,
+                        run_signature=cached_source.run_signature,
+                        workflow_run_id=cached_source.workflow_run_id,
+                        workflow_run_block_id=cached_source.workflow_run_block_id,
+                        requires_agent=False,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
                     append_block_code(cached_source.code)
             else:
                 # Create a requires_agent entry (no code, no run_signature)
                 placeholder_code = f"# Block '{arb_label}' ({arb['block_type']}) — executed via agent"
                 if script_id and script_revision_id and organization_id:
-                    try:
-                        await create_or_update_script_block(
-                            block_code=placeholder_code,
-                            script_revision_id=script_revision_id,
-                            script_id=script_id,
-                            organization_id=organization_id,
-                            block_label=arb_label,
-                            update=pending,
-                            run_signature=None,
-                            requires_agent=True,
-                        )
-                    except Exception as e:
-                        LOG.error("Failed to create agent-required script block", error=str(e), exc_info=True)
+                    ok = await create_or_update_script_block(
+                        block_code=placeholder_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=arb_label,
+                        update=pending,
+                        run_signature=None,
+                        requires_agent=True,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
 
     # --- preserve cached blocks from unexecuted branches ----------------
     # When a workflow has conditional blocks, not all branches execute in a single run.
@@ -3166,26 +3179,22 @@ async def generate_workflow_script_python_code(
             continue  # Skip entries without usable code/metadata
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=cached_source.code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=cached_label,
-                    update=pending,
-                    run_signature=cached_source.run_signature,
-                    workflow_run_id=cached_source.workflow_run_id,
-                    workflow_run_block_id=cached_source.workflow_run_block_id,
-                    input_fields=cached_source.input_fields,
-                )
-            except Exception as e:
-                LOG.error(
-                    "Failed to preserve cached script block from unexecuted branch",
-                    error=str(e),
-                    block_label=cached_label,
-                    exc_info=True,
-                )
+            ok = await create_or_update_script_block(
+                block_code=cached_source.code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=cached_label,
+                update=pending,
+                run_signature=cached_source.run_signature,
+                workflow_run_id=cached_source.workflow_run_id,
+                workflow_run_block_id=cached_source.workflow_run_block_id,
+                input_fields=cached_source.input_fields,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         append_block_code(cached_source.code)
         preserved_count += 1
@@ -3241,7 +3250,7 @@ async def generate_workflow_script_python_code(
             start_block_module = cst.Module(body=start_block_body)
             start_block_code = start_block_module.code
 
-            await create_or_update_script_block(
+            ok = await create_or_update_script_block(
                 block_code=start_block_code,
                 script_revision_id=script_revision_id,
                 script_id=script_id,
@@ -3249,9 +3258,13 @@ async def generate_workflow_script_python_code(
                 block_label=settings.WORKFLOW_START_BLOCK_LABEL,
                 update=pending,
             )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
         except Exception as e:
             LOG.error("Failed to create __start_block__", error=str(e), exc_info=True)
-            # Continue without script block creation if it fails
+            blocks_failed += 1
 
     # Build module body with the start block content and other blocks
     module_body = [
@@ -3260,7 +3273,7 @@ async def generate_workflow_script_python_code(
     ]
 
     module = cst.Module(body=module_body)
-    return module.code
+    return CodeGenResult(source_code=module.code, blocks_created=blocks_created, blocks_failed=blocks_failed)
 
 
 async def create_or_update_script_block(
@@ -3275,10 +3288,12 @@ async def create_or_update_script_block(
     workflow_run_block_id: str | None = None,
     input_fields: list[str] | None = None,
     requires_agent: bool | None = None,
-) -> None:
+) -> bool:
     """
     Create a script block in the database and save the block code to a script file.
     If update is True, the script block will be updated instead of created.
+
+    Returns True on success, False if an error occurred (logged but not raised).
 
     Args:
         block_code: The code to save
@@ -3294,15 +3309,17 @@ async def create_or_update_script_block(
         requires_agent: Whether this block must be executed via agent (None = don't change on update)
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
+    content_hash = f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}"
+
     try:
-        # Step 3: Create script block in database
-        script_block = await app.DATABASE.get_script_block_by_label(
+        # Step 1: Get or create ScriptBlock record for this revision
+        script_block = await app.DATABASE.scripts.get_script_block_by_label(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
             script_block_label=block_label,
         )
         if not script_block:
-            script_block = await app.DATABASE.create_script_block(
+            script_block = await app.DATABASE.scripts.create_script_block(
                 script_revision_id=script_revision_id,
                 script_id=script_id,
                 organization_id=organization_id,
@@ -3318,7 +3335,7 @@ async def create_or_update_script_block(
             for value in [run_signature, workflow_run_id, workflow_run_block_id, input_fields, requires_agent]
         ):
             # Update metadata when new values are provided
-            script_block = await app.DATABASE.update_script_block(
+            script_block = await app.DATABASE.scripts.update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 run_signature=run_signature,
@@ -3328,50 +3345,118 @@ async def create_or_update_script_block(
                 requires_agent=requires_agent,
             )
 
-        # Step 4: Create script file for the block
-        # Generate a unique filename for the block
+        # Step 2: Create or update ScriptFile with content deduplication
         file_name = f"{block_label}.skyvern"
         file_path = f"blocks/{file_name}"
 
-        # Create artifact and upload to S3
-        artifact_id = None
         if update and script_block.script_file_id:
-            script_file = await app.DATABASE.get_script_file_by_id(
+            # UPDATE path: block already has a ScriptFile in this revision
+            script_file = await app.DATABASE.scripts.get_script_file_by_id(
                 script_revision_id,
                 script_block.script_file_id,
                 organization_id,
             )
+            if script_file and script_file.content_hash == content_hash:
+                # Content unchanged — skip S3 upload entirely
+                LOG.info(
+                    "script_block_dedup_hit",
+                    script_id=script_id,
+                    block_label=block_label,
+                    content_hash=content_hash,
+                    dedup_type="update_same_revision",
+                )
+                return True
+
+            # Content changed — await S3 upload, then update hash only on success.
+            # Intentionally sequential (not fire-and-forget) so content_hash is never
+            # updated unless S3 write succeeds, preventing stale-artifact dedup hits.
             if script_file and script_file.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                 if artifact:
-                    asyncio.create_task(app.STORAGE.store_artifact(artifact, block_code_bytes))
+                    await app.STORAGE.store_artifact(artifact, block_code_bytes)
+                    await app.DATABASE.scripts.update_script_file(
+                        script_file_id=script_file.file_id,
+                        organization_id=organization_id,
+                        content_hash=content_hash,
+                    )
+                    LOG.info(
+                        "script_block_dedup_miss",
+                        script_id=script_id,
+                        block_label=block_label,
+                        content_hash=content_hash,
+                        dedup_type="update_content_changed",
+                    )
+                    return True
+                else:
+                    LOG.error(
+                        "Artifact not found, cannot update S3",
+                        artifact_id=script_file.artifact_id,
+                        script_file_id=script_file.file_id,
+                    )
+                    return False
             else:
                 LOG.error("Script file or artifact not found", script_file_id=script_block.script_file_id)
+                return False
         else:
-            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-                organization_id=organization_id,
-                script_id=script_id,
-                script_version=1,  # Assuming version 1 for now
-                file_path=file_path,
-                data=block_code_bytes,
-            )
-
-            # Create script file record
-            script_file = await app.DATABASE.create_script_file(
-                script_revision_id=script_revision_id,
+            # CREATE path: check for existing ScriptFile with matching hash (cross-revision dedup)
+            existing_file = await app.DATABASE.scripts.get_script_file_by_content_hash(
                 script_id=script_id,
                 organization_id=organization_id,
-                file_path=file_path,
-                file_name=file_name,
-                file_type="file",
-                content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
-                file_size=len(block_code_bytes),
-                mime_type="text/x-python",
-                artifact_id=artifact_id,
+                content_hash=content_hash,
             )
 
-            # update script block with script file id
-            await app.DATABASE.update_script_block(
+            if existing_file and existing_file.artifact_id:
+                # Content matches a previous version — reuse artifact, skip S3 upload
+                script_file = await app.DATABASE.scripts.create_script_file(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type="file",
+                    content_hash=content_hash,
+                    file_size=len(block_code_bytes),
+                    mime_type="text/x-python",
+                    artifact_id=existing_file.artifact_id,
+                )
+                LOG.info(
+                    "script_block_dedup_hit",
+                    script_id=script_id,
+                    block_label=block_label,
+                    content_hash=content_hash,
+                    dedup_type="create_cross_revision",
+                )
+            else:
+                # No match — full S3 upload
+                artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    script_version=1,
+                    file_path=file_path,
+                    data=block_code_bytes,
+                )
+                script_file = await app.DATABASE.scripts.create_script_file(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type="file",
+                    content_hash=content_hash,
+                    file_size=len(block_code_bytes),
+                    mime_type="text/x-python",
+                    artifact_id=artifact_id,
+                )
+                LOG.info(
+                    "script_block_dedup_miss",
+                    script_id=script_id,
+                    block_label=block_label,
+                    content_hash=content_hash,
+                    dedup_type="create_new_content",
+                )
+
+            # Link ScriptBlock to its ScriptFile
+            await app.DATABASE.scripts.update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 script_file_id=script_file.file_id,
@@ -3379,8 +3464,13 @@ async def create_or_update_script_block(
                 workflow_run_block_id=workflow_run_block_id,
             )
 
-    except Exception as e:
-        # Log error but don't fail the entire generation process
-        LOG.error("Failed to create script block", error=str(e), exc_info=True)
-        # For now, just log the error and continue
-        # In production, you might want to handle this differently
+        return True
+
+    except Exception:
+        LOG.exception(
+            "Failed to create or update script block — caller will track failure",
+            block_label=block_label,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
+        )
+        return False

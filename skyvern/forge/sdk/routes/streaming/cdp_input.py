@@ -271,7 +271,7 @@ async def cdp_input_stream(
     try:
         deadline = time.monotonic() + 120
         while True:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )

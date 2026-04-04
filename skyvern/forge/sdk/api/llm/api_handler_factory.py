@@ -836,7 +836,7 @@ class LLMAPIHandlerFactory:
                     if cached_tokens == 0:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
                 if step and not is_speculative_step:
-                    await app.DATABASE.update_step(
+                    await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
                         organization_id=step.organization_id,
@@ -847,7 +847,7 @@ class LLMAPIHandlerFactory:
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     )
                 if thought:
-                    await app.DATABASE.update_thought(
+                    await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
@@ -1302,7 +1302,7 @@ class LLMAPIHandlerFactory:
                 _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
 
                 if step and not is_speculative_step:
-                    await app.DATABASE.update_step(
+                    await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
                         organization_id=step.organization_id,
@@ -1313,7 +1313,7 @@ class LLMAPIHandlerFactory:
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     )
                 if thought:
-                    await app.DATABASE.update_thought(
+                    await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
@@ -1704,7 +1704,7 @@ class LLMCaller:
 
             call_stats = await self.get_call_stats(response)
             if step and not is_speculative_step:
-                await app.DATABASE.update_step(
+                await app.DATABASE.tasks.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
                     organization_id=step.organization_id,
@@ -1715,7 +1715,7 @@ class LLMCaller:
                     incremental_cached_tokens=call_stats.cached_tokens,
                 )
             if thought:
-                await app.DATABASE.update_thought(
+                await app.DATABASE.observer.update_thought(
                     thought_id=thought.observer_thought_id,
                     organization_id=thought.organization_id,
                     input_token_count=call_stats.input_tokens,

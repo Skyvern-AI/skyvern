@@ -28,17 +28,17 @@ async def agent_db(db_engine: Any) -> AsyncGenerator[AgentDB, None]:
 async def test_create_organization(agent_db: AgentDB) -> None:
     org_name = "Test Organization"
     domain = "test.com"
-    organization = await agent_db.create_organization(organization_name=org_name, domain=domain)
+    organization = await agent_db.organizations.create_organization(organization_name=org_name, domain=domain)
     assert organization is not None
     assert organization.organization_name == org_name
     assert organization.domain == domain
 
-    retrieved_org = await agent_db.get_organization(organization.organization_id)
+    retrieved_org = await agent_db.organizations.get_organization(organization.organization_id)
     assert retrieved_org is not None
     assert retrieved_org.organization_name == org_name
     assert retrieved_org.domain == domain
 
-    retrieved_by_domain = await agent_db.get_organization_by_domain(domain=domain)
+    retrieved_by_domain = await agent_db.organizations.get_organization_by_domain(domain=domain)
     assert retrieved_by_domain is not None
     assert retrieved_by_domain.organization_name == org_name
     assert retrieved_by_domain.domain == domain
@@ -46,7 +46,7 @@ async def test_create_organization(agent_db: AgentDB) -> None:
 
 @pytest.mark.asyncio
 async def test_create_organization_with_explicit_id(agent_db: AgentDB) -> None:
-    organization = await agent_db.create_organization(
+    organization = await agent_db.organizations.create_organization(
         organization_id="o_test_org",
         organization_name="Explicit Id Organization",
         domain="explicit.test",
@@ -54,7 +54,7 @@ async def test_create_organization_with_explicit_id(agent_db: AgentDB) -> None:
 
     assert organization.organization_id == "o_test_org"
 
-    retrieved_org = await agent_db.get_organization("o_test_org")
+    retrieved_org = await agent_db.organizations.get_organization("o_test_org")
     assert retrieved_org is not None
     assert retrieved_org.organization_name == "Explicit Id Organization"
     assert retrieved_org.domain == "explicit.test"
@@ -62,20 +62,20 @@ async def test_create_organization_with_explicit_id(agent_db: AgentDB) -> None:
 
 @pytest.mark.asyncio
 async def test_get_organization_not_found(agent_db: AgentDB) -> None:
-    retrieved_org = await agent_db.get_organization("non_existent_id")
+    retrieved_org = await agent_db.organizations.get_organization("non_existent_id")
     assert retrieved_org is None
 
-    retrieved_by_domain = await agent_db.get_organization_by_domain(domain="nonexistent.com")
+    retrieved_by_domain = await agent_db.organizations.get_organization_by_domain(domain="nonexistent.com")
     assert retrieved_by_domain is None
 
 
 @pytest.mark.asyncio
 async def test_create_workflow_run_parameters_persists_all_values(agent_db: AgentDB) -> None:
-    organization = await agent_db.create_organization(
+    organization = await agent_db.organizations.create_organization(
         organization_name="Workflow Parameter Org",
         domain="workflow-params.test",
     )
-    workflow = await agent_db.create_workflow(
+    workflow = await agent_db.workflows.create_workflow(
         title="Workflow Parameter Test",
         workflow_definition={"parameters": [], "blocks": []},
         organization_id=organization.organization_id,

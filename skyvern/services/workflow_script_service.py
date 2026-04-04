@@ -10,7 +10,10 @@ from cachetools import TTLCache
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.core.script_generations.generate_script import ScriptBlockSource, generate_workflow_script_python_code
+from skyvern.core.script_generations.generate_script import (
+    ScriptBlockSource,
+    generate_workflow_script_python_code,
+)
 from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
@@ -147,10 +150,12 @@ async def generate_or_update_pending_workflow_script(
     script_id = context.script_id
     script = None
     if script_id:
-        script = await app.DATABASE.get_script(script_id=script_id, organization_id=organization_id)
+        script = await app.DATABASE.scripts.get_script(script_id=script_id, organization_id=organization_id)
 
     if not script:
-        script = await app.DATABASE.create_script(organization_id=organization_id, run_id=workflow_run.workflow_run_id)
+        script = await app.DATABASE.scripts.create_script(
+            organization_id=organization_id, run_id=workflow_run.workflow_run_id
+        )
         if context:
             context.script_id = script.script_id
             context.script_revision_id = script.script_revision_id
@@ -184,7 +189,7 @@ async def get_workflow_script(
     rendered_cache_key_value = ""
 
     try:
-        parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+        parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
             workflow_run_id=workflow_run.workflow_run_id,
         )
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
@@ -296,7 +301,7 @@ async def get_workflow_script_by_cache_key_value(
             return _workflow_script_cache[cache_key_tuple]
 
         # Cache miss - fetch from database
-        script, is_pinned = await app.DATABASE.get_workflow_script_by_cache_key_value(
+        script, is_pinned = await app.DATABASE.scripts.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             cache_key_value=cache_key_value,
@@ -311,7 +316,7 @@ async def get_workflow_script_by_cache_key_value(
 
         return script, is_pinned
 
-    return await app.DATABASE.get_workflow_script_by_cache_key_value(
+    return await app.DATABASE.scripts.get_workflow_script_by_cache_key_value(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         cache_key_value=cache_key_value,
@@ -331,7 +336,7 @@ async def get_latest_published_script(
     variants), this returns the script with the highest version number to ensure
     the most recently reviewed code is selected.
     """
-    workflow_scripts = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+    workflow_scripts = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
         statuses=[ScriptStatus.published],
@@ -344,7 +349,7 @@ async def get_latest_published_script(
     # TODO: add a bulk get_latest_script_versions() if this becomes a bottleneck.
     best: Script | None = None
     for ws in workflow_scripts:
-        script = await app.DATABASE.get_latest_script_version(
+        script = await app.DATABASE.scripts.get_latest_script_version(
             script_id=ws.script_id,
             organization_id=organization_id,
         )
@@ -362,7 +367,7 @@ async def _load_cached_script_block_sources(
     """
     cached_blocks: dict[str, ScriptBlockSource] = {}
 
-    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+    script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
         script_revision_id=script.script_revision_id,
         organization_id=organization_id,
     )
@@ -373,13 +378,13 @@ async def _load_cached_script_block_sources(
 
         code_str: str | None = None
         if script_block.script_file_id:
-            script_file = await app.DATABASE.get_script_file_by_id(
+            script_file = await app.DATABASE.scripts.get_script_file_by_id(
                 script_revision_id=script.script_revision_id,
                 file_id=script_block.script_file_id,
                 organization_id=organization_id,
             )
             if script_file and script_file.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                 if artifact:
                     file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
                     if isinstance(file_content, bytes):
@@ -456,7 +461,7 @@ async def generate_workflow_script(
             missing_labels=list(missing_labels),
         )
 
-        python_src = await generate_workflow_script_python_code(
+        codegen_result = await generate_workflow_script_python_code(
             file_name=codegen_input.file_name,
             workflow_run_request=codegen_input.workflow_run,
             workflow=codegen_input.workflow,
@@ -481,6 +486,10 @@ async def generate_workflow_script(
         )
         return
 
+    python_src = codegen_result.source_code
+    blocks_created = codegen_result.blocks_created
+    blocks_failed = codegen_result.blocks_failed
+
     generation_duration_ms = (time.monotonic() - generation_start) * 1000
     LOG.info(
         "Script generation completed",
@@ -489,7 +498,28 @@ async def generate_workflow_script(
         cache_key_value=rendered_cache_key_value,
         duration_ms=round(generation_duration_ms, 1),
         script_size_bytes=len(python_src.encode("utf-8")),
+        blocks_created=blocks_created,
+        blocks_failed=blocks_failed,
     )
+
+    if blocks_failed > 0 and blocks_created > 0:
+        LOG.warning(
+            "Partial script block creation failure — some blocks were not persisted",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            script_id=script.script_id,
+            blocks_created=blocks_created,
+            blocks_failed=blocks_failed,
+        )
+
+    # Guard: if every block creation failed, do not persist a zero-block script
+    if blocks_created == 0 and blocks_failed > 0:
+        LOG.error(
+            "All script block creations failed — skipping WorkflowScript creation",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            script_id=script.script_id,
+            blocks_failed=blocks_failed,
+        )
+        return
 
     # 3.5) Post-process: fix static actions inside for-loop blocks
     python_src = _fix_static_actions_in_for_loops(python_src)
@@ -539,7 +569,7 @@ async def generate_workflow_script(
     status = ScriptStatus.published
     if pending:
         status = ScriptStatus.pending
-        existing_pending_workflow_script = await app.DATABASE.get_workflow_script(
+        existing_pending_workflow_script = await app.DATABASE.scripts.get_workflow_script(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run.workflow_run_id,
@@ -547,7 +577,7 @@ async def generate_workflow_script(
         )
     if not existing_pending_workflow_script:
         # Record the workflow->script mapping for cache lookup
-        await app.DATABASE.create_workflow_script(
+        await app.DATABASE.scripts.create_workflow_script(
             organization_id=workflow.organization_id,
             script_id=script.script_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
@@ -956,6 +986,213 @@ def _patch_main_py(main_py_content: str, updated_blocks: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+async def _reconstruct_main_py_from_blocks(
+    base_main_py: str,
+    new_revision_id: str,
+    organization_id: str,
+    updated_blocks: dict[str, str],
+) -> str | None:
+    """Reconstruct main.py from the header + individual block files when _patch_main_py fails.
+
+    Takes the header (imports, models, workflow function) from the base main.py
+    and appends every block's code — both newly reviewed blocks and existing ones
+    carried forward from the base. Each block file was individually compile-verified,
+    so concatenation should produce valid Python.
+
+    Returns the reconstructed source, or None if reconstruction fails.
+    """
+    try:
+        # Extract the header: everything before the first @skyvern.cached decorator
+        lines = base_main_py.split("\n")
+        decorator_pattern = re.compile(r"^@skyvern\.cached\(\s*cache_key\s*=\s*['\"]([^'\"]+)['\"]\s*\)")
+        header_end = len(lines)
+        for i, line in enumerate(lines):
+            if decorator_pattern.match(line.strip()):
+                header_end = i
+                break
+        # Strip trailing blank lines from header
+        while header_end > 0 and not lines[header_end - 1].strip():
+            header_end -= 1
+        header = "\n".join(lines[:header_end])
+
+        # Collect all block code: updated blocks from the reviewer, plus existing
+        # blocks from the new revision's block files (which were either freshly
+        # uploaded or copied from the base revision)
+        block_codes: dict[str, str] = {}
+
+        # Load all block files for this revision from the DB
+        block_files = await app.DATABASE.scripts.get_script_files(
+            script_revision_id=new_revision_id,
+            organization_id=organization_id,
+        )
+        for f in block_files:
+            if not f.file_path.startswith("blocks/") or not f.artifact_id:
+                continue
+            # Extract label from path: "blocks/login.py" -> "login"
+            label = f.file_path.removeprefix("blocks/").removesuffix(".py").removesuffix(".skyvern")
+            if label in updated_blocks:
+                # Prefer the reviewer's version (it's compile-verified)
+                block_codes[label] = updated_blocks[label]
+            else:
+                # Load existing block content from S3
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(f.artifact_id, organization_id)
+                if artifact:
+                    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+                    if content:
+                        block_codes[label] = content.decode("utf-8") if isinstance(content, bytes) else content
+
+        # Also include any updated blocks that don't have block files yet (new blocks)
+        for label, code in updated_blocks.items():
+            if label not in block_codes:
+                block_codes[label] = code
+
+        if not block_codes:
+            LOG.warning("No block code found for reconstruction")
+            return None
+
+        # Assemble: header + all blocks with decorators
+        parts = [header, ""]
+        for label, code in block_codes.items():
+            code = code.rstrip("\n")
+            # Hoist any leading imports (same as _patch_main_py does)
+            imports, body = _split_imports(code)
+            if imports:
+                # Inject into header (crude but safe — duplicates are harmless)
+                for imp in imports:
+                    if imp not in header:
+                        parts.insert(1, imp)
+            # Add the block with its decorator if not already present
+            if not body.lstrip().startswith("@skyvern.cached"):
+                parts.extend(["", f"@skyvern.cached(cache_key = '{label}')", body])
+            else:
+                parts.extend(["", body])
+
+        reconstructed = "\n".join(parts) + "\n"
+        reconstructed = _fix_static_actions_in_for_loops(reconstructed)
+
+        # Final compile check
+        compile(reconstructed, "<reconstructed_main.py>", "exec")
+        LOG.info(
+            "Successfully reconstructed main.py from block files",
+            block_count=len(block_codes),
+            block_labels=sorted(block_codes.keys()),
+        )
+        return reconstructed
+    except SyntaxError as exc:
+        LOG.error(
+            "Reconstructed main.py has syntax error — code assembly issue",
+            failure_type="syntax_error",
+            error=str(exc),
+            lineno=exc.lineno,
+        )
+        return None
+    except Exception as exc:
+        LOG.exception(
+            "Failed to reconstruct main.py — infrastructure issue (S3/DB)",
+            failure_type="infra",
+            error=str(exc),
+        )
+        return None
+
+
+async def _llm_fix_broken_main_py(
+    broken_source: str,
+    syntax_error: SyntaxError,
+    organization_id: str,
+    max_attempts: int = 2,
+) -> str | None:
+    """Ask an LLM to fix a syntax error in main.py when mechanical reconstruction fails.
+
+    This is a last-resort fix for rare cases where _patch_main_py corrupts the script
+    AND reconstruction from block files also fails. The LLM sees the broken source +
+    error and makes a targeted syntax fix. Called infrequently, so cost is negligible.
+
+    Returns the fixed source, or None if the LLM can't fix it.
+    """
+    # Guard against sending very large scripts to the LLM — cap at 50KB
+    # (typical scripts are 2-12KB; anything larger suggests an accumulation bug)
+    max_source_bytes = 50_000
+    if len(broken_source.encode("utf-8")) > max_source_bytes:
+        LOG.warning(
+            "Skipping LLM fix — script too large",
+            source_bytes=len(broken_source.encode("utf-8")),
+            max_bytes=max_source_bytes,
+        )
+        return None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            error_context = (
+                f"Line {syntax_error.lineno}: {syntax_error.msg}" if syntax_error.lineno else str(syntax_error)
+            )
+            prompt = (
+                "The following Python script has a syntax error introduced during automated assembly. "
+                "Fix ONLY the syntax error. Do not change any logic, selectors, parameters, or function behavior. "
+                "Return the complete fixed Python script and nothing else.\n\n"
+                f"SYNTAX ERROR: {error_context}\n\n"
+                f"BROKEN SCRIPT:\n```python\n{broken_source}\n```"
+            )
+            response = await app.SCRIPT_REVIEWER_LLM_API_HANDLER(
+                prompt=prompt,
+                prompt_name="fix-broken-main-py",
+                step=None,
+                organization_id=organization_id,
+            )
+            # Extract code from response — log which extraction path fired
+            fixed_code: str | None = None
+            extraction_path = "none"
+            if isinstance(response, str):
+                fixed_code = response
+                extraction_path = "raw_string"
+            elif isinstance(response, dict):
+                for key in ("code", "fixed_code", "text"):
+                    if response.get(key):
+                        fixed_code = response[key]
+                        extraction_path = f"dict['{key}']"
+                        break
+                if not fixed_code:
+                    for k, v in response.items():
+                        if isinstance(v, str) and "async def " in v:
+                            fixed_code = v
+                            extraction_path = f"dict_scan['{k}']"
+                            break
+            if not fixed_code:
+                LOG.warning("LLM fix: no code in response", attempt=attempt, extraction_path=extraction_path)
+                continue
+            LOG.info("LLM fix: extracted code", attempt=attempt, extraction_path=extraction_path)
+
+            # Strip markdown code fences if present
+            if "```python" in fixed_code:
+                fixed_code = fixed_code.split("```python", 1)[1]
+                if "```" in fixed_code:
+                    fixed_code = fixed_code.split("```", 1)[0]
+            elif "```" in fixed_code:
+                fixed_code = fixed_code.split("```", 1)[1]
+                if "```" in fixed_code:
+                    fixed_code = fixed_code.split("```", 1)[0]
+            fixed_code = fixed_code.strip()
+
+            # Verify the fix compiles
+            compile(fixed_code, "<llm-fixed-main.py>", "exec")
+            LOG.info(
+                "LLM successfully fixed broken main.py",
+                attempt=attempt,
+                original_error=error_context,
+            )
+            return fixed_code
+        except SyntaxError as new_err:
+            LOG.warning(
+                "LLM fix still has syntax error",
+                attempt=attempt,
+                error=str(new_err),
+            )
+            # Update the error for the next attempt
+            syntax_error = new_err
+        except Exception:
+            LOG.exception("LLM fix attempt failed", attempt=attempt)
+    return None
+
+
 async def _find_main_py_content(script_id: str, organization_id: str, base_revision_id: str) -> str | None:
     """Find main.py content, preferring the base revision then falling back to v1.
 
@@ -965,13 +1202,13 @@ async def _find_main_py_content(script_id: str, organization_id: str, base_revis
     """
 
     async def _load_main_py_from_revision(revision_id: str) -> str | None:
-        files = await app.DATABASE.get_script_files(
+        files = await app.DATABASE.scripts.get_script_files(
             script_revision_id=revision_id,
             organization_id=organization_id,
         )
         for f in files:
             if f.file_path == "main.py" and f.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(f.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(f.artifact_id, organization_id)
                 if artifact:
                     content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
                     if content:
@@ -984,7 +1221,7 @@ async def _find_main_py_content(script_id: str, organization_id: str, base_revis
         return result
 
     # Fall back to v1 (bootstrapping: base was created before this fix)
-    v1_script = await app.DATABASE.get_script(
+    v1_script = await app.DATABASE.scripts.get_script(
         script_id=script_id,
         organization_id=organization_id,
         version=1,
@@ -1022,7 +1259,7 @@ async def create_script_version_from_review(
         # _trigger_script_reviewer() already gates on is_script_pinned(), but
         # that check can be bypassed when the skyvern context is missing.
         # Guard here so no code path can mutate a pinned script.
-        if await app.DATABASE.is_script_pinned(
+        if await app.DATABASE.scripts.is_script_pinned(
             organization_id=organization_id,
             script_id=base_script.script_id,
         ):
@@ -1035,7 +1272,7 @@ async def create_script_version_from_review(
             return None
 
         # Create a new script version
-        new_script = await app.DATABASE.create_script(
+        new_script = await app.DATABASE.scripts.create_script(
             organization_id=organization_id,
             script_id=base_script.script_id,
             version=base_script.version + 1,
@@ -1043,7 +1280,7 @@ async def create_script_version_from_review(
         )
 
         # Copy existing script blocks from the base revision
-        existing_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+        existing_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
             script_revision_id=base_script.script_revision_id,
             organization_id=organization_id,
         )
@@ -1066,7 +1303,7 @@ async def create_script_version_from_review(
                     file_path=file_path,
                     data=content_bytes,
                 )
-                new_file = await app.DATABASE.create_script_file(
+                new_file = await app.DATABASE.scripts.create_script_file(
                     script_revision_id=new_script.script_revision_id,
                     script_id=new_script.script_id,
                     organization_id=organization_id,
@@ -1090,7 +1327,7 @@ async def create_script_version_from_review(
                 )
 
                 # Create script block entry pointing to the new file
-                await app.DATABASE.create_script_block(
+                await app.DATABASE.scripts.create_script_block(
                     organization_id=organization_id,
                     script_id=new_script.script_id,
                     script_revision_id=new_script.script_revision_id,
@@ -1103,7 +1340,7 @@ async def create_script_version_from_review(
                 )
             else:
                 # Copy existing block as-is
-                await app.DATABASE.create_script_block(
+                await app.DATABASE.scripts.create_script_block(
                     organization_id=organization_id,
                     script_id=new_script.script_id,
                     script_revision_id=new_script.script_revision_id,
@@ -1126,6 +1363,54 @@ async def create_script_version_from_review(
         if main_py_content:
             patched_main = _patch_main_py(main_py_content, updated_blocks)
             patched_main = _fix_static_actions_in_for_loops(patched_main)
+
+            # Validate the patched main.py compiles. If the splice corrupted it,
+            # reconstruct from individual block files (which are all compile-verified
+            # by the reviewer) instead of persisting a broken script.
+            try:
+                compile(patched_main, "<patched_main.py>", "exec")
+            except SyntaxError as exc:
+                LOG.warning(
+                    "Patched main.py has syntax error — reconstructing from block files",
+                    script_id=new_script.script_id,
+                    error=str(exc),
+                    lineno=exc.lineno,
+                    organization_id=organization_id,
+                )
+                reconstructed = await _reconstruct_main_py_from_blocks(
+                    base_main_py=main_py_content,
+                    new_revision_id=new_script.script_revision_id,
+                    organization_id=organization_id,
+                    updated_blocks=updated_blocks,
+                )
+                if reconstructed:
+                    patched_main = reconstructed
+                else:
+                    # Reconstruction failed too — ask an LLM to fix the syntax error.
+                    # This is rare and cheap; the LLM sees the full script + error.
+                    llm_fixed = await _llm_fix_broken_main_py(
+                        broken_source=patched_main,
+                        syntax_error=exc,
+                        organization_id=organization_id,
+                    )
+                    if llm_fixed:
+                        patched_main = llm_fixed
+                    else:
+                        # All recovery attempts failed. Delete the workflow script
+                        # mapping so the next run falls back to AI and regenerates
+                        # a completely fresh script.
+                        LOG.error(
+                            "All main.py recovery attempts failed — deleting workflow script mapping",
+                            script_id=new_script.script_id,
+                            organization_id=organization_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                        )
+                        await app.DATABASE.scripts.delete_workflow_scripts_by_permanent_id(
+                            organization_id=organization_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                        )
+                        return new_script
+
             patched_bytes = patched_main.encode("utf-8")
             patched_hash = hashlib.sha256(patched_bytes).hexdigest()
 
@@ -1136,7 +1421,7 @@ async def create_script_version_from_review(
                 file_path="main.py",
                 data=patched_bytes,
             )
-            await app.DATABASE.create_script_file(
+            await app.DATABASE.scripts.create_script_file(
                 script_revision_id=new_script.script_revision_id,
                 script_id=new_script.script_id,
                 organization_id=organization_id,
@@ -1158,19 +1443,19 @@ async def create_script_version_from_review(
 
             # Copy non-block files (e.g., .skyvern metadata) from the base revision
             # or v1 — whichever has the full file set
-            source_files = await app.DATABASE.get_script_files(
+            source_files = await app.DATABASE.scripts.get_script_files(
                 script_revision_id=base_script.script_revision_id,
                 organization_id=organization_id,
             )
             if not any(f.file_path != "main.py" and not f.file_path.startswith("blocks/") for f in source_files):
                 # Base revision has no non-block files, fall back to v1
-                v1_script = await app.DATABASE.get_script(
+                v1_script = await app.DATABASE.scripts.get_script(
                     script_id=base_script.script_id,
                     organization_id=organization_id,
                     version=1,
                 )
                 if v1_script:
-                    source_files = await app.DATABASE.get_script_files(
+                    source_files = await app.DATABASE.scripts.get_script_files(
                         script_revision_id=v1_script.script_revision_id,
                         organization_id=organization_id,
                     )
@@ -1180,7 +1465,7 @@ async def create_script_version_from_review(
                 # Skip main.py (already patched) and updated block files (already created)
                 if f.file_path == "main.py" or f.file_path in updated_block_file_paths:
                     continue
-                await app.DATABASE.create_script_file(
+                await app.DATABASE.scripts.create_script_file(
                     script_revision_id=new_script.script_revision_id,
                     script_id=new_script.script_id,
                     organization_id=organization_id,
@@ -1208,7 +1493,7 @@ async def create_script_version_from_review(
             )
         else:
             # No workflow run — look up the existing cache key value from the base script
-            existing_ws = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+            existing_ws = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
                 statuses=[ScriptStatus.published],
@@ -1219,7 +1504,7 @@ async def create_script_version_from_review(
                     rendered_cache_key_value = ws.cache_key_value
                     break
 
-        await app.DATABASE.create_workflow_script(
+        await app.DATABASE.scripts.create_workflow_script(
             organization_id=organization_id,
             script_id=new_script.script_id,
             workflow_permanent_id=workflow_permanent_id,

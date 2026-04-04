@@ -163,7 +163,7 @@ class TestTriggerScriptReviewerCap:
         self.mock_cache.get_lock = MagicMock(return_value=mock_lock)
         # Mock is_script_pinned to return False (not pinned) so tests reach the cap logic
         self._pin_patcher = patch(
-            "skyvern.forge.sdk.workflow.service.app.DATABASE.is_script_pinned",
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.scripts.is_script_pinned",
             new_callable=AsyncMock,
             return_value=False,
         )

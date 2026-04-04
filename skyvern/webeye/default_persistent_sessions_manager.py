@@ -10,7 +10,7 @@ import structlog
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import BrowserSessionClosed, BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
@@ -45,7 +45,7 @@ async def validate_session_for_renewal(
     Validate a specific browser session for renewal. Otherwise raise.
     """
 
-    browser_session = await database.get_persistent_browser_session(
+    browser_session = await database.browser_sessions.get_persistent_browser_session(
         session_id=session_id,
         organization_id=organization_id,
     )
@@ -117,7 +117,7 @@ async def renew_session(database: AgentDB, session_id: str, organization_id: str
         minutes_diff = floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60)
         new_timeout_minutes = current_timeout_minutes + minutes_diff
 
-        browser_session = await database.update_persistent_browser_session(
+        browser_session = await database.browser_sessions.update_persistent_browser_session(
             session_id,
             organization_id=organization_id,
             timeout_minutes=new_timeout_minutes,
@@ -138,7 +138,7 @@ async def renew_session(database: AgentDB, session_id: str, organization_id: str
 async def update_status(
     db: AgentDB, session_id: str, organization_id: str, status: str
 ) -> PersistentBrowserSession | None:
-    persistent_browser_session = await db.get_persistent_browser_session(session_id, organization_id)
+    persistent_browser_session = await db.browser_sessions.get_persistent_browser_session(session_id, organization_id)
 
     if not persistent_browser_session:
         LOG.warning(
@@ -167,7 +167,7 @@ async def update_status(
     )
 
     completed_at = datetime.now(timezone.utc) if is_final_status(status) else None
-    persistent_browser_session = await db.update_persistent_browser_session(
+    persistent_browser_session = await db.browser_sessions.update_persistent_browser_session(
         session_id,
         status=status,
         organization_id=organization_id,
@@ -215,12 +215,15 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         LOG.info("Begin browser session", browser_session_id=browser_session_id)
 
-        persistent_browser_session = await self.database.get_persistent_browser_session(
+        persistent_browser_session = await self.database.browser_sessions.get_persistent_browser_session(
             browser_session_id, organization_id
         )
 
         if persistent_browser_session is None:
             raise Exception(f"Persistent browser session not found for {browser_session_id}")
+
+        if is_final_status(persistent_browser_session.status):
+            raise BrowserSessionClosed(browser_session_id)
 
         await self.occupy_browser_session(
             session_id=browser_session_id,
@@ -243,11 +246,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         self, runnable_id: str, organization_id: str
     ) -> PersistentBrowserSession | None:
         """Get a specific browser session by runnable ID."""
-        return await self.database.get_persistent_browser_session_by_runnable_id(runnable_id, organization_id)
+        return await self.database.browser_sessions.get_persistent_browser_session_by_runnable_id(
+            runnable_id, organization_id
+        )
 
     async def get_active_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active sessions for an organization."""
-        return await self.database.get_active_persistent_browser_sessions(organization_id)
+        return await self.database.browser_sessions.get_active_persistent_browser_sessions(organization_id)
 
     async def get_browser_state(self, session_id: str, organization_id: str | None = None) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
@@ -260,7 +265,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
-        return await self.database.get_persistent_browser_session(session_id, organization_id)
+        return await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
 
     async def create_session(
         self,
@@ -280,7 +285,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             "Creating new browser session",
             organization_id=organization_id,
         )
-        session = await self.database.create_persistent_browser_session(
+        session = await self.database.browser_sessions.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
@@ -347,7 +352,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 await browser_state.close()
                 return
             # Set started_at so renewal knows the browser is live
-            await self.database.update_persistent_browser_session(
+            await self.database.browser_sessions.update_persistent_browser_session(
                 session_id,
                 organization_id=organization_id,
                 started_at=datetime.now(timezone.utc),
@@ -372,7 +377,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         organization_id: str,
     ) -> None:
         """Occupy a specific browser session."""
-        await self.database.occupy_persistent_browser_session(
+        await self.database.browser_sessions.occupy_persistent_browser_session(
             session_id=session_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
@@ -407,7 +412,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
     async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific browser session."""
-        await self.database.release_persistent_browser_session(session_id, organization_id)
+        await self.database.browser_sessions.release_persistent_browser_session(session_id, organization_id)
 
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
@@ -488,13 +493,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 session_id=browser_session_id,
             )
 
-        await self.database.close_persistent_browser_session(browser_session_id, organization_id)
+        await self.database.browser_sessions.close_persistent_browser_session(browser_session_id, organization_id)
         if settings.BROWSER_STREAMING_MODE == "cdp":
-            await self.database.archive_browser_session_address(browser_session_id, organization_id)
+            await self.database.browser_sessions.archive_browser_session_address(browser_session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""
-        browser_sessions = await self.database.get_active_persistent_browser_sessions(organization_id)
+        browser_sessions = await self.database.browser_sessions.get_active_persistent_browser_sessions(organization_id)
         for browser_session in browser_sessions:
             await self.close_session(organization_id, browser_session.persistent_browser_session_id)
 
@@ -502,17 +507,17 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """Close sessions left active by a previous process."""
         if settings.BROWSER_STREAMING_MODE != "cdp":
             return
-        stale_sessions = await self.database.get_uncompleted_persistent_browser_sessions()
+        stale_sessions = await self.database.browser_sessions.get_uncompleted_persistent_browser_sessions()
         for db_session in stale_sessions:
             LOG.info(
                 "Closing stale browser session from previous run",
                 session_id=db_session.persistent_browser_session_id,
                 organization_id=db_session.organization_id,
             )
-            await self.database.close_persistent_browser_session(
+            await self.database.browser_sessions.close_persistent_browser_session(
                 db_session.persistent_browser_session_id, db_session.organization_id
             )
-            await self.database.archive_browser_session_address(
+            await self.database.browser_sessions.archive_browser_session_address(
                 db_session.persistent_browser_session_id, db_session.organization_id
             )
 
@@ -521,7 +526,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """Close all browser sessions across all organizations."""
         LOG.info("Closing PersistentSessionsManager")
         if cls.instance:
-            active_sessions = await cls.instance.database.get_all_active_persistent_browser_sessions()
+            active_sessions = await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
             for db_session in active_sessions:
                 await cls.instance.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
         LOG.info("PersistentSessionsManager is closed")

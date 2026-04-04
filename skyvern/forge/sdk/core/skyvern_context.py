@@ -45,6 +45,7 @@ class SkyvernContext:
     use_artifact_bundling: bool = False
 
     # script run context
+    code_version: int | None = None
     script_id: str | None = None
     script_revision_id: str | None = None
     action_order: int = 0

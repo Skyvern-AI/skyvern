@@ -115,7 +115,7 @@ async def _bootstrap_sqlite() -> None:
         )
 
     organization = await ensure_local_org()
-    existing_token = await db.get_valid_org_auth_token(organization.organization_id, "api")
+    existing_token = await db.organizations.get_valid_org_auth_token(organization.organization_id, "api")
     if existing_token is not None:
         LOG.info("SQLite database already bootstrapped", organization_id=organization.organization_id)
         return

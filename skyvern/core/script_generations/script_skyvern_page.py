@@ -82,7 +82,7 @@ class ScriptSkyvernPage(SkyvernPage):
     async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:
         context = skyvern_context.current()
         if context and context.workflow_run_id and context.organization_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
             )
             if workflow_run:
@@ -101,7 +101,7 @@ class ScriptSkyvernPage(SkyvernPage):
     async def _get_browser_state(cls) -> BrowserState | None:
         context = skyvern_context.current()
         if context and context.workflow_run_id and context.organization_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
             )
             if workflow_run:
@@ -153,7 +153,7 @@ class ScriptSkyvernPage(SkyvernPage):
         organization_id = context.organization_id
         download_timeout = BROWSER_DOWNLOAD_TIMEOUT
         if context.task_id:
-            task = await app.DATABASE.get_task(context.task_id, organization_id=organization_id)
+            task = await app.DATABASE.tasks.get_task(context.task_id, organization_id=organization_id)
             if task and task.download_timeout:
                 download_timeout = task.download_timeout
         await check_downloading_files_and_wait_for_download_to_complete(
@@ -392,7 +392,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         except Exception:
             LOG.warning("Failed to generate action reasoning, using fallback", action_type=action_type)
-        await app.DATABASE.update_action_reasoning(
+        await app.DATABASE.workflow_params.update_action_reasoning(
             organization_id=organization_id,
             action_id=action_id,
             reasoning=reasoning,
@@ -496,7 +496,7 @@ class ScriptSkyvernPage(SkyvernPage):
                     created_by="script",
                 )
 
-            created_action = await app.DATABASE.create_action(action)
+            created_action = await app.DATABASE.workflow_params.create_action(action)
             # Skip LLM reasoning in script mode — use static string instead.
             # Build a descriptive label from the selector for the timeline.
             if context and context.script_mode:
@@ -521,7 +521,7 @@ class ScriptSkyvernPage(SkyvernPage):
                     else:
                         label = selector[:60]
                 reasoning = f"Script execution: {label}" if label else "Script execution"
-                await app.DATABASE.update_action_reasoning(
+                await app.DATABASE.workflow_params.update_action_reasoning(
                     organization_id=str(context.organization_id),
                     action_id=str(created_action.action_id),
                     reasoning=reasoning,
@@ -586,7 +586,7 @@ class ScriptSkyvernPage(SkyvernPage):
             screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
 
             if screenshot:
-                step = await app.DATABASE.get_step(
+                step = await app.DATABASE.tasks.get_step(
                     context.step_id,
                     organization_id=context.organization_id,
                 )
@@ -642,7 +642,7 @@ class ScriptSkyvernPage(SkyvernPage):
             html = await skyvern_frame.get_content()
 
             if html:
-                step = await app.DATABASE.get_step(
+                step = await app.DATABASE.tasks.get_step(
                     context.step_id,
                     organization_id=context.organization_id,
                 )
@@ -690,7 +690,7 @@ class ScriptSkyvernPage(SkyvernPage):
             screenshot = await browser_state.take_fullpage_screenshot()
 
             if screenshot:
-                step = await app.DATABASE.get_step(
+                step = await app.DATABASE.tasks.get_step(
                     context.step_id,
                     organization_id=context.organization_id,
                 )
@@ -981,8 +981,8 @@ class ScriptSkyvernPage(SkyvernPage):
             await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
-        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
-        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
         if task and step:
             solve_captcha_handler = ActionHandler._handled_action_types[ActionType.SOLVE_CAPTCHA]
             action = SolveCaptchaAction(
@@ -1014,15 +1014,15 @@ class ScriptSkyvernPage(SkyvernPage):
             if context.script_mode:
                 print("  ⏭ Skipping complete() verification (--no-verify)")
             return
-        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
-        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
         if task and step:
             # CRITICAL: Update step.output with actions_and_results BEFORE validation
             # This ensures complete_verify() can access action history (including download info)
             # when checking if the goal was achieved
             await self._update_step_output_before_complete(context)
             # Refresh step to get updated output for validation
-            step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+            step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
             if not step:
                 return
 
@@ -1062,8 +1062,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 msg += ": " + "; ".join(errors)
             raise ScriptTerminationException(msg)
 
-        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
-        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
         if task and step:
             action = TerminateAction(
                 organization_id=context.organization_id,
@@ -1116,7 +1116,7 @@ class ScriptSkyvernPage(SkyvernPage):
             errors=errors,
         )
 
-        await app.DATABASE.update_step(
+        await app.DATABASE.tasks.update_step(
             step_id=context.step_id,
             task_id=context.task_id,
             organization_id=context.organization_id,

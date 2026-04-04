@@ -163,15 +163,15 @@ async def send_totp_code(
     )
     # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
     if data.task_id:
-        task = await app.DATABASE.get_task(data.task_id, curr_org.organization_id)
+        task = await app.DATABASE.tasks.get_task(data.task_id, curr_org.organization_id)
         if not task:
             raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
     if data.workflow_id:
-        workflow = await app.DATABASE.get_workflow(data.workflow_id, curr_org.organization_id)
+        workflow = await app.DATABASE.workflows.get_workflow(data.workflow_id, curr_org.organization_id)
         if not workflow:
             raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
     if data.workflow_run_id:
-        workflow_run = await app.DATABASE.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
@@ -191,7 +191,7 @@ async def send_totp_code(
         )
         raise HTTPException(status_code=400, detail="Failed to parse otp login")
 
-    return await app.DATABASE.create_otp_code(
+    return await app.DATABASE.otp.create_otp_code(
         organization_id=curr_org.organization_id,
         totp_identifier=data.totp_identifier,
         content=data.content,
@@ -245,7 +245,7 @@ async def get_totp_codes(
         description="Maximum number of codes to return.",
     ),
 ) -> list[TOTPCode]:
-    codes = await app.DATABASE.get_recent_otp_codes(
+    codes = await app.DATABASE.otp.get_recent_otp_codes(
         organization_id=curr_org.organization_id,
         limit=limit,
         valid_lifespan_minutes=None,
@@ -431,7 +431,7 @@ async def rename_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential = await app.DATABASE.get_credential(
+    credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
     )
     if not credential:
@@ -448,7 +448,7 @@ async def rename_credential(
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
         update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
-    updated = await app.DATABASE.update_credential(**update_kwargs)
+    updated = await app.DATABASE.credentials.update_credential(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
@@ -589,7 +589,7 @@ async def test_login(
             organization_id=organization_id,
         )
         try:
-            await app.DATABASE.delete_credential(
+            await app.DATABASE.credentials.delete_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
             )
@@ -665,7 +665,9 @@ async def test_credential(
     organization_id = current_org.organization_id
 
     # Validate credential exists and is a password type
-    credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
+    credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id, organization_id=organization_id
+    )
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential {credential_id} not found")
     if credential.credential_type != CredentialType.PASSWORD:
@@ -677,7 +679,7 @@ async def test_credential(
     # Check if the credential already has a browser profile
     existing_browser_profile_id = credential.browser_profile_id
     if existing_browser_profile_id:
-        profile = await app.DATABASE.get_browser_profile(
+        profile = await app.DATABASE.browser_sessions.get_browser_profile(
             profile_id=existing_browser_profile_id,
             organization_id=organization_id,
         )
@@ -889,11 +891,15 @@ async def get_test_credential_status(
 ) -> TestCredentialStatusResponse:
     organization_id = current_org.organization_id
 
-    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
     if not workflow_run:
         raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
 
-    credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
+    credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id, organization_id=organization_id
+    )
 
     status = workflow_run.status
     status_str = str(status)
@@ -1010,12 +1016,12 @@ async def cancel_credential_test(
     # Only clean up temporary credentials after successful cancellation.
     # The background task may also try to delete — that's fine, it handles NotFound gracefully.
     try:
-        credential = await app.DATABASE.get_credential(
+        credential = await app.DATABASE.credentials.get_credential(
             credential_id=credential_id,
             organization_id=organization_id,
         )
         if credential and credential.name.startswith("_test_login_"):
-            await app.DATABASE.delete_credential(
+            await app.DATABASE.credentials.delete_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
             )
@@ -1050,7 +1056,7 @@ async def _create_browser_profile_after_workflow(
 
     try:
         for _ in range(max_polls):
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id, organization_id=organization_id
             )
             if not workflow_run:
@@ -1076,7 +1082,7 @@ async def _create_browser_profile_after_workflow(
                 # Clean up temporary credentials created by test-login
                 if credential_name.startswith("_test_login_"):
                     try:
-                        await app.DATABASE.delete_credential(
+                        await app.DATABASE.credentials.delete_credential(
                             credential_id=credential_id,
                             organization_id=organization_id,
                         )
@@ -1126,7 +1132,7 @@ async def _create_browser_profile_after_workflow(
 
             # Create the browser profile in DB
             profile_name = f"Profile - {credential_name} ({credential_id})"
-            profile = await app.DATABASE.create_browser_profile(
+            profile = await app.DATABASE.browser_sessions.create_browser_profile(
                 organization_id=organization_id,
                 name=profile_name,
                 description=f"Browser profile from credential test for {credential_name}",
@@ -1140,7 +1146,7 @@ async def _create_browser_profile_after_workflow(
             )
 
             # Link browser profile to credential
-            await app.DATABASE.update_credential(
+            await app.DATABASE.credentials.update_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
                 browser_profile_id=profile.browser_profile_id,
@@ -1163,7 +1169,7 @@ async def _create_browser_profile_after_workflow(
         # Clean up temporary credentials on poll timeout
         if credential_name.startswith("_test_login_"):
             try:
-                await app.DATABASE.delete_credential(
+                await app.DATABASE.credentials.delete_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
                 )
@@ -1182,7 +1188,7 @@ async def _create_browser_profile_after_workflow(
         # Clean up temporary credentials on unexpected error
         if credential_name.startswith("_test_login_"):
             try:
-                await app.DATABASE.delete_credential(
+                await app.DATABASE.credentials.delete_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
                 )
@@ -1233,7 +1239,7 @@ async def update_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    existing_credential = await app.DATABASE.get_credential(
+    existing_credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
     )
     if not existing_credential:
@@ -1308,7 +1314,7 @@ async def delete_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
-    credential = await app.DATABASE.get_credential(
+    credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
     )
     if not credential:
@@ -1381,7 +1387,7 @@ async def get_credential(
     non-sensitive fields are included in the response. See the module
     docstring for the full security invariant.
     """
-    credential = await app.DATABASE.get_credential(
+    credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
     )
     if not credential:
@@ -1441,7 +1447,7 @@ async def get_credentials(
     SECURITY: Like ``get_credential``, this endpoint never returns raw secret
     material. See the module docstring for the full security invariant.
     """
-    credentials = await app.DATABASE.get_credentials(
+    credentials = await app.DATABASE.credentials.get_credentials(
         current_org.organization_id,
         page=page,
         page_size=page_size,
@@ -1469,7 +1475,7 @@ async def get_onepassword_token(
     Get the current OnePassword service account token for the organization.
     """
     try:
-        auth_token = await app.DATABASE.get_valid_org_auth_token(
+        auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.onepassword_service_account.value,
         )
@@ -1520,13 +1526,13 @@ async def update_onepassword_token(
     """
     try:
         # Invalidate any existing valid OnePassword tokens for this organization
-        await app.DATABASE.invalidate_org_auth_tokens(
+        await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.onepassword_service_account,
         )
 
         # Create the new token
-        auth_token = await app.DATABASE.create_org_auth_token(
+        auth_token = await app.DATABASE.organizations.create_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.onepassword_service_account,
             token=data.token,
@@ -1586,7 +1592,7 @@ async def get_bitwarden_credential(
     Get the current Bitwarden credential for the organization.
     """
     try:
-        auth_token = await app.DATABASE.get_valid_org_auth_token(
+        auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.bitwarden_credential.value,
         )
@@ -1685,7 +1691,7 @@ async def get_azure_client_secret_credential(
     Get the current Azure Client Secret Credential for the organization.
     """
     try:
-        auth_token = await app.DATABASE.get_valid_org_auth_token(
+        auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
@@ -1736,13 +1742,13 @@ async def update_azure_client_secret_credential(
     """
     try:
         # Invalidate any existing valid Azure Client Secret Credential for this organization
-        await app.DATABASE.invalidate_org_auth_tokens(
+        await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
         )
 
         # Create the new Azure token
-        auth_token = await app.DATABASE.create_org_auth_token(
+        auth_token = await app.DATABASE.organizations.create_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
             token=request.credential,
@@ -1788,7 +1794,7 @@ async def get_custom_credential_service_config(
     Get the current custom credential service configuration for the organization.
     """
     try:
-        auth_token = await app.DATABASE.get_valid_org_auth_token(
+        auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.custom_credential_service.value,
         )
@@ -1839,7 +1845,7 @@ async def update_custom_credential_service_config(
     """
     try:
         # Invalidate any existing valid custom credential service configuration for this organization
-        await app.DATABASE.invalidate_org_auth_tokens(
+        await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.custom_credential_service,
         )
@@ -1848,7 +1854,7 @@ async def update_custom_credential_service_config(
         config_json = json.dumps(request.config.model_dump())
 
         # Create the new configuration
-        auth_token = await app.DATABASE.create_org_auth_token(
+        auth_token = await app.DATABASE.organizations.create_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.custom_credential_service,
             token=config_json,
