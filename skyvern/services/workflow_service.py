@@ -144,6 +144,7 @@ async def get_workflow_run_response(
         app_url=app_url,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
+        run_with=workflow_run.run_with,
         browser_profile_id=workflow_run.browser_profile_id,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,
