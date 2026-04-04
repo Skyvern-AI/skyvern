@@ -1091,40 +1091,36 @@ class ScriptReviewer:
         script_revision_id: str | None,
         block_label: str,
     ) -> str | None:
-        """Load the current cached code for a block from the database."""
+        """Load the current cached code for a block by extracting it from main.py.
+
+        main.py is the single source of truth for all cached block functions.
+        Each block is identified by its @skyvern.cached(cache_key='<label>') decorator.
+        """
         if not script_revision_id:
             return None
 
+        return await self._extract_block_from_main_py(
+            organization_id=organization_id,
+            script_revision_id=script_revision_id,
+            block_label=block_label,
+        )
+
+    async def _extract_block_from_main_py(
+        self,
+        organization_id: str,
+        script_revision_id: str,
+        block_label: str,
+    ) -> str | None:
+        """Extract a block function from main.py when no separate block file exists."""
+        from skyvern.services.workflow_script_service import extract_single_cached_block, load_main_py_content
+
         try:
-            script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
-                script_revision_id=script_revision_id,
-                organization_id=organization_id,
-            )
-            for sb in script_blocks:
-                if sb.script_block_label == block_label and sb.script_file_id:
-                    # Load the code from the script file
-                    script_file = await app.DATABASE.scripts.get_script_file_by_id(
-                        script_revision_id=script_revision_id,
-                        file_id=sb.script_file_id,
-                        organization_id=organization_id,
-                    )
-                    if script_file and script_file.artifact_id:
-                        artifact = await app.DATABASE.artifacts.get_artifact_by_id(
-                            artifact_id=script_file.artifact_id,
-                            organization_id=organization_id,
-                        )
-                        if artifact:
-                            file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-                            if isinstance(file_content, bytes):
-                                return file_content.decode("utf-8")
-                            elif isinstance(file_content, str):
-                                return file_content
+            content = await load_main_py_content(script_revision_id, organization_id)
+            if not content:
+                return None
+            return extract_single_cached_block(content, block_label)
         except Exception:
-            LOG.exception(
-                "ScriptReviewer: failed to load block code",
-                block_label=block_label,
-                script_revision_id=script_revision_id,
-            )
+            LOG.warning("Failed to extract block from main.py", block_label=block_label, exc_info=True)
         return None
 
     async def _load_all_block_codes(
@@ -1132,41 +1128,22 @@ class ScriptReviewer:
         organization_id: str,
         script_revision_id: str | None,
     ) -> dict[str, str]:
-        """Load code for all blocks in a script revision.
+        """Load code for all blocks by extracting from main.py.
 
-        Returns {block_label: code} for blocks that have code.
+        Returns {block_label: code} for all @skyvern.cached functions in main.py.
         """
+        from skyvern.services.workflow_script_service import extract_cached_blocks_from_source, load_main_py_content
+
         if not script_revision_id:
             return {}
         try:
-            script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
-                script_revision_id=script_revision_id,
-                organization_id=organization_id,
-            )
-            result: dict[str, str] = {}
-            for sb in script_blocks:
-                if not sb.script_file_id:
-                    continue
-                script_file = await app.DATABASE.scripts.get_script_file_by_id(
-                    script_revision_id=script_revision_id,
-                    file_id=sb.script_file_id,
-                    organization_id=organization_id,
-                )
-                if script_file and script_file.artifact_id:
-                    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
-                        artifact_id=script_file.artifact_id,
-                        organization_id=organization_id,
-                    )
-                    if artifact:
-                        file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-                        if isinstance(file_content, bytes):
-                            result[sb.script_block_label] = file_content.decode("utf-8")
-                        elif isinstance(file_content, str):
-                            result[sb.script_block_label] = file_content
-            return result
+            content = await load_main_py_content(script_revision_id, organization_id)
+            if not content:
+                return {}
+            return extract_cached_blocks_from_source(content)
         except Exception:
             LOG.exception(
-                "ScriptReviewer: failed to load all block codes",
+                "ScriptReviewer: failed to load all block codes from main.py",
                 script_revision_id=script_revision_id,
             )
             return {}
@@ -2148,11 +2125,6 @@ class ScriptReviewer:
 
     # Regex for email addresses in text_patterns (PII that should not be in cached scripts)
     _EMAIL_RE: re.Pattern[str] = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-
-    # Regex to extract text_patterns dict values from page.classify() calls.
-    # Matches: text_patterns={"key": "value with PII", ...}
-    # Uses a simple approach: find text_patterns={, then extract all string values.
-    _TEXT_PATTERN_VALUE_RE: re.Pattern[str] = re.compile(r"""["']([^"']{10,})["']""")
 
     # Regex for :has-text("X") where X is very short (1-2 chars) — likely hardcoded run data
     _SHORT_HAS_TEXT_RE: re.Pattern[str] = re.compile(r""":has-text\(\s*['"](.{1,2})['"]\s*\)""")

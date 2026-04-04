@@ -42,7 +42,10 @@ from skyvern.schemas.scripts import (
 )
 from skyvern.services import script_service, workflow_script_service
 from skyvern.services.script_reviewer import ScriptReviewer, store_review_artifacts
-from skyvern.services.workflow_script_service import create_script_version_from_review
+from skyvern.services.workflow_script_service import (
+    create_script_version_from_review,
+    extract_cached_blocks_from_source,
+)
 
 LOG = structlog.get_logger()
 
@@ -102,18 +105,33 @@ async def get_script_blocks_response(
         return ScriptBlocksResponse(blocks={}, main_script=main_script, script_id=script_id, version=version)
 
     result: dict[str, str] = {}
+    main_py_block_codes: dict[str, str] | None = None
 
     # TODO(jdo): make concurrent to speed up
     for script_block in script_blocks:
         script_file_id = script_block.script_file_id
 
         if not script_file_id:
+            # Reviewer-created blocks have no script_file_id — fall back to
+            # extracting the block code from main.py (lazy-loaded once).
+            block_label = script_block.script_block_label
+            if main_py_block_codes is None:
+                content = await _load_main_script_content(
+                    organization_id=organization_id,
+                    script_revision_id=script_revision_id,
+                )
+                main_py_block_codes = extract_cached_blocks_from_source(content) if content else {}
+
+            if block_label in main_py_block_codes:
+                result[block_label] = main_py_block_codes[block_label]
+                continue
+
             LOG.info(
-                "No script file ID found for script block",
+                "No script file ID found for script block and block not in main.py",
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
                 script_revision_id=script_revision_id,
-                block_label=script_block.script_block_label,
+                block_label=block_label,
             )
             continue
 

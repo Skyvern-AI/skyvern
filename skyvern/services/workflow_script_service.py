@@ -26,6 +26,76 @@ from skyvern.services import script_service
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 
+# Shared regex for parsing @skyvern.cached decorator lines in main.py source.
+_CACHED_DECORATOR_RE = re.compile(
+    r"^@skyvern\.cached\(\s*cache_key\s*=\s*['\"]([^'\"]+)['\"]\s*\)",
+    re.MULTILINE,
+)
+
+
+def extract_cached_blocks_from_source(content: str) -> dict[str, str]:
+    """Parse all @skyvern.cached blocks from Python source.
+
+    Returns {block_label: code} for every block found. Each value includes
+    the decorator line through to the start of the next decorator (or EOF).
+    """
+    matches = list(_CACHED_DECORATOR_RE.finditer(content))
+    result: dict[str, str] = {}
+    for idx, match in enumerate(matches):
+        label = match.group(1)
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+        block_code = content[start:end].rstrip()
+        if block_code:
+            result[label] = block_code
+    return result
+
+
+def extract_single_cached_block(content: str, block_label: str) -> str | None:
+    """Extract a single @skyvern.cached block by label from Python source."""
+    pattern = re.compile(
+        rf"^@skyvern\.cached\(\s*cache_key\s*=\s*['\"]{re.escape(block_label)}['\"]\s*\)",
+        re.MULTILINE,
+    )
+    match = pattern.search(content)
+    if not match:
+        return None
+    start = match.start()
+    next_decorator = _CACHED_DECORATOR_RE.search(content[match.end() :])
+    end = match.end() + next_decorator.start() if next_decorator else len(content)
+    block_code = content[start:end].rstrip()
+    return block_code if block_code else None
+
+
+async def load_main_py_content(
+    script_revision_id: str,
+    organization_id: str,
+) -> str | None:
+    """Load and decode main.py content from S3 for a script revision."""
+    try:
+        script_files = await app.DATABASE.scripts.get_script_files(
+            script_revision_id=script_revision_id,
+            organization_id=organization_id,
+        )
+        for f in script_files:
+            if f.file_path == "main.py" and f.artifact_id:
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(f.artifact_id, organization_id)
+                if not artifact:
+                    return None
+                raw_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+                if isinstance(raw_content, bytes):
+                    return raw_content.decode("utf-8")
+                elif isinstance(raw_content, str):
+                    return raw_content
+                return None
+    except Exception:
+        LOG.warning(
+            "Failed to load main.py content",
+            script_revision_id=script_revision_id,
+            exc_info=True,
+        )
+    return None
+
 
 def _jinja_domain_filter(url: str) -> str:
     """Extract the domain (netloc) from a URL for use as a cache key grouping.
@@ -358,12 +428,31 @@ async def get_latest_published_script(
     return best
 
 
+async def _extract_all_blocks_from_main_py(
+    script_revision_id: str,
+    organization_id: str,
+) -> dict[str, str]:
+    """Extract all @skyvern.cached block functions from main.py for a script revision.
+
+    Returns {block_label: code} for every block found. Used as a fallback when blocks
+    don't have individual block files (e.g. reviewer-created revisions).
+    """
+    content = await load_main_py_content(script_revision_id, organization_id)
+    if not content:
+        return {}
+    return extract_cached_blocks_from_source(content)
+
+
 async def _load_cached_script_block_sources(
     script: Script,
     organization_id: str,
 ) -> dict[str, ScriptBlockSource]:
     """
     Load existing script block sources (code + metadata) for a script revision so they can be reused.
+
+    Blocks may have code stored as individual block files (script_file_id) or only in main.py
+    (reviewer-created revisions store code exclusively in main.py). This function tries
+    the block file first, then falls back to extracting the block from main.py.
     """
     cached_blocks: dict[str, ScriptBlockSource] = {}
 
@@ -371,6 +460,10 @@ async def _load_cached_script_block_sources(
         script_revision_id=script.script_revision_id,
         organization_id=organization_id,
     )
+
+    # Lazily loaded: block codes extracted from main.py, used as fallback when
+    # a block has no script_file_id (i.e. reviewer-created revisions).
+    main_py_block_codes: dict[str, str] | None = None
 
     for script_block in script_blocks:
         if not script_block.script_block_label:
@@ -391,6 +484,16 @@ async def _load_cached_script_block_sources(
                         code_str = file_content.decode("utf-8")
                     elif isinstance(file_content, str):
                         code_str = file_content
+
+        # Fallback: extract block code from main.py (reviewer-created revisions
+        # store all block code in main.py and don't create individual block files).
+        if not code_str:
+            if main_py_block_codes is None:
+                main_py_block_codes = await _extract_all_blocks_from_main_py(
+                    script_revision_id=script.script_revision_id,
+                    organization_id=organization_id,
+                )
+            code_str = main_py_block_codes.get(script_block.script_block_label)
 
         if not code_str:
             continue
@@ -988,26 +1091,22 @@ def _patch_main_py(main_py_content: str, updated_blocks: dict[str, str]) -> str:
 
 async def _reconstruct_main_py_from_blocks(
     base_main_py: str,
-    new_revision_id: str,
-    organization_id: str,
     updated_blocks: dict[str, str],
 ) -> str | None:
-    """Reconstruct main.py from the header + individual block files when _patch_main_py fails.
+    """Reconstruct main.py when _patch_main_py fails.
 
-    Takes the header (imports, models, workflow function) from the base main.py
-    and appends every block's code — both newly reviewed blocks and existing ones
-    carried forward from the base. Each block file was individually compile-verified,
-    so concatenation should produce valid Python.
+    Takes the header (imports, models, workflow function) from the base main.py,
+    then appends each block: updated blocks from the reviewer, plus existing
+    blocks extracted from the base main.py.
 
     Returns the reconstructed source, or None if reconstruction fails.
     """
     try:
         # Extract the header: everything before the first @skyvern.cached decorator
         lines = base_main_py.split("\n")
-        decorator_pattern = re.compile(r"^@skyvern\.cached\(\s*cache_key\s*=\s*['\"]([^'\"]+)['\"]\s*\)")
         header_end = len(lines)
         for i, line in enumerate(lines):
-            if decorator_pattern.match(line.strip()):
+            if _CACHED_DECORATOR_RE.match(line.strip()):
                 header_end = i
                 break
         # Strip trailing blank lines from header
@@ -1015,36 +1114,12 @@ async def _reconstruct_main_py_from_blocks(
             header_end -= 1
         header = "\n".join(lines[:header_end])
 
-        # Collect all block code: updated blocks from the reviewer, plus existing
-        # blocks from the new revision's block files (which were either freshly
-        # uploaded or copied from the base revision)
-        block_codes: dict[str, str] = {}
+        # Extract all existing blocks from the base main.py
+        block_codes = extract_cached_blocks_from_source(base_main_py)
 
-        # Load all block files for this revision from the DB
-        block_files = await app.DATABASE.scripts.get_script_files(
-            script_revision_id=new_revision_id,
-            organization_id=organization_id,
-        )
-        for f in block_files:
-            if not f.file_path.startswith("blocks/") or not f.artifact_id:
-                continue
-            # Extract label from path: "blocks/login.py" -> "login"
-            label = f.file_path.removeprefix("blocks/").removesuffix(".py").removesuffix(".skyvern")
-            if label in updated_blocks:
-                # Prefer the reviewer's version (it's compile-verified)
-                block_codes[label] = updated_blocks[label]
-            else:
-                # Load existing block content from S3
-                artifact = await app.DATABASE.artifacts.get_artifact_by_id(f.artifact_id, organization_id)
-                if artifact:
-                    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-                    if content:
-                        block_codes[label] = content.decode("utf-8") if isinstance(content, bytes) else content
-
-        # Also include any updated blocks that don't have block files yet (new blocks)
+        # Override with updated blocks from the reviewer
         for label, code in updated_blocks.items():
-            if label not in block_codes:
-                block_codes[label] = code
+            block_codes[label] = code
 
         if not block_codes:
             LOG.warning("No block code found for reconstruction")
@@ -1073,7 +1148,7 @@ async def _reconstruct_main_py_from_blocks(
         # Final compile check
         compile(reconstructed, "<reconstructed_main.py>", "exec")
         LOG.info(
-            "Successfully reconstructed main.py from block files",
+            "Successfully reconstructed main.py from base source",
             block_count=len(block_codes),
             block_labels=sorted(block_codes.keys()),
         )
@@ -1288,70 +1363,29 @@ async def create_script_version_from_review(
         conditional_blocks = conditional_blocks or {}
 
         for sb in existing_blocks:
-            if sb.script_block_label in updated_blocks:
-                # This block has an updated version from the reviewer
-                updated_code = updated_blocks[sb.script_block_label]
-                content_bytes = updated_code.encode("utf-8")
-                content_hash = hashlib.sha256(content_bytes).hexdigest()
-                file_path = f"blocks/{sb.script_block_label}.py"
+            # Determine if this is a conditional block being upgraded to code.
+            is_conditional_upgrade = sb.script_block_label in conditional_blocks
+            block_requires_agent = False if is_conditional_upgrade else sb.requires_agent
+            block_run_signature = (
+                f'await skyvern.conditional(label="{sb.script_block_label}")'
+                if is_conditional_upgrade
+                else sb.run_signature
+            )
 
-                # Upload code to S3 and create script file DB record
-                artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-                    organization_id=organization_id,
-                    script_id=new_script.script_id,
-                    script_version=new_script.version,
-                    file_path=file_path,
-                    data=content_bytes,
-                )
-                new_file = await app.DATABASE.scripts.create_script_file(
-                    script_revision_id=new_script.script_revision_id,
-                    script_id=new_script.script_id,
-                    organization_id=organization_id,
-                    file_path=file_path,
-                    file_name=f"{sb.script_block_label}.py",
-                    file_type="file",
-                    content_hash=f"sha256:{content_hash}",
-                    file_size=len(content_bytes),
-                    mime_type="text/x-python",
-                    artifact_id=artifact_id,
-                )
-
-                # Determine if this is a conditional block being upgraded to code.
-                # If so, flip requires_agent to False and set the run_signature.
-                is_conditional_upgrade = sb.script_block_label in conditional_blocks
-                block_requires_agent = False if is_conditional_upgrade else sb.requires_agent
-                block_run_signature = (
-                    f'await skyvern.conditional(label="{sb.script_block_label}")'
-                    if is_conditional_upgrade
-                    else sb.run_signature
-                )
-
-                # Create script block entry pointing to the new file
-                await app.DATABASE.scripts.create_script_block(
-                    organization_id=organization_id,
-                    script_id=new_script.script_id,
-                    script_revision_id=new_script.script_revision_id,
-                    script_block_label=sb.script_block_label,
-                    script_file_id=new_file.file_id,
-                    run_signature=block_run_signature,
-                    workflow_run_id=workflow_run.workflow_run_id if workflow_run else None,
-                    input_fields=sb.input_fields,
-                    requires_agent=block_requires_agent,
-                )
-            else:
-                # Copy existing block as-is
-                await app.DATABASE.scripts.create_script_block(
-                    organization_id=organization_id,
-                    script_id=new_script.script_id,
-                    script_revision_id=new_script.script_revision_id,
-                    script_block_label=sb.script_block_label,
-                    script_file_id=sb.script_file_id,
-                    run_signature=sb.run_signature,
-                    workflow_run_id=sb.workflow_run_id,
-                    workflow_run_block_id=sb.workflow_run_block_id,
-                    input_fields=sb.input_fields,
-                    requires_agent=sb.requires_agent,
-                )
+            # Create script block entry (metadata only — code lives in main.py).
+            # All blocks in this version are attributed to the triggering run — even
+            # non-updated blocks — so the version has uniform provenance.
+            await app.DATABASE.scripts.create_script_block(
+                organization_id=organization_id,
+                script_id=new_script.script_id,
+                script_revision_id=new_script.script_revision_id,
+                script_block_label=sb.script_block_label,
+                run_signature=block_run_signature,
+                workflow_run_id=workflow_run.workflow_run_id if workflow_run else sb.workflow_run_id,
+                workflow_run_block_id=sb.workflow_run_block_id,
+                input_fields=sb.input_fields,
+                requires_agent=block_requires_agent,
+            )
 
         # Patch main.py with updated block functions and copy non-block files.
         # Prefers the base revision's main.py (cumulative patches), falls back to v1.
@@ -1365,13 +1399,13 @@ async def create_script_version_from_review(
             patched_main = _fix_static_actions_in_for_loops(patched_main)
 
             # Validate the patched main.py compiles. If the splice corrupted it,
-            # reconstruct from individual block files (which are all compile-verified
-            # by the reviewer) instead of persisting a broken script.
+            # reconstruct from the base main.py source instead of persisting
+            # a broken script.
             try:
                 compile(patched_main, "<patched_main.py>", "exec")
             except SyntaxError as exc:
                 LOG.warning(
-                    "Patched main.py has syntax error — reconstructing from block files",
+                    "Patched main.py has syntax error — reconstructing from base source",
                     script_id=new_script.script_id,
                     error=str(exc),
                     lineno=exc.lineno,
@@ -1379,8 +1413,6 @@ async def create_script_version_from_review(
                 )
                 reconstructed = await _reconstruct_main_py_from_blocks(
                     base_main_py=main_py_content,
-                    new_revision_id=new_script.script_revision_id,
-                    organization_id=organization_id,
                     updated_blocks=updated_blocks,
                 )
                 if reconstructed:
@@ -1460,10 +1492,9 @@ async def create_script_version_from_review(
                         organization_id=organization_id,
                     )
 
-            updated_block_file_paths = {f"blocks/{label}.py" for label in updated_blocks}
             for f in source_files:
-                # Skip main.py (already patched) and updated block files (already created)
-                if f.file_path == "main.py" or f.file_path in updated_block_file_paths:
+                # Skip main.py (already patched) and any legacy block files
+                if f.file_path == "main.py" or f.file_path.startswith("blocks/"):
                     continue
                 await app.DATABASE.scripts.create_script_file(
                     script_revision_id=new_script.script_revision_id,
