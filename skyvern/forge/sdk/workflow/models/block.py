@@ -1796,7 +1796,7 @@ class ForLoopBlock(Block):
             # Check max_iterations limit
             if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
                 LOG.info(
-                    f"ForLoopBlock: Reached max_iterations limit ({DEFAULT_MAX_LOOP_ITERATIONS}), stopping loop",
+                    f"ForLoopBlock Reached max_iterations limit ({DEFAULT_MAX_LOOP_ITERATIONS}), stopping loop",
                     workflow_run_id=workflow_run_id,
                     loop_idx=loop_idx,
                     max_iterations=DEFAULT_MAX_LOOP_ITERATIONS,
@@ -1852,8 +1852,8 @@ class ForLoopBlock(Block):
             each_loop_output_values: list[dict[str, Any]] = []
 
             iteration_step_count = 0
-            LOG.info(
-                f"ForLoopBlock: Starting iteration {loop_idx} with max_steps_per_iteration={DEFAULT_MAX_STEPS_PER_ITERATION}",
+            LOG.debug(
+                "ForLoopBlock starting iteration",
                 workflow_run_id=workflow_run_id,
                 loop_idx=loop_idx,
                 max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
@@ -1963,7 +1963,7 @@ class ForLoopBlock(Block):
                 iteration_step_count += 1  # Count each block execution as a step
                 if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
                     LOG.info(
-                        f"ForLoopBlock: Reached max_steps_per_iteration limit ({DEFAULT_MAX_STEPS_PER_ITERATION}) in iteration {loop_idx}, stopping iteration",
+                        f"ForLoopBlock Reached max_steps_per_iteration limit ({DEFAULT_MAX_STEPS_PER_ITERATION}) in iteration {loop_idx}, stopping iteration",
                         workflow_run_id=workflow_run_id,
                         loop_idx=loop_idx,
                         max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
@@ -1991,7 +1991,7 @@ class ForLoopBlock(Block):
 
                 if block_output.status == BlockStatus.canceled:
                     LOG.info(
-                        f"ForLoopBlock: Block with type {loop_block.block_type} at index {block_idx} during loop {loop_idx} was canceled for workflow run {workflow_run_id}, canceling for loop",
+                        f"ForLoopBlock Block with type {loop_block.block_type} at index {block_idx} during loop {loop_idx} was canceled for workflow run {workflow_run_id}, canceling for loop",
                         block_type=loop_block.block_type,
                         workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
@@ -2011,7 +2011,7 @@ class ForLoopBlock(Block):
                     and not self.next_loop_on_failure
                 ):
                     LOG.info(
-                        f"ForLoopBlock: Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
+                        f"ForLoopBlock Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
                         block_outputs=block_outputs,
                         loop_idx=loop_idx,
                         block_idx=block_idx,
@@ -2064,7 +2064,7 @@ class ForLoopBlock(Block):
 
                 if loop_block.next_loop_on_failure or self.next_loop_on_failure:
                     LOG.info(
-                        f"ForLoopBlock: Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
+                        f"ForLoopBlock Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
                         block_outputs=block_outputs,
                         loop_idx=loop_idx,
                         block_idx=block_idx,
@@ -2597,7 +2597,7 @@ class TextPromptBlock(Block):
                 LOG.error("Failed to fetch workflow_run_block for TextPromptBlock artifacts", error=e)
 
         LOG.info(
-            "TextPromptBlock: Sending prompt to LLM",
+            "TextPromptBlock Sending prompt to LLM",
             prompt=prompt,
             llm_key=self.llm_key,
         )
@@ -2613,7 +2613,7 @@ class TextPromptBlock(Block):
             except Exception as e:
                 LOG.error("Failed to save TextPromptBlock artifacts", error=e)
 
-        LOG.info("TextPromptBlock: Received response from LLM", response=response)
+        LOG.info("TextPromptBlock Received response from LLM", response=response)
         return response
 
     async def _resolve_default_llm_handler(self, workflow_run_id: str, organization_id: str | None) -> LLMAPIHandler:
@@ -2771,7 +2771,7 @@ class DownloadToS3Block(Block):
             task_url_parameter_value = workflow_run_context.get_value(self.url)
             if task_url_parameter_value:
                 LOG.info(
-                    "DownloadToS3Block: Task URL is parameterized, using parameter value",
+                    "DownloadToS3Block Task URL is parameterized, using parameter value",
                     task_url_parameter_value=task_url_parameter_value,
                     task_url_parameter_key=self.url,
                 )
@@ -2792,7 +2792,7 @@ class DownloadToS3Block(Block):
         try:
             file_path = await download_file(self.url, max_size_mb=10, organization_id=organization_id)
         except Exception as e:
-            LOG.error("DownloadToS3Block: Failed to download file", url=self.url, error=str(e))
+            LOG.error("DownloadToS3Block Failed to download file", url=self.url, error=str(e))
             raise e
 
         uri = None
@@ -2800,10 +2800,10 @@ class DownloadToS3Block(Block):
             uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}"
             await self._upload_file_to_s3(uri, file_path)
         except Exception as e:
-            LOG.error("DownloadToS3Block: Failed to upload file to S3", uri=uri, error=str(e))
+            LOG.error("DownloadToS3Block Failed to upload file to S3", uri=uri, error=str(e))
             raise e
 
-        LOG.info("DownloadToS3Block: File downloaded and uploaded to S3", uri=uri)
+        LOG.info("DownloadToS3Block File downloaded and uploaded to S3", uri=uri)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uri)
         return await self.build_block_result(
             success=True,
@@ -2859,7 +2859,7 @@ class UploadToS3Block(Block):
             file_path_parameter_value = workflow_run_context.get_value(self.path)
             if file_path_parameter_value:
                 LOG.info(
-                    "UploadToS3Block: File path is parameterized, using parameter value",
+                    "UploadToS3Block File path is parameterized, using parameter value",
                     file_path_parameter_value=file_path_parameter_value,
                     file_path_parameter_key=self.path,
                 )
@@ -2886,14 +2886,14 @@ class UploadToS3Block(Block):
             )
 
         if not self.path:
-            raise ValueError("UploadToS3Block: path is required")
+            raise ValueError("UploadToS3Block path is required")
 
         context = skyvern_context.current()
         run_id = context.run_id if context and context.run_id else workflow_run_id
         resolved_path = validate_local_file_path(self.path, run_id)
 
         if not os.path.exists(resolved_path):
-            raise FileNotFoundError(f"UploadToS3Block: File not found at path: {resolved_path}")
+            raise FileNotFoundError(f"UploadToS3Block File not found at path: {resolved_path}")
 
         s3_uris = []
         try:
@@ -2907,7 +2907,7 @@ class UploadToS3Block(Block):
                 for file in files:
                     # if the file is a directory, we will not upload it
                     if os.path.isdir(os.path.join(resolved_path, file)):
-                        LOG.warning("UploadToS3Block: Skipping directory", file=file)
+                        LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
                     file_path = os.path.join(resolved_path, file)
                     s3_uri = self._get_s3_uri(workflow_run_id, file_path)
@@ -2918,10 +2918,10 @@ class UploadToS3Block(Block):
                 s3_uris.append(s3_uri)
                 await client.upload_file_from_path(uri=s3_uri, file_path=resolved_path)
         except Exception as e:
-            LOG.exception("UploadToS3Block: Failed to upload file to S3", file_path=self.path)
+            LOG.exception("UploadToS3Block Failed to upload file to S3", file_path=self.path)
             raise e
 
-        LOG.info("UploadToS3Block: File(s) uploaded to S3", file_path=self.path)
+        LOG.info("UploadToS3Block File(s) uploaded to S3", file_path=self.path)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, s3_uris)
         return await self.build_block_result(
             success=True,
@@ -3109,7 +3109,7 @@ class FileUploadBlock(Block):
                     raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
                 for file in files:
                     if os.path.isdir(os.path.join(download_files_path, file)):
-                        LOG.warning("FileUploadBlock: Skipping directory", file=file)
+                        LOG.warning("FileUploadBlock Skipping directory", file=file)
                         continue
                     files_to_upload.append(os.path.join(download_files_path, file))
             else:
@@ -3133,7 +3133,7 @@ class FileUploadBlock(Block):
                     s3_uri = self._get_s3_uri(workflow_run_id, file_path)
                     uploaded_uris.append(s3_uri)
                     await aws_client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
-                LOG.info("FileUploadBlock: File(s) uploaded to S3", file_path=self.path)
+                LOG.info("FileUploadBlock File(s) uploaded to S3", file_path=self.path)
             elif self.storage_type == FileStorageType.AZURE:
                 actual_azure_storage_account_name = (
                     workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_name)
@@ -3151,19 +3151,19 @@ class FileUploadBlock(Block):
                     storage_account_key=actual_azure_storage_account_key,
                 )
                 for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock: Uploading file to Azure Blob Storage", file_path=file_path)
+                    LOG.info("FileUploadBlock Uploading file to Azure Blob Storage", file_path=file_path)
                     blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
                     azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
                     uploaded_uris.append(azure_uri)
                     uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
                     await azure_client.upload_file_from_path(uri, file_path)
-                LOG.info("FileUploadBlock: File(s) uploaded to Azure Blob Storage", file_path=self.path)
+                LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation
                 raise ValueError(f"Unsupported storage type: {self.storage_type}")
 
         except Exception as e:
-            LOG.exception("FileUploadBlock: Failed to upload file", file_path=self.path, storage_type=self.storage_type)
+            LOG.exception("FileUploadBlock Failed to upload file", file_path=self.path, storage_type=self.storage_type)
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to upload file to {self.storage_type}: {str(e)}",
@@ -3294,7 +3294,7 @@ class SendEmailBlock(Block):
                 # if the path is WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, use download directory for the workflow run
                 path = str(get_path_for_workflow_download_directory(run_id).absolute())
                 LOG.info(
-                    "SendEmailBlock: Using download directory for the workflow run",
+                    "SendEmailBlock Using download directory for the workflow run",
                     workflow_run_id=workflow_run_id,
                     file_path=path,
                 )
@@ -3307,7 +3307,7 @@ class SendEmailBlock(Block):
                 if os.path.isdir(path):
                     for file in os.listdir(path):
                         if os.path.isdir(os.path.join(path, file)):
-                            LOG.warning("SendEmailBlock: Skipping directory", file=file)
+                            LOG.warning("SendEmailBlock Skipping directory", file=file)
                             continue
                         file_path = os.path.join(path, file)
                         file_paths.append(file_path)
@@ -3317,7 +3317,7 @@ class SendEmailBlock(Block):
             elif is_remote_url(path):
                 file_paths.append(path)
             else:
-                LOG.warning("SendEmailBlock: File not found", file_path=path)
+                LOG.warning("SendEmailBlock File not found", file_path=path)
 
         return file_paths
 
@@ -3337,7 +3337,7 @@ class SendEmailBlock(Block):
                 recipients.append(maybe_recipient)
             except EmailNotValidError as e:
                 LOG.warning(
-                    "SendEmailBlock: Invalid email address",
+                    "SendEmailBlock Invalid email address",
                     recipient=maybe_recipient,
                     reason=str(e),
                 )
@@ -3373,14 +3373,14 @@ class SendEmailBlock(Block):
             if filename.startswith(("s3://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
-                LOG.info("SendEmailBlock: Looking for file locally", filename=filename)
+                LOG.info("SendEmailBlock Looking for file locally", filename=filename)
                 if not os.path.exists(filename):
                     raise FileNotFoundError(f"File not found: {filename}")
                 if not os.path.isfile(filename):
                     raise IsADirectoryError(f"Path is a directory: {filename}")
 
                 path = filename
-                LOG.info("SendEmailBlock: Found file locally", path=path)
+                LOG.info("SendEmailBlock Found file locally", path=path)
 
             if not path:
                 raise FileNotFoundError(f"File not found: {filename}")
@@ -3409,7 +3409,7 @@ class SendEmailBlock(Block):
                     attachment_filename += f".{extension}"
 
             LOG.info(
-                "SendEmailBlock: Adding attachment",
+                "SendEmailBlock Adding attachment",
                 filename=attachment_filename,
                 maintype=maintype,
                 subtype=subtype,
@@ -3430,11 +3430,11 @@ class SendEmailBlock(Block):
         duplicate_files_list = [files for files in file_names_by_hash.values() if len(files) > 1]
 
         # Log file statistics
-        LOG.info("SendEmailBlock: Total files attached", total_files=total_files)
-        LOG.info("SendEmailBlock: Unique files (based on content) attached", unique_files=unique_files)
+        LOG.info("SendEmailBlock Total files attached", total_files=total_files)
+        LOG.info("SendEmailBlock Unique files (based on content) attached", unique_files=unique_files)
         if duplicate_files_list:
             LOG.info(
-                "SendEmailBlock: Duplicate files (based on content) attached", duplicate_files_list=duplicate_files_list
+                "SendEmailBlock Duplicate files (based on content) attached", duplicate_files_list=duplicate_files_list
             )
 
         return msg
@@ -3474,19 +3474,19 @@ class SendEmailBlock(Block):
         smtp_host = None
         try:
             smtp_host = smtplib.SMTP(smtp_host_value, smtp_port_value)
-            LOG.info("SendEmailBlock: Connected to SMTP server")
+            LOG.info("SendEmailBlock Connected to SMTP server")
             smtp_host.starttls()
             smtp_host.login(smtp_username_value, smtp_password_value)
-            LOG.info("SendEmailBlock: Logged in to SMTP server")
+            LOG.info("SendEmailBlock Logged in to SMTP server")
             message = await self._build_email_message(
                 workflow_run_context,
                 workflow_run_id,
                 organization_id=organization_id,
             )
             smtp_host.send_message(message)
-            LOG.info("SendEmailBlock: Email sent")
+            LOG.info("SendEmailBlock Email sent")
         except Exception as e:
-            LOG.error("SendEmailBlock: Failed to send email", exc_info=True)
+            LOG.error("SendEmailBlock Failed to send email", exc_info=True)
             result_dict = {"success": False, "error": str(e)}
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
             return await self.build_block_result(
@@ -3567,7 +3567,7 @@ class FileParserBlock(Block):
             detected = self._detect_file_type_from_magic_bytes(file_path)
             if detected is not None:
                 LOG.info(
-                    "FileParserBlock: Detected file type from magic bytes (URL had no recognizable extension)",
+                    "FileParserBlock Detected file type from magic bytes (URL had no recognizable extension)",
                     file_url=file_url,
                     detected_file_type=detected,
                 )
@@ -3906,7 +3906,7 @@ class FileParserBlock(Block):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
                 LOG.info(
-                    "FileParserBlock: File URL is parameterized, using parameter value",
+                    "FileParserBlock File URL is parameterized, using parameter value",
                     file_url_parameter_value=file_url_parameter_value,
                     file_url_parameter_key=self.file_url,
                 )
@@ -3947,7 +3947,7 @@ class FileParserBlock(Block):
             )
 
         LOG.debug(
-            "FileParserBlock: After file type validation",
+            "FileParserBlock After file type validation",
             file_type=self.file_type,
             json_schema_present=self.json_schema is not None,
             json_schema_type=type(self.json_schema),
@@ -3979,7 +3979,7 @@ class FileParserBlock(Block):
         # If json_schema is provided, use AI to extract structured data
         final_data: str | list[dict[str, Any]] | dict[str, Any]
         LOG.debug(
-            "FileParserBlock: JSON schema check",
+            "FileParserBlock JSON schema check",
             has_json_schema=self.json_schema is not None,
             json_schema_type=type(self.json_schema),
             json_schema=self.json_schema,
@@ -4059,7 +4059,7 @@ class PDFParserBlock(Block):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
                 LOG.info(
-                    "PDFParserBlock: File URL is parameterized, using parameter value",
+                    "PDFParserBlock File URL is parameterized, using parameter value",
                     file_url_parameter_value=file_url_parameter_value,
                     file_url_parameter_key=self.file_url,
                 )
@@ -5008,7 +5008,7 @@ class HttpRequestBlock(Block):
 
                     # Get allowed directory paths (using class method for cached result)
                     allowed_dirs = self.get_allowed_dirs()
-                    LOG.debug("HttpRequestBlock: Allowed directories", allowed_dirs=allowed_dirs)
+                    LOG.debug("HttpRequestBlock Allowed directories", allowed_dirs=allowed_dirs)
 
                     # Check if file is within any allowed directory
                     for allowed_dir in allowed_dirs:
@@ -5048,7 +5048,7 @@ class HttpRequestBlock(Block):
                         )
                     downloaded_files[field_name] = local_file_path_str
                     LOG.info(
-                        "HttpRequestBlock: Using allowed local file",
+                        "HttpRequestBlock Using allowed local file",
                         field_name=field_name,
                         file_path=local_file_path_str,
                     )
@@ -5056,7 +5056,7 @@ class HttpRequestBlock(Block):
                     # Download from remote source
                     try:
                         LOG.info(
-                            "HttpRequestBlock: Downloading file from remote source",
+                            "HttpRequestBlock Downloading file from remote source",
                             field_name=field_name,
                             file_path=file_path,
                             is_url=is_url,
@@ -5065,7 +5065,7 @@ class HttpRequestBlock(Block):
                         local_file_path = await download_file(file_path, organization_id=organization_id)
                         downloaded_files[field_name] = local_file_path
                         LOG.info(
-                            "HttpRequestBlock: File downloaded successfully",
+                            "HttpRequestBlock File downloaded successfully",
                             field_name=field_name,
                             original_path=file_path,
                             local_path=local_file_path,
@@ -5236,7 +5236,7 @@ class PrintPageBlock(Block):
         artifact_org_id = organization_id or workflow_run_context.organization_id
         if not artifact_org_id:
             LOG.warning(
-                "PrintPageBlock: Missing organization_id, skipping artifact upload",
+                "PrintPageBlock Missing organization_id, skipping artifact upload",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -5249,7 +5249,7 @@ class PrintPageBlock(Block):
             )
         except NotFoundError:
             LOG.warning(
-                "PrintPageBlock: Workflow run block not found, skipping artifact upload",
+                "PrintPageBlock Workflow run block not found, skipping artifact upload",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=artifact_org_id,
@@ -5265,7 +5265,7 @@ class PrintPageBlock(Block):
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([workflow_run_block.workflow_run_block_id])
         except Exception:
             LOG.warning(
-                "PrintPageBlock: Failed to upload PDF artifact",
+                "PrintPageBlock Failed to upload PDF artifact",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block.workflow_run_block_id,
                 exc_info=True,
@@ -5280,7 +5280,7 @@ class PrintPageBlock(Block):
                 artifact_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
         except Exception:
             LOG.warning(
-                "PrintPageBlock: Failed to generate artifact download URL",
+                "PrintPageBlock Failed to generate artifact download URL",
                 artifact_id=artifact_id,
                 exc_info=True,
             )
@@ -5329,7 +5329,7 @@ class PrintPageBlock(Block):
             error_msg = str(e)
             if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):
                 error_msg = "PDF generation requires Chromium browser. Current browser does not support page.pdf()."
-            LOG.warning("PrintPageBlock: Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
+            LOG.warning("PrintPageBlock Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to generate PDF: {error_msg}",
