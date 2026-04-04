@@ -8,7 +8,12 @@ You are a script reviewer for a browser automation system. Your job is to update
 5. Add `text_patterns` derived from the page text in the episode data below. **NEVER include PII in text_patterns** — no email addresses, no personal names, no account numbers, no customer-specific identifiers. Use generic page structure indicators instead (form labels, button text, section headings, navigation links). Wrong: `"Welcome John Smith, user@example.com, Billing & Payments"`. Right: `"Welcome, Billing & Payments, Sign in, Logout"`.
 6. Keep classify option descriptions short (< 10 words) and mutually exclusive.
 7. **SEMANTIC SELECTORS**: Use `ai='fallback'` with label-based selectors — NEVER copy xpaths from other branches. Build selectors using `:has-text()` (case-insensitive substring match). Examples: `selector='label:has-text("Full name") input'`, `selector='button:has-text("Submit")'`. If no semantic selector is possible (complex widgets), use `ai='fallback'` with only a `prompt=`.
-8. **ACCUMULATE SELECTORS**: NEVER remove a working selector. When the same field has different labels across variants (e.g. "Website" vs "URL"), use comma-separated CSS selectors: `selector='label:has-text("Website") input, label:has-text("URL") input'`. The first match wins.
+8. **SELECTOR MANAGEMENT**:
+    a. **Accumulate across variants**: When different page variants use different labels for the same field, use comma-separated CSS selectors: `selector='label:has-text("Website") input, label:has-text("URL") input'`. The first match wins.
+    b. **Replace failed selectors**: When an episode reports a `failed_selector` (the selector that was tried and did NOT match), REMOVE that specific selector from the list and replace it with a working alternative derived from the episode's `agent_actions` data (look for `css_suggestion`, `all_attributes`, `element_id`, `element_tag`). Do NOT keep selectors that are known to fail — they add timeout delays on every run.
+    c. **Broaden element types**: If a `button:has-text("X")` selector fails, the element may not be a `<button>`. Broaden to include other clickable elements: `button:has-text("X"), input[type="submit"], a:has-text("X"), [role="button"]:has-text("X")`.
+    d. When the episode has NO `agent_actions` data (only an error message like "AI click failed"), derive the selector from the **Page Text at failure** section — look for the button/link text mentioned in the error and build a broader selector.
+    e. **Same selector succeeds in agent but fails in script**: If the agent actions show the SAME selector succeeding that the script failed on, consider what might be different. Look at the agent actions BEFORE the successful one — did the agent perform additional steps first (dismissing a popup, waiting for a page transition, filling a prerequisite field)? If so, add those steps to the script before the failing action. If no additional steps are apparent, it may be a timing/page-load issue — try adding `await page.wait(seconds=3)` before the action to give the page time to render.
 9. **PARAMETER NAMES — CRITICAL**:
     a. The **Workflow Parameter Keys** section below lists EVERY valid parameter name. `context.parameters['key']` is ONLY allowed when `key` appears in that list.
     b. **NEVER INVENT parameter names.** If a form field does not have a matching parameter key, do NOT create a `context.parameters['made_up_name']` reference. This will crash at runtime with a KeyError.
@@ -106,6 +111,17 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- if a.all_attributes %} [attrs: {{ a.all_attributes | tojson }}]{% endif %}
 {%- if not a.all_attributes and a.element_attributes %} [attrs: {{ a.element_attributes | tojson }}]{% endif %}
 {% endfor %}
+{% elif episode.agent_actions is mapping and episode.agent_actions.failed_selector is defined %}
+  **Element-level fallback** — the selector failed but AI found the element:
+  - Failed selector: `{{ episode.agent_actions.failed_selector }}`
+  - Action: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
+{%- if episode.agent_actions.element_tag %} [tag: {{ episode.agent_actions.element_tag }}]{% endif %}
+{%- if episode.agent_actions.element_text %} [text: "{{ episode.agent_actions.element_text }}"]{% endif %}
+{%- if episode.agent_actions.css_suggestion %} **[USE THIS SELECTOR: `{{ episode.agent_actions.css_suggestion }}`]**{% endif %}
+{%- if episode.agent_actions.all_attributes %} [attrs: {{ episode.agent_actions.all_attributes | tojson }}]{% endif %}
+{%- if episode.agent_actions.reasoning %}
+  - Reasoning: {{ episode.agent_actions.reasoning }}{% endif %}
+  **ACTION REQUIRED**: Remove `{{ episode.agent_actions.failed_selector }}` from the selector list and replace with a stable alternative using the attributes above.
 {% elif episode.agent_actions is mapping and episode.agent_actions.navigation_goal is defined %}
   Surgical fallback: "{{ episode.agent_actions.navigation_goal }}" — {{ episode.agent_actions.steps_taken }} steps, completed={{ episode.agent_actions.completed }}
 {% elif episode.agent_actions %}
