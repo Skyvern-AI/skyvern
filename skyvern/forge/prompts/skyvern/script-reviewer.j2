@@ -106,14 +106,18 @@ The cached code failed and the AI agent took over. Here is what happened:
 {% endif %}
 - **Agent Actions After Fallback** (use these to write the NEW branch actions):
 {% if episode.agent_actions is mapping and episode.agent_actions.actions is defined %}
+{% set ns = namespace(prev_url='') %}
 {% for a in episode.agent_actions.actions %}
   {{ loop.index }}. {{ a.action_type }}: {{ a.intention or a.reasoning or "N/A" }} ({{ a.status }})
+{%- if a.page_url and loop.first %} [url: {{ a.page_url }}]{% endif %}
+{%- if a.page_url and not loop.first and a.page_url != ns.prev_url %} [url changed: {{ a.page_url }}]{% endif %}
 {%- if a.field %} [field: {{ a.field }}]{% endif %}
 {%- if a.element_tag %} [tag: {{ a.element_tag }}]{% endif %}
 {%- if a.element_text %} [text: "{{ a.element_text }}"]{% endif %}
 {%- if a.css_suggestion %} **[USE THIS SELECTOR: `{{ a.css_suggestion }}`]**{% endif %}
 {%- if a.all_attributes %} [attrs: {{ a.all_attributes | tojson }}]{% endif %}
 {%- if not a.all_attributes and a.element_attributes %} [attrs: {{ a.element_attributes | tojson }}]{% endif %}
+{%- if a.page_url %}{% set ns.prev_url = a.page_url %}{% endif %}
 {% endfor %}
 {% elif episode.agent_actions is mapping and episode.agent_actions.failed_selector is defined %}
   **Element-level fallback** — the selector failed but AI found the element:
