@@ -12,15 +12,22 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
 from skyvern.cli.core.browser_ops import (
+    _ALLOWED_EXECUTE_TOOLS,
+    MAX_EXECUTE_STEPS,
+    ExecuteStep,
     do_act,
+    do_execute,
     do_extract,
     do_find,
     do_frame_list,
     do_frame_main,
     do_frame_switch,
     do_navigate,
+    do_observe,
     do_screenshot,
     parse_extract_schema,
+    ref_to_selector,
+    serialize_elements,
 )
 from skyvern.cli.core.guards import (
     CREDENTIAL_HINT,
@@ -1270,7 +1277,7 @@ async def skyvern_extract(
 
     with Timer() as timer:
         try:
-            result = await do_extract(page, prompt, schema=parsed_schema)
+            result = await do_extract(page, prompt, schema=parsed_schema, skip_refresh=True)
             timer.mark("sdk")
         except GuardError as e:
             return make_result(
@@ -1365,7 +1372,7 @@ async def skyvern_act(
 
     with Timer() as timer:
         try:
-            result = await do_act(page, prompt)
+            result = await do_act(page, prompt, skip_refresh=True, use_economy_tree=True)
             timer.mark("sdk")
         except GuardError as e:
             return make_result(
@@ -1947,5 +1954,266 @@ async def skyvern_clipboard_write(
         "skyvern_clipboard_write",
         browser_context=ctx,
         data={"written": True, "length": len(text)},
+        timing_ms=timer.timing_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observe — scoped accessibility tree snapshot
+# ---------------------------------------------------------------------------
+
+
+async def skyvern_observe(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    selector: Annotated[
+        str | None,
+        Field(description="CSS selector to scope the snapshot (e.g., 'form#login'). Omit for full page."),
+    ] = None,
+    interactive_only: Annotated[
+        bool,
+        Field(description="Only return interactive elements (buttons, inputs, links). Default true."),
+    ] = True,
+    max_elements: Annotated[
+        int,
+        Field(description="Max elements to return. Default 50.", ge=1, le=200),
+    ] = 50,
+) -> dict[str, Any]:
+    """Get a structured snapshot of interactive page elements with stable refs for use in skyvern_execute batches.
+
+    Returns element refs (e0, e1, ...) that can be passed to skyvern_execute steps.
+    Use this before skyvern_execute to discover elements, then reference them by ref in batch steps.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_observe", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            result = await do_observe(
+                page,
+                selector=selector,
+                interactive_only=interactive_only,
+                max_elements=max_elements,
+            )
+            timer.mark("sdk")
+        except Exception as e:
+            return make_result(
+                "skyvern_observe",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page is loaded"),
+            )
+
+    elements = serialize_elements(result.elements)
+    hint = (
+        f"Found {result.element_count} interactive elements"
+        f"{f' (of {result.total_on_page} total on page)' if result.total_on_page > result.element_count else ''}. "
+        "Use these refs in skyvern_execute steps, e.g.: "
+        '{tool: "click", params: {ref: "e0"}}'
+    )
+    return make_result(
+        "skyvern_observe",
+        browser_context=ctx,
+        data={
+            "url": result.url,
+            "title": result.title,
+            "elements": elements,
+            "element_count": result.element_count,
+            "total_on_page": result.total_on_page,
+            "hint": hint,
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Execute — batch multi-step execution
+# ---------------------------------------------------------------------------
+
+# DESIGN-1: Maps execute step tool names to existing MCP tool function names.
+# Dispatch through existing tools to inherit security guards.
+_TOOL_NAME_MAP: dict[str, str] = {
+    "navigate": "skyvern_navigate",
+    "click": "skyvern_click",
+    "type": "skyvern_type",
+    "press_key": "skyvern_press_key",
+    "select_option": "skyvern_select_option",
+    "hover": "skyvern_hover",
+    "scroll": "skyvern_scroll",
+    "wait": "skyvern_wait",
+    "screenshot": "skyvern_screenshot",
+    "evaluate": "skyvern_evaluate",
+}
+
+# Accepted user-facing params for each dispatched tool (excludes session_id/cdp_url).
+_TOOL_ACCEPTED_PARAMS: dict[str, frozenset[str]] = {
+    "navigate": frozenset({"url", "timeout", "wait_until"}),
+    "click": frozenset({"intent", "selector", "timeout", "click_count", "button"}),
+    "type": frozenset({"text", "intent", "selector", "clear_first", "press_enter", "timeout"}),
+    "press_key": frozenset({"key", "intent", "selector"}),
+    "select_option": frozenset({"value", "intent", "selector", "timeout", "by_label"}),
+    "hover": frozenset({"intent", "selector", "timeout"}),
+    "scroll": frozenset({"direction", "amount", "intent", "selector"}),
+    "wait": frozenset({"time_ms", "intent", "selector", "state", "timeout", "poll_interval_ms"}),
+    "screenshot": frozenset({"full_page", "selector", "inline"}),
+    "evaluate": frozenset({"expression"}),
+}
+
+
+async def _dispatch_step(
+    step: ExecuteStep,
+    ref_map: dict[str, dict[str, Any]],
+    session_id: str | None,
+    cdp_url: str | None,
+) -> dict[str, Any] | None:
+    """Route a step to the appropriate handler, resolving refs to selectors."""
+    params = dict(step.params)
+
+    # Resolve ref to selector if present
+    if ref := params.pop("ref", None):
+        elem = ref_map.get(ref)
+        if not elem:
+            raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
+        params["selector"] = ref_to_selector(elem)
+
+    # Observe is handled inline (not an existing MCP tool)
+    if step.tool == "observe":
+        from skyvern.cli.core.browser_ops import do_observe as _do_observe
+
+        page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
+        accepted = {"selector", "interactive_only", "max_elements"}
+        filtered = {k: v for k, v in params.items() if k in accepted}
+        result = await _do_observe(page, **filtered)
+        return {
+            "elements": serialize_elements(result.elements),
+            "element_count": result.element_count,
+            "total_on_page": result.total_on_page,
+        }
+
+    # DESIGN-1: Dispatch through existing MCP tool functions via module lookup
+    import skyvern.cli.mcp_tools.browser as _browser_mod
+
+    fn_name = _TOOL_NAME_MAP.get(step.tool)
+    if fn_name is None:
+        raise ValueError(f"Unknown tool '{step.tool}' — allowed: {sorted(_ALLOWED_EXECUTE_TOOLS)}")
+
+    tool_fn = getattr(_browser_mod, fn_name)
+
+    # Filter params to only those accepted by the target tool to prevent
+    # TypeError from unexpected keyword arguments.
+    accepted_params = _TOOL_ACCEPTED_PARAMS.get(step.tool, frozenset())
+    filtered_params = {k: v for k, v in params.items() if k in accepted_params}
+    filtered_params["session_id"] = session_id
+    filtered_params["cdp_url"] = cdp_url
+
+    tool_result = await tool_fn(**filtered_params)
+
+    if not tool_result.get("ok", False):
+        error = tool_result.get("error", {})
+        raise RuntimeError(error.get("message", "Tool execution failed"))
+
+    return tool_result.get("data")
+
+
+async def skyvern_execute(
+    steps: Annotated[
+        list[dict[str, Any]],
+        Field(description="Array of {tool, params} step objects to execute sequentially"),
+    ],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    stop_on_error: Annotated[
+        bool,
+        Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
+    ] = True,
+) -> dict[str, Any]:
+    """Execute multiple browser operations in a single batch call, reducing round-trips and tokens.
+
+    Each step is {tool, params}. Allowed tools: navigate, click, type, press_key, select_option,
+    hover, scroll, wait, observe, screenshot, evaluate.
+    Use observe as step 0 to get element refs, then reference them in subsequent steps via ref param.
+    """
+    if not steps:
+        return make_result(
+            "skyvern_execute",
+            data={
+                "steps_completed": 0,
+                "steps_total": 0,
+                "results": [],
+                "error_step": None,
+            },
+        )
+
+    if len(steps) > MAX_EXECUTE_STEPS:
+        return make_result(
+            "skyvern_execute",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Too many steps: {len(steps)} (max {MAX_EXECUTE_STEPS})",
+                f"Split into multiple skyvern_execute calls of {MAX_EXECUTE_STEPS} steps or fewer",
+            ),
+        )
+
+    # Validate step structure and tool names upfront
+    parsed_steps: list[ExecuteStep] = []
+    for i, raw in enumerate(steps):
+        tool = raw.get("tool")
+        if not tool:
+            return make_result(
+                "skyvern_execute",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Step {i} missing 'tool' field",
+                    "Each step must have {tool: 'name', params: {...}}",
+                ),
+            )
+        if tool not in _ALLOWED_EXECUTE_TOOLS:
+            return make_result(
+                "skyvern_execute",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Step {i}: unknown tool '{tool}'",
+                    f"Allowed tools: {sorted(_ALLOWED_EXECUTE_TOOLS)}",
+                ),
+            )
+        parsed_steps.append(ExecuteStep(tool=tool, params=raw.get("params", {})))
+
+    # Verify we can reach the browser before executing anything
+    try:
+        await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_execute", ok=False, error=no_browser_error())
+
+    async def dispatch(step: ExecuteStep, ref_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        return await _dispatch_step(step, ref_map, session_id=session_id, cdp_url=cdp_url)
+
+    with Timer() as timer:
+        result = await do_execute(dispatch, parsed_steps, stop_on_error=stop_on_error)
+        timer.mark("sdk")
+
+    step_results = []
+    for sr in result.results:
+        entry: dict[str, Any] = {"step": sr.step, "tool": sr.tool, "ok": sr.ok, "wall_ms": sr.wall_ms}
+        if sr.data:
+            entry["data"] = sr.data
+        if sr.error:
+            entry["error"] = sr.error
+        step_results.append(entry)
+
+    return make_result(
+        "skyvern_execute",
+        ok=result.error_step is None,
+        data={
+            "steps_completed": result.steps_completed,
+            "steps_total": result.steps_total,
+            "results": step_results,
+            "error_step": result.error_step,
+        },
         timing_ms=timer.timing_ms,
     )

@@ -114,6 +114,8 @@ class SkyvernBrowserPage(SkyvernPage):
     async def act(
         self,
         prompt: str,
+        skip_refresh: bool = False,
+        use_economy_tree: bool = False,
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt.
 
@@ -126,4 +128,4 @@ class SkyvernBrowserPage(SkyvernPage):
             await page.act("Click the login button")
             ```
         """
-        return await self._ai.ai_act(prompt)
+        return await self._ai.ai_act(prompt, skip_refresh=skip_refresh, use_economy_tree=use_economy_tree)
