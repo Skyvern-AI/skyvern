@@ -19,6 +19,7 @@ from .browser import (
     skyvern_clipboard_write,
     skyvern_drag,
     skyvern_evaluate,
+    skyvern_execute,
     skyvern_extract,
     skyvern_file_upload,
     skyvern_find,
@@ -28,6 +29,7 @@ from .browser import (
     skyvern_hover,
     skyvern_login,
     skyvern_navigate,
+    skyvern_observe,
     skyvern_press_key,
     skyvern_run_task,
     skyvern_screenshot,
@@ -396,6 +398,10 @@ mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_evaluate)
 mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_clipboard_read)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_clipboard_write)
 
+# -- Batch tools (observe + execute for multi-step optimization) --
+mcp.tool(tags={"browser_primitive", "batch"}, annotations=_RO)(skyvern_observe)
+mcp.tool(tags={"browser_primitive", "batch"}, annotations=_MUT)(skyvern_execute)
+
 # -- Precision tools (selector/intent-based browser primitives) --
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_click)
 mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_drag)
@@ -504,6 +510,9 @@ __all__ = [
     # Clipboard
     "skyvern_clipboard_read",
     "skyvern_clipboard_write",
+    # Batch tools (observe + execute)
+    "skyvern_observe",
+    "skyvern_execute",
     # Precision (selector/intent browser primitives)
     "skyvern_click",
     "skyvern_drag",

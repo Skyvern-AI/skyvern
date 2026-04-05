@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,8 +77,13 @@ async def do_screenshot(
     return ScreenshotResult(data=data, full_page=full_page)
 
 
-async def do_act(page: Any, prompt: str) -> ActResult:
-    await page.act(prompt)
+async def do_act(
+    page: Any,
+    prompt: str,
+    skip_refresh: bool = False,
+    use_economy_tree: bool = False,
+) -> ActResult:
+    await page.act(prompt, skip_refresh=skip_refresh, use_economy_tree=use_economy_tree)
     return ActResult(prompt=prompt, completed=True)
 
 
@@ -85,9 +91,10 @@ async def do_extract(
     page: Any,
     prompt: str,
     schema: str | dict[str, Any] | None = None,
+    skip_refresh: bool = False,
 ) -> ExtractResult:
     parsed_schema = parse_extract_schema(schema)
-    extracted = await page.extract(prompt=prompt, schema=parsed_schema)
+    extracted = await page.extract(prompt=prompt, schema=parsed_schema, skip_refresh=skip_refresh)
     return ExtractResult(extracted=extracted)
 
 
@@ -489,4 +496,289 @@ async def do_network_unroute(raw_page: Any, state: Any, url_pattern: str) -> Net
         url_pattern=url_pattern,
         removed=removed,
         active_routes=sorted(page_routes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observe — scoped accessibility tree snapshot with stable refs
+# ---------------------------------------------------------------------------
+
+INTERACTIVE_ROLES = frozenset(
+    {
+        "button",
+        "checkbox",
+        "combobox",
+        "link",
+        "listbox",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "radio",
+        "searchbox",
+        "slider",
+        "spinbutton",
+        "switch",
+        "tab",
+        "textbox",
+        "treeitem",
+    }
+)
+
+_ROLE_TO_TAG: dict[str, str] = {
+    "textbox": "input",
+    "searchbox": "input",
+    "checkbox": "input",
+    "radio": "input",
+    "slider": "input",
+    "spinbutton": "input",
+    "switch": "input",
+    "button": "button",
+    "link": "a",
+    "combobox": "select",
+    "listbox": "select",
+    "option": "option",
+    "tab": "button",
+    "menuitem": "li",
+    "menuitemcheckbox": "li",
+    "menuitemradio": "li",
+    "treeitem": "li",
+}
+
+_PASSWORD_NAME_RE = re.compile(
+    r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\btoken\b|\bcredential\b|\bpwd\b|\bpasswd\b|\bpin\b",
+    re.IGNORECASE,
+)
+
+# Structural fields always kept in serialized output; display fields filtered if empty.
+_ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
+
+
+@dataclass
+class ObservedElement:
+    ref: str
+    role: str
+    name: str
+    tag: str
+    value: str | None = None
+    options: list[str] | None = None
+
+
+@dataclass
+class ObserveResult:
+    url: str
+    title: str
+    elements: list[ObservedElement]
+    element_count: int
+    total_on_page: int
+
+
+def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Recursively flatten an accessibility tree into a flat element list."""
+    if node is None:
+        return []
+    result: list[dict[str, Any]] = []
+    if node.get("role") and node["role"] != "WebArea":
+        result.append(node)
+    for child in node.get("children", []):
+        result.extend(_flatten_a11y_tree(child))
+    return result
+
+
+def _is_password_field(role: str, name: str) -> bool:
+    """DESIGN-2: Detect password-type fields for value redaction."""
+    if _PASSWORD_NAME_RE.search(name):
+        return True
+    return role == "textbox" and "password" in name.lower()
+
+
+def _extract_options(node: dict[str, Any]) -> list[str] | None:
+    """Extract option labels from combobox/listbox children."""
+    children = node.get("children")
+    if not children:
+        return None
+    opts = [c.get("name", "") for c in children if c.get("role") == "option"]
+    return opts if opts else None
+
+
+async def do_observe(
+    page: Any,
+    selector: str | None = None,
+    interactive_only: bool = True,
+    max_elements: int = 50,
+) -> ObserveResult:
+    """Capture interactive elements with stable refs for batch operations."""
+    if selector:
+        element_handle = await page.locator(selector).first.element_handle()
+        snapshot = await page.accessibility.snapshot(root=element_handle)
+    else:
+        snapshot = await page.accessibility.snapshot()
+
+    all_elements = _flatten_a11y_tree(snapshot)
+
+    if interactive_only:
+        all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
+
+    total = len(all_elements)
+    capped = all_elements[:max_elements]
+
+    observed: list[ObservedElement] = []
+    for i, elem in enumerate(capped):
+        role = elem.get("role", "")
+        name = elem.get("name", "")
+        value = elem.get("value")
+
+        # DESIGN-2: Redact password field values
+        if value and _is_password_field(role, name):
+            value = "***"
+
+        observed.append(
+            ObservedElement(
+                ref=f"e{i}",
+                role=role,
+                name=name,
+                tag=_ROLE_TO_TAG.get(role, ""),
+                value=value,
+                options=_extract_options(elem),
+            )
+        )
+
+    return ObserveResult(
+        url=page.url,
+        title=await page.title(),
+        elements=observed,
+        element_count=len(observed),
+        total_on_page=total,
+    )
+
+
+def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
+    """Serialize observed elements to dicts, filtering empty display fields."""
+    return [
+        {
+            k: v
+            for k, v in {
+                "ref": e.ref,
+                "role": e.role,
+                "name": e.name,
+                "tag": e.tag,
+                "value": e.value,
+                "options": e.options,
+            }.items()
+            if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")
+        }
+        for e in elements
+    ]
+
+
+def ref_to_selector(elem: dict[str, Any]) -> str:
+    """Convert an observed element's a11y data to a Playwright role selector."""
+    role = elem.get("role", "")
+    name = elem.get("name", "")
+    if name:
+        escaped = name.replace('"', '\\"')
+        return f'role={role}[name="{escaped}"]'
+    return f"role={role}"
+
+
+# ---------------------------------------------------------------------------
+# Execute — batch multi-step execution with ref threading
+# ---------------------------------------------------------------------------
+
+# Tools that are blocked after a failed navigate step (DESIGN-3)
+_SENSITIVE_TOOLS = frozenset({"type", "evaluate"})
+
+_ALLOWED_EXECUTE_TOOLS = frozenset(
+    {
+        "navigate",
+        "click",
+        "type",
+        "press_key",
+        "select_option",
+        "hover",
+        "scroll",
+        "wait",
+        "observe",
+        "screenshot",
+        "evaluate",
+    }
+)
+
+MAX_EXECUTE_STEPS = 20
+
+
+@dataclass
+class ExecuteStep:
+    tool: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StepResult:
+    step: int
+    tool: str
+    ok: bool
+    wall_ms: int = 0
+    data: dict[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass
+class ExecuteResult:
+    steps_completed: int
+    steps_total: int
+    results: list[StepResult]
+    error_step: int | None
+
+
+async def do_execute(
+    dispatch_fn: Any,
+    steps: list[ExecuteStep],
+    stop_on_error: bool = True,
+) -> ExecuteResult:
+    """Execute a sequence of deterministic browser operations in one batch.
+
+    dispatch_fn: async callable(step, ref_map) -> dict with tool result
+    """
+    results: list[StepResult] = []
+    ref_map: dict[str, dict[str, Any]] = {}
+    nav_failed = False
+
+    for i, step in enumerate(steps):
+        # DESIGN-3: Block sensitive ops after failed navigate
+        if nav_failed and not stop_on_error and step.tool in _SENSITIVE_TOOLS:
+            results.append(
+                StepResult(
+                    step=i,
+                    tool=step.tool,
+                    ok=False,
+                    error="blocked_by_failed_navigate: refusing to execute sensitive "
+                    "operation after navigation failure",
+                )
+            )
+            continue
+
+        t0 = time.monotonic()
+        try:
+            result = await dispatch_fn(step, ref_map)
+            wall_ms = int((time.monotonic() - t0) * 1000)
+            results.append(StepResult(step=i, tool=step.tool, ok=True, wall_ms=wall_ms, data=result))
+
+            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges)
+            if step.tool == "observe" and result and "elements" in result:
+                ref_map = {elem["ref"]: elem for elem in result["elements"]}
+
+        except Exception as e:
+            wall_ms = int((time.monotonic() - t0) * 1000)
+            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=str(e)))
+            if step.tool == "navigate":
+                nav_failed = True
+            if stop_on_error:
+                break
+
+    return ExecuteResult(
+        steps_completed=len(results),
+        steps_total=len(steps),
+        results=results,
+        error_step=next((r.step for r in results if not r.ok), None),
     )

@@ -65,6 +65,7 @@ class SkyvernPageAi(Protocol):
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
+        skip_refresh: bool = False,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
         ...
@@ -80,6 +81,8 @@ class SkyvernPageAi(Protocol):
     async def ai_act(
         self,
         prompt: str,
+        skip_refresh: bool = False,
+        use_economy_tree: bool = False,
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         ...

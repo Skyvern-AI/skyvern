@@ -1322,7 +1322,15 @@ class SkyvernPage(Page):
             ```
         """
         data = kwargs.pop("data", None)
-        return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
+        skip_refresh = kwargs.pop("skip_refresh", False)
+        return await self._ai.ai_extract(
+            prompt=prompt,
+            schema=schema,
+            error_code_mapping=error_code_mapping,
+            intention=intention,
+            data=data,
+            skip_refresh=skip_refresh,
+        )
 
     async def validate(
         self,

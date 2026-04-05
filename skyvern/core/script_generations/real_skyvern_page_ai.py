@@ -891,10 +891,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
+        skip_refresh: bool = False,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
-        await self._refresh_scraped_page(take_screenshots=True)
+        if not skip_refresh:
+            await self._refresh_scraped_page(take_screenshots=True)
         context = skyvern_context.current()
         tz_info = datetime.now(tz=timezone.utc).tzinfo
         if context and context.tz_info:
@@ -1059,6 +1061,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
     async def ai_act(
         self,
         prompt: str,
+        skip_refresh: bool = False,
+        use_economy_tree: bool = False,
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         context = skyvern_context.ensure_context()
@@ -1108,8 +1112,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
             reasoning=action_info.get("reasoning"),
         )
 
-        await self._refresh_scraped_page(take_screenshots=False)
-        element_tree = self.scraped_page.build_element_tree()
+        if not skip_refresh:
+            await self._refresh_scraped_page(take_screenshots=False)
+        if use_economy_tree and self.scraped_page.support_economy_elements_tree():
+            element_tree = self.scraped_page.build_economy_elements_tree()
+        else:
+            element_tree = self.scraped_page.build_element_tree()
 
         template: str
         llm_handler: Any
@@ -1129,13 +1137,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
 
+        local_datetime = datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat()
         single_action_prompt = prompt_engine.load_prompt(
             template=template,
             navigation_goal=prompt,
             navigation_payload_str=None,
             current_url=self.page.url,
             elements=element_tree,
-            local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+            local_datetime=local_datetime,
         )
 
         try:
@@ -1147,6 +1156,29 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
             actions_json = action_response.get("actions", [])
+            if not actions_json and use_economy_tree:
+                LOG.info(
+                    "ai_act: economy tree returned no actions, retrying with full tree",
+                    prompt=prompt,
+                    action_type=action_type,
+                )
+                await self._refresh_scraped_page(take_screenshots=False)
+                element_tree = self.scraped_page.build_element_tree()
+                single_action_prompt = prompt_engine.load_prompt(
+                    template=template,
+                    navigation_goal=prompt,
+                    navigation_payload_str=None,
+                    current_url=self.page.url,
+                    elements=element_tree,
+                    local_datetime=local_datetime,
+                )
+                action_response = await llm_handler(
+                    prompt=single_action_prompt,
+                    prompt_name=template,
+                    step=step,
+                    organization_id=organization_id,
+                )
+                actions_json = action_response.get("actions", [])
             if not actions_json:
                 LOG.warning("ai_act: no actions generated", prompt=prompt, action_type=action_type)
                 return
