@@ -33,6 +33,7 @@ from skyvern.client.types.output_parameter import OutputParameter as BlockOutput
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
+    BlockedHost,
     BlockNotFound,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
@@ -124,6 +125,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import script_service, workflow_script_service
 from skyvern.utils.css_selector import build_action_summary  # shared with script_service
+from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -3008,7 +3010,7 @@ class WorkflowService:
         status: WorkflowStatus = WorkflowStatus.auto_generated,
         run_with: str | None = None,
         ai_fallback: bool = True,
-        task_version: Literal["v1", "v2"] = "v2",
+        task_version: Literal["v1", "v2"] = "v1",
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -3039,6 +3041,14 @@ class WorkflowService:
             data_extraction_goal: str | None = task_response.get("data_extraction_goal")
             navigation_goal: str = task_response.get("navigation_goal", None) or user_prompt
             url: str = task_response.get("url", None) or ""
+            if url:
+                try:
+                    url = validate_url_with_blocked_host_check(url) or ""
+                except BlockedHost:
+                    raise
+                except Exception:
+                    LOG.warning("LLM returned invalid URL in generate-task response, falling back to empty", url=url)
+                    url = ""
 
             blocks = [
                 NavigationBlock(
