@@ -1,14 +1,25 @@
 import typing as t
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from typing_extensions import Self
 
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import PromptedTaskRequest
 
 
+class PromptedTaskRequestOptionalUrl(PromptedTaskRequest):
+    url: str | None = None  # type: ignore[assignment]  # Pydantic allows narrowing required→optional in subclasses
+
+    @model_validator(mode="after")
+    def validate_url(self) -> Self:
+        if self.url is None:
+            return self
+        return super().validate_url()
+
+
 class CreateWorkflowFromPromptRequestV1(BaseModel):
     task_version: t.Literal["v1"]
-    request: PromptedTaskRequest
+    request: PromptedTaskRequestOptionalUrl
 
 
 class CreateWorkflowFromPromptRequestV2(BaseModel):

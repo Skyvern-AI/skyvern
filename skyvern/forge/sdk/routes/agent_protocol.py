@@ -20,7 +20,7 @@ from fastapi import (
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
 from opentelemetry import trace
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from skyvern import analytics
 from skyvern._version import __version__
@@ -135,6 +135,8 @@ from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+_create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
 
 
 class AISuggestionType(str, Enum):
@@ -639,12 +641,25 @@ async def create_workflow(
     include_in_schema=False,
 )
 async def create_workflow_from_prompt(
-    data: CreateFromPromptRequest,
+    raw_request: Request,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
-    task_version = data.task_version or "v2"
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+    if "task_version" not in body:
+        LOG.info("task_version not provided in request, defaulting to v1", organization_id=organization.organization_id)
+        body["task_version"] = "v1"
+    try:
+        data = _create_from_prompt_adapter.validate_python(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    task_version = data.task_version
     request = data.request
 
     if x_max_iterations_override or x_max_steps_override:
