@@ -57,7 +57,7 @@ from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -4501,11 +4501,21 @@ class WorkflowService:
             )
             return
 
-        if not api_key:
+        signing_api_key = api_key
+        if not signing_api_key:
+            org_api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
+                workflow_run.organization_id,
+                OrganizationAuthTokenType.api.value,
+            )
+            if org_api_key:
+                signing_api_key = org_api_key.token
+
+        if not signing_api_key:
             LOG.warning(
-                "Request has no api key. Not sending workflow response",
+                "No API key available for workflow webhook signature. Not sending workflow response",
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
             )
             return
 
@@ -4545,7 +4555,7 @@ class WorkflowService:
         payload_dict.update(workflow_run_response_dict)
         signed_data = generate_skyvern_webhook_signature(
             payload=payload_dict,
-            api_key=api_key,
+            api_key=signing_api_key,
         )
         LOG.info(
             "Sending webhook run status to webhook callback url",
