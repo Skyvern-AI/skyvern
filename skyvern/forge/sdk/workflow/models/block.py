@@ -159,6 +159,9 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
 
 # ForLoop constants
 DEFAULT_MAX_LOOP_ITERATIONS = 100
+# Persist accumulated loop output to DB every N iterations to survive timeouts.
+# Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
+PERSIST_LOOP_OUTPUT_INTERVAL = 10
 DEFAULT_MAX_STEPS_PER_ITERATION = 50
 
 
@@ -1776,6 +1779,42 @@ class ForLoopBlock(Block):
             if isinstance(block, ForLoopBlock):
                 block.validate_loop_blocks()
 
+    async def _persist_partial_loop_output(
+        self,
+        workflow_run_id: str,
+        outputs_with_loop_values: list[list[dict[str, Any]]],
+        loop_idx: int,
+    ) -> None:
+        """Persist partial for-loop output to DB so data survives Temporal
+        activity timeouts. The timeout handler runs on a different node and
+        reads from DB — without this, accumulated iteration data is lost when
+        the loop is killed mid-execution.
+
+        Uses the DB UPSERT directly instead of record_output_parameter_value
+        to avoid re-registering context parameters and emitting spurious
+        'already has a registered value' warnings on every call.
+
+        On the normal iteration path, this is called every
+        PERSIST_LOOP_OUTPUT_INTERVAL iterations and on the final iteration
+        to balance durability vs DB load. Early-return paths (failure,
+        cancellation) always persist since they are terminal."""
+        if not self.output_parameter:
+            return
+        try:
+            await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                value=outputs_with_loop_values,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to incrementally persist for-loop output",
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                loop_idx=loop_idx,
+                exc_info=True,
+            )
+
     async def execute_loop_helper(
         self,
         workflow_run_id: str,
@@ -1809,6 +1848,7 @@ class ForLoopBlock(Block):
                     organization_id=organization_id,
                 )
                 block_outputs.append(failure_block_result)
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
                 return LoopBlockExecutedResult(
                     outputs_with_loop_values=outputs_with_loop_values,
                     block_outputs=block_outputs,
@@ -1880,6 +1920,7 @@ class ForLoopBlock(Block):
                     )
                     block_outputs.append(failure_block_result)
                     outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
                     return LoopBlockExecutedResult(
                         outputs_with_loop_values=outputs_with_loop_values,
                         block_outputs=block_outputs,
@@ -1981,6 +2022,7 @@ class ForLoopBlock(Block):
                     # If next_loop_on_failure is False, stop the entire loop
                     if not self.next_loop_on_failure:
                         outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
                         return LoopBlockExecutedResult(
                             outputs_with_loop_values=outputs_with_loop_values,
                             block_outputs=block_outputs,
@@ -1998,6 +2040,7 @@ class ForLoopBlock(Block):
                         block_result=block_outputs,
                     )
                     outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
                     return LoopBlockExecutedResult(
                         outputs_with_loop_values=outputs_with_loop_values,
                         block_outputs=block_outputs,
@@ -2021,6 +2064,7 @@ class ForLoopBlock(Block):
                         next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
                     )
                     outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
                     return LoopBlockExecutedResult(
                         outputs_with_loop_values=outputs_with_loop_values,
                         block_outputs=block_outputs,
@@ -2052,6 +2096,7 @@ class ForLoopBlock(Block):
                         )
                         block_outputs.append(failure_block_result)
                         outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
                         return LoopBlockExecutedResult(
                             outputs_with_loop_values=outputs_with_loop_values,
                             block_outputs=block_outputs,
@@ -2076,6 +2121,9 @@ class ForLoopBlock(Block):
                 break
 
             outputs_with_loop_values.append(each_loop_output_values)
+            is_last_iteration = loop_idx == len(loop_over_values) - 1
+            if loop_idx % PERSIST_LOOP_OUTPUT_INTERVAL == 0 or is_last_iteration:
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
 
         return LoopBlockExecutedResult(
             outputs_with_loop_values=outputs_with_loop_values,
