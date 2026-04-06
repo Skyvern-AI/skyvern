@@ -4502,12 +4502,13 @@ class WorkflowService:
             return
 
         signing_api_key = api_key
-        org_api_key = await app.DATABASE.get_valid_org_auth_token(
-            workflow_run.organization_id,
-            OrganizationAuthTokenType.api.value,
-        )
-        if org_api_key:
-            signing_api_key = org_api_key.token
+        if not signing_api_key:
+            org_api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
+                workflow_run.organization_id,
+                OrganizationAuthTokenType.api.value,
+            )
+            if org_api_key:
+                signing_api_key = org_api_key.token
 
         if not signing_api_key:
             LOG.warning(
