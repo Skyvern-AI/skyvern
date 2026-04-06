@@ -21,6 +21,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
+from skyvern.utils.css_selector import compute_stable_selector
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
@@ -712,14 +713,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if hasattr(action, "element_id"):
                 action_data["element_id"] = action.element_id
             if hasattr(action, "skyvern_element_data") and action.skyvern_element_data:
-                # This contains xpath, tag, text, attributes — the data the reviewer
-                # needs to derive a stable selector
                 el_data = action.skyvern_element_data
-                action_data["element_tag"] = el_data.get("tag", "")
-                action_data["element_text"] = el_data.get("text", "")[:200]
+                el_attrs = el_data.get("attributes") or {}
+                action_data["element_tag"] = el_data.get("tagName", "")
+                action_data["element_text"] = (el_data.get("text") or "")[:200]
                 action_data["all_attributes"] = {
                     k: v
-                    for k, v in el_data.items()
+                    for k, v in el_attrs.items()
                     if k
                     in (
                         "id",
@@ -735,9 +735,16 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         "title",
                     )
                 }
-                xpath = action.get_xpath() if hasattr(action, "get_xpath") else None
-                if xpath:
-                    action_data["css_suggestion"] = f"xpath={xpath}"
+                # el_data already has the shape compute_stable_selector expects
+                # (tagName, attributes dict, text) — pass it directly.
+                css_sel = compute_stable_selector(el_data)
+                if css_sel:
+                    action_data["css_suggestion"] = css_sel
+                else:
+                    # Fall back to xpath only if no CSS selector can be derived
+                    xpath = action.get_xpath() if hasattr(action, "get_xpath") else None
+                    if xpath:
+                        action_data["css_suggestion"] = f"xpath={xpath}"
             if hasattr(action, "reasoning"):
                 action_data["reasoning"] = action.reasoning
 

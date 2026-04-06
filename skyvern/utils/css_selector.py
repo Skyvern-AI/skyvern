@@ -83,10 +83,11 @@ def compute_stable_selector(element_data: dict | None) -> str | None:
 
 
 def _looks_dynamic(value: str) -> bool:
-    """Heuristic: IDs with long hex/numeric suffixes are likely auto-generated."""
-    # Matches patterns like "ember123", "react-456", "el_abc123def", "uid-xxxx"
+    """Heuristic: IDs that are likely auto-generated and will change across runs."""
+    # Long hex strings (ember123, react-456, el_abc123def)
     if re.search(r"[0-9a-f]{8,}", value, re.IGNORECASE):
         return True
+    # Word-digit patterns (uid-1234, el_5678)
     if re.search(r"^\w+[-_]\d{4,}$", value):
         return True
     return False
