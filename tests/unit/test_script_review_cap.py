@@ -168,7 +168,17 @@ class TestTriggerScriptReviewerCap:
             return_value=False,
         )
         self._pin_patcher.start()
+        # Mock _get_script_review_cap to return the default cap (5) so PostHog
+        # doesn't interfere with cap arithmetic in these tests.
+        self._cap_patcher = patch.object(
+            self.service,
+            "_get_script_review_cap",
+            new_callable=AsyncMock,
+            return_value=5,
+        )
+        self._cap_patcher.start()
         yield  # type: ignore[misc]
+        self._cap_patcher.stop()
         self._pin_patcher.stop()
         CacheFactory.set_cache(self._original_cache)
 
@@ -422,3 +432,59 @@ class TestTriggerScriptReviewerCap:
 
             set_calls = [c for c in self.mock_cache.set.call_args_list if "daily_cap" in str(c)]
             assert len(set_calls) == 0
+
+
+class TestGetScriptReviewCap:
+    """Unit tests for _get_script_review_cap PostHog integration."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self) -> None:
+        from skyvern.forge import app
+
+        self.service = WorkflowService()
+        self.mock_provider = AsyncMock()
+        # AppHolder proxies to _inst; set a mock ForgeApp so attribute access works
+        self._mock_app = MagicMock()
+        self._mock_app.EXPERIMENTATION_PROVIDER = self.mock_provider
+        object.__setattr__(app, "_inst", self._mock_app)
+        yield  # type: ignore[misc]
+        object.__setattr__(app, "_inst", None)
+
+    @pytest.mark.asyncio
+    async def test_no_organization_id_returns_default(self) -> None:
+        assert await self.service._get_script_review_cap(None) == 5
+
+    @pytest.mark.asyncio
+    async def test_no_provider_returns_default(self) -> None:
+        self._mock_app.EXPERIMENTATION_PROVIDER = None
+        assert await self.service._get_script_review_cap("org_1") == 5
+
+    @pytest.mark.asyncio
+    async def test_valid_payload_returns_custom_cap(self) -> None:
+        self.mock_provider.get_payload_cached = AsyncMock(return_value="20")
+        assert await self.service._get_script_review_cap("org_1") == 20
+
+    @pytest.mark.asyncio
+    async def test_invalid_payload_returns_default(self) -> None:
+        self.mock_provider.get_payload_cached = AsyncMock(return_value="not-a-number")
+        assert await self.service._get_script_review_cap("org_1") == 5
+
+    @pytest.mark.asyncio
+    async def test_zero_returns_default(self) -> None:
+        self.mock_provider.get_payload_cached = AsyncMock(return_value="0")
+        assert await self.service._get_script_review_cap("org_1") == 5
+
+    @pytest.mark.asyncio
+    async def test_negative_returns_default(self) -> None:
+        self.mock_provider.get_payload_cached = AsyncMock(return_value="-5")
+        assert await self.service._get_script_review_cap("org_1") == 5
+
+    @pytest.mark.asyncio
+    async def test_posthog_exception_returns_default(self) -> None:
+        self.mock_provider.get_payload_cached = AsyncMock(side_effect=RuntimeError("network"))
+        assert await self.service._get_script_review_cap("org_1") == 5
+
+    @pytest.mark.asyncio
+    async def test_none_payload_returns_default(self) -> None:
+        self.mock_provider.get_payload_cached = AsyncMock(return_value=None)
+        assert await self.service._get_script_review_cap("org_1") == 5
