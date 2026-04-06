@@ -527,3 +527,53 @@ async def block_1(page, context):
         result = extract_cached_blocks_from_source(source)
         assert "only_block" in result
         assert "pass" in result["only_block"]
+
+
+class TestClassifyBlockStrategy:
+    """Tests for _classify_block_strategy template selection."""
+
+    def setup_method(self):
+        from skyvern.services.script_reviewer import ScriptReviewer
+
+        self.reviewer = ScriptReviewer()
+
+    def test_extraction_block(self):
+        """Block with page.extract() and no page.click() → extraction."""
+        code = "async def block(page, ctx):\n    return await page.extract(prompt='...')\n"
+        result = self.reviewer._classify_block_strategy(existing_code=code)
+        assert result == "extraction"
+
+    def test_extraction_with_click_is_sequential(self):
+        """Block with both extract and click → sequential (not extraction)."""
+        code = (
+            "async def block(page, ctx):\n    await page.click('#btn')\n    return await page.extract(prompt='...')\n"
+        )
+        result = self.reviewer._classify_block_strategy(existing_code=code)
+        assert result == "sequential"
+
+    def test_existing_fill_form_stays_form_filling(self):
+        """Block already using page.fill_form() stays form_filling."""
+        code = "async def block(page, ctx):\n    await page.fill_form(ctx.parameters, prompt='...')\n"
+        result = self.reviewer._classify_block_strategy(existing_code=code)
+        assert result == "form_filling"
+
+    def test_download_block_is_sequential(self):
+        """Download block should be sequential, never form_filling."""
+        code = "async def download(page, ctx):\n    await page.download_file(prompt='...')\n    await page.complete()\n"
+        result = self.reviewer._classify_block_strategy(existing_code=code)
+        assert result == "sequential"
+
+    def test_navigation_block_with_form_fields_is_sequential(self):
+        """Block on a page with form fields should still be sequential (not form_filling).
+
+        Regression guard: this data (5 form fields + form keywords in goal + form
+        action types) would have triggered the removed heuristic. Verifies it's gone.
+        """
+        code = "async def block(page, ctx):\n    await page.click('#btn')\n    await page.complete()\n"
+        result = self.reviewer._classify_block_strategy(existing_code=code)
+        assert result == "sequential"
+
+    def test_default_is_sequential(self):
+        """Empty code, no special signals → sequential."""
+        result = self.reviewer._classify_block_strategy(existing_code="")
+        assert result == "sequential"
