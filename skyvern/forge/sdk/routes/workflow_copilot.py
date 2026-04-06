@@ -66,7 +66,7 @@ class RunInfo:
 
 
 async def _get_debug_artifact(organization_id: str, workflow_run_id: str) -> Artifact | None:
-    artifacts = await app.DATABASE.get_artifacts_for_run(
+    artifacts = await app.DATABASE.artifacts.get_artifacts_for_run(
         run_id=workflow_run_id, organization_id=organization_id, artifact_types=[ArtifactType.VISIBLE_ELEMENTS_TREE]
     )
     return artifacts[0] if isinstance(artifacts, list) and artifacts else None
@@ -76,7 +76,7 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
     if not workflow_run_id:
         return None
 
-    blocks = await app.DATABASE.get_workflow_run_blocks(
+    blocks = await app.DATABASE.observer.get_workflow_run_blocks(
         workflow_run_id=workflow_run_id, organization_id=organization_id
     )
     if not blocks:
@@ -651,7 +651,7 @@ async def workflow_copilot_chat_post(
             )
 
             if chat_request.workflow_copilot_chat_id:
-                chat = await app.DATABASE.get_workflow_copilot_chat_by_id(
+                chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
                     organization_id=organization.organization_id,
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                 )
@@ -660,12 +660,12 @@ async def workflow_copilot_chat_post(
                 if chat_request.workflow_permanent_id != chat.workflow_permanent_id:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wrong workflow permanent ID")
             else:
-                chat = await app.DATABASE.create_workflow_copilot_chat(
+                chat = await app.DATABASE.workflow_params.create_workflow_copilot_chat(
                     organization_id=organization.organization_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                 )
 
-            chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(
+            chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             )
             global_llm_context = None
@@ -719,20 +719,20 @@ async def workflow_copilot_chat_post(
                 return
 
             if updated_workflow and chat.auto_accept is not True:
-                await app.DATABASE.update_workflow_copilot_chat(
+                await app.DATABASE.workflow_params.update_workflow_copilot_chat(
                     organization_id=chat.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     proposed_workflow=updated_workflow.model_dump(mode="json"),
                 )
 
-            await app.DATABASE.create_workflow_copilot_chat_message(
+            await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 sender=WorkflowCopilotChatSender.USER,
                 content=chat_request.message,
             )
 
-            assistant_message = await app.DATABASE.create_workflow_copilot_chat_message(
+            assistant_message = await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 sender=WorkflowCopilotChatSender.AI,
@@ -791,12 +791,14 @@ async def workflow_copilot_chat_history(
     workflow_permanent_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowCopilotChatHistoryResponse:
-    latest_chat = await app.DATABASE.get_latest_workflow_copilot_chat(
+    latest_chat = await app.DATABASE.workflow_params.get_latest_workflow_copilot_chat(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )
     if latest_chat:
-        chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(latest_chat.workflow_copilot_chat_id)
+        chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
+            latest_chat.workflow_copilot_chat_id
+        )
     else:
         chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
@@ -814,7 +816,7 @@ async def workflow_copilot_clear_proposed_workflow(
     clear_request: WorkflowCopilotClearProposedWorkflowRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
-    updated_chat = await app.DATABASE.update_workflow_copilot_chat(
+    updated_chat = await app.DATABASE.workflow_params.update_workflow_copilot_chat(
         organization_id=organization.organization_id,
         workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
         proposed_workflow=None,

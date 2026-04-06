@@ -109,9 +109,9 @@ async def test_batch_actions_preserve_per_task_ordering() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
-        mock_app.DATABASE.get_workflow_run_blocks = AsyncMock(return_value=[run_block_a, run_block_b])
-        mock_app.DATABASE.get_tasks_by_ids = AsyncMock(return_value=[mock_task_a, mock_task_b])
-        mock_app.DATABASE.get_tasks_actions = AsyncMock(return_value=all_actions_descending)
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[run_block_a, run_block_b])
+        mock_app.DATABASE.tasks.get_tasks_by_ids = AsyncMock(return_value=[mock_task_a, mock_task_b])
+        mock_app.DATABASE.tasks.get_tasks_actions = AsyncMock(return_value=all_actions_descending)
 
         result = await transform_workflow_run_to_code_gen_input(workflow_run_id="wr_test", organization_id="org_test")
 
@@ -187,9 +187,9 @@ async def test_batch_actions_without_reverse_would_be_wrong() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
-        mock_app.DATABASE.get_workflow_run_blocks = AsyncMock(return_value=[run_block])
-        mock_app.DATABASE.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
-        mock_app.DATABASE.get_tasks_actions = AsyncMock(return_value=actions_descending)
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[run_block])
+        mock_app.DATABASE.tasks.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
+        mock_app.DATABASE.tasks.get_tasks_actions = AsyncMock(return_value=actions_descending)
 
         result = await transform_workflow_run_to_code_gen_input(workflow_run_id="wr_test", organization_id="org_test")
 
@@ -250,9 +250,9 @@ async def test_batch_actions_preserve_none_element_id() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
-        mock_app.DATABASE.get_workflow_run_blocks = AsyncMock(return_value=[run_block])
-        mock_app.DATABASE.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
-        mock_app.DATABASE.get_tasks_actions = AsyncMock(return_value=[action_extract])
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[run_block])
+        mock_app.DATABASE.tasks.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
+        mock_app.DATABASE.tasks.get_tasks_actions = AsyncMock(return_value=[action_extract])
 
         result = await transform_workflow_run_to_code_gen_input(workflow_run_id="wr_test", organization_id="org_test")
 

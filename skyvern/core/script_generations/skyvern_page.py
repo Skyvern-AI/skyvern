@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import structlog
 from playwright.async_api import Frame, Locator, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
 from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
@@ -200,6 +201,59 @@ class SkyvernPage(Page):
         if ctx:
             ctx.script_llm_call_count += 1
 
+    async def _wait_for_selector_with_retry(
+        self,
+        selector: str,
+        timeout: float = 5000,
+        max_retries: int = 2,
+        retry_interval: float = 1.0,
+    ) -> Locator:
+        """Wait for a CSS selector to match an element in the DOM, retrying on failure.
+
+        When a page action triggers a redirect or slow render (e.g. SSO login flow),
+        the next selector may not exist yet.  This method retries the selector lookup
+        a few times with short waits, giving the page time to settle before falling
+        back to the expensive AI path.
+
+        Only retries when the element is NOT in the DOM (TimeoutError from wait_for).
+        Once an element is found, it's returned immediately — no retries on interaction
+        failures, which avoids the risk of double-clicking or double-submitting.
+
+        Returns the located element, or raises TimeoutError if all retries fail.
+        """
+        # Only retry for code_v2 scripts. Code v1 scripts have different
+        # execution patterns and haven't been tested with retries.
+        ctx = skyvern_context.current()
+        if not ctx or ctx.code_version != 2:
+            max_retries = 0
+
+        locator = self._locator_scope.locator(selector).first
+        for attempt in range(1 + max_retries):
+            try:
+                # First attempt uses full timeout; retries use a shorter check
+                # since we're just waiting for a redirect/render to complete.
+                attempt_timeout = timeout if attempt == 0 else min(timeout, 2000)
+                await locator.wait_for(state="attached", timeout=attempt_timeout)
+                return locator
+            except Exception as exc:
+                # Only retry on element-not-found (timeout) or navigation errors
+                # (execution context destroyed). Non-transient errors (browser
+                # crashed, page closed) are re-raised immediately.
+                is_transient = isinstance(exc, PlaywrightTimeoutError) or "execution context" in str(exc).lower()
+                if attempt < max_retries and is_transient:
+                    LOG.info(
+                        "Selector not found, retrying after wait",
+                        selector=selector[:120],
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                        retry_interval=retry_interval,
+                    )
+                    await asyncio.sleep(retry_interval)
+                    # Re-acquire locator in case the DOM was replaced entirely
+                    locator = self._locator_scope.locator(selector).first
+                else:
+                    raise
+
     async def _prepare_element(self, locator: Any, timeout: float = 5000) -> None:
         """Prepare an element for interaction, matching agent-level robustness.
 
@@ -314,9 +368,12 @@ class SkyvernPage(Page):
         if ai == "fallback":
             # try to click the element with the original selector first
             error_to_raise = None
+            original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
-                    locator = self._locator_scope.locator(selector).first
+                    # Retry selector lookup to handle page transitions (redirects,
+                    # slow renders) before burning an expensive AI fallback call.
+                    locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
                     await self._prepare_element(locator, timeout=timeout)
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
@@ -351,6 +408,8 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    failed_selector=original_selector or "",
+                    block_label=self.current_label,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -887,6 +946,7 @@ class SkyvernPage(Page):
         if ai == "fallback":
             error_to_raise = None
             original_value = value
+            original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
                     value = await self.get_actual_value(
@@ -894,7 +954,9 @@ class SkyvernPage(Page):
                         totp_identifier=totp_identifier,
                         totp_url=totp_url,
                     )
-                    locator = self._locator_scope.locator(selector).first
+                    # Retry selector lookup to handle page transitions (redirects,
+                    # slow renders) before burning an expensive AI fallback call.
+                    locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
                     await self._prepare_element(locator, timeout=timeout)
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
@@ -920,6 +982,8 @@ class SkyvernPage(Page):
                     totp_identifier=totp_identifier,
                     totp_url=totp_url,
                     timeout=timeout,
+                    failed_selector=original_selector or "",
+                    block_label=self.current_label,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -1258,7 +1322,15 @@ class SkyvernPage(Page):
             ```
         """
         data = kwargs.pop("data", None)
-        return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
+        skip_refresh = kwargs.pop("skip_refresh", False)
+        return await self._ai.ai_extract(
+            prompt=prompt,
+            schema=schema,
+            error_code_mapping=error_code_mapping,
+            intention=intention,
+            data=data,
+            skip_refresh=skip_refresh,
+        )
 
     async def validate(
         self,
@@ -1526,7 +1598,7 @@ class SkyvernPage(Page):
                         field_index=idx,
                         value=str(value)[:50],
                         options_count=len(field.get("options", [])),
-                        option_labels=[o.get("label", "?")[:30] for o in field.get("options", [])],
+                        option_labels=[(o.get("label") or "?")[:30] for o in field.get("options", [])],
                     )
                     if isinstance(value, str):
                         try:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, select, update
+from sqlalchemy import and_, delete, distinct, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -374,12 +374,34 @@ class ScriptsRepository(BaseRepository):
             ).first()
             return convert_to_script_file(script_file) if script_file else None
 
+    @db_operation("get_script_file_by_content_hash")
+    async def get_script_file_by_content_hash(
+        self,
+        script_id: str,
+        organization_id: str,
+        content_hash: str,
+    ) -> ScriptFile | None:
+        """Find the most recent ScriptFile with a matching content_hash across all revisions of a script."""
+        async with self.Session() as session:
+            script_file = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_id=script_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(content_hash=content_hash)
+                    .order_by(ScriptFileModel.created_at.desc())
+                    .limit(1)
+                )
+            ).first()
+            return convert_to_script_file(script_file) if script_file else None
+
     @db_operation("update_script_file")
     async def update_script_file(
         self,
         script_file_id: str,
         organization_id: str,
         artifact_id: str | None = None,
+        content_hash: str | None = None,
     ) -> ScriptFile:
         async with self.Session() as session:
             script_file = (
@@ -390,6 +412,8 @@ class ScriptsRepository(BaseRepository):
             if script_file:
                 if artifact_id:
                     script_file.artifact_id = artifact_id
+                if content_hash is not None:
+                    script_file.content_hash = content_hash
                 await session.commit()
                 await session.refresh(script_file)
                 return convert_to_script_file(script_file)
@@ -699,12 +723,18 @@ class ScriptsRepository(BaseRepository):
         page_size: int = 50,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
-    ) -> tuple[list[WorkflowRunModel], int, dict[str, int]]:
-        """Get workflow runs associated with a script, with total count and status counts.
+    ) -> tuple[list[WorkflowRunModel], int, dict[str, int], float | None]:
+        """Get workflow runs associated with a script, with total count, status counts,
+        and average AI fallbacks per run.
 
-        Returns (runs, total_count, status_counts) where runs is limited by page_size,
-        total_count is derived from the status_counts GROUP BY, and status_counts is a
-        GROUP BY aggregation of statuses across all runs.
+        Includes actual script runs (run_with='code', 'code_v2', or NULL), excluding
+        explicit agent runs. run_with is NULL when the workflow ran in auto mode and
+        should_run_script() resolved to code via fallback (e.g. code_version >= 1).
+
+        Returns (runs, total_count, status_counts, avg_fallbacks_per_run) where runs
+        is limited by page_size, total_count is derived from the status_counts GROUP BY,
+        status_counts is a GROUP BY aggregation of statuses across all runs, and
+        avg_fallbacks_per_run is the average number of fallback episodes per run.
 
         If created_after/created_before are provided, filters by the workflow_script
         entry's created_at (not the run's created_at), scoping to the version that
@@ -730,10 +760,19 @@ class ScriptsRepository(BaseRepository):
                     WorkflowScriptModel.created_at < created_before,
                 )
 
-            # Base filter for workflow runs
+            # Base filter for workflow runs - only include actual script runs.
+            # run_with may be NULL when the workflow ran in auto mode and
+            # should_run_script() resolved to code mode via fallback (e.g.
+            # code_version >= 1 or adaptive_caching). NULL is therefore
+            # treated as a code run here; explicit "agent" runs are excluded
+            # by not appearing in the workflow_scripts join above.
             base_filters = [
                 WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
                 WorkflowRunModel.organization_id == organization_id,
+                or_(
+                    WorkflowRunModel.run_with.in_(["code", "code_v2"]),
+                    WorkflowRunModel.run_with.is_(None),
+                ),
             ]
 
             # Count statuses via GROUP BY (also gives us total_count)
@@ -744,7 +783,7 @@ class ScriptsRepository(BaseRepository):
             total_count = sum(status_counts.values())
 
             if total_count == 0:
-                return [], 0, {}
+                return [], 0, {}, None
 
             # Get the actual workflow runs (paginated)
             runs_query = (
@@ -755,7 +794,27 @@ class ScriptsRepository(BaseRepository):
             )
             runs = list((await session.scalars(runs_query)).all())
 
-            return runs, total_count, status_counts
+            # Compute average AI fallbacks per run over the last 20 runs.
+            max_fallback_sample = 20
+            recent_run_ids = (
+                select(WorkflowRunModel.workflow_run_id)
+                .filter(*base_filters)
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(max_fallback_sample)
+            )
+            total_fallbacks_result = await session.execute(
+                select(func.count())
+                .select_from(ScriptFallbackEpisodeModel)
+                .filter(
+                    ScriptFallbackEpisodeModel.workflow_run_id.in_(recent_run_ids),
+                    ScriptFallbackEpisodeModel.organization_id == organization_id,
+                )
+            )
+            total_fallbacks = total_fallbacks_result.scalar() or 0
+            sample_size = min(total_count, max_fallback_sample)
+            avg_fallbacks_per_run = round(total_fallbacks / sample_size, 2)
+
+            return runs, total_count, status_counts, avg_fallbacks_per_run
 
     @db_operation("get_script_run_stats")
     async def get_script_run_stats(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
@@ -155,6 +156,13 @@ def build_action_summary(action: Action) -> dict:
         "intention": action.intention,
         "reasoning": action.reasoning,
         "status": action.status,
+        # Strip query params from URL — they can contain OAuth tokens, email
+        # addresses, session IDs. The reviewer only needs host+path for redirect detection.
+        "page_url": (
+            f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if (raw_url := elem.get("page_url")) and (parsed := urlparse(raw_url)).netloc
+            else None
+        ),
         "field": (action.input_or_select_context.field if action.input_or_select_context else None),
         # Legacy: 6 core attributes (kept for backward compat with older templates)
         "element_attributes": (

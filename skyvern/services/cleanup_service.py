@@ -53,12 +53,12 @@ async def check_running_tasks_or_workflows() -> tuple[bool, int, int]:
         stale_threshold = settings.CLEANUP_STALE_TASK_THRESHOLD_HOURS
 
         # Check tasks
-        active_tasks, stale_tasks = await app.DATABASE.get_running_tasks_info_globally(
+        active_tasks, stale_tasks = await app.DATABASE.tasks.get_running_tasks_info_globally(
             stale_threshold_hours=stale_threshold
         )
 
         # Check workflow runs
-        active_workflows, stale_workflows = await app.DATABASE.get_running_workflow_runs_info_globally(
+        active_workflows, stale_workflows = await app.DATABASE.workflow_runs.get_running_workflow_runs_info_globally(
             stale_threshold_hours=stale_threshold
         )
 

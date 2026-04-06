@@ -204,7 +204,7 @@ class ForgeAgent:
                 LOG.info("No browser state found for workflow run, setting task url to empty string")
                 task_url = ""
 
-        task = await app.DATABASE.create_task(
+        task = await app.DATABASE.tasks.create_task(
             url=task_url,
             task_type=task_block.task_type,
             complete_criterion=task_block.complete_criterion,
@@ -244,13 +244,13 @@ class ForgeAgent:
             task_retry=task_retry,
         )
         # Update task status to running
-        task = await app.DATABASE.update_task(
+        task = await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=task.organization_id,
             status=TaskStatus.running,
         )
 
-        step = await app.DATABASE.create_step(
+        step = await app.DATABASE.tasks.create_step(
             task.task_id,
             order=0,
             retry_index=0,
@@ -270,14 +270,14 @@ class ForgeAgent:
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
         # validate browser session id
         if task_request.browser_session_id:
-            browser_session = await app.DATABASE.get_persistent_browser_session(
+            browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
                 session_id=task_request.browser_session_id,
                 organization_id=organization_id,
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
 
-        task = await app.DATABASE.create_task(
+        task = await app.DATABASE.tasks.create_task(
             url=str(task_request.url),
             title=task_request.title,
             webhook_callback_url=webhook_callback_url,
@@ -345,7 +345,7 @@ class ForgeAgent:
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=task.workflow_run_id,
                 organization_id=organization.organization_id,
             )
@@ -381,7 +381,9 @@ class ForgeAgent:
                 )
                 return step, None, None
 
-        refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
+        refreshed_task = await app.DATABASE.tasks.get_task(
+            task_id=task.task_id, organization_id=organization.organization_id
+        )
         if refreshed_task:
             task = refreshed_task
 
@@ -413,7 +415,7 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
         if max_steps_per_run and task.max_steps_per_run != max_steps_per_run:
-            await app.DATABASE.update_task(
+            await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
                 organization_id=organization.organization_id,
                 max_steps_per_run=max_steps_per_run,
@@ -938,7 +940,7 @@ class ForgeAgent:
                     # Only pass new errors — update_task() appends to existing errors
                     if detected_errors:
                         new_errors = [error.model_dump() for error in detected_errors]
-                        await app.DATABASE.update_task(
+                        await app.DATABASE.tasks.update_task(
                             task_id=task.task_id,
                             organization_id=task.organization_id,
                             errors=new_errors,
@@ -1321,7 +1323,7 @@ class ForgeAgent:
                         action_order=action_idx,
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
-                    action.action_id = (await app.DATABASE.create_action(action=action)).action_id
+                    action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
                     await self.record_artifacts_after_action(task, step, browser_state, engine, action)
                     break
 
@@ -1570,7 +1572,7 @@ class ForgeAgent:
             ):
                 working_page = await browser_state.must_get_working_page()
                 # refresh task in case the extracted information is updated previously
-                refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+                refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
                 assert refreshed_task is not None
                 task = refreshed_task
                 extract_action = await self.create_extract_action(task, step, scraped_page)
@@ -1664,7 +1666,7 @@ class ForgeAgent:
             cached_tokens = first_response.usage.input_tokens_details.cached_tokens or 0
             reasoning_tokens = first_response.usage.output_tokens_details.reasoning_tokens or 0
             llm_cost = (3.0 / 1000000) * input_tokens + (12.0 / 1000000) * output_tokens
-            await app.DATABASE.update_step(
+            await app.DATABASE.tasks.update_step(
                 task_id=task.task_id,
                 step_id=step.step_id,
                 organization_id=task.organization_id,
@@ -1777,7 +1779,7 @@ class ForgeAgent:
         cached_tokens = current_response.usage.input_tokens_details.cached_tokens or 0
         reasoning_tokens = current_response.usage.output_tokens_details.reasoning_tokens or 0
         llm_cost = (3.0 / 1000000) * input_tokens + (12.0 / 1000000) * output_tokens
-        await app.DATABASE.update_step(
+        await app.DATABASE.tasks.update_step(
             task_id=task.task_id,
             step_id=step.step_id,
             organization_id=task.organization_id,
@@ -2107,7 +2109,7 @@ class ForgeAgent:
             or incremental_reasoning_tokens is not None
             or incremental_cached_tokens is not None
         ):
-            await app.DATABASE.update_step(
+            await app.DATABASE.tasks.update_step(
                 task_id=step.task_id,
                 step_id=step.step_id,
                 organization_id=step.organization_id,
@@ -2452,7 +2454,7 @@ class ForgeAgent:
                 )
             else:
                 try:
-                    await app.DATABASE.update_action_screenshot_artifact_id(
+                    await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
                         organization_id=action.organization_id,
                         action_id=action.action_id,
                         screenshot_artifact_id=screenshot_artifact_id,
@@ -3406,7 +3408,7 @@ class ForgeAgent:
         Find the last successful ScrapeAction for the task and return the extracted information.
         """
         # TODO: make sure we can get extracted information with the ExtractAction change
-        steps = await app.DATABASE.get_task_steps(
+        steps = await app.DATABASE.tasks.get_task_steps(
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
@@ -3439,7 +3441,7 @@ class ForgeAgent:
         Find the TerminateAction for the task and return the reasoning.
         # TODO (kerem): Also return meaningful exceptions when we add them [WYV-311]
         """
-        steps = await app.DATABASE.get_task_steps(
+        steps = await app.DATABASE.tasks.get_task_steps(
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
@@ -3475,7 +3477,9 @@ class ForgeAgent:
         """
         # refresh the task from the db to get the latest status
         try:
-            refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+            refreshed_task = await app.DATABASE.tasks.get_task(
+                task_id=task.task_id, organization_id=task.organization_id
+            )
             if not refreshed_task:
                 LOG.error("Failed to get task from db when clean up task", task_id=task.task_id)
                 raise TaskNotFound(task_id=task.task_id)
@@ -3579,7 +3583,7 @@ class ForgeAgent:
                 task_id=task.task_id,
             )
             return
-        last_step = await app.DATABASE.get_latest_step(task.task_id, organization_id=task.organization_id)
+        last_step = await app.DATABASE.tasks.get_latest_step(task.task_id, organization_id=task.organization_id)
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
         # try to build the new TaskRunResponse for backward compatibility
@@ -3622,7 +3626,7 @@ class ForgeAgent:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
-                await app.DATABASE.update_task(
+                await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
                     organization_id=task.organization_id,
                     webhook_failure_reason="",
@@ -3635,7 +3639,7 @@ class ForgeAgent:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
-                await app.DATABASE.update_task(
+                await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
                     organization_id=task.organization_id,
                     webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
@@ -3665,7 +3669,7 @@ class ForgeAgent:
         downloaded_files: list[FileInfo] | None = None
 
         # get the artifact of the screenshot and get the screenshot_url
-        screenshot_artifact = await app.DATABASE.get_artifact(
+        screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
             task_id=task.task_id,
             step_id=last_step.step_id,
             artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -3689,9 +3693,11 @@ class ForgeAgent:
                 LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
 
         if recording_url is None:
-            first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+            first_step = await app.DATABASE.tasks.get_first_step(
+                task_id=task.task_id, organization_id=task.organization_id
+            )
             if first_step:
-                recording_artifact = await app.DATABASE.get_artifact(
+                recording_artifact = await app.DATABASE.artifacts.get_artifact(
                     task_id=task.task_id,
                     step_id=first_step.step_id,
                     artifact_type=ArtifactType.RECORDING,
@@ -3701,7 +3707,7 @@ class ForgeAgent:
                     recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
-        latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
+        latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
             task_id=task.task_id,
             organization_id=task.organization_id,
             artifact_types=[ArtifactType.SCREENSHOT_ACTION],
@@ -3737,7 +3743,7 @@ class ForgeAgent:
                 )
 
         if need_browser_log:
-            browser_console_log = await app.DATABASE.get_latest_artifact(
+            browser_console_log = await app.DATABASE.artifacts.get_latest_artifact(
                 task_id=task.task_id,
                 artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
                 organization_id=task.organization_id,
@@ -3746,7 +3752,7 @@ class ForgeAgent:
                 browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
 
         # get the latest task from the db to get the latest status, extracted_information, and failure_reason
-        task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if not task_from_db:
             LOG.error("Failed to get task from db when sending task response")
             raise TaskNotFound(task_id=task.task_id)
@@ -3886,7 +3892,7 @@ class ForgeAgent:
 
         await save_step_logs(step.step_id)
 
-        return await app.DATABASE.update_step(
+        return await app.DATABASE.tasks.update_step(
             task_id=step.task_id,
             step_id=step.step_id,
             organization_id=step.organization_id,
@@ -3904,7 +3910,7 @@ class ForgeAgent:
         failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
-        task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if task_from_db:
             task = task_from_db
 
@@ -3944,7 +3950,7 @@ class ForgeAgent:
 
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
-        return await app.DATABASE.update_task(
+        return await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
@@ -3990,7 +3996,7 @@ class ForgeAgent:
             name=f"verify_goal_{step.step_id}",
         )
 
-        next_step = await app.DATABASE.create_step(
+        next_step = await app.DATABASE.tasks.create_step(
             task_id=task.task_id,
             order=step.order + 1,
             retry_index=0,
@@ -4297,7 +4303,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            next_step = await app.DATABASE.create_step(
+            next_step = await app.DATABASE.tasks.create_step(
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 order=step.order,
@@ -4316,7 +4322,7 @@ class ForgeAgent:
         llm_errors: list[str] = []
 
         try:
-            steps = await app.DATABASE.get_task_steps(
+            steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
             for step_cnt, step in enumerate(steps):
@@ -4434,7 +4440,7 @@ class ForgeAgent:
         steps_without_actions = 0
 
         try:
-            steps = await app.DATABASE.get_task_steps(
+            steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
 
@@ -4722,7 +4728,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            next_step = await app.DATABASE.create_step(
+            next_step = await app.DATABASE.tasks.create_step(
                 task_id=task.task_id,
                 order=step.order + 1,
                 retry_index=0,
@@ -4843,7 +4849,7 @@ class ForgeAgent:
         if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             workflow_id = workflow_permanent_id = None
             if task.workflow_run_id:
-                workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
                 if workflow_run:
                     workflow_id = workflow_run.workflow_id
                     workflow_permanent_id = workflow_run.workflow_permanent_id
@@ -4891,7 +4897,7 @@ class ForgeAgent:
 
     @staticmethod
     async def get_task_errors(task: Task) -> list[UserDefinedError]:
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+        steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         errors = []
         for step in steps:
             if step.output and step.output.errors:
@@ -4907,7 +4913,7 @@ class ForgeAgent:
         step_errors = detailed_step_output.extract_errors() or []
         task_errors.extend([error.model_dump() for error in step_errors])
 
-        return await app.DATABASE.update_task(
+        return await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=task.organization_id,
             errors=task_errors,
@@ -4962,7 +4968,7 @@ class ForgeAgent:
         """
         Run the extraction flow when a task with a data extraction goal completes during parallel verification.
         """
-        refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+        refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
         if refreshed_task:
             task = refreshed_task
 

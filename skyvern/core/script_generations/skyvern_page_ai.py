@@ -14,6 +14,8 @@ class SkyvernPageAi(Protocol):
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention."""
         ...
@@ -27,6 +29,8 @@ class SkyvernPageAi(Protocol):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
         ...
@@ -61,6 +65,7 @@ class SkyvernPageAi(Protocol):
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
+        skip_refresh: bool = False,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
         ...
@@ -76,6 +81,8 @@ class SkyvernPageAi(Protocol):
     async def ai_act(
         self,
         prompt: str,
+        skip_refresh: bool = False,
+        use_economy_tree: bool = False,
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         ...

@@ -40,8 +40,16 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,  # noqa: ARG002 — accepted for Protocol compat, no episode recording in library path
+        block_label: str | None = None,  # noqa: ARG002
     ) -> str | None:
-        """Click an element using AI via API call."""
+        """Click an element using AI via API call.
+
+        Note: failed_selector/block_label are accepted for SkyvernPageAi Protocol
+        compatibility but intentionally ignored. The library path (SDK/CLI) lacks
+        the workflow context (code_version, workflow_run_id, DB) needed to create
+        fallback episodes. Episode recording lives in real_skyvern_page_ai.py.
+        """
 
         LOG.info("AI click", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
@@ -69,6 +77,8 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,  # noqa: ARG002 — Protocol compat, see ai_click docstring
+        block_label: str | None = None,  # noqa: ARG002
     ) -> str:
         """Input text into an element using AI via API call."""
 
@@ -156,8 +166,14 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
+        skip_refresh: bool = False,
     ) -> dict[str, Any] | list | str | None:
-        """Extract information from the page using AI via API call."""
+        """Extract information from the page using AI via API call.
+
+        Note: skip_refresh is accepted for Protocol compatibility but not forwarded
+        to the API. The server-side always refreshes when called via the SDK HTTP path.
+        The optimization only takes effect on the direct RealSkyvernPageAI path (MCP local browser).
+        """
 
         LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
 
@@ -208,8 +224,15 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     async def ai_act(
         self,
         prompt: str,
+        skip_refresh: bool = False,
+        use_economy_tree: bool = False,
     ) -> None:
-        """Perform an action on the page using AI via API call."""
+        """Perform an action on the page using AI via API call.
+
+        Note: skip_refresh and use_economy_tree are accepted for Protocol compatibility
+        but not forwarded to the API. The optimizations only take effect on the direct
+        RealSkyvernPageAI path (MCP local browser).
+        """
 
         LOG.info("AI act", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
 

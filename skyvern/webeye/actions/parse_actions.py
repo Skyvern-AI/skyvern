@@ -76,6 +76,13 @@ def parse_action(
     intention = action["user_detail_query"] if "user_detail_query" in action else None
     response = action["user_detail_answer"] if "user_detail_answer" in action else None
 
+    # Inject the page URL into element data so the script reviewer can detect
+    # URL changes between consecutive actions (e.g. SSO redirects).
+    if skyvern_element_data is not None:
+        skyvern_element_data = {**skyvern_element_data, "page_url": scraped_page.url}
+    else:
+        skyvern_element_data = {"page_url": scraped_page.url}
+
     base_action_dict = {
         "element_id": element_id,
         "skyvern_element_hash": skyvern_element_hash,
@@ -847,7 +854,7 @@ async def generate_cua_fallback_actions(
             assistant_message=assistant_message,
             reasoning=reasoning,
         )
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             extracted_information=assistant_message,

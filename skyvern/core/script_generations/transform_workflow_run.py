@@ -71,7 +71,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
     workflow_definition_blocks = workflow.workflow_definition.blocks
 
     # get workflow run blocks for task execution data
-    workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
+    workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
         workflow_run_id=workflow_run_id, organization_id=organization_id
     )
     workflow_run_blocks.sort(key=lambda x: x.created_at)
@@ -93,7 +93,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
     if all_task_ids:
         task_ids_list = list(all_task_ids)
         # Single query for all tasks
-        tasks = await app.DATABASE.get_tasks_by_ids(task_ids=task_ids_list, organization_id=organization_id)
+        tasks = await app.DATABASE.tasks.get_tasks_by_ids(task_ids=task_ids_list, organization_id=organization_id)
         tasks_by_id = {task.task_id: task for task in tasks}
         LOG.debug(
             "Batch fetched tasks for code gen",
@@ -102,7 +102,9 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         )
 
         # Single query for all actions (returns desc order for timeline; reverse for chronological)
-        all_actions = await app.DATABASE.get_tasks_actions(task_ids=task_ids_list, organization_id=organization_id)
+        all_actions = await app.DATABASE.tasks.get_tasks_actions(
+            task_ids=task_ids_list, organization_id=organization_id
+        )
         all_actions.reverse()
         for action in all_actions:
             if action.task_id:

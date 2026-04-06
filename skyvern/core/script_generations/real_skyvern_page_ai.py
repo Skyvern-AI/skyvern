@@ -163,8 +163,18 @@ class RealSkyvernPageAi(SkyvernPageAi):
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str | None:
-        """Click an element using AI to locate it based on intention."""
+        """Click an element using AI to locate it based on intention.
+
+        Args:
+            failed_selector: The original CSS selector that failed before falling
+                back to AI. Used to record an element-level fallback episode so
+                the script reviewer can fix the selector. Only set when called from
+                the ai='fallback' path in skyvern_page.py.
+            block_label: The cached block label (from SkyvernPage.current_label).
+        """
         try:
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
@@ -174,7 +184,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
             organization_id = context.organization_id if context else None
             step_id = context.step_id if context else None
-            step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+            step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
             single_click_prompt = prompt_engine.load_prompt(
                 template="single-click-action",
                 navigation_goal=intention,
@@ -199,7 +209,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     "The element may not exist on the current page."
                 )
             task_id = context.task_id if context else None
-            task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
+            task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
             if organization_id and task and step:
                 actions = parse_actions(
                     task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
@@ -210,6 +220,20 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     raise Exception(result[-1].exception_message)
                 xpath = action.get_xpath()
                 selector = f"xpath={xpath}" if xpath else selector
+
+                # Record element-level fallback episode for the script reviewer (code_v2 only).
+                # This fires when a cached script's selector failed (or was missing) and
+                # ai_click succeeded. The episode gives the reviewer the AI-found action data
+                # so it can write a proper selector.
+                await self._record_element_fallback_episode(
+                    context=context,
+                    action_type="click",
+                    failed_selector=failed_selector,
+                    intention=intention,
+                    action=action,
+                    block_label=block_label,
+                )
+
                 return selector
         except Exception:
             LOG.exception(
@@ -233,6 +257,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        failed_selector: str | None = None,
+        block_label: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
 
@@ -244,8 +270,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         task_id = context.task_id
         step_id = context.step_id
         workflow_run_id = context.workflow_run_id
-        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+        task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
 
         if intention:
             try:
@@ -349,6 +375,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
+            await self._record_element_fallback_episode(
+                context=context,
+                action_type="fill",
+                failed_selector=failed_selector,
+                intention=intention,
+                action=action,
+                block_label=block_label,
+            )
         else:
             locator = self.page.locator(selector)
             await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
@@ -367,13 +401,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         context = skyvern_context.ensure_context()
         files = files or ""
+        original_files = files
         action: UploadFileAction | None = None
         organization_id = context.organization_id
         task_id = context.task_id
         step_id = context.step_id
         workflow_run_id = context.workflow_run_id
-        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+        task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
 
         if intention:
             try:
@@ -445,6 +480,15 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
 
+        if action and original_files and action.file_url and action.file_url != original_files:
+            LOG.warning(
+                "LLM returned a different file url than the user provided, using the original",
+                llm_file_url=action.file_url[:20],
+                original_file_url=original_files[:20],
+            )
+            action.file_url = original_files
+            files = original_files
+
         if public_url_only and not validate_download_url(files, organization_id=organization_id):
             raise Exception("Only public URLs are allowed")
 
@@ -468,8 +512,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         option_value = value or ""
         context = skyvern_context.current()
         if context and context.task_id and context.step_id and context.organization_id:
-            task = await app.DATABASE.get_task(context.task_id, organization_id=context.organization_id)
-            step = await app.DATABASE.get_step(context.step_id, organization_id=context.organization_id)
+            task = await app.DATABASE.tasks.get_task(context.task_id, organization_id=context.organization_id)
+            step = await app.DATABASE.tasks.get_step(context.step_id, organization_id=context.organization_id)
             if intention and task and step:
                 try:
                     prompt = context.prompt if context else None
@@ -600,7 +644,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         step = None
         organization_id = context.organization_id if context else None
         if context and context.organization_id and context.step_id:
-            step = await app.DATABASE.get_step(
+            step = await app.DATABASE.tasks.get_step(
                 step_id=context.step_id,
                 organization_id=context.organization_id,
             )
@@ -635,6 +679,94 @@ class RealSkyvernPageAi(SkyvernPageAi):
         self._store_classify_result(result)
         return result
 
+    async def _record_element_fallback_episode(
+        self,
+        context: skyvern_context.SkyvernContext,
+        action_type: str,
+        failed_selector: str | None,
+        intention: str,
+        action: Any,
+        block_label: str | None = None,
+    ) -> None:
+        """Record an element-level fallback episode when ai_click/ai_input_text fires
+        because a CSS selector failed or was missing. Gated on code_version >= 2.
+
+        This gives the script reviewer the signal AND the action data (css_suggestion,
+        element attributes) it needs to write a proper selector for the next script version.
+        """
+        if failed_selector is None:
+            # None means the caller didn't pass failed_selector — this is a direct
+            # ai_click call (not from the ai='fallback' path), so don't record.
+            return
+        if (context.code_version or 0) < 2:
+            return
+        if not context.workflow_run_id or not context.workflow_permanent_id:
+            return
+        try:
+            # Build agent_actions data for the reviewer
+            action_data: dict[str, Any] = {
+                "action_type": action_type,
+                "intention": intention,
+                "failed_selector": failed_selector if failed_selector else "(missing — no selector= argument)",
+            }
+            if hasattr(action, "element_id"):
+                action_data["element_id"] = action.element_id
+            if hasattr(action, "skyvern_element_data") and action.skyvern_element_data:
+                # This contains xpath, tag, text, attributes — the data the reviewer
+                # needs to derive a stable selector
+                el_data = action.skyvern_element_data
+                action_data["element_tag"] = el_data.get("tag", "")
+                action_data["element_text"] = el_data.get("text", "")[:200]
+                action_data["all_attributes"] = {
+                    k: v
+                    for k, v in el_data.items()
+                    if k
+                    in (
+                        "id",
+                        "name",
+                        "class",
+                        "aria-label",
+                        "placeholder",
+                        "type",
+                        "role",
+                        "data-testid",
+                        "href",
+                        "value",
+                        "title",
+                    )
+                }
+                xpath = action.get_xpath() if hasattr(action, "get_xpath") else None
+                if xpath:
+                    action_data["css_suggestion"] = f"xpath={xpath}"
+            if hasattr(action, "reasoning"):
+                action_data["reasoning"] = action.reasoning
+
+            error_msg = (
+                f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
+                f"AI fallback succeeded. "
+                f"Original selector: {failed_selector or '(none)'}. "
+                f"Intention: {intention}"
+            )
+            await app.DATABASE.scripts.create_fallback_episode(
+                organization_id=context.organization_id or "",
+                workflow_permanent_id=context.workflow_permanent_id,
+                workflow_run_id=context.workflow_run_id,
+                block_label=block_label or self.current_label or "unknown",
+                fallback_type="element",
+                script_revision_id=context.script_revision_id,
+                error_message=error_msg,
+                page_url=self.page.url,
+                agent_actions=action_data,
+            )
+            LOG.info(
+                "Recorded element fallback episode for selector failure",
+                block_label=block_label or self.current_label,
+                action_type=action_type,
+                failed_selector=failed_selector,
+            )
+        except Exception:
+            LOG.warning("Failed to record element fallback episode for selector failure", exc_info=True)
+
     @staticmethod
     def _store_classify_result(result: str) -> None:
         """Store the classify result on SkyvernContext for fallback episode recording."""
@@ -652,7 +784,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if not context or not context.organization_id or not context.workflow_permanent_id:
                 return
             block_label = self.current_label or "unknown"
-            await app.DATABASE.record_branch_hit(
+            await app.DATABASE.scripts.record_branch_hit(
                 organization_id=context.organization_id,
                 workflow_permanent_id=context.workflow_permanent_id,
                 block_label=block_label,
@@ -724,7 +856,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         # Record an element fallback episode for the feedback loop
         if context.workflow_run_id and context.workflow_permanent_id:
             try:
-                await app.DATABASE.create_fallback_episode(
+                await app.DATABASE.scripts.create_fallback_episode(
                     organization_id=context.organization_id,
                     workflow_permanent_id=context.workflow_permanent_id,
                     workflow_run_id=context.workflow_run_id,
@@ -759,10 +891,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
+        skip_refresh: bool = False,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
-        await self._refresh_scraped_page(take_screenshots=True)
+        if not skip_refresh:
+            await self._refresh_scraped_page(take_screenshots=True)
         context = skyvern_context.current()
         tz_info = datetime.now(tz=timezone.utc).tzinfo
         if context and context.tz_info:
@@ -782,7 +916,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         )
         step = None
         if context and context.organization_id and context.task_id and context.step_id:
-            step = await app.DATABASE.get_step(
+            step = await app.DATABASE.tasks.get_step(
                 step_id=context.step_id,
                 organization_id=context.organization_id,
             )
@@ -858,7 +992,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         step = None
         if context.organization_id and context.task_id and context.step_id:
-            step = await app.DATABASE.get_step(
+            step = await app.DATABASE.tasks.get_step(
                 step_id=context.step_id,
                 organization_id=context.organization_id,
             )
@@ -927,6 +1061,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
     async def ai_act(
         self,
         prompt: str,
+        skip_refresh: bool = False,
+        use_economy_tree: bool = False,
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         context = skyvern_context.ensure_context()
@@ -934,8 +1070,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         task_id = context.task_id
         step_id = context.step_id
 
-        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+        task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.tasks.get_step(step_id, organization_id) if step_id and organization_id else None
 
         if not task or not step:
             LOG.warning("ai_act: missing task or step", task_id=task_id, step_id=step_id)
@@ -976,8 +1112,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
             reasoning=action_info.get("reasoning"),
         )
 
-        await self._refresh_scraped_page(take_screenshots=False)
-        element_tree = self.scraped_page.build_element_tree()
+        if not skip_refresh:
+            await self._refresh_scraped_page(take_screenshots=False)
+        if use_economy_tree and self.scraped_page.support_economy_elements_tree():
+            element_tree = self.scraped_page.build_economy_elements_tree()
+        else:
+            element_tree = self.scraped_page.build_element_tree()
 
         template: str
         llm_handler: Any
@@ -997,13 +1137,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
 
+        local_datetime = datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat()
         single_action_prompt = prompt_engine.load_prompt(
             template=template,
             navigation_goal=prompt,
             navigation_payload_str=None,
             current_url=self.page.url,
             elements=element_tree,
-            local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+            local_datetime=local_datetime,
         )
 
         try:
@@ -1015,6 +1156,29 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
             actions_json = action_response.get("actions", [])
+            if not actions_json and use_economy_tree:
+                LOG.info(
+                    "ai_act: economy tree returned no actions, retrying with full tree",
+                    prompt=prompt,
+                    action_type=action_type,
+                )
+                await self._refresh_scraped_page(take_screenshots=False)
+                element_tree = self.scraped_page.build_element_tree()
+                single_action_prompt = prompt_engine.load_prompt(
+                    template=template,
+                    navigation_goal=prompt,
+                    navigation_payload_str=None,
+                    current_url=self.page.url,
+                    elements=element_tree,
+                    local_datetime=local_datetime,
+                )
+                action_response = await llm_handler(
+                    prompt=single_action_prompt,
+                    prompt_name=template,
+                    step=step,
+                    organization_id=organization_id,
+                )
+                actions_json = action_response.get("actions", [])
             if not actions_json:
                 LOG.warning("ai_act: no actions generated", prompt=prompt, action_type=action_type)
                 return

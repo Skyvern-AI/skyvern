@@ -452,7 +452,7 @@ class AgentFunction:
         if not has_valid_step_status:
             reasons.append(f"invalid_step_status:{step.status}")
         # can't execute if the task has another step that is running
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+        steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         has_no_running_steps = not any(step.status == StepStatus.running for step in steps)
         if not has_no_running_steps:
             reasons.append(f"another_step_is_running_for_task:{task.task_id}")

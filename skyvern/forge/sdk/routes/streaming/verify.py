@@ -117,7 +117,7 @@ async def verify_task(
     with it.
     """
 
-    task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+    task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
 
     if not task:
         LOG.info("Task not found.", task_id=task_id, organization_id=organization_id)
@@ -171,7 +171,7 @@ async def verify_workflow_run(
     with it.
     """
 
-    workflow_run = await app.DATABASE.get_workflow_run(
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )

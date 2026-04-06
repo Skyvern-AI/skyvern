@@ -339,7 +339,7 @@ class TestCachedBlockPreservationDuringRegeneration:
             )
 
             # The output should contain branch A's cached code
-            assert "branch_a_extract" in result, (
+            assert "branch_a_extract" in result.source_code, (
                 "Cached block from unexecuted branch A should be preserved in the script output"
             )
 
@@ -403,7 +403,7 @@ class TestCachedBlockPreservationDuringRegeneration:
             )
 
             # Incomplete block should NOT appear in the output
-            assert "incomplete_block" not in result
+            assert "incomplete_block" not in result.source_code
 
             # create_or_update_script_block should NOT be called for incomplete block
             incomplete_calls = [
@@ -626,9 +626,9 @@ class TestCachedBlockPreservationDuringRegeneration:
             )
 
             # Both branch A and B should be preserved
-            assert "branch_a_extract" in result, "Branch A cached block should be preserved"
-            assert "branch_b_navigate" in result, "Branch B cached block should be preserved"
-            assert "branch_c_extract" in result, "Branch C (executed) block should be present"
+            assert "branch_a_extract" in result.source_code, "Branch A cached block should be preserved"
+            assert "branch_b_navigate" in result.source_code, "Branch B cached block should be preserved"
+            assert "branch_c_extract" in result.source_code, "Branch C (executed) block should be present"
 
             # Verify DB entries were created for all 3 blocks + __start_block__
             all_labels = {call.kwargs.get("block_label") for call in mock_create_block.call_args_list}
@@ -685,7 +685,7 @@ class TestCachedBlockPreservationDuringRegeneration:
             )
 
             # Code should still be in the output
-            assert "branch_a" in result
+            assert "branch_a" in result.source_code
 
             # But no DB calls should be made for preserved blocks
             preserved_calls = [

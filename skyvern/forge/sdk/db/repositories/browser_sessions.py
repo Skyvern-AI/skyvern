@@ -13,12 +13,10 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
-    DebugSessionModel,
     PersistentBrowserSessionModel,
 )
 from skyvern.forge.sdk.db.utils import serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
-from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
     PersistentBrowserSession,
@@ -457,19 +455,3 @@ class BrowserSessionsRepository(BaseRepository):
                 select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
             )
             return result.scalars().all()
-
-    @db_operation("get_debug_session_by_browser_session_id")
-    async def get_debug_session_by_browser_session_id(
-        self,
-        browser_session_id: str,
-        organization_id: str,
-    ) -> DebugSession | None:
-        async with self.Session() as session:
-            query = (
-                select(DebugSessionModel)
-                .filter_by(browser_session_id=browser_session_id)
-                .filter_by(organization_id=organization_id)
-                .filter_by(deleted_at=None)
-            )
-            model = (await session.scalars(query)).first()
-            return DebugSession.model_validate(model) if model else None
