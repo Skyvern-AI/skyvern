@@ -5318,6 +5318,7 @@ class WorkflowService:
             # runaway revision churn when the same issue repeats every run.
             cap_exceeded = await self._check_script_review_cap(
                 workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
             )
             if cap_exceeded:
                 LOG.info(
@@ -5374,7 +5375,50 @@ class WorkflowService:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         return f"script_reviewer:daily_cap:{workflow_permanent_id}:{today}"
 
-    async def _check_script_review_cap(self, workflow_permanent_id: str) -> bool:
+    async def _get_script_review_cap(self, organization_id: str | None) -> int:
+        """Return the effective daily script-review cap for an organization.
+
+        Checks PostHog for a per-org override via the ``script_review_daily_cap``
+        feature flag payload.  Falls back to ``settings.SCRIPT_REVIEW_DAILY_CAP``
+        (default 5) when PostHog is unavailable, the flag is unset, or the
+        payload is not a valid integer.
+        """
+        default_cap: int = settings.SCRIPT_REVIEW_DAILY_CAP
+        if not organization_id or not app.EXPERIMENTATION_PROVIDER:
+            return default_cap
+
+        try:
+            # Use organization_id as distinct_id (not a run-level ID) because this
+            # is an org-level feature flag — same cap for all runs in this org.
+            payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
+                "script_review_daily_cap",
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+            if payload is not None:
+                custom_cap = int(payload)
+                if custom_cap > 0:
+                    LOG.info(
+                        "Using custom script review daily cap from PostHog",
+                        cap=custom_cap,
+                        organization_id=organization_id,
+                    )
+                    return custom_cap
+        except (ValueError, TypeError):
+            LOG.warning(
+                "Invalid script_review_daily_cap payload, using default",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+        except Exception:
+            LOG.debug(
+                "Failed to fetch script_review_daily_cap from PostHog, using default",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+        return default_cap
+
+    async def _check_script_review_cap(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
         """Check if the daily script-review cap has been reached for this wpid.
 
         Returns True if the cap is exceeded and the review should be skipped.
@@ -5388,7 +5432,8 @@ class WorkflowService:
             raw_count = await cache.get(cap_key)
             if raw_count is not None:
                 count = int(raw_count)
-                if count >= settings.SCRIPT_REVIEW_DAILY_CAP:
+                cap = await self._get_script_review_cap(organization_id)
+                if count >= cap:
                     return True
         except Exception:
             LOG.debug("Failed to check script review cap, allowing review", exc_info=True)
