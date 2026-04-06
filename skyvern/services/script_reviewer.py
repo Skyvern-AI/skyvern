@@ -662,12 +662,7 @@ class ScriptReviewer:
         function_signature = self._extract_function_signature(existing_code)
 
         # Classify strategy for this block
-        strategy = self._classify_block_strategy(
-            block_label=block_label,
-            navigation_goal=navigation_goal,
-            existing_code=existing_code,
-            episodes=episodes,
-        )
+        strategy = self._classify_block_strategy(existing_code=existing_code)
 
         # Choose template based on strategy
         if strategy == "extraction":
@@ -1024,19 +1019,21 @@ class ScriptReviewer:
 
     def _classify_block_strategy(
         self,
-        block_label: str,
-        navigation_goal: str | None,
         existing_code: str | None,
-        episodes: list[ScriptFallbackEpisode],
     ) -> Literal["form_filling", "sequential", "extraction"]:
-        """Classify a block's caching strategy based on its content.
+        """Classify a block's caching strategy based on its existing code.
 
         Rules (heuristic, no LLM call):
         1. If existing_code contains "page.extract(" without "page.click(" → "extraction"
         2. If existing_code already uses "page.fill_form(" → "form_filling"
-        3. If navigation_goal contains form-filling keywords AND
-           episodes have form_fields with 4+ fields → "form_filling"
-        4. Otherwise → "sequential"
+           (preserve classification for blocks already using the form-filling API)
+        3. Otherwise → "sequential"
+
+        Note: form_filling is NOT inferred from page content or navigation goals.
+        The form-filling template produces a FIELD_MAP dict response format that is
+        incompatible with blocks that mix clicks, navigation, and downloads. Only
+        blocks explicitly using page.fill_form() (static form scripts) should use
+        the form-filling template.
         """
         code = existing_code or ""
 
@@ -1044,43 +1041,8 @@ class ScriptReviewer:
         if "page.extract(" in code and "page.click(" not in code:
             return "extraction"
 
-        # Rule 2: Already uses fill_form (previous form-filling classification)
+        # Rule 2: Already uses fill_form (preserve existing form-filling classification)
         if "page.fill_form(" in code:
-            return "form_filling"
-
-        # Rule 3: Heuristic for form-filling based on navigation goal + episode data
-        goal = (navigation_goal or "").lower()
-        form_keywords = {"fill", "application", "form", "submit", "apply", "sign up", "register", "signup"}
-        has_form_goal = any(kw in goal for kw in form_keywords)
-
-        # Check known form hosts in episode URLs
-        form_hosts = {"lever.co", "greenhouse.io", "workday.com", "myworkdayjobs.com", "icims.com", "ashbyhq.com"}
-        has_form_url = False
-        for ep in episodes:
-            if ep.page_url:
-                if any(host in ep.page_url.lower() for host in form_hosts):
-                    has_form_url = True
-                    break
-
-        # Count form fields and form actions per episode (use max across episodes)
-        max_form_fields = 0
-        max_form_actions = 0
-        for ep in episodes:
-            if isinstance(ep.agent_actions, dict):
-                form_fields = ep.agent_actions.get("form_fields", [])
-                if isinstance(form_fields, list):
-                    max_form_fields = max(max_form_fields, len(form_fields))
-
-                ep_form_actions = 0
-                actions = ep.agent_actions.get("actions", [])
-                if isinstance(actions, list):
-                    for a in actions:
-                        if isinstance(a, dict) and a.get("action_type") in ("input_text", "select_option"):
-                            ep_form_actions += 1
-                max_form_actions = max(max_form_actions, ep_form_actions)
-
-        # Classify as form_filling if we see strong signals
-        if (has_form_goal or has_form_url) and (max_form_fields >= 4 or max_form_actions >= 4):
             return "form_filling"
 
         return "sequential"
