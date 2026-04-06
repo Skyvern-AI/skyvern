@@ -3,7 +3,6 @@ import string
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import structlog
 from opentelemetry import trace as otel_trace
 from sqlalchemy.exc import OperationalError
@@ -2067,13 +2066,14 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        timeout = httpx.Timeout(30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                task_v2.webhook_callback_url,
-                data=payload,
-                headers=headers,
-            )
+        resp = await app.AGENT_FUNCTION.deliver_webhook(
+            url=task_v2.webhook_callback_url,
+            payload=payload,
+            headers=headers,
+            timeout_seconds=30.0,
+            organization_id=task_v2.organization_id,
+            run_id=task_v2.observer_cruise_id,
+        )
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",

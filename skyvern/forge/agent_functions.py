@@ -4,6 +4,7 @@ import hashlib
 from datetime import timedelta
 from typing import Any, Dict, List
 
+import httpx
 import structlog
 from playwright.async_api import Frame, Page
 
@@ -617,6 +618,28 @@ class AgentFunction:
 
     async def post_action_execution(self, action: Action) -> None:
         pass
+
+    async def deliver_webhook(
+        self,
+        url: str,
+        payload: str,
+        headers: dict[str, str],
+        timeout_seconds: float = 30.0,
+        organization_id: str | None = None,
+        run_id: str | None = None,
+    ) -> httpx.Response:
+        """Deliver a webhook POST request to *url*.
+
+        Returns the upstream ``httpx.Response``.  Cloud override routes NAT-org
+        traffic through the egress proxy so it egresses from a static IP.
+        """
+        async with httpx.AsyncClient() as client:
+            return await client.post(
+                url,
+                content=payload,
+                headers=headers,
+                timeout=httpx.Timeout(timeout_seconds),
+            )
 
     def get_copilot_security_rules(self) -> str:
         """Return security guardrails for the workflow copilot system prompt.

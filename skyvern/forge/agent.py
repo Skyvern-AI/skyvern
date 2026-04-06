@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Tuple, cast
 
-import httpx
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
@@ -3612,13 +3611,14 @@ class ForgeAgent:
                 headers=signed_data.headers,
             )
 
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    task.webhook_callback_url,
-                    data=signed_data.signed_payload,
-                    headers=signed_data.headers,
-                    timeout=httpx.Timeout(30.0),
-                )
+            resp = await app.AGENT_FUNCTION.deliver_webhook(
+                url=task.webhook_callback_url,
+                payload=signed_data.signed_payload,
+                headers=signed_data.headers,
+                timeout_seconds=30.0,
+                organization_id=task.organization_id,
+                run_id=task.task_id,
+            )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",

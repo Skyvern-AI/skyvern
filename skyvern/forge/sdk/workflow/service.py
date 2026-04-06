@@ -12,7 +12,6 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, cast
 
-import httpx
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -4576,13 +4575,14 @@ class WorkflowService:
             headers=signed_data.headers,
         )
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    url=workflow_run.webhook_callback_url,
-                    data=signed_data.signed_payload,
-                    headers=signed_data.headers,
-                    timeout=httpx.Timeout(30.0),
-                )
+            resp = await app.AGENT_FUNCTION.deliver_webhook(
+                url=workflow_run.webhook_callback_url,
+                payload=signed_data.signed_payload,
+                headers=signed_data.headers,
+                timeout_seconds=30.0,
+                organization_id=workflow_run.organization_id,
+                run_id=workflow_run.workflow_run_id,
+            )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",

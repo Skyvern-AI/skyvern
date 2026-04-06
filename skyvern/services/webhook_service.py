@@ -250,6 +250,8 @@ async def replay_run_webhook(
         url=validated_url,
         payload=signed_data.signed_payload,
         headers=signed_data.headers,
+        organization_id=organization_id,
+        run_id=run_id,
     )
 
     return RunWebhookReplayResponse(
@@ -465,7 +467,11 @@ async def _get_api_key(organization_id: str) -> str:
 
 
 async def _deliver_webhook(
-    url: str, payload: str, headers: dict[str, str]
+    url: str,
+    payload: str,
+    headers: dict[str, str],
+    organization_id: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[int | None, int, str | None, str | None]:
     start = perf_counter()
     status_code: int | None = None
@@ -473,8 +479,14 @@ async def _deliver_webhook(
     error: str | None = None
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, content=payload, headers=headers, timeout=httpx.Timeout(60.0))
+        response = await app.AGENT_FUNCTION.deliver_webhook(
+            url=url,
+            payload=payload,
+            headers=headers,
+            timeout_seconds=60.0,
+            organization_id=organization_id,
+            run_id=run_id,
+        )
         status_code = response.status_code
         body_text = response.text or ""
         if len(body_text) > RESPONSE_BODY_TRUNCATION_LIMIT:
