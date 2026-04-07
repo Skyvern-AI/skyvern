@@ -31,7 +31,7 @@ type Props = {
   className?: string;
   fontSize?: number;
   fullHeight?: boolean;
-};
+} & Pick<React.HTMLAttributes<HTMLDivElement>, "aria-required">;
 
 const fullHeightExtension = EditorView.theme({
   "&": { height: "100%" },
@@ -49,6 +49,7 @@ function CodeEditor({
   readOnly = false,
   fontSize = 12,
   fullHeight = false,
+  ...restProps
 }: Props) {
   const viewRef = useRef<EditorView | null>(null);
   const [internalValue, setInternalValue] = useState(value);
@@ -127,6 +128,7 @@ function CodeEditor({
       readOnly={readOnly}
       className={cn("cursor-auto", className)}
       style={style}
+      {...restProps}
       onCreateEditor={(view) => {
         viewRef.current = view;
       }}

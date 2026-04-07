@@ -14,10 +14,12 @@ import {
   useToggleScheduleMutation,
   useDeleteScheduleMutation,
 } from "@/routes/workflows/hooks/useScheduleMutations";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { ScheduleCard } from "./ScheduleCard";
 import { CreateScheduleDialog } from "./CreateScheduleDialog";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
+import { useParams } from "react-router-dom";
 
 function WorkflowSchedulePanel() {
   const {
@@ -34,11 +36,16 @@ function WorkflowSchedulePanel() {
     scheduleId: string | null;
   }>({ open: false, scheduleId: null });
 
+  const { workflowPermanentId } = useParams();
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  const workflowParameters = workflow?.workflow_definition.parameters ?? [];
+
   const handleCreate = (
     cronExpression: string,
     timezone: string,
     name: string,
     description: string,
+    parameters: Record<string, unknown> | null,
     callbacks: { onSuccess: () => void },
   ) => {
     createSchedule.mutate(
@@ -48,6 +55,7 @@ function WorkflowSchedulePanel() {
         enabled: true,
         ...(name && { name }),
         ...(description && { description }),
+        ...(parameters && { parameters }),
       },
       { onSuccess: callbacks.onSuccess },
     );
@@ -75,6 +83,7 @@ function WorkflowSchedulePanel() {
           {schedules && schedules.length > 0 ? ` (${schedules.length})` : ""}
         </h3>
         <CreateScheduleDialog
+          workflowParameters={workflowParameters}
           onSubmit={handleCreate}
           isPending={createSchedule.isPending}
         />
