@@ -58,6 +58,31 @@ def test_build_action_summary_page_url_with_element_data():
     assert summary["all_attributes"]["id"] == "email"
 
 
+def test_build_action_summary_includes_selector_options():
+    """selector_options shows ALL viable selectors ranked by stability."""
+    action = Action(
+        action_type=ActionType.INPUT_TEXT,
+        status="completed",
+        intention="Fill passcode",
+        skyvern_element_data={
+            "tagName": "input",
+            "attributes": {"id": "input61", "name": "credentials.passcode", "type": "password"},
+        },
+    )
+    summary = build_action_summary(action)
+    assert summary["selector_options"] is not None
+    selectors = [s for s, _ in summary["selector_options"]]
+    assert 'input[name="credentials.passcode"]' in selectors
+    assert "#input61" in selectors
+
+
+def test_build_action_summary_selector_options_none_when_no_element():
+    """selector_options is None when no element data."""
+    action = _make_action()
+    summary = build_action_summary(action)
+    assert summary["selector_options"] is None
+
+
 def test_template_url_rendering():
     """The reviewer template renders [url: ...] and [url changed: ...] correctly."""
     from skyvern.forge.prompts import prompt_engine
