@@ -777,19 +777,18 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    # Skip scroll_into_view when a page-level SCROLL just completed on THIS element.
-    # The scroll positioned the page at the bottom to enable T&C buttons;
-    # scroll_into_view() would use programmatic window.scroll() to center the
-    # element, moving the page away from the bottom and re-disabling the button.
+    # Skip scroll_into_view when a SCROLL action just completed on THIS element.
+    # The scroll may have positioned the page or a container at the bottom to enable
+    # T&C buttons; element.scrollIntoView() would undo that positioning.
     # Uses element ID matching (not a boolean) so unrelated clicks aren't affected.
     skip_scroll_into_view = await page.evaluate(
-        "(id) => { const v = window.__skyvernPageScrolledElementId;"
-        " window.__skyvernPageScrolledElementId = null; return v === id; }",
+        "(id) => { const v = window.__skyvernScrolledElementId;"
+        " window.__skyvernScrolledElementId = null; return v === id; }",
         action.element_id,
     )
     if skip_scroll_into_view:
         LOG.info(
-            "Skipping scroll_into_view after page-level scroll to preserve scroll position",
+            "Skipping scroll_into_view after deliberate scroll action to preserve scroll position",
             element_id=skyvern_element.get_id(),
         )
     else:
@@ -2328,17 +2327,28 @@ async def handle_scroll_action(
             # Wait for page JS to process scroll events (e.g. enabling buttons)
             await page.wait_for_timeout(500)
 
-            # Record which element was just page-level scrolled. The click handler
+            # Record which element was just deliberately scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which
-            # would use programmatic window.scroll() to center it — undoing the
+            # would use element.scrollIntoView() to center it — undoing the
             # scroll position that enables buttons on T&C pages. Using the element
             # ID (not a boolean) ensures unrelated clicks aren't affected.
             await page.evaluate(
-                "(id) => { window.__skyvernPageScrolledElementId = id; }",
+                "(id) => { window.__skyvernScrolledElementId = id; }",
                 action.element_id,
             )
             return [ActionSuccess(data={"page_level_scroll": True})]
-        elif not scroll_result:
+        elif scroll_result:
+            # Sub-container was scrolled successfully. Record the element ID so
+            # the click handler skips scroll_into_view() for this element — same
+            # protection as page-level scrolls. Without this, element.scrollIntoView()
+            # would re-center the container and undo the deliberate scroll (e.g.,
+            # scrolling a T&C modal to the bottom to enable an accept button).
+            await page.evaluate(
+                "(id) => { window.__skyvernScrolledElementId = id; }",
+                action.element_id,
+            )
+            return [ActionSuccess(data={"container_scroll": True})]
+        else:
             LOG.warning(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
