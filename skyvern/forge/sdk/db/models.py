@@ -352,7 +352,7 @@ class WorkflowScheduleModel(Base):
     timezone = Column(String, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
     parameters = Column(JSON, nullable=True)
-    temporal_schedule_id = Column(String, nullable=True)
+    backend_schedule_id = Column("temporal_schedule_id", String, nullable=True)
     name = Column(String, nullable=True)
     description = Column(String, nullable=True)
 
