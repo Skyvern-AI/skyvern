@@ -340,7 +340,8 @@ class WorkflowsRepository(BaseRepository):
 
         Search semantics:
         - If `search_key` is provided, its value is used as a unified search term for
-          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value).
+          `workflows.title`, `workflows.workflow_permanent_id`, `folders.title`, and
+          workflow parameter metadata (key, description, and default_value).
         - If `search_key` is not provided, no search filtering is applied.
         - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
         """
@@ -395,6 +396,7 @@ class WorkflowsRepository(BaseRepository):
                 search_like = f"%{search_key}%"
                 title_like = WorkflowModel.title.ilike(search_like)
                 folder_title_like = FolderModel.title.ilike(search_like)
+                workflow_permanent_id_like = WorkflowModel.workflow_permanent_id.icontains(search_key, autoescape=True)
 
                 parameter_filters = [
                     # WorkflowParameterModel
@@ -516,7 +518,9 @@ class WorkflowsRepository(BaseRepository):
                         )
                     ),
                 ]
-                main_query = main_query.where(or_(title_like, folder_title_like, or_(*parameter_filters)))
+                main_query = main_query.where(
+                    or_(title_like, folder_title_like, workflow_permanent_id_like, or_(*parameter_filters))
+                )
             main_query = (
                 main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             )

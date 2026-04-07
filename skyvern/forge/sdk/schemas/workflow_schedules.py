@@ -5,7 +5,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class WorkflowSchedule(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    # populate_by_name + serialize_by_alias keep the wire format stable at
+    # `temporal_schedule_id` (the already-deployed name external clients see)
+    # while the Python attribute stays backend-agnostic.
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+        serialize_by_alias=True,
+    )
 
     workflow_schedule_id: str
     organization_id: str
@@ -14,7 +21,7 @@ class WorkflowSchedule(BaseModel):
     timezone: str
     enabled: bool
     parameters: dict[str, Any] | None = None
-    temporal_schedule_id: str | None = None
+    backend_schedule_id: str | None = Field(default=None, alias="temporal_schedule_id")
     name: str | None = None
     description: str | None = None
     created_at: datetime
@@ -23,6 +30,14 @@ class WorkflowSchedule(BaseModel):
 
 
 class OrganizationScheduleItem(BaseModel):
+    """Compact schedule projection for the org-wide list endpoint.
+
+    Intentionally omits `backend_schedule_id` — the list view is for browsing
+    schedules in the dashboard, not for managing the underlying execution-backend
+    binding. Callers that need the backend id should fetch the individual
+    schedule via the per-workflow get endpoint.
+    """
+
     workflow_schedule_id: str
     organization_id: str
     workflow_permanent_id: str
@@ -70,3 +85,16 @@ class OrganizationScheduleListResponse(BaseModel):
     total_count: int
     page: int
     page_size: int
+
+
+class DeleteScheduleResponse(BaseModel):
+    ok: bool
+
+
+class WorkflowScheduleUpsertRequest(BaseModel):
+    cron_expression: str
+    timezone: str
+    enabled: bool = True
+    parameters: dict[str, Any] | None = None
+    name: str | None = None
+    description: str | None = None
