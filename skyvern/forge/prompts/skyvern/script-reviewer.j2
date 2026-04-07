@@ -110,7 +110,9 @@ The cached code failed and the AI agent took over. Here is what happened:
 {% for a in episode.agent_actions.actions %}
   {{ loop.index }}. {{ a.action_type }}: {{ a.intention or a.reasoning or "N/A" }} ({{ a.status }})
 {%- if a.page_url and loop.first %} [url: {{ a.page_url }}]{% endif %}
-{%- if a.page_url and not loop.first and a.page_url != ns.prev_url %} [url changed: {{ a.page_url }}]{% endif %}
+{%- if a.page_url and not loop.first and a.page_url != ns.prev_url and a.seconds_since_previous and a.seconds_since_previous > 3 %} [after step {{ loop.index - 1 }}, page navigated to {{ a.page_url }} — {{ a.seconds_since_previous }}s since last action]
+{%- elif a.page_url and not loop.first and a.page_url != ns.prev_url %} [after step {{ loop.index - 1 }}, page navigated to {{ a.page_url }}]
+{%- elif a.seconds_since_previous and a.seconds_since_previous > 3 %} [{{ a.seconds_since_previous }}s since last action]{% endif %}
 {%- if a.field %} [field: {{ a.field }}]{% endif %}
 {%- if a.element_tag %} [tag: {{ a.element_tag }}]{% endif %}
 {%- if a.element_text %} [text: "{{ a.element_text }}"]{% endif %}
