@@ -437,7 +437,13 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter(effective_status.in_(status))
 
             if search_key:
-                query = query.filter(TaskRunModel.searchable_text.icontains(search_key, autoescape=True))
+                query = query.filter(
+                    or_(
+                        TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
+                        TaskRunModel.run_id.icontains(search_key, autoescape=True),
+                        TaskRunModel.workflow_permanent_id.icontains(search_key, autoescape=True),
+                    )
+                )
 
             offset = (page - 1) * page_size
             query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
