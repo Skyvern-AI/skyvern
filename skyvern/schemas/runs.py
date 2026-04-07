@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -382,7 +382,7 @@ class TaskRunRequest(BaseModel):
         examples=TASK_URL_EXAMPLES,
     )
     engine: RunEngine = Field(
-        default=RunEngine.skyvern_v2,
+        default=RunEngine.skyvern_v1,
         description=TASK_ENGINE_DOC_STRING,
     )
     title: str | None = Field(
@@ -481,6 +481,12 @@ class TaskRunRequest(BaseModel):
             return url
 
         return validate_url(url)
+
+    @model_validator(mode="after")
+    def _force_v2_for_publish_workflow(self) -> TaskRunRequest:
+        if self.publish_workflow and self.engine != RunEngine.skyvern_v2:
+            self.engine = RunEngine.skyvern_v2
+        return self
 
 
 class WorkflowRunRequest(BaseModel):
