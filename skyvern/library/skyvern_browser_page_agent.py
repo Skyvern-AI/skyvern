@@ -36,7 +36,7 @@ class SkyvernBrowserPageAgent:
     async def run_task(
         self,
         prompt: str,
-        engine: RunEngine = RunEngine.skyvern_v2,
+        engine: RunEngine = RunEngine.skyvern_v1,
         model: dict[str, Any] | None = None,
         url: str | None = None,
         webhook_url: str | None = None,
@@ -53,7 +53,7 @@ class SkyvernBrowserPageAgent:
 
         Args:
             prompt: Natural language description of the task to perform.
-            engine: The execution engine to use. Defaults to skyvern_v2.
+            engine: The execution engine to use. Defaults to skyvern_v1.
             model: LLM model configuration options.
             url: URL to navigate to. If not provided, uses the current page URL.
             webhook_url: URL to receive webhook notifications about task progress.

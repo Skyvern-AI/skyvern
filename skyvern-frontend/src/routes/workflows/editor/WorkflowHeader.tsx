@@ -37,7 +37,6 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { cn } from "@/util/utils";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
 
@@ -99,7 +98,6 @@ function WorkflowHeader({
   const { data: workflowRun } = useWorkflowRunQuery();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
-  const schedulesEnabled = useFeatureFlag("WORKFLOW_SCHEDULES");
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const [chosenCacheKeyValue, setChosenCacheKeyValue] = useState<string | null>(
@@ -400,22 +398,20 @@ function WorkflowHeader({
                 </Tooltip>
               </TooltipProvider>
             )}
-            {schedulesEnabled && (
-              <Button
-                disabled={isRecording}
-                variant="tertiary"
-                size="lg"
-                onClick={onScheduleClick}
-              >
-                <ClockIcon className="mr-2 h-5 w-5" />
-                <span className="mr-2">Schedule</span>
-                {schedulesPanelOpen ? (
-                  <ChevronUpIcon className="h-6 w-6" />
-                ) : (
-                  <ChevronDownIcon className="h-6 w-6" />
-                )}
-              </Button>
-            )}
+            <Button
+              disabled={isRecording}
+              variant="tertiary"
+              size="lg"
+              onClick={onScheduleClick}
+            >
+              <ClockIcon className="mr-2 h-5 w-5" />
+              <span className="mr-2">Schedule</span>
+              {schedulesPanelOpen ? (
+                <ChevronUpIcon className="h-6 w-6" />
+              ) : (
+                <ChevronDownIcon className="h-6 w-6" />
+              )}
+            </Button>
             <Button
               disabled={isRecording}
               variant="tertiary"

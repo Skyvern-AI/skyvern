@@ -1014,6 +1014,16 @@ class ScriptSkyvernPage(SkyvernPage):
             if context.script_mode:
                 print("  ⏭ Skipping complete() verification (--no-verify)")
             return
+
+        # In script mode, add a settle delay before verification. Scripts execute
+        # actions sequentially with no pause — page.complete() fires immediately
+        # after the last click/fill. The page may still be mid-redirect or
+        # rendering the post-action state. In agent mode, the step loop naturally
+        # introduces 5-15 seconds of latency (re-scrape + LLM processing) which
+        # gives the page time to settle. This delay bridges that gap.
+        if (context.code_version or 0) >= 2:
+            await asyncio.sleep(3)
+
         task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
         step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
         if task and step:

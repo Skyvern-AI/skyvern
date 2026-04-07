@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,6 +12,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PlusIcon } from "@radix-ui/react-icons";
+import type { Parameter } from "@/routes/workflows/types/workflowTypes";
+import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
+import { buildScheduleParametersPayload } from "@/routes/workflows/components/scheduleParameters";
+import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
 import {
   CRON_PRESETS,
   cronToHumanReadable,
@@ -24,24 +28,48 @@ import {
 import { cn } from "@/util/utils";
 
 type Props = {
+  workflowParameters: ReadonlyArray<Parameter>;
   onSubmit: (
     cronExpression: string,
     timezone: string,
     name: string,
     description: string,
+    parameters: Record<string, unknown> | null,
     callbacks: { onSuccess: () => void },
   ) => void;
   isPending?: boolean;
 };
 
-function CreateScheduleDialog({ onSubmit, isPending }: Props) {
+function CreateScheduleDialog({
+  workflowParameters,
+  onSubmit,
+  isPending,
+}: Readonly<Props>) {
   const [open, setOpen] = useState(false);
   const [cronExpression, setCronExpression] = useState("0 9 * * *");
   const [timezone, setTimezone] = useState(getLocalTimezone);
-  // TODO - Create shared util
   const [timezoneFilter, setTimezoneFilter] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const {
+    values: parameters,
+    errors: parameterErrors,
+    handleChange: handleParameterChange,
+    validate: validateParameters,
+    reset: resetParameters,
+  } = useScheduleParameterState(workflowParameters);
+
+  // Re-seed parameter state if the workflow definition resolves after mount
+  // (e.g., the query was still loading when this dialog mounted) or if the
+  // workflow's parameters change while the dialog is closed. Also re-fires
+  // when the workflowParameters reference changes so newly-arrived
+  // definitions get seeded with their defaults. Skipped while the dialog is
+  // open so we don't clobber user input mid-edit.
+  useEffect(() => {
+    if (!open) {
+      resetParameters();
+    }
+  }, [open, workflowParameters, resetParameters]);
 
   const allTimezones = useMemo(() => getTimezones(), []);
   const filteredTimezones = useMemo(() => {
@@ -50,28 +78,43 @@ function CreateScheduleDialog({ onSubmit, isPending }: Props) {
     const lower = timezoneFilter.toLowerCase();
     return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
   }, [allTimezones, timezoneFilter]);
-  // ! end TODO
 
   const valid = isValidCron(cronExpression);
   const humanReadable = valid ? cronToHumanReadable(cronExpression) : null;
   const nextRuns = valid ? getNextRuns(cronExpression, timezone, 5) : [];
 
-  const handleSubmit = () => {
-    if (!valid) return;
-    onSubmit(cronExpression, timezone, name, description, {
+  function resetFormState() {
+    setCronExpression("0 9 * * *");
+    setTimezone(getLocalTimezone());
+    setTimezoneFilter(null);
+    setName("");
+    setDescription("");
+    resetParameters();
+  }
+
+  function handleSubmit() {
+    const parametersValid = validateParameters();
+    if (!valid || !parametersValid) return;
+    const payload = buildScheduleParametersPayload(
+      parameters,
+      workflowParameters,
+    );
+    onSubmit(cronExpression, timezone, name, description, payload, {
       onSuccess: () => {
         setOpen(false);
-        setCronExpression("0 9 * * *");
-        setTimezone(getLocalTimezone());
-        setTimezoneFilter(null);
-        setName("");
-        setDescription("");
+        resetFormState();
       },
     });
-  };
+  }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) resetFormState();
+      }}
+    >
       <DialogTrigger asChild>
         <Button variant="outline" size="sm" className="h-8 gap-1.5">
           <PlusIcon className="size-3" />
@@ -87,7 +130,6 @@ function CreateScheduleDialog({ onSubmit, isPending }: Props) {
         </DialogHeader>
 
         <div className="space-y-6 py-4">
-          {/* Schedule Name & Description */}
           <div className="space-y-2">
             <Label>Name (optional)</Label>
             <Input
@@ -105,7 +147,14 @@ function CreateScheduleDialog({ onSubmit, isPending }: Props) {
             />
           </div>
 
-          {/* Cron Presets */}
+          <ScheduleParametersSection
+            parameters={workflowParameters}
+            values={parameters}
+            onChange={handleParameterChange}
+            errors={parameterErrors}
+            disabled={isPending}
+          />
+
           <div className="space-y-2">
             <Label>Quick Presets</Label>
             <div className="flex flex-wrap gap-2">
@@ -126,7 +175,6 @@ function CreateScheduleDialog({ onSubmit, isPending }: Props) {
             </div>
           </div>
 
-          {/* Custom Cron Input */}
           <div className="space-y-2">
             <Label>Cron Expression</Label>
             <Input
@@ -145,7 +193,6 @@ function CreateScheduleDialog({ onSubmit, isPending }: Props) {
             )}
           </div>
 
-          {/* Timezone Selector */}
           <div className="space-y-2">
             <Label>Timezone</Label>
             <Input
@@ -192,7 +239,6 @@ function CreateScheduleDialog({ onSubmit, isPending }: Props) {
             <p className="text-xs text-slate-500">Current: {timezone}</p>
           </div>
 
-          {/* Next Runs Preview */}
           {nextRuns.length > 0 && (
             <div className="space-y-2">
               <Label>Next Scheduled Runs</Label>

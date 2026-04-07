@@ -123,7 +123,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.utils.css_selector import build_action_summary  # shared with script_service
+from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
 
@@ -1124,6 +1124,14 @@ class WorkflowService:
                     blocks_to_update=blocks_to_update,
                     finalize=True,  # Force regeneration to ensure field mappings have complete action data
                     has_conditionals=has_conditionals,
+                )
+            else:
+                LOG.info(
+                    "Skipping post-run script generation due to run status",
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    pre_finally_status=pre_finally_status,
+                    blocks_to_update_count=len(blocks_to_update),
                 )
 
             # Trigger AI Script Reviewer for adaptive caching workflows
@@ -2282,7 +2290,7 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = [build_action_summary(a) for a in actions[:20]]
+                                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",
@@ -2441,7 +2449,9 @@ class WorkflowService:
                         "For-loop child blocks marked for caching",
                         parent_label=block.label,
                         child_labels=new_labels,
+                        child_count=len(new_labels),
                         workflow_run_id=workflow_run_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
                     )
 
             workflow_run, should_stop = await self._handle_block_result_status(
@@ -5052,7 +5062,8 @@ class WorkflowService:
             block_labels=block_labels,
             code_gen=code_gen,
             workflow_run_id=workflow_run.workflow_run_id,
-            blocks_to_update=list(blocks_to_update),
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            blocks_to_update_count=len(blocks_to_update),
         )
 
         if block_labels and not code_gen:
@@ -5210,17 +5221,27 @@ class WorkflowService:
                     updated_block_labels=blocks_to_update,
                 )
 
-                # If generation failed (e.g. syntax error), clean up the empty script row
-                # to avoid orphaned versions that skip version numbers on next regeneration.
+                # If generation failed (e.g. syntax error, S3/DB contention), clean up
+                # the empty script row to avoid orphaned versions that skip version
+                # numbers AND to prevent later runs from finding a published revision
+                # with zero blocks (the empty_blocks_detected regression from SKY-8757).
+                # Check BOTH files and blocks — a revision with main.py but zero
+                # script_block rows still fails code-mode execution.
                 script_files = await app.DATABASE.scripts.get_script_files(
                     script_revision_id=regenerated_script.script_revision_id,
                     organization_id=workflow.organization_id,
                 )
-                if not script_files:
+                script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
+                    script_revision_id=regenerated_script.script_revision_id,
+                    organization_id=workflow.organization_id,
+                )
+                if not script_files or not script_blocks:
                     LOG.warning(
-                        "Script generation produced no files, soft-deleting empty version",
+                        "Script generation produced no files or no blocks, soft-deleting empty version",
                         script_id=regenerated_script.script_id,
                         version=regenerated_script.version,
+                        script_file_count=len(script_files),
+                        script_block_count=len(script_blocks),
                     )
                     await app.DATABASE.scripts.soft_delete_script_by_revision(
                         script_revision_id=regenerated_script.script_revision_id,
@@ -5271,6 +5292,14 @@ class WorkflowService:
                 await _regenerate_script()
             return
 
+        LOG.debug(
+            "Creating new cached script (first run for this cache key)",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            cache_key_value=rendered_cache_key_value,
+            blocks_to_update_count=len(blocks_to_update),
+        )
+
         created_script = await app.DATABASE.scripts.create_script(
             organization_id=workflow.organization_id,
             run_id=workflow_run.workflow_run_id,
@@ -5284,6 +5313,32 @@ class WorkflowService:
             cached_script=None,
             updated_block_labels=None,
         )
+
+        # Mirror the regeneration path's post-write guard: if this first-time
+        # generation produced no files or no blocks, soft-delete the empty revision
+        # so it can't be observed by subsequent runs. (SKY-8757 follow-up.)
+        script_files = await app.DATABASE.scripts.get_script_files(
+            script_revision_id=created_script.script_revision_id,
+            organization_id=workflow.organization_id,
+        )
+        script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
+            script_revision_id=created_script.script_revision_id,
+            organization_id=workflow.organization_id,
+        )
+        if not script_files or not script_blocks:
+            LOG.warning(
+                "First-time script generation produced no files or no blocks, soft-deleting empty version",
+                script_id=created_script.script_id,
+                version=created_script.version,
+                script_file_count=len(script_files),
+                script_block_count=len(script_blocks),
+            )
+            await app.DATABASE.scripts.soft_delete_script_by_revision(
+                script_revision_id=created_script.script_revision_id,
+                organization_id=workflow.organization_id,
+            )
+            return
+
         aio_task_primary_key = f"{created_script.script_id}_{created_script.version}"
         if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
             aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]

@@ -18,10 +18,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { useQuery } from "@tanstack/react-query";
-import { getClient } from "@/api/AxiosClient";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useScheduleDetailQuery } from "./useScheduleDetailQuery";
 import {
   useDeleteOrgScheduleMutation,
@@ -39,12 +36,22 @@ import {
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import { cn } from "@/util/utils";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
+import {
+  buildScheduleParametersPayload,
+  formatScheduleParameterValue,
+  hasUserFacingParameters,
+  isScheduleParameter,
+} from "@/routes/workflows/components/scheduleParameters";
+import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
+import type { Parameter } from "@/routes/workflows/types/workflowTypes";
+
+const allTimezones = getTimezones();
 
 function ScheduleDetailPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { workflowPermanentId, scheduleId } = useParams();
-  const credentialGetter = useCredentialGetter();
   const { data, isLoading, isError } = useScheduleDetailQuery(
     workflowPermanentId,
     scheduleId,
@@ -52,15 +59,8 @@ function ScheduleDetailPage() {
 
   const titleFromState = (location.state as { workflowTitle?: string })
     ?.workflowTitle;
-  const { data: workflow } = useQuery<WorkflowApiResponse>({
-    queryKey: ["workflow", workflowPermanentId],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      return client
-        .get(`/workflows/${workflowPermanentId}`)
-        .then((r) => r.data);
-    },
-    enabled: !!workflowPermanentId && !titleFromState,
+  const { data: workflow, isSuccess: workflowLoaded } = useWorkflowQuery({
+    workflowPermanentId,
   });
   const workflowTitle =
     titleFromState || workflow?.title || workflowPermanentId || "Schedule";
@@ -82,13 +82,27 @@ function ScheduleDetailPage() {
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
 
-  const allTimezones = useMemo(() => getTimezones(), []);
+  const workflowParameters: ReadonlyArray<Parameter> = useMemo(
+    () => workflow?.workflow_definition.parameters ?? [],
+    [workflow],
+  );
+  const {
+    values: editParameters,
+    errors: parameterErrors,
+    handleChange: handleParameterChange,
+    validate: validateParameters,
+    reset: resetParameters,
+  } = useScheduleParameterState(
+    workflowParameters,
+    data?.schedule.parameters ?? null,
+  );
+
   const filteredTimezones = useMemo(() => {
     if (timezoneFilter === null) return allTimezones;
     if (!timezoneFilter) return allTimezones;
     const lower = timezoneFilter.toLowerCase();
     return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
-  }, [allTimezones, timezoneFilter]);
+  }, [timezoneFilter]);
   // ! end TODO
 
   const editValid = isValidCron(editCron);
@@ -120,16 +134,30 @@ function ScheduleDetailPage() {
     setTimezoneFilter(null);
     setEditName(schedule.name ?? "");
     setEditDescription(schedule.description ?? "");
+    resetParameters();
     setEditing(true);
   }
 
   function cancelEditing() {
     setEditing(false);
     setTimezoneFilter(null);
+    // Drop any in-progress parameter edits so they don't reappear on
+    // re-entry; re-seed from the stored schedule values.
+    resetParameters();
   }
 
   function handleSave() {
-    if (!editValid || !workflowPermanentId || !scheduleId) return;
+    if (!workflowPermanentId || !scheduleId) return;
+    const parametersValid = validateParameters();
+    if (!editValid || !parametersValid) return;
+    // Only persist explicitly-set overrides. The form is seeded from
+    // workflow defaults, so blindly sending the whole values dict would
+    // pin the current default into the schedule and change semantics from
+    // "use workflow default at execution time" to "freeze current default".
+    const payload = buildScheduleParametersPayload(
+      editParameters,
+      workflowParameters,
+    );
     updateMutation.mutate(
       {
         workflowPermanentId,
@@ -138,7 +166,7 @@ function ScheduleDetailPage() {
           cron_expression: editCron,
           timezone: editTimezone,
           enabled: schedule.enabled,
-          parameters: schedule.parameters,
+          parameters: payload,
           ...(editName && { name: editName }),
           description: editDescription || undefined,
         },
@@ -246,6 +274,10 @@ function ScheduleDetailPage() {
                 size="sm"
                 className="h-7 gap-1.5 px-2 text-xs"
                 onClick={startEditing}
+                disabled={!workflowLoaded}
+                title={
+                  workflowLoaded ? undefined : "Loading workflow definition..."
+                }
               >
                 <Pencil1Icon className="size-3" />
                 Edit
@@ -276,6 +308,14 @@ function ScheduleDetailPage() {
                   className="h-8 text-sm"
                 />
               </div>
+
+              <ScheduleParametersSection
+                parameters={workflowParameters}
+                values={editParameters}
+                onChange={handleParameterChange}
+                errors={parameterErrors}
+                disabled={updateMutation.isPending}
+              />
 
               {/* Cron Presets */}
               <div className="space-y-2">
@@ -453,6 +493,50 @@ function ScheduleDetailPage() {
               </div>
             </div>
           </div>
+
+          {hasUserFacingParameters(workflowParameters) && (
+            <div className="rounded-lg border border-slate-700 p-4">
+              <h3 className="mb-4 text-sm text-slate-400">
+                Workflow Parameters
+              </h3>
+              <div className="space-y-2">
+                {workflowParameters
+                  .filter(isScheduleParameter)
+                  .map((parameter) => {
+                    const storedValue = schedule.parameters?.[parameter.key];
+                    const hasValue =
+                      storedValue !== undefined && storedValue !== null;
+                    return (
+                      <div
+                        key={parameter.key}
+                        className="flex items-start justify-between gap-4"
+                      >
+                        <span className="font-mono text-xs text-slate-400">
+                          {parameter.key}
+                        </span>
+                        <span className="max-w-[60%] truncate text-right text-xs text-slate-50">
+                          {hasValue ? (
+                            formatScheduleParameterValue(storedValue)
+                          ) : parameter.default_value !== null &&
+                            parameter.default_value !== undefined ? (
+                            <span className="italic text-slate-500">
+                              default:{" "}
+                              {formatScheduleParameterValue(
+                                parameter.default_value,
+                              )}
+                            </span>
+                          ) : (
+                            <span className="italic text-slate-500">
+                              (not set)
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
 
           <div className="rounded-lg border border-slate-700 p-4">
             <h3 className="mb-4 text-sm text-slate-400">Upcoming Runs</h3>

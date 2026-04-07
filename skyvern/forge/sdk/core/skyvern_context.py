@@ -1,3 +1,5 @@
+import builtins
+import dataclasses
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -92,6 +94,34 @@ class SkyvernContext:
     # Track task_ids where proactive captcha injection has already been attempted,
     # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
     proactive_captcha_task_ids: set[str] = field(default_factory=set)
+
+    def create_iteration_copy(self, browser_session_id: str) -> "SkyvernContext":
+        """Create an isolated copy for a parallel loop iteration.
+
+        Copies scalar fields by value and creates fresh instances of mutable
+        containers (dicts, lists, sets).  Fields that hold non-copyable objects
+        (Playwright Frame/Page) are reset to empty defaults.
+        """
+        kwargs: dict[str, Any] = {}
+        for f in dataclasses.fields(self):
+            val = getattr(self, f.name)
+            if isinstance(val, dict):
+                # frame_index_map and magic_link_pages hold Playwright objects
+                # that cannot be safely copied — start fresh per iteration.
+                if f.name in ("frame_index_map", "magic_link_pages"):
+                    kwargs[f.name] = {}
+                else:
+                    kwargs[f.name] = dict(val)
+            elif isinstance(val, list):
+                kwargs[f.name] = list(val)
+            # builtins.set required because the module-level `set()` function
+            # below (line ~180) shadows the built-in inside this module.
+            elif isinstance(val, builtins.set):
+                kwargs[f.name] = builtins.set(val)
+            else:
+                kwargs[f.name] = val
+        kwargs["browser_session_id"] = browser_session_id
+        return SkyvernContext(**kwargs)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"

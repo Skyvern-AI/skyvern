@@ -1,6 +1,20 @@
 from enum import StrEnum
 from pathlib import Path
 
+# Parallel loop iteration browser key separator
+LOOP_ITERATION_SEPARATOR = "__iter_"
+
+
+def loop_iteration_key(workflow_run_id: str, loop_idx: int) -> str:
+    """Build the cache key for a parallel loop iteration's browser state."""
+    return f"{workflow_run_id}{LOOP_ITERATION_SEPARATOR}{loop_idx}"
+
+
+def is_loop_iteration_key(key: str) -> bool:
+    """Check whether a browser_session_id belongs to a parallel loop iteration."""
+    return LOOP_ITERATION_SEPARATOR in key
+
+
 # This is the attribute name used to tag interactable elements
 SKYVERN_ID_ATTR: str = "unique_id"
 SKYVERN_DIR = Path(__file__).parent

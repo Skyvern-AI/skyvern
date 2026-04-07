@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -154,3 +155,38 @@ async def test_batch_create_propagates_sqlalchemy_error_from_commit() -> None:
     assert exc_info.value is db_error
     session.flush.assert_awaited_once()
     session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_id() -> None:
+    """Regression test for SKY-8795: searching by run_id (wr_*/tsk_*) or wpid_*
+    on the global runs page must match the underlying ID columns, not only
+    `searchable_text` (which contains only title + url)."""
+    captured: dict[str, Any] = {}
+
+    class _Result:
+        def mappings(self):
+            class _M:
+                def all(self_inner):
+                    return []
+
+            return _M()
+
+    async def _execute(query):
+        captured["query"] = query
+        return _Result()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="wr_abc123")
+
+    # Inspect the WHERE clause specifically — both columns are also in the SELECT
+    # list, so a substring check on the full SQL would be a false positive.
+    where_clause = str(captured["query"].whereclause.compile(compile_kwargs={"literal_binds": True}))
+    assert "task_runs.run_id" in where_clause
+    assert "task_runs.workflow_permanent_id" in where_clause
+    # autoescape rewrites '_' to e.g. '/_' so check the distinctive suffix.
+    assert "abc123" in where_clause
