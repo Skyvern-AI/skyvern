@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
 import structlog
 from playwright.async_api import async_playwright
 
+from skyvern.constants import is_loop_iteration_key, loop_iteration_key
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -22,6 +25,16 @@ LOG = structlog.get_logger()
 class RealBrowserManager(BrowserManager):
     def __init__(self) -> None:
         self.pages: dict[str, BrowserState] = {}
+        # Lazily initialized inside an async context to avoid binding the lock
+        # to the wrong event loop when RealBrowserManager is instantiated
+        # during module import or test fixtures that haven't started a loop.
+        self._loop_iteration_lock_instance: asyncio.Lock | None = None
+
+    @property
+    def _loop_iteration_lock(self) -> asyncio.Lock:
+        if self._loop_iteration_lock_instance is None:
+            self._loop_iteration_lock_instance = asyncio.Lock()
+        return self._loop_iteration_lock_instance
 
     @staticmethod
     async def _create_browser_state(
@@ -160,6 +173,28 @@ class RealBrowserManager(BrowserManager):
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
 
+        # When running inside a parallel loop iteration, SkyvernContext holds an
+        # iteration-specific browser_session_id (e.g. "wr_xxx__iter_0").  The
+        # iteration browser was pre-created by get_or_create_for_loop_iteration()
+        # and stored under that key.  Return it directly so child blocks (task,
+        # action, etc.) use the isolated browser instead of racing to create one
+        # under the bare workflow_run_id.
+        ctx = skyvern_context.current()
+        if ctx and ctx.browser_session_id and is_loop_iteration_key(ctx.browser_session_id):
+            iteration_browser = self.pages.get(ctx.browser_session_id)
+            if iteration_browser:
+                # Navigate to the task URL if page is still on about:blank
+                if url:
+                    page = await iteration_browser.get_working_page()
+                    if page and page.url == "about:blank":
+                        await iteration_browser.navigate_to_url(page=page, url=url)
+                LOG.debug(
+                    "Returning iteration-specific browser state from parallel loop context",
+                    workflow_run_id=workflow_run_id,
+                    iteration_key=ctx.browser_session_id,
+                )
+                return iteration_browser
+
         # Check own cache entry first so navigate_to_url is only called on the first step.
         # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
         # below so PBS runs don't accidentally inherit the parent's browser.
@@ -252,6 +287,15 @@ class RealBrowserManager(BrowserManager):
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
     ) -> BrowserState | None:
+        # Check for parallel loop iteration browser via SkyvernContext first.
+        # This mirrors the async get_or_create_for_workflow_run() so callers
+        # like task block's non-first-task path get the correct iteration browser.
+        ctx = skyvern_context.current()
+        if ctx and ctx.browser_session_id and is_loop_iteration_key(ctx.browser_session_id):
+            iteration_browser = self.pages.get(ctx.browser_session_id)
+            if iteration_browser:
+                return iteration_browser
+
         # Priority: parent first, then own entry.
         # Callers that need to avoid parent inheritance must omit parent_workflow_run_id.
         # See get_or_create_for_workflow_run() for the two-phase lookup pattern.
@@ -264,6 +308,13 @@ class RealBrowserManager(BrowserManager):
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
+        # Check parallel loop iteration browser first
+        ctx = skyvern_context.current()
+        if ctx and ctx.browser_session_id and is_loop_iteration_key(ctx.browser_session_id):
+            iter_browser = self.pages.get(ctx.browser_session_id)
+            if iter_browser:
+                iter_browser.browser_artifacts.video_artifacts = artifacts
+                return
         if task.workflow_run_id and task.workflow_run_id in self.pages:
             self.pages[task.workflow_run_id].browser_artifacts.video_artifacts = artifacts
             return
@@ -525,3 +576,95 @@ class RealBrowserManager(BrowserManager):
         if script_id and script_id in self.pages:
             return self.pages[script_id]
         return None
+
+    async def get_or_create_for_loop_iteration(
+        self,
+        workflow_run_id: str,
+        loop_idx: int,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState:
+        """Get or create an isolated BrowserContext for a parallel loop iteration.
+
+        Each iteration gets its own browser context so cookies, auth state, and
+        storage are fully isolated between concurrent iterations.
+
+        Uses _loop_iteration_lock to prevent concurrent create_task coroutines
+        from racing through the check-then-act on self.pages.
+        """
+        key = loop_iteration_key(workflow_run_id, loop_idx)
+
+        async with self._loop_iteration_lock:
+            if key in self.pages:
+                return self.pages[key]
+
+            # Persistent sessions cannot be aliased under per-iteration keys —
+            # multiple iterations would race on the same live page. The caller
+            # (execute_loop_helper) is expected to force sequential execution
+            # when a persistent session is in use; this branch only runs if
+            # that contract is bypassed, in which case we still create a fresh
+            # isolated context to preserve correctness over the persistence.
+            if browser_session_id:
+                LOG.warning(
+                    "Persistent browser session not used for parallel loop iteration — "
+                    "creating isolated context to avoid cross-iteration races",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                    browser_session_id=browser_session_id,
+                )
+
+            LOG.info(
+                "Creating isolated browser state for loop iteration",
+                workflow_run_id=workflow_run_id,
+                loop_idx=loop_idx,
+                key=key,
+            )
+            browser_state = await self._create_browser_state(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            self.pages[key] = browser_state
+
+        # Page creation can happen outside the lock — the key is already
+        # reserved in self.pages so no other coroutine will race on it.
+        await browser_state.get_or_create_page(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        return browser_state
+
+    async def cleanup_loop_iterations(
+        self,
+        workflow_run_id: str,
+        loop_indices: list[int],
+        organization_id: str | None = None,
+    ) -> None:
+        """Close and remove browser states for the given parallel loop iterations.
+
+        Uses _loop_iteration_lock so cleanup cannot race with create or with
+        a concurrent cleanup call from another batch.
+        """
+        # Collect entries to close under the lock, then close outside it
+        # to avoid holding the lock during potentially slow browser teardown.
+        to_close: list[tuple[int, BrowserState]] = []
+        async with self._loop_iteration_lock:
+            for loop_idx in loop_indices:
+                key = loop_iteration_key(workflow_run_id, loop_idx)
+                browser_state = self.pages.pop(key, None)
+                if browser_state is None:
+                    continue
+                # Only close if no other entry still references the same object
+                shared = any(bs is browser_state for bs in self.pages.values())
+                if not shared:
+                    to_close.append((loop_idx, browser_state))
+
+        for loop_idx, browser_state in to_close:
+            try:
+                await browser_state.close()
+            except Exception:
+                LOG.warning(
+                    "Failed to close loop iteration browser state",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                    exc_info=True,
+                )

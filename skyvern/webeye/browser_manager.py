@@ -61,6 +61,21 @@ class BrowserManager(Protocol):
 
     def get_for_script(self, script_id: str | None = None) -> BrowserState | None: ...
 
+    async def get_or_create_for_loop_iteration(
+        self,
+        workflow_run_id: str,
+        loop_idx: int,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState: ...
+
+    async def cleanup_loop_iterations(
+        self,
+        workflow_run_id: str,
+        loop_indices: list[int],
+        organization_id: str | None = None,
+    ) -> None: ...
+
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None: ...
 
     async def get_video_artifacts(
