@@ -21,6 +21,7 @@ export type FileInputValue =
 type Props = {
   value: FileInputValue;
   onChange: (value: FileInputValue) => void;
+  required?: boolean;
 };
 
 const FILE_SIZE_LIMIT_IN_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -34,7 +35,7 @@ function showFileSizeError() {
   });
 }
 
-function FileUpload({ value, onChange }: Props) {
+function FileUpload({ value, onChange, required }: Props) {
   const credentialGetter = useCredentialGetter();
   const [file, setFile] = useState<File | null>(null);
   const inputId = useId();
@@ -155,6 +156,7 @@ function FileUpload({ value, onChange }: Props) {
               id={inputId}
               type="file"
               onChange={handleFileChange}
+              aria-required={required || undefined}
               accept=".csv,.pdf"
               className="hidden"
             />
@@ -176,6 +178,7 @@ function FileUpload({ value, onChange }: Props) {
           <Label>File URL</Label>
           {typeof value === "string" && (
             <Input
+              aria-required={required || undefined}
               value={value}
               onChange={(event) => onChange(event.target.value)}
             />
