@@ -3,6 +3,7 @@ import hashlib
 import re
 import time
 import urllib.parse
+from collections import deque
 from typing import Any, NamedTuple
 
 import structlog
@@ -554,10 +555,24 @@ async def generate_workflow_script(
         updated_block_labels.update(missing_labels)
         updated_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
+        # Count all descendant blocks inside top-level for-loops (task, extraction,
+        # nested for-loops, etc). Does not include blocks inside task_v2 or conditionals.
+        forloop_descendant_count = 0
+        for blk in codegen_input.workflow_blocks:
+            if blk.get("block_type") == "for_loop":
+                q: deque[dict[str, Any]] = deque(blk.get("loop_blocks", []))
+                while q:
+                    inner = q.popleft()
+                    forloop_descendant_count += 1
+                    if inner.get("block_type") == "for_loop":
+                        q.extend(inner.get("loop_blocks", []))
+
         LOG.info(
             "Script generation block analysis",
             workflow_run_id=workflow_run.workflow_run_id,
-            total_blocks=len(block_labels),
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            total_top_level_blocks=len(block_labels),
+            forloop_descendant_blocks=forloop_descendant_count,
             cached_blocks=len(cached_block_sources),
             missing_blocks=len(missing_labels),
             blocks_to_regenerate=len(updated_block_labels),
@@ -584,6 +599,8 @@ async def generate_workflow_script(
         generation_duration_ms = (time.monotonic() - generation_start) * 1000
         LOG.error(
             "Failed to generate workflow script source",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
             duration_ms=round(generation_duration_ms, 1),
             exc_info=True,
         )
@@ -598,6 +615,7 @@ async def generate_workflow_script(
         "Script generation completed",
         workflow_run_id=workflow_run.workflow_run_id,
         workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
         cache_key_value=rendered_cache_key_value,
         duration_ms=round(generation_duration_ms, 1),
         script_size_bytes=len(python_src.encode("utf-8")),
@@ -614,12 +632,16 @@ async def generate_workflow_script(
             blocks_failed=blocks_failed,
         )
 
-    # Guard: if every block creation failed, do not persist a zero-block script
-    if blocks_created == 0 and blocks_failed > 0:
+    # Guard: never persist a zero-block script, regardless of whether the blocks
+    # failed or were silently skipped (e.g. generate_script.py:2901 fast-skip for
+    # blocks with no actions and no task_id). Publishing an empty revision is the
+    # `empty_blocks_detected=True` regression tracked under SKY-8757.
+    if blocks_created == 0:
         LOG.error(
-            "All script block creations failed — skipping WorkflowScript creation",
+            "Script generation produced zero blocks — skipping WorkflowScript creation",
             workflow_permanent_id=workflow.workflow_permanent_id,
             script_id=script.script_id,
+            script_revision_id=script.script_revision_id,
             blocks_failed=blocks_failed,
         )
         return

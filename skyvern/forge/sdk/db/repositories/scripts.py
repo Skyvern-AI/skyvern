@@ -555,6 +555,12 @@ class ScriptsRepository(BaseRepository):
                     WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
                     WorkflowScriptModel.cache_key_value == cache_key_value,
                     WorkflowScriptModel.deleted_at.is_(None),
+                    # Exclude soft-deleted Script revisions so an empty/failed revision
+                    # left behind by a crashed regeneration cannot be returned as the
+                    # "latest" version for this cache key. Without this filter, runs
+                    # observe has_script=True with script_block_count=0 (empty_blocks_detected
+                    # regression tracked under SKY-8757).
+                    ScriptModel.deleted_at.is_(None),
                 )
             )
 

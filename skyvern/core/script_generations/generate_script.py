@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import keyword
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -537,7 +538,9 @@ def _render_value(
 ) -> cst.BaseExpression:
     """Create a prompt value with template rendering logic if needed."""
     if not prompt_text:
-        return cst.SimpleString("")
+        # Delegate to _value so empty/None inputs produce a valid CST node
+        # (libcst rejects SimpleString("") because it lacks enclosing quotes).
+        return _value(prompt_text)
     if "{{" in prompt_text and "}}" in prompt_text:
         args = [cst.Arg(value=_value(prompt_text))]
         if data_variable_name:
@@ -1052,10 +1055,16 @@ def _build_form_filling_block_fn(
 
     navigation_goal = block.get("navigation_goal") or "Fill out the form"
 
-    # Include page.goto(url) if the block has a URL, just like _build_block_fn does
+    # Include page.goto(url) if the block has a URL, just like _build_block_fn does.
+    # Templated URLs (e.g. {{ outer_loop.current_value.url }}) are wrapped in
+    # skyvern.render_template() so they resolve at runtime.
     goto_line = ""
     if block.get("url"):
-        goto_line = f"    await page.goto({repr(block['url'])})\n"
+        url_str = block["url"]
+        if isinstance(url_str, str) and "{{" in url_str and "}}" in url_str:
+            goto_line = f"    await page.goto(skyvern.render_template({repr(url_str)}))\n"
+        else:
+            goto_line = f"    await page.goto({repr(url_str)})\n"
 
     func_code = (
         f"async def {name}(page: SkyvernPage, context: RunContext):\n"
@@ -1135,7 +1144,14 @@ def _build_block_fn(
     actions = _annotate_multi_field_totp_sequence(actions)
 
     if block.get("url"):
-        body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
+        # Use skyvern.render_template() when the URL contains a Jinja expression
+        # (e.g. {{ outer_page_loop.current_value.url }}) so it resolves at runtime
+        # against workflow_run_context.values populated by skyvern.loop().
+        url_str = block["url"]
+        if isinstance(url_str, str) and "{{" in url_str and "}}" in url_str:
+            body_stmts.append(cst.parse_statement(f"await page.goto(skyvern.render_template({repr(url_str)}))"))
+        else:
+            body_stmts.append(cst.parse_statement(f"await page.goto({repr(url_str)})"))
 
     # For file_download blocks inside for-loops, generate a dynamic click that uses
     # per-iteration context instead of hardcoded xpath/prompt from iteration 0.
@@ -1406,7 +1422,7 @@ def _build_extract_statement(
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("data_extraction_goal", "")),
+            value=_render_value(block.get("data_extraction_goal", ""), data_variable_name),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1414,6 +1430,8 @@ def _build_extract_statement(
         ),
         cst.Arg(
             keyword=cst.Name("schema"),
+            # data_schema is a dict/object, not a string template — _render_value only
+            # handles strings, so we intentionally keep _value here.
             value=_value(block.get("data_schema", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
@@ -1421,6 +1439,20 @@ def _build_extract_statement(
             ),
         ),
     ]
+    # Emit url so the extraction block navigates to the right page on cache hit.
+    # Uses _render_value so Jinja refs like {{ outer_page_loop.current_value.url }}
+    # resolve at runtime from workflow_run_context.values (populated by skyvern.loop()).
+    if block.get("url"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("url"),
+                value=_render_value(block.get("url", ""), data_variable_name),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
     if block.get("model"):
         args.append(
             cst.Arg(
@@ -2440,7 +2472,14 @@ def __build_base_task_statement(
     if value_to_param and prompt:
         prompt_value = _build_parameterized_prompt_cst(prompt, value_to_param)
     if prompt_value is None:
-        prompt_value = _value(prompt)
+        if prompt:
+            # Use _render_value so Jinja refs (e.g. {{ current_value }},
+            # {{ outer_loop.current_value.url }}) are resolved at runtime via
+            # skyvern.render_template() instead of emitted as Python literals.
+            prompt_value = _render_value(prompt, data_variable_name)
+        else:
+            # Preserve old behavior for None/empty prompts (emits `None` vs `""`).
+            prompt_value = _value(prompt)
 
     args = [
         cst.Arg(
@@ -2456,7 +2495,10 @@ def __build_base_task_statement(
         args.append(
             cst.Arg(
                 keyword=cst.Name("url"),
-                value=_value(block.get("url", "")),
+                # Use _render_value so Jinja refs (e.g. {{ current_value }},
+                # {{ outer_loop.current_value.url }}) resolve at runtime via
+                # skyvern.render_template() instead of being emitted as literals.
+                value=_render_value(block.get("url", ""), data_variable_name),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -3030,8 +3072,86 @@ async def generate_workflow_script_python_code(
         # Inner blocks (e.g. extraction inside a loop) are nested in loop_blocks and
         # are NOT in the top-level blocks list, so they need separate processing here.
         # This follows the same pattern as task_v2 child block handling (lines 2704-2714).
-        for loop_block in for_loop_block.get("loop_blocks", []):
-            if loop_block.get("block_type") not in SCRIPT_TASK_BLOCKS:
+        # Uses a BFS queue to recursively handle nested for-loops (SKY-8757).
+        # Each queue entry is (block_dict, parent_forloop_label) so cache
+        # invalidation propagates from the correct parent at any depth.
+        loop_block_queue: deque[tuple[dict[str, Any], str]] = deque(
+            (lb, for_loop_label) for lb in for_loop_block.get("loop_blocks", [])
+        )
+        while loop_block_queue:
+            loop_block, parent_fl_label = loop_block_queue.popleft()
+            loop_block_type = loop_block.get("block_type")
+
+            # block_type is a string here (from dict.get on model_dump output),
+            # not a BlockType enum — unlike transform_workflow_run.py which
+            # works with ORM objects. Both compare correctly to string literals.
+            #
+            # Nested for-loop: create script_block for the inner for-loop itself,
+            # then push its children onto the queue for processing.
+            # NOTE: Do NOT call append_block_code() for nested for_loop blocks
+            # (same as top-level for_loops) — they produce bare `async for`
+            # statements that cause SyntaxError at module level.
+            if loop_block_type == "for_loop":
+                nested_label = loop_block.get("label") or f"for_loop_{loop_block.get('workflow_run_block_id')}"
+
+                cached_nested = cached_blocks.get(nested_label)
+                # Force rebuild when the nested label OR its immediate parent
+                # for-loop is marked for regeneration (invalidation propagates
+                # down at every nesting depth, not just from the top-level).
+                use_nested_cached = (
+                    cached_nested is not None
+                    and nested_label not in updated_block_labels
+                    and parent_fl_label not in updated_block_labels
+                )
+
+                nested_wrbi = loop_block.get("workflow_run_block_id")
+                nested_wri = loop_block.get("workflow_run_id") or run_id
+
+                # use_nested_cached already guarantees cached_nested is not None;
+                # the explicit check is retained only for mypy type narrowing.
+                if (
+                    use_nested_cached
+                    and cached_nested is not None
+                    and cached_nested.code
+                    and cached_nested.run_signature
+                ):
+                    nested_code = cached_nested.code
+                    nested_sig = cached_nested.run_signature
+                    nested_wrbi = cached_nested.workflow_run_block_id
+                    nested_wri = cached_nested.workflow_run_id
+                else:
+                    # No usable cache entry (missing, incomplete, or needs update)
+                    # — rebuild from current run data. Mark this label as updated
+                    # so invalidation cascades to deeper descendants.
+                    updated_block_labels.add(nested_label)
+                    nested_stmt = _build_for_loop_statement(nested_label, loop_block)
+                    temp_mod = cst.Module(body=[nested_stmt])
+                    nested_code = temp_mod.code
+                    nested_sig = nested_code.strip()
+
+                if script_id and script_revision_id and organization_id:
+                    ok = await create_or_update_script_block(
+                        block_code=nested_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=nested_label,
+                        update=pending,
+                        run_signature=nested_sig,
+                        workflow_run_id=nested_wri,
+                        workflow_run_block_id=nested_wrbi,
+                        input_fields=None,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
+
+                # Push nested for-loop's children with this loop as their parent
+                loop_block_queue.extend((child, nested_label) for child in loop_block.get("loop_blocks", []))
+                continue
+
+            if loop_block_type not in SCRIPT_TASK_BLOCKS:
                 continue
 
             inner_label = (
@@ -3051,7 +3171,11 @@ async def generate_workflow_script_python_code(
             else:
                 inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
                 if not inner_actions:
-                    continue  # No actions from agent run = can't generate cached function
+                    # No actions from agent run = can't generate cached function.
+                    # No script_block row is created; the block will be cached on
+                    # a future run when actions become available. This is intentional
+                    # — generating a stub would produce broken code.
+                    continue
 
                 inner_fn_def = _build_block_fn(
                     loop_block,
@@ -3160,10 +3284,22 @@ async def generate_workflow_script_python_code(
     for flb in for_loop_blocks:
         label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
         processed_labels.add(label)
-        # Also track inner block labels to prevent duplication in the
-        # "preserve unexecuted branch" section below
-        for lb in flb.get("loop_blocks", []):
-            inner_lbl = lb.get("label") or lb.get("title")
+        # Recursively track all inner block labels (including nested for-loops)
+        # to prevent duplication in the "preserve unexecuted branch" section below.
+        # Use the same label derivation as the main code generation loop to ensure
+        # labels match (e.g., for_loop blocks without explicit labels get the
+        # "for_loop_{workflow_run_block_id}" fallback).
+        inner_queue: deque[dict[str, Any]] = deque(flb.get("loop_blocks", []))
+        while inner_queue:
+            lb = inner_queue.popleft()
+            lb_type = lb.get("block_type")
+            if lb_type == "for_loop":
+                inner_lbl = lb.get("label") or f"for_loop_{lb.get('workflow_run_block_id')}"
+                inner_queue.extend(lb.get("loop_blocks", []))
+            else:
+                # Use the same 3-fallback chain as the main generation loop
+                # (label → title → block_{wrb_id}) so labels always match.
+                inner_lbl = lb.get("label") or lb.get("title") or f"block_{lb.get('workflow_run_block_id')}"
             if inner_lbl:
                 processed_labels.add(inner_lbl)
     if adaptive_caching:
