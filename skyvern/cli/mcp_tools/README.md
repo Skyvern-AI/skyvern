@@ -2,10 +2,14 @@
 
 The Skyvern MCP server gives AI assistants (Claude, Cursor, Windsurf, Codex) full browser control -- clicking, filling forms, extracting data, navigating pages, uploading files, managing workflows, and more. 75+ tools, one server.
 
-## Install
+## Quickstart
 
 ```bash
 pip install skyvern
+skyvern setup claude-code
+
+# or if you're using other coding agents
+skyvern setup
 ```
 
 ## Setup
