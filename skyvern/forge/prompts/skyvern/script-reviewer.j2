@@ -116,7 +116,12 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- if a.field %} [field: {{ a.field }}]{% endif %}
 {%- if a.element_tag %} [tag: {{ a.element_tag }}]{% endif %}
 {%- if a.element_text %} [text: "{{ a.element_text }}"]{% endif %}
-{%- if a.css_suggestion %} **[USE THIS SELECTOR: `{{ a.css_suggestion }}`]**{% endif %}
+{%- if a.selector_options and a.selector_options | length > 1 %}
+    Selector options (prefer the most robust — avoid IDs that look auto-generated):
+{%- for sel, desc in a.selector_options %}
+      {{ loop.index }}. `{{ sel }}` — {{ desc }}
+{%- endfor %}
+{%- elif a.css_suggestion %} **[USE THIS SELECTOR: `{{ a.css_suggestion }}`]**{% endif %}
 {%- if a.all_attributes %} [attrs: {{ a.all_attributes | tojson }}]{% endif %}
 {%- if not a.all_attributes and a.element_attributes %} [attrs: {{ a.element_attributes | tojson }}]{% endif %}
 {%- if a.page_url %}{% set ns.prev_url = a.page_url %}{% endif %}
@@ -127,7 +132,12 @@ The cached code failed and the AI agent took over. Here is what happened:
   - Action: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
 {%- if episode.agent_actions.element_tag %} [tag: {{ episode.agent_actions.element_tag }}]{% endif %}
 {%- if episode.agent_actions.element_text %} [text: "{{ episode.agent_actions.element_text }}"]{% endif %}
-{%- if episode.agent_actions.css_suggestion %} **[USE THIS SELECTOR: `{{ episode.agent_actions.css_suggestion }}`]**{% endif %}
+{%- if episode.agent_actions.selector_options and episode.agent_actions.selector_options | length > 1 %}
+  Selector options (prefer the most robust — avoid IDs that look auto-generated):
+{%- for sel, desc in episode.agent_actions.selector_options %}
+    {{ loop.index }}. `{{ sel }}` — {{ desc }}
+{%- endfor %}
+{%- elif episode.agent_actions.css_suggestion %} **[USE THIS SELECTOR: `{{ episode.agent_actions.css_suggestion }}`]**{% endif %}
 {%- if episode.agent_actions.all_attributes %} [attrs: {{ episode.agent_actions.all_attributes | tojson }}]{% endif %}
 {%- if episode.agent_actions.reasoning %}
   - Reasoning: {{ episode.agent_actions.reasoning }}{% endif %}
