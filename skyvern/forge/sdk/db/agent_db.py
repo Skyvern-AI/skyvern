@@ -547,8 +547,8 @@ class AgentDB(BaseAlchemyDB):
     async def create_workflow_schedule_with_limit(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.create_workflow_schedule_with_limit(*args, **kwargs)
 
-    async def set_temporal_schedule_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.schedules.set_temporal_schedule_id(*args, **kwargs)
+    async def set_backend_schedule_id(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.schedules.set_backend_schedule_id(*args, **kwargs)
 
     async def update_workflow_schedule(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.update_workflow_schedule(*args, **kwargs)

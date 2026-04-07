@@ -21,7 +21,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
-from skyvern.utils.css_selector import compute_stable_selector
+from skyvern.utils.css_selector import compute_selector_options
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
@@ -735,11 +735,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         "title",
                     )
                 }
-                # el_data already has the shape compute_stable_selector expects
+                # el_data already has the shape compute_selector_options expects
                 # (tagName, attributes dict, text) — pass it directly.
-                css_sel = compute_stable_selector(el_data)
-                if css_sel:
-                    action_data["css_suggestion"] = css_sel
+                sel_options = compute_selector_options(el_data)
+                if sel_options:
+                    action_data["css_suggestion"] = sel_options[0][0]
+                    action_data["selector_options"] = sel_options
                 else:
                     # Fall back to xpath only if no CSS selector can be derived
                     xpath = action.get_xpath() if hasattr(action, "get_xpath") else None
