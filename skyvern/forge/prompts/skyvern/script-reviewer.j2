@@ -127,9 +127,9 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- if a.page_url %}{% set ns.prev_url = a.page_url %}{% endif %}
 {% endfor %}
 {% elif episode.agent_actions is mapping and episode.agent_actions.failed_selector is defined %}
-  **Element-level fallback** — the selector failed but AI found the element:
-  - Failed selector: `{{ episode.agent_actions.failed_selector }}`
-  - Action: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
+  **Element-level fallback** — the selector `{{ episode.agent_actions.failed_selector }}` failed.
+  - Intention: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
+  - AI clicked:
 {%- if episode.agent_actions.element_tag %} [tag: {{ episode.agent_actions.element_tag }}]{% endif %}
 {%- if episode.agent_actions.element_text %} [text: "{{ episode.agent_actions.element_text }}"]{% endif %}
 {%- if episode.agent_actions.selector_options and episode.agent_actions.selector_options | length > 1 %}
@@ -137,11 +137,11 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- for sel, desc in episode.agent_actions.selector_options %}
     {{ loop.index }}. `{{ sel }}` — {{ desc }}
 {%- endfor %}
-{%- elif episode.agent_actions.css_suggestion %} **[USE THIS SELECTOR: `{{ episode.agent_actions.css_suggestion }}`]**{% endif %}
+{%- elif episode.agent_actions.css_suggestion %} [css: `{{ episode.agent_actions.css_suggestion }}`]{% endif %}
 {%- if episode.agent_actions.all_attributes %} [attrs: {{ episode.agent_actions.all_attributes | tojson }}]{% endif %}
 {%- if episode.agent_actions.reasoning %}
-  - Reasoning: {{ episode.agent_actions.reasoning }}{% endif %}
-  **ACTION REQUIRED**: Remove `{{ episode.agent_actions.failed_selector }}` from the selector list and replace with a stable alternative using the attributes above.
+  - AI reasoning: {{ episode.agent_actions.reasoning }}{% endif %}
+  Read the AI reasoning carefully — it explains what actually happened and why. Fix the script so this interaction succeeds without AI fallback.
 {% elif episode.agent_actions is mapping and episode.agent_actions.navigation_goal is defined %}
   Surgical fallback: "{{ episode.agent_actions.navigation_goal }}" — {{ episode.agent_actions.steps_taken }} steps, completed={{ episode.agent_actions.completed }}
 {% elif episode.agent_actions %}
