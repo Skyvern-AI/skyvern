@@ -892,34 +892,49 @@ class SkyvernElement:
         if not await self.is_visible():
             return
 
+        # Step 1: Use native element.scrollIntoView() which handles both window scrolling
+        # AND nested scrollable containers (e.g., SPA app shells with overflow-y: auto).
+        # See SKY-8748 for the motivating case. Falls back to window-level scroll if the
+        # native call fails (e.g., detached elements).
         try:
-            target_x: int | None = None
-            target_y: int | None = None
-
-            rect = await self.get_rect(timeout=timeout)
-            element_x: int | None = None
-            element_y: int | None = None
-            if rect is not None:
-                element_x = rect["x"] if rect["x"] > 0 else None
-                element_y = rect["y"] if rect["y"] > 0 else None
-
-            # calculating y to move the element to the middle of the viewport
-            if element_y is not None:
-                target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
-
-            if element_x is not None:
-                target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
-
             skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-            if target_x is not None and target_y is not None:
-                await skyvern_frame.safe_scroll_to_x_y(target_x, target_y)
+            element_handler = await self.get_element_handler(timeout=timeout)
+            await skyvern_frame.scroll_into_view(element_handler)
         except Exception:
             LOG.info(
-                "Failed to calculate the y to move the element to the middle of the viewport, ignore it",
+                "Failed to scrollIntoView via native JS, falling back to window scroll",
                 exc_info=True,
                 element_id=self.get_id(),
             )
+            try:
+                target_x: int | None = None
+                target_y: int | None = None
 
+                rect = await self.get_rect(timeout=timeout)
+                element_x: int | None = None
+                element_y: int | None = None
+                if rect is not None:
+                    element_x = rect["x"] if rect["x"] > 0 else None
+                    element_y = rect["y"] if rect["y"] > 0 else None
+
+                if element_y is not None:
+                    target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
+
+                if element_x is not None:
+                    target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
+
+                skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+                if target_x is not None and target_y is not None:
+                    await skyvern_frame.safe_scroll_to_x_y(target_x, target_y)
+            except Exception:
+                LOG.info(
+                    "Fallback window scroll also failed, ignoring",
+                    exc_info=True,
+                    element_id=self.get_id(),
+                )
+
+        # Step 2: Playwright actionability confirmation. After Step 1, the element should
+        # already be in the viewport so this check passes quickly.
         try:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)

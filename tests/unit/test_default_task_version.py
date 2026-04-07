@@ -73,3 +73,34 @@ class TestServiceDefault:
 
         sig = inspect.signature(WorkflowService.create_workflow_from_prompt)
         assert sig.parameters["task_version"].default == "v1"
+
+
+class TestTaskRunRequestEngine:
+    def test_default_engine_is_v1(self) -> None:
+        """TaskRunRequest.engine must default to skyvern_v1 (skyvern-1.0)."""
+        from skyvern.schemas.runs import RunEngine, TaskRunRequest
+
+        req = TaskRunRequest(prompt="hello")
+        assert req.engine == RunEngine.skyvern_v1
+
+    def test_explicit_v2_engine_preserved(self) -> None:
+        """Explicitly passing skyvern_v2 should be preserved."""
+        from skyvern.schemas.runs import RunEngine, TaskRunRequest
+
+        req = TaskRunRequest(prompt="hello", engine=RunEngine.skyvern_v2)
+        assert req.engine == RunEngine.skyvern_v2
+
+    def test_publish_workflow_forces_v2(self) -> None:
+        """publish_workflow=True must force engine to v2, since v1 doesn't support it."""
+        from skyvern.schemas.runs import RunEngine, TaskRunRequest
+
+        req = TaskRunRequest(prompt="hello", publish_workflow=True)
+        assert req.engine == RunEngine.skyvern_v2
+
+    def test_publish_workflow_false_keeps_v1(self) -> None:
+        """publish_workflow=False (default) should keep the v1 default."""
+        from skyvern.schemas.runs import RunEngine, TaskRunRequest
+
+        req = TaskRunRequest(prompt="hello")
+        assert req.engine == RunEngine.skyvern_v1
+        assert req.publish_workflow is False

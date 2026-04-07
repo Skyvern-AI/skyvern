@@ -177,3 +177,23 @@ def build_action_summary(action: Action) -> dict:
         "all_attributes": useful_attrs or None,
         "css_suggestion": compute_stable_selector(elem),
     }
+
+
+def build_action_summaries_with_timing(actions: list[Action]) -> list[dict]:
+    """Build action summaries with time deltas between consecutive actions.
+
+    Wraps build_action_summary and adds seconds_since_previous (the delta
+    in seconds from the previous action) for all actions with timestamps.
+    The Jinja template filters to only render deltas > 3 seconds.
+    """
+    summaries = []
+    prev_ts = None
+    for a in actions[:20]:
+        summary = build_action_summary(a)
+        if a.created_at and prev_ts:
+            delta = (a.created_at - prev_ts).total_seconds()
+            summary["seconds_since_previous"] = round(max(delta, 0), 1)
+        if a.created_at:
+            prev_ts = a.created_at
+        summaries.append(summary)
+    return summaries

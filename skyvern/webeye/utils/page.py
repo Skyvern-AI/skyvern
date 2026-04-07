@@ -414,6 +414,12 @@ class SkyvernFrame:
         except Exception:
             LOG.warning("Failed to scroll to x, y, ignore it", x=x, y=y, exc_info=True)
 
+    async def scroll_into_view(self, element: ElementHandle) -> None:
+        """Scroll all ancestor containers (including nested ones with overflow-y: auto)
+        so that the element is centered in the viewport."""
+        js_script = "(element) => element.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'})"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
         js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[element, page_by_page])

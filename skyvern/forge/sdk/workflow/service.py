@@ -123,7 +123,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.utils.css_selector import build_action_summary  # shared with script_service
+from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
 
@@ -2282,7 +2282,7 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = [build_action_summary(a) for a in actions[:20]]
+                                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",
