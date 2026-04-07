@@ -116,11 +116,76 @@ def test_template_url_rendering():
 
     # First action should show [url: portal.example.com/login]
     assert "[url: https://portal.example.com/login]" in prompt
-    # Third action should show [url changed: sso.example.com/auth]
-    assert "[url changed: https://sso.example.com/auth]" in prompt
+    # Third action should show page navigation to sso.example.com/auth
+    assert "page navigated to https://sso.example.com/auth" in prompt
     # Second action (same URL as first) should NOT show url
     lines = prompt.split("\n")
     action_2_lines = [line for line in lines if "2. input_text:" in line]
     assert action_2_lines, "Action 2 should exist"
     assert "[url:" not in action_2_lines[0]
-    assert "[url changed:" not in action_2_lines[0]
+    assert "page navigated" not in action_2_lines[0]
+
+
+class TestBuildActionSummariesWithTiming:
+    """Tests for build_action_summaries_with_timing shared helper."""
+
+    def _make_action_with_timestamp(self, ts, **kwargs):
+        from skyvern.webeye.actions.actions import Action, ActionType
+
+        defaults = {
+            "action_type": ActionType.CLICK,
+            "status": "completed",
+            "intention": "Click button",
+            "created_at": ts,
+            "skyvern_element_data": None,
+        }
+        defaults.update(kwargs)
+        return Action(**defaults)
+
+    def test_computes_deltas_between_actions(self):
+        from datetime import datetime, timezone
+
+        from skyvern.utils.css_selector import build_action_summaries_with_timing
+
+        t0 = datetime(2026, 4, 6, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 4, 6, 12, 0, 2, tzinfo=timezone.utc)  # +2s
+        t2 = datetime(2026, 4, 6, 12, 0, 9, tzinfo=timezone.utc)  # +7s
+
+        actions = [
+            self._make_action_with_timestamp(t0),
+            self._make_action_with_timestamp(t1),
+            self._make_action_with_timestamp(t2),
+        ]
+        summaries = build_action_summaries_with_timing(actions)
+        assert len(summaries) == 3
+        assert "seconds_since_previous" not in summaries[0]  # first action, no previous
+        assert summaries[1]["seconds_since_previous"] == 2.0
+        assert summaries[2]["seconds_since_previous"] == 7.0
+
+    def test_handles_none_timestamps(self):
+        from skyvern.utils.css_selector import build_action_summaries_with_timing
+
+        actions = [
+            self._make_action_with_timestamp(None),
+            self._make_action_with_timestamp(None),
+        ]
+        summaries = build_action_summaries_with_timing(actions)
+        assert len(summaries) == 2
+        assert "seconds_since_previous" not in summaries[0]
+        assert "seconds_since_previous" not in summaries[1]
+
+    def test_negative_delta_clamped_to_zero(self):
+        from datetime import datetime, timezone
+
+        from skyvern.utils.css_selector import build_action_summaries_with_timing
+
+        t0 = datetime(2026, 4, 6, 12, 0, 10, tzinfo=timezone.utc)
+        t1 = datetime(2026, 4, 6, 12, 0, 5, tzinfo=timezone.utc)  # earlier (clock skew)
+
+        actions = [
+            self._make_action_with_timestamp(t0),
+            self._make_action_with_timestamp(t1),
+        ]
+        summaries = build_action_summaries_with_timing(actions)
+        # Negative delta clamped to 0
+        assert summaries[1]["seconds_since_previous"] == 0.0

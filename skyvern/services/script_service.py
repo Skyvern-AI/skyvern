@@ -84,7 +84,7 @@ from skyvern.schemas.scripts import (
 )
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
-from skyvern.utils.css_selector import build_action_summary
+from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
@@ -1395,7 +1395,7 @@ async def _fallback_to_ai_run(
                         task_id=task_id,
                         organization_id=organization_id,
                     )
-                    agent_actions_summary["actions"] = [build_action_summary(a) for a in actions[:20]]
+                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
                 except Exception:
                     LOG.debug("Could not fetch actions for fallback episode", exc_info=True)
 

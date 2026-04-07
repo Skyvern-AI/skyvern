@@ -426,6 +426,24 @@ def _get_proxy_server_creds(proxy: str) -> dict:
     return {}
 
 
+def _is_browser_profile_corruption_error(error: Exception) -> bool:
+    """Return True if the error is consistent with a corrupted or bloated browser profile.
+
+    These errors appear when launch_persistent_context fails to start Chrome because
+    the user_data_dir is in a bad state (corrupted files, oversized cache, lock files
+    from a prior crash, etc.).  The error text comes from Playwright's CDP driver.
+    """
+    error_str = str(error).lower()
+    corruption_indicators = [
+        "connection closed while reading from the driver",
+        "target closed",
+        "browser has been closed",
+        "failed to launch",
+        "unable to open database",
+    ]
+    return any(indicator in error_str for indicator in corruption_indicators)
+
+
 def _get_cdp_port(kwargs: dict) -> int | None:
     raw_cdp_port = kwargs.get("cdp_port")
     if isinstance(raw_cdp_port, (int, str)):
@@ -479,6 +497,7 @@ async def _create_headless_chromium(
     browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
     organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
     user_data_dir: str | None = None
+    loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
         profile_dir = await app.STORAGE.retrieve_browser_profile(
@@ -487,6 +506,7 @@ async def _create_headless_chromium(
         )
         if profile_dir:
             user_data_dir = profile_dir
+            loaded_from_saved_profile = True
             LOG.info(
                 "Using browser profile",
                 browser_profile_id=browser_profile_id,
@@ -522,7 +542,29 @@ async def _create_headless_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
-    browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+    try:
+        browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+    except Exception as launch_error:
+        if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+            LOG.warning(
+                "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
+                browser_profile_id=browser_profile_id,
+                organization_id=organization_id_for_profile,
+                error=str(launch_error),
+            )
+            fallback_dir = make_temp_directory(prefix="skyvern_browser_")
+            BrowserContextFactory.update_chromium_browser_preferences(
+                user_data_dir=fallback_dir,
+                download_dir=download_dir,
+            )
+            browser_args["user_data_dir"] = fallback_dir
+            browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+                har_path=browser_args["record_har_path"],
+                browser_session_dir=fallback_dir,
+            )
+            browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+        else:
+            raise
     return browser_context, browser_artifacts, None
 
 
@@ -544,6 +586,7 @@ async def _create_headful_chromium(
     browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
     organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
     user_data_dir: str | None = None
+    loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
         profile_dir = await app.STORAGE.retrieve_browser_profile(
@@ -552,6 +595,7 @@ async def _create_headful_chromium(
         )
         if profile_dir:
             user_data_dir = profile_dir
+            loaded_from_saved_profile = True
             LOG.info(
                 "Using browser profile",
                 browser_profile_id=browser_profile_id,
@@ -587,7 +631,29 @@ async def _create_headful_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
-    browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+    try:
+        browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+    except Exception as launch_error:
+        if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+            LOG.warning(
+                "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
+                browser_profile_id=browser_profile_id,
+                organization_id=organization_id_for_profile,
+                error=str(launch_error),
+            )
+            fallback_dir = make_temp_directory(prefix="skyvern_browser_")
+            BrowserContextFactory.update_chromium_browser_preferences(
+                user_data_dir=fallback_dir,
+                download_dir=download_dir,
+            )
+            browser_args["user_data_dir"] = fallback_dir
+            browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+                har_path=browser_args["record_har_path"],
+                browser_session_dir=fallback_dir,
+            )
+            browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+        else:
+            raise
     return browser_context, browser_artifacts, None
 
 

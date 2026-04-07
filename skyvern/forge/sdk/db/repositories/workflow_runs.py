@@ -437,7 +437,13 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter(effective_status.in_(status))
 
             if search_key:
-                query = query.filter(TaskRunModel.searchable_text.icontains(search_key, autoescape=True))
+                query = query.filter(
+                    or_(
+                        TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
+                        TaskRunModel.run_id.icontains(search_key, autoescape=True),
+                        TaskRunModel.workflow_permanent_id.icontains(search_key, autoescape=True),
+                    )
+                )
 
             offset = (page - 1) * page_size
             query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
@@ -756,6 +762,49 @@ class WorkflowRunsRepository(BaseRepository):
             if status:
                 count_query = count_query.filter(WorkflowRunModel.status.in_(status))
             return (await session.execute(count_query)).scalar_one()
+
+    @db_operation("get_workflow_runs_for_organization_by_status")
+    async def get_workflow_runs_for_organization_by_status(
+        self,
+        organization_id: str,
+        status: WorkflowRunStatus,
+        limit: int | None = None,
+    ) -> list[WorkflowRun]:
+        """Return workflow runs for an organization ordered oldest-first."""
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.status == status.value)
+                .order_by(WorkflowRunModel.created_at.asc())
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            workflow_runs = (await session.scalars(query)).all()
+            return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
+
+    @db_operation("get_workflow_runs_for_organization_by_statuses")
+    async def get_workflow_runs_for_organization_by_statuses(
+        self,
+        organization_id: str,
+        statuses: list[WorkflowRunStatus],
+        limit: int | None = None,
+    ) -> list[WorkflowRun]:
+        """Return workflow runs for an organization filtered by multiple statuses."""
+        if not statuses:
+            return []
+
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.status.in_([status.value for status in statuses]))
+                .order_by(WorkflowRunModel.created_at.asc())
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            workflow_runs = (await session.scalars(query)).all()
+            return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
     @db_operation("get_workflow_runs_for_workflow_permanent_id")
     async def get_workflow_runs_for_workflow_permanent_id(
