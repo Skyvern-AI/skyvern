@@ -4840,7 +4840,9 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=existing_latest_workflow.folder_id,
                     adaptive_caching=request.adaptive_caching,
-                    code_version=request.code_version,
+                    code_version=request.code_version
+                    if request.code_version is not None
+                    else existing_latest_workflow.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
                 )
             else:
