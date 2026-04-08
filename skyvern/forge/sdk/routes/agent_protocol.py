@@ -132,6 +132,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -547,7 +548,7 @@ async def create_workflow_legacy(
     analytics.capture("skyvern-oss-agent-workflow-create-legacy")
     raw_yaml = await request.body()
     try:
-        workflow_yaml = yaml.safe_load(raw_yaml)
+        workflow_yaml = safe_load_no_dates(raw_yaml)
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
@@ -607,7 +608,7 @@ async def create_workflow(
     analytics.capture("skyvern-oss-agent-workflow-create")
     try:
         if data.yaml_definition:
-            workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
             workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
@@ -953,7 +954,7 @@ async def update_workflow_legacy(
     # validate the workflow
     raw_yaml = await request.body()
     try:
-        workflow_yaml = yaml.safe_load(raw_yaml)
+        workflow_yaml = safe_load_no_dates(raw_yaml)
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
@@ -1022,7 +1023,7 @@ async def update_workflow(
     analytics.capture("skyvern-oss-agent-workflow-update")
     try:
         if data.yaml_definition:
-            workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
             workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
