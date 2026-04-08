@@ -585,6 +585,7 @@ Iterate over an array and execute nested blocks for each item.
 | `loop_over_parameter_key` | string | `""` | Parameter containing the array to iterate. |
 | `loop_variable_reference` | string | — | Custom name for the loop variable. |
 | `complete_if_empty` | boolean | `false` | If `true`, completes successfully when array is empty. |
+| `max_concurrency` | integer \| null | `null` | Maximum number of iterations to run in parallel. When set, loop iterations execute concurrently up to this limit. When `null` or omitted, iterations run sequentially. |
 
 <Info>
 **Accessing the current item inside a loop**
@@ -592,6 +593,12 @@ Iterate over an array and execute nested blocks for each item.
 Use `{{nested_block_label.current_value}}` to reference the current iteration value, where `nested_block_label` is the `label` of the block **inside** `loop_blocks` — not the label of the `for_loop` itself.
 
 In the example above, the loop label is `apply_to_jobs` and the nested block label is `submit_application`, so the current URL is accessed as `{{submit_application.current_value}}`.
+</Info>
+
+<Info>
+**Parallel execution**
+
+Set `max_concurrency` to run loop iterations in parallel. For example, `max_concurrency: 3` processes up to 3 iterations at the same time. Each parallel iteration gets its own browser session. Omit or set to `null` for sequential execution.
 </Info>
 
 The output of a `for_loop` block is an array containing the result from each iteration.
