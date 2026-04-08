@@ -31,6 +31,8 @@ class TestAntiBotDetection:
             "Access denied by WAF",
             "Anti-bot system triggered",
             "Human verification required",
+            "The current page shows an 'Access Denied' error",
+            "Access Denied - website blocked the request",
         ],
     )
     def test_keywords_match(self, reason: str) -> None:
@@ -38,6 +40,22 @@ class TestAntiBotDetection:
         assert result is not None
         categories = [r["category"] for r in result]
         assert "ANTI_BOT_DETECTION" in categories
+
+    def test_access_denied_with_auth_context_is_not_antibot(self) -> None:
+        """'Access denied' + auth keywords → AUTH_FAILURE, not ANTI_BOT_DETECTION."""
+        result = classify_from_failure_reason("Access denied after login - user does not have permission")
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "AUTH_FAILURE" in categories
+        assert "ANTI_BOT_DETECTION" not in categories
+
+    def test_access_denied_with_password_context_is_not_antibot(self) -> None:
+        """'Access denied' when password is mentioned → AUTH_FAILURE."""
+        result = classify_from_failure_reason("The page shows 'Access Denied'. Unable to enter your password.")
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "AUTH_FAILURE" in categories
+        assert "ANTI_BOT_DETECTION" not in categories
 
     def test_broad_blocked_does_not_match(self) -> None:
         """'blocked' alone should NOT trigger ANTI_BOT_DETECTION (narrowed keywords)."""
