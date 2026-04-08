@@ -3086,11 +3086,151 @@ async def input_or_auto_complete_input(
             current_value = new_current_value
 
     else:
+        if not input_or_select_context.is_search_bar:
+            LOG.info(
+                "Auto completion attempts exhausted, trying discover-all-options fallback",
+                element_id=skyvern_element.get_id(),
+                original_text=text,
+            )
+            fallback_result = await discover_and_select_from_full_dropdown(
+                context=input_or_select_context,
+                page=page,
+                dom=dom,
+                original_text=text,
+                skyvern_element=skyvern_element,
+                step=step,
+                task=task,
+            )
+            if fallback_result is not None:
+                return fallback_result
+
         LOG.warning(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             context=input_or_select_context,
         )
         return None
+
+
+@traced()
+async def discover_and_select_from_full_dropdown(
+    context: InputOrSelectContext,
+    page: Page,
+    dom: DomUtil,
+    original_text: str,
+    skyvern_element: SkyvernElement,
+    step: Step,
+    task: Task,
+    relevance_threshold: float = 0.6,
+) -> ActionResult | None:
+    """Fallback for auto-completion: clear input, press ArrowDown to reveal all options,
+    then ask LLM to pick the best semantic match from actual dropdown values."""
+    if not await skyvern_element.is_visible():
+        return None
+
+    current_frame = skyvern_element.get_frame()
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+
+    try:
+        await skyvern_element.scroll_into_view()
+        await skyvern_element.input_clear()
+
+        try:
+            await skyvern_element.press_key("ArrowDown")
+        except TimeoutError:
+            LOG.info(
+                "Timeout pressing ArrowDown in discover fallback, continuing",
+                element_id=skyvern_element.get_id(),
+            )
+
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+
+        incremental_element = await incremental_scraped.get_incremental_element_tree(
+            clean_and_remove_element_tree_factory(
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            ),
+        )
+
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options appeared after ArrowDown",
+                element_id=skyvern_element.get_id(),
+            )
+            return None
+
+        cleaned_elements = remove_duplicated_HTML_element(incremental_element)
+        html = incremental_scraped.build_html_tree(cleaned_elements)
+        new_element_ids = [e.get("id", "") for e in cleaned_elements if e.get("id")]
+
+        field_information = context.field if not context.intention else context.intention
+        prompt = prompt_engine.load_prompt(
+            "auto-completion-choose-option",
+            is_search=context.is_search_bar,
+            field_information=field_information,
+            filled_value=original_text,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
+            elements=html,
+            new_elements_ids=new_element_ids,
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        )
+
+        LOG.info(
+            "Discover fallback: asking LLM to pick from actual options",
+            element_id=skyvern_element.get_id(),
+            original_text=original_text,
+        )
+        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+            prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
+        )
+
+        element_id = json_response.get("id", "")
+        relevance_float = json_response.get("relevance_float", 0)
+
+        if not element_id or relevance_float < relevance_threshold:
+            LOG.info(
+                "Discover fallback: no suitable option found",
+                element_id=element_id,
+                relevance_float=relevance_float,
+                threshold=relevance_threshold,
+            )
+            return None
+
+        LOG.info(
+            "Discover fallback: found suitable option",
+            element_id=element_id,
+            relevance_float=relevance_float,
+        )
+
+        locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+        if await locator.count() == 0:
+            LOG.warning(
+                "Discover fallback: selected element not found in DOM",
+                element_id=element_id,
+            )
+            return None
+
+        selected_element = SkyvernElement(
+            locator=locator,
+            frame=current_frame,
+            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+        )
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
+        return ActionSuccess()
+
+    except Exception:
+        LOG.warning(
+            "Discover fallback failed",
+            exc_info=True,
+            original_text=original_text,
+        )
+        return None
+    finally:
+        await incremental_scraped.stop_listen_dom_increment()
 
 
 @traced()
