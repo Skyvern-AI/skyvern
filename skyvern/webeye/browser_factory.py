@@ -426,6 +426,30 @@ def _get_proxy_server_creds(proxy: str) -> dict:
     return {}
 
 
+def _is_display_server_error(error: Exception) -> bool:
+    """Return True if the worker cannot initialize the browser display/graphics stack.
+
+    These errors appear when a headed browser is launched on a worker node
+    without a usable display/graphics environment. Retrying with a fresh profile
+    will not help — the fix is environment-side (display/EGL/SwiftShader support)
+    rather than profile-side.
+    """
+    error_str = str(error).lower()
+    display_indicators = [
+        "missing x server",
+        "xserver running",
+        "no display",
+        "$display",
+        "the platform failed to initialize",
+        "no suitable egl configs found",
+        "failed to get config for surface",
+        "collectgraphicsinfo failed",
+        "glcontext::createoffscreenglsurface failed",
+        "exiting gpu process due to errors during initialization",
+    ]
+    return any(indicator in error_str for indicator in display_indicators)
+
+
 def _is_browser_profile_corruption_error(error: Exception) -> bool:
     """Return True if the error is consistent with a corrupted or bloated browser profile.
 
@@ -433,6 +457,9 @@ def _is_browser_profile_corruption_error(error: Exception) -> bool:
     the user_data_dir is in a bad state (corrupted files, oversized cache, lock files
     from a prior crash, etc.).  The error text comes from Playwright's CDP driver.
     """
+    if _is_display_server_error(error):
+        return False
+
     error_str = str(error).lower()
     corruption_indicators = [
         "connection closed while reading from the driver",
