@@ -14,7 +14,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-01T03:43:13.763856Z"
+exclude-newer = "2026-04-01T06:56:52.086696Z"
 exclude-newer-span = "P7D"
 
 [manifest]
@@ -5523,7 +5523,7 @@ wheels = [
 
 [[package]]
 name = "skyvern"
-version = "1.0.29"
+version = "1.0.30"
 source = { editable = "." }
 dependencies = [
     { name = "aioboto3" },
