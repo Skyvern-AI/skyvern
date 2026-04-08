@@ -49,6 +49,7 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
@@ -572,7 +573,7 @@ def _process_workflow_yaml(
     organization_id: str,
     workflow_yaml: str,
 ) -> Workflow:
-    parsed_yaml = yaml.safe_load(workflow_yaml)
+    parsed_yaml = safe_load_no_dates(workflow_yaml)
 
     # Fixing trivial common LLM mistakes
     workflow_definition = parsed_yaml.get("workflow_definition", None)
@@ -850,7 +851,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
     that the comparison panel expects.
     """
     try:
-        parsed_yaml = yaml.safe_load(request.workflow_definition_yaml)
+        parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
         _repair_next_block_label_chain(workflow_definition_yaml.blocks)
