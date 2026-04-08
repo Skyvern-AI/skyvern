@@ -14,7 +14,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-03-26T19:14:39.897426Z"
+exclude-newer = "2026-04-01T03:43:13.763856Z"
 exclude-newer-span = "P7D"
 
 [manifest]
@@ -1139,7 +1139,7 @@ wheels = [
 
 [[package]]
 name = "fastmcp"
-version = "3.1.1"
+version = "3.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "authlib" },
@@ -1164,9 +1164,9 @@ dependencies = [
     { name = "watchfiles" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/25/83/c95d3bf717698a693eccb43e137a32939d2549876e884e246028bff6ecce/fastmcp-3.1.1.tar.gz", hash = "sha256:db184b5391a31199323766a3abf3a8bfbb8010479f77eca84c0e554f18655c48", size = 17347644, upload-time = "2026-03-14T19:12:20.235Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d0/32/4f1b2cfd7b50db89114949f90158b1dcc2c92a1917b9f57c0ff24e47a2f4/fastmcp-3.2.0.tar.gz", hash = "sha256:d4830b8ffc3592d3d9c76dc0f398904cf41f04910e41a0de38cc1004e0903bef", size = 26318581, upload-time = "2026-03-30T20:25:37.692Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/70/ea/570122de7e24f72138d006f799768e14cc1ccf7fcb22b7750b2bd276c711/fastmcp-3.1.1-py3-none-any.whl", hash = "sha256:8132ba069d89f14566b3266919d6d72e2ec23dd45d8944622dca407e9beda7eb", size = 633754, upload-time = "2026-03-14T19:12:22.736Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/67/684fa2d2de1e7504549d4ca457b4f854ccec3cd3be03bd86b33b599fbf58/fastmcp-3.2.0-py3-none-any.whl", hash = "sha256:e71aba3df16f86f546a4a9e513261d3233bcc92bef0dfa647bac3fa33623f681", size = 705550, upload-time = "2026-03-30T20:25:35.499Z" },
 ]
 
 [[package]]
@@ -2685,7 +2685,7 @@ wheels = [
 
 [[package]]
 name = "litellm"
-version = "1.82.6"
+version = "1.83.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2701,9 +2701,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/29/75/1c537aa458426a9127a92bc2273787b2f987f4e5044e21f01f2eed5244fd/litellm-1.82.6.tar.gz", hash = "sha256:2aa1c2da21fe940c33613aa447119674a3ad4d2ad5eb064e4d5ce5ee42420136", size = 17414147, upload-time = "2026-03-22T06:36:00.452Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/22/92/6ce9737554994ca8e536e5f4f6a87cc7c4774b656c9eb9add071caf7d54b/litellm-1.83.0.tar.gz", hash = "sha256:860bebc76c4bb27b4cf90b4a77acd66dba25aced37e3db98750de8a1766bfb7a", size = 17333062, upload-time = "2026-03-31T05:08:25.331Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/02/6c/5327667e6dbe9e98cbfbd4261c8e91386a52e38f41419575854248bbab6a/litellm-1.82.6-py3-none-any.whl", hash = "sha256:164a3ef3e19f309e3cabc199bef3d2045212712fefdfa25fc7f75884a5b5b205", size = 15591595, upload-time = "2026-03-22T06:35:56.795Z" },
+    { url = "https://files.pythonhosted.org/packages/19/2c/a670cc050fcd6f45c6199eb99e259c73aea92edba8d5c2fc1b3686d36217/litellm-1.83.0-py3-none-any.whl", hash = "sha256:88c536d339248f3987571493015784671ba3f193a328e1ea6780dbebaa2094a8", size = 15610306, upload-time = "2026-03-31T05:08:21.987Z" },
 ]
 
 [[package]]
@@ -5666,7 +5666,7 @@ requires-dist = [
     { name = "curlparser", specifier = ">=0.1.0,<0.2" },
     { name = "email-validator", specifier = ">=2.2.0,<3" },
     { name = "fastapi", specifier = ">=0.121.0,<0.129" },
-    { name = "fastmcp", specifier = ">=2.10.1,<4" },
+    { name = "fastmcp", specifier = ">=3.2.0,<4" },
     { name = "filetype", specifier = ">=1.2.0,<2" },
     { name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" },
     { name = "greenlet", marker = "python_full_version == '3.11.*'", specifier = "==3.0.3" },
@@ -5677,7 +5677,7 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.25.1" },
     { name = "lark", specifier = ">=1.2.2,<2" },
     { name = "libcst", specifier = ">=1.8.2,<2" },
-    { name = "litellm", specifier = ">=1.80.10" },
+    { name = "litellm", specifier = ">=1.83.0" },
     { name = "onepassword-sdk", specifier = "==0.4.0" },
     { name = "openai", specifier = ">=1.68.2" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2" },
