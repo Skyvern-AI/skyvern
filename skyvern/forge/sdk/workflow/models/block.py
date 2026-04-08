@@ -122,6 +122,39 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
+
+# SKY-8818: observability threshold for under-configured file_download blocks.
+# Warning fires when `max_steps_per_run` is set below this value. Not a behavior change —
+# purely a Datadog-searchable signal (`log_code=file_download_low_max_steps`).
+MAX_STEPS_DOWNLOAD_WARNING_THRESHOLD = 5
+
+
+def warn_if_file_download_max_steps_low(
+    block: BaseTaskBlock,
+    workflow_run_id: str | None = None,
+) -> None:
+    """Emit a structured warning if a file_download block has an under-configured step budget.
+
+    A `max_steps_per_run` of None means "use org default", which is not a misconfiguration.
+    Only configured values strictly below MAX_STEPS_DOWNLOAD_WARNING_THRESHOLD warn.
+    """
+    if block.block_type != BlockType.FILE_DOWNLOAD:
+        return
+    configured = block.max_steps_per_run
+    if configured is None:
+        return
+    if configured >= MAX_STEPS_DOWNLOAD_WARNING_THRESHOLD:
+        return
+    LOG.warning(
+        "file_download block configured with low max_steps_per_run",
+        log_code="file_download_low_max_steps",
+        block_label=block.label,
+        max_steps_per_run=configured,
+        recommended_minimum=MAX_STEPS_DOWNLOAD_WARNING_THRESHOLD,
+        workflow_run_id=workflow_run_id,
+    )
+
+
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
     jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
 else:
@@ -870,6 +903,14 @@ class BaseTaskBlock(Block):
                 organization_id=organization_id,
             )
 
+        # SKY-8818: observability + wait_until override. Computed ONCE per block
+        # execution — hoisted outside the retry loop so the Datadog signal counts
+        # block runs, not retries, and `_navigate_wait_until` is a pure function of
+        # self.block_type (which does not change between retries).
+        warn_if_file_download_max_steps_low(self, workflow_run_id=workflow_run_id)
+        _is_file_download = self.block_type == BlockType.FILE_DOWNLOAD
+        _navigate_wait_until = "domcontentloaded" if _is_file_download else "load"
+
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
         while will_retry:
@@ -899,9 +940,13 @@ class BaseTaskBlock(Block):
             if is_first_task:
                 # the first task block will create the browser state and do the navigation
                 try:
+                    # SKY-8818: for file_download blocks, skip the browser factory's built-in
+                    # goto (which uses wait_until='load' and stalls on slow subresources) and
+                    # let the about:blank fallback below handle navigation with our override.
+                    _bm_url = None if _is_file_download else self.url
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run,
-                        url=self.url,
+                        url=_bm_url,
                         browser_session_id=browser_session_id,
                         browser_profile_id=workflow_run.browser_profile_id,
                     )
@@ -912,8 +957,21 @@ class BaseTaskBlock(Block):
                             workflow_run_id=workflow_run.workflow_run_id,
                         )
                         raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
-                    if working_page.url == "about:blank" and self.url:
-                        await browser_state.navigate_to_url(page=working_page, url=self.url)
+                    # SKY-8818: for file_download we passed url=None above so the factory
+                    # skipped its built-in goto. We must therefore navigate explicitly to
+                    # self.url — not just when the page is about:blank, but whenever the
+                    # working page is not already on the target URL (e.g. persistent
+                    # browser sessions that carry state from a prior block).
+                    if self.url:
+                        _needs_navigation = working_page.url == "about:blank" or (
+                            _is_file_download and working_page.url.rstrip("/") != self.url.rstrip("/")
+                        )
+                        if _needs_navigation:
+                            await browser_state.navigate_to_url(
+                                page=working_page,
+                                url=self.url,
+                                wait_until=_navigate_wait_until,
+                            )
 
                     # When a browser profile is loaded, wait for the page to fully settle
                     # so that cookie-based authentication can redirect or restore the session
@@ -990,7 +1048,13 @@ class BaseTaskBlock(Block):
                         step_id=step.step_id,
                     )
                     try:
-                        await browser_state.navigate_to_url(page=working_page, url=self.url)
+                        # SKY-8818: use the hoisted wait_until override so file_download
+                        # pages with slow subresources can still resolve via domcontentloaded.
+                        await browser_state.navigate_to_url(
+                            page=working_page,
+                            url=self.url,
+                            wait_until=_navigate_wait_until,
+                        )
                     except Exception as e:
                         await self._handle_task_failure_with_error_detection(
                             task=task,
