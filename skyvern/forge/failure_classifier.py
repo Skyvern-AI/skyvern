@@ -31,20 +31,28 @@ def classify_from_failure_reason(
     categories: list[dict] = []
 
     # Bot detection / CAPTCHA — use specific phrases to avoid false positives
-    if any(
-        kw in reason
-        for kw in [
-            "captcha",
-            "cloudflare",
-            "bot detect",
-            "bot block",
-            "ip block",
-            "request block",
-            "access denied by",
-            "anti-bot",
-            "human verification",
-        ]
-    ):
+    _auth_context_keywords = ["login", "auth", "password", "permission", "credential"]
+    _has_auth_context = any(kw in reason for kw in _auth_context_keywords)
+    _antibot_keywords = [
+        "captcha",
+        "cloudflare",
+        "bot detect",
+        "bot block",
+        "ip block",
+        "request block",
+        "anti-bot",
+        "human verification",
+    ]
+    # "access denied" is ambiguous: it can be bot blocking OR auth failure.
+    # Only treat it as bot detection when there are no auth-related keywords nearby.
+    # Note: in Skyvern's context, failure_reason is LLM-generated from page observations,
+    # so RBAC-style messages like "Access denied: insufficient privileges" are unlikely.
+    # If this becomes a false-positive source, consider further narrowing (e.g. requiring
+    # "access denied" appears without ANY qualifier, or adding more exclusion keywords).
+    if not _has_auth_context:
+        _antibot_keywords.append("access denied")
+
+    if any(kw in reason for kw in _antibot_keywords):
         categories.append(
             {
                 "category": "ANTI_BOT_DETECTION",
@@ -87,8 +95,10 @@ def classify_from_failure_reason(
             }
         )
 
-    # Auth failure
-    if any(kw in reason for kw in ["login fail", "authentication fail", "auth fail", "mfa", "password"]):
+    # Auth failure — also catches "access denied" when auth context is present
+    if any(kw in reason for kw in ["login fail", "authentication fail", "auth fail", "mfa", "password"]) or (
+        "access denied" in reason and _has_auth_context
+    ):
         categories.append(
             {
                 "category": "AUTH_FAILURE",
