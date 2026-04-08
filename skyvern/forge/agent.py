@@ -86,6 +86,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -3889,6 +3890,18 @@ class ForgeAgent:
                 step_status=status,
                 organization_id=step.organization_id,
             )
+
+        # Flush event strategy metrics on any terminal status (including canceled)
+        if status in [StepStatus.completed, StepStatus.failed, StepStatus.canceled]:
+            try:
+                EventStrategyFactory.flush_metrics(
+                    step_id=step.step_id,
+                    task_id=step.task_id,
+                    step_status=status,
+                    organization_id=step.organization_id,
+                )
+            except Exception:
+                LOG.warning("Failed to flush event strategy metrics", exc_info=True)
 
         await save_step_logs(step.step_id)
 
