@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import os
-import time
 
 import structlog
 from playwright.async_api import async_playwright
 
-from skyvern.constants import is_loop_iteration_key, loop_iteration_key
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
-from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -23,47 +19,9 @@ from skyvern.webeye.real_browser_state import RealBrowserState
 LOG = structlog.get_logger()
 
 
-def _consume_future_exception(future: asyncio.Future[BrowserState]) -> None:
-    """Done-callback that retrieves a future's exception so asyncio does not
-    emit an "exception was never retrieved" warning when the owning coroutine
-    re-raises and no other waiter attached to the in-flight future. The
-    owner always re-raises the real exception on its own task, so dropping
-    it here is safe — this callback only exists to silence asyncio's
-    unhandled-exception warning when the in-flight group happened to have
-    zero waiters at the time of failure.
-
-    Logs at INFO so launch failures and teardown-race exceptions are
-    correlatable with incidents even when the owner's re-raise lands in a
-    separate log entry (cleanup/close/owner-cancellation paths intentionally
-    surface a RuntimeError here; real Playwright failures surface the real
-    exception type)."""
-    if future.cancelled():
-        return
-    exc = future.exception()
-    if exc is not None:
-        LOG.info(
-            "Consumed in-flight loop iteration launch exception (re-raised on owner)",
-            exc_type=type(exc).__name__,
-        )
-
-
 class RealBrowserManager(BrowserManager):
     def __init__(self) -> None:
         self.pages: dict[str, BrowserState] = {}
-        # Lazily initialized inside an async context to avoid binding the lock
-        # to the wrong event loop when RealBrowserManager is instantiated
-        # during module import or test fixtures that haven't started a loop.
-        self._loop_iteration_lock_instance: asyncio.Lock | None = None
-        # Single-flight registry for in-progress loop-iteration browser
-        # launches. The lock is held only across check-then-insert, not
-        # across the Playwright launch itself.
-        self._loop_iteration_inflight: dict[str, asyncio.Future[BrowserState]] = {}
-
-    @property
-    def _loop_iteration_lock(self) -> asyncio.Lock:
-        if self._loop_iteration_lock_instance is None:
-            self._loop_iteration_lock_instance = asyncio.Lock()
-        return self._loop_iteration_lock_instance
 
     @staticmethod
     async def _create_browser_state(
@@ -202,28 +160,6 @@ class RealBrowserManager(BrowserManager):
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
 
-        # When running inside a parallel loop iteration, SkyvernContext holds an
-        # iteration-specific browser_session_id (e.g. "wr_xxx__iter_0").  The
-        # iteration browser was pre-created by get_or_create_for_loop_iteration()
-        # and stored under that key.  Return it directly so child blocks (task,
-        # action, etc.) use the isolated browser instead of racing to create one
-        # under the bare workflow_run_id.
-        ctx = skyvern_context.current()
-        if ctx and ctx.browser_session_id and is_loop_iteration_key(ctx.browser_session_id):
-            iteration_browser = self.pages.get(ctx.browser_session_id)
-            if iteration_browser:
-                # Navigate to the task URL if page is still on about:blank
-                if url:
-                    page = await iteration_browser.get_working_page()
-                    if page and page.url == "about:blank":
-                        await iteration_browser.navigate_to_url(page=page, url=url)
-                LOG.debug(
-                    "Returning iteration-specific browser state from parallel loop context",
-                    workflow_run_id=workflow_run_id,
-                    iteration_key=ctx.browser_session_id,
-                )
-                return iteration_browser
-
         # Check own cache entry first so navigate_to_url is only called on the first step.
         # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
         # below so PBS runs don't accidentally inherit the parent's browser.
@@ -316,15 +252,6 @@ class RealBrowserManager(BrowserManager):
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
     ) -> BrowserState | None:
-        # Check for parallel loop iteration browser via SkyvernContext first.
-        # This mirrors the async get_or_create_for_workflow_run() so callers
-        # like task block's non-first-task path get the correct iteration browser.
-        ctx = skyvern_context.current()
-        if ctx and ctx.browser_session_id and is_loop_iteration_key(ctx.browser_session_id):
-            iteration_browser = self.pages.get(ctx.browser_session_id)
-            if iteration_browser:
-                return iteration_browser
-
         # Priority: parent first, then own entry.
         # Callers that need to avoid parent inheritance must omit parent_workflow_run_id.
         # See get_or_create_for_workflow_run() for the two-phase lookup pattern.
@@ -337,13 +264,6 @@ class RealBrowserManager(BrowserManager):
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
-        # Check parallel loop iteration browser first
-        ctx = skyvern_context.current()
-        if ctx and ctx.browser_session_id and is_loop_iteration_key(ctx.browser_session_id):
-            iter_browser = self.pages.get(ctx.browser_session_id)
-            if iter_browser:
-                iter_browser.browser_artifacts.video_artifacts = artifacts
-                return
         if task.workflow_run_id and task.workflow_run_id in self.pages:
             self.pages[task.workflow_run_id].browser_artifacts.video_artifacts = artifacts
             return
@@ -425,33 +345,9 @@ class RealBrowserManager(BrowserManager):
 
     async def close(self) -> None:
         LOG.info("Closing BrowserManager")
-        # Hold the loop-iteration lock across the whole shutdown so a
-        # concurrent Phase 1 registration cannot land a fresh in-flight
-        # future after we've already cancelled + cleared the dict, and
-        # so cleanup_loop_iterations cannot race with us for the same
-        # keys. cleanup_loop_iterations already takes this lock; close()
-        # must do the same for the invariant to hold.
-        async with self._loop_iteration_lock:
-            # Fail in-flight launches with a regular Exception (not cancel())
-            # so shielded same-key waiters see a RuntimeError they can route
-            # through _execute_single_iteration_parallel's Exception handler,
-            # instead of a CancelledError that would bypass `isinstance(result,
-            # Exception)` in _execute_loop_parallel and crash the batch unpack.
-            # The owner of each launch still discards its new browser state
-            # via the identity-guarded check below (stored_future mismatch) —
-            # future.cancelled() is not required for discard.
-            for key, future in list(self._loop_iteration_inflight.items()):
-                if not future.done():
-                    future.set_exception(RuntimeError(f"loop iteration {key} was cleaned up during launch"))
-            self._loop_iteration_inflight.clear()
-            # Intentionally sequential here (unlike cleanup_loop_iterations,
-            # which parallelizes via asyncio.gather). close() runs under
-            # _loop_iteration_lock so that Phase 1 registration cannot
-            # race the teardown; a future refactor to gather() must
-            # preserve that lock-held invariant.
-            for browser_state in self.pages.values():
-                await browser_state.close()
-            self.pages = dict()
+        for browser_state in self.pages.values():
+            await browser_state.close()
+        self.pages = dict()
         LOG.info("BrowserManger is closed")
 
     async def cleanup_for_task(
@@ -629,274 +525,3 @@ class RealBrowserManager(BrowserManager):
         if script_id and script_id in self.pages:
             return self.pages[script_id]
         return None
-
-    async def get_or_create_for_loop_iteration(
-        self,
-        workflow_run_id: str,
-        loop_idx: int,
-        organization_id: str | None = None,
-        browser_session_id: str | None = None,
-    ) -> BrowserState:
-        """Get or create an isolated BrowserContext for a parallel loop iteration.
-
-        Each iteration gets its own browser context so cookies, auth state, and
-        storage are fully isolated between concurrent iterations.
-
-        Uses _loop_iteration_lock to guard the check-then-register on
-        self.pages / self._loop_iteration_inflight, but releases it before
-        doing the Playwright launch so concurrent iterations with distinct
-        keys can cold-start in parallel. Single-flight semantics are
-        preserved via an in-flight futures map so concurrent callers for
-        the same key share a single launch.
-        """
-        key = loop_iteration_key(workflow_run_id, loop_idx)
-
-        # Phase 1: short critical section — either return cached, attach to
-        # an in-flight launch, or register a new future and proceed to launch.
-        async with self._loop_iteration_lock:
-            if key in self.pages:
-                cached_state = self.pages[key]
-                inflight_future: asyncio.Future[BrowserState] | None = None
-                owns_launch = False
-            elif key in self._loop_iteration_inflight:
-                cached_state = None
-                inflight_future = self._loop_iteration_inflight[key]
-                owns_launch = False
-            else:
-                cached_state = None
-                inflight_future = asyncio.get_running_loop().create_future()
-                # Eagerly observe any exception the future may carry so that
-                # a launch failure with no attached waiters doesn't emit an
-                # "exception was never retrieved" warning from asyncio. The
-                # owning coroutine always re-raises separately.
-                inflight_future.add_done_callback(_consume_future_exception)
-                self._loop_iteration_inflight[key] = inflight_future
-                owns_launch = True
-
-                # Persistent sessions cannot be aliased under per-iteration keys —
-                # multiple iterations would race on the same live page. The caller
-                # (execute_loop_helper) is expected to force sequential execution
-                # when a persistent session is in use; this branch only runs if
-                # that contract is bypassed, in which case we still create a fresh
-                # isolated context to preserve correctness over the persistence.
-                if browser_session_id:
-                    LOG.warning(
-                        "Persistent browser session not used for parallel loop iteration — "
-                        "creating isolated context to avoid cross-iteration races",
-                        workflow_run_id=workflow_run_id,
-                        loop_idx=loop_idx,
-                        browser_session_id=browser_session_id,
-                    )
-
-                LOG.info(
-                    "Creating isolated browser state for loop iteration",
-                    workflow_run_id=workflow_run_id,
-                    loop_idx=loop_idx,
-                    key=key,
-                )
-
-        # Phase 2: fulfil the request outside the lock.
-        if cached_state is not None:
-            browser_state = cached_state
-        elif not owns_launch:
-            # Attached to another coroutine's in-flight launch. Shield the
-            # shared future from this waiter's cancellation so one waiter
-            # being cancelled does not cancel the shared launch and fan out
-            # CancelledError to the entire single-flight group.
-            assert inflight_future is not None
-            browser_state = await asyncio.shield(inflight_future)
-        else:
-            # This coroutine owns the launch — do it unlocked so other keys
-            # can launch in parallel. The owner also performs the first
-            # get_or_create_page before publishing the future so same-key
-            # waiters don't race inside RealBrowserState.get_or_create_page
-            # (which is not internally synchronized).
-            assert inflight_future is not None
-            owner_state: BrowserState | None = None
-            launch_start = time.perf_counter()
-            try:
-                owner_state = await self._create_browser_state(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                )
-                await owner_state.get_or_create_page(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                )
-            except BaseException as exc:
-                # The pop + future-resolution pair below must be synchronous
-                # (no awaits between them) so cancellation cannot split the
-                # pop from the future resolution and orphan the in-flight
-                # entry. Any attached waiters see the exception; subsequent
-                # callers get a fresh launch.
-                #
-                # Identity-guarded pop: a concurrent cleanup may have
-                # cancelled+removed our future and a replacement owner may
-                # have registered a new one for the same key. Only remove
-                # the entry if it is still ours — otherwise leave the
-                # replacement alone.
-                if self._loop_iteration_inflight.get(key) is inflight_future:
-                    self._loop_iteration_inflight.pop(key, None)
-                if not inflight_future.done():
-                    # Normalize owner-task cancellation to a RuntimeError for
-                    # shielded waiters. A raw CancelledError on the shared
-                    # future would bypass `isinstance(result, Exception)` in
-                    # _execute_loop_parallel (CancelledError is a BaseException)
-                    # and crash the batch success-unpack. The owner task
-                    # itself still re-raises the original CancelledError via
-                    # the `raise` below to let its own cancellation propagate.
-                    if isinstance(exc, asyncio.CancelledError):
-                        inflight_future.set_exception(RuntimeError(f"loop iteration {key} launch cancelled"))
-                    else:
-                        inflight_future.set_exception(exc)
-                # Teardown below runs AFTER the future is already settled,
-                # so the await does not affect waiters or reopen a race on
-                # the in-flight entry. Best effort — a failing close should
-                # not mask the original exception.
-                if owner_state is not None:
-                    try:
-                        await asyncio.shield(owner_state.close())
-                    except BaseException:
-                        LOG.warning(
-                            "Failed to close half-initialized loop iteration browser state",
-                            workflow_run_id=workflow_run_id,
-                            loop_idx=loop_idx,
-                            exc_info=True,
-                        )
-                raise
-
-            assert owner_state is not None
-            browser_state = owner_state
-            # Success path is synchronous from here on — no awaits between
-            # page init completing and the future being resolved, so
-            # cancellation of this owner task cannot orphan the in-flight
-            # entry.
-            #
-            # cleanup_loop_iterations and close() can run concurrently with
-            # the launch (launch is no longer under the lock). Both teardown
-            # paths pop our entry from _loop_iteration_inflight and then set
-            # a RuntimeError on the future, so our identity check below
-            # detects the race via `stored_future is not inflight_future`
-            # alone. No `inflight_future.cancelled()` check is needed
-            # because neither teardown path calls `.cancel()` — both use
-            # set_exception so shielded waiters receive a regular Exception
-            # that _execute_single_iteration_parallel handles normally
-            # instead of a BaseException-derived CancelledError that would
-            # bypass the batch-result dispatch.
-            stored_future = self._loop_iteration_inflight.get(key)
-            if stored_future is inflight_future:
-                self._loop_iteration_inflight.pop(key, None)
-            if stored_future is not inflight_future:
-                LOG.warning(
-                    "Loop iteration cleanup ran during launch, discarding browser state",
-                    workflow_run_id=workflow_run_id,
-                    loop_idx=loop_idx,
-                    key=key,
-                )
-                try:
-                    await asyncio.shield(browser_state.close())
-                except BaseException:
-                    LOG.warning(
-                        "Failed to close loop iteration browser state after concurrent cleanup",
-                        workflow_run_id=workflow_run_id,
-                        loop_idx=loop_idx,
-                        exc_info=True,
-                    )
-                # Use a plain Exception subclass rather than CancelledError:
-                # the parallel for-loop driver routes gather() results via
-                # isinstance(result, Exception), and BaseException-derived
-                # CancelledError would bypass that check and crash the
-                # success-unpack path with a TypeError.
-                raise RuntimeError(f"loop iteration {key} was cleaned up during launch")
-
-            self.pages[key] = browser_state
-            if not inflight_future.done():
-                inflight_future.set_result(browser_state)
-            LOG.info(
-                "Loop iteration browser launch completed",
-                workflow_run_id=workflow_run_id,
-                loop_idx=loop_idx,
-                key=key,
-                elapsed_s=round(time.perf_counter() - launch_start, 3),
-            )
-            return browser_state
-
-        # Waiters/cache-hit path: the owner has already completed the
-        # initial get_or_create_page before publishing the future, so this
-        # call will cache-hit and not race with any concurrent setup.
-        await browser_state.get_or_create_page(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
-        return browser_state
-
-    async def cleanup_loop_iterations(
-        self,
-        workflow_run_id: str,
-        loop_indices: list[int],
-        organization_id: str | None = None,
-    ) -> None:
-        """Close and remove browser states for the given parallel loop iterations.
-
-        Uses _loop_iteration_lock so cleanup cannot race with create or with
-        a concurrent cleanup call from another batch.
-        """
-        # Collect entries to close under the lock, then close outside it
-        # to avoid holding the lock during potentially slow browser teardown.
-        # Also fail any in-flight launches for these keys so a launch still
-        # running in its unlocked section discards its new browser state
-        # instead of publishing it after cleanup has already run.
-        to_close: list[tuple[int, BrowserState]] = []
-        async with self._loop_iteration_lock:
-            for loop_idx in loop_indices:
-                key = loop_iteration_key(workflow_run_id, loop_idx)
-                inflight_future = self._loop_iteration_inflight.pop(key, None)
-                if inflight_future is not None and not inflight_future.done():
-                    # set_exception (not cancel()) so shielded same-key
-                    # waiters receive a RuntimeError that
-                    # _execute_single_iteration_parallel can catch via its
-                    # `except Exception` handler, instead of a CancelledError
-                    # that would bypass _execute_loop_parallel's
-                    # `isinstance(result, Exception)` dispatch and crash the
-                    # batch success-unpack path (CancelledError is a
-                    # BaseException, not an Exception).
-                    inflight_future.set_exception(RuntimeError(f"loop iteration {key} was cleaned up during launch"))
-                browser_state = self.pages.pop(key, None)
-                if browser_state is None:
-                    continue
-                # Only close if no other entry still references the same object
-                shared = any(bs is browser_state for bs in self.pages.values())
-                if not shared:
-                    to_close.append((loop_idx, browser_state))
-
-        if not to_close:
-            return
-
-        # Close all entries in parallel — Playwright context teardown is
-        # IO-bound and would otherwise dominate the batch gap.
-        close_start = time.perf_counter()
-        results = await asyncio.gather(
-            *(browser_state.close() for _, browser_state in to_close),
-            return_exceptions=True,
-        )
-        close_elapsed_s = time.perf_counter() - close_start
-        failure_count = sum(1 for r in results if isinstance(r, BaseException))
-        LOG.info(
-            "cleanup_loop_iterations closed entries",
-            workflow_run_id=workflow_run_id,
-            count=len(to_close),
-            failures=failure_count,
-            elapsed_s=round(close_elapsed_s, 3),
-        )
-        for (loop_idx, _), result in zip(to_close, results):
-            if isinstance(result, BaseException):
-                LOG.warning(
-                    "Failed to close loop iteration browser state",
-                    workflow_run_id=workflow_run_id,
-                    loop_idx=loop_idx,
-                    # return_exceptions=True means there is no active
-                    # exception context, so exc_info=True won't pick
-                    # anything up. Pass an explicit (type, value, tb)
-                    # tuple — structlog's documented signature.
-                    exc_info=(type(result), result, result.__traceback__),
-                )
