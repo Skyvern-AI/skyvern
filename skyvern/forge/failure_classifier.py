@@ -17,10 +17,10 @@ def classify_from_failure_reason(
     user-guided / expected.
 
     Categories:
-        ANTI_BOT_DETECTION, BROWSER_ERROR, NAVIGATION_FAILURE, PAGE_LOAD_TIMEOUT,
-        AUTH_FAILURE, LLM_ERROR, CREDENTIAL_ERROR, DATA_EXTRACTION_FAILURE,
-        ELEMENT_NOT_FOUND, WRONG_PAGE_STATE, MAX_STEPS_EXCEEDED,
-        INFRASTRUCTURE_ERROR, UNKNOWN
+        ANTI_BOT_DETECTION, PROXY_ERROR, BROWSER_ERROR, NAVIGATION_FAILURE,
+        PAGE_LOAD_TIMEOUT, AUTH_FAILURE, LLM_ERROR, CREDENTIAL_ERROR,
+        DATA_EXTRACTION_FAILURE, ELEMENT_NOT_FOUND, WRONG_PAGE_STATE,
+        MAX_STEPS_EXCEEDED, INFRASTRUCTURE_ERROR, UNKNOWN
     """
     if not failure_reason and not exception:
         return None
@@ -31,20 +31,28 @@ def classify_from_failure_reason(
     categories: list[dict] = []
 
     # Bot detection / CAPTCHA — use specific phrases to avoid false positives
-    if any(
-        kw in reason
-        for kw in [
-            "captcha",
-            "cloudflare",
-            "bot detect",
-            "bot block",
-            "ip block",
-            "request block",
-            "access denied by",
-            "anti-bot",
-            "human verification",
-        ]
-    ):
+    _auth_context_keywords = ["login", "auth", "password", "permission", "credential"]
+    _has_auth_context = any(kw in reason for kw in _auth_context_keywords)
+    _antibot_keywords = [
+        "captcha",
+        "cloudflare",
+        "bot detect",
+        "bot block",
+        "ip block",
+        "request block",
+        "anti-bot",
+        "human verification",
+    ]
+    # "access denied" is ambiguous: it can be bot blocking OR auth failure.
+    # Only treat it as bot detection when there are no auth-related keywords nearby.
+    # Note: in Skyvern's context, failure_reason is LLM-generated from page observations,
+    # so RBAC-style messages like "Access denied: insufficient privileges" are unlikely.
+    # If this becomes a false-positive source, consider further narrowing (e.g. requiring
+    # "access denied" appears without ANY qualifier, or adding more exclusion keywords).
+    if not _has_auth_context:
+        _antibot_keywords.append("access denied")
+
+    if any(kw in reason for kw in _antibot_keywords):
         categories.append(
             {
                 "category": "ANTI_BOT_DETECTION",
@@ -53,8 +61,22 @@ def classify_from_failure_reason(
             }
         )
 
-    # Browser errors
-    if any(kw in exc_name for kw in ["Browser", "CDP", "TargetClosed"]) or any(
+    # Proxy errors — check before browser errors so proxy failures don't fall into BROWSER_ERROR.
+    # The exception name may contain "Browser" (e.g. UnknownErrorWhileCreatingBrowserContext) but the
+    # root cause is proxy pool exhaustion.
+    _proxy_exc_keywords = ["NoProxy", "ProxyError"]
+    _proxy_reason_keywords = ["no proxy available", "proxy unavailable"]
+    if any(kw in exc_name for kw in _proxy_exc_keywords) or any(kw in reason for kw in _proxy_reason_keywords):
+        categories.append(
+            {
+                "category": "PROXY_ERROR",
+                "confidence_float": 0.9,
+                "reasoning": f"Exception: {exc_name}" if exc_name else "Keywords matched",
+            }
+        )
+
+    # Browser errors — only match if not already classified as PROXY_ERROR above
+    elif any(kw in exc_name for kw in ["Browser", "CDP", "TargetClosed"]) or any(
         kw in reason for kw in ["browser context closed", "page closed", "browser crash"]
     ):
         categories.append(
@@ -87,8 +109,10 @@ def classify_from_failure_reason(
             }
         )
 
-    # Auth failure
-    if any(kw in reason for kw in ["login fail", "authentication fail", "auth fail", "mfa", "password"]):
+    # Auth failure — also catches "access denied" when auth context is present
+    if any(kw in reason for kw in ["login fail", "authentication fail", "auth fail", "mfa", "password"]) or (
+        "access denied" in reason and _has_auth_context
+    ):
         categories.append(
             {
                 "category": "AUTH_FAILURE",

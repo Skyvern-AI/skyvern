@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
   ChevronDownIcon,
@@ -486,13 +486,25 @@ function SchedulesPage() {
               {schedules.map((schedule, index) => (
                 <TableRow
                   key={schedule.workflow_schedule_id}
-                  className="cursor-pointer select-none hover:bg-muted/50"
+                  tabIndex={0}
+                  aria-label={`Open schedule ${schedule.name ?? schedule.workflow_title}`}
+                  className="cursor-pointer select-none hover:bg-muted/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-primary"
                   onClick={() =>
                     navigate(
                       `/schedules/${schedule.workflow_permanent_id}/${schedule.workflow_schedule_id}`,
                       { state: { workflowTitle: schedule.workflow_title } },
                     )
                   }
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      navigate(
+                        `/schedules/${schedule.workflow_permanent_id}/${schedule.workflow_schedule_id}`,
+                        { state: { workflowTitle: schedule.workflow_title } },
+                      );
+                    }
+                  }}
                 >
                   {showCheckbox && (
                     <TableCell
@@ -507,16 +519,8 @@ function SchedulesPage() {
                       />
                     </TableCell>
                   )}
-                  <TableCell
-                    className="truncate font-medium"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <Link
-                      to={`/workflows/${schedule.workflow_permanent_id}/runs`}
-                      className="hover:underline"
-                    >
-                      {schedule.workflow_title}
-                    </Link>
+                  <TableCell className="truncate font-medium">
+                    {schedule.workflow_title}
                   </TableCell>
                   <TableCell className="truncate text-slate-400">
                     {schedule.name ?? "\u2014"}

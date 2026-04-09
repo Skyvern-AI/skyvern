@@ -29,7 +29,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import {
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  formatExecutionTime,
+} from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   CodeIcon,
@@ -194,20 +198,21 @@ function WorkflowPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-1/4">ID</TableHead>
-                <TableHead className="w-1/4">Status</TableHead>
-                <TableHead className="w-1/4">Created At</TableHead>
-                <TableHead className="w-1/4"></TableHead>
+                <TableHead className="w-1/5">ID</TableHead>
+                <TableHead className="w-1/5">Status</TableHead>
+                <TableHead className="w-1/5">Created At</TableHead>
+                <TableHead className="w-1/5">Duration</TableHead>
+                <TableHead className="w-1/5"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
                 <TableRow>
-                  <TableCell colSpan={4}>Loading...</TableCell>
+                  <TableCell colSpan={5}>Loading...</TableCell>
                 </TableRow>
               ) : workflowRuns?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={4}>No workflow runs found</TableCell>
+                  <TableCell colSpan={5}>No workflow runs found</TableCell>
                 </TableRow>
               ) : (
                 workflowRuns?.map((workflowRun) => {
@@ -257,6 +262,12 @@ function WorkflowPage() {
                         >
                           {basicLocalTimeFormat(workflowRun.created_at)}
                         </TableCell>
+                        <TableCell className="text-slate-400">
+                          {formatExecutionTime(
+                            workflowRun.started_at ?? workflowRun.created_at,
+                            workflowRun.finished_at,
+                          ) ?? "-"}
+                        </TableCell>
                         <TableCell>
                           <div className="flex justify-end gap-2">
                             <TooltipProvider>
@@ -293,7 +304,7 @@ function WorkflowPage() {
                       {isExpanded && (
                         <TableRow key={`${workflowRun.workflow_run_id}-params`}>
                           <TableCell
-                            colSpan={4}
+                            colSpan={5}
                             className="bg-slate-50 dark:bg-slate-900/50"
                           >
                             <WorkflowRunParameters

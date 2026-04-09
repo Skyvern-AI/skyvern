@@ -130,21 +130,54 @@ class RealBrowserState(BrowserState):
             total_wait_ms += random.randint(0, SETTLE_JITTER_MS)
         await asyncio.sleep(total_wait_ms / 1000)
 
-    async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
+    async def navigate_to_url(
+        self,
+        page: Page,
+        url: str,
+        retry_times: int = NAVIGATION_MAX_RETRY_TIME,
+        wait_until: str = "load",
+    ) -> None:
+        # SKY-8818: progressive wait_until degradation. Many pages never fire
+        # `load` because a subresource stalls; degrading to `domcontentloaded` and
+        # then `commit` lets navigation succeed once the DOM or response is ready.
+        # Monotonic: a retry never upgrades to a STRONGER wait state than the caller asked for.
+        _degradation_map: dict[str, list[str]] = {
+            "load": ["load", "domcontentloaded", "commit"],
+            "domcontentloaded": ["domcontentloaded", "commit"],
+            "commit": ["commit"],
+        }
+        degradation = _degradation_map.get(wait_until, [wait_until])
+
         try:
             for retry_time in range(retry_times):
-                LOG.info("Trying to navigate to url", url=url, retry_time=retry_time)
+                strategy = degradation[min(retry_time, len(degradation) - 1)]
+                LOG.info(
+                    "Trying to navigate to url",
+                    url=url,
+                    retry_time=retry_time,
+                    wait_until=strategy,
+                )
                 try:
                     start_time = time.time()
-                    await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                    await page.goto(
+                        url,
+                        timeout=settings.BROWSER_LOADING_TIMEOUT_MS,
+                        wait_until=strategy,
+                    )
                     end_time = time.time()
                     LOG.info(
                         "Page loading time",
                         loading_time=end_time - start_time,
                         url=url,
+                        wait_until=strategy,
                     )
                     await self._wait_for_settle()
-                    LOG.info("Successfully navigated to url", url=url, retry_time=retry_time)
+                    LOG.info(
+                        "Successfully navigated to url",
+                        url=url,
+                        retry_time=retry_time,
+                        wait_until=strategy,
+                    )
                     return
 
                 except Exception as e:
@@ -156,6 +189,7 @@ class RealBrowserState(BrowserState):
                         exc_info=True,
                         url=url,
                         retry_time=retry_time,
+                        wait_until=strategy,
                     )
                     # Wait for 1 seconds before retrying
                     await asyncio.sleep(1)

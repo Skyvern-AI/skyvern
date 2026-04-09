@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.29"
+version = "1.0.30"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -16,16 +16,16 @@ dependencies = [
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.35.0",
-    "litellm>=1.80.10",
+    "litellm>=1.83.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
     "pillow>=10.2.0",
-    "starlette-context>=0.3.6,<0.4",
+    "starlette-context>=0.3.6,<0.6",
     "pydantic>=2.5.2,<3",
     "pydantic-settings>=2.1.0,<3",
-    "fastapi>=0.121.0,<0.129",
+    "fastapi>=0.121.0,<0.136",
     "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
     "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
     "alembic>=1.12.1,<2",
@@ -48,14 +48,14 @@ dependencies = [
     "posthog>=3.7.0,<4",
     "aiofiles>=24.1.0,<25",
     "pyotp>=2.9.0,<3",
-    "asyncpg>=0.30.0,<0.31",
-    "json-repair>=0.34.0,<0.35",
+    "asyncpg>=0.30.0,<0.32",
+    "json-repair>=0.34.0,<0.59",
     "pypdf>=6.7.5,<7",
     "pdfplumber>=0.11.0,<0.12",
-    "fastmcp>=2.10.1,<4",
+    "fastmcp>=3.2.0,<4",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
-    "anthropic>=0.50.0,<0.51",
+    "anthropic>=0.50.0,<0.89",
     "google-cloud-aiplatform>=1.90.0,<2",
     "onepassword-sdk==0.4.0",
     "types-boto3[full]>=1.38.31,<2",
@@ -77,7 +77,7 @@ dependencies = [
     "pyasn1>=0.6.3",
     "PyJWT>=2.12.0",
     "tornado>=6.5.5",
-    "aiosqlite>=0.21.0,<0.22",
+    "aiosqlite>=0.21.0,<0.23",
 ]
 
 [dependency-groups]
@@ -121,8 +121,8 @@ dev = [
     "twine>=6.1.0,<7",
     "build>=1.2.2.post1,<2",
     "pre-commit>=4.2.0,<5",
-    "ruff>=0.14.1,<0.15",
-    "aiosqlite>=0.21.0,<0.22",
+    "ruff>=0.14.1,<0.16",
+    "aiosqlite>=0.21.0,<0.23",
     "moto[s3, server]>=5.1.5,<6",
     "curlify>=3.0.0",
     "openpyxl>=3.1.0",

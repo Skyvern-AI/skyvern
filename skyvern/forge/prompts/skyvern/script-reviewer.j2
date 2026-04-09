@@ -37,7 +37,7 @@ You are a script reviewer for a browser automation system. Your job is to update
        ```
 10. **URL PATTERNS**: When different variants come from different URL hosts or paths, add `url_patterns` to the `page.classify()` call for FREE Tier-0 disambiguation. Use regex on the URL path: `url_patterns={"variant_a": "example\\.com/form-a"}`. URL patterns are checked BEFORE text patterns and cost nothing.
 11. **FOR-LOOP BLOCKS**: When code runs inside a for-loop (e.g. by iterating over extracted items), every `page.click()`, `page.goto()`, or `page.download_file()` call MUST use per-iteration data to target the specific item. Never use a static selector or generic prompt that would resolve to the same element on every iteration.
-    - **File download blocks**: Use `context.download_selector()` which builds a CSS selector (e.g. `a[href*="filename.pdf"]`) from URL-like fields in the current loop value. Combine with `context.prompt` for AI fallback: `await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")`. If `download_selector()` returns `None` (no URL in loop value), fall back to a text-based selector using `context.loop_value`.
+    - **File download and navigation blocks**: Use `context.loop_item_selector()` which builds a CSS selector from the current loop value — URL path matching (e.g. `a[href*="water-act-2014"]`) or text matching (e.g. `a:has-text("Document Title")`). Combine with `context.prompt` for AI fallback: `await page.click(selector=context.loop_item_selector(), prompt=context.prompt, ai="fallback")`. Returns `None` when no viable selector can be built, which makes `page.click` fall back to AI automatically.
     - **Other blocks**: Use `context.loop_value` (dict) to build selectors. Prefer `page.goto(context.loop_value["url"])` for direct URLs, or include the item's title/identifier in the selector: `selector=f'a:has-text("{context.loop_value["title"]}")'`.
 12. **NEVER HARDCODE PER-RUN VALUES IN SELECTORS OR PROMPTS**. If a selector or prompt contains a value that varies per run (a person's name, an ID, an address, a company name), it MUST be dynamic — never a literal string. This applies even when the page shows an abbreviated form (e.g., "J. Smith") that doesn't exactly match the parameter ("John H. Smith").
     - **How to detect**: Check the **Current Run Parameter Values** and **Past Episode Parameters** sections below. If different episodes show different values for the same parameter (e.g., `full_name: "John Smith"` in one run, `full_name: "Jane Doe"` in another), any selector referencing that name is per-run and must be dynamic.
@@ -59,6 +59,32 @@ You are a script reviewer for a browser automation system. Your job is to update
 ```
 {{ navigation_goal }}
 ```
+{% if terminate_criterion %}
+
+## Block Termination Criterion
+When this condition is met, call `await page.terminate(errors=["<error_code>: <reason>"])`:
+```
+{{ terminate_criterion }}
+```
+You MUST check for this condition using `page.classify()` or `page.extract()` and terminate inside an `if`/`elif` branch when it is satisfied. Do NOT rely on the AI fallback to handle termination — the script should detect it directly.
+{% endif %}
+{% if complete_criterion %}
+
+## Block Completion Criterion
+The block should call `await page.complete()` when this condition is met:
+```
+{{ complete_criterion }}
+```
+{% endif %}
+{% if error_code_mapping %}
+
+## Error Code Mapping
+These are the specific error codes defined for this block. When terminating, use the matching error code:
+{% for code, description in error_code_mapping.items() %}
+- **{{ code }}**: {{ description }}
+{% endfor %}
+Use these codes in `page.terminate(errors=["<ERROR_CODE>: <details>"])` when the corresponding condition is detected.
+{% endif %}
 {% if parameter_keys %}
 
 ## Workflow Parameter Keys
@@ -486,7 +512,7 @@ async def block_fn(page, context):
 These properties are available on the `context` object when code runs inside a for-loop:
 - `context.loop_value` — Current loop iteration value (dict). Contains the extracted data for this iteration (e.g. `{"title": "...", "download_url": "...", "unique_id": "..."}`).
 - `context.prompt` — Per-iteration navigation goal/prompt (str or None). Set automatically from the block's navigation_goal with the current loop value substituted.
-- `context.download_selector()` — Builds a CSS selector targeting a download link from `context.loop_value`. Scans the dict values for URL-like strings, extracts the filename, and returns e.g. `'a[href*="filename.pdf"]'`. Returns `None` if no URL is found — in that case, build a selector manually from `context.loop_value`.
+- `context.loop_item_selector()` — Builds a CSS selector to click the current loop item's link. Tries URL path matching first (e.g. `'a[href*="water-act-2014"]'` from path segments), then text matching (e.g. `'a:has-text("Document Title")'`). Returns `None` if no viable selector — `page.click` will fall back to AI. Works for both navigation and download blocks.
 
 ### DO NOT USE (these do NOT exist and will crash at runtime)
 - ~~`page.completed`~~ — Does NOT exist. Use `await page.complete()` to finish.

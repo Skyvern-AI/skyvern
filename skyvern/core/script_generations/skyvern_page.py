@@ -3513,14 +3513,18 @@ class RunContext:
             return ctx.loop_metadata.get("current_value")
         return None
 
-    def download_selector(self) -> str | None:
-        """Build a CSS selector targeting a download link from the current loop value.
+    def loop_item_selector(self) -> str | None:
+        """Build a CSS selector to click the current loop item's link on the page.
 
-        Tries strategies in order of reliability:
-        1. URL in values → a[href*="filename.pdf"] (most precise)
-        2. Title text → a:has-text("title") (works when title IS the link)
+        Strategies in order of reliability:
+        1. URL path matching — extract the last meaningful path segment from URL
+           values and match via ``a[href*="path-segment"]``. Skips bare domains
+           (no path) to avoid matching every link on the page.
+        2. Text matching — use the longest non-URL text value via
+           ``a:has-text("title")``.
 
-        Returns the first viable selector, or None to fall back to AI.
+        Works for both navigation clicks and file downloads. Returns None when
+        no viable selector can be built (caller should fall back to AI).
         """
         value = self.loop_value
         if not value or not isinstance(value, dict):
@@ -3531,13 +3535,21 @@ class RunContext:
             if not isinstance(v, str) or not v.strip():
                 continue
 
-            # Strategy 1: URL-like values → href selector (most reliable)
-            if re.match(r"https?://", v) or re.match(r"/.*\.\w+", v):
-                filename = v.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
-                if filename and "." in filename:
-                    filename = re.sub(r'["\[\]\\]', "", filename)
-                    if filename:
-                        return f'a[href*="{filename}"]'
+            # Strategy 1: URL values → href selector from path segment.
+            # Uses the first URL with a viable path (dict insertion order is
+            # stable in Python 3.7+; extraction blocks control field ordering).
+            if re.match(r"https?://", v) or v.startswith("/"):
+                # Extract path, strip trailing slash
+                # "https://example.com/pub/water-act-2014/" → "/pub/water-act-2014"
+                # "/files/report.pdf?v=2" → "/files/report.pdf"
+                path = re.sub(r"https?://[^/]*", "", v).split("?")[0].split("#")[0].rstrip("/")
+                if path and path != "/":
+                    segment = path.rsplit("/", 1)[-1]
+                    segment = re.sub(r'["\[\]\\]', "", segment)
+                    if segment and len(segment) >= 3:
+                        return f'a[href*="{segment}"]'
+                # Short or empty path segment — fall through to text matching
+                continue
 
             texts.append(v.strip())
 
@@ -3546,10 +3558,13 @@ class RunContext:
 
         # Strategy 2: Direct link text match — many sites make the document
         # title clickable (e.g., <a href="...">Annual Report 2025</a>).
-        # Use the longest text (likely the title, which is more often the link text).
         longest = max(texts, key=len)
-        escaped = longest.replace('"', '\\"')
+        escaped = longest.replace("\n", " ").replace("\r", "").replace('"', '\\"')
         if len(escaped) >= 3:
             return f'a:has-text("{escaped}")'
 
         return None
+
+    # Backward-compatible alias — existing cached scripts reference download_selector()
+    def download_selector(self) -> str | None:
+        return self.loop_item_selector()

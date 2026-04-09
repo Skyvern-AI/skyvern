@@ -31,6 +31,8 @@ class TestAntiBotDetection:
             "Access denied by WAF",
             "Anti-bot system triggered",
             "Human verification required",
+            "The current page shows an 'Access Denied' error",
+            "Access Denied - website blocked the request",
         ],
     )
     def test_keywords_match(self, reason: str) -> None:
@@ -38,6 +40,22 @@ class TestAntiBotDetection:
         assert result is not None
         categories = [r["category"] for r in result]
         assert "ANTI_BOT_DETECTION" in categories
+
+    def test_access_denied_with_auth_context_is_not_antibot(self) -> None:
+        """'Access denied' + auth keywords → AUTH_FAILURE, not ANTI_BOT_DETECTION."""
+        result = classify_from_failure_reason("Access denied after login - user does not have permission")
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "AUTH_FAILURE" in categories
+        assert "ANTI_BOT_DETECTION" not in categories
+
+    def test_access_denied_with_password_context_is_not_antibot(self) -> None:
+        """'Access denied' when password is mentioned → AUTH_FAILURE."""
+        result = classify_from_failure_reason("The page shows 'Access Denied'. Unable to enter your password.")
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "AUTH_FAILURE" in categories
+        assert "ANTI_BOT_DETECTION" not in categories
 
     def test_broad_blocked_does_not_match(self) -> None:
         """'blocked' alone should NOT trigger ANTI_BOT_DETECTION (narrowed keywords)."""
@@ -51,6 +69,46 @@ class TestAntiBotDetection:
         if result:
             categories = [r["category"] for r in result]
             assert "ANTI_BOT_DETECTION" not in categories
+
+
+class TestProxyError:
+    def test_no_proxy_exception_is_proxy_not_browser(self) -> None:
+        """NoProxyAvailable exception should be PROXY_ERROR, not BROWSER_ERROR."""
+
+        class NoProxyAvailable(Exception):
+            pass
+
+        result = classify_from_failure_reason(
+            "Failed to create browser context for dynamic-browser (NoProxyAvailable). No proxy available",
+            exception=NoProxyAvailable(),
+        )
+        assert result is not None
+        assert result[0]["category"] == "PROXY_ERROR"
+        categories = [r["category"] for r in result]
+        assert "BROWSER_ERROR" not in categories
+
+    def test_unknown_error_creating_browser_context_with_proxy_reason(self) -> None:
+        """UnknownErrorWhileCreatingBrowserContext caused by proxy should be PROXY_ERROR."""
+
+        class UnknownErrorWhileCreatingBrowserContext(Exception):
+            pass
+
+        result = classify_from_failure_reason(
+            "No proxy available, proxy_location=RESIDENTIAL, retry_count=15",
+            exception=UnknownErrorWhileCreatingBrowserContext(),
+        )
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "PROXY_ERROR" in categories
+        assert "BROWSER_ERROR" not in categories
+
+    def test_proxy_error_exception(self) -> None:
+        class ProxyErrorOccurred(Exception):
+            pass
+
+        result = classify_from_failure_reason("proxy connection failed", exception=ProxyErrorOccurred())
+        assert result is not None
+        assert result[0]["category"] == "PROXY_ERROR"
 
 
 class TestBrowserError:

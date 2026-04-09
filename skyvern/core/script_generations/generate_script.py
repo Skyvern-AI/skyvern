@@ -915,7 +915,7 @@ def _action_to_stmt(
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_value(act["data_extraction_goal"]),
+                value=_render_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1153,13 +1153,15 @@ def _build_block_fn(
         else:
             body_stmts.append(cst.parse_statement(f"await page.goto({repr(url_str)})"))
 
-    # For file_download blocks inside for-loops, generate a dynamic click that uses
-    # per-iteration context instead of hardcoded xpath/prompt from iteration 0.
+    # For blocks inside for-loops that click on loop items, generate a dynamic click
+    # that uses per-iteration context instead of hardcoded xpath/prompt from iteration 0.
+    # loop_item_selector() builds a selector from the current loop value at runtime:
+    # URL path matching (a[href*="path-segment"]) or text matching (a:has-text("title")).
     block_type = block.get("block_type")
-    if is_in_for_loop and block_type == "file_download":
+    if is_in_for_loop and block_type in ("file_download", "navigation"):
         body_stmts.append(
             cst.parse_statement(
-                'await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")'
+                'await page.click(selector=context.loop_item_selector(), prompt=context.prompt, ai="fallback")'
             )
         )
     else:
