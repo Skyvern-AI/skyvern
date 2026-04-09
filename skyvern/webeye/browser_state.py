@@ -38,7 +38,13 @@ class BrowserState(Protocol):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None: ...
 
-    async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None: ...
+    async def navigate_to_url(
+        self,
+        page: Page,
+        url: str,
+        retry_times: int = NAVIGATION_MAX_RETRY_TIME,
+        wait_until: str = "load",
+    ) -> None: ...
 
     async def get_or_create_page(
         self,
