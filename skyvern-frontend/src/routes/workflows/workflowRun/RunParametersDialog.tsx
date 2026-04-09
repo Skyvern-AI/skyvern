@@ -57,8 +57,8 @@ export function RunParametersDialog({
   ).map(([key, value]) => {
     const def = defByKey.get(key);
     const description =
-      def && "description" in def ? def.description ?? undefined : undefined;
-    const type = def ? def.parameter_type ?? undefined : undefined;
+      def && "description" in def ? (def.description ?? undefined) : undefined;
+    const type = def ? (def.parameter_type ?? undefined) : undefined;
     const displayValue =
       value === null || value === undefined
         ? ""

@@ -385,7 +385,7 @@ function layout(
       ...childNodes.map((child) =>
         child.type === "loop"
           ? getLoopNodeWidth(child, nodes)
-          : child.measured?.width ?? 0,
+          : (child.measured?.width ?? 0),
       ),
     );
     const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
@@ -682,9 +682,9 @@ function convertToNode(
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
           // When engine is SkyvernV2, use navigation_goal as the prompt
-          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          prompt: isV2Engine ? (block.navigation_goal ?? "") : "",
           maxSteps: isV2Engine
-            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            ? (block.max_steps_per_run ?? MAX_STEPS_DEFAULT)
             : MAX_STEPS_DEFAULT,
         },
       };
@@ -833,7 +833,7 @@ function convertToNode(
       const loopVariableReference =
         block.loop_variable_reference !== null
           ? block.loop_variable_reference
-          : block.loop_over?.key ?? "";
+          : (block.loop_over?.key ?? "");
       return {
         ...identifiers,
         ...common,
@@ -1813,9 +1813,9 @@ function getElements(
     const branchHidden =
       Boolean(
         conditionalNodeId &&
-          conditionalBranchId &&
-          activeBranchId &&
-          conditionalBranchId !== activeBranchId,
+        conditionalBranchId &&
+        activeBranchId &&
+        conditionalBranchId !== activeBranchId,
       ) ?? false;
 
     const nodeHidden =

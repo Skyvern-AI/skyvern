@@ -124,7 +124,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                   value={
                     item.status === "canceled"
                       ? "This block was cancelled"
-                      : item.failure_reason ?? ""
+                      : (item.failure_reason ?? "")
                   }
                   readOnly
                 />
@@ -232,7 +232,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                 value={
                   item.status === "canceled"
                     ? "This block was cancelled"
-                    : item.failure_reason ?? ""
+                    : (item.failure_reason ?? "")
                 }
                 readOnly
               />

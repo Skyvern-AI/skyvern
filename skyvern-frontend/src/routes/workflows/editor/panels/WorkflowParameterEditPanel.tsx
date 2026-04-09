@@ -239,7 +239,7 @@ function WorkflowParameterEditPanel({
   );
 
   const [urlParameterKey, setUrlParameterKey] = useState(
-    isBitwardenCredential ? initialValues?.urlParameterKey ?? "" : "",
+    isBitwardenCredential ? (initialValues?.urlParameterKey ?? "") : "",
   );
   const [description, setDescription] = useState(
     initialValues?.description ?? "",
@@ -248,7 +248,7 @@ function WorkflowParameterEditPanel({
     isBitwardenCredential ||
       initialValues?.parameterType === "secret" ||
       initialValues?.parameterType === "creditCardData"
-      ? initialValues?.collectionId ?? ""
+      ? (initialValues?.collectionId ?? "")
       : "",
   );
   const [parameterType, setParameterType] = useState<ParameterTypeSelection>(
@@ -309,7 +309,7 @@ function WorkflowParameterEditPanel({
   );
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
-    useState(isBitwardenCredential ? initialValues?.itemId ?? "" : "");
+    useState(isBitwardenCredential ? (initialValues?.itemId ?? "") : "");
 
   const [azureVaultName, setAzureVaultName] = useState(
     isAzureVaultCredential ? initialValues.vaultName : "",
@@ -321,7 +321,7 @@ function WorkflowParameterEditPanel({
     isAzureVaultCredential ? initialValues.passwordKey : "",
   );
   const [azureTotpSecretKey, setAzureTotpKey] = useState(
-    isAzureVaultCredential ? initialValues.totpSecretKey ?? "" : "",
+    isAzureVaultCredential ? (initialValues.totpSecretKey ?? "") : "",
   );
 
   // Handle credential data type change - reset source to first available
