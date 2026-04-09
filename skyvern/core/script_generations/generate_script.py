@@ -915,7 +915,7 @@ def _action_to_stmt(
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_value(act["data_extraction_goal"]),
+                value=_render_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
