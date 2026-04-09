@@ -1994,12 +1994,17 @@ class ScriptReviewer:
         )
 
     def _validate_missing_selectors(self, code: str) -> str | None:
-        """Flag interaction methods that have ai='fallback' but no selector= argument.
+        """Flag interaction methods that lack a selector= argument.
 
-        When page.click(ai='fallback', prompt='...') has no selector, the CSS-try
-        block is skipped entirely and AI click fires as the primary path on every run,
-        burning LLM tokens silently. The block "succeeds" via AI so no fallback episode
-        is created and the reviewer never gets a signal to fix it.
+        Two cases are flagged:
+        1. ai='fallback' but no selector — the CSS-try block is skipped entirely and
+           AI fires as the primary path on every run, burning LLM tokens silently.
+        2. No ai= argument at all and no selector — the call has no deterministic path
+           and no explicit AI strategy, so it silently burns tokens with no fallback
+           episode created.
+
+        ai='proactive' without a selector is intentional (AI always generates the value)
+        and is NOT flagged here.
 
         Returns an error message or None if no issues found.
         """
@@ -2015,10 +2020,15 @@ class ScriptReviewer:
             if match and match.group(1) in self._INTERACTION_METHODS:
                 end_line = self._find_call_end(lines, i)
                 call_text = "\n".join(lines[i : end_line + 1]) if end_line > i else lines[i]
-                has_fallback = bool(re.search(r"""\bai\s*=\s*['"]fallback['"]""", call_text))
                 has_selector = bool(re.search(r"""\bselector\s*=""", call_text))
-                if has_fallback and not has_selector:
+                has_any_ai = bool(re.search(r"""\bai\s*=""", call_text))
+                has_proactive = bool(re.search(r"""\bai\s*=\s*['"]proactive['"]""", call_text))
+                # Flag if no selector AND (explicit fallback OR no ai argument at all).
+                # ai='proactive' without selector is fine — intentional AI-driven fill.
+                if not has_selector and has_any_ai and not has_proactive:
                     issues.append(f"page.{match.group(1)}() on line {i + 1}")
+                elif not has_selector and not has_any_ai:
+                    issues.append(f"page.{match.group(1)}() on line {i + 1} (no ai= argument)")
                 i = end_line + 1
             else:
                 i += 1
@@ -2027,12 +2037,12 @@ class ScriptReviewer:
             return None
 
         return (
-            f"Missing selector on interaction methods with ai='fallback': {', '.join(issues[:5])}. "
-            f"When ai='fallback' is set but no selector= is provided, the CSS-try block is "
-            f"skipped entirely and AI click fires as the PRIMARY path on every run, burning "
-            f"LLM tokens silently with no fallback episode created. Add a selector= argument "
-            f"with a stable CSS selector (aria-label, placeholder, name, role, :has-text()) "
-            f"so the element is found without an LLM call. Keep ai='fallback' as a safety net."
+            f"Missing selector on interaction methods: {', '.join(issues[:5])}. "
+            f"Interaction methods without a selector= argument have no deterministic path — "
+            f"they silently invoke the LLM on every run, burning tokens with no fallback "
+            f"episode created. Add a selector= argument with a stable CSS selector "
+            f"(aria-label, placeholder, name, role, :has-text()) and set ai='fallback' "
+            f"so the element is found without an LLM call."
         )
 
     # Known auto-generated ID patterns from popular web frameworks.
