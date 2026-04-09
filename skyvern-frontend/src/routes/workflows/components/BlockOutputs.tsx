@@ -31,7 +31,7 @@ function BlockOutputs({
   const [overrideHasError, setOverrideHasError] = useState(false);
   const useOverride = useBlockOutputStore((state) =>
     workflowPermanentId
-      ? state.useOverrides[workflowPermanentId]?.[blockLabel] ?? false
+      ? (state.useOverrides[workflowPermanentId]?.[blockLabel] ?? false)
       : false,
   );
 
@@ -158,7 +158,7 @@ function BlockOutputs({
             fullHeight
             onChange={(value) => {
               try {
-                JSON.parse(value), setOverrideHasError(false);
+                (JSON.parse(value), setOverrideHasError(false));
               } catch {
                 setOverrideHasError(true);
                 return;
