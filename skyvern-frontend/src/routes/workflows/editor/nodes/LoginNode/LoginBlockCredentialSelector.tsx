@@ -140,7 +140,7 @@ function LoginBlockCredentialSelector({
     totpIdentifier:
       credential.credential_type === "password" &&
       "totp_identifier" in credential.credential
-        ? (credential.credential.totp_identifier ?? null)
+        ? credential.credential.totp_identifier ?? null
         : null,
   }));
 
@@ -171,9 +171,7 @@ function LoginBlockCredentialSelector({
     <>
       <Select
         key={value ?? "no-credential"}
-        value={
-          isCredentialMissing ? undefined : (selectedCredentialId ?? value)
-        }
+        value={isCredentialMissing ? undefined : selectedCredentialId ?? value}
         onValueChange={(newValue) => {
           if (newValue === "new") {
             setIsOpen(true);

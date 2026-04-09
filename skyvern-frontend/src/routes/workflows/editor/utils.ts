@@ -127,7 +127,7 @@ const constructCacheKeyValue = (opts: {
   }
 
   const workflowParameters = workflowRun
-    ? (workflowRun?.parameters ?? {})
+    ? workflowRun?.parameters ?? {}
     : getInitialParameters(workflow)
         .filter((p) => p.parameterType === "workflow")
         .reduce(

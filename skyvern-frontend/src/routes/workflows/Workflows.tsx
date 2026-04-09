@@ -602,7 +602,7 @@ function Workflows() {
                       key: param.key,
                       value:
                         param.parameter_type === "workflow"
-                          ? (param.default_value ?? "")
+                          ? param.default_value ?? ""
                           : "",
                       description: param.description ?? null,
                     }));

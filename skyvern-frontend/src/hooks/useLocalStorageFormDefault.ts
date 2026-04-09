@@ -15,6 +15,6 @@ export function useLocalStorageFormDefault(
   return useMemo(() => {
     if (typeof window === "undefined") return fallback ?? null;
     const value = localStorage.getItem(storageKey);
-    return value !== null ? value : (fallback ?? null);
+    return value !== null ? value : fallback ?? null;
   }, [storageKey, fallback]);
 }

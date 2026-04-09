@@ -193,7 +193,7 @@ function RunHistory() {
           <span>{run.title ?? ""}</span>
         </div>
       ) : (
-        (run.title ?? "")
+        run.title ?? ""
       );
 
       return (

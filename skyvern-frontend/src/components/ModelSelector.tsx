@@ -72,7 +72,7 @@ function ModelSelector({
   const labels = Object.keys(reverseMap);
 
   const chosen = value
-    ? (models[value.model_name] ?? constants.SkyvernOptimized)
+    ? models[value.model_name] ?? constants.SkyvernOptimized
     : constants.SkyvernOptimized;
   const choices = [constants.SkyvernOptimized, ...labels];
 

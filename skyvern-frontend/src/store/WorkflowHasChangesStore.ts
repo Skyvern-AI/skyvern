@@ -157,7 +157,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         ai_fallback: saveData.settings.aiFallback ?? true,
         code_version:
           saveData.settings.runWith === "code"
-            ? (saveData.settings.codeVersion ?? 2)
+            ? saveData.settings.codeVersion ?? 2
             : undefined,
         workflow_definition: {
           version: saveData.workflowDefinitionVersion,
@@ -255,7 +255,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             const loc = err.loc
               ?.filter((part) => part !== "body" && part !== "__root__")
               .join(" -> ");
-            return loc ? `${loc}: ${err.msg}` : (err.msg ?? "Unknown error");
+            return loc ? `${loc}: ${err.msg}` : err.msg ?? "Unknown error";
           })
           .join("; ");
       } else {

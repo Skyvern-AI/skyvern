@@ -1981,7 +1981,7 @@ function Workspace({
               adaptive_caching: false,
               code_version:
                 saveData.settings.runWith === "code"
-                  ? (saveData.settings.codeVersion ?? 2)
+                  ? saveData.settings.codeVersion ?? 2
                   : null,
               run_sequentially: saveData.settings.runSequentially,
               sequential_key: saveData.settings.sequentialKey,

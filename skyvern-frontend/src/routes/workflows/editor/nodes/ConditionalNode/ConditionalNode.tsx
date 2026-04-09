@@ -408,7 +408,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     // If the deleted branch was active, switch to the first branch
     const newActiveBranchId =
       data.activeBranchId === branchId
-        ? (updatedBranches[0]?.id ?? null)
+        ? updatedBranches[0]?.id ?? null
         : data.activeBranchId;
 
     update({
@@ -789,7 +789,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                     value={
                       activeBranch.is_default
                         ? "Executed when no other condition matches"
-                        : (activeBranch.criteria?.expression ?? "")
+                        : activeBranch.criteria?.expression ?? ""
                     }
                     disabled={!data.editable || activeBranch.is_default}
                     onChange={(value) => {

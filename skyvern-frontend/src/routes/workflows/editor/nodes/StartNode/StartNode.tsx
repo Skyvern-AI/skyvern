@@ -405,7 +405,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             data.extraHttpHeaders &&
                             typeof data.extraHttpHeaders === "object"
                               ? JSON.stringify(data.extraHttpHeaders)
-                              : (data.extraHttpHeaders ?? null)
+                              : data.extraHttpHeaders ?? null
                           }
                           onChange={(val) => {
                             const v =

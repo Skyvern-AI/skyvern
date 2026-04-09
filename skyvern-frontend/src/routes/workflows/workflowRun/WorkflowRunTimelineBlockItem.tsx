@@ -666,9 +666,7 @@ function WorkflowRunTimelineBlockItem({
             <div className="space-y-2">
               {loopIterationGroups.map((group, groupIndex) => {
                 const loopValueFromIterable =
-                  group.index !== null
-                    ? (loopValues[group.index] ?? null)
-                    : null;
+                  group.index !== null ? loopValues[group.index] ?? null : null;
                 const iterationNumber =
                   group.index !== null ? group.index + 1 : groupIndex + 1;
                 const currentValuePreview = truncateValue(

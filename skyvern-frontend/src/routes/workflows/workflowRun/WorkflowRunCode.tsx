@@ -294,10 +294,10 @@ function WorkflowRunCode(props?: Props) {
   // "Used" = the version that existed before this run created new ones,
   // OR the currentVersion if the run didn't generate anything (just used cache)
   const usedVersion = didGenerate
-    ? (versions.find(
+    ? versions.find(
         (v) =>
           v.version < earliestGeneratedVersion! && v.run_id !== workflowRunId,
-      )?.version ?? null)
+      )?.version ?? null
     : currentVersion;
 
   // Edit button shown when not in edit mode and there's a script to edit
