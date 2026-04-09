@@ -641,7 +641,6 @@ class ForLoopBlockYAML(BlockYAML):
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
     data_schema: dict[str, Any] | str | None = None
-    max_concurrency: int | None = None
 
 
 class BranchCriteriaYAML(BaseModel):

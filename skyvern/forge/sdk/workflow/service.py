@@ -3116,6 +3116,34 @@ class WorkflowService:
                 )
             ]
 
+        # Track task_generation for observability (SKY-8842)
+        try:
+            user_prompt_hash = sha256(user_prompt.encode("utf-8")).hexdigest()
+            v1_kwargs: dict[str, Any] = {}
+            if task_version == "v1":
+                v1_kwargs = {
+                    "url": url,
+                    "navigation_goal": navigation_goal,
+                    "navigation_payload": task_response.get("navigation_payload"),
+                    "data_extraction_goal": data_extraction_goal,
+                    "suggested_title": task_response.get("suggested_title"),
+                    "llm": settings.LLM_KEY,
+                    "llm_prompt": task_prompt,
+                    "llm_response": str(task_response),
+                }
+            await app.DATABASE.workflow_params.create_task_generation(
+                organization_id=organization.organization_id,
+                user_prompt=user_prompt,
+                user_prompt_hash=user_prompt_hash,
+                **v1_kwargs,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to create task_generation record",
+                exc_info=True,
+                organization_id=organization.organization_id,
+            )
+
         new_workflow = await self.create_workflow(
             title=title,
             workflow_definition=WorkflowDefinition(parameters=[], blocks=blocks),
@@ -5144,6 +5172,28 @@ class WorkflowService:
                         workflow_id=workflow.workflow_id,
                         workflow_run_id=workflow_run.workflow_run_id,
                         missing_labels=list(missing_labels),
+                    )
+
+            # Don't regenerate blocks already in the cached script — doing so
+            # just churns the version number without producing a different script.
+            already_cached = blocks_to_update & cached_block_labels
+            if already_cached:
+                blocks_to_update -= already_cached
+                if not blocks_to_update:
+                    LOG.info(
+                        "All blocks in blocks_to_update are already cached; skipping regeneration",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        already_cached=sorted(already_cached),
+                        script_id=existing_script.script_id,
+                    )
+                else:
+                    LOG.debug(
+                        "Removed already-cached blocks from blocks_to_update",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        removed=sorted(already_cached),
+                        remaining=sorted(blocks_to_update),
                     )
 
             should_regenerate = bool(blocks_to_update) or bool(code_gen)

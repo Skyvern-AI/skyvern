@@ -439,7 +439,6 @@ def block_yaml_to_block(
             loop_blocks=loop_blocks,
             complete_if_empty=block_yaml.complete_if_empty,
             data_schema=block_yaml.data_schema,
-            max_concurrency=block_yaml.max_concurrency,
         )
     elif block_yaml.block_type == BlockType.CONDITIONAL:
         branch_conditions = []
