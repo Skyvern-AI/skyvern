@@ -1,7 +1,17 @@
 ---
 title: Webhooks
 subtitle: Get notified when tasks and workflows complete
+description: Configure webhook URLs for tasks and workflows to receive notifications when runs reach terminal status. Includes payload structure, HMAC-SHA256 signature verification, failure handling, and retry mechanisms.
 slug: going-to-production/webhooks
+keywords:
+  - webhook_url
+  - HMAC-SHA256
+  - signature verification
+  - payload
+  - callback
+  - notification
+  - retry
+  - failure handling
 ---
 
 Workflows and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.

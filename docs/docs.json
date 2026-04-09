@@ -288,6 +288,12 @@
       "twitter": "https://twitter.com/skyvernai"
     }
   },
+  "contextual": {
+    "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode", "mcp"]
+  },
+  "seo": {
+    "indexing": "navigable"
+  },
   "css": "/style.css",
   "api": {
     "baseUrl": "https://api.skyvern.com",
@@ -297,6 +303,13 @@
     },
     "playground": {
       "display": "interactive"
+    }
+  },
+  "errors": {
+    "404": {
+      "redirect": false,
+      "title": "Page not found",
+      "description": "This page doesn't exist. Try the [documentation home](/) or use search to find what you need."
     }
   },
   "redirects": [
