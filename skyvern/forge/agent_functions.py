@@ -651,19 +651,6 @@ class AgentFunction:
 
         return cleanup_element_tree_func
 
-    async def check_parallel_loop_quota(self, organization_id: str, requested_concurrency: int) -> int:
-        """Check per-org quota for parallel loop iterations.
-
-        Returns the number of parallel iterations allowed. OSS base returns
-        requested_concurrency unchanged (no enforcement). Cloud override
-        enforces org-level caps via Redis.
-        """
-        return requested_concurrency
-
-    async def release_parallel_loop_quota(self, organization_id: str, count: int) -> None:
-        """Release parallel loop iteration slots. OSS base is a no-op."""
-        return
-
     async def validate_code_block(self, organization_id: str | None = None) -> None:
         if not settings.ENABLE_CODE_BLOCK:
             raise DisabledBlockExecutionError("CodeBlock is disabled")
