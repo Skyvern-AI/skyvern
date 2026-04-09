@@ -1916,7 +1916,7 @@ class ForLoopBlock(Block):
             # parallel iterations — every iteration would race on the same
             # live page. Fall back to sequential execution rather than
             # corrupt the session.
-            LOG.info(
+            LOG.warning(
                 "Persistent browser session set; forcing sequential execution for for-loop",
                 workflow_run_id=workflow_run_id,
                 browser_session_id=browser_session_id,
@@ -1945,6 +1945,14 @@ class ForLoopBlock(Block):
                     # Fall through to sequential path below
 
             if effective_concurrency > 1:
+                if self.max_concurrency and effective_concurrency < self.max_concurrency:
+                    LOG.warning(
+                        "ForLoopBlock parallel granted concurrency below requested",
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        requested_concurrency=self.max_concurrency,
+                        granted_concurrency=effective_concurrency,
+                    )
                 return await self._execute_loop_parallel(
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
