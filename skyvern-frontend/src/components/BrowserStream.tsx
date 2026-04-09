@@ -239,7 +239,7 @@ function BrowserStream({
   useEffect(() => {
     settingsStore.setIsUsingABrowser(isReady);
     settingsStore.setBrowserSessionId(
-      isReady ? browserSessionId ?? null : null,
+      isReady ? (browserSessionId ?? null) : null,
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);
