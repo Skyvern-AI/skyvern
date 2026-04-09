@@ -25,6 +25,31 @@ You are a script reviewer for a browser automation system. Your job is to make a
 ```
 {{ navigation_goal }}
 ```
+{% if terminate_criterion %}
+
+## Block Termination Criterion
+When this condition is met, call `await page.terminate(errors=["<error_code>: <reason>"])`:
+```
+{{ terminate_criterion }}
+```
+You MUST check for this condition using `page.classify()` or `page.extract()` and terminate inside an `if`/`elif` branch when it is satisfied.
+{% endif %}
+{% if complete_criterion %}
+
+## Block Completion Criterion
+The block should call `await page.complete()` when this condition is met:
+```
+{{ complete_criterion }}
+```
+{% endif %}
+{% if error_code_mapping %}
+
+## Error Code Mapping
+These are the specific error codes defined for this block. When terminating, use the matching error code:
+{% for code, description in error_code_mapping.items() %}
+- **{{ code }}**: {{ description }}
+{% endfor %}
+{% endif %}
 {% if parameter_keys %}
 
 ## Workflow Parameter Keys

@@ -155,8 +155,8 @@ class ScriptReviewer:
         if not episodes:
             return None
 
-        # Load the workflow definition to get navigation goals and parameter keys
-        navigation_goals, all_parameter_keys = await self._load_workflow_context(
+        # Load the workflow definition to get navigation goals, parameter keys, and block criteria
+        navigation_goals, all_parameter_keys, block_criteria = await self._load_workflow_context(
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
         )
@@ -251,6 +251,7 @@ class ScriptReviewer:
                     run_parameter_values=run_parameter_values,
                     user_instructions=user_instructions,
                     historical_run_params=historical_run_params,
+                    block_criteria=block_criteria.get(block_label),
                 )
                 if result:
                     updated_blocks[block_label] = result
@@ -294,7 +295,7 @@ class ScriptReviewer:
             )
 
         # No episodes — review all blocks with user instructions only
-        navigation_goals, all_parameter_keys = await self._load_workflow_context(
+        navigation_goals, all_parameter_keys, block_criteria = await self._load_workflow_context(
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
         )
@@ -324,6 +325,7 @@ class ScriptReviewer:
                     run_parameter_values=run_parameter_values,
                     user_instructions=user_instructions,
                     preloaded_code=existing_code,
+                    block_criteria=block_criteria.get(block_label),
                 )
                 if result:
                     updated_blocks[block_label] = result
@@ -620,6 +622,7 @@ class ScriptReviewer:
         user_instructions: str | None = None,
         preloaded_code: str | None = None,
         historical_run_params: dict[str, dict[str, str]] | None = None,
+        block_criteria: dict[str, str | dict[str, str] | None] | None = None,
     ) -> BlockReviewResult | None:
         """Review a single block's fallback episodes and generate updated code.
 
@@ -709,6 +712,15 @@ class ScriptReviewer:
                 summary["run_parameters"] = ep_params
             history_summaries.append(summary)
 
+        # Extract block criteria for the template
+        terminate_criterion = None
+        complete_criterion = None
+        error_code_mapping = None
+        if block_criteria:
+            terminate_criterion = block_criteria.get("terminate_criterion")
+            complete_criterion = block_criteria.get("complete_criterion")
+            error_code_mapping = block_criteria.get("error_code_mapping")
+
         # Build the reviewer prompt
         reviewer_prompt = prompt_engine.load_prompt(
             template=template,
@@ -732,6 +744,9 @@ class ScriptReviewer:
             historical_episodes=history_summaries,
             run_parameter_values=run_parameter_values,
             user_instructions=user_instructions,
+            terminate_criterion=terminate_criterion,
+            complete_criterion=complete_criterion,
+            error_code_mapping=error_code_mapping,
         )
 
         LOG.info(
@@ -1114,13 +1129,19 @@ class ScriptReviewer:
         self,
         organization_id: str,
         workflow_permanent_id: str,
-    ) -> tuple[dict[str, str], list[str]]:
-        """Load navigation goals and parameter keys for a workflow.
+    ) -> tuple[dict[str, str], list[str], dict[str, dict[str, str | dict[str, str] | None]]]:
+        """Load navigation goals, parameter keys, and block criteria for a workflow.
 
-        Returns (goals_by_label, parameter_keys).
+        Returns (goals_by_label, parameter_keys, block_criteria_by_label).
+        block_criteria_by_label maps block_label -> {
+            "terminate_criterion": str | None,
+            "complete_criterion": str | None,
+            "error_code_mapping": dict[str, str] | None,
+        }
         """
         goals: dict[str, str] = {}
         parameter_keys: list[str] = []
+        block_criteria: dict[str, dict[str, str | dict[str, str] | None]] = {}
         try:
             workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
                 workflow_permanent_id=workflow_permanent_id,
@@ -1134,6 +1155,16 @@ class ScriptReviewer:
                     goal = getattr(block, "navigation_goal", None) or getattr(block, "data_extraction_goal", None)
                     if goal:
                         goals[block.label] = goal
+                    # Collect termination/completion criteria and error code mappings
+                    terminate_criterion = getattr(block, "terminate_criterion", None)
+                    complete_criterion = getattr(block, "complete_criterion", None)
+                    error_code_mapping = getattr(block, "error_code_mapping", None)
+                    if terminate_criterion or complete_criterion or error_code_mapping:
+                        block_criteria[block.label] = {
+                            "terminate_criterion": terminate_criterion,
+                            "complete_criterion": complete_criterion,
+                            "error_code_mapping": error_code_mapping,
+                        }
                 # Collect parameter keys from workflow definition
                 for param in workflow.workflow_definition.parameters:
                     if param.key:
@@ -1144,7 +1175,7 @@ class ScriptReviewer:
                 workflow_permanent_id=workflow_permanent_id,
                 exc_info=True,
             )
-        return goals, parameter_keys
+        return goals, parameter_keys, block_criteria
 
     def _extract_function_signature(self, code: str) -> str:
         """Extract the async function signature from existing code."""
