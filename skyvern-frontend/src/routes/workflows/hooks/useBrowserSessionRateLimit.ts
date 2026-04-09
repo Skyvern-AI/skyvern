@@ -61,7 +61,7 @@ function useBrowserSessionRateLimit(
 ): RateLimitState {
   const storeAttempts = useRateLimitStore((state) =>
     workflowPermanentId
-      ? state.attemptsByWorkflow[workflowPermanentId] ?? null
+      ? (state.attemptsByWorkflow[workflowPermanentId] ?? null)
       : null,
   );
   const setAttempts = useRateLimitStore((state) => state.setAttempts);

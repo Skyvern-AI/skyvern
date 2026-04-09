@@ -29,7 +29,7 @@ export function createBranchCondition(
   return {
     id: overrides.id ?? nanoid(),
     criteria:
-      overrides.is_default ?? false
+      (overrides.is_default ?? false)
         ? null
         : overrides.criteria
           ? {
