@@ -387,16 +387,19 @@ async def block_fn(page, context):
         assert error is not None
         assert "page.fill()" in error
 
-    def test_no_ai_arg_not_flagged(self) -> None:
-        """Calls without ai='fallback' are not our concern here."""
+    def test_no_ai_arg_without_selector_flagged(self) -> None:
+        """Bare calls with no ai= and no selector= silently burn LLM tokens."""
         code = """
 async def block_fn(page, context):
     await page.click(prompt='Click something')
 """
-        assert self.reviewer._validate_missing_selectors(code) is None
+        error = self.reviewer._validate_missing_selectors(code)
+        assert error is not None
+        assert "page.click()" in error
+        assert "no ai= argument" in error
 
     def test_proactive_without_selector_not_flagged(self) -> None:
-        """ai='proactive' without selector is caught by _validate_proactive_misuse, not this validator."""
+        """ai='proactive' without selector is intentional — AI always generates the value."""
         code = """
 async def block_fn(page, context):
     await page.click(ai='proactive', prompt='Click something')
