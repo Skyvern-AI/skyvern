@@ -5146,6 +5146,28 @@ class WorkflowService:
                         missing_labels=list(missing_labels),
                     )
 
+            # Don't regenerate blocks already in the cached script — doing so
+            # just churns the version number without producing a different script.
+            already_cached = blocks_to_update & cached_block_labels
+            if already_cached:
+                blocks_to_update -= already_cached
+                if not blocks_to_update:
+                    LOG.info(
+                        "All blocks in blocks_to_update are already cached; skipping regeneration",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        already_cached=sorted(already_cached),
+                        script_id=existing_script.script_id,
+                    )
+                else:
+                    LOG.debug(
+                        "Removed already-cached blocks from blocks_to_update",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        removed=sorted(already_cached),
+                        remaining=sorted(blocks_to_update),
+                    )
+
             should_regenerate = bool(blocks_to_update) or bool(code_gen)
 
             if not should_regenerate:
