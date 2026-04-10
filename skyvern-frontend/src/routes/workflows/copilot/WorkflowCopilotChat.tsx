@@ -456,7 +456,7 @@ export function WorkflowCopilotChat({
           ai_fallback: saveData.settings.aiFallback ?? true,
           code_version:
             saveData.settings.runWith === "code"
-              ? saveData.settings.codeVersion ?? 2
+              ? (saveData.settings.codeVersion ?? 2)
               : undefined,
           workflow_definition: {
             version: saveData.workflowDefinitionVersion,
