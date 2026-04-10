@@ -17,6 +17,12 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -412,7 +418,7 @@ function WorkflowRunTimelineBlockItem({
 
   return (
     <div
-      className={cn({
+      className={cn("min-w-0", {
         "ml-3 pl-3": depth > 0,
         "border-l border-slate-700": depth > 0,
       })}
@@ -434,7 +440,7 @@ function WorkflowRunTimelineBlockItem({
         }}
         ref={refCallback}
       >
-        <div className="space-y-4 p-4">
+        <div className="min-w-0 space-y-4 overflow-hidden p-4">
           <div className="space-y-2">
             <div className="flex justify-between">
               <div className="flex gap-3">
@@ -509,7 +515,7 @@ function WorkflowRunTimelineBlockItem({
               <div className="text-xs text-slate-400">{block.description}</div>
             ) : null}
             {isLoopBlock && (
-              <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
+              <div className="min-w-0 space-y-2 overflow-hidden rounded bg-slate-elevation5 px-3 py-2 text-xs">
                 <div className="text-slate-300">
                   Iterable values:{" "}
                   <span className="font-medium text-slate-200">
@@ -518,14 +524,35 @@ function WorkflowRunTimelineBlockItem({
                 </div>
                 {loopValues.length > 0 && (
                   <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
-                    {loopValues.map((value, index) => (
-                      <div key={index} className="text-slate-400">
-                        <span className="mr-1 text-slate-500">[{index}]</span>
-                        <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
-                          {truncateValue(stringifyTimelineValue(value), 120)}
-                        </code>
-                      </div>
-                    ))}
+                    {loopValues.map((value, index) => {
+                      const fullValue = stringifyTimelineValue(value);
+                      const collapsed = fullValue.replace(/\s+/g, " ").trim();
+                      return (
+                        <div
+                          key={index}
+                          className="flex min-w-0 text-slate-400"
+                        >
+                          <span className="mr-1 shrink-0 text-slate-500">
+                            [{index}]
+                          </span>
+                          <TooltipProvider delayDuration={300}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <code className="block min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
+                                  {collapsed}
+                                </code>
+                              </TooltipTrigger>
+                              <TooltipContent
+                                side="top"
+                                className="max-w-xs break-all font-mono text-[11px]"
+                              >
+                                {fullValue}
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -671,12 +698,16 @@ function WorkflowRunTimelineBlockItem({
                     : null;
                 const iterationNumber =
                   group.index !== null ? group.index + 1 : groupIndex + 1;
+                const currentValueFull = stringifyTimelineValue(
+                  loopValueFromIterable ?? group.currentValue,
+                );
                 const currentValuePreview = truncateValue(
-                  stringifyTimelineValue(
-                    loopValueFromIterable ?? group.currentValue,
-                  ),
+                  currentValueFull,
                   140,
                 );
+                const isValueTruncated =
+                  currentValuePreview !==
+                  currentValueFull.replace(/\s+/g, " ").trim();
 
                 return (
                   <Collapsible
@@ -704,13 +735,31 @@ function WorkflowRunTimelineBlockItem({
                             <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
                             <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
                           </div>
-                          <code className="max-w-[70%] truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
-                            current_value: {currentValuePreview}
-                          </code>
+                          {isValueTruncated ? (
+                            <TooltipProvider delayDuration={300}>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <code className="max-w-[70%] truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                                    current_value: {currentValuePreview}
+                                  </code>
+                                </TooltipTrigger>
+                                <TooltipContent
+                                  side="top"
+                                  className="max-w-xs break-all font-mono text-[11px]"
+                                >
+                                  {currentValueFull}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          ) : (
+                            <code className="max-w-[70%] truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                              current_value: {currentValuePreview}
+                            </code>
+                          )}
                         </button>
                       </CollapsibleTrigger>
                     </div>
-                    <CollapsibleContent className="px-2 pb-2 pt-2">
+                    <CollapsibleContent className="min-w-0 overflow-hidden px-2 pb-2 pt-2">
                       <TimelineSubItems
                         items={group.items}
                         activeItem={activeItem}

@@ -559,7 +559,7 @@ function WorkflowRun() {
         <div className="w-2/3">
           <Outlet />
         </div>
-        <div className="w-1/3">
+        <div className="w-1/3 min-w-0 overflow-hidden">
           <WorkflowRunTimeline
             activeItem={selection}
             onActionItemSelected={(item) => {
