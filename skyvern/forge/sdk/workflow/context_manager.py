@@ -1,5 +1,4 @@
 import copy
-from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
 import structlog
@@ -225,50 +224,6 @@ class WorkflowRunContext:
         if label is None:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
-
-    def create_iteration_snapshot(self, loop_idx: int) -> "WorkflowRunContext":
-        """Create a deep-copy snapshot of mutable state for a parallel loop iteration.
-
-        The snapshot shares immutable/reference fields (aws_client, workflow, secrets,
-        parameters, organization_id) but gets its own copies of values and blocks_metadata
-        so concurrent iterations don't interfere with each other.
-        """
-        snapshot = WorkflowRunContext(
-            workflow_title=self.workflow_title,
-            workflow_id=self.workflow_id,
-            workflow_permanent_id=self.workflow_permanent_id,
-            workflow_run_id=self.workflow_run_id,
-            aws_client=self._aws_client,
-            workflow=self.workflow,
-        )
-        snapshot.organization_id = self.organization_id
-        snapshot.browser_session_id = self.browser_session_id
-        snapshot.include_secrets_in_templates = self.include_secrets_in_templates
-        snapshot.credential_totp_identifiers = self.credential_totp_identifiers
-        # Parameter definitions and secrets are read-only during iteration today,
-        # but shallow-copy the dicts so a future code path that mutates them
-        # inside a loop block can't silently leak across iterations.
-        snapshot.parameters = dict(self.parameters)
-        snapshot.secrets = dict(self.secrets)
-        # Deep-copy mutable state so iterations don't clobber each other
-        snapshot.values = copy.deepcopy(self.values)
-        snapshot.blocks_metadata = copy.deepcopy(self.blocks_metadata)
-        snapshot.workflow_run_outputs = copy.deepcopy(self.workflow_run_outputs)
-        return snapshot
-
-    def merge_iteration_results(self, snapshots: list[tuple[int, "WorkflowRunContext"]]) -> None:
-        """Merge results from parallel iteration snapshots back into this context.
-
-        Snapshots are applied in iteration-index order so that later iterations
-        overwrite earlier ones when keys collide (matching sequential semantics).
-        """
-        for _loop_idx, snapshot in sorted(snapshots, key=lambda t: t[0]):
-            # Merge values: iteration outputs are keyed by block label
-            self.values.update(snapshot.values)
-            # Merge block metadata
-            self.blocks_metadata.update(snapshot.blocks_metadata)
-            # Merge workflow run outputs
-            self.workflow_run_outputs.update(snapshot.workflow_run_outputs)
 
     async def _should_include_secrets_in_templates(self) -> bool:
         """
@@ -1270,22 +1225,6 @@ class WorkflowRunContext:
         self.values[parameter.key][key] = secret_id
 
 
-# Per-task override for the active WorkflowRunContext, used by parallel loop
-# iterations. When set, get_workflow_run_context() returns this snapshot
-# instead of looking up the shared context in workflow_run_contexts. Because
-# ContextVar state is copied per asyncio.create_task, each iteration sees its
-# own snapshot, so child blocks resolving context via the classmethod get
-# their isolated view without any call-signature changes.
-_iteration_workflow_run_context: ContextVar["WorkflowRunContext | None"] = ContextVar(
-    "_iteration_workflow_run_context", default=None
-)
-
-
-def set_iteration_workflow_run_context(context: "WorkflowRunContext | None") -> None:
-    """Set the per-task workflow run context override for parallel loop iterations."""
-    _iteration_workflow_run_context.set(context)
-
-
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
     workflow_run_contexts: dict[str, WorkflowRunContext]
@@ -1343,14 +1282,6 @@ class WorkflowContextManager:
         return workflow_run_context
 
     def get_workflow_run_context(self, workflow_run_id: str) -> WorkflowRunContext:
-        # Parallel loop iterations install a per-task snapshot via the
-        # _iteration_workflow_run_context ContextVar. If present and matching
-        # this workflow_run_id, return the snapshot so child blocks resolving
-        # context via the classmethod see their isolated view instead of the
-        # globally shared context.
-        override = _iteration_workflow_run_context.get()
-        if override is not None and override.workflow_run_id == workflow_run_id:
-            return override
         self._validate_workflow_run_context(workflow_run_id)
         return self.workflow_run_contexts[workflow_run_id]
 
