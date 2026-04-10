@@ -3116,6 +3116,34 @@ class WorkflowService:
                 )
             ]
 
+        # Track task_generation for observability (SKY-8842)
+        try:
+            user_prompt_hash = sha256(user_prompt.encode("utf-8")).hexdigest()
+            v1_kwargs: dict[str, Any] = {}
+            if task_version == "v1":
+                v1_kwargs = {
+                    "url": url,
+                    "navigation_goal": navigation_goal,
+                    "navigation_payload": task_response.get("navigation_payload"),
+                    "data_extraction_goal": data_extraction_goal,
+                    "suggested_title": task_response.get("suggested_title"),
+                    "llm": settings.LLM_KEY,
+                    "llm_prompt": task_prompt,
+                    "llm_response": str(task_response),
+                }
+            await app.DATABASE.workflow_params.create_task_generation(
+                organization_id=organization.organization_id,
+                user_prompt=user_prompt,
+                user_prompt_hash=user_prompt_hash,
+                **v1_kwargs,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to create task_generation record",
+                exc_info=True,
+                organization_id=organization.organization_id,
+            )
+
         new_workflow = await self.create_workflow(
             title=title,
             workflow_definition=WorkflowDefinition(parameters=[], blocks=blocks),
