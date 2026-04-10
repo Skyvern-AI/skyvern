@@ -112,8 +112,8 @@ The AI engine that powers the task. These are not iterations—they're suited fo
 
 | Engine | Description |
 |--------|-------------|
-| `skyvern-2.0` | **Default.** Multi-objective, flexible, handles complex multi-step tasks. 85.85% on WebVoyager benchmark. Slower and more expensive. |
-| `skyvern-1.0` | Single objective, precise, faster, cheaper. Best for simple tasks like form filling or single-page extraction. |
+| `skyvern-1.0` | **Default.** Single objective, precise, faster, cheaper. Best for simple tasks like form filling or single-page extraction. |
+| `skyvern-2.0` | Multi-objective, flexible, handles complex multi-step tasks. 85.85% on WebVoyager benchmark. Slower and more expensive. |
 | `openai-cua` | OpenAI's Computer Use Agent |
 | `anthropic-cua` | Anthropic Claude Sonnet with computer use |
 | `ui-tars` | UI-TARS model (Seed1.5-VL) via Doubao API |
@@ -657,7 +657,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 
 ## `publish_workflow`
 
-Convert this task into a reusable workflow. Only available for `skyvern-2.0`.
+Convert this task into a reusable workflow. Requires `skyvern-2.0` — the engine is automatically upgraded to `skyvern-2.0` when this option is enabled.
 
 <CodeGroup>
 ```python Python

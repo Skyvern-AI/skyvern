@@ -193,7 +193,7 @@ Run an AI task in the context of the current page. Always waits for completion.
 ```python
 result = await page.agent.run_task(
     prompt: str,
-    engine: RunEngine = RunEngine.skyvern_v2,
+    engine: RunEngine = RunEngine.skyvern_v1,
     url: str | None = None,           # Defaults to current page URL.
     data_extraction_schema: dict | str | None = None,
     max_steps: int | None = None,
@@ -334,7 +334,7 @@ from skyvern.schemas.run_blocks import CredentialType      # skyvern, bitwarden,
 result = await client.run_task(
     prompt: str,                                # Required. Natural language instructions.
     url: str | None = None,                     # Starting page URL.
-    engine: RunEngine = RunEngine.skyvern_v2,   # AI engine.
+    engine: RunEngine = RunEngine.skyvern_v1,   # AI engine.
     wait_for_completion: bool = False,          # Block until finished.
     timeout: float = 1800,                      # Max wait (seconds). Only with wait_for_completion.
     max_steps: int | None = None,               # Cap AI steps to limit cost.

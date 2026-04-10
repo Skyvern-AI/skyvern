@@ -585,6 +585,7 @@ Iterate over an array and execute nested blocks for each item.
 | `loop_over_parameter_key` | string | `""` | Parameter containing the array to iterate. |
 | `loop_variable_reference` | string | — | Custom name for the loop variable. |
 | `complete_if_empty` | boolean | `false` | If `true`, completes successfully when array is empty. |
+| `max_concurrency` | integer | `null` | Maximum number of iterations to run in parallel. When set, the loop executes iterations concurrently up to this limit. When `null` (default), iterations run sequentially. |
 
 <Info>
 **Accessing the current item inside a loop**
