@@ -68,16 +68,16 @@ function WorkflowPostRunParameters() {
   const isTaskV2 = Boolean(workflowRun?.task_v2);
 
   const webhookCallbackUrl = isTaskV2
-    ? workflowRun?.task_v2?.webhook_callback_url ?? null
-    : workflowRun?.webhook_callback_url ?? null;
+    ? (workflowRun?.task_v2?.webhook_callback_url ?? null)
+    : (workflowRun?.webhook_callback_url ?? null);
 
   const proxyLocation = isTaskV2
-    ? workflowRun?.task_v2?.proxy_location ?? null
-    : workflowRun?.proxy_location ?? null;
+    ? (workflowRun?.task_v2?.proxy_location ?? null)
+    : (workflowRun?.proxy_location ?? null);
 
   const extraHttpHeaders = isTaskV2
-    ? workflowRun?.task_v2?.extra_http_headers ?? null
-    : workflowRun?.extra_http_headers ?? null;
+    ? (workflowRun?.task_v2?.extra_http_headers ?? null)
+    : (workflowRun?.extra_http_headers ?? null);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return <div>Loading workflow parameters...</div>;
@@ -209,7 +209,7 @@ function WorkflowPostRunParameters() {
               waitSec={
                 activeBlock.wait_sec ??
                 (isBlockOfType(definitionBlock, WorkflowBlockTypes.Wait)
-                  ? definitionBlock.wait_sec ?? null
+                  ? (definitionBlock.wait_sec ?? null)
                   : null)
               }
             />
@@ -409,7 +409,7 @@ function WorkflowPostRunParameters() {
               <Input value={workflowRun.browser_session_id} readOnly />
             </div>
           ) : null}
-          {workflowRun.run_with ?? workflow?.run_with ? (
+          {(workflowRun.run_with ?? workflow?.run_with) ? (
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Run With</h1>

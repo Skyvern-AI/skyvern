@@ -38,8 +38,8 @@ function TriggerTypeFilterDropdown({ values, onChange }: Props) {
     values.length === 0
       ? "All Runs"
       : values.length === 1
-        ? triggerTypeDropdownItems.find((i) => i.value === values[0])?.label ??
-          "All Runs"
+        ? (triggerTypeDropdownItems.find((i) => i.value === values[0])?.label ??
+          "All Runs")
         : `${values.length} types`;
 
   return (
