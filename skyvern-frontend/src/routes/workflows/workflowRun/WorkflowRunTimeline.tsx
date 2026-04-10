@@ -91,7 +91,7 @@ function WorkflowRunTimeline({
         </div>
       </div>
       <ScrollArea>
-        <ScrollAreaViewport className="h-[37rem] max-h-[37rem] [&>div]:!overflow-x-hidden">
+        <ScrollAreaViewport className="h-[37rem] max-h-[37rem] [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="space-y-4 p-1">
             {workflowRunIsNotFinalized && (
               <div

@@ -72,7 +72,9 @@ function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
             )}
           </div>
         </div>
-        <div className="text-xs text-slate-400">{action.reasoning}</div>
+        <div className="break-words text-xs text-slate-400">
+          {action.reasoning}
+        </div>
         {action.action_type === ActionTypes.InputText && (
           <>
             <Separator />
