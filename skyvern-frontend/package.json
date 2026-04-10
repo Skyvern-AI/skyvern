@@ -77,7 +77,7 @@
     "tailwindcss-animate": "^1.0.7",
     "use-debounce": "^10.0.4",
     "vaul": "^1.1.1",
-    "yaml": "^2.4.2",
+    "yaml": "^2.8.3",
     "zod": "^3.22.4",
     "zustand": "^4.5.2"
   },
@@ -100,7 +100,7 @@
     "prettier-plugin-tailwindcss": "^0.6.5",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.5.3",
-    "vite": "^5.4.21",
+    "vite": "^8.0.8",
     "vitest": "^3.2.4"
   },
   "lint-staged": {
