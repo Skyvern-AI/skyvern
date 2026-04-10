@@ -225,7 +225,7 @@ function WorkflowPage() {
                         <span>{workflowRun.workflow_run_id ?? ""}</span>
                       </div>
                     ) : (
-                      workflowRun.workflow_run_id ?? ""
+                      (workflowRun.workflow_run_id ?? "")
                     );
 
                   const isExpanded = expandedRows.has(
