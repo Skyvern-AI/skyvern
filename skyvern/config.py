@@ -168,6 +168,11 @@ class Settings(BaseSettings):
     # browser settings
     BROWSER_LOCALE: str | None = None  # "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
+    # Directory containing pre-built default browser profiles ({dir}/chrome/ and {dir}/chromium/).
+    # When set, used as the default profile source for new browser sessions.
+    # Cloud workers download S3 profiles here at startup; self-hosted users can point this at a
+    # local profile directory. Leave empty to use the in-repo template.
+    DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
