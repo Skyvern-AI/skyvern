@@ -53,6 +53,7 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -3720,7 +3721,9 @@ class WorkflowService:
             ai_fallback=ai_fallback,
             failure_category=failure_category,
         )
-        if status in [WorkflowRunStatus.completed, WorkflowRunStatus.failed, WorkflowRunStatus.terminated]:
+        if status.is_final():
+            # Free extraction-cache entries for this run.
+            extraction_cache.clear_workflow_run(workflow_run_id)
             start_time = (
                 workflow_run.started_at.replace(tzinfo=UTC)
                 if workflow_run.started_at

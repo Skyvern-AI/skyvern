@@ -67,6 +67,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -4182,9 +4183,31 @@ async def extract_information_for_navigation_goal(
     Scrapes a webpage and returns the scraped response, including:
     1. JSON representation of what the user is seeing
     2. The scraped page
+
+    Extraction-result cache
+    --------------------------------
+    Many workflows re-extract the same page on every iteration of a loop
+    (e.g. navigate back to a documents list, extract, click one row, repeat).
+    When the page content, data-extraction goal, and output schema are
+    identical to a previous call within the same workflow run, reuse the
+    prior LLM result instead of paying for another extract-information call.
     """
     scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
+
+    # Compute llm key up-front so the cache key includes it.
+    llm_key_override = task.llm_key
+    if await service_utils.is_cua_task(task=task):
+        # CUA tasks should use the default data extraction llm key
+        llm_key_override = None
+
+    # Compute local_datetime once so both the cache key and the prompt use the
+    # same value (avoids stale hits when date-relative extraction goals cross midnight).
+    local_datetime_str = datetime.now(context.tz_info).isoformat()
+
+    # Render the prompt FIRST so the cache key hashes the exact string that
+    # will be sent to the LLM (captures economy-tree swaps and 2/3 truncation
+    # inside load_prompt_with_elements).
     extract_information_prompt = load_prompt_with_elements(
         element_tree_builder=scraped_page_refreshed,
         prompt_engine=prompt_engine,
@@ -4198,13 +4221,28 @@ async def extract_information_for_navigation_goal(
         current_url=scraped_page_refreshed.url,
         extracted_text=scraped_page_refreshed.extracted_text,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-        local_datetime=datetime.now(context.tz_info).isoformat(),
+        local_datetime=local_datetime_str,
     )
 
-    llm_key_override = task.llm_key
-    if await service_utils.is_cua_task(task=task):
-        # CUA tasks should use the default data extraction llm key
-        llm_key_override = None
+    # Best-effort cache lookup — any failure falls through to LLM.
+    cache_key: str | None = None
+    try:
+        cache_key = extraction_cache.compute_cache_key(
+            rendered_prompt=extract_information_prompt,
+            llm_key=llm_key_override,
+        )
+        cached = extraction_cache.get(task.workflow_run_id, cache_key)
+        if cached is not None:
+            LOG.info(
+                "extract_information cache hit — skipping LLM call",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
+            )
+            return ScrapeResult(scraped_data=cached)
+    except Exception:
+        LOG.warning("extract_information cache lookup failed; falling through to LLM", exc_info=True)
+        cache_key = None
 
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -4224,6 +4262,14 @@ async def extract_information_for_navigation_goal(
             extraction_result=json_response,
             schema=task.extracted_information_schema,
         )
+
+    # Cache the post-validation result so cache hits return the same shape as
+    # a fresh LLM call (schema-validated with missing fields filled).
+    if cache_key is not None and json_response is not None:
+        try:
+            extraction_cache.store(task.workflow_run_id, cache_key, json_response)
+        except Exception:
+            LOG.warning("extract_information cache store failed; ignoring", exc_info=True)
 
     return ScrapeResult(
         scraped_data=json_response,
