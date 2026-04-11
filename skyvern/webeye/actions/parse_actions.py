@@ -1136,12 +1136,8 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
         # Get arguments
         action_inputs = {}
         for kw in call.keywords:
-            if kw.arg and isinstance(kw.value, (ast.Constant, ast.Str)):
-                if isinstance(kw.value, ast.Constant):
-                    value = kw.value.value
-                else:  # ast.Str for older Python versions
-                    value = kw.value.s
-                action_inputs[kw.arg] = value
+            if kw.arg and isinstance(kw.value, ast.Constant):
+                action_inputs[kw.arg] = kw.value.value
 
         return {
             "action_type": func_name,
