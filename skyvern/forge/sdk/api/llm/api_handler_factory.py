@@ -914,6 +914,7 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
                 )
 
                 if step and is_speculative_step:
@@ -1380,6 +1381,7 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
                 )
 
                 if step and is_speculative_step:
