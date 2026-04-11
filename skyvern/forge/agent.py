@@ -82,6 +82,7 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -4965,9 +4966,34 @@ class ForgeAgent:
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
-        data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-            prompt=prompt, step=step, prompt_name="data-extraction-summary"
-        )
+        # Cache the summary LLM call — the inputs (goal, schema, URL) are
+        # identical across download-loop iterations that revisit the same page.
+        workflow_run_id = context.workflow_run_id if context else None
+        cache_key: str | None = None
+        cached = None
+        try:
+            cache_key = extraction_cache.compute_cache_key(
+                rendered_prompt=prompt,
+                llm_key=None,
+            )
+            cached = extraction_cache.get(workflow_run_id, cache_key)
+        except Exception:
+            LOG.warning("data-extraction-summary cache lookup failed", exc_info=True)
+
+        if cached is not None:
+            LOG.info(
+                "data-extraction-summary cache hit — skipping LLM call",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+            )
+            data_extraction_summary_resp = cached
+        else:
+            data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="data-extraction-summary"
+            )
+            if cache_key:
+                extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,
