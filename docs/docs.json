@@ -446,6 +446,14 @@
       "destination": "/integrations/local-llms"
     },
     {
+      "source": "/integrations/mcp-server",
+      "destination": "/integrations/mcp"
+    },
+    {
+      "source": "/home/integrations/mcp-server",
+      "destination": "/integrations/mcp"
+    },
+    {
       "source": "/api-reference/api-reference/agent/run-task",
       "destination": "/api-reference/agent/run-a-task"
     },
