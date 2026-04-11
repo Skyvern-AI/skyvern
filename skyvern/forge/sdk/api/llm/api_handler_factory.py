@@ -1741,11 +1741,13 @@ class LLMCaller:
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
-                reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
+                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
+                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
+                reasoning_tokens=call_stats.reasoning_tokens
+                if call_stats and call_stats.reasoning_tokens is not None
+                else None,
+                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
+                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
             )
 
             # Raw response is used for CUA engine LLM calls.
