@@ -1071,6 +1071,78 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
+    # Gemini API (Google AI Studio) flex tier variants — 50% cheaper, best-effort latency.
+    # Docs: https://ai.google.dev/gemini-api/docs/flex-inference
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_PRO_FLEX",
+        LLMConfig(
+            "gemini/gemini-2.5-pro",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                service_tier="flex",
+                timeout=900.0,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_FLASH_FLEX",
+        LLMConfig(
+            "gemini/gemini-2.5-flash",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                service_tier="flex",
+                timeout=900.0,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_FLASH_LITE",
+        LLMConfig(
+            "gemini/gemini-2.5-flash-lite",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_FLASH_LITE_FLEX",
+        LLMConfig(
+            "gemini/gemini-2.5-flash-lite",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                service_tier="flex",
+                timeout=900.0,
+            ),
+        ),
+    )
     LLMConfigRegistry.register_config(
         "GEMINI_3.0_FLASH",
         LLMConfig(
@@ -1468,6 +1540,22 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.1_FLASH_LITE",
+        LLMConfig(
+            "vertex_ai/gemini-3.1-flash-lite-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
     # Backward compat aliases — both resolve to the canonical VERTEX_GEMINI_3_PRO.
     # Bump VERTEX_GEMINI_3_PRO above when Google ships a newer version.
     LLMConfigRegistry.register_config(
@@ -1494,6 +1582,137 @@ if settings.ENABLE_VERTEX_AI:
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
+    # Flex tier variants — 50% cheaper, best-effort latency (1-15 min), sheddable.
+    # Use for latency-tolerant workloads (script gen, extraction, validation).
+    # Falls back to standard tier via router configs.
+    # NOTE: Requires litellm version with BerriAI/litellm#24898 (service_tier support for Vertex AI).
+    # Without it, drop_params=True silently strips service_tier and requests go through at standard pricing.
+    # TODO: If adding "priority" tier support, pass service_tier="priority" directly —
+    # litellm maps "auto" to "priority", which may cause confusion.
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_FLASH_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-flash",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex"},
+                timeout=900.0,  # Vertex flex best-effort SLA upper bound (15 min)
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_FLASH_LITE_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-flash-lite",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex"},
+                timeout=900.0,  # Vertex flex best-effort SLA upper bound (15 min)
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_PRO_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-pro",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex"},
+                timeout=900.0,  # Vertex flex best-effort SLA upper bound (15 min)
+            ),
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3.1-flash-lite-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex"},
+                timeout=900.0,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.1_PRO_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3.1-pro-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.1-pro-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex"},
+                timeout=900.0,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.0_FLASH_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3-flash-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3-flash-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex"},
+                timeout=900.0,
             ),
         ),
     )
