@@ -1789,9 +1789,9 @@ async def run_task(
             return output
 
         except ScriptTerminationException:
-            # Explicit termination from script (e.g., ATS validation failure).
+            # Explicit termination from script (e.g., target data does not exist).
             # Do NOT fall back to AI — the script intentionally terminated.
-            LOG.info("Script requested termination. Not falling back to AI.")
+            LOG.info("Script requested termination. Not falling back to AI.", cache_key=cache_key)
             raise
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
@@ -2070,6 +2070,11 @@ async def download(
                     label=cache_key,
                 )
 
+        except ScriptTerminationException:
+            # Explicit termination from script (e.g., target data does not exist).
+            # Do NOT fall back to AI — the script intentionally terminated.
+            LOG.info("Script requested termination in download block. Not falling back to AI.", cache_key=cache_key)
+            raise
         except Exception as e:
             LOG.exception("Failed to run download block. Falling back to AI run.")
             await _fallback_to_ai_run(
@@ -2157,6 +2162,11 @@ async def action(
                     label=cache_key,
                 )
 
+        except ScriptTerminationException:
+            # Explicit termination from script (e.g., target data does not exist).
+            # Do NOT fall back to AI — the script intentionally terminated.
+            LOG.info("Script requested termination in action block. Not falling back to AI.", cache_key=cache_key)
+            raise
         except Exception as e:
             LOG.exception("Failed to run action block. Falling back to AI run.")
             await _fallback_to_ai_run(
@@ -2247,6 +2257,11 @@ async def login(
                     label=cache_key,
                 )
 
+        except ScriptTerminationException:
+            # Explicit termination from script (e.g., target data does not exist).
+            # Do NOT fall back to AI — the script intentionally terminated.
+            LOG.info("Script requested termination in login block. Not falling back to AI.", cache_key=cache_key)
+            raise
         except Exception as e:
             LOG.exception("Failed to run login block")
             await _fallback_to_ai_run(
