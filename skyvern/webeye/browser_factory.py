@@ -851,6 +851,88 @@ async def _connect_to_cdp_browser(
     return browser_context, browser_artifacts, None
 
 
+async def _create_stealth_chromium(
+    playwright: Playwright,
+    proxy_location: ProxyLocation | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    **kwargs: dict,
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+            apply_download_behaviour=True,
+        )
+
+    try:
+        from cloakbrowser.config import IGNORE_DEFAULT_ARGS, get_default_stealth_args
+        from cloakbrowser.download import ensure_binary
+    except ImportError:
+        raise ImportError(
+            "CloakBrowser is required for stealth-chromium browser type. Install it with: pip install cloakbrowser"
+        )
+
+    # Check for browser_profile_id and load from storage if available
+    browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+    organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
+    user_data_dir: str | None = None
+
+    if browser_profile_id and organization_id_for_profile:
+        profile_dir = await app.STORAGE.retrieve_browser_profile(
+            organization_id=organization_id_for_profile,
+            profile_id=browser_profile_id,
+        )
+        if profile_dir:
+            user_data_dir = profile_dir
+            LOG.info(
+                "Using browser profile",
+                browser_profile_id=browser_profile_id,
+                profile_dir=profile_dir,
+            )
+        else:
+            LOG.warning(
+                "Browser profile not found, using temp directory",
+                browser_profile_id=browser_profile_id,
+                organization_id=organization_id_for_profile,
+            )
+
+    if not user_data_dir:
+        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+
+    download_dir = initialize_download_dir()
+    BrowserContextFactory.update_chromium_browser_preferences(
+        user_data_dir=user_data_dir,
+        download_dir=download_dir,
+    )
+    cdp_port: int | None = _get_cdp_port(kwargs)
+    browser_args = BrowserContextFactory.build_browser_args(
+        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+    )
+
+    binary_path = ensure_binary()
+    stealth_args = get_default_stealth_args()
+    existing_args = list(browser_args.get("args", []))
+
+    browser_args.update(
+        {
+            "user_data_dir": user_data_dir,
+            "downloads_path": download_dir,
+            "headless": False,
+            "executable_path": binary_path,
+            "ignore_default_args": IGNORE_DEFAULT_ARGS,
+            "args": [*existing_args, *stealth_args],
+        }
+    )
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+        har_path=browser_args["record_har_path"],
+        browser_session_dir=user_data_dir,
+    )
+    browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+    return browser_context, browser_artifacts, None
+
+
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
 BrowserContextFactory.register_type("cdp-connect", _create_cdp_connection_browser)
+BrowserContextFactory.register_type("stealth-chromium", _create_stealth_chromium)
