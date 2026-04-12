@@ -12,9 +12,13 @@ metadata:
 
 # Skyvern — AI Browser Automation
 
+<<<<<<< HEAD
 Skyvern automates browser-based workflows using LLMs and computer vision. It navigates websites it has never seen before, filling forms, extracting data, and completing multi-step tasks via a simple API.
 
 **SDK reference (all methods, parameters, types in one page):** https://skyvern.com/docs/sdk-reference/complete-reference
+=======
+Skyvern automates browser-based workflows using LLMs and computer vision. It navigates websites it has never seen before — filling forms, extracting data, and completing multi-step tasks — via a simple API.
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 
 ## When to use Skyvern
 
@@ -173,7 +177,12 @@ skyvern workflow run --id wf_xxx        # Run a workflow
 ## Key references
 
 - [API Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): First task in 5 minutes
+<<<<<<< HEAD
 - [SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference): All methods and types (Python + TypeScript)
+=======
+- [Python SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference.md): All methods and types
+- [TypeScript SDK Reference](https://skyvern.com/docs/ts-sdk-reference/complete-reference.md): All methods and types
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 - [MCP Server Setup](https://skyvern.com/docs/going-to-production/mcp.md): Connect AI assistants
 - [Workflow Blocks Reference](https://skyvern.com/docs/multi-step-automations/workflow-blocks-reference.md): All block types
 - [Task Parameters](https://skyvern.com/docs/running-automations/task-parameters.md): All task options
