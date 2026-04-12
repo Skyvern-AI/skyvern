@@ -20,12 +20,13 @@ The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Code
 
 ## What you can do
 
-The MCP server exposes 75+ tools across many categories. Here are the key ones:
+The MCP server exposes 77 tools across many categories. Here are the key ones:
 
 | Category | Key tools | What they do |
 |----------|-----------|--------------|
 | **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions — including connecting to a local browser via CDP |
 | **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language, CSS/XPath selectors, or both (hybrid mode) |
+| **Batch operations** | `skyvern_observe`, `skyvern_execute` | Snapshot interactive page elements and run multiple browser actions in a single call to reduce round-trips |
 | **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured JSON from pages, capture screenshots, run JavaScript |
 | **Validation** | `skyvern_validate` | Assert page conditions in natural language (returns true/false with reasoning) |
 | **Credentials & login** | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
@@ -360,6 +361,68 @@ Always use `--api-key` when exposing your browser via tunnel. Without it, anyone
 <Accordion title="Claude Desktop bundle updates">
 Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb) again, then reinstall it by double-clicking the bundle or using **Settings > Extensions**.
 </Accordion>
+
+## Batch operations with observe and execute
+
+Use `skyvern_observe` and `skyvern_execute` to reduce round-trips when you need to perform multiple browser actions in sequence. Instead of making separate tool calls for each click, type, or scroll, you can batch them into a single `skyvern_execute` call.
+
+### How it works
+
+1. Call `skyvern_observe` to get a structured snapshot of interactive elements on the page. Each element gets a stable ref (e.g., `e0`, `e1`).
+2. Call `skyvern_execute` with a list of steps that reference those elements by ref.
+
+### skyvern_observe
+
+Returns interactive page elements with stable refs for use in `skyvern_execute`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_id` | string | — | Browser session ID (`pbs_...`) |
+| `cdp_url` | string | — | CDP WebSocket URL (alternative to `session_id`) |
+| `selector` | string | — | CSS selector to scope the snapshot (e.g., `form#login`). Omit for full page |
+| `interactive_only` | boolean | `true` | Only return interactive elements (buttons, inputs, links) |
+| `max_elements` | integer | `50` | Max elements to return (1–200) |
+
+The response includes an `elements` array where each element has a `ref` field (e.g., `e0`), along with its role, name, and other accessibility attributes.
+
+### skyvern_execute
+
+Runs multiple browser operations in a single batch call.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `steps` | array | — | Array of `{tool, params}` step objects to execute sequentially |
+| `session_id` | string | — | Browser session ID (`pbs_...`) |
+| `cdp_url` | string | — | CDP WebSocket URL (alternative to `session_id`) |
+| `stop_on_error` | boolean | `true` | Stop at first failure (`true`) or continue past errors (`false`) |
+
+Each step in the `steps` array specifies a `tool` and its `params`. You can reference element refs from `skyvern_observe` using the `ref` param instead of a selector.
+
+**Allowed tools in steps:** `navigate`, `click`, `type`, `press_key`, `select_option`, `hover`, `scroll`, `wait`, `observe`, `screenshot`, `evaluate`
+
+### Example
+
+```json
+// Step 1: Observe the page to get element refs
+// Call skyvern_observe → returns elements like {ref: "e0", role: "textbox", name: "Email"}, ...
+
+// Step 2: Execute a batch of actions using those refs
+{
+  "steps": [
+    {"tool": "click", "params": {"ref": "e0"}},
+    {"tool": "type", "params": {"ref": "e0", "text": "user@example.com"}},
+    {"tool": "click", "params": {"ref": "e3"}},
+    {"tool": "type", "params": {"ref": "e3", "text": "mypassword"}},
+    {"tool": "click", "params": {"ref": "e5"}},
+    {"tool": "screenshot", "params": {}}
+  ],
+  "stop_on_error": true
+}
+```
+
+<Tip>
+Batch operations are especially useful for form filling, multi-step interactions, and any scenario where you already know what actions to perform. They reduce token usage and latency by combining multiple tool calls into one.
+</Tip>
 
 ## QA your frontend changes
 
