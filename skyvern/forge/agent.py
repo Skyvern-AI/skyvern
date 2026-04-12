@@ -82,6 +82,7 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -605,6 +606,7 @@ class ForgeAgent:
                         status=TaskStatus.completed,
                     )
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                    # Skip per-step video sync: clean_up_task performs the authoritative final upload.
                     await self.clean_up_task(
                         task=completed_task,
                         last_step=last_step,
@@ -621,6 +623,8 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 # If there is no next step, it means that the task has failed
                 if maybe_next_step:
+                    # Only sync on retry; clean_up_task handles the final upload on terminal paths.
+                    await self._sync_video_artifact_after_step(task, browser_state)
                     next_step = maybe_next_step
                     retry = True
                 else:
@@ -655,6 +659,7 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
+                    # Skip per-step video sync: clean_up_task performs the authoritative final upload.
                     await self.clean_up_task(
                         task=task,
                         last_step=last_step,
@@ -664,6 +669,8 @@ class ForgeAgent:
                     )
                     return last_step, detailed_output, None
                 elif maybe_next_step:
+                    # Only sync when continuing to the next step; clean_up_task handles terminal paths.
+                    await self._sync_video_artifact_after_step(task, browser_state)
                     next_step = maybe_next_step
                     retry = False
                 else:
@@ -680,6 +687,7 @@ class ForgeAgent:
                 )
                 # Flush for unexpected step status to release any buffered data.
                 await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                await self._sync_video_artifact_after_step(task, browser_state)
 
             cua_response_param = detailed_output.cua_response if detailed_output else None
             if not cua_response_param and cua_response:
@@ -2344,6 +2352,33 @@ class ForgeAgent:
             )
             return None
 
+    async def _sync_video_artifact_after_step(self, task: Task, browser_state: BrowserState | None) -> None:
+        """Upload the current video snapshot once per step so in-progress recordings are visible.
+
+        The video file is still open while recording, so this is a partial snapshot rather than a
+        finalized recording. The authoritative final upload happens in cleanup_and_persist_task after
+        the browser closes and Playwright writes the complete file.
+        """
+        if not browser_state:
+            return
+        try:
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                task_id=task.task_id, browser_state=browser_state
+            )
+            for video_artifact in video_artifacts:
+                await app.ARTIFACT_MANAGER.update_artifact_data(
+                    artifact_id=video_artifact.video_artifact_id,
+                    organization_id=task.organization_id,
+                    data=video_artifact.video_data,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to sync video artifact after step",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                exc_info=True,
+            )
+
     async def record_artifacts_after_action(
         self,
         task: Task,
@@ -2466,19 +2501,6 @@ class ForgeAgent:
                         screenshot_artifact_id=screenshot_artifact_id,
                         exc_info=True,
                     )
-
-        try:
-            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
-            )
-            for video_artifact in video_artifacts:
-                await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
-                    organization_id=task.organization_id,
-                    data=video_artifact.video_data,
-                )
-        except Exception:
-            LOG.exception("Failed to record video after action")
 
     async def initialize_execution_state(
         self,
@@ -4944,9 +4966,34 @@ class ForgeAgent:
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
-        data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-            prompt=prompt, step=step, prompt_name="data-extraction-summary"
-        )
+        # Cache the summary LLM call — the inputs (goal, schema, URL) are
+        # identical across download-loop iterations that revisit the same page.
+        workflow_run_id = context.workflow_run_id if context else None
+        cache_key: str | None = None
+        cached = None
+        try:
+            cache_key = extraction_cache.compute_cache_key(
+                rendered_prompt=prompt,
+                llm_key=None,
+            )
+            cached = extraction_cache.get(workflow_run_id, cache_key)
+        except Exception:
+            LOG.warning("data-extraction-summary cache lookup failed", exc_info=True)
+
+        if cached is not None:
+            LOG.info(
+                "data-extraction-summary cache hit — skipping LLM call",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+            )
+            data_extraction_summary_resp = cached
+        else:
+            data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="data-extraction-summary"
+            )
+            if cache_key:
+                extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,

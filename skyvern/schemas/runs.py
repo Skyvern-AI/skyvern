@@ -262,7 +262,7 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
         return ZoneInfo("America/New_York")
 
     if proxy_location == ProxyLocation.US_WA:
-        return ZoneInfo("America/New_York")
+        return ZoneInfo("America/Los_Angeles")
 
     if proxy_location == ProxyLocation.RESIDENTIAL:
         return ZoneInfo("America/New_York")

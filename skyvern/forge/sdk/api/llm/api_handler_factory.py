@@ -51,6 +51,11 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.trace import traced
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
+try:
+    from opentelemetry import trace as _otel_trace
+except ImportError:  # pragma: no cover
+    _otel_trace = None  # type: ignore[assignment]
+
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
@@ -909,6 +914,7 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
                 )
 
                 if step and is_speculative_step:
@@ -1375,6 +1381,7 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
                 )
 
                 if step and is_speculative_step:
@@ -1741,12 +1748,32 @@ class LLMCaller:
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
-                reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
+                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
+                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
+                reasoning_tokens=call_stats.reasoning_tokens
+                if call_stats and call_stats.reasoning_tokens is not None
+                else None,
+                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
+                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
             )
+
+            # Propagate token stats to the current OTel span so they appear
+            # in Logfire traces (gen_ai semantic conventions).
+            if _otel_trace and call_stats:
+                span = _otel_trace.get_current_span()
+                if span and span.is_recording():
+                    _token_attrs = {
+                        "gen_ai.usage.input_tokens": call_stats.input_tokens,
+                        "gen_ai.usage.output_tokens": call_stats.output_tokens,
+                        "gen_ai.usage.reasoning_tokens": call_stats.reasoning_tokens,
+                        "gen_ai.usage.cached_tokens": call_stats.cached_tokens,
+                        "gen_ai.usage.cost": call_stats.llm_cost,
+                    }
+                    for attr_key, attr_val in _token_attrs.items():
+                        if attr_val is not None:
+                            span.set_attribute(attr_key, attr_val)
+                    span.set_attribute("gen_ai.request.model", self.llm_config.model_name)
+                    span.set_attribute("llm_key", self.llm_key)
 
             # Raw response is used for CUA engine LLM calls.
             if raw_response:

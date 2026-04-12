@@ -10,7 +10,7 @@ resolution-markers = [
 [manifest]
 overrides = [
     { name = "authlib", specifier = ">=1.6.9" },
-    { name = "fastmcp", specifier = ">=3.1.1" },
+    { name = "fastmcp", specifier = ">=3.2.0" },
     { name = "mcp", specifier = ">=1.23.0" },
     { name = "pyasn1", specifier = ">=0.6.3" },
     { name = "pyjwt", specifier = ">=2.12.0" },
@@ -835,7 +835,7 @@ wheels = [
 
 [[package]]
 name = "fastmcp"
-version = "3.1.1"
+version = "3.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "authlib" },
@@ -860,9 +860,9 @@ dependencies = [
     { name = "watchfiles" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/25/83/c95d3bf717698a693eccb43e137a32939d2549876e884e246028bff6ecce/fastmcp-3.1.1.tar.gz", hash = "sha256:db184b5391a31199323766a3abf3a8bfbb8010479f77eca84c0e554f18655c48", size = 17347644, upload-time = "2026-03-14T19:12:20.235Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/61/a4470e2f590d98a1db3d40cb6f424a1353b2b09d4d0dfe01d0b8d3987984/fastmcp-3.2.2.tar.gz", hash = "sha256:a5351ec8c098844a8d508a53e484b362f5357b890596aaf233ac9686a796a62f", size = 26328077, upload-time = "2026-04-09T01:33:04.558Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/70/ea/570122de7e24f72138d006f799768e14cc1ccf7fcb22b7750b2bd276c711/fastmcp-3.1.1-py3-none-any.whl", hash = "sha256:8132ba069d89f14566b3266919d6d72e2ec23dd45d8944622dca407e9beda7eb", size = 633754, upload-time = "2026-03-14T19:12:22.736Z" },
+    { url = "https://files.pythonhosted.org/packages/99/3b/4225e516266146de5fc6e64a7357f0c1460e4f7134b2f0e6447ae35413f5/fastmcp-3.2.2-py3-none-any.whl", hash = "sha256:9d2fe9731bbae43e6979a0bf7194bd076fd014f780c118edfdc52645b9adbe5b", size = 707240, upload-time = "2026-04-09T01:33:00.938Z" },
 ]
 
 [[package]]
@@ -2060,7 +2060,7 @@ wheels = [
 
 [[package]]
 name = "litellm"
-version = "1.81.9"
+version = "1.83.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2076,9 +2076,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ff/8f/2a08f3d86fd008b4b02254649883032068378a8551baed93e8d9dcbbdb5d/litellm-1.81.9.tar.gz", hash = "sha256:a2cd9bc53a88696c21309ef37c55556f03c501392ed59d7f4250f9932917c13c", size = 16276983, upload-time = "2026-02-07T21:14:24.473Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/22/92/6ce9737554994ca8e536e5f4f6a87cc7c4774b656c9eb9add071caf7d54b/litellm-1.83.0.tar.gz", hash = "sha256:860bebc76c4bb27b4cf90b4a77acd66dba25aced37e3db98750de8a1766bfb7a", size = 17333062, upload-time = "2026-03-31T05:08:25.331Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/8b/672fc06c8a2803477e61e0de383d3c6e686e0f0fc62789c21f0317494076/litellm-1.81.9-py3-none-any.whl", hash = "sha256:24ee273bc8a62299fbb754035f83fb7d8d44329c383701a2bd034f4fd1c19084", size = 14433170, upload-time = "2026-02-07T21:14:21.469Z" },
+    { url = "https://files.pythonhosted.org/packages/19/2c/a670cc050fcd6f45c6199eb99e259c73aea92edba8d5c2fc1b3686d36217/litellm-1.83.0-py3-none-any.whl", hash = "sha256:88c536d339248f3987571493015784671ba3f193a328e1ea6780dbebaa2094a8", size = 15610306, upload-time = "2026-03-31T05:08:21.987Z" },
 ]
 
 [[package]]
@@ -3989,7 +3989,7 @@ wheels = [
 
 [[package]]
 name = "skyvern"
-version = "1.0.28"
+version = "1.0.30"
 source = { directory = "../../" }
 dependencies = [
     { name = "aioboto3" },
@@ -4070,11 +4070,11 @@ requires-dist = [
     { name = "aiofiles", specifier = ">=24.1.0,<25" },
     { name = "aiohttp", specifier = ">=3.8.5,<4" },
     { name = "aioredlock", specifier = ">=0.7.3,<0.8" },
-    { name = "aiosqlite", specifier = ">=0.21.0,<0.22" },
+    { name = "aiosqlite", specifier = ">=0.21.0,<0.23" },
     { name = "alembic", specifier = ">=1.12.1,<2" },
-    { name = "anthropic", specifier = ">=0.50.0,<0.51" },
+    { name = "anthropic", specifier = ">=0.50.0,<0.89" },
     { name = "asyncache", specifier = ">=0.3.1,<0.4" },
-    { name = "asyncpg", specifier = ">=0.30.0,<0.31" },
+    { name = "asyncpg", specifier = ">=0.30.0,<0.32" },
     { name = "authlib", specifier = ">=1.6.9" },
     { name = "azure-identity", specifier = ">=1.24.0,<2" },
     { name = "azure-keyvault-secrets", specifier = ">=4.2.0,<5" },
@@ -4083,19 +4083,19 @@ requires-dist = [
     { name = "croniter", specifier = ">=1.3.8,<4" },
     { name = "curlparser", specifier = ">=0.1.0,<0.2" },
     { name = "email-validator", specifier = ">=2.2.0,<3" },
-    { name = "fastapi", specifier = ">=0.121.0,<0.129" },
-    { name = "fastmcp", specifier = ">=2.10.1,<4" },
+    { name = "fastapi", specifier = ">=0.121.0,<0.136" },
+    { name = "fastmcp", specifier = ">=3.2.0,<4" },
     { name = "filetype", specifier = ">=1.2.0,<2" },
     { name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" },
     { name = "greenlet", marker = "python_full_version == '3.11.*'", specifier = "==3.0.3" },
     { name = "greenlet", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">3.0.3" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.2,<4" },
-    { name = "json-repair", specifier = ">=0.34.0,<0.35" },
+    { name = "json-repair", specifier = ">=0.34.0,<0.59" },
     { name = "jsonschema", specifier = ">=4.25.1" },
     { name = "lark", specifier = ">=1.2.2,<2" },
     { name = "libcst", specifier = ">=1.8.2,<2" },
-    { name = "litellm", specifier = ">=1.80.10" },
+    { name = "litellm", specifier = ">=1.83.0" },
     { name = "onepassword-sdk", specifier = "==0.4.0" },
     { name = "openai", specifier = ">=1.68.2" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2" },
@@ -4124,7 +4124,7 @@ requires-dist = [
     { name = "rich", extras = ["jupyter"], specifier = ">=13.7.0,<14" },
     { name = "sqlalchemy", extras = ["mypy"], specifier = ">=2.0.29,<3" },
     { name = "sse-starlette", specifier = ">=3.0.3,<4" },
-    { name = "starlette-context", specifier = ">=0.3.6,<0.4" },
+    { name = "starlette-context", specifier = ">=0.3.6,<0.6" },
     { name = "structlog", specifier = ">=23.2.0,<24" },
     { name = "tiktoken", specifier = ">=0.9.0" },
     { name = "tldextract", specifier = ">=5.1.2,<6" },
@@ -4164,7 +4164,7 @@ cloud = [
     { name = "temporalio", extras = ["opentelemetry"], specifier = ">=1.6.0,<2" },
 ]
 dev = [
-    { name = "aiosqlite", specifier = ">=0.21.0,<0.22" },
+    { name = "aiosqlite", specifier = ">=0.21.0,<0.23" },
     { name = "autoflake", specifier = ">=2.2.0,<3" },
     { name = "build", specifier = ">=1.2.2.post1,<2" },
     { name = "curlify", specifier = ">=3.0.0" },
@@ -4183,7 +4183,7 @@ dev = [
     { name = "pytest", specifier = ">=7.4.0,<8" },
     { name = "pytest-asyncio", specifier = ">=0.21.1,<0.22" },
     { name = "python-pptx", specifier = ">=1.0.2" },
-    { name = "ruff", specifier = ">=0.14.1,<0.15" },
+    { name = "ruff", specifier = ">=0.14.1,<0.16" },
     { name = "twine", specifier = ">=6.1.0,<7" },
     { name = "types-requests", specifier = ">=2.31.0.2,<3" },
 ]

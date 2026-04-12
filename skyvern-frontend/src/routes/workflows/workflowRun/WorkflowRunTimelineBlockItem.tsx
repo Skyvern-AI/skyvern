@@ -7,7 +7,7 @@ import {
   ExternalLinkIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useShimmerText } from "./useShimmerText";
 
@@ -17,6 +17,12 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -109,6 +115,51 @@ function truncateValue(value: string, maxLength = 120): string {
     return collapsed;
   }
   return `${collapsed.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Renders a loop value with line-clamp-2.  Shows a tooltip with the full
+ * value only when the CSS clamp actually truncates the visible text.
+ */
+function LoopValueCode({
+  collapsed,
+  fullValue,
+}: {
+  collapsed: string;
+  fullValue: string;
+}) {
+  const codeRef = useRef<HTMLElement>(null);
+  const [isClamped, setIsClamped] = useState(false);
+
+  useEffect(() => {
+    const el = codeRef.current;
+    if (el) {
+      setIsClamped(el.scrollHeight > el.clientHeight + 1);
+    }
+  }, [collapsed]);
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      <Tooltip open={isClamped ? undefined : false}>
+        <TooltipTrigger asChild>
+          <code
+            ref={codeRef}
+            className="line-clamp-2 block min-w-0 break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300"
+          >
+            {collapsed}
+          </code>
+        </TooltipTrigger>
+        {isClamped && (
+          <TooltipContent
+            side="top"
+            className="max-w-xs break-all font-mono text-[11px]"
+          >
+            {fullValue}
+          </TooltipContent>
+        )}
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 function getLoopIterationGroups(
@@ -412,7 +463,7 @@ function WorkflowRunTimelineBlockItem({
 
   return (
     <div
-      className={cn({
+      className={cn("min-w-0", {
         "ml-3 pl-3": depth > 0,
         "border-l border-slate-700": depth > 0,
       })}
@@ -434,7 +485,7 @@ function WorkflowRunTimelineBlockItem({
         }}
         ref={refCallback}
       >
-        <div className="space-y-4 p-4">
+        <div className="min-w-0 space-y-4 p-4">
           <div className="space-y-2">
             <div className="flex justify-between">
               <div className="flex gap-3">
@@ -506,10 +557,12 @@ function WorkflowRunTimelineBlockItem({
               </div>
             </div>
             {block.description ? (
-              <div className="text-xs text-slate-400">{block.description}</div>
+              <div className="break-words text-xs text-slate-400">
+                {block.description}
+              </div>
             ) : null}
             {isLoopBlock && (
-              <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
+              <div className="min-w-0 space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
                 <div className="text-slate-300">
                   Iterable values:{" "}
                   <span className="font-medium text-slate-200">
@@ -518,14 +571,24 @@ function WorkflowRunTimelineBlockItem({
                 </div>
                 {loopValues.length > 0 && (
                   <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
-                    {loopValues.map((value, index) => (
-                      <div key={index} className="text-slate-400">
-                        <span className="mr-1 text-slate-500">[{index}]</span>
-                        <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
-                          {truncateValue(stringifyTimelineValue(value), 120)}
-                        </code>
-                      </div>
-                    ))}
+                    {loopValues.map((value, index) => {
+                      const fullValue = stringifyTimelineValue(value);
+                      const collapsed = fullValue.replace(/\s+/g, " ").trim();
+                      return (
+                        <div
+                          key={index}
+                          className="flex min-w-0 break-words text-slate-400"
+                        >
+                          <span className="mr-1 shrink-0 text-slate-500">
+                            [{index}]
+                          </span>
+                          <LoopValueCode
+                            collapsed={collapsed}
+                            fullValue={fullValue}
+                          />
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -557,7 +620,7 @@ function WorkflowRunTimelineBlockItem({
                         ) : (
                           <div className="space-y-1">
                             <div className="text-slate-400">
-                              <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
+                              <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
                                 {evaluation.original_expression}
                               </code>
                             </div>
@@ -566,7 +629,7 @@ function WorkflowRunTimelineBlockItem({
                                 evaluation.original_expression && (
                                 <div className="text-slate-400">
                                   → rendered to{" "}
-                                  <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
+                                  <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
                                     {evaluation.rendered_expression}
                                   </code>
                                 </div>
@@ -610,7 +673,7 @@ function WorkflowRunTimelineBlockItem({
                     block.executed_branch_expression !== undefined ? (
                       <div className="text-slate-300">
                         Condition{" "}
-                        <code className="rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
+                        <code className="break-all rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
                           {block.executed_branch_expression}
                         </code>{" "}
                         evaluated to{" "}
@@ -666,15 +729,21 @@ function WorkflowRunTimelineBlockItem({
             <div className="space-y-2">
               {loopIterationGroups.map((group, groupIndex) => {
                 const loopValueFromIterable =
-                  group.index !== null ? loopValues[group.index] ?? null : null;
+                  group.index !== null
+                    ? (loopValues[group.index] ?? null)
+                    : null;
                 const iterationNumber =
                   group.index !== null ? group.index + 1 : groupIndex + 1;
+                const currentValueFull = stringifyTimelineValue(
+                  loopValueFromIterable ?? group.currentValue,
+                );
                 const currentValuePreview = truncateValue(
-                  stringifyTimelineValue(
-                    loopValueFromIterable ?? group.currentValue,
-                  ),
+                  currentValueFull,
                   140,
                 );
+                const isValueTruncated =
+                  currentValuePreview !==
+                  currentValueFull.replace(/\s+/g, " ").trim();
 
                 return (
                   <Collapsible
@@ -702,13 +771,31 @@ function WorkflowRunTimelineBlockItem({
                             <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
                             <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
                           </div>
-                          <code className="max-w-[70%] truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
-                            current_value: {currentValuePreview}
-                          </code>
+                          {isValueTruncated ? (
+                            <TooltipProvider delayDuration={300}>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                                    current_value: {currentValuePreview}
+                                  </code>
+                                </TooltipTrigger>
+                                <TooltipContent
+                                  side="top"
+                                  className="max-w-xs break-all font-mono text-[11px]"
+                                >
+                                  {currentValueFull}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          ) : (
+                            <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                              current_value: {currentValuePreview}
+                            </code>
+                          )}
                         </button>
                       </CollapsibleTrigger>
                     </div>
-                    <CollapsibleContent className="px-2 pb-2 pt-2">
+                    <CollapsibleContent className="min-w-0 px-2 pb-2 pt-2">
                       <TimelineSubItems
                         items={group.items}
                         activeItem={activeItem}

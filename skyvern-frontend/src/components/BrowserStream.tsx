@@ -1,4 +1,9 @@
-import RFB from "@novnc/novnc/lib/rfb.js";
+// @novnc/novnc is CJS with __esModule marker. Vite 8 (Rollup 5) changed
+// CJS interop so the default import may be the namespace object instead of
+// exports.default.  This guard works across bundler versions.
+import _RFB from "@novnc/novnc/lib/rfb.js";
+type RFB = _RFB;
+const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
 import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -239,7 +244,7 @@ function BrowserStream({
   useEffect(() => {
     settingsStore.setIsUsingABrowser(isReady);
     settingsStore.setBrowserSessionId(
-      isReady ? browserSessionId ?? null : null,
+      isReady ? (browserSessionId ?? null) : null,
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);

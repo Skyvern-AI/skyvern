@@ -5,6 +5,7 @@
 log.txt
 log-ingestion.txt
 logs
+log
 *.log
 current.json
 
