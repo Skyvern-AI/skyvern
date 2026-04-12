@@ -1,7 +1,16 @@
 ---
 title: Storage Configuration
 subtitle: Configure where Skyvern stores artifacts and recordings
+description: Configure Skyvern artifact storage using local filesystem, AWS S3, or Azure Blob Storage. Covers screenshots, browser recordings, HAR files, and extracted data storage for self-hosted deployments.
 slug: self-hosted/storage
+keywords:
+  - AWS S3
+  - Azure Blob Storage
+  - local filesystem
+  - artifact storage
+  - ARTIFACT_STORAGE_TYPE
+  - bucket
+  - container
 ---
 
 Skyvern generates several types of artifacts during task execution: screenshots, browser recordings, HAR files, and extracted data. By default, these are stored on the local filesystem. For production deployments, you can configure S3 or Azure Blob Storage.
