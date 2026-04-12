@@ -6752,6 +6752,12 @@
             "type": "boolean",
             "title": "Complete If Empty",
             "default": false
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "nullable": true,
+            "title": "Max Concurrency",
+            "description": "Maximum number of loop iterations to run in parallel. When null (default), iterations run sequentially."
           }
         },
         "type": "object",
@@ -6890,6 +6896,12 @@
             "type": "boolean",
             "title": "Complete If Empty",
             "default": false
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "nullable": true,
+            "title": "Max Concurrency",
+            "description": "Maximum number of loop iterations to run in parallel. When null (default), iterations run sequentially."
           }
         },
         "type": "object",
@@ -10450,8 +10462,8 @@
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "\nThe engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
-            "default": "skyvern-2.0"
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
+            "default": "skyvern-1.0"
           },
           "title": {
             "type": "string",

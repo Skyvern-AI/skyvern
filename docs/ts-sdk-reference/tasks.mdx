@@ -50,12 +50,12 @@ The `runTask` method accepts a single request object with the following shape:
 |-----------|------|----------|---------|-------------|
 | `body.prompt` | `string` | Yes | — | Natural language instructions for what the AI should do. |
 | `body.url` | `string` | No | `undefined` | Starting page URL. If omitted, the AI navigates from a blank page. |
-| `body.engine` | `RunEngine` | No | `"skyvern_v2"` | AI engine. Options: `"skyvern_v2"`, `"skyvern_v1"`, `"openai_cua"`, `"anthropic_cua"`, `"ui_tars"`. |
+| `body.engine` | `RunEngine` | No | `"skyvern_v1"` | AI engine. Options: `"skyvern_v1"`, `"skyvern_v2"`, `"openai_cua"`, `"anthropic_cua"`, `"ui_tars"`. |
 | `body.max_steps` | `number` | No | `undefined` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
 | `body.data_extraction_schema` | `Record<string, unknown> \| string` | No | `undefined` | JSON schema constraining the output shape. |
 | `body.proxy_location` | `ProxyLocation` | No | `undefined` | Route the browser through a geographic proxy. |
 | `body.browser_session_id` | `string` | No | `undefined` | Run inside an existing [browser session](/optimization/browser-sessions). |
-| `body.publish_workflow` | `boolean` | No | `false` | Save the generated code as a reusable workflow. Only works with `skyvern_v2`. |
+| `body.publish_workflow` | `boolean` | No | `false` | Save the generated code as a reusable workflow. Automatically upgrades the engine to `skyvern_v2`. |
 | `body.webhook_url` | `string` | No | `undefined` | URL to receive a POST when the run finishes. |
 | `body.error_code_mapping` | `Record<string, string>` | No | `undefined` | Map custom error codes to failure reasons. |
 | `body.totp_identifier` | `string` | No | `undefined` | Identifier for TOTP verification. |

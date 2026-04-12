@@ -46,14 +46,14 @@ print(result.output)
 |-----------|------|----------|---------|-------------|
 | `prompt` | `str` | Yes | — | Natural language instructions for what the AI should do. |
 | `url` | `str` | No | `None` | Starting page URL. If omitted, the AI navigates from a blank page. |
-| `engine` | `RunEngine` | No | `skyvern_v2` | AI engine. Options: `skyvern_v2`, `skyvern_v1`, `openai_cua`, `anthropic_cua`, `ui_tars`. |
+| `engine` | `RunEngine` | No | `skyvern_v1` | AI engine. Options: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`. |
 | `wait_for_completion` | `bool` | No | `False` | Block until the run finishes. |
 | `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
 | `max_steps` | `int` | No | `None` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
 | `data_extraction_schema` | `dict \| str` | No | `None` | JSON schema or Pydantic model name constraining the output shape. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
 | `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/optimization/browser-sessions). |
-| `publish_workflow` | `bool` | No | `False` | Save the generated code as a reusable workflow. Only works with `skyvern_v2`. |
+| `publish_workflow` | `bool` | No | `False` | Save the generated code as a reusable workflow. Automatically upgrades the engine to `skyvern_v2`. |
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
 | `error_code_mapping` | `dict[str, str]` | No | `None` | Map custom error codes to failure reasons. |
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
