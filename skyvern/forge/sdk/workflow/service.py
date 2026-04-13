@@ -60,7 +60,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
-from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -4395,10 +4395,10 @@ class WorkflowService:
         total_steps = None
         total_cost = None
         if include_step_count or include_cost:
-            workflow_run_steps = await app.DATABASE.tasks.get_steps_by_task_ids(
+            step_count, completed_step_count = await app.DATABASE.tasks.get_step_counts_by_task_ids(
                 task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
             )
-            total_steps = len(workflow_run_steps)
+            total_steps = step_count
 
             if include_cost:
                 workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
@@ -4408,9 +4408,7 @@ class WorkflowService:
                     block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
                 ]
                 # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
-                # successful steps are the ones that have a status of completed and the total count of unique step.order
-                successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
-                total_cost = 0.05 * (len(successful_steps) + len(text_prompt_blocks))
+                total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
         return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
