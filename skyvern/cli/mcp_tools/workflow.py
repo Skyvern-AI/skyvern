@@ -19,7 +19,7 @@ from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.client.types import WorkflowCreateYamlRequest
-from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 
@@ -607,9 +607,13 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
 
 # Parameter types that are auto-managed (credentials and secrets set via the UI) and should
 # always be preserved from the existing workflow during MCP updates, regardless of what the
-# caller sends.  These should NEVER be modifiable via MCP — only via the UI credential picker.
+# caller sends. These should NEVER be modifiable via MCP — only via the UI credential picker.
 # Derived from the enum to stay in sync when new secret types are added.
 _AUTO_MANAGED_PARAMETER_TYPES = frozenset(pt.value for pt in ParameterType if pt.is_secret_or_credential())
+_PROTECTED_WORKFLOW_PARAMETER_TYPES = frozenset(pt.value for pt in WorkflowParameterType if pt.is_credential_type())
+# Login-capable credential types — subset of protected params that carry username/password data.
+# Derived from the enum to stay in sync when new login-capable types are added.
+_LOGIN_CREDENTIAL_PARAMETER_TYPES = frozenset(pt.value for pt in ParameterType if pt.is_login_credential())
 
 # Runtime-only fields returned by GET /api/v1/workflows/{id} that must be stripped before
 # re-injecting parameters into a YAML/JSON definition.  Uses a suffix-based deny-list so
@@ -629,6 +633,43 @@ def _strip_runtime_fields(param: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_protected_update_parameter(param: Any) -> bool:
+    """Return True when *param* should be preserved from the existing workflow.
+
+    This includes:
+    - Secret/credential parameter types managed directly by the UI.
+    - Workflow input parameters whose type is `credential_id`, where the
+      selected credential lives in `default_value`.
+    """
+    if not isinstance(param, dict):
+        return False
+
+    key = param.get("key")
+    parameter_type = param.get("parameter_type")
+    if not key or not parameter_type:
+        return False
+    if parameter_type in _AUTO_MANAGED_PARAMETER_TYPES:
+        return True
+    return (
+        parameter_type == ParameterType.WORKFLOW.value
+        and param.get("workflow_parameter_type") in _PROTECTED_WORKFLOW_PARAMETER_TYPES
+    )
+
+
+def _is_login_credential_reference(param: dict[str, Any]) -> bool:
+    """Return True when *param* represents a credential reference usable by login blocks."""
+
+    parameter_type = param.get("parameter_type")
+    if not parameter_type:
+        return False
+    if parameter_type in _LOGIN_CREDENTIAL_PARAMETER_TYPES:
+        return True
+    return (
+        parameter_type == ParameterType.WORKFLOW.value
+        and param.get("workflow_parameter_type") in _PROTECTED_WORKFLOW_PARAMETER_TYPES
+    )
+
+
 def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return all block dicts from a block list, recursing into for_loop nested blocks."""
     result: list[dict[str, Any]] = []
@@ -643,11 +684,11 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> str:
-    """Preserve auto-managed parameters (credentials/secrets) during MCP workflow updates.
+    """Preserve protected credential/secret parameters during MCP workflow updates.
 
-    Credential parameters should NEVER be modifiable via MCP — the existing workflow's
-    values always win.  This function:
-      1. Always replaces auto-managed parameters with the existing workflow's versions
+    Credential references should NEVER be modifiable via MCP — the existing workflow's
+    values always win. This function:
+      1. Always replaces protected parameters with the existing workflow's versions
          (even if the caller includes them — they may have stale/wrong data).
       2. Injects credential parameter_keys into blocks using type-based matching
          (login blocks always get ALL credential keys) with label-based fallback
@@ -673,28 +714,25 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
 
     modified = False
 
-    # --- Step 1: Always replace auto-managed parameters with existing values ---
-    # Credential/secret parameters should NEVER be modifiable via MCP — the existing
-    # workflow's values always win, even if the caller includes them with different data.
-    # This means callers cannot swap credential references or remove credential params
-    # via MCP; those operations must go through the UI credential picker.
-    auto_managed_keys: set[str] = set()
+    # --- Step 1: Always replace protected parameters with existing values ---
+    # Credential/secret parameters — including workflow inputs of type credential_id —
+    # should NEVER be modifiable via MCP. The existing workflow's values always win,
+    # even if the caller includes them with different data. This means callers cannot
+    # swap credential references or remove credential params via MCP; those operations
+    # must go through the UI credential picker.
+    protected_keys: set[str] = set()
     for param in existing_params:
-        if not isinstance(param, dict):
-            continue
-        if param.get("parameter_type") in _AUTO_MANAGED_PARAMETER_TYPES and param.get("key"):
-            auto_managed_keys.add(param["key"])
+        if _is_protected_update_parameter(param):
+            protected_keys.add(param["key"])
 
-    if auto_managed_keys:
-        # Remove any auto-managed params the caller may have included (may have stale data)
-        update_params = [p for p in update_params if not (isinstance(p, dict) and p.get("key") in auto_managed_keys)]
-        # Inject all auto-managed params from the existing workflow, stripping runtime-only
+    if protected_keys:
+        # Remove any protected params the caller may have included (may have stale data)
+        update_params = [p for p in update_params if not (isinstance(p, dict) and p.get("key") in protected_keys)]
+        # Inject all protected params from the existing workflow, stripping runtime-only
         # fields that come from the GET API response (e.g. *_parameter_id, workflow_id,
         # created_at, modified_at, deleted_at) to keep the definition YAML-clean.
         for param in existing_params:
-            if not isinstance(param, dict):
-                continue
-            if param.get("parameter_type") in _AUTO_MANAGED_PARAMETER_TYPES and param.get("key"):
+            if _is_protected_update_parameter(param):
                 update_params.append(_strip_runtime_fields(param))
         modified = True
         wf_def["parameters"] = update_params
@@ -707,11 +745,11 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
     # credential injection; non-login secret refs are rare and still work when labels match.
     all_cred_keys: set[str] = set()
     login_cred_keys: set[str] = set()
-    for p in existing_params:
-        if isinstance(p, dict) and p.get("parameter_type") in _AUTO_MANAGED_PARAMETER_TYPES and p.get("key"):
-            all_cred_keys.add(p["key"])
-            if p.get("parameter_type") == "credential":
-                login_cred_keys.add(p["key"])
+    for param in existing_params:
+        if _is_protected_update_parameter(param):
+            all_cred_keys.add(param["key"])
+            if _is_login_credential_reference(param):
+                login_cred_keys.add(param["key"])
 
     if all_cred_keys:
         existing_blocks: list[dict[str, Any]] = existing_wf_def.get("blocks", [])
