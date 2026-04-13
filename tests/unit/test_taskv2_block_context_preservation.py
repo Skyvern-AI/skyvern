@@ -1,4 +1,6 @@
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -6,6 +8,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation import providers as providers_module
+from skyvern.services import task_v2_service
 
 
 class CaptureLogger:
@@ -220,3 +223,53 @@ def test_replace_flushes_existing_context_before_overwrite(monkeypatch: pytest.M
         )
     ]
     assert skyvern_context.current() is replacement_context
+
+
+@pytest.mark.asyncio
+async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop_state = {"downloaded_file_signatures_before_iteration": [("a.pdf", "abc", "https://files/a.pdf")]}
+    parent_context = SkyvernContext(
+        organization_id="org_parent",
+        organization_name="Parent Org",
+        workflow_run_id="wr_parent",
+        root_workflow_run_id="wr_root",
+        run_id="wr_parent",
+        loop_internal_state=loop_state,
+    )
+    skyvern_context.set(parent_context)
+
+    task_v2 = SimpleNamespace(
+        observer_cruise_id="tsk_v2_child",
+        workflow_id="wf_child",
+        workflow_run_id="wr_child",
+    )
+    captured_contexts: list[SkyvernContext] = []
+
+    async def fake_run_task_v2_helper(**_: Any) -> tuple[object, object, object]:
+        current_context = skyvern_context.ensure_context()
+        captured_contexts.append(current_context)
+        return (
+            SimpleNamespace(workflow_id="wf_child"),
+            SimpleNamespace(parent_workflow_run_id=None, browser_address=None),
+            task_v2,
+        )
+
+    monkeypatch.setattr(task_v2_service, "run_task_v2_helper", fake_run_task_v2_helper)
+
+    with patch("skyvern.services.task_v2_service.app") as mock_app:
+        mock_app.DATABASE.observer.get_task_v2 = AsyncMock(return_value=task_v2)
+        mock_app.WORKFLOW_SERVICE.clean_up_workflow = AsyncMock()
+
+        result = await task_v2_service.run_task_v2(
+            organization=SimpleNamespace(organization_id="org_parent", organization_name="Parent Org"),
+            task_v2_id="tsk_v2_child",
+        )
+
+    assert result is task_v2
+    assert len(captured_contexts) == 1
+    child_context = captured_contexts[0]
+    assert child_context.run_id == "wr_parent"
+    assert child_context.root_workflow_run_id == "wr_root"
+    assert child_context.loop_internal_state == loop_state
+    assert child_context.loop_internal_state is not loop_state
+    assert skyvern_context.current() is parent_context

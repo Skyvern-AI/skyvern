@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -712,6 +713,7 @@ class WorkflowService:
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 max_steps_override=max_steps_override,
                 max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
+                loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
             )
         )
 

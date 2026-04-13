@@ -15,6 +15,8 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.exceptions import InvalidCredentialId, MissingValueForParameter, WorkflowRunParameterPersistenceError
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -75,6 +77,13 @@ def _make_service_with_mocks(
 
     organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
     return service, organization, workflow_run
+
+
+@pytest.fixture(autouse=True)
+def reset_context() -> None:
+    skyvern_context.reset()
+    yield
+    skyvern_context.reset()
 
 
 @pytest.mark.asyncio
@@ -170,3 +179,37 @@ async def test_setup_workflow_run_raises_on_non_string_credential_id() -> None:
             )
 
     service.create_workflow_run_parameters.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_context() -> None:
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+
+    loop_state = {"downloaded_file_signatures_before_iteration": [("a.pdf", "abc", "https://files/a.pdf")]}
+    parent_context = SkyvernContext(
+        organization_id="org_test",
+        organization_name="Test Org",
+        workflow_run_id="wr_parent",
+        root_workflow_run_id="wr_root",
+        run_id="wr_parent",
+        loop_internal_state=loop_state,
+    )
+    skyvern_context.set(parent_context)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    current_context = skyvern_context.current()
+    assert current_context is not None
+    assert current_context.workflow_run_id == "wr_test"
+    assert current_context.run_id == "wr_parent"
+    assert current_context.root_workflow_run_id == "wr_root"
+    assert current_context.loop_internal_state == loop_state
+    assert current_context.loop_internal_state is not loop_state
