@@ -209,6 +209,23 @@ class TasksRepository(BaseRepository):
             ).all()
             return [convert_to_step(step, debug_enabled=self.debug_enabled) for step in steps]
 
+    @db_operation("get_step_counts_by_task_ids")
+    async def get_step_counts_by_task_ids(
+        self, task_ids: list[str], organization_id: str | None = None
+    ) -> tuple[int, int]:
+        """Return (total_steps, completed_steps) counts without fetching full step objects."""
+        async with self.Session() as session:
+            query = (
+                select(
+                    func.count().label("total"),
+                    func.count().filter(StepModel.status == StepStatus.completed).label("completed"),
+                )
+                .where(StepModel.task_id.in_(task_ids))
+                .where(StepModel.organization_id == organization_id)
+            )
+            row = (await session.execute(query)).one()
+            return row.total, row.completed
+
     @db_operation("get_total_unique_step_order_count_by_task_ids")
     async def get_total_unique_step_order_count_by_task_ids(
         self,
