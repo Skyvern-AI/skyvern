@@ -904,7 +904,9 @@ class BaseTaskBlock(Block):
         # self.block_type (which does not change between retries).
         warn_if_file_download_max_steps_low(self, workflow_run_id=workflow_run_id)
         _is_file_download = self.block_type == BlockType.FILE_DOWNLOAD
-        _navigate_wait_until = "domcontentloaded" if _is_file_download else "load"
+        _navigate_wait_until: Literal["load", "domcontentloaded", "commit"] = (
+            "domcontentloaded" if _is_file_download else "load"
+        )
 
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations

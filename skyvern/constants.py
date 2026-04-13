@@ -16,6 +16,18 @@ DOWNLOAD_FILE_PREFIX = "downloads"
 SAVE_DOWNLOADED_FILES_TIMEOUT = 180
 GET_DOWNLOADED_FILES_TIMEOUT = 30
 NAVIGATION_MAX_RETRY_TIME = 5
+PERMANENT_NAV_ERRORS = ("net::ERR_INVALID_URL",)
+PROXY_SENSITIVE_NAV_ERRORS = (
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NAME_RESOLUTION_FAILED",
+    "net::ERR_CERT_",
+    "net::ERR_SSL_",
+)
+# Errors that should not be retried within the same browser context/proxy.
+# The outer context-recreation retry in get_or_create_page may still attempt
+# recovery for proxy-sensitive errors by picking a different proxy node.
+SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
+
 AUTO_COMPLETION_POTENTIAL_VALUES_COUNT = 3
 DROPDOWN_MENU_MAX_DISTANCE = 100
 BROWSER_DOWNLOADING_SUFFIX = ".crdownload"
