@@ -434,8 +434,6 @@ Skyvern currently supports the following password manager integrations:
 
 ## Model Context Protocol (MCP)
 
-<a href="https://glama.ai/mcp/servers/Skyvern-AI/skyvern"><img src="https://glama.ai/mcp/servers/Skyvern-AI/skyvern/badge" alt="Skyvern MCP server" /></a>
-
 Skyvern supports the Model Context Protocol (MCP) to allow you to use any LLM that supports MCP.
 
 See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/skyvern/cli/mcp_tools/README.md)
