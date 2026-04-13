@@ -331,7 +331,7 @@ function WorkflowPage() {
             workflowPermanentId={workflowPermanentId}
             workflowRunId={openRunParams}
           />
-          <div className="flex items-center justify-between pt-2">
+          <div className="flex items-center justify-between px-3 py-3">
             <div className="flex items-center gap-2">
               <span className="text-sm text-slate-400">Items per page</span>
               <Select
@@ -355,7 +355,7 @@ function WorkflowPage() {
                 </SelectContent>
               </Select>
             </div>
-            <Pagination>
+            <Pagination className="ml-auto w-auto">
               <PaginationContent>
                 <PaginationItem>
                   <PaginationPrevious
