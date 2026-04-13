@@ -46,6 +46,9 @@ jobs:
             andrewneilson)
               echo "GH_PAT=${{ secrets.ANDREW_GH_PAT }}" >> $GITHUB_OUTPUT
               ;;
+            AronPerez)
+              echo "GH_PAT=${{ secrets.AARON_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
             claude\[bot\])
               echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               ;;
