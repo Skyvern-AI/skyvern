@@ -3096,6 +3096,7 @@ async def input_or_auto_complete_input(
             fallback_result = await discover_and_select_from_full_dropdown(
                 context=input_or_select_context,
                 page=page,
+                scraped_page=scraped_page,
                 dom=dom,
                 original_text=text,
                 skyvern_element=skyvern_element,
@@ -3116,6 +3117,7 @@ async def input_or_auto_complete_input(
 async def discover_and_select_from_full_dropdown(
     context: InputOrSelectContext,
     page: Page,
+    scraped_page: ScrapedPage,
     dom: DomUtil,
     original_text: str,
     skyvern_element: SkyvernElement,
@@ -3123,7 +3125,7 @@ async def discover_and_select_from_full_dropdown(
     task: Task,
     relevance_threshold: float = 0.6,
 ) -> ActionResult | None:
-    """Fallback for auto-completion: clear input, press ArrowDown to reveal all options,
+    """Fallback for auto-completion: clear input, click/ArrowDown to reveal all options,
     then ask LLM to pick the best semantic match from actual dropdown values."""
     if not await skyvern_element.is_visible():
         return None
@@ -3137,27 +3139,73 @@ async def discover_and_select_from_full_dropdown(
         await skyvern_element.scroll_into_view()
         await skyvern_element.input_clear()
 
+        # Try click first to open the dropdown (most combobox components respond to click)
         try:
-            await skyvern_element.press_key("ArrowDown")
-        except TimeoutError:
+            await skyvern_element.get_locator().click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        except Exception:
             LOG.info(
-                "Timeout pressing ArrowDown in discover fallback, continuing",
+                "Click failed in discover fallback, continuing to ArrowDown",
                 element_id=skyvern_element.get_id(),
             )
 
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
 
-        incremental_element = await incremental_scraped.get_incremental_element_tree(
-            clean_and_remove_element_tree_factory(
-                task=task,
-                step=step,
-                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
-            ),
+        cleanup_func = clean_and_remove_element_tree_factory(
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
         )
+        incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
+
+        # If click didn't produce options, try ArrowDown as fallback
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options after click, trying ArrowDown",
+                element_id=skyvern_element.get_id(),
+            )
+            try:
+                await skyvern_element.press_key("ArrowDown")
+            except TimeoutError:
+                LOG.info(
+                    "Timeout pressing ArrowDown in discover fallback, continuing",
+                    element_id=skyvern_element.get_id(),
+                )
+
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+            incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
+
+        # If incremental detection failed (e.g. options in a different shadow root),
+        # try a full page re-scrape diff as last resort
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options from incremental detection, trying re-scrape diff",
+                element_id=skyvern_element.get_id(),
+            )
+            scraped_page_after = await scraped_page.generate_scraped_page_without_screenshots()
+            new_element_ids_from_rescrape = list(
+                set(scraped_page_after.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+            )
+            if new_element_ids_from_rescrape:
+                # Feed re-scrape results back into incremental_element so the unified
+                # auto-completion-choose-option path below handles them (best-effort,
+                # with relevance_threshold). This avoids select_from_emerging_elements
+                # which uses the more aggressive custom-select prompt.
+                rescrape_elements = [
+                    scraped_page_after.id_to_element_dict[eid]
+                    for eid in new_element_ids_from_rescrape
+                    if eid in scraped_page_after.id_to_element_dict
+                ]
+                if rescrape_elements:
+                    LOG.info(
+                        "Discover fallback: re-scrape diff found new elements",
+                        new_element_count=len(rescrape_elements),
+                    )
+                    incremental_element = rescrape_elements
+                    incremental_scraped.id_to_element_dict.update(scraped_page_after.id_to_element_dict)
 
         if not incremental_element:
             LOG.info(
-                "Discover fallback: no options appeared after ArrowDown",
+                "Discover fallback: no options found after all attempts",
                 element_id=skyvern_element.get_id(),
             )
             return None
@@ -3200,28 +3248,44 @@ async def discover_and_select_from_full_dropdown(
             )
             return None
 
+        discovered_value = json_response.get("value", "")
         LOG.info(
-            "Discover fallback: found suitable option",
+            "Discover fallback: found suitable option, typing discovered value to trigger auto-completion",
             element_id=element_id,
             relevance_float=relevance_float,
+            discovered_value=discovered_value,
         )
 
-        locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-        if await locator.count() == 0:
-            LOG.warning(
-                "Discover fallback: selected element not found in DOM",
-                element_id=element_id,
-            )
+        if not discovered_value:
+            # FIXME: when element_id is valid and the dropdown is still open (incremental path),
+            # we could try clicking the element directly instead of requiring the value text.
+            # Currently this only affects the re-scrape path where the dropdown is closed.
             return None
 
-        selected_element = SkyvernElement(
-            locator=locator,
-            frame=current_frame,
-            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
-        )
-        await selected_element.scroll_into_view()
-        await selected_element.click(page=page)
-        return ActionSuccess()
+        # Instead of clicking the option directly (dropdown may have closed during re-scrape),
+        # input the discovered value into the combobox. Since it's an exact match, the combobox's
+        # filter will show it as the only option. Then find and click it directly via Playwright.
+        await skyvern_element.input_clear()
+        await skyvern_element.press_fill(discovered_value)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+
+        # Select the first matching option via keyboard: ArrowDown highlights it, Enter confirms.
+        # This avoids needing to locate the option element in shadow DOM.
+        try:
+            await skyvern_element.press_key("ArrowDown")
+            await skyvern_element.press_key("Enter")
+            LOG.info(
+                "Discover fallback: selected option via keyboard",
+                discovered_value=discovered_value,
+            )
+            return ActionSuccess()
+        except Exception:
+            LOG.info(
+                "Discover fallback: keyboard selection failed",
+                exc_info=True,
+                discovered_value=discovered_value,
+            )
+            return None
 
     except Exception:
         LOG.warning(
