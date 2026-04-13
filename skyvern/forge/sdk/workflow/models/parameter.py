@@ -47,6 +47,15 @@ class ParameterType(StrEnum):
             ParameterType.AZURE_SECRET,
         ]
 
+    def is_login_credential(self) -> bool:
+        """Return True for credential types that carry login (username/password) data."""
+        return self in [
+            ParameterType.CREDENTIAL,
+            ParameterType.ONEPASSWORD,
+            ParameterType.AZURE_VAULT_CREDENTIAL,
+            ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
+        ]
+
 
 class Parameter(BaseModel, abc.ABC):
     # TODO (kerem): Should we also have organization_id here?
