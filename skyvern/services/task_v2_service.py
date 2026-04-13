@@ -1,3 +1,4 @@
+import copy
 import json
 import string
 from datetime import UTC, datetime
@@ -492,6 +493,7 @@ async def run_task_v2(
         run_id=current_run_id,
         request_id=request_id,
         browser_session_id=browser_session_id,
+        loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to

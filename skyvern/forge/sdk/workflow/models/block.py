@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import asyncio
+import copy
 import csv
 import json
 import os
@@ -4701,6 +4702,11 @@ class TaskV2Block(Block):
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id)
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
+        current_context = skyvern_context.current()
+        download_lookup_run_id = (
+            current_context.run_id if current_context and current_context.run_id else workflow_run_id
+        )
+        loop_internal_state = copy.deepcopy(current_context.loop_internal_state) if current_context else None
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=organization,
@@ -4779,19 +4785,18 @@ class TaskV2Block(Block):
         )
 
         # Attempt to get downloaded files for the current iteration
-        current_context = skyvern_context.current()
         downloaded_files: list[FileInfo] = []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=organization_id or "",
-                    run_id=current_context.run_id if current_context and current_context.run_id else workflow_run_id,
+                    run_id=download_lookup_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning("Timeout getting downloaded files", task_v2_id=task_v2.observer_cruise_id)
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
-            current_context.loop_internal_state if current_context else None,
+            loop_internal_state,
         )
 
         task_v2_output = {
