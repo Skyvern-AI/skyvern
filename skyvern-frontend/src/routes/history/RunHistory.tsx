@@ -1,5 +1,12 @@
 import { LightningBoltIcon, MixerHorizontalIcon } from "@radix-ui/react-icons";
 
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tip } from "@/components/Tip";
 import {
   Status,
@@ -322,27 +329,30 @@ function RunHistory() {
           </TableHeader>
           <TableBody>{displayTableBody()}</TableBody>
         </Table>
-        <div className="relative px-3 py-3">
-          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
-            <select
-              className="h-9 rounded-md border border-slate-300 bg-background px-3"
-              value={itemsPerPage}
-              onChange={(e) => {
-                const next = Number(e.target.value);
+        <div className="flex items-center justify-between px-3 py-3">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-slate-400">Items per page</span>
+            <Select
+              value={String(itemsPerPage)}
+              onValueChange={(size) => {
                 const params = new URLSearchParams(searchParams);
-                params.set("page_size", String(next));
+                params.set("page_size", size);
                 params.set("page", "1");
                 setSearchParams(params, { replace: true });
               }}
             >
-              <option value={5}>5</option>
-              <option value={10}>10</option>
-              <option value={20}>20</option>
-              <option value={50}>50</option>
-            </select>
+              <SelectTrigger className="w-[65px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="5">5</SelectItem>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-          <Pagination className="pt-0">
+          <Pagination className="mx-0 w-auto pt-0">
             <PaginationContent>
               <PaginationItem>
                 <PaginationPrevious
