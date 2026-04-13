@@ -1,9 +1,15 @@
-from contextvars import ContextVar
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+import structlog
 from playwright.async_api import Frame, Page
+
+from skyvern.config import settings
+
+LOG = structlog.get_logger()
 
 
 @dataclass
@@ -31,6 +37,7 @@ class SkyvernContext:
     max_screenshot_scrolls: int | None = None
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
+    workflow_feature_flags_entries: dict[str, bool | str | None] = field(default_factory=dict)
 
     # feature flags
     enable_page_ready_wait: bool = False
@@ -116,6 +123,36 @@ class SkyvernContext:
             return False
         return True
 
+    def flush_workflow_feature_flags(self) -> None:
+        if not self.workflow_feature_flags_entries:
+            return
+        if not self.workflow_run_id:
+            LOG.debug(
+                "Discarding workflow_feature_flags entries for non-workflow context",
+                count=len(self.workflow_feature_flags_entries),
+            )
+            self.workflow_feature_flags_entries.clear()
+            return
+
+        feature_resolutions = dict(sorted(self.workflow_feature_flags_entries.items()))
+        log_fields: dict[str, Any] = {
+            "organization_id": str(self.organization_id or ""),
+            "workflow_run_id": str(self.workflow_run_id),
+            "workflow_permanent_id": str(self.workflow_permanent_id or ""),
+            "feature_resolutions": feature_resolutions,
+            "service_name": settings.OTEL_SERVICE_NAME,
+        }
+        if self.task_id:
+            log_fields["task_id"] = str(self.task_id)
+        if self.task_v2_id:
+            log_fields["task_v2_id"] = str(self.task_v2_id)
+        if self.browser_session_id:
+            log_fields["browser_session_id"] = str(self.browser_session_id)
+        if self.request_id:
+            log_fields["request_id"] = str(self.request_id)
+        LOG.info("workflow_feature_flags", **log_fields)
+        self.workflow_feature_flags_entries.clear()
+
 
 _context: ContextVar[SkyvernContext | None] = ContextVar(
     "Global context",
@@ -162,6 +199,57 @@ def set(context: SkyvernContext) -> None:
     _context.set(context)
 
 
+def replace(context: SkyvernContext) -> None:
+    """
+    Flush the current context summary, then replace it with a new context.
+
+    Args:
+        context: The context to set
+
+    Returns:
+        None
+    """
+    _flush_workflow_feature_flags_if_needed(current())
+    _context.set(context)
+
+
+def _flush_workflow_feature_flags_if_needed(context: SkyvernContext | None) -> None:
+    if context is not None and context.workflow_feature_flags_entries:
+        context.flush_workflow_feature_flags()
+
+
+def _restore(token: Token[SkyvernContext | None]) -> None:
+    """
+    Flush the current context summary and restore the previous context using a token.
+
+    Args:
+        token: ContextVar token returned by ContextVar.set()
+
+    Returns:
+        None
+    """
+    _flush_workflow_feature_flags_if_needed(current())
+    _context.reset(token)
+
+
+@contextmanager
+def scoped(context: SkyvernContext) -> Iterator[SkyvernContext]:
+    """
+    Temporarily scope the current context to a fresh child context.
+
+    Args:
+        context: The child context to set for the scope
+
+    Yields:
+        The child context
+    """
+    token = _context.set(context)
+    try:
+        yield context
+    finally:
+        _restore(token)
+
+
 def reset() -> None:
     """
     Reset the current context
@@ -169,4 +257,5 @@ def reset() -> None:
     Returns:
         None
     """
+    _flush_workflow_feature_flags_if_needed(current())
     _context.set(None)

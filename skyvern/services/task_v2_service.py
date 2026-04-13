@@ -482,59 +482,72 @@ async def run_task_v2(
         raise TaskV2NotFound(task_v2_id=task_v2_id)
 
     workflow, workflow_run = None, None
-    try:
-        workflow, workflow_run, task_v2 = await run_task_v2_helper(
-            organization=organization,
-            task_v2=task_v2,
-            request_id=request_id,
-            max_steps_override=max_steps_override,
-            browser_session_id=browser_session_id,
-        )
-    except TaskTerminationError as e:
-        task_v2 = await mark_task_v2_as_terminated(
-            task_v2_id=task_v2_id,
-            workflow_run_id=task_v2.workflow_run_id,
-            organization_id=organization_id,
-            failure_reason=e.message,
-        )
-        LOG.info("Task v2 is terminated", task_v2_id=task_v2_id, failure_reason=e.message)
-        return task_v2
-    except OperationalError:
-        LOG.error("Database error when running task v2", exc_info=True)
-        task_v2 = await mark_task_v2_as_failed(
-            task_v2_id,
-            workflow_run_id=task_v2.workflow_run_id,
-            failure_reason="Database error when running task 2.0",
-            organization_id=organization_id,
-        )
-    except Exception as e:
-        LOG.error("Failed to run task v2", exc_info=True)
-        failure_reason = f"Failed to run task 2.0: {str(e)}"
-        task_v2 = await mark_task_v2_as_failed(
-            task_v2_id,
-            workflow_run_id=task_v2.workflow_run_id,
-            failure_reason=failure_reason,
-            organization_id=organization_id,
-        )
-    finally:
-        if task_v2.workflow_id and not workflow:
-            workflow = await app.WORKFLOW_SERVICE.get_workflow(task_v2.workflow_id, organization_id=organization_id)
-        if task_v2.workflow_run_id and not workflow_run:
-            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-                task_v2.workflow_run_id, organization_id=organization_id
-            )
-        if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
-            await app.WORKFLOW_SERVICE.clean_up_workflow(
-                workflow=workflow,
-                workflow_run=workflow_run,
+    parent_context = skyvern_context.current()
+    current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
+    context = SkyvernContext(
+        organization_id=organization_id,
+        organization_name=organization.organization_name,
+        root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+        task_v2_id=task_v2_id,
+        run_id=current_run_id,
+        request_id=request_id,
+        browser_session_id=browser_session_id,
+    )
+    # SKY-7005: scoped() restores the parent context on exit, preserving
+    # loop_internal_state so per-iteration download filtering continues to
+    # work for subsequent blocks in the same loop iteration.
+    with skyvern_context.scoped(context):
+        try:
+            workflow, workflow_run, task_v2 = await run_task_v2_helper(
+                organization=organization,
+                task_v2=task_v2,
+                request_id=request_id,
+                max_steps_override=max_steps_override,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
-                need_call_webhook=False,
             )
-        else:
-            LOG.warning("Workflow or workflow run not found")
-
-        skyvern_context.reset()
+        except TaskTerminationError as e:
+            task_v2 = await mark_task_v2_as_terminated(
+                task_v2_id=task_v2_id,
+                workflow_run_id=task_v2.workflow_run_id,
+                organization_id=organization_id,
+                failure_reason=e.message,
+            )
+            LOG.info("Task v2 is terminated", task_v2_id=task_v2_id, failure_reason=e.message)
+            return task_v2
+        except OperationalError:
+            LOG.error("Database error when running task v2", exc_info=True)
+            task_v2 = await mark_task_v2_as_failed(
+                task_v2_id,
+                workflow_run_id=task_v2.workflow_run_id,
+                failure_reason="Database error when running task 2.0",
+                organization_id=organization_id,
+            )
+        except Exception as e:
+            LOG.error("Failed to run task v2", exc_info=True)
+            failure_reason = f"Failed to run task 2.0: {str(e)}"
+            task_v2 = await mark_task_v2_as_failed(
+                task_v2_id,
+                workflow_run_id=task_v2.workflow_run_id,
+                failure_reason=failure_reason,
+                organization_id=organization_id,
+            )
+        finally:
+            if task_v2.workflow_id and not workflow:
+                workflow = await app.WORKFLOW_SERVICE.get_workflow(task_v2.workflow_id, organization_id=organization_id)
+            if task_v2.workflow_run_id and not workflow_run:
+                workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                    task_v2.workflow_run_id, organization_id=organization_id
+                )
+            if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
+                await app.WORKFLOW_SERVICE.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
+                    need_call_webhook=False,
+                )
+            else:
+                LOG.warning("Workflow or workflow run not found")
 
     return task_v2
 
@@ -618,29 +631,30 @@ async def run_task_v2_helper(
 
     ###################### run task v2 ######################
 
-    context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+    # NOTE: run_task_v2 pushes a partial SkyvernContext via scoped() before
+    # calling this function. We enrich it here with workflow-level fields
+    # that are only available after the DB lookups above. This function
+    # MUST be called inside run_task_v2's scoped() block.
+    context = skyvern_context.ensure_context()
     current_run_id = context.run_id if context and context.run_id else task_v2_id
     # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
     root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
+    context.organization_id = organization_id
+    context.workflow_id = workflow_id
+    context.workflow_permanent_id = workflow.workflow_permanent_id
+    context.workflow_run_id = workflow_run_id
+    context.root_workflow_run_id = root_workflow_run_id
+    context.request_id = request_id
+    context.task_v2_id = task_v2_id
+    context.run_id = current_run_id
+    context.browser_session_id = browser_session_id
+    context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
     enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
         current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},
     )
-    skyvern_context.set(
-        SkyvernContext(
-            organization_id=organization_id,
-            workflow_id=workflow_id,
-            workflow_run_id=workflow_run_id,
-            root_workflow_run_id=root_workflow_run_id,
-            request_id=request_id,
-            task_v2_id=task_v2_id,
-            run_id=current_run_id,
-            browser_session_id=browser_session_id,
-            max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
-            enable_parse_select_in_extract=bool(enable_parse_select_in_extract),
-        )
-    )
+    context.enable_parse_select_in_extract = bool(enable_parse_select_in_extract)
 
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running

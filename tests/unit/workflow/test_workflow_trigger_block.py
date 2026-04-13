@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.experimentation import providers as providers_module
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.block import (
     _JSON_TYPE_MARKER,
@@ -15,7 +18,19 @@ from skyvern.forge.sdk.workflow.models.block import (
     WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
+
+
+class CaptureLogger:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self.records.append(("info", event, kwargs))
+
+    def debug(self, event: str, **kwargs: Any) -> None:
+        self.records.append(("debug", event, kwargs))
 
 
 def _make_output_parameter() -> OutputParameter:
@@ -197,6 +212,101 @@ class TestCheckTriggerDepth:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
             depth = await block._check_trigger_depth("wr_nonexistent")
         assert depth == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_preserves_parent_feature_flag_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    logger = CaptureLogger()
+    monkeypatch.setattr(skyvern_context, "LOG", logger)
+
+    block = _make_block(use_parent_browser_session=True)
+    parent_context = SkyvernContext(
+        organization_id="org_parent",
+        workflow_run_id="wr_parent",
+        workflow_permanent_id="wfp_parent",
+        root_workflow_run_id="wr_parent",
+        run_id="wr_parent",
+    )
+    skyvern_context.set(parent_context)
+    providers_module.record_feature_flag_resolution(
+        feature_name="PARENT_BEFORE",
+        resolution_kind="enabled",
+        resolved_value=True,
+    )
+
+    organization = MagicMock()
+    organization.organization_id = "org_parent"
+    organization.organization_name = "Org Parent"
+
+    async def _setup_workflow_run(**_: Any) -> Any:
+        skyvern_context.replace(
+            SkyvernContext(
+                organization_id="org_parent",
+                organization_name="Org Parent",
+                workflow_run_id="wr_child",
+                workflow_permanent_id="wfp_child",
+                root_workflow_run_id="wr_parent",
+                run_id="wr_parent",
+            )
+        )
+        workflow_run = MagicMock()
+        workflow_run.workflow_run_id = "wr_child"
+        workflow_run.workflow_permanent_id = "wfp_child"
+        return workflow_run
+
+    async def _execute_workflow(**_: Any) -> Any:
+        providers_module.record_feature_flag_resolution(
+            feature_name="CHILD_FLAG",
+            resolution_kind="enabled",
+            resolved_value=False,
+        )
+        workflow_run = MagicMock()
+        workflow_run.status = WorkflowRunStatus.completed
+        workflow_run.failure_reason = None
+        workflow_run.workflow_id = "wf_child"
+        return workflow_run
+
+    monkeypatch.setattr(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock())
+    monkeypatch.setattr(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None)
+    monkeypatch.setattr(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0))
+    monkeypatch.setattr(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock())
+    monkeypatch.setattr(WorkflowTriggerBlock, "build_block_result", AsyncMock(return_value=MagicMock()))
+
+    try:
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+            mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(side_effect=_setup_workflow_run)
+            mock_app.WORKFLOW_SERVICE.execute_workflow = AsyncMock(side_effect=_execute_workflow)
+            mock_app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples = AsyncMock(
+                return_value=[]
+            )
+
+            await block.execute(
+                workflow_run_id="wr_parent",
+                workflow_run_block_id="wrb_parent",
+                organization_id="org_parent",
+                browser_session_id="pbs_parent",
+            )
+
+        assert skyvern_context.current() is parent_context
+
+        providers_module.record_feature_flag_resolution(
+            feature_name="PARENT_AFTER",
+            resolution_kind="enabled",
+            resolved_value=False,
+        )
+    finally:
+        skyvern_context.reset()
+
+    summary_records = [fields for _, event, fields in logger.records if event == "workflow_feature_flags"]
+    assert len(summary_records) == 2
+    assert summary_records[0]["workflow_run_id"] == "wr_child"
+    assert summary_records[0]["feature_resolutions"] == {"CHILD_FLAG": False}
+    assert summary_records[1]["workflow_run_id"] == "wr_parent"
+    assert summary_records[1]["feature_resolutions"] == {
+        "PARENT_AFTER": False,
+        "PARENT_BEFORE": True,
+    }
 
 
 class TestBlockMetadata:

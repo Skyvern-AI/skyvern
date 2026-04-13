@@ -700,7 +700,7 @@ class WorkflowService:
         root_workflow_run_id = (
             context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run.workflow_run_id
         )
-        skyvern_context.set(
+        skyvern_context.replace(
             SkyvernContext(
                 organization_id=organization.organization_id,
                 organization_name=organization.organization_name,
