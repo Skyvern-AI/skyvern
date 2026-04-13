@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext
 from skyvern.webeye.actions.handler import (
@@ -68,6 +67,10 @@ def _mock_skyvern_element(frame: MagicMock | None = None) -> MagicMock:
     el.is_visible = AsyncMock(return_value=True)
     el.get_element_handler = AsyncMock(return_value=MagicMock())
     el.click = AsyncMock()
+    # get_locator().click() needs to be async for the discover fallback's click call
+    mock_locator = MagicMock()
+    mock_locator.click = AsyncMock()
+    el.get_locator.return_value = mock_locator
     return el
 
 
@@ -79,10 +82,12 @@ def _mock_frame(locator_count: int = 1) -> MagicMock:
     locator.element_handle = AsyncMock(return_value=MagicMock())
     locator.bounding_box = AsyncMock(return_value={"x": 0, "y": 0, "width": 100, "height": 30})
     locator.scroll_into_view_if_needed = AsyncMock()
-    # SkyvernElement.is_visible() needs locator.is_visible()
     locator.is_visible = AsyncMock(return_value=True)
     frame.locator.return_value = locator
     frame.evaluate = AsyncMock(return_value=None)
+    # locator.first.click needs to be async for option clicking
+    locator.first = MagicMock()
+    locator.first.click = AsyncMock()
     return frame
 
 
@@ -111,7 +116,7 @@ def _mock_selected_element() -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_discover_fallback_succeeds_when_options_appear() -> None:
-    """ArrowDown reveals options, LLM picks a match with relevance >= 0.6 → ActionSuccess."""
+    """Click reveals options, LLM picks a match, then types discovered value and clicks matched option."""
     frame = _mock_frame(locator_count=1)
     skyvern_el = _mock_skyvern_element(frame)
     inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
@@ -120,10 +125,9 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
         "auto_completion_attempt": True,
         "relevance_float": 0.9,
         "id": "OPT3",
+        "value": "I do not wish to disclose",
         "reasoning": "'I do not wish to disclose' matches 'Decline to Self Identify'",
     }
-
-    mock_selected_el = _mock_selected_element()
 
     with (
         patch(
@@ -137,7 +141,6 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
         patch("skyvern.webeye.actions.handler.app") as mock_app,
         patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
         patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
-        patch("skyvern.webeye.actions.handler.SkyvernElement", return_value=mock_selected_el),
     ):
         mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
         mock_prompt.load_prompt.return_value = "mocked prompt"
@@ -146,6 +149,7 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
         result = await discover_and_select_from_full_dropdown(
             context=_make_context(),
             page=MagicMock(),
+            scraped_page=MagicMock(),
             dom=MagicMock(),
             original_text="Decline to Self Identify",
             skyvern_element=skyvern_el,
@@ -155,10 +159,9 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
 
         assert isinstance(result, ActionSuccess)
         skyvern_el.input_clear.assert_awaited()
-        skyvern_el.press_key.assert_awaited_with("ArrowDown")
-        frame.locator.assert_called_with(f'[{SKYVERN_ID_ATTR}="OPT3"]')
-        mock_selected_el.scroll_into_view.assert_awaited()
-        mock_selected_el.click.assert_awaited()
+        skyvern_el.get_locator().click.assert_awaited()
+        # Types the discovered value, then finds and clicks matched option via Playwright locator
+        skyvern_el.press_fill.assert_awaited_with("I do not wish to disclose")
         inc_scrape.stop_listen_dom_increment.assert_awaited()
 
 
@@ -184,6 +187,7 @@ async def test_discover_fallback_returns_none_when_no_options() -> None:
         result = await discover_and_select_from_full_dropdown(
             context=_make_context(),
             page=MagicMock(),
+            scraped_page=MagicMock(),
             dom=MagicMock(),
             original_text="Decline to Self Identify",
             skyvern_element=skyvern_el,
@@ -229,6 +233,7 @@ async def test_discover_fallback_returns_none_when_relevance_too_low() -> None:
         result = await discover_and_select_from_full_dropdown(
             context=_make_context(),
             page=MagicMock(),
+            scraped_page=MagicMock(),
             dom=MagicMock(),
             original_text="Decline to Self Identify",
             skyvern_element=skyvern_el,
@@ -272,6 +277,7 @@ async def test_discover_fallback_returns_none_when_llm_returns_no_id() -> None:
         result = await discover_and_select_from_full_dropdown(
             context=_make_context(),
             page=MagicMock(),
+            scraped_page=MagicMock(),
             dom=MagicMock(),
             original_text="Decline to Self Identify",
             skyvern_element=skyvern_el,
@@ -291,6 +297,7 @@ async def test_discover_fallback_returns_none_when_element_invisible() -> None:
     result = await discover_and_select_from_full_dropdown(
         context=_make_context(),
         page=MagicMock(),
+        scraped_page=MagicMock(),
         dom=MagicMock(),
         original_text="Decline to Self Identify",
         skyvern_element=skyvern_el,
@@ -335,6 +342,7 @@ async def test_discover_fallback_returns_none_when_element_not_in_dom() -> None:
         result = await discover_and_select_from_full_dropdown(
             context=_make_context(),
             page=MagicMock(),
+            scraped_page=MagicMock(),
             dom=MagicMock(),
             original_text="Decline to Self Identify",
             skyvern_element=skyvern_el,
@@ -347,22 +355,36 @@ async def test_discover_fallback_returns_none_when_element_not_in_dom() -> None:
 
 @pytest.mark.asyncio
 async def test_discover_fallback_handles_arrow_down_timeout() -> None:
-    """If ArrowDown times out, fallback should continue (not crash)."""
+    """If click yields no options and ArrowDown times out, fallback succeeds when options found after ArrowDown."""
     from playwright.async_api import TimeoutError as PlaywrightTimeout
 
     frame = _mock_frame(locator_count=1)
     skyvern_el = _mock_skyvern_element(frame)
-    skyvern_el.press_key = AsyncMock(side_effect=PlaywrightTimeout("timeout"))
-    inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+    # ArrowDown for opening dropdown times out, but subsequent keyboard presses succeed
+    call_count = 0
+
+    async def press_key_side_effect(key, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise PlaywrightTimeout("timeout")
+
+    skyvern_el.press_key = AsyncMock(side_effect=press_key_side_effect)
+    # Click yields no options on first call, ArrowDown (despite timeout) yields options on second
+    inc_scrape = _mock_incremental_scrape([])
+    # 3 calls: click→empty, ArrowDown→options, press_fill→options (for select_one_element_by_value)
+    inc_scrape.get_incremental_element_tree = AsyncMock(
+        side_effect=[[], copy.deepcopy(DROPDOWN_OPTIONS), copy.deepcopy(DROPDOWN_OPTIONS)]
+    )
+    inc_scrape.id_to_element_dict = {e["id"]: e for e in DROPDOWN_OPTIONS}
 
     llm_response = {
         "auto_completion_attempt": True,
         "relevance_float": 0.9,
         "id": "OPT3",
+        "value": "I do not wish to disclose",
         "reasoning": "Match found",
     }
-
-    mock_selected_el = _mock_selected_element()
 
     with (
         patch(
@@ -376,7 +398,6 @@ async def test_discover_fallback_handles_arrow_down_timeout() -> None:
         patch("skyvern.webeye.actions.handler.app") as mock_app,
         patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
         patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
-        patch("skyvern.webeye.actions.handler.SkyvernElement", return_value=mock_selected_el),
     ):
         mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
         mock_prompt.load_prompt.return_value = "mocked prompt"
@@ -385,6 +406,7 @@ async def test_discover_fallback_handles_arrow_down_timeout() -> None:
         result = await discover_and_select_from_full_dropdown(
             context=_make_context(),
             page=MagicMock(),
+            scraped_page=MagicMock(),
             dom=MagicMock(),
             original_text="Decline to Self Identify",
             skyvern_element=skyvern_el,
@@ -394,6 +416,126 @@ async def test_discover_fallback_handles_arrow_down_timeout() -> None:
 
         # Should still succeed — ArrowDown timeout is handled gracefully
         assert isinstance(result, ActionSuccess)
+
+
+# ---------------------------------------------------------------------------
+# Tests for re-scrape diff fallback (Strategy 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_rescrape_diff_succeeds() -> None:
+    """When click and ArrowDown both return empty, re-scrape diff finds new elements and keyboard selects."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    # Both click and ArrowDown produce no incremental elements
+    inc_scrape = _mock_incremental_scrape([])
+    inc_scrape.get_incremental_element_tree = AsyncMock(
+        side_effect=[[], [], copy.deepcopy(DROPDOWN_OPTIONS)]  # click→empty, ArrowDown→empty, press_fill→options
+    )
+    inc_scrape.id_to_element_dict = {}
+
+    llm_response = {
+        "auto_completion_attempt": True,
+        "relevance_float": 0.95,
+        "id": "OPT3",
+        "value": "I do not wish to disclose",
+        "reasoning": "Best semantic match",
+    }
+
+    # Mock scraped_page for re-scrape diff
+    mock_scraped_page = MagicMock()
+    mock_scraped_page.id_to_css_dict = {"EXISTING1": "css1"}  # before scrape
+
+    # After re-scrape: has new elements
+    mock_scraped_after = MagicMock()
+    mock_scraped_after.id_to_css_dict = {
+        "EXISTING1": "css1",
+        "OPT1": "css2",
+        "OPT2": "css3",
+        "OPT3": "css4",
+    }
+    mock_scraped_after.id_to_element_dict = {e["id"]: e for e in DROPDOWN_OPTIONS}
+    mock_scraped_page.generate_scraped_page_without_screenshots = AsyncMock(return_value=mock_scraped_after)
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await discover_and_select_from_full_dropdown(
+            context=_make_context(),
+            page=MagicMock(),
+            scraped_page=mock_scraped_page,
+            dom=MagicMock(),
+            original_text="Decline to Self Identify",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+        assert isinstance(result, ActionSuccess)
+        # Verify re-scrape was triggered
+        mock_scraped_page.generate_scraped_page_without_screenshots.assert_awaited_once()
+        # Verify discovered value was typed + keyboard selection
+        skyvern_el.press_fill.assert_awaited_with("I do not wish to disclose")
+        # ArrowDown + Enter for keyboard selection
+        assert skyvern_el.press_key.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_rescrape_diff_no_new_elements() -> None:
+    """When re-scrape diff finds no new elements, returns None."""
+    skyvern_el = _mock_skyvern_element()
+    inc_scrape = _mock_incremental_scrape([])
+
+    # Mock scraped_page where re-scrape returns same elements (no diff)
+    mock_scraped_page = MagicMock()
+    mock_scraped_page.id_to_css_dict = {"EXISTING1": "css1"}
+    mock_scraped_after = MagicMock()
+    mock_scraped_after.id_to_css_dict = {"EXISTING1": "css1"}  # same as before
+    mock_scraped_page.generate_scraped_page_without_screenshots = AsyncMock(return_value=mock_scraped_after)
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock()
+
+        result = await discover_and_select_from_full_dropdown(
+            context=_make_context(),
+            page=MagicMock(),
+            scraped_page=mock_scraped_page,
+            dom=MagicMock(),
+            original_text="Decline to Self Identify",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+        assert result is None
+        mock_scraped_page.generate_scraped_page_without_screenshots.assert_awaited_once()
+        # LLM should not be called since no new elements
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
