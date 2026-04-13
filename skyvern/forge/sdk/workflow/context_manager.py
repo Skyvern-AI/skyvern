@@ -1062,7 +1062,10 @@ class WorkflowRunContext:
             current_value = self.values[block_label]
             # only able to merge the value when the current value and the pending value are both dicts
             if isinstance(current_value, dict) and isinstance(block_reference_value, dict):
-                block_reference_value.update(current_value)
+                # Merge old into new so that new values (e.g. from the latest loop
+                # iteration) take precedence over stale ones.
+                merged = {**current_value, **block_reference_value}
+                block_reference_value = merged
             else:
                 LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
