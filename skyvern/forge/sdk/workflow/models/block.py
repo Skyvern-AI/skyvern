@@ -4723,37 +4723,32 @@ class TaskV2Block(Block):
                     organization_id=organization_id,
                     block_workflow_run_id=task_v2.workflow_run_id,
                 )
+        except Exception as e:
+            LOG.exception("Failed to initialize or queue TaskV2", error=e)
+            output_reason = f"Failed to initialize or queue TaskV2: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": output_reason}
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=output_reason,
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
-            task_v2 = await task_v2_service.run_task_v2(
-                organization=organization,
-                task_v2_id=task_v2.observer_cruise_id,
-                request_id=None,
-                max_steps_override=self.max_steps,
-                browser_session_id=browser_session_id,
-            )
-        finally:
-            context: skyvern_context.SkyvernContext | None = skyvern_context.current()
-            current_run_id = context.run_id if context and context.run_id else workflow_run_id
-            root_workflow_run_id = (
-                context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
-            )
-            # Preserve loop_internal_state so per-iteration download filtering
-            # continues to work for subsequent blocks in the same loop iteration (SKY-7005)
-            loop_state = context.loop_internal_state if context else None
-            skyvern_context.set(
-                skyvern_context.SkyvernContext(
-                    organization_id=organization_id,
-                    organization_name=organization.organization_name,
-                    workflow_id=workflow_run.workflow_id,
-                    workflow_permanent_id=workflow_run.workflow_permanent_id,
-                    workflow_run_id=workflow_run_id,
-                    root_workflow_run_id=root_workflow_run_id,
-                    run_id=current_run_id,
-                    browser_session_id=browser_session_id,
-                    max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-                    loop_internal_state=loop_state,
-                )
-            )
+        # run_task_v2 uses scoped() internally, so context is always restored
+        # even if it raises. Its own exception handlers mark the task as
+        # failed/terminated with proper status, so we let exceptions propagate
+        # to the status-mapping logic below.
+        task_v2 = await task_v2_service.run_task_v2(
+            organization=organization,
+            task_v2_id=task_v2.observer_cruise_id,
+            request_id=None,
+            max_steps_override=self.max_steps,
+            browser_session_id=browser_session_id,
+        )
         result_dict = None
         if task_v2:
             result_dict = task_v2.output
@@ -6877,92 +6872,79 @@ class WorkflowTriggerBlock(Block):
                 browser_session_id=resolved_browser_session_id,
             )
 
-            # Save the parent's skyvern_context because setup_workflow_run and
-            # execute_workflow overwrite it with the child's values. We restore
-            # it after the child finishes so subsequent parent blocks get correct
-            # context (logs, observability, workflow_run_id, etc.).
-            from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
-
+            # Isolate the synchronous child workflow in a placeholder scope so
+            # setup_workflow_run() can replace the current context without
+            # flushing the parent's pending workflow_feature_flags summary.
             parent_context = skyvern_context.current()
-            try:
-                triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-                    request_id=None,
-                    workflow_request=workflow_request,
-                    workflow_permanent_id=resolved_workflow_permanent_id,
-                    organization=organization,
-                    parent_workflow_run_id=workflow_run_id,
+            with skyvern_context.scoped(
+                skyvern_context.SkyvernContext(
+                    run_id=parent_context.run_id if parent_context else None,
+                    root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
                 )
-            except Exception as e:
-                error_msg = get_user_facing_exception_message(e)
-                if parent_context:
-                    skyvern_context.set(parent_context)
-                if created_fresh_session and resolved_browser_session_id:
+            ):
+                try:
+                    triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+                        request_id=None,
+                        workflow_request=workflow_request,
+                        workflow_permanent_id=resolved_workflow_permanent_id,
+                        organization=organization,
+                        parent_workflow_run_id=workflow_run_id,
+                    )
+                except Exception as e:
+                    error_msg = get_user_facing_exception_message(e)
+                    return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
+
+                triggered_run_id = triggered_workflow_run.workflow_run_id
+
+                LOG.info(
+                    "Triggered workflow run (sync)",
+                    parent_workflow_run_id=workflow_run_id,
+                    triggered_workflow_run_id=triggered_run_id,
+                    triggered_workflow_permanent_id=resolved_workflow_permanent_id,
+                )
+
+                try:
+                    final_run = await app.WORKFLOW_SERVICE.execute_workflow(
+                        workflow_run_id=triggered_run_id,
+                        api_key=None,
+                        organization=organization,
+                        browser_session_id=resolved_browser_session_id,
+                    )
+                    success = final_run.status == WorkflowRunStatus.completed
+                    output_data = {
+                        "workflow_run_id": triggered_run_id,
+                        "workflow_permanent_id": resolved_workflow_permanent_id,
+                        "status": str(final_run.status),
+                        "failure_reason": final_run.failure_reason,
+                    }
+                    # Include the child workflow's output parameters so downstream
+                    # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
                     try:
-                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                            organization_id, resolved_browser_session_id
+                        child_output_params = (
+                            await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
+                                workflow_id=final_run.workflow_id,
+                                workflow_run_id=triggered_run_id,
+                            )
                         )
+                        child_outputs: dict[str, Any] = {}
+                        for output_param, run_output_param in child_output_params:
+                            child_outputs[output_param.key] = run_output_param.value
+                        output_data["outputs"] = child_outputs
                     except Exception:
                         LOG.warning(
-                            "Failed to close child browser session after setup failure",
-                            child_browser_session_id=resolved_browser_session_id,
+                            "Failed to fetch child workflow outputs",
+                            triggered_workflow_run_id=triggered_run_id,
                             exc_info=True,
                         )
-                return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
-
-            triggered_run_id = triggered_workflow_run.workflow_run_id
-
-            LOG.info(
-                "Triggered workflow run (sync)",
-                parent_workflow_run_id=workflow_run_id,
-                triggered_workflow_run_id=triggered_run_id,
-                triggered_workflow_permanent_id=resolved_workflow_permanent_id,
-            )
-
-            try:
-                final_run = await app.WORKFLOW_SERVICE.execute_workflow(
-                    workflow_run_id=triggered_run_id,
-                    api_key=None,
-                    organization=organization,
-                    browser_session_id=resolved_browser_session_id,
-                )
-                success = final_run.status == WorkflowRunStatus.completed
-                output_data = {
-                    "workflow_run_id": triggered_run_id,
-                    "workflow_permanent_id": resolved_workflow_permanent_id,
-                    "status": str(final_run.status),
-                    "failure_reason": final_run.failure_reason,
-                }
-                # Include the child workflow's output parameters so downstream
-                # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
-                try:
-                    child_output_params = (
-                        await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
-                            workflow_id=final_run.workflow_id,
-                            workflow_run_id=triggered_run_id,
-                        )
-                    )
-                    child_outputs: dict[str, Any] = {}
-                    for output_param, run_output_param in child_output_params:
-                        child_outputs[output_param.key] = run_output_param.value
-                    output_data["outputs"] = child_outputs
-                except Exception:
-                    LOG.warning(
-                        "Failed to fetch child workflow outputs",
-                        triggered_workflow_run_id=triggered_run_id,
-                        exc_info=True,
-                    )
-            except Exception as e:
-                error_msg = get_user_facing_exception_message(e)
-                output_data = {
-                    "workflow_run_id": triggered_run_id,
-                    "workflow_permanent_id": resolved_workflow_permanent_id,
-                    "status": "failed",
-                    "failure_reason": f"Triggered workflow execution failed: {error_msg}",
-                }
-                success = False
-            finally:
-                if parent_context:
-                    skyvern_context.set(parent_context)
+                except Exception as e:
+                    error_msg = get_user_facing_exception_message(e)
+                    output_data = {
+                        "workflow_run_id": triggered_run_id,
+                        "workflow_permanent_id": resolved_workflow_permanent_id,
+                        "status": "failed",
+                        "failure_reason": f"Triggered workflow execution failed: {error_msg}",
+                    }
+                    success = False
                 if created_fresh_session and resolved_browser_session_id:
                     try:
                         await app.PERSISTENT_SESSIONS_MANAGER.close_session(

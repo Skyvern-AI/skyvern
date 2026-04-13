@@ -136,7 +136,7 @@ async def run_sdk_action(
     )
 
     context = skyvern_context.ensure_context()
-    skyvern_context.set(
+    skyvern_context.replace(
         SkyvernContext(
             request_id=context.request_id,
             organization_id=task.organization_id,
