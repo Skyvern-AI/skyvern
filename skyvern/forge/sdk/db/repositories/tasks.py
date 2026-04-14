@@ -413,6 +413,7 @@ class TasksRepository(BaseRepository):
         incremental_reasoning_tokens: int | None = None,
         incremental_cached_tokens: int | None = None,
         created_by: str | None = None,
+        last_llm_model: str | None = None,
     ) -> Step:
         async with self.Session() as session:
             if step := (
@@ -446,6 +447,8 @@ class TasksRepository(BaseRepository):
                     step.cached_token_count = incremental_cached_tokens + (step.cached_token_count or 0)
                 if created_by is not None:
                     step.created_by = created_by
+                if last_llm_model is not None:
+                    step.last_llm_model = last_llm_model
 
                 await session.commit()
                 updated_step = await self.get_step(step_id, organization_id)
