@@ -118,6 +118,10 @@ class TaskBase(BaseModel):
         description="The maximum time to wait for downloads to complete, in seconds. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT seconds.",
         examples=[15.0],
     )
+    include_extracted_text: bool = Field(
+        default=True,
+        description="If False, omit the scraped page text dump from the extract-information prompt. ExtractionBlock opts out; everything else keeps the default.",
+    )
 
 
 class TaskRequest(TaskBase):

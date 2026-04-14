@@ -84,6 +84,7 @@ from skyvern.utils.prompt_engine import (
     CheckPhoneNumberFormatResponse,
     load_prompt_with_elements,
 )
+from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -4269,6 +4270,11 @@ async def extract_information_for_navigation_goal(
     # same value (avoids stale hits when date-relative extraction goals cross midnight).
     local_datetime_str = datetime.now(context.tz_info).isoformat()
 
+    extracted_text_for_prompt = scraped_page_refreshed.extracted_text if task.include_extracted_text else None
+
+    previous_info_capped = truncate_previous_extracted_information(task.extracted_information)
+    capped_schema = truncate_extraction_schema(task.extracted_information_schema)
+
     # Render the prompt FIRST so the cache key hashes the exact string that
     # will be sent to the LLM (captures economy-tree swaps and 2/3 truncation
     # inside load_prompt_with_elements).
@@ -4279,11 +4285,11 @@ async def extract_information_for_navigation_goal(
         html_need_skyvern_attrs=False,
         navigation_goal=task.navigation_goal,
         navigation_payload=task.navigation_payload,
-        previous_extracted_information=task.extracted_information,
+        previous_extracted_information=previous_info_capped,
         data_extraction_goal=task.data_extraction_goal,
-        extracted_information_schema=task.extracted_information_schema,
+        extracted_information_schema=capped_schema,
         current_url=scraped_page_refreshed.url,
-        extracted_text=scraped_page_refreshed.extracted_text,
+        extracted_text=extracted_text_for_prompt,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
         local_datetime=local_datetime_str,
     )

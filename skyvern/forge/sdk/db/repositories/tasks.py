@@ -65,6 +65,7 @@ class TasksRepository(BaseRepository):
         browser_session_id: str | None = None,
         browser_address: str | None = None,
         download_timeout: float | None = None,
+        include_extracted_text: bool = True,
     ) -> Task:
         # Sanitize text fields to remove NUL bytes and control characters
         # that PostgreSQL cannot store in text columns
@@ -108,6 +109,7 @@ class TasksRepository(BaseRepository):
                 browser_session_id=browser_session_id,
                 browser_address=browser_address,
                 download_timeout=download_timeout,
+                include_extracted_text=include_extracted_text,
             )
             session.add(new_task)
             await session.commit()
