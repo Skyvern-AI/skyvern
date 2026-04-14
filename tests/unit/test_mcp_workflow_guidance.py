@@ -16,7 +16,12 @@ def test_build_workflow_prompt_guides_text_prompt_defaults() -> None:
 
 def test_mcp_instructions_guide_text_prompt_defaults() -> None:
     # text_prompt guidance moved to build_workflow prompt; instructions now focus on task classification.
+    # Verify the classification table (the core of the rewritten instructions) is present.
     assert "Task Classification" in mcp.instructions
+    assert "If a browser session is already open, keep using it." in mcp.instructions
+    assert '"try this once"' in mcp.instructions
+    assert "skyvern_run_task" in mcp.instructions
+    assert "skyvern_workflow_create" in mcp.instructions
     assert "skyvern_validate" in mcp.instructions
     assert "skyvern_extract" in mcp.instructions
     assert "skyvern_act" in mcp.instructions
