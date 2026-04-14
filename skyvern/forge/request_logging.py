@@ -23,6 +23,9 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/credentials",
     "POST /v1/credentials/onepassword/create",
     "POST /v1/credentials/azure_credential/create",
+    "POST /v1/credentials/totp",
+    "POST /api/v1/totp",
+    "GET /v1/credentials/totp",
 }
 _MAX_BODY_LENGTH = 1000
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
@@ -47,6 +50,11 @@ _SENSITIVE_FIELDS: set[str] = {
     "auth",
     "authorization",
     "secret_key",
+    "totp",
+    "otp",
+    "one_time_code",
+    "one_time_password",
+    "mfa_code",
 }
 
 
