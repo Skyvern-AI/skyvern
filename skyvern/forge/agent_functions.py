@@ -500,6 +500,10 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
+    async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
+        """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
+        return False
+
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
         """Return the backend-specific schedule id used by the execution engine.
 
