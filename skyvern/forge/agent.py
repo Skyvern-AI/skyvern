@@ -4968,32 +4968,71 @@ class ForgeAgent:
 
         # Cache the summary LLM call — the inputs (goal, schema, URL) are
         # identical across download-loop iterations that revisit the same page.
+        # The `try` is narrowed to just compute_cache_key + lookup so a
+        # downstream log failure can't double-count as a lookup_error.
         workflow_run_id = context.workflow_run_id if context else None
         cache_key: str | None = None
-        cached = None
+        lookup_result: extraction_cache.LookupResult | None = None
         try:
             cache_key = extraction_cache.compute_cache_key(
                 rendered_prompt=prompt,
                 llm_key=None,
             )
-            cached = extraction_cache.get(workflow_run_id, cache_key)
+            lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
-            LOG.warning("data-extraction-summary cache lookup failed", exc_info=True)
+            LOG.warning(
+                "data-extraction-summary cache lookup failed",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                cache_hit=False,
+                cache_scope=extraction_cache.SCOPE_RUN,
+                cache_age_seconds=None,
+                fallback_reason=extraction_cache.FALLBACK_LOOKUP_ERROR,
+                cache_path="agent",
+                exc_info=True,
+            )
+            # Preserve cache_key so the store() below can still warm the cache
+            # for subsequent identical calls even when lookup() fails transiently.
 
-        if cached is not None:
+        if lookup_result is not None and lookup_result.hit:
             LOG.info(
                 "data-extraction-summary cache hit — skipping LLM call",
                 workflow_run_id=workflow_run_id,
                 cache_key=cache_key,
+                cache_hit=True,
+                cache_scope=lookup_result.scope,
+                cache_age_seconds=lookup_result.age_seconds,
+                fallback_reason=None,
+                cache_path="agent",
             )
-            data_extraction_summary_resp = cached
+            data_extraction_summary_resp = lookup_result.value
         else:
+            if lookup_result is not None:
+                LOG.info(
+                    "data-extraction-summary cache miss",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_hit=False,
+                    cache_scope=lookup_result.scope,
+                    cache_age_seconds=None,
+                    fallback_reason=lookup_result.fallback_reason,
+                    cache_path="agent",
+                )
             data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
                 prompt=prompt, step=step, prompt_name="data-extraction-summary"
             )
-            if cache_key:
+            # Guard on both cache_key and response to match the other two call sites
+            # and avoid caching None — a cached None would later produce hit=True/value=None,
+            # which would then trip the RuntimeError below instead of falling through to a
+            # fresh LLM call as the pre-telemetry get()-returns-None path did.
+            if cache_key and data_extraction_summary_resp is not None:
                 extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
 
+        if data_extraction_summary_resp is None:
+            raise RuntimeError(
+                "data_extraction_summary_resp unexpectedly None after cache/LLM block "
+                f"(workflow_run_id={workflow_run_id!r}, cache_key={cache_key!r})"
+            )
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,

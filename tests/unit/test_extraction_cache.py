@@ -73,33 +73,57 @@ def test_key_is_stable_across_equivalent_schema_dict_orderings() -> None:
     assert _key(extracted_information_schema=schema_a) == _key(extracted_information_schema=schema_b)
 
 
-def test_get_returns_none_on_miss() -> None:
-    assert extraction_cache.get("wfr_1", _key()) is None
+def test_lookup_returns_miss_on_empty_cache() -> None:
+    result = extraction_cache.lookup("wfr_1", _key())
+    assert result.hit is False
+    assert result.value is None
+    assert result.age_seconds is None
+    assert result.fallback_reason == extraction_cache.FALLBACK_FIRST_CALL_IN_RUN
+    assert result.scope == extraction_cache.SCOPE_RUN
 
 
-def test_set_then_get_returns_stored_value() -> None:
+def test_store_then_lookup_returns_hit_with_age() -> None:
     key = _key()
     extraction_cache.store("wfr_1", key, {"docs": ["a.pdf"]})
-    assert extraction_cache.get("wfr_1", key) == {"docs": ["a.pdf"]}
+    result = extraction_cache.lookup("wfr_1", key)
+    assert result.hit is True
+    assert result.value == {"docs": ["a.pdf"]}
+    assert result.age_seconds is not None
+    assert result.age_seconds >= 0.0
+    assert result.fallback_reason is None
+    assert result.scope == extraction_cache.SCOPE_RUN
+
+
+def test_lookup_returns_key_not_found_when_run_exists_but_key_does_not() -> None:
+    """A run with other entries but missing this key must report key_not_found,
+    not first_call_in_run — downstream metrics use this split to distinguish
+    unavoidable first-call misses from potential normalization opportunities."""
+    extraction_cache.store("wfr_1", _key(current_url="https://example.com/A"), {"a": 1})
+    result = extraction_cache.lookup("wfr_1", _key(current_url="https://example.com/B"))
+    assert result.hit is False
+    assert result.value is None
+    assert result.fallback_reason == extraction_cache.FALLBACK_KEY_NOT_FOUND
 
 
 def test_cache_is_isolated_per_workflow_run_id() -> None:
     key = _key()
     extraction_cache.store("wfr_1", key, {"docs": ["a.pdf"]})
-    assert extraction_cache.get("wfr_2", key) is None
+    result = extraction_cache.lookup("wfr_2", key)
+    assert result.hit is False
+    assert result.fallback_reason == extraction_cache.FALLBACK_FIRST_CALL_IN_RUN
 
 
 def test_empty_workflow_run_id_bypasses_cache() -> None:
     key = _key()
     extraction_cache.store(None, key, {"docs": ["a.pdf"]})
-    assert extraction_cache.get(None, key) is None
+    assert extraction_cache.lookup(None, key) is None
 
 
 def test_clear_workflow_run_drops_entries() -> None:
     key = _key()
     extraction_cache.store("wfr_1", key, {"docs": ["a.pdf"]})
     extraction_cache.clear_workflow_run("wfr_1")
-    assert extraction_cache.get("wfr_1", key) is None
+    assert extraction_cache.lookup("wfr_1", key).hit is False
 
 
 def test_fifo_eviction_when_run_cache_is_full() -> None:
@@ -111,23 +135,47 @@ def test_fifo_eviction_when_run_cache_is_full() -> None:
         k = _key(current_url=f"https://example.com/{i}")
         extraction_cache.store("wfr_1", k, {"i": i})
 
-    assert extraction_cache.get("wfr_1", first_key) is None
+    assert extraction_cache.lookup("wfr_1", first_key).hit is False
     last_key = _key(current_url=f"https://example.com/{max_entries}")
-    assert extraction_cache.get("wfr_1", last_key) == {"i": max_entries}
+    last_result = extraction_cache.lookup("wfr_1", last_key)
+    assert last_result.hit is True
+    assert last_result.value == {"i": max_entries}
 
 
-def test_store_and_get_list_result() -> None:
+def test_store_and_lookup_list_result() -> None:
     """Extraction schemas with array roots produce list results — these must be cached too."""
     key = _key()
     extraction_cache.store("wfr_1", key, [{"doc": "a.pdf"}, {"doc": "b.pdf"}])
-    assert extraction_cache.get("wfr_1", key) == [{"doc": "a.pdf"}, {"doc": "b.pdf"}]
+    result = extraction_cache.lookup("wfr_1", key)
+    assert result.hit is True
+    assert result.value == [{"doc": "a.pdf"}, {"doc": "b.pdf"}]
 
 
-def test_store_and_get_string_result() -> None:
+def test_store_and_lookup_string_result() -> None:
     """Some extractions return a plain string — these must be cached too."""
     key = _key()
     extraction_cache.store("wfr_1", key, "plain text extraction")
-    assert extraction_cache.get("wfr_1", key) == "plain text extraction"
+    result = extraction_cache.lookup("wfr_1", key)
+    assert result.hit is True
+    assert result.value == "plain text extraction"
+
+
+def test_lookup_age_seconds_is_monotonic_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+    """age_seconds should reflect elapsed time between store() and lookup()."""
+    fake_now = [1_000.0]
+
+    def _fake_monotonic() -> float:
+        return fake_now[0]
+
+    monkeypatch.setattr(extraction_cache.time, "monotonic", _fake_monotonic)
+
+    key = _key()
+    extraction_cache.store("wfr_1", key, {"docs": []})
+
+    fake_now[0] = 1_012.5
+    result = extraction_cache.lookup("wfr_1", key)
+    assert result.hit is True
+    assert result.age_seconds == pytest.approx(12.5)
 
 
 def test_key_changes_when_local_date_changes() -> None:
@@ -190,7 +238,7 @@ def test_rendered_prompt_llm_key_affects_hash() -> None:
     assert k1 != k2
 
 
-def test_get_refreshes_lru_position() -> None:
+def test_lookup_refreshes_lru_position() -> None:
     """A cache hit should refresh the run's LRU position, preventing eviction."""
     max_runs = extraction_cache._MAX_WORKFLOW_RUNS
     key = _key()
@@ -201,12 +249,16 @@ def test_get_refreshes_lru_position() -> None:
         extraction_cache.store(f"wfr_{i}", key, {"v": i})
 
     # Cache is at capacity. wfr_oldest is the LRU candidate.
-    # A get() hit should refresh its position to most-recent.
-    assert extraction_cache.get("wfr_oldest", key) == {"v": 0}
+    # A lookup() hit should refresh its position to most-recent.
+    refreshed = extraction_cache.lookup("wfr_oldest", key)
+    assert refreshed.hit is True
+    assert refreshed.value == {"v": 0}
 
     # Adding one more run triggers eviction. Without the LRU refresh,
     # wfr_oldest would be evicted; with it, wfr_1 (now the oldest) goes.
     extraction_cache.store("wfr_new", key, {"v": 999})
 
-    assert extraction_cache.get("wfr_oldest", key) == {"v": 0}
-    assert extraction_cache.get("wfr_1", key) is None  # evicted
+    oldest_after = extraction_cache.lookup("wfr_oldest", key)
+    assert oldest_after.hit is True
+    assert oldest_after.value == {"v": 0}
+    assert extraction_cache.lookup("wfr_1", key).hit is False  # evicted
