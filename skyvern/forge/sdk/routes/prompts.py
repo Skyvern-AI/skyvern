@@ -7,7 +7,12 @@ from fastapi import Depends, HTTPException, Query, status
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.api.llm.exceptions import (
+    EmptyLLMResponseError,
+    InvalidLLMResponseFormat,
+    InvalidLLMResponseType,
+    LLMProviderError,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.prompts import (
@@ -15,9 +20,12 @@ from skyvern.forge.sdk.schemas.prompts import (
     GenerateWorkflowTitleResponse,
     ImprovePromptRequest,
     ImprovePromptResponse,
+    SummarizeOutputRequest,
+    SummarizeOutputResponse,
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.service import generate_title_from_blocks_info
+from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
 
@@ -172,4 +180,82 @@ async def generate_workflow_title(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to generate title: {str(e)}",
+        )
+
+
+@base_router.post(
+    "/prompts/summarize-output",
+    tags=["Prompts"],
+    description="Summarize workflow run output JSON into a human-readable summary",
+    summary="Summarize output",
+    include_in_schema=False,
+)
+async def summarize_output(
+    request: SummarizeOutputRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> SummarizeOutputResponse:
+    template_name = "summarize-workflow-run-output"
+
+    llm_prompt = prompt_engine.load_prompt(
+        template=template_name,
+        output_json=escape_code_fences(request.output_json),
+        workflow_title=escape_code_fences(request.workflow_title),
+        block_label=escape_code_fences(request.block_label),
+    )
+
+    LOG.info(
+        "Summarizing workflow run output",
+        organization_id=current_org.organization_id,
+    )
+
+    try:
+        llm_response = await app.LLM_API_HANDLER(
+            prompt=llm_prompt,
+            prompt_name=template_name,
+            organization_id=current_org.organization_id,
+        )
+
+        if isinstance(llm_response, dict) and "output" in llm_response:
+            output = llm_response["output"]
+        else:
+            output = llm_response
+
+        if not isinstance(output, dict):
+            return SummarizeOutputResponse(
+                error="LLM response is not valid JSON.",
+                summary="",
+            )
+        if "summary" not in output:
+            return SummarizeOutputResponse(
+                error="LLM response missing 'summary' field.",
+                summary="",
+            )
+        if not isinstance(output["summary"], str):
+            return SummarizeOutputResponse(
+                error="LLM 'summary' field is not a string.",
+                summary="",
+            )
+
+        return SummarizeOutputResponse(
+            error=None,
+            summary=output["summary"].strip(),
+        )
+
+    except (InvalidLLMResponseFormat, InvalidLLMResponseType, EmptyLLMResponseError):
+        LOG.warning("LLM returned malformed response while summarizing output", exc_info=True)
+        return SummarizeOutputResponse(
+            error="LLM response is not valid JSON.",
+            summary="",
+        )
+    except LLMProviderError:
+        LOG.error("LLM provider error while summarizing output", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to summarize output. Please try again later.",
+        )
+    except Exception:
+        LOG.error("Unexpected error summarizing output", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to summarize output. Please try again later.",
         )
