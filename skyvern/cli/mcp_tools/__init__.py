@@ -120,7 +120,12 @@ Skyvern is the complete browser MCP for AI agents. Use Skyvern for ALL browser i
 DO NOT use Skyvern for: REST API calls (use curl/requests), downloading raw files (use wget/curl), \
 fetching static JSON/XML endpoints (use WebFetch), or general web search (use WebSearch).
 
-## Task Classification — ALWAYS classify before choosing a tool
+## ALWAYS Start Here: Session + Classification
+
+**If a browser session is already open, keep using it. Otherwise start with:** skyvern_browser_session_create -> skyvern_navigate(url="...") -> [work] -> skyvern_browser_session_close()
+**Passwords:** NEVER type passwords via skyvern_type or skyvern_act. ALWAYS use skyvern_login with stored credentials.
+
+## Task Classification — classify before choosing a tool
 
 | Classification | Signal | Tool | Cost | What Happens |
 |---|---|---|---|---|
@@ -129,8 +134,18 @@ fetching static JSON/XML endpoints (use WebFetch), or general web search (use We
 | Single action (known target) | "click #submit" | skyvern_click / skyvern_type | 0 LLM | Deterministic Playwright. No AI. Fastest. |
 | Single action (unknown target) | "click the submit button" | skyvern_act | 2-3 LLM, no screenshots | No screenshots in reasoning. Economy a11y tree. For visual targets, use observe first. |
 | Multi-step (simple, fast) | "fill the form and submit" | skyvern_observe + skyvern_execute | 0 Skyvern LLM | A11y tree + YOUR LLM plans from refs + batched primitives. Fast, cheap. |
-| Multi-step (complex) | "navigate a multi-page wizard" | skyvern_run_task | N LLM + screenshots | Full ForgeAgent: screenshot + DOM + Skyvern LLM + execute + verify + loop. Reliable. |
-| Repeated/production | "automate this weekly" | skyvern_workflow_create | Varies | Caching converts AI runs into deterministic scripts over time. |
+| Throwaway autonomous trial | "try this once", "see if this works" | skyvern_run_task | Higher | One-off autonomous agent for exploratory work. Do not use for reusable or multi-page production automations. |
+| Multi-step (complex) | "navigate a multi-page wizard" | skyvern_workflow_create (multi-block) | N LLM + screenshots | Build a workflow with one navigation block per step. Each block gets visual reasoning + verification. |
+| Repeated/production | "automate this weekly", "run every Monday", "schedule", "recurring" | skyvern_workflow_create + run | Varies | Caching converts AI runs into deterministic scripts over time (10-100x faster on repeat). |
+
+## Decision Rules (highest precedence)
+
+1. If the user gives a selector, id, XPath, or exact field target, use browser primitives -- not skyvern_act.
+2. If you only need a yes/no answer, use skyvern_validate -- not skyvern_extract or skyvern_act.
+3. If the work stays on one page and the UI is standard, prefer skyvern_observe + skyvern_execute.
+4. If the user says "try this once", "see if this works", or clearly wants a one-off exploratory trial, use skyvern_run_task.
+5. If the task spans multiple pages and is meant to be reusable, scheduled, repeatable, or explicitly "set up" as automation, use skyvern_workflow_create.
+6. Never type passwords. Always use skyvern_login with stored credentials.
 
 ## Quick Start by Classification
 
@@ -147,11 +162,14 @@ fetching static JSON/XML endpoints (use WebFetch), or general web search (use We
 2. Your LLM plans which refs to interact with
 3. skyvern_execute(steps=[{"tool":"click","params":{"ref":"e0"}}, {"tool":"type","params":{"ref":"e1","text":"hello"}}])
 
-**Multi-step (complex) — for visual complexity, multi-page flows:**
-skyvern_run_task(prompt="Complete the checkout flow", url="https://example.com/cart")
+**Throwaway autonomous trial:**
+skyvern_run_task(prompt="Try the checkout flow once and tell me whether it succeeds")
 
-**Repeated/production:**
-skyvern_workflow_create(...) -> skyvern_workflow_run(workflow_id="wpid_...") -> skyvern_workflow_status(run_id="wr_...")
+**Multi-step (complex) — build a workflow with one block per step:**
+skyvern_workflow_create(
+  definition='{"title":"Checkout","workflow_definition":{"blocks":[{"block_type":"navigation","label":"shipping","navigation_goal":"Fill shipping info"},{"block_type":"navigation","label":"payment","navigation_goal":"Select payment and submit"},{"block_type":"extraction","label":"confirm","data_extraction_goal":"Extract order number"}]}}',
+  format="json"
+) -> skyvern_workflow_run(workflow_id="wpid_...") -> skyvern_workflow_status(run_id="wr_...")
 
 **QA testing:** Use the qa_test prompt to test frontend changes — reads git diff, generates + runs browser tests.
 
@@ -159,8 +177,8 @@ skyvern_workflow_create(...) -> skyvern_workflow_run(workflow_id="wpid_...") -> 
 
 1. **act has NO screenshots** in its LLM reasoning. It uses an economy accessibility tree. \
 Fine for well-labeled elements. For visually complex targets, use skyvern_observe then skyvern_click with the ref.
-2. **observe+execute is DIFFERENT from run_task.** observe+execute uses the accessibility tree and YOUR LLM plans \
-(no Skyvern LLM calls, fast/cheap). run_task uses the full ForgeAgent with screenshots + visual reasoning (slow/reliable).
+2. **observe+execute is DIFFERENT from workflows.** observe+execute uses the accessibility tree and YOUR LLM plans \
+(no Skyvern LLM calls, fast/cheap). Workflows use the full ForgeAgent per block with screenshots + visual reasoning (reliable).
 3. **validate is the cheapest AI option** for yes/no — prefer it over extract or act for boolean checks.
 4. **extract DOES use screenshots** (unlike act) with a dedicated extraction LLM. Better than screenshot then read.
 5. **NEVER type passwords** through skyvern_type or skyvern_act. Use skyvern_login with stored credentials.
@@ -174,7 +192,7 @@ These use AI and cost tokens, but cached results enable free re-execution.
 - **skyvern_validate**(prompt) — boolean check WITH screenshots. Cheapest AI.
 - **skyvern_observe**() — a11y tree snapshot with element refs (e0, e1...). No LLM calls.
 - **skyvern_execute**(steps) — batch primitives using refs from observe. No Skyvern LLM calls.
-- **skyvern_run_task**(prompt) — full autonomous agent. Screenshots + visual reasoning + verification loop.
+- **skyvern_run_task**(prompt) — one-off exploratory agent. Do not use when the user is asking to set up, automate, schedule, or reuse the flow.
 - **skyvern_login**(credential_id) — AI-powered login with stored credentials.
 
 ### Tier 2: Browser Primitives (use when you know the exact selector)
@@ -250,13 +268,41 @@ navigation (most common), extraction, for_loop, conditional, code, text_prompt, 
 wait, login, validation, http_request, send_email, file_download, file_upload. \
 Call skyvern_block_schema() for full schemas.
 
+## Common Patterns
+
+**Logging in securely:**
+1. skyvern_credential_list -- find the credential
+2. skyvern_browser_session_create -- start session
+3. skyvern_navigate(url="https://login.example.com") -- go to login page
+4. skyvern_login(credential_id="cred_...") -- AI handles the full login flow
+5. skyvern_screenshot -- verify login succeeded
+
+**Debugging browser issues:**
+skyvern_browser_session_create -> skyvern_navigate -> perform actions -> \
+skyvern_console_messages(level="error") for JS errors, skyvern_network_requests for API calls
+
+**Testing feasibility before building a workflow:**
+Walk through the site interactively -- use skyvern_act on each page and skyvern_screenshot to verify. \
+Once confirmed, compose steps into a workflow with skyvern_workflow_create.
+
+## Writing Scripts (ONLY when user explicitly asks)
+
+Use the Skyvern Python SDK: from skyvern import Skyvern. \
+NEVER import from skyvern.cli.mcp_tools -- those are internal server modules.
+In verbose mode (--verbose), every tool response includes an sdk_equivalent field for script conversion.
+
+**Hybrid xpath+prompt pattern** -- the recommended approach for production scripts:
+  await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
+  await page.fill("xpath=//input[@name='email']", "user@example.com", prompt="email input field")
+This tries the xpath first (fast, deterministic) and falls back to AI if the selector breaks. \
+To get xpaths, use skyvern_click -- its resolved_selector response field gives you the xpath.
+
 ## Critical Rules
 1. Create a session (skyvern_browser_session_create) before any browser tool.
 2. NEVER scrape by guessing API endpoints — use skyvern_navigate + skyvern_extract.
 3. After page-changing actions, use skyvern_screenshot to verify.
 4. NEVER type passwords — use skyvern_login with stored credentials.
 5. NEVER create single-block workflows with long prompts — split into one block per step.
-6. For SDK scripts: from skyvern import Skyvern. NEVER import from skyvern.cli.mcp_tools.
 """,
 )
 mcp.add_middleware(MCPTelemetryMiddleware())

@@ -16,11 +16,22 @@ Skyvern uses AI to navigate and interact with websites. Every command below is a
 | Quick inspection | "what does the page show?" | `skyvern browser extract` | 1 LLM + screenshots | Dedicated extraction LLM + schema validation + caching. |
 | Single action (known target) | "click #submit" | `skyvern browser click/type` | 0 LLM | Deterministic Playwright. No AI. Fastest. |
 | Single action (unknown target) | "click the submit button" | `skyvern browser act` | 2-3 LLM, no screenshots | No screenshots in reasoning. Economy a11y tree. For visual targets, use hybrid mode (selector + intent). |
-| Multi-step (simple, fast) | "fill the form and submit" | MCP: `observe + execute` | 0 Skyvern LLM | A11y tree + YOUR LLM plans from refs. Not available as CLI commands -- use MCP or `act`. |
-| Multi-step (complex) | "navigate a multi-page wizard" | `skyvern browser run-task` | N LLM + screenshots | Full ForgeAgent: screenshot + DOM + Skyvern LLM + execute + verify + loop. Reliable. |
-| Repeated/production | "automate this weekly" | `skyvern workflow create` | Varies | Caching converts AI runs into deterministic scripts over time. |
+| Same-page multi-step | "fill the form and submit" | `skyvern browser act` or primitive chain | 2-3 LLM or 0 LLM | Use `act` when labels are clear. Use click/type/select directly when you know selectors. |
+| Throwaway autonomous trial | "try this once", "see if this works" | `skyvern browser run-task` | Higher | One-off autonomous agent for exploration. Do not use for recurring or multi-page production automations. |
+| Multi-page or reusable automation | "navigate a multi-page wizard", "set this up", "automate this weekly" | `skyvern workflow create` + `run` | N LLM + screenshots | Build a workflow with one block per step. Each block gets visual reasoning, verification, and reusable run history. |
 
-## Step 2: Create a Session
+**MCP note:** if you are using the Skyvern MCP instead of the CLI, prefer `observe + execute` for same-page multi-step UI work. The CLI does not expose that pair directly.
+
+## Step 2: Apply These Decision Rules
+
+1. If the prompt includes a selector, id, XPath, or exact field target, use browser primitives -- not `act`.
+2. If you only need a yes/no answer, use `validate` -- not `extract` or `act`.
+3. If the work stays on one page and labels are clear, use `act` or a primitive chain.
+4. If the user says `try this once`, `see if this works`, or clearly wants a one-off exploratory trial, use `run-task`.
+5. If the task spans multiple pages and is meant to be reusable, scheduled, repeatable, or explicitly `set up` as automation, use `workflow create`.
+6. Never type passwords. Always use stored credentials with `skyvern browser login`.
+
+## Step 3: Create a Session
 
 Every browser command needs a session. Create one first:
 
@@ -38,7 +49,7 @@ skyvern browser session connect --cdp "ws://localhost:9222"
 Session state persists between commands. After `session create`, subsequent commands auto-attach.
 Override with `--session pbs_...`. Close when done: `skyvern browser session close`.
 
-## Step 3: Execute by Classification
+## Step 4: Execute by Classification
 
 ### Quick check (yes/no)
 
@@ -81,23 +92,36 @@ skyvern browser act --prompt "Close the cookie banner, then click Sign In"
 **Warning:** act has NO screenshots in its LLM reasoning. It uses an economy accessibility tree.
 Fine for well-labeled elements. For visually complex targets, use MCP observe+click or hybrid mode.
 
-### Multi-step (simple, fast) -- MCP only
+### Same-page multi-step
 
-The `observe + execute` pattern uses the accessibility tree and YOUR LLM to plan, with no Skyvern
-LLM calls. This is MCP-only (not available as CLI commands). For CLI, use `act` with clear prompts
-or break into multiple click/type commands.
+```bash
+skyvern browser act --prompt "Fill the shipping form and click Continue"
+```
 
-### Multi-step (complex, reliable)
+Use `act` when the fields and buttons are clearly labeled and the flow stays on one page.
+If you need tighter control, break the work into `click`, `type`, `select`, `press-key`, and `wait`.
+
+### Throwaway autonomous trial
 
 ```bash
 skyvern browser run-task \
-  --prompt "Go to the pricing page and extract all plan names and prices" \
   --url "https://example.com" \
-  --schema '{"type":"object","properties":{"plans":{"type":"array"}}}'
+  --prompt "Check whether the checkout flow works end to end and extract the confirmation number"
 ```
 
-Full ForgeAgent: screenshots + visual reasoning + verification + retry loop. Always uses engine 2.0.
-Flags: `--prompt` (required), `--url`, `--schema`, `--max-steps`, `--timeout` (default 180s).
+Use `run-task` to prove feasibility or do one-off exploration. If the task becomes important enough
+to rerun, debug, or share, convert it to a workflow.
+
+### Multi-page or reusable automation — build a workflow with one block per step
+
+```bash
+skyvern workflow create --definition @checkout-workflow.yaml
+skyvern workflow run --id wpid_123 --wait
+skyvern workflow status --run-id wr_789
+```
+
+Each navigation block runs with visual reasoning + verification. Split complex flows into
+multiple blocks (one per page/step). First run uses AI; subsequent runs replay cached scripts.
 
 ### Repeated/production
 
@@ -111,7 +135,7 @@ Split into one block per step. Use **navigation** blocks for actions, **extracti
 First run uses AI; subsequent runs replay a cached script (10-100x faster).
 Set `--run-with agent` to force AI mode for debugging.
 
-## Step 4: Verify
+## Step 5: Verify
 
 Always verify after page-changing actions:
 
@@ -121,7 +145,7 @@ skyvern browser validate --prompt "Was the form submitted successfully?"  # bool
 skyvern browser evaluate --expression "document.title"                    # JS state check
 ```
 
-## Step 5: Error Recovery
+## Step 6: Error Recovery
 
 | Problem | Fix |
 |---------|-----|
@@ -156,6 +180,34 @@ skyvern block validate --block-json @block.json       # validate before creating
 
 Engine: known path = 1.0 (default). Dynamic planning = 2.0. Split into multiple 1.0 blocks when in doubt.
 Status lifecycle: `created -> queued -> running -> completed | failed | canceled | terminated | timed_out`
+
+## Common Patterns
+
+**Login flow:**
+```bash
+skyvern credential list                          # find credential ID
+skyvern browser session create
+skyvern browser navigate --url "https://login.example.com"
+skyvern browser login --url "https://login.example.com" --credential-id cred_123
+skyvern browser validate --prompt "Is the user logged in?"
+skyvern browser screenshot
+```
+
+**Pagination loop:**
+```bash
+skyvern browser extract --prompt "Extract all rows"
+skyvern browser validate --prompt "Is there a Next button that is not disabled?"
+# If true:
+skyvern browser act --prompt "Click the Next page button"
+# Repeat extraction. Stop when: no next button, duplicate first row, or max page limit.
+```
+
+**Debugging:**
+```bash
+skyvern browser screenshot                       # visual state
+skyvern browser evaluate --expression "document.title"
+skyvern browser evaluate --expression "document.querySelectorAll('table tr').length"
+```
 
 ## Agent Mode
 
