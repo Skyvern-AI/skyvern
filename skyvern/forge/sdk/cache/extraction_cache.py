@@ -45,7 +45,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -57,8 +59,51 @@ _MAX_WORKFLOW_RUNS = 256
 # Sentinel hashed in place of None so that None and "" produce different keys.
 _NULL_SENTINEL = "\x00__NULL__"
 
-# workflow_run_id -> ordered dict of {cache_key: extraction_result}
-_CACHE: OrderedDict[str, OrderedDict[str, Any]] = OrderedDict()
+# Cache scope identifiers. v1 ships with "run" only; "wpid" and "global"
+# are reserved for the Redis cross-run cache (SKY-8873/SKY-8874).
+SCOPE_RUN = "run"
+
+# Fallback reasons emitted on cache misses. Used by log-based metrics to
+# distinguish first-call-in-run (unavoidable) from key-not-found (possible
+# normalization opportunity) from lookup_error (bug or infra issue).
+FALLBACK_FIRST_CALL_IN_RUN = "first_call_in_run"
+FALLBACK_KEY_NOT_FOUND = "key_not_found"
+# Reserved for the TTL-backed Redis cache in v4 (SKY-8874). Never emitted in v1.
+FALLBACK_TTL_EXPIRED = "ttl_expired"
+FALLBACK_LOOKUP_ERROR = "lookup_error"
+
+
+@dataclass(frozen=True)
+class _CacheEntry:
+    """Internal wrapper storing a cached value alongside its insertion time.
+
+    `stored_at` is a monotonic clock reading, used only for computing the
+    `cache_age_seconds` field reported on cache hits.
+    """
+
+    value: Any
+    stored_at: float
+
+
+@dataclass(frozen=True)
+class LookupResult:
+    """Result of a cache lookup with telemetry metadata.
+
+    On a hit: ``hit=True``, ``value`` is the cached result, ``age_seconds``
+    is the elapsed seconds since ``store``, and ``fallback_reason`` is None.
+    On a miss: ``hit=False``, ``value`` is None, ``age_seconds`` is None,
+    and ``fallback_reason`` identifies why the lookup missed.
+    """
+
+    hit: bool
+    value: Any | None
+    age_seconds: float | None
+    fallback_reason: str | None
+    scope: str
+
+
+# workflow_run_id -> ordered dict of {cache_key: _CacheEntry}
+_CACHE: OrderedDict[str, OrderedDict[str, _CacheEntry]] = OrderedDict()
 
 # Simple hit/miss counters for post-deploy observability.
 _hits = 0
@@ -161,28 +206,66 @@ def compute_cache_key(
     return hashlib.sha256(joined).hexdigest()
 
 
-def get(workflow_run_id: str | None, cache_key: str) -> Any | None:
-    """Return a cached extraction result, or None on miss."""
-    global _hits, _misses  # noqa: PLW0603
+def _miss(fallback_reason: str) -> LookupResult:
+    """Build a miss `LookupResult` for the v1 run-scoped cache and bump counters.
+
+    Sole owner of ``_misses`` mutations — ``lookup()`` delegates all miss
+    accounting here so the counter is never bumped without also ticking the
+    hit-rate logger.
+    """
+    global _misses  # noqa: PLW0603
+    _misses += 1
+    _maybe_log_hit_rate()
+    return LookupResult(
+        hit=False,
+        value=None,
+        age_seconds=None,
+        fallback_reason=fallback_reason,
+        scope=SCOPE_RUN,
+    )
+
+
+def lookup(workflow_run_id: str | None, cache_key: str) -> LookupResult | None:
+    """Look up a cached extraction result and return a structured telemetry record.
+
+    Returns a :class:`LookupResult` on a genuine hit or miss, or ``None`` when
+    the cache path is bypassed entirely (no ``workflow_run_id``).
+
+    Call sites should treat ``None`` as "cache not applicable here" — no hit/miss
+    log should be emitted and no metric counter should be bumped. ``None`` is
+    intentionally distinct from a miss so that Datadog dashboards are not
+    inflated with non-actionable zero-run lookups.
+
+    On a genuine miss, the returned ``LookupResult`` carries :attr:`~LookupResult.fallback_reason`
+    so log-based metrics can distinguish first-call-in-run (unavoidable) from
+    key-not-found (possible normalization opportunity) from lookup-error (infra issue).
+    """
+    global _hits  # noqa: PLW0603
 
     if not workflow_run_id:
         return None
+
     run_cache = _CACHE.get(workflow_run_id)
     if not run_cache:
-        _misses += 1
-        LOG.debug("extraction_cache.miss", workflow_run_id=workflow_run_id, cache_key=cache_key)
-        _maybe_log_hit_rate()
-        return None
-    result = run_cache.get(cache_key)
-    if result is not None:
-        _hits += 1
-        # Refresh LRU position so actively-read runs aren't evicted.
-        _CACHE.move_to_end(workflow_run_id)
-    else:
-        _misses += 1
-        LOG.debug("extraction_cache.miss", workflow_run_id=workflow_run_id, cache_key=cache_key)
+        return _miss(FALLBACK_FIRST_CALL_IN_RUN)
+
+    entry = run_cache.get(cache_key)
+    if entry is None:
+        return _miss(FALLBACK_KEY_NOT_FOUND)
+
+    _hits += 1
+    # Refresh LRU position so actively-read runs aren't evicted.
+    _CACHE.move_to_end(workflow_run_id)
     _maybe_log_hit_rate()
-    return result
+    # Clamp to zero to guard against monotonic clock edge cases.
+    age = max(0.0, time.monotonic() - entry.stored_at)
+    return LookupResult(
+        hit=True,
+        value=entry.value,
+        age_seconds=age,
+        fallback_reason=None,
+        scope=SCOPE_RUN,
+    )
 
 
 def _maybe_log_hit_rate() -> None:
@@ -210,7 +293,7 @@ def store(workflow_run_id: str | None, cache_key: str, result: Any) -> None:
         _CACHE[workflow_run_id] = run_cache
     if cache_key in run_cache:
         run_cache.move_to_end(cache_key)
-    run_cache[cache_key] = result
+    run_cache[cache_key] = _CacheEntry(value=result, stored_at=time.monotonic())
     while len(run_cache) > _MAX_ENTRIES_PER_RUN:
         evicted_key, _ = run_cache.popitem(last=False)
         LOG.debug(
