@@ -224,6 +224,8 @@ class TestBrowserCommands:
     ) -> None:
         from skyvern.cli.commands import browser as browser_cmd
 
+        capture_mock = MagicMock()
+        monkeypatch.setattr(browser_cmd, "capture_cli_tool_call", capture_mock)
         monkeypatch.setattr(
             browser_cmd,
             "_resolve_connection",
@@ -245,6 +247,7 @@ class TestBrowserCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert "Must provide intent, selector, or both" in parsed["error"]["message"]
+        capture_mock.assert_not_called()
 
     def test_click_with_intent_uses_proactive_ai_mode(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
@@ -261,6 +264,8 @@ class TestBrowserCommands:
             lambda _session, _cdp: browser_cmd.ConnectionTarget(mode="cloud", session_id="pbs_123"),
         )
         monkeypatch.setattr(browser_cmd, "_connect_browser", AsyncMock(return_value=browser))
+        capture_mock = MagicMock()
+        monkeypatch.setattr(browser_cmd, "capture_cli_tool_call", capture_mock)
 
         browser_cmd.click(
             intent="the Submit button",
@@ -278,6 +283,7 @@ class TestBrowserCommands:
         assert parsed["action"] == "click"
         assert parsed["data"]["ai_mode"] == "proactive"
         assert parsed["data"]["resolved_selector"] == "xpath=//button[@id='submit']"
+        capture_mock.assert_called_once_with("skyvern_click", ok=True)
 
     def test_wait_rejects_invalid_state_before_connection(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
@@ -853,6 +859,7 @@ class TestBrowserPRCCommands:
     def test_login_json_error_exits_nonzero(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
+        from skyvern.cli.commands import _output as output_mod
         from skyvern.cli.commands import browser as browser_cmd
 
         monkeypatch.setattr(
@@ -878,6 +885,8 @@ class TestBrowserPRCCommands:
             }
         )
         monkeypatch.setattr(browser_cmd, "tool_login", tool)
+        capture_mock = MagicMock()
+        monkeypatch.setattr(output_mod, "capture_cli_tool_call", capture_mock)
 
         with pytest.raises(SystemExit, match="1"):
             browser_cmd.login(
@@ -894,6 +903,26 @@ class TestBrowserPRCCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert "Missing required fields" in parsed["error"]["message"]
+        capture_mock.assert_called_once_with("skyvern_login", ok=False)
+
+    def test_workflow_create_missing_definition_file_does_not_emit_cli_telemetry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        capture_mock = MagicMock()
+        monkeypatch.setattr("skyvern.cli.commands._output.capture_cli_tool_call", capture_mock)
+
+        with pytest.raises(typer.BadParameter):
+            workflow_cmd.workflow_create(
+                definition="@/does/not/exist.json",
+                definition_format="json",
+                folder_id=None,
+                json_output=False,
+            )
+
+        capture_mock.assert_not_called()
 
 
 class TestParityErrorFormatting:
@@ -954,17 +983,25 @@ class TestParityErrorFormatting:
         assert captured == {"message": "Unknown error", "hint": "", "json_mode": False}
 
     def test_browser_emit_tool_result_handles_none_message_and_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli.commands import _output as output_mod
         from skyvern.cli.commands import browser as browser_cmd
 
         captured: dict[str, str | bool] = {}
 
-        def _fake_output_error(message: str, *, hint: str = "", json_mode: bool = False, exit_code: int = 1) -> None:
+        def _fake_output_error(
+            message: str,
+            *,
+            hint: str = "",
+            action: str = "",
+            json_mode: bool = False,
+            exit_code: int = 1,
+        ) -> None:
             captured["message"] = message
             captured["hint"] = hint
             captured["json_mode"] = json_mode
             raise SystemExit(exit_code)
 
-        monkeypatch.setattr(browser_cmd, "output_error", _fake_output_error)
+        monkeypatch.setattr(output_mod, "output_error", _fake_output_error)
 
         with pytest.raises(SystemExit, match="1"):
             browser_cmd._emit_tool_result(

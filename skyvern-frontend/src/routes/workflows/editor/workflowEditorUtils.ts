@@ -114,9 +114,12 @@ import {
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
-import { loginNodeDefaultData } from "./nodes/LoginNode/types";
+import { isLoginNode, loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
-import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
+import {
+  fileDownloadNodeDefaultData,
+  isFileDownloadNode,
+} from "./nodes/FileDownloadNode/types";
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   isPdfParserNode,
@@ -133,6 +136,7 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
@@ -4091,11 +4095,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (node.data.navigationGoal.length === 0) {
       errors.push(`${node.data.label}: Action Instruction is required.`);
     }
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   // check loop node parameters
@@ -4112,11 +4114,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   // check task node json fields
   const taskNodes = nodes.filter(isTaskNode);
   taskNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     // Validate Task data schema JSON when enabled (value different from "null")
     if (node.data.dataSchema && node.data.dataSchema !== "null") {
       const result = TSON.parse(node.data.dataSchema);
@@ -4131,11 +4131,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const validationNodes = nodes.filter(isValidationNode);
   validationNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     if (
       node.data.completeCriterion.length === 0 &&
       node.data.terminateCriterion.length === 0
@@ -4165,6 +4163,23 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         errors.push(`${node.data.label}: Prompt is required.`);
       }
     }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const loginNodes = nodes.filter(isLoginNode);
+  loginNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const fileDownloadNodes = nodes.filter(isFileDownloadNode);
+  fileDownloadNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   const conditionalNodes = nodes.filter((node) => node.type === "conditional");
