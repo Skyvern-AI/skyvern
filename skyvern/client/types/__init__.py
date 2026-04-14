@@ -101,6 +101,7 @@ if typing.TYPE_CHECKING:
     from .credential_type_output import CredentialTypeOutput
     from .credential_vault_type import CredentialVaultType
     from .credit_card_credential_response import CreditCardCredentialResponse
+    from .delete_schedule_response import DeleteScheduleResponse
     from .download_to_s3block import DownloadToS3Block
     from .download_to_s3block_yaml import DownloadToS3BlockYaml
     from .extensions import Extensions
@@ -311,6 +312,8 @@ if typing.TYPE_CHECKING:
     from .non_empty_password_credential import NonEmptyPasswordCredential
     from .one_password_credential_parameter import OnePasswordCredentialParameter
     from .one_password_credential_parameter_yaml import OnePasswordCredentialParameterYaml
+    from .organization_schedule_item import OrganizationScheduleItem
+    from .organization_schedule_list_response import OrganizationScheduleListResponse
     from .otp_type import OtpType
     from .output_parameter import OutputParameter
     from .output_parameter_yaml import OutputParameterYaml
@@ -579,6 +582,10 @@ if typing.TYPE_CHECKING:
     from .workflow_run_timeline import WorkflowRunTimeline
     from .workflow_run_timeline_type import WorkflowRunTimelineType
     from .workflow_run_trigger_type import WorkflowRunTriggerType
+    from .workflow_schedule import WorkflowSchedule
+    from .workflow_schedule_list_response import WorkflowScheduleListResponse
+    from .workflow_schedule_response import WorkflowScheduleResponse
+    from .workflow_schedule_upsert_request import WorkflowScheduleUpsertRequest
     from .workflow_status import WorkflowStatus
     from .workflow_trigger_block import WorkflowTriggerBlock
     from .workflow_trigger_block_parameters_item import (
@@ -684,6 +691,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CredentialTypeOutput": ".credential_type_output",
     "CredentialVaultType": ".credential_vault_type",
     "CreditCardCredentialResponse": ".credit_card_credential_response",
+    "DeleteScheduleResponse": ".delete_schedule_response",
     "DownloadToS3Block": ".download_to_s3block",
     "DownloadToS3BlockYaml": ".download_to_s3block_yaml",
     "Extensions": ".extensions",
@@ -874,6 +882,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "NonEmptyPasswordCredential": ".non_empty_password_credential",
     "OnePasswordCredentialParameter": ".one_password_credential_parameter",
     "OnePasswordCredentialParameterYaml": ".one_password_credential_parameter_yaml",
+    "OrganizationScheduleItem": ".organization_schedule_item",
+    "OrganizationScheduleListResponse": ".organization_schedule_list_response",
     "OtpType": ".otp_type",
     "OutputParameter": ".output_parameter",
     "OutputParameterYaml": ".output_parameter_yaml",
@@ -1120,6 +1130,10 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowRunTimeline": ".workflow_run_timeline",
     "WorkflowRunTimelineType": ".workflow_run_timeline_type",
     "WorkflowRunTriggerType": ".workflow_run_trigger_type",
+    "WorkflowSchedule": ".workflow_schedule",
+    "WorkflowScheduleListResponse": ".workflow_schedule_list_response",
+    "WorkflowScheduleResponse": ".workflow_schedule_response",
+    "WorkflowScheduleUpsertRequest": ".workflow_schedule_upsert_request",
     "WorkflowStatus": ".workflow_status",
     "WorkflowTriggerBlock": ".workflow_trigger_block",
     "WorkflowTriggerBlockParametersItem": ".workflow_trigger_block_parameters_item",
@@ -1247,6 +1261,7 @@ __all__ = [
     "CredentialTypeOutput",
     "CredentialVaultType",
     "CreditCardCredentialResponse",
+    "DeleteScheduleResponse",
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
     "Extensions",
@@ -1437,6 +1452,8 @@ __all__ = [
     "NonEmptyPasswordCredential",
     "OnePasswordCredentialParameter",
     "OnePasswordCredentialParameterYaml",
+    "OrganizationScheduleItem",
+    "OrganizationScheduleListResponse",
     "OtpType",
     "OutputParameter",
     "OutputParameterYaml",
@@ -1683,6 +1700,10 @@ __all__ = [
     "WorkflowRunTimeline",
     "WorkflowRunTimelineType",
     "WorkflowRunTriggerType",
+    "WorkflowSchedule",
+    "WorkflowScheduleListResponse",
+    "WorkflowScheduleResponse",
+    "WorkflowScheduleUpsertRequest",
     "WorkflowStatus",
     "WorkflowTriggerBlock",
     "WorkflowTriggerBlockParametersItem",
