@@ -43,7 +43,7 @@ try {
   }
   newWssBaseUrl = url.toString();
 } catch (e) {
-  newWssBaseUrl = wssBaseUrl.replace("/api", "");
+  newWssBaseUrl = wssBaseUrl?.replace("/api", "") ?? "";
 }
 
 // Base URL for the Runs API (strip a leading `/api` segment: /api/v1 -> /v1)
@@ -55,7 +55,7 @@ const runsApiBaseUrl = (() => {
     }
     return `${url.origin}${url.pathname}`;
   } catch (e) {
-    return apiBaseUrl.replace("/api", "");
+    return apiBaseUrl?.replace("/api", "") ?? "";
   }
 })();
 

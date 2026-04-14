@@ -80,9 +80,11 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
+import { isMacPlatform } from "@/util/platform";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
+import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
@@ -246,6 +248,12 @@ function Workspace({
   const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  const {
+    undo: undoWorkflowEdit,
+    redo: redoWorkflowEdit,
+    canUndo: canUndoWorkflowEdit,
+    canRedo: canRedoWorkflowEdit,
+  } = useWorkflowHistory({ nodes, edges, setNodes, setEdges });
   const { getNodes, getEdges } = useReactFlow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -394,6 +402,64 @@ function Workspace({
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, []);
+
+  // Undo/redo keyboard shortcuts. Skip when the user is typing inside an
+  // editable element so the browser's native per-input undo keeps working.
+  const isRecording = recordingStore.isRecording;
+  // macOS users expect Cmd+Y to be browser "History Forward" (some apps
+  // bind it to "Redo Typing"), so we only honour Ctrl+Y on non-Mac.
+  // Memoized so the platform sniff runs exactly once per mount.
+  const isMac = useMemo(() => isMacPlatform(), []);
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+        return true;
+      }
+      if (target.isContentEditable) return true;
+      // Monaco wraps its editor surface in a div with role="textbox"; let
+      // it keep native undo as well.
+      if (target.getAttribute("role") === "textbox") return true;
+      return false;
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Recording owns the editor - don't let hotkeys mutate state behind
+      // the disabled toolbar buttons.
+      if (isRecording) return;
+      // IME composition (CJK, accents) fires keydown events we must not
+      // intercept - those belong to the composition flow.
+      if (event.isComposing) return;
+      const mod = event.metaKey || event.ctrlKey;
+      if (!mod) return;
+      // Match the typed character via event.key rather than event.code.
+      // On QWERTZ / Dvorak / AZERTY the labeled Z key is at a different
+      // physical position than US QWERTY, so matching event.code would
+      // either miss the user's Cmd+Z entirely or fire undo when they
+      // press a different key. event.key honors the keycap label.
+      const key = event.key.toLowerCase();
+      const isZ = key === "z";
+      const isY = key === "y";
+      if (!isZ && !isY) return;
+      if (isY && isMac) return;
+      if (isEditableTarget(event.target)) return;
+
+      if (isZ && !event.shiftKey) {
+        event.preventDefault();
+        undoWorkflowEdit();
+      } else if ((isZ && event.shiftKey) || isY) {
+        // Cmd/Ctrl+Shift+Z is the universal redo; Ctrl+Y is the
+        // Windows/Linux alternate redo binding (not accepted on Mac).
+        event.preventDefault();
+        redoWorkflowEdit();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [undoWorkflowEdit, redoWorkflowEdit, isRecording, isMac]);
 
   useEffect(() => {
     const currentUrlValue = searchParams.get("cache-key-value");
@@ -1289,6 +1355,10 @@ function Workspace({
         <WorkflowHeader
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
+          canUndo={canUndoWorkflowEdit}
+          canRedo={canRedoWorkflowEdit}
+          onUndo={undoWorkflowEdit}
+          onRedo={redoWorkflowEdit}
           isGeneratingCode={isGeneratingCode}
           isTemplate={workflow?.is_template}
           saving={workflowChangesStore.saveIsPending}
