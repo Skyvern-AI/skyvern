@@ -159,6 +159,25 @@ def _log_vertex_cache_hit_if_needed(
         )
 
 
+def _normalize_llm_model(model: str | None) -> str | None:
+    # LiteLLM's response.model can include a provider prefix
+    # (e.g. "vertex_ai/gemini-2.5-flash", "openai/gpt-4.1-mini") while
+    # config-side fallbacks tend to use the bare model name. Strip the
+    # prefix so dbt aggregates the same model under one bucket.
+    if not model:
+        return model
+    return model.split("/")[-1]
+
+
+def _assert_step_thought_exclusive(step: Step | None, thought: Thought | None) -> None:
+    # step and thought write the same llm_cost to different tables
+    # (steps.step_cost vs observer_thoughts.thought_cost). int_org_llm_costs
+    # UNION ALLs them, so setting both would double-count cost in
+    # fct_org_margin.llm_cost.
+    if step is not None and thought is not None:
+        raise ValueError("LLM API handler invoked with both step and thought set — these are mutually exclusive")
+
+
 def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
     if policy is None:
         return None
@@ -512,6 +531,7 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
+            _assert_step_thought_exclusive(step, thought)
             start_time = time.time()
 
             if parameters is None:
@@ -840,6 +860,16 @@ class LLMAPIHandlerFactory:
                     # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
                     if cached_tokens == 0:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+
+                # Prefer the actual backing model returned by LiteLLM so we don't persist the
+                # router group name (e.g. "GEMINI_2_5_FLASH_WITH_FALLBACK") when the router
+                # falls back. Mirrors the pattern in llm_api_handler/call.
+                # Phase 1 tradeoff: last_llm_model records the most recent model used in
+                # the step. dbt attributes the full step_cost to it, which is accurate
+                # only for single-model steps. For multi-model steps (router fallback,
+                # secondary LLM) the attribution is lossy — resolved in Phase 2 by a
+                # per-call tracking table.
+                actual_model = _normalize_llm_model(getattr(response, "model", None) or model_used)
                 if step and not is_speculative_step:
                     await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
@@ -850,6 +880,7 @@ class LLMAPIHandlerFactory:
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                         incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 if thought:
                     await app.DATABASE.observer.update_thought(
@@ -860,6 +891,7 @@ class LLMAPIHandlerFactory:
                         thought_cost=llm_cost,
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
@@ -1002,6 +1034,7 @@ class LLMAPIHandlerFactory:
             force_dict: bool = True,
             system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
+            _assert_step_thought_exclusive(step, thought)
             start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
@@ -1307,6 +1340,7 @@ class LLMAPIHandlerFactory:
 
                 _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
 
+                actual_model = _normalize_llm_model(getattr(response, "model", None) or model_name)
                 if step and not is_speculative_step:
                     await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
@@ -1317,6 +1351,7 @@ class LLMAPIHandlerFactory:
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                         incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 if thought:
                     await app.DATABASE.observer.update_thought(
@@ -1327,6 +1362,7 @@ class LLMAPIHandlerFactory:
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         thought_cost=llm_cost,
+                        last_llm_model=actual_model,
                     )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
@@ -1533,6 +1569,7 @@ class LLMCaller:
         system_prompt: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
+        _assert_step_thought_exclusive(step, thought)
         start_time = time.perf_counter()
         active_parameters = self.base_parameters or {}
         if parameters is None:
@@ -1710,6 +1747,7 @@ class LLMCaller:
                     )
 
             call_stats = await self.get_call_stats(response)
+            actual_model = _normalize_llm_model(getattr(response, "model", None) or self.llm_config.model_name)
             if step and not is_speculative_step:
                 await app.DATABASE.tasks.update_step(
                     task_id=step.task_id,
@@ -1720,6 +1758,7 @@ class LLMCaller:
                     incremental_output_tokens=call_stats.output_tokens,
                     incremental_reasoning_tokens=call_stats.reasoning_tokens,
                     incremental_cached_tokens=call_stats.cached_tokens,
+                    last_llm_model=actual_model,
                 )
             if thought:
                 await app.DATABASE.observer.update_thought(
@@ -1730,6 +1769,7 @@ class LLMCaller:
                     reasoning_token_count=call_stats.reasoning_tokens,
                     cached_token_count=call_stats.cached_tokens,
                     thought_cost=call_stats.llm_cost,
+                    last_llm_model=actual_model,
                 )
 
             organization_id = organization_id or (
