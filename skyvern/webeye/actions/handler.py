@@ -67,7 +67,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
-from skyvern.forge.sdk.cache import extraction_cache
+from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -4328,6 +4328,59 @@ async def extract_information_for_navigation_goal(
             fallback_reason=None,
             cache_path="agent",
         )
+        # Fire-and-forget shadow sampling on sampled hits. Flag lookup happens
+        # inside the background task so the cache-hit return is not blocked
+        # by the flag provider (e.g. PostHog latency on the first hit per run).
+        if cache_key is not None and task.workflow_run_id is not None:
+            shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+            )
+            shadow_schema = task.extracted_information_schema
+            # Snapshot screenshots at schedule time — scraped_page is mutable
+            # and may be refreshed before the background task runs.
+            shadow_screenshots = list(scraped_page.screenshots)
+
+            async def _shadow_gate() -> bool:
+                # Captures `task` by reference — safe because the cloud override
+                # only reads immutable identifiers (workflow_run_id, organization_id,
+                # workflow_permanent_id, task_id) set at construction.
+                return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+            async def _shadow_llm_call() -> Any:
+                fresh = await shadow_llm_api_handler(
+                    prompt=extract_information_prompt,
+                    # step=None suppresses both update_step (token/cost accounting)
+                    # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
+                    # are an observability side-channel — the user-visible request
+                    # was served from cache, so they must not inflate step usage,
+                    # billing, or artifact counts.
+                    step=None,
+                    screenshots=shadow_screenshots,
+                    # Use the same prompt_name as the miss path so prompt-level
+                    # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
+                    # cached (tuned) vs fresh (untuned) would diverge for config
+                    # reasons unrelated to cache correctness.
+                    prompt_name="extract-information",
+                    force_dict=False,
+                )
+                # Apply the same post-processing the miss path applies so the
+                # comparison is apples-to-apples against the cached value.
+                if shadow_schema:
+                    fresh = validate_and_fill_extraction_result(
+                        extraction_result=fresh,
+                        schema=shadow_schema,
+                    )
+                return fresh
+
+            extraction_shadow.schedule_shadow_check(
+                gate=_shadow_gate,
+                cache_key=cache_key,
+                workflow_run_id=task.workflow_run_id,
+                cached_value=lookup_result.value,
+                cached_age_seconds=lookup_result.age_seconds if lookup_result.age_seconds is not None else -1.0,
+                llm_call=_shadow_llm_call,
+                schema=shadow_schema,
+            )
         return ScrapeResult(scraped_data=lookup_result.value)
     if lookup_result is not None:
         LOG.info(
