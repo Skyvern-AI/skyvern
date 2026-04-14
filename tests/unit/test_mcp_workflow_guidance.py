@@ -15,9 +15,12 @@ def test_build_workflow_prompt_guides_text_prompt_defaults() -> None:
 
 
 def test_mcp_instructions_guide_text_prompt_defaults() -> None:
-    assert "For **text_prompt** blocks, default to Skyvern Optimized by omitting both `model` and `llm_key`." in (
-        mcp.instructions
-    )
+    # text_prompt guidance moved to build_workflow prompt; instructions now focus on task classification.
+    assert "Task Classification" in mcp.instructions
+    assert "skyvern_validate" in mcp.instructions
+    assert "skyvern_extract" in mcp.instructions
+    assert "skyvern_act" in mcp.instructions
+    assert "skyvern_observe" in mcp.instructions
 
 
 @pytest.mark.asyncio

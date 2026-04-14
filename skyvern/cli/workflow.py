@@ -69,6 +69,7 @@ def workflow_list(
         json_output=json_output,
         hint_on_exception="Check your API key and workflow list filters.",
         action="skyvern_workflow_list",
+        telemetry_tool_name="skyvern_workflow_list",
     )
 
 
@@ -88,6 +89,7 @@ def workflow_get(
         json_output=json_output,
         hint_on_exception="Check your API key and workflow ID.",
         action="skyvern_workflow_get",
+        telemetry_tool_name="skyvern_workflow_get",
     )
 
 
@@ -121,6 +123,7 @@ def workflow_create(
         json_output=json_output,
         hint_on_exception="Check the workflow definition syntax.",
         action="skyvern_workflow_create",
+        telemetry_tool_name="skyvern_workflow_create",
     )
 
 
@@ -154,6 +157,7 @@ def workflow_update(
         json_output=json_output,
         hint_on_exception="Check the workflow ID and definition syntax.",
         action="skyvern_workflow_update",
+        telemetry_tool_name="skyvern_workflow_update",
     )
 
 
@@ -173,6 +177,7 @@ def workflow_delete(
         json_output=json_output,
         hint_on_exception="Check the workflow ID and your permissions.",
         action="skyvern_workflow_delete",
+        telemetry_tool_name="skyvern_workflow_delete",
     )
 
 
@@ -220,6 +225,7 @@ def workflow_run(
         json_output=json_output,
         hint_on_exception="Check the workflow ID and run parameters.",
         action="skyvern_workflow_run",
+        telemetry_tool_name="skyvern_workflow_run",
     )
 
 
@@ -238,6 +244,7 @@ def workflow_status(
         json_output=json_output,
         hint_on_exception="Check the run ID and API key.",
         action="skyvern_workflow_status",
+        telemetry_tool_name="skyvern_workflow_status",
     )
 
 
@@ -256,4 +263,5 @@ def workflow_cancel(
         json_output=json_output,
         hint_on_exception="Check the run ID and API key.",
         action="skyvern_workflow_cancel",
+        telemetry_tool_name="skyvern_workflow_cancel",
     )
