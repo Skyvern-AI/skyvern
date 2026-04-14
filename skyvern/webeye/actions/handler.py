@@ -4288,25 +4288,59 @@ async def extract_information_for_navigation_goal(
         local_datetime=local_datetime_str,
     )
 
-    # Best-effort cache lookup — any failure falls through to LLM.
+    # Best-effort cache lookup — any failure falls through to LLM. The `try`
+    # is narrowed to just compute_cache_key + lookup so a downstream log
+    # failure can't re-enter the except block and double-count the call as
+    # both a hit/miss and a `lookup_error` in the Datadog miss-reason metric.
     cache_key: str | None = None
+    lookup_result: extraction_cache.LookupResult | None = None
     try:
         cache_key = extraction_cache.compute_cache_key(
             rendered_prompt=extract_information_prompt,
             llm_key=llm_key_override,
         )
-        cached = extraction_cache.get(task.workflow_run_id, cache_key)
-        if cached is not None:
-            LOG.info(
-                "extract_information cache hit — skipping LLM call",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                cache_key=cache_key,
-            )
-            return ScrapeResult(scraped_data=cached)
+        lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
     except Exception:
-        LOG.warning("extract_information cache lookup failed; falling through to LLM", exc_info=True)
-        cache_key = None
+        LOG.warning(
+            "extract_information cache lookup failed; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=extraction_cache.SCOPE_RUN,
+            cache_age_seconds=None,
+            fallback_reason=extraction_cache.FALLBACK_LOOKUP_ERROR,
+            cache_path="agent",
+            exc_info=True,
+        )
+        # Preserve cache_key so the downstream store() can still warm the cache
+        # for subsequent identical calls even when lookup() fails transiently.
+
+    if lookup_result is not None and lookup_result.hit:
+        LOG.info(
+            "extract_information cache hit — skipping LLM call",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            cache_hit=True,
+            cache_scope=lookup_result.scope,
+            cache_age_seconds=lookup_result.age_seconds,
+            fallback_reason=None,
+            cache_path="agent",
+        )
+        return ScrapeResult(scraped_data=lookup_result.value)
+    if lookup_result is not None:
+        LOG.info(
+            "extract_information cache miss",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=lookup_result.scope,
+            cache_age_seconds=None,
+            fallback_reason=lookup_result.fallback_reason,
+            cache_path="agent",
+        )
 
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(

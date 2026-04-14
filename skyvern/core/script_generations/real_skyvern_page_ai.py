@@ -931,25 +931,57 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         # Share the extract-information cache with the agent path. Best-effort
         # per the RFC review — any exception falls through to the full LLM
-        # call below.
+        # call below. The `try` is narrowed to just compute_cache_key + lookup
+        # so a downstream log failure can't re-enter the except block and
+        # double-count the call as both a hit/miss and a `lookup_error` in
+        # the Datadog miss-reason metric.
         workflow_run_id = context.workflow_run_id if context else None
         cache_key: str | None = None
+        lookup_result: extraction_cache.LookupResult | None = None
         try:
             cache_key = extraction_cache.compute_cache_key(
                 rendered_prompt=extract_information_prompt,
                 llm_key=None,
             )
-            cached = extraction_cache.get(workflow_run_id, cache_key)
-            if cached is not None:
-                LOG.info(
-                    "ai_extract cache hit — skipping LLM call",
-                    workflow_run_id=workflow_run_id,
-                    cache_key=cache_key,
-                )
-                return cached  # type: ignore[return-value]
+            lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
-            LOG.warning("ai_extract cache lookup failed; falling through to LLM", exc_info=True)
-            cache_key = None
+            LOG.warning(
+                "ai_extract cache lookup failed; falling through to LLM",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                cache_hit=False,
+                cache_scope=extraction_cache.SCOPE_RUN,
+                cache_age_seconds=None,
+                fallback_reason=extraction_cache.FALLBACK_LOOKUP_ERROR,
+                cache_path="script",
+                exc_info=True,
+            )
+            # Preserve cache_key so the downstream store() can still warm the cache
+            # for subsequent identical calls even when lookup() fails transiently.
+
+        if lookup_result is not None and lookup_result.hit:
+            LOG.info(
+                "ai_extract cache hit — skipping LLM call",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                cache_hit=True,
+                cache_scope=lookup_result.scope,
+                cache_age_seconds=lookup_result.age_seconds,
+                fallback_reason=None,
+                cache_path="script",
+            )
+            return lookup_result.value  # type: ignore[return-value]
+        if lookup_result is not None:
+            LOG.info(
+                "ai_extract cache miss",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                cache_hit=False,
+                cache_scope=lookup_result.scope,
+                cache_age_seconds=None,
+                fallback_reason=lookup_result.fallback_reason,
+                cache_path="script",
+            )
         step = None
         if context and context.organization_id and context.task_id and context.step_id:
             step = await app.DATABASE.tasks.get_step(
