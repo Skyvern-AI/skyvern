@@ -307,6 +307,39 @@ class TasksRepository(BaseRepository):
             actions = (await session.scalars(query)).all()
             return [hydrate_action(action) for action in actions]
 
+    @db_operation("get_recent_actions_for_tasks")
+    async def get_recent_actions_for_tasks(
+        self,
+        task_ids: list[str],
+        organization_id: str,
+        per_task_limit: int = 15,
+    ) -> list[Action]:
+        """Return the most recent *per_task_limit* actions per task for the given task IDs.
+
+        Uses a single query with application-level grouping to enforce the per-task cap.
+        Results are newest-first within each task.
+        """
+        if not task_ids:
+            return []
+        unique_ids = list(dict.fromkeys(task_ids))
+        async with self.Session() as session:
+            query = (
+                select(ActionModel)
+                .filter(ActionModel.organization_id == organization_id)
+                .filter(ActionModel.task_id.in_(unique_ids))
+                .order_by(ActionModel.task_id, ActionModel.created_at.desc())
+            )
+            rows = (await session.scalars(query)).all()
+
+        counts: dict[str, int] = {}
+        results: list[Action] = []
+        for row in rows:
+            tid = row.task_id
+            if counts.get(tid, 0) < per_task_limit:
+                results.append(hydrate_action(row))
+                counts[tid] = counts.get(tid, 0) + 1
+        return results
+
     @db_operation("get_action_count_for_step")
     async def get_action_count_for_step(self, step_id: str, task_id: str, organization_id: str) -> int:
         """Get count of actions for a step. Uses composite index for efficiency."""

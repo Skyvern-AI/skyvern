@@ -249,6 +249,46 @@ class WorkflowRunsRepository(BaseRepository):
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
+    @db_operation("update_workflow_run_if_not_final")
+    async def update_workflow_run_if_not_final(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        failure_reason: str | None = None,
+    ) -> WorkflowRun | None:
+        """Transition a workflow run to ``status`` only if it is not already in a
+        terminal state. Returns the updated row, or ``None`` when the row was
+        already terminal (or missing). Implemented as a single conditional
+        ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
+        finalization write cannot be clobbered by a late cancel.
+        """
+        non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        values: dict[str, Any] = {"status": status}
+        if status.is_final():
+            values["finished_at"] = datetime.now(timezone.utc)
+        if failure_reason is not None:
+            values["failure_reason"] = failure_reason
+
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status.in_(non_terminal),
+                )
+                .values(**values)
+                .returning(WorkflowRunModel.workflow_run_id)
+            )
+            affected = result.scalar_one_or_none()
+            await session.commit()
+            if affected is None:
+                return None
+            refreshed = (
+                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+            ).one()
+            await save_workflow_run_logs(workflow_run_id)
+            return convert_to_workflow_run(refreshed)
+
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
         self,
