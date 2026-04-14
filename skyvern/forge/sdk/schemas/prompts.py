@@ -1,6 +1,7 @@
+import json
 import typing as t
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Self
 
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
@@ -58,3 +59,42 @@ class GenerateWorkflowTitleRequest(BaseModel):
 
 class GenerateWorkflowTitleResponse(BaseModel):
     title: str | None = Field(None, description="The generated workflow title")
+
+
+MAX_SUMMARIZE_OUTPUT_JSON_LENGTH = 100_000
+MAX_SUMMARIZE_CONTEXT_STRING_LENGTH = 500
+
+
+class SummarizeOutputRequest(BaseModel):
+    output_json: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_SUMMARIZE_OUTPUT_JSON_LENGTH,
+        description="The JSON output to summarize",
+    )
+    workflow_title: str | None = Field(
+        None,
+        max_length=MAX_SUMMARIZE_CONTEXT_STRING_LENGTH,
+        description="Title of the workflow for context",
+    )
+    block_label: str | None = Field(
+        None,
+        max_length=MAX_SUMMARIZE_CONTEXT_STRING_LENGTH,
+        description="Label of the specific block being summarized",
+    )
+
+    @field_validator("output_json")
+    @classmethod
+    def _validate_output_json(cls, value: str) -> str:
+        try:
+            json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"output_json must be valid JSON: {exc.msg}") from exc
+        except RecursionError as exc:
+            raise ValueError("output_json is too deeply nested") from exc
+        return value
+
+
+class SummarizeOutputResponse(BaseModel):
+    error: str | None = Field(None, description="Error message if summarization failed")
+    summary: str = Field(..., description="The human-readable summary of the output")
