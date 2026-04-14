@@ -6,6 +6,7 @@ import datetime as dt
 import typing
 
 import httpx
+from . import core
 from .core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from .core.request_options import RequestOptions
 from .environment import SkyvernEnvironment
@@ -50,7 +51,6 @@ from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
     from .artifacts.client import ArtifactsClient, AsyncArtifactsClient
-    from .schedules.client import AsyncSchedulesClient, SchedulesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
@@ -124,7 +124,6 @@ class Skyvern:
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[ArtifactsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
-        self._schedules: typing.Optional[SchedulesClient] = None
 
     @property
     def with_raw_response(self) -> RawSkyvern:
@@ -179,7 +178,7 @@ class Skyvern:
 
         engine : typing.Optional[RunEngine]
 
-            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+            The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
@@ -1338,11 +1337,14 @@ class Skyvern:
         )
         return _response.data
 
-    def upload_file(self, *, file: str, request_options: typing.Optional[RequestOptions] = None) -> UploadFileResponse:
+    def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
         """
         Parameters
         ----------
-        file : str
+        file : core.File
+            See core.File for more documentation
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1359,9 +1361,7 @@ class Skyvern:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        client.upload_file(
-            file="file",
-        )
+        client.upload_file()
         """
         _response = self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
@@ -2492,14 +2492,6 @@ class Skyvern:
             self._scripts = ScriptsClient(client_wrapper=self._client_wrapper)
         return self._scripts
 
-    @property
-    def schedules(self):
-        if self._schedules is None:
-            from .schedules.client import SchedulesClient  # noqa: E402
-
-            self._schedules = SchedulesClient(client_wrapper=self._client_wrapper)
-        return self._schedules
-
 
 class AsyncSkyvern:
     """
@@ -2569,7 +2561,6 @@ class AsyncSkyvern:
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[AsyncArtifactsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
-        self._schedules: typing.Optional[AsyncSchedulesClient] = None
 
     @property
     def with_raw_response(self) -> AsyncRawSkyvern:
@@ -2624,7 +2615,7 @@ class AsyncSkyvern:
 
         engine : typing.Optional[RunEngine]
 
-            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+            The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
@@ -3952,12 +3943,13 @@ class AsyncSkyvern:
         return _response.data
 
     async def upload_file(
-        self, *, file: str, request_options: typing.Optional[RequestOptions] = None
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> UploadFileResponse:
         """
         Parameters
         ----------
-        file : str
+        file : core.File
+            See core.File for more documentation
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3979,9 +3971,7 @@ class AsyncSkyvern:
 
 
         async def main() -> None:
-            await client.upload_file(
-                file="file",
-            )
+            await client.upload_file()
 
 
         asyncio.run(main())
@@ -5284,14 +5274,6 @@ class AsyncSkyvern:
 
             self._scripts = AsyncScriptsClient(client_wrapper=self._client_wrapper)
         return self._scripts
-
-    @property
-    def schedules(self):
-        if self._schedules is None:
-            from .schedules.client import AsyncSchedulesClient  # noqa: E402
-
-            self._schedules = AsyncSchedulesClient(client_wrapper=self._client_wrapper)
-        return self._schedules
 
 
 def _get_base_url(*, base_url: typing.Optional[str] = None, environment: SkyvernEnvironment) -> str:

@@ -25,6 +25,36 @@ keywords:
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
+<Update label="Week of April 14, 2026" description="Undo/redo in workflow editor, PDF download and editor bug fixes">
+
+## New features
+
+- **Undo/Redo in Workflow Editor** — The workflow canvas now supports undo and redo via Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z (or toolbar buttons). Up to 50 canvas snapshots are tracked, and native per-field undo inside text inputs is preserved. ([#5484](https://github.com/Skyvern-AI/skyvern/pull/5484))
+
+## Bug fixes
+
+- Fixed PDF downloads in CloakBrowser where the AI selecting "Open" instead of "Download file" caused failures; the print-to-file path is now used as a reliable fallback on affected portals.
+- The workflow editor now shows a warning when an `error_code_mapping` key contains leading or trailing whitespace, which previously caused error conditions to silently never match at runtime. ([#5487](https://github.com/Skyvern-AI/skyvern/pull/5487))
+
+</Update>
+
+<Update label="Week of April 7, 2026" description="Loop output fixes, navigation reliability, shadow DOM and credential improvements">
+
+## Improvements
+
+- **Consistent Pagination Styling** — The "Items per page" dropdown on the Run History page now matches the styling on the Workflow Runs page for a uniform experience. ([#5480](https://github.com/Skyvern-AI/skyvern/pull/5480))
+
+## Bug fixes
+
+- Fixed MCP-edited workflows dropping external credential bindings (OnePassword, Bitwarden, Azure Vault) on login blocks after a workflow update, which caused login failures on re-run. ([#5479](https://github.com/Skyvern-AI/skyvern/pull/5479))
+- Fixed database timeouts when loading workflow run details for large runs with many tasks and steps; step counts are now fetched with a single aggregate query.
+- Fixed a bug in workflow loops where downloaded files accumulated across iterations, producing incorrect cumulative ZIP archives instead of per-iteration ones. ([#5477](https://github.com/Skyvern-AI/skyvern/pull/5477))
+- Fixed loop block output leaking across iterations, where data from a prior iteration could overwrite the current iteration's results in downstream parameter references. ([#5475](https://github.com/Skyvern-AI/skyvern/pull/5475))
+- Navigation errors are now classified as permanent, proxy-sensitive, or transient; permanent errors (e.g. invalid URL) no longer retry, reducing wasted time on unrecoverable failures.
+- Fixed combobox/dropdown fields in shadow DOM component libraries failing to discover options; a full page re-scrape diff is now used as a fallback when the observed shadow root doesn't reveal options. ([#5471](https://github.com/Skyvern-AI/skyvern/pull/5471))
+
+</Update>
+
 <Update label="v1.0.22 — February 26, 2026" description="Adaptive caching, Workflow Trigger block, CLI signup, and more">
 
 ## New features
