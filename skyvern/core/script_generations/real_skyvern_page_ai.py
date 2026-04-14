@@ -24,6 +24,7 @@ from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.css_selector import compute_selector_options
 from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_truncation import truncate_extraction_schema
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
     ActionStatus,
@@ -901,6 +902,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
+        include_extracted_text: bool = True,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
@@ -916,15 +918,17 @@ class RealSkyvernPageAi(SkyvernPageAi):
         # Render the prompt FIRST so the cache key hashes the exact string
         # that will be sent to the LLM (captures economy-tree swaps and 2/3
         # truncation inside load_prompt_with_elements).
+        extracted_text_for_prompt = self.scraped_page.extracted_text if include_extracted_text else None
+
         extract_information_prompt = load_prompt_with_elements(
             element_tree_builder=self.scraped_page,
             prompt_engine=prompt_engine,
             template_name="extract-information",
             html_need_skyvern_attrs=False,
             data_extraction_goal=prompt,
-            extracted_information_schema=schema,
+            extracted_information_schema=truncate_extraction_schema(schema),
             current_url=self.scraped_page.url,
-            extracted_text=self.scraped_page.extracted_text,
+            extracted_text=extracted_text_for_prompt,
             error_code_mapping_str=(json.dumps(error_code_mapping) if error_code_mapping else None),
             local_datetime=local_datetime_str,
         )

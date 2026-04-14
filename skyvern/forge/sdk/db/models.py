@@ -107,6 +107,7 @@ class TaskModel(Base):
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
     include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
+    include_extracted_text = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)

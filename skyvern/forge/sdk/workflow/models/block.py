@@ -729,6 +729,7 @@ class BaseTaskBlock(Block):
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
+    include_extracted_text: bool = True
 
     def get_all_parameters(
         self,
@@ -4676,6 +4677,7 @@ class ExtractionBlock(BaseTaskBlock):
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
     data_extraction_goal: str
+    include_extracted_text: bool = False
 
 
 class LoginBlock(BaseTaskBlock):

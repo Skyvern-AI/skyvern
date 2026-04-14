@@ -113,7 +113,14 @@ from skyvern.services.otp_service import (
     try_generate_totp_from_credential,
 )
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
+from skyvern.utils.prompt_engine import (
+    PROMPT_HARD_CEILING_TOKENS,
+    MaxStepsReasonResponse,
+    enforce_prompt_ceiling,
+    load_prompt_with_elements,
+)
+from skyvern.utils.prompt_truncation import truncate_extraction_schema
+from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -145,6 +152,15 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
+
+
+class _PromptCeilingExceeded(Exception):
+    """Internal signal: the cached split-template prompt blew past the
+    PROMPT_HARD_CEILING_TOKENS budget. Raised inside the cached extract-action
+    branch to trigger the fall-through to load_prompt_with_elements, which
+    applies the per-template fallback drop chain."""
+
+
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
 
@@ -308,6 +324,7 @@ class ForgeAgent:
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
             download_timeout=task_block.download_timeout,
+            include_extracted_text=task_block.include_extracted_text,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -376,6 +393,7 @@ class ForgeAgent:
             extra_http_headers=task_request.extra_http_headers,
             browser_session_id=task_request.browser_session_id,
             browser_address=task_request.browser_address,
+            include_extracted_text=task_request.include_extracted_text,
         )
         LOG.info(
             "Created new task",
@@ -3224,6 +3242,16 @@ class ForgeAgent:
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
+                if count_tokens(combined_prompt) > PROMPT_HARD_CEILING_TOKENS:
+                    # The cached split-template path renders static+dynamic separately,
+                    # so the load_prompt_with_elements ceiling logic never sees this
+                    # prompt. Raise the dedicated sentinel to trigger the except below,
+                    # which falls through to the full load_prompt_with_elements render
+                    # where the fallback drop chain can apply.
+                    raise _PromptCeilingExceeded(
+                        f"cached extract-action prompt exceeded {PROMPT_HARD_CEILING_TOKENS} tokens"
+                    )
+
                 LOG.info(
                     "Using cached prompt",
                     task_id=task.task_id,
@@ -5039,13 +5067,20 @@ class ForgeAgent:
     @staticmethod
     async def create_extract_action(task: Task, step: Step, scraped_page: ScrapedPage) -> ExtractAction:
         context = skyvern_context.ensure_context()
+        capped_schema = truncate_extraction_schema(task.extracted_information_schema)
         # generate reasoning by prompt llm to think briefly what data to extract
-        prompt = prompt_engine.load_prompt(
-            "data-extraction-summary",
-            data_extraction_goal=task.data_extraction_goal,
-            data_extraction_schema=task.extracted_information_schema,
-            current_url=scraped_page.url,
-            local_datetime=datetime.now(context.tz_info).isoformat(),
+        summary_kwargs: dict[str, Any] = {
+            "data_extraction_goal": task.data_extraction_goal,
+            "data_extraction_schema": capped_schema,
+            "current_url": scraped_page.url,
+            "local_datetime": datetime.now(context.tz_info).isoformat(),
+        }
+        prompt = prompt_engine.load_prompt("data-extraction-summary", **summary_kwargs)
+        prompt = enforce_prompt_ceiling(
+            prompt,
+            prompt_engine=prompt_engine,
+            template_name="data-extraction-summary",
+            kwargs=summary_kwargs,
         )
 
         # Cache the summary LLM call — the inputs (goal, schema, URL) are
