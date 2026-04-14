@@ -4,6 +4,7 @@ import datetime as dt
 import typing
 from json.decoder import JSONDecodeError
 
+from . import core
 from .core.api_error import ApiError
 from .core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from .core.http_response import AsyncHttpResponse, HttpResponse
@@ -104,7 +105,7 @@ class RawSkyvern:
 
         engine : typing.Optional[RunEngine]
 
-            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+            The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
@@ -1793,12 +1794,13 @@ class RawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     def upload_file(
-        self, *, file: str, request_options: typing.Optional[RequestOptions] = None
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> HttpResponse[UploadFileResponse]:
         """
         Parameters
         ----------
-        file : str
+        file : core.File
+            See core.File for more documentation
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1811,10 +1813,10 @@ class RawSkyvern:
         _response = self._client_wrapper.httpx_client.request(
             "v1/upload_file",
             method="POST",
-            data={
+            data={},
+            files={
                 "file": file,
             },
-            files={},
             request_options=request_options,
             omit=OMIT,
             force_multipart=True,
@@ -3508,7 +3510,7 @@ class AsyncRawSkyvern:
 
         engine : typing.Optional[RunEngine]
 
-            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+            The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
@@ -5197,12 +5199,13 @@ class AsyncRawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     async def upload_file(
-        self, *, file: str, request_options: typing.Optional[RequestOptions] = None
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> AsyncHttpResponse[UploadFileResponse]:
         """
         Parameters
         ----------
-        file : str
+        file : core.File
+            See core.File for more documentation
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5215,10 +5218,10 @@ class AsyncRawSkyvern:
         _response = await self._client_wrapper.httpx_client.request(
             "v1/upload_file",
             method="POST",
-            data={
+            data={},
+            files={
                 "file": file,
             },
-            files={},
             request_options=request_options,
             omit=OMIT,
             force_multipart=True,
