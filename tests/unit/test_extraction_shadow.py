@@ -300,6 +300,35 @@ def test_compare_semantic_unique_items_behind_ref() -> None:
     assert result.match is True
 
 
+def test_compare_semantic_unique_items_ref_cycle_does_not_skip_siblings() -> None:
+    """Hitting a cycle must not short-circuit the rest of the current node's keys.
+
+    Regression guard: the cycle check used to `return` early, which dropped
+    sibling traversal (properties/items/combinators) on any node that
+    contained a `$ref` already in the current expansion path.
+    """
+    # Both the outer "ids" ref and the sibling uniqueItems must be picked up.
+    schema = {
+        "$defs": {
+            "Container": {
+                "type": "object",
+                "properties": {
+                    # Self-referential: Container.parent → Container
+                    "parent": {"$ref": "#/$defs/Container"},
+                    # Sibling that depends on cycle-guard allowing traversal.
+                    "ids": {"type": "array", "uniqueItems": True, "items": {"type": "integer"}},
+                },
+            },
+        },
+        "$ref": "#/$defs/Container",
+    }
+    # Reorder-only diff at ids — must match because uniqueItems is detected.
+    cached = {"ids": [1, 2, 3], "parent": {"ids": [1, 2, 3]}}
+    fresh = {"ids": [3, 2, 1], "parent": {"ids": [1, 2, 3]}}
+    result = extraction_shadow.compare_results(cached, fresh, schema=schema)
+    assert result.match is True
+
+
 def test_compare_semantic_unique_items_ref_circular_safe() -> None:
     """Circular $ref must not cause infinite recursion in the collector."""
     schema = {
@@ -774,8 +803,8 @@ async def test_schedule_shadow_check_skips_when_gate_returns_false() -> None:
         logger=captured,
     )
     await task
-    # One debug log confirming the gate evaluated to False — useful for
-    # verifying the sampling rate in production without running the shadow LLM.
+    # One info log confirming the gate evaluated to False — used as the
+    # sampling-rate denominator (status:skipped) alongside status:ok/error.
     assert len(captured.calls) == 1
     event, fields = captured.calls[0]
     assert event == "extract_information.shadow_comparison"

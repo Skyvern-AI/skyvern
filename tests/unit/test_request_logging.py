@@ -12,6 +12,7 @@ from skyvern.forge.request_logging import (
     _is_loggable_content_type,
     _is_sensitive_key,
     _redact_sensitive_fields,
+    _sanitize_body,
     _sanitize_response_body,
 )
 
@@ -44,6 +45,12 @@ class TestIsSensitiveKey:
             "auth",
             "authorization",
             "secret_key",
+            "totp",
+            "TOTP",
+            "otp",
+            "one_time_code",
+            "one_time_password",
+            "mfa_code",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
@@ -112,6 +119,18 @@ class TestRedactSensitiveFields:
             "api-key": "f",
             "api_key": "g",
             "Authorization": "h",
+        }
+        result = _redact_sensitive_fields(data)
+        for key in data:
+            assert result[key] == _REDACTED, f"Expected {key} to be redacted"
+
+    def test_redacts_totp_and_otp_fields(self) -> None:
+        data = {
+            "totp": "123456",
+            "otp": "999999",
+            "one_time_code": "abc123",
+            "one_time_password": "xyz789",
+            "mfa_code": "mfa42",
         }
         result = _redact_sensitive_fields(data)
         for key in data:
@@ -256,4 +275,50 @@ class TestSanitizeResponseBody:
     def test_sensitive_endpoint_trailing_slash(self) -> None:
         request = _make_request("POST", "/api/v1/credentials/")
         result = _sanitize_response_body(request, '{"data": "value"}', "application/json")
+        assert result == _REDACTED
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/v1/credentials/totp"),
+            ("POST", "/v1/credentials/totp/"),
+            ("POST", "/api/v1/totp"),
+            ("POST", "/api/v1/totp/"),
+            ("GET", "/v1/credentials/totp"),
+            ("GET", "/v1/credentials/totp/"),
+        ],
+    )
+    def test_totp_endpoints_response_redacted(self, method: str, path: str) -> None:
+        request = _make_request(method, path)
+        body = json.dumps({"code": "123456", "content": "Your code is 123456"})
+        result = _sanitize_response_body(request, body, "application/json")
+        assert result == _REDACTED
+
+
+class TestSanitizeBody:
+    def test_sensitive_endpoint_request_fully_redacted(self) -> None:
+        request = _make_request("POST", "/v1/credentials")
+        result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
+        assert result == _REDACTED
+
+    def test_non_sensitive_endpoint_request_preserved(self) -> None:
+        request = _make_request("GET", "/v1/tasks")
+        result = _sanitize_body(request, b'{"user": "alice"}', "application/json")
+        assert result == '{"user": "alice"}'
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/v1/credentials/totp"),
+            ("POST", "/v1/credentials/totp/"),
+            ("POST", "/api/v1/totp"),
+            ("POST", "/api/v1/totp/"),
+            ("GET", "/v1/credentials/totp"),
+            ("GET", "/v1/credentials/totp/"),
+        ],
+    )
+    def test_totp_endpoints_request_redacted(self, method: str, path: str) -> None:
+        request = _make_request(method, path)
+        body = b'{"totp_identifier": "x@y.com", "content": "Your code is 123456"}'
+        result = _sanitize_body(request, body, "application/json")
         assert result == _REDACTED
