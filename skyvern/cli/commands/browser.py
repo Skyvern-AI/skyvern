@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +13,14 @@ if TYPE_CHECKING:
 
 import typer
 
-from skyvern.cli.commands._output import console, output, output_error
+from skyvern.cli.commands._output import (
+    console,
+)
+from skyvern.cli.commands._output import emit_tool_result as shared_emit_tool_result
+from skyvern.cli.commands._output import (
+    output,
+    output_error,
+)
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
 from skyvern.cli.core.artifacts import save_artifact
 from skyvern.cli.core.browser_ops import (
@@ -46,6 +52,7 @@ from skyvern.cli.core.guards import (
 )
 from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install_ngrok, offer_setup_auth
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
+from skyvern.cli.core.telemetry import capture_cli_tool_call
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
@@ -149,20 +156,28 @@ def _validate_wait_state(state: str) -> None:
         raise GuardError(f"Invalid state: {state}", "Use visible, hidden, attached, or detached")
 
 
-def _emit_tool_result(result: dict[str, Any], *, json_output: bool, action: str) -> None:
-    if json_output:
-        json.dump(result, sys.stdout, indent=2, default=str)
-        sys.stdout.write("\n")
-        if not result.get("ok", False):
-            raise SystemExit(1)
-        return
+def _emit_tool_result(
+    result: dict[str, Any],
+    *,
+    json_output: bool,
+    action: str,
+    telemetry_tool_name: str | None = None,
+) -> None:
+    shared_emit_tool_result(
+        result,
+        json_output=json_output,
+        action=action,
+        telemetry_tool_name=telemetry_tool_name,
+    )
 
-    if result.get("ok", False):
-        output(result.get("data"), action=action, json_mode=False)
-        return
 
-    err = result.get("error") or {}
-    output_error(str(err.get("message") or "Unknown error"), hint=str(err.get("hint") or ""), json_mode=False)
+def _handle_tool_error(e: Exception, *, tool: str, hint: str, json_output: bool) -> None:
+    """Common error handler for CLI commands: emit telemetry + output error."""
+    capture_cli_tool_call(tool, ok=False, error=e)
+    if isinstance(e, GuardError):
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    else:
+        output_error(str(e), hint=hint, json_mode=json_output)
 
 
 # ---------------------------------------------------------------------------
@@ -202,13 +217,17 @@ def session_create(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_browser_session_create", ok=True)
         output(data, action="session_create", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Check your API key and network connection.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_browser_session_create",
+            hint="Check your API key and network connection.",
+            json_output=json_output,
+        )
 
 
 @session_app.command("close")
@@ -235,11 +254,17 @@ def session_close(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_browser_session_close", ok=True)
         output(data, action="session_close", json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Verify the session ID or CDP URL is correct.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_browser_session_close",
+            hint="Verify the session ID or CDP URL is correct.",
+            json_output=json_output,
+        )
 
 
 @session_app.command("connect")
@@ -266,11 +291,17 @@ def session_connect(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_browser_session_connect", ok=True)
         output(data, action="session_connect", json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Verify the session ID or CDP URL is reachable.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_browser_session_connect",
+            hint="Verify the session ID or CDP URL is reachable.",
+            json_output=json_output,
+        )
 
 
 @session_app.command("list")
@@ -286,9 +317,17 @@ def session_list(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_browser_session_list", ok=True)
         output(data, action="session_list", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), hint="Check your API key and network connection.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_browser_session_list",
+            hint="Check your API key and network connection.",
+            json_output=json_output,
+        )
 
 
 @session_app.command("get")
@@ -315,9 +354,17 @@ def session_get(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_browser_session_get", ok=True)
         output(data, action="session_get", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), hint="Verify the session ID exists and is accessible.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_browser_session_get",
+            hint="Verify the session ID exists and is accessible.",
+            json_output=json_output,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +399,16 @@ def network_requests_cmd(
 
     try:
         result = asyncio.run(_run())
-        _emit_tool_result(result, json_output=json_output, action="network_requests")
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="network_requests",
+            telemetry_tool_name="skyvern_network_requests",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_network_requests", ok=False, error=e)
         output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
 
 
@@ -378,8 +433,16 @@ def network_detail_cmd(
 
     try:
         result = asyncio.run(_run())
-        _emit_tool_result(result, json_output=json_output, action="network_detail")
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="network_detail",
+            telemetry_tool_name="skyvern_network_request_detail",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_network_request_detail", ok=False, error=e)
         output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
 
 
@@ -416,8 +479,16 @@ def network_route_cmd(
 
     try:
         result = asyncio.run(_run())
-        _emit_tool_result(result, json_output=json_output, action="network_route")
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="network_route",
+            telemetry_tool_name="skyvern_network_route",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_network_route", ok=False, error=e)
         output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
 
 
@@ -442,8 +513,16 @@ def network_unroute_cmd(
 
     try:
         result = asyncio.run(_run())
-        _emit_tool_result(result, json_output=json_output, action="network_unroute")
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="network_unroute",
+            telemetry_tool_name="skyvern_network_unroute",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_network_unroute", ok=False, error=e)
         output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
 
 
@@ -462,9 +541,13 @@ def navigate(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Navigate to a URL in the browser session."""
+    try:
+        validate_wait_until(wait_until)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
     async def _run() -> dict:
-        validate_wait_until(wait_until)
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -479,13 +562,17 @@ def navigate(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_navigate", ok=True)
         output(data, action="navigate", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Check the URL is valid and the session is active.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_navigate",
+            hint="Check the URL is valid and the session is active.",
+            json_output=json_output,
+        )
 
 
 @browser_app.command("screenshot")
@@ -524,13 +611,17 @@ def screenshot(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_screenshot", ok=True)
         output(data, action="screenshot", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Ensure the session is active and the page has loaded.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_screenshot",
+            hint="Ensure the session is active and the page has loaded.",
+            json_output=json_output,
+        )
 
 
 @browser_app.command("evaluate")
@@ -541,9 +632,13 @@ def evaluate(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Run JavaScript on the current page."""
+    try:
+        check_js_password(expression)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
     async def _run() -> dict:
-        check_js_password(expression)
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -553,13 +648,14 @@ def evaluate(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_evaluate", ok=True)
         output(data, action="evaluate", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Check JavaScript syntax and page state.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_evaluate", hint="Check JavaScript syntax and page state.", json_output=json_output
+        )
 
 
 @browser_app.command("click")
@@ -574,10 +670,14 @@ def click(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Click an element using selector, intent, or both."""
-
-    async def _run() -> dict:
+    try:
         validate_button(button)
         ai_mode = _resolve_ai_target(selector, intent, operation="click")
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
+
+    async def _run() -> dict:
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -602,13 +702,17 @@ def click(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_click", ok=True)
         output(data, action="click", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Element may be hidden, disabled, or not yet available.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_click",
+            hint="Element may be hidden, disabled, or not yet available.",
+            json_output=json_output,
+        )
 
 
 @browser_app.command("hover")
@@ -621,9 +725,13 @@ def hover(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Hover over an element using selector, intent, or both."""
+    try:
+        ai_mode = _resolve_ai_target(selector, intent, operation="hover")
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
     async def _run() -> dict:
-        ai_mode = _resolve_ai_target(selector, intent, operation="hover")
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -639,13 +747,14 @@ def hover(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_hover", ok=True)
         output(data, action="hover", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Element may be hidden or not interactable.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_hover", hint="Element may be hidden or not interactable.", json_output=json_output
+        )
 
 
 @browser_app.command("type")
@@ -661,16 +770,19 @@ def type_text(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Type into an input field using selector, intent, or both."""
-
-    async def _run() -> dict:
+    try:
         target_text = f"{intent or ''} {selector or ''}"
         if PASSWORD_PATTERN.search(target_text):
             raise GuardError(
                 "Cannot type into password fields — credentials must not be passed through tool calls",
                 CREDENTIAL_HINT,
             )
-
         ai_mode = _resolve_ai_target(selector, intent, operation="type")
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
+
+    async def _run() -> dict:
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -711,13 +823,14 @@ def type_text(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_type", ok=True)
         output(data, action="type", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Element may not be editable or may be obscured.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_type", hint="Element may not be editable or may be obscured.", json_output=json_output
+        )
 
 
 @browser_app.command("scroll")
@@ -731,12 +844,15 @@ def scroll(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Scroll the page or scroll a targeted element into view."""
-
-    async def _run() -> dict:
+    try:
         valid_directions = ("up", "down", "left", "right")
         if not intent and direction not in valid_directions:
             raise GuardError(f"Invalid direction: {direction}", "Use up, down, left, or right")
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
+    async def _run() -> dict:
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -761,13 +877,14 @@ def scroll(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_scroll", ok=True)
         output(data, action="scroll", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Scroll failed; check selector and page readiness.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_scroll", hint="Scroll failed; check selector and page readiness.", json_output=json_output
+        )
 
 
 @browser_app.command("select")
@@ -782,9 +899,13 @@ def select(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Select an option from a dropdown."""
+    try:
+        ai_mode = _resolve_ai_target(selector, intent, operation="select")
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
     async def _run() -> dict:
-        ai_mode = _resolve_ai_target(selector, intent, operation="select")
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -803,13 +924,17 @@ def select(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_select_option", ok=True)
         output(data, action="select", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Check dropdown selector and available options.", json_mode=json_output)
+        _handle_tool_error(
+            e,
+            tool="skyvern_select_option",
+            hint="Check dropdown selector and available options.",
+            json_output=json_output,
+        )
 
 
 @browser_app.command("press-key")
@@ -822,6 +947,18 @@ def press_key(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Press a keyboard key."""
+    ai_mode: str | None = None
+    try:
+        if intent or selector:
+            ai_mode, err = resolve_ai_mode(selector, intent)
+            if err:
+                raise GuardError(
+                    "Must provide intent, selector, or both",
+                    "Use intent='describe where to press' or selector='#css-selector'",
+                )
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
     async def _run() -> dict:
         connection = _resolve_connection(session, cdp)
@@ -830,12 +967,6 @@ def press_key(
         await _apply_cli_frame_state(page)
 
         if intent or selector:
-            ai_mode, err = resolve_ai_mode(selector, intent)
-            if err:
-                raise GuardError(
-                    "Must provide intent, selector, or both",
-                    "Use intent='describe where to press' or selector='#css-selector'",
-                )
             if ai_mode is not None:
                 locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
             else:
@@ -849,13 +980,14 @@ def press_key(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_press_key", ok=True)
         output(data, action="press_key", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Check key name and focused target.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_press_key", hint="Check key name and focused target.", json_output=json_output
+        )
 
 
 @browser_app.command("wait")
@@ -871,15 +1003,18 @@ def wait(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Wait for time, selector state, or AI condition."""
-
-    async def _run() -> dict:
+    try:
         _validate_wait_state(state)
         if time_ms is None and not selector and not intent:
             raise GuardError(
                 "Must provide intent, selector, or time_ms",
                 "Use --time, --selector, or --intent to specify what to wait for",
             )
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
+    async def _run() -> dict:
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -918,13 +1053,14 @@ def wait(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_wait", ok=True)
         output(data, action="wait", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Condition was not met within timeout.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_wait", hint="Condition was not met within timeout.", json_output=json_output
+        )
 
 
 @browser_app.command("act")
@@ -935,9 +1071,13 @@ def act(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Perform a natural language action on the current page."""
+    try:
+        check_password_prompt(prompt)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+        return
 
     async def _run() -> dict:
-        check_password_prompt(prompt)
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
@@ -947,13 +1087,14 @@ def act(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_act", ok=True)
         output(data, action="act", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Simplify the prompt or break into steps.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_act", hint="Simplify the prompt or break into steps.", json_output=json_output
+        )
 
 
 @browser_app.command("extract")
@@ -976,13 +1117,14 @@ def extract(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_extract", ok=True)
         output(data, action="extract", json_mode=json_output)
-    except GuardError as e:
-        output_error(str(e), hint=e.hint, json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Simplify the prompt or provide a JSON schema.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_extract", hint="Simplify the prompt or provide a JSON schema.", json_output=json_output
+        )
 
 
 @browser_app.command("validate")
@@ -1004,11 +1146,14 @@ def validate(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_validate", ok=True)
         output(data, action="validate", json_mode=json_output)
     except typer.BadParameter:
         raise
     except Exception as e:
-        output_error(str(e), hint="Check the page state and validation prompt.", json_mode=json_output)
+        _handle_tool_error(
+            e, tool="skyvern_validate", hint="Check the page state and validation prompt.", json_output=json_output
+        )
 
 
 @browser_app.command("run-task")
@@ -1043,10 +1188,16 @@ def run_task(
 
     try:
         result = asyncio.run(_run())
-        _emit_tool_result(result, json_output=json_output, action="run_task")
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="run_task",
+            telemetry_tool_name="skyvern_run_task",
+        )
     except typer.BadParameter:
         raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_run_task", ok=False, error=e)
         output_error(str(e), hint="Check the prompt, active connection, and timeout settings.", json_mode=json_output)
 
 
@@ -1109,10 +1260,16 @@ def login(
 
     try:
         result = asyncio.run(_run())
-        _emit_tool_result(result, json_output=json_output, action="login")
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="login",
+            telemetry_tool_name="skyvern_login",
+        )
     except typer.BadParameter:
         raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_login", ok=False, error=e)
         output_error(
             str(e), hint="Check credential inputs, active connection, and timeout settings.", json_mode=json_output
         )
@@ -1604,11 +1761,18 @@ def frame_switch(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_frame_switch", ok=True)
         output(data, action="frame_switch", json_mode=json_output)
-    except (ValueError, GuardError) as e:
-        output_error(str(e), hint="Use 'skyvern browser frame list' to find frames.", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        capture_cli_tool_call("skyvern_frame_switch", ok=False, error=e)
+        if isinstance(e, GuardError):
+            output_error(str(e), hint=e.hint, json_mode=json_output)
+        elif isinstance(e, ValueError):
+            output_error(str(e), hint="Use 'skyvern browser frame list' to find frames.", json_mode=json_output)
+        else:
+            output_error(str(e), json_mode=json_output)
 
 
 @frame_app.command("main")
@@ -1634,9 +1798,12 @@ def frame_main_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_frame_main", ok=True)
         output(data, action="frame_main", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_frame_main", hint="", json_output=json_output)
 
 
 @frame_app.command("list")
@@ -1656,9 +1823,12 @@ def frame_list_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_frame_list", ok=True)
         output(data, action="frame_list", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_frame_list", hint="", json_output=json_output)
 
 
 # ── State persistence commands ──────────────────────────────────────
@@ -1690,9 +1860,12 @@ def state_save_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_state_save", ok=True)
         output(data, action="state_save", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_state_save", hint="", json_output=json_output)
 
 
 @state_app.command("load")
@@ -1724,9 +1897,12 @@ def state_load_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_state_load", ok=True)
         output(data, action="state_load", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_state_load", hint="", json_output=json_output)
 
 
 # ── Web storage commands ────────────────────────────────────────────
@@ -1757,9 +1933,12 @@ def storage_get_session_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_get_session_storage", ok=True)
         output(data, action="get_session_storage", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_get_session_storage", hint="", json_output=json_output)
 
 
 @storage_app.command("set-session")
@@ -1781,9 +1960,12 @@ def storage_set_session_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_set_session_storage", ok=True)
         output(data, action="set_session_storage", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_set_session_storage", hint="", json_output=json_output)
 
 
 @storage_app.command("clear-session")
@@ -1805,9 +1987,12 @@ def storage_clear_session_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_clear_session_storage", ok=True)
         output(data, action="clear_session_storage", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_clear_session_storage", hint="", json_output=json_output)
 
 
 @storage_app.command("clear-local")
@@ -1829,9 +2014,12 @@ def storage_clear_local_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_clear_local_storage", ok=True)
         output(data, action="clear_local_storage", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_clear_local_storage", hint="", json_output=json_output)
 
 
 # ── Page JS errors command ───────────────────────────────────────────
@@ -1853,11 +2041,16 @@ def get_errors_cmd(
 
     try:
         result = asyncio.run(_run())
-        if result.get("ok"):
-            output(result["data"], action="get_errors", json_mode=json_output)
-        else:
-            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="get_errors",
+            telemetry_tool_name="skyvern_get_errors",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_get_errors", ok=False, error=e)
         output_error(str(e), json_mode=json_output)
 
 
@@ -1877,11 +2070,16 @@ def har_start_cmd(
 
     try:
         result = asyncio.run(_run())
-        if result.get("ok"):
-            output(result["data"], action="har_start", json_mode=json_output)
-        else:
-            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="har_start",
+            telemetry_tool_name="skyvern_har_start",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_har_start", ok=False, error=e)
         output_error(str(e), json_mode=json_output)
 
 
@@ -1898,11 +2096,16 @@ def har_stop_cmd(
 
     try:
         result = asyncio.run(_run())
-        if result.get("ok"):
-            output(result["data"], action="har_stop", json_mode=json_output)
-        else:
-            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="har_stop",
+            telemetry_tool_name="skyvern_har_stop",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_har_stop", ok=False, error=e)
         output_error(str(e), json_mode=json_output)
 
 
@@ -1928,9 +2131,12 @@ def get_html_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_get_html", ok=True)
         output(data, action="get_html", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_get_html", hint="", json_output=json_output)
 
 
 @browser_app.command("get-value")
@@ -1951,9 +2157,12 @@ def get_value_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_get_value", ok=True)
         output(data, action="get_value", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_get_value", hint="", json_output=json_output)
 
 
 @browser_app.command("get-styles")
@@ -1975,9 +2184,12 @@ def get_styles_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_get_styles", ok=True)
         output(data, action="get_styles", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_get_styles", hint="", json_output=json_output)
 
 
 # -- Semantic locator command --
@@ -2009,9 +2221,12 @@ def find_cmd(
 
     try:
         data = asyncio.run(_run())
+        capture_cli_tool_call("skyvern_find", ok=True)
         output(data, action="find", json_mode=json_output)
+    except typer.BadParameter:
+        raise
     except Exception as e:
-        output_error(str(e), json_mode=json_output)
+        _handle_tool_error(e, tool="skyvern_find", hint="", json_output=json_output)
 
 
 # ---------------------------------------------------------------------------
@@ -2031,11 +2246,16 @@ def clipboard_read_cmd(
 
     try:
         result = asyncio.run(_run())
-        if result.get("ok"):
-            output(result["data"], action="clipboard_read", json_mode=json_output)
-        else:
-            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="clipboard_read",
+            telemetry_tool_name="skyvern_clipboard_read",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_clipboard_read", ok=False, error=e)
         output_error(str(e), json_mode=json_output)
 
 
@@ -2054,9 +2274,14 @@ def clipboard_write_cmd(
 
     try:
         result = asyncio.run(_run())
-        if result.get("ok"):
-            output(result["data"], action="clipboard_write", json_mode=json_output)
-        else:
-            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+        _emit_tool_result(
+            result,
+            json_output=json_output,
+            action="clipboard_write",
+            telemetry_tool_name="skyvern_clipboard_write",
+        )
+    except typer.BadParameter:
+        raise
     except Exception as e:
+        capture_cli_tool_call("skyvern_clipboard_write", ok=False, error=e)
         output_error(str(e), json_mode=json_output)
