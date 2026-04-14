@@ -4377,6 +4377,8 @@ async def extract_information_for_navigation_goal(
                 cache_key=cache_key,
                 workflow_run_id=task.workflow_run_id,
                 cached_value=lookup_result.value,
+                # -1.0 sentinel marks "age unknown" so it's distinguishable in
+                # Datadog from "just-cached (0.0)".
                 cached_age_seconds=lookup_result.age_seconds if lookup_result.age_seconds is not None else -1.0,
                 llm_call=_shadow_llm_call,
                 schema=shadow_schema,

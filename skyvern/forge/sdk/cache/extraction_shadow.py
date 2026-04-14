@@ -9,7 +9,6 @@ errors are swallowed — shadow is best-effort.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
 from collections import Counter
@@ -99,9 +98,9 @@ def _collect_unique_item_paths(
         seen_refs = frozenset()
 
     ref = schema.get("$ref")
-    if isinstance(ref, str):
-        if ref in seen_refs:
-            return paths
+    if isinstance(ref, str) and ref not in seen_refs:
+        # Skip re-expanding a ref already in the current path (cycle guard),
+        # but fall through to scan any sibling keywords on this node.
         resolved = _resolve_ref(ref, root)
         if resolved is not None:
             paths.update(_collect_unique_item_paths(resolved, prefix, root=root, seen_refs=seen_refs | {ref}))
@@ -126,10 +125,6 @@ def _collect_unique_item_paths(
                 paths.update(_collect_unique_item_paths(branch, prefix, root=root, seen_refs=seen_refs))
 
     return paths
-
-
-def _json_key(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, default=str)
 
 
 def _canonical_form(value: Any, *, unique_item_paths: set[str], prefix: str) -> Any:
