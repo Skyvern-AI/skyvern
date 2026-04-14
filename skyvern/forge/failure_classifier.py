@@ -16,11 +16,12 @@ def classify_from_failure_reason(
     where the absence of a classification may simply mean the termination was
     user-guided / expected.
 
-    Categories:
+    Categories (16):
         ANTI_BOT_DETECTION, PROXY_ERROR, BROWSER_ERROR, NAVIGATION_FAILURE,
         PAGE_LOAD_TIMEOUT, AUTH_FAILURE, LLM_ERROR, CREDENTIAL_ERROR,
         DATA_EXTRACTION_FAILURE, ELEMENT_NOT_FOUND, WRONG_PAGE_STATE,
-        MAX_STEPS_EXCEEDED, INFRASTRUCTURE_ERROR, UNKNOWN
+        MAX_STEPS_EXCEEDED, LLM_REASONING_ERROR, INFRASTRUCTURE_ERROR,
+        PARAMETER_BINDING_ERROR, UNKNOWN
     """
     if not failure_reason and not exception:
         return None
@@ -187,6 +188,21 @@ def classify_from_failure_reason(
             {
                 "category": "LLM_REASONING_ERROR",
                 "confidence_float": 0.6,
+                "reasoning": "Keywords matched",
+            }
+        )
+
+    # Internal configuration mismatch — not a site/selector failure.
+    _param_binding_keywords = [
+        "should have already been set through workflow run parameters",
+        "should have already been set through workflow run context init",
+        "pre-run invariant: workflow_definition and persisted parameter rows disagree",
+    ]
+    if any(kw in reason for kw in _param_binding_keywords):
+        categories.append(
+            {
+                "category": "PARAMETER_BINDING_ERROR",
+                "confidence_float": 0.95,
                 "reasoning": "Keywords matched",
             }
         )
