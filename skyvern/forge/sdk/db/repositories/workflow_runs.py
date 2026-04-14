@@ -191,6 +191,9 @@ class WorkflowRunsRepository(BaseRepository):
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        started_at: datetime | None | object = _UNSET,
+        queued_at: datetime | None | object = _UNSET,
+        finished_at: datetime | None | object = _UNSET,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -242,6 +245,13 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.browser_profile_id = browser_profile_id
                 if failure_category is not None:
                     workflow_run.failure_category = failure_category
+                # Explicit timestamp overrides (used when resetting workflow runs)
+                if started_at is not _UNSET:
+                    workflow_run.started_at = started_at
+                if queued_at is not _UNSET:
+                    workflow_run.queued_at = queued_at
+                if finished_at is not _UNSET:
+                    workflow_run.finished_at = finished_at
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
