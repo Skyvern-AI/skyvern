@@ -11,9 +11,9 @@ from skyvern.forge.request_logging import (
     _REDACTED,
     _is_loggable_content_type,
     _is_sensitive_key,
-    _redact_sensitive_fields,
     _sanitize_body,
     _sanitize_response_body,
+    redact_sensitive_fields,
 )
 
 # ---------------------------------------------------------------------------
@@ -86,26 +86,26 @@ class TestIsSensitiveKey:
 
 
 # ---------------------------------------------------------------------------
-# _redact_sensitive_fields
+# redact_sensitive_fields
 # ---------------------------------------------------------------------------
 
 
 class TestRedactSensitiveFields:
     def test_redacts_password(self) -> None:
         data = {"username": "alice", "password": "secret123"}
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result["username"] == "alice"
         assert result["password"] == _REDACTED
 
     def test_redacts_nested_keys(self) -> None:
         data = {"user": {"api_key": "key123", "name": "bob"}}
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result["user"]["api_key"] == _REDACTED
         assert result["user"]["name"] == "bob"
 
     def test_redacts_in_lists(self) -> None:
         data = [{"token": "abc"}, {"name": "ok"}]
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result[0]["token"] == _REDACTED
         assert result[1]["name"] == "ok"
 
@@ -120,7 +120,7 @@ class TestRedactSensitiveFields:
             "api_key": "g",
             "Authorization": "h",
         }
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         for key in data:
             assert result[key] == _REDACTED, f"Expected {key} to be redacted"
 
@@ -132,7 +132,7 @@ class TestRedactSensitiveFields:
             "one_time_password": "xyz789",
             "mfa_code": "mfa42",
         }
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         for key in data:
             assert result[key] == _REDACTED, f"Expected {key} to be redacted"
 
@@ -145,7 +145,7 @@ class TestRedactSensitiveFields:
             "author": "alice",
             "token_count": 42,
         }
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result == data
 
     def test_depth_limit_prevents_crash(self) -> None:
@@ -156,7 +156,7 @@ class TestRedactSensitiveFields:
             current = current["nested"]
         current["password"] = "should_not_crash"
 
-        result = _redact_sensitive_fields(deep)
+        result = redact_sensitive_fields(deep)
         assert result is not None  # should not raise RecursionError
 
     def test_depth_limit_still_redacts_keys_at_boundary(self) -> None:
@@ -170,7 +170,7 @@ class TestRedactSensitiveFields:
         current["password"] = "leak_me"
         current["safe"] = "visible"
 
-        result = _redact_sensitive_fields(deep)
+        result = redact_sensitive_fields(deep)
         node = result["level"]
         for _ in range(19):
             node = node["next"]
@@ -179,13 +179,13 @@ class TestRedactSensitiveFields:
 
     def test_preserves_non_sensitive_values(self) -> None:
         data = {"status": "ok", "count": 42, "items": [1, 2, 3]}
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result == data
 
     def test_handles_non_dict_non_list(self) -> None:
-        assert _redact_sensitive_fields("hello") == "hello"
-        assert _redact_sensitive_fields(42) == 42
-        assert _redact_sensitive_fields(None) is None
+        assert redact_sensitive_fields("hello") == "hello"
+        assert redact_sensitive_fields(42) == 42
+        assert redact_sensitive_fields(None) is None
 
 
 # ---------------------------------------------------------------------------
