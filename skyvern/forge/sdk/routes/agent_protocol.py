@@ -283,6 +283,10 @@ async def run_task(
             run_type = RunType.openai_cua
         elif run_request.engine == RunEngine.anthropic_cua:
             run_type = RunType.anthropic_cua
+        elif run_request.engine == RunEngine.ui_tars:
+            run_type = RunType.ui_tars
+        elif run_request.engine == RunEngine.yutori_navigator:
+            run_type = RunType.yutori_navigator
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,

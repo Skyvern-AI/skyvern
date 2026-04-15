@@ -2508,6 +2508,10 @@ class LLMCaller:
         if self.llm_key and "UI_TARS" in self.llm_key:
             return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
+        # Route Yutori Navigator models to Yutori SDK
+        if self.llm_key and "YUTORI" in self.llm_key:
+            return await self._call_yutori_navigator(messages, timeout, **active_parameters)
+
         return await litellm.acompletion(
             model=self.llm_config.model_name,
             messages=messages,
@@ -2615,6 +2619,48 @@ class LLMCaller:
             timeout=timeout,
         )
         return response
+
+    async def _call_yutori_navigator(
+        self,
+        messages: list[dict[str, Any]],
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        **active_parameters: dict[str, Any],
+    ) -> ModelResponse:
+        """Call the Yutori Navigator API via the Yutori SDK client."""
+        from yutori.navigator import estimate_messages_size_bytes, trimmed_messages_to_fit
+
+        if not app.YUTORI_CLIENT:
+            raise ValueError("YUTORI_CLIENT not initialized. Ensure ENABLE_YUTORI=true and YUTORI_API_KEY is set.")
+
+        # Trim old screenshots if payload exceeds size limit
+        max_bytes = 9_500_000
+        if estimate_messages_size_bytes(messages) > max_bytes:
+            messages, _, removed = trimmed_messages_to_fit(messages, max_bytes=max_bytes)
+            if removed:
+                LOG.info("Trimmed old screenshots for payload size", removed=removed)
+
+        model_name = self.llm_config.model_name
+        tool_set = settings.YUTORI_TOOL_SET or None
+        max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
+
+        LOG.info(
+            "Yutori Navigator request",
+            model_name=model_name,
+            tool_set=tool_set,
+            messages_length=len(messages),
+        )
+
+        completion = await app.YUTORI_CLIENT.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+            tool_set=tool_set,
+            timeout=timeout,
+        )
+
+        # Convert to litellm ModelResponse for standard cost/stats tracking
+        response_dict = completion.model_dump()
+        return litellm.ModelResponse(**response_dict)
 
     async def get_call_stats(
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse

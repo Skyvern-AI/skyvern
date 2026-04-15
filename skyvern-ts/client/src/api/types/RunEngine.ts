@@ -6,5 +6,6 @@ export const RunEngine = {
     OpenaiCua: "openai-cua",
     AnthropicCua: "anthropic-cua",
     UiTars: "ui-tars",
+    YutoriNavigator: "yutori-navigator",
 } as const;
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];

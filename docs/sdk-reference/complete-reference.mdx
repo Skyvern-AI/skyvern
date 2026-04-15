@@ -694,6 +694,7 @@ request_options=RequestOptions(
 - `browser_profile_id` works with `run_workflow` only - silently ignored by `run_task`.
 - Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
 - Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
+- `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
 - `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
 - `page.agent` methods always wait for completion.
 - Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `fill_from_mapping`, `extract_form_fields`, `validate_mapping`, `fill_autocomplete`), iframe management (`frame_switch`, `frame_main`, `frame_list`).

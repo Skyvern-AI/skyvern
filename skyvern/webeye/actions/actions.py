@@ -134,6 +134,7 @@ class Action(BaseModel):
     # Explicit signal that this action's user-defined errors should bypass step retry.
     terminal_user_errors: bool = False
     data_extraction_goal: str | None = None
+    output: dict[str, Any] | list | str | None = None
 
     # WebAction fields
     file_name: str | None = None
@@ -211,8 +212,14 @@ class Action(BaseModel):
                 return ReloadPageAction.model_validate(value)
             elif action_type is ActionType.GOTO_URL:
                 return GotoUrlAction.model_validate(value)
+            elif action_type is ActionType.GO_BACK:
+                return GoBackAction.model_validate(value)
+            elif action_type is ActionType.GO_FORWARD:
+                return GoForwardAction.model_validate(value)
             elif action_type is ActionType.CLOSE_PAGE:
                 return ClosePageAction.model_validate(value)
+            elif action_type is ActionType.EXECUTE_JS:
+                return ExecuteJsAction.model_validate(value)
             else:
                 raise ValueError(f"Unsupported action type: {action_type}")
         else:
@@ -371,6 +378,14 @@ class GotoUrlAction(Action):
     is_magic_link: bool = False  # if True, shouldn't go to url directly when replaying the cache
 
 
+class GoBackAction(Action):
+    action_type: ActionType = ActionType.GO_BACK
+
+
+class GoForwardAction(Action):
+    action_type: ActionType = ActionType.GO_FORWARD
+
+
 class MoveAction(Action):
     action_type: ActionType = ActionType.MOVE
     x: int | None = None
@@ -394,6 +409,11 @@ class LeftMouseAction(Action):
     direction: Literal["down", "up"]
     x: int | None = None
     y: int | None = None
+
+
+class ExecuteJsAction(Action):
+    action_type: ActionType = ActionType.EXECUTE_JS
+    js_code: str
 
 
 class ScrapeResult(BaseModel):

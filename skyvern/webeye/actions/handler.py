@@ -2255,7 +2255,7 @@ async def handle_null_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    return [ActionSuccess()]
+    return [ActionSuccess(data=action.output)]
 
 
 @traced(name="skyvern.agent.action.select_option")
@@ -2971,6 +2971,39 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
+async def handle_go_back_action(
+    action: actions.GoBackAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.go_back(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    return [ActionSuccess()]
+
+
+async def handle_go_forward_action(
+    action: actions.GoForwardAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.go_forward(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    return [ActionSuccess()]
+
+
+async def handle_reload_page_action(
+    action: actions.ReloadPageAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    return [ActionSuccess()]
+
+
 @traced(name="skyvern.agent.action.close_page")
 async def handle_close_page_action(
     action: actions.ClosePageAction,
@@ -2981,6 +3014,23 @@ async def handle_close_page_action(
 ) -> list[ActionResult]:
     await page.close(reason=action.reasoning)
     return [ActionSuccess()]
+
+
+async def handle_execute_js_action(
+    action: actions.ExecuteJsAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    import json as _json
+
+    result = await page.evaluate(action.js_code)
+    if result is None:
+        return [ActionSuccess(data="undefined")]
+    if isinstance(result, str):
+        return [ActionSuccess(data=result)]
+    return [ActionSuccess(data=_json.dumps(result))]
 
 
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
@@ -3003,6 +3053,10 @@ ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verifica
 ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
 ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
 ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_action)
+ActionHandler.register_action_type(ActionType.GO_BACK, handle_go_back_action)
+ActionHandler.register_action_type(ActionType.GO_FORWARD, handle_go_forward_action)
+ActionHandler.register_action_type(ActionType.RELOAD_PAGE, handle_reload_page_action)
+ActionHandler.register_action_type(ActionType.EXECUTE_JS, handle_execute_js_action)
 
 
 def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:

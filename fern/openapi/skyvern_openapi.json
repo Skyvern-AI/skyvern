@@ -291,6 +291,7 @@
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
+                      "yutori_navigator": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -17352,10 +17353,11 @@
               "task_v2",
               "openai_cua",
               "anthropic_cua",
-              "ui_tars"
+              "ui_tars",
+              "yutori_navigator"
             ],
             "title": "Run Type",
-            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
+            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars, yutori_navigator"
           },
           "run_request": {
             "anyOf": [

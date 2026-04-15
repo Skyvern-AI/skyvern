@@ -24,11 +24,14 @@ class ActionType(StrEnum):
     VERIFICATION_CODE = "verification_code"
 
     GOTO_URL = "goto_url"
+    GO_BACK = "go_back"
+    GO_FORWARD = "go_forward"
     SCROLL = "scroll"
     KEYPRESS = "keypress"
     MOVE = "move"
     DRAG = "drag"
     LEFT_MOUSE = "left_mouse"
+    EXECUTE_JS = "execute_js"
 
     def is_web_action(self) -> bool:
         return self in [
