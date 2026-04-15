@@ -95,8 +95,8 @@ import {
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
   upgradeWorkflowDefinitionToVersionTwo,
+  getWorkflowErrors,
 } from "./workflowEditorUtils";
-import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
@@ -1053,7 +1053,13 @@ function FlowRenderer({
                 return (
                   change.type === "add" ||
                   change.type === "remove" ||
-                  change.type === "replace"
+                  change.type === "replace" ||
+                  // User drag-drop. `dragging === false` fires once at the
+                  // end of a drag gesture. Programmatic position updates
+                  // (mount-time layout, setNodes from node components)
+                  // leave `dragging` undefined, so this filter doesn't
+                  // falsely trip for them.
+                  (change.type === "position" && change.dragging === false)
                 );
               })
             ) {

@@ -16,6 +16,7 @@ def _reset_cache() -> None:
 
 def _key(**overrides: object) -> str:
     defaults: dict[str, object] = {
+        "call_path": "test",
         "element_tree": "<html><body>docs</body></html>",
         "extracted_text": "Document list",
         "current_url": "https://example.com/docs",
@@ -195,49 +196,6 @@ def test_none_and_empty_string_produce_different_keys() -> None:
     assert _key(data_extraction_goal=None) != _key(data_extraction_goal="")
 
 
-def test_rendered_prompt_path_identical_prompts_hit() -> None:
-    """Two calls with the same rendered prompt should produce the same key."""
-    prompt = "Extract docs.\nCurrent datetime, ISO format:\n2026-04-10T08:00:00\nDone."
-    key1 = extraction_cache.compute_cache_key(rendered_prompt=prompt, llm_key="gpt-4o")
-    key2 = extraction_cache.compute_cache_key(rendered_prompt=prompt, llm_key="gpt-4o")
-    assert key1 == key2
-
-
-def test_rendered_prompt_path_different_prompts_miss() -> None:
-    """Different rendered prompts must produce different keys."""
-    p1 = "Extract docs from list A\n2026-04-10T08:00:00"
-    p2 = "Extract docs from list B\n2026-04-10T08:00:00"
-    assert extraction_cache.compute_cache_key(rendered_prompt=p1) != extraction_cache.compute_cache_key(
-        rendered_prompt=p2
-    )
-
-
-def test_rendered_prompt_normalizes_timestamp_line() -> None:
-    """Same-day prompts with different ISO timestamps should hash identically."""
-    p1 = "Header\n2026-04-10T08:30:15.123456\nFooter"
-    p2 = "Header\n2026-04-10T23:59:59.999999\nFooter"
-    assert extraction_cache.compute_cache_key(rendered_prompt=p1) == extraction_cache.compute_cache_key(
-        rendered_prompt=p2
-    )
-
-
-def test_rendered_prompt_midnight_crossing_produces_miss() -> None:
-    """Different dates in the rendered prompt timestamp must produce different keys."""
-    p1 = "Header\n2026-04-10T23:59:59\nFooter"
-    p2 = "Header\n2026-04-11T00:00:01\nFooter"
-    assert extraction_cache.compute_cache_key(rendered_prompt=p1) != extraction_cache.compute_cache_key(
-        rendered_prompt=p2
-    )
-
-
-def test_rendered_prompt_llm_key_affects_hash() -> None:
-    """Same rendered prompt with different llm_key should produce different keys."""
-    prompt = "Extract docs\n2026-04-10T08:00:00"
-    k1 = extraction_cache.compute_cache_key(rendered_prompt=prompt, llm_key="gpt-4o")
-    k2 = extraction_cache.compute_cache_key(rendered_prompt=prompt, llm_key="claude-sonnet-4-6")
-    assert k1 != k2
-
-
 def test_lookup_refreshes_lru_position() -> None:
     """A cache hit should refresh the run's LRU position, preventing eviction."""
     max_runs = extraction_cache._MAX_WORKFLOW_RUNS
@@ -262,3 +220,261 @@ def test_lookup_refreshes_lru_position() -> None:
     assert oldest_after.hit is True
     assert oldest_after.value == {"v": 0}
     assert extraction_cache.lookup("wfr_1", key).hit is False  # evicted
+
+
+# ---------------------------------------------------------------------------
+# _canonical_url primitive
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalUrl:
+    def test_returns_none_for_none(self) -> None:
+        assert extraction_cache._canonical_url(None) is None
+
+    def test_returns_empty_for_empty(self) -> None:
+        assert extraction_cache._canonical_url("") == ""
+
+    def test_leaves_simple_url_unchanged(self) -> None:
+        assert extraction_cache._canonical_url("https://example.com/docs") == "https://example.com/docs"
+
+    def test_sorts_query_params_by_key(self) -> None:
+        assert extraction_cache._canonical_url("https://x/y?b=2&a=1") == "https://x/y?a=1&b=2"
+
+    def test_redacts_nonce_param_values_and_preserves_keys(self) -> None:
+        """Nonce values are replaced with a sentinel but keys are preserved so
+        presence/absence of the param still differentiates cache keys.
+        """
+        out = extraction_cache._canonical_url("https://x/y?a=1&_csrf=abc&b=2")
+        assert "_csrf=__NONCE__" in out
+        assert "a=1" in out and "b=2" in out
+
+    def test_same_nonce_key_different_values_produce_same_canonical(self) -> None:
+        """Two URLs that differ only in a nonce value must hash identically."""
+        a = extraction_cache._canonical_url("https://x/y?_csrf=abc")
+        b = extraction_cache._canonical_url("https://x/y?_csrf=xyz")
+        assert a == b
+
+    def test_nonce_key_absent_vs_present_produce_different_canonical(self) -> None:
+        """A URL with the nonce key absent must canonicalize differently than one with the key present."""
+        with_nonce = extraction_cache._canonical_url("https://x/y?_csrf=abc")
+        without = extraction_cache._canonical_url("https://x/y")
+        assert with_nonce != without
+
+    def test_empty_nonce_value_does_not_collide_with_populated_value(self) -> None:
+        """`?_csrf=` (empty) must canonicalize differently than `?_csrf=abc`."""
+        empty = extraction_cache._canonical_url("https://x/y?_csrf=")
+        populated = extraction_cache._canonical_url("https://x/y?_csrf=abc")
+        assert empty != populated
+        assert "_csrf=__NONCE__" not in empty
+
+    def test_bare_flag_does_not_collide_with_empty_value(self) -> None:
+        """`?flag` (no `=`) must canonicalize differently than `?flag=`."""
+        bare = extraction_cache._canonical_url("https://x/y?flag")
+        empty = extraction_cache._canonical_url("https://x/y?flag=")
+        assert bare != empty
+        assert bare.endswith("?flag")
+        assert empty.endswith("?flag=")
+
+    def test_preserves_fragment(self) -> None:
+        """SPAs with hash routing encode page identity in the fragment (e.g. `#/orders/123` vs
+        `#/orders/456`); stripping the fragment would collapse structurally-different pages."""
+        assert extraction_cache._canonical_url("https://x/y?a=1#section") == "https://x/y?a=1#section"
+
+    def test_different_fragments_produce_different_canonical(self) -> None:
+        """Hash-routed SPA URLs must canonicalize distinctly when the fragment differs."""
+        a = extraction_cache._canonical_url("https://x/y#/orders/123")
+        b = extraction_cache._canonical_url("https://x/y#/orders/456")
+        assert a != b
+
+    def test_preserves_duplicate_keys_in_order(self) -> None:
+        # Repeated keys can be semantically ordered (first-wins handlers,
+        # ordered multi-sort). Python's stable sort preserves insertion order
+        # within the same key.
+        url = "https://x/y?sort=price&sort=rating"
+        assert extraction_cache._canonical_url(url) == "https://x/y?sort=price&sort=rating"
+
+    def test_trailing_punctuation_is_not_stripped(self) -> None:
+        # _canonical_url operates on pre-parsed URL strings, not on URLs
+        # embedded in prose. Callers pass `current_url` directly.
+        assert extraction_cache._canonical_url("https://x/y.") == "https://x/y."
+
+    def test_malformed_url_returns_input_unchanged(self) -> None:
+        # Never raise — cache lookup must degrade gracefully.
+        assert extraction_cache._canonical_url("not a url at all") == "not a url at all"
+
+    def test_case_insensitive_nonce_match_redacts_value(self) -> None:
+        """Uppercase nonce keys are still matched; the value is redacted, the key preserved."""
+        out = extraction_cache._canonical_url("https://x/y?CSRF=abc&a=1")
+        assert "CSRF=__NONCE__" in out
+        assert "a=1" in out
+
+
+# ---------------------------------------------------------------------------
+# _canonical_element_tree primitive
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalElementTree:
+    def test_returns_none_for_none(self) -> None:
+        assert extraction_cache._canonical_element_tree(None) is None
+
+    def test_returns_empty_for_empty(self) -> None:
+        assert extraction_cache._canonical_element_tree("") == ""
+
+    def test_scrubs_uuid_in_id_attribute(self) -> None:
+        h1 = '<div id="3f8a9b12-1234-4678-9abc-def012345678">x</div>'
+        h2 = '<div id="fedcba98-8765-4321-abcd-123456789abc">x</div>'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_random_hex_suffix_in_id_attribute(self) -> None:
+        h1 = '<div id="row-abc123def">x</div>'
+        h2 = '<div id="row-fedcba987">x</div>'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_data_testid(self) -> None:
+        h1 = '<button data-testid="btn-1a2b3c4d">go</button>'
+        h2 = '<button data-testid="btn-5e6f7a8b">go</button>'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_leaves_class_and_href_untouched(self) -> None:
+        # class and href carry semantic weight — they must differentiate pages.
+        h1 = '<a class="btn primary" href="/docs">go</a>'
+        h2 = '<a class="btn danger" href="/docs">go</a>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_csrf_input_value(self) -> None:
+        h1 = '<input name="_csrf" value="abc123">'
+        h2 = '<input name="_csrf" value="zyx987">'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_csrf_meta_content(self) -> None:
+        h1 = '<meta name="csrf-token" content="abc123">'
+        h2 = '<meta name="csrf-token" content="zyx987">'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_canonical_element_tree_returns_string_for_valid_html(self) -> None:
+        # selectolax is permissive enough that we can't reliably force its
+        # parser to raise from pytest; the except-path fallback is exercised
+        # indirectly by the None/empty-string guards at the top of the function.
+        assert extraction_cache._canonical_element_tree("<div>ok</div>") is not None
+
+    def test_preserves_text_content(self) -> None:
+        out = extraction_cache._canonical_element_tree('<div id="x-abc123def">hello world</div>')
+        assert "hello world" in out
+
+    def test_different_text_produces_different_output(self) -> None:
+        out1 = extraction_cache._canonical_element_tree("<div>alpha</div>")
+        out2 = extraction_cache._canonical_element_tree("<div>beta</div>")
+        assert out1 != out2
+
+    def test_scrubs_csrf_input_case_insensitive(self) -> None:
+        """CSRF <input name=...> match must be case-insensitive, matching prior regex behavior."""
+        h1 = '<input name="CSRF_TOKEN" value="abc123">'
+        h2 = '<input name="CSRF_TOKEN" value="zyx987">'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_csrf_meta_case_insensitive(self) -> None:
+        """CSRF <meta name=...> match must be case-insensitive, matching prior regex behavior."""
+        h1 = '<meta name="CSRF-TOKEN" content="abc123">'
+        h2 = '<meta name="CSRF-TOKEN" content="zyx987">'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_semantic_input_name_values(self) -> None:
+        """<input name=...> values carry field-name semantics (not transient IDs).
+        Two forms with different input names must NOT collapse to the same canonical.
+        """
+        h1 = '<form><input name="company_name" type="text"><button>Go</button></form>'
+        h2 = '<form><input name="contact_phone" type="text"><button>Go</button></form>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_stable_business_ids_in_suspect_attrs(self) -> None:
+        """Semantic identifiers without transient patterns must survive canonicalization.
+
+        Only UUIDs and random-looking hex suffixes are redacted inside suspect
+        attributes; stable business IDs like id='submit-button' must differentiate.
+        """
+        h1 = '<button id="submit-button">go</button>'
+        h2 = '<button id="cancel-button">go</button>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_numeric_only_suffix_in_suspect_attrs(self) -> None:
+        """Purely numeric suffixes (e.g. 'order-123456') are stable business IDs; don't collapse them."""
+        h1 = '<div id="order-123456">go</div>'
+        h2 = '<div id="order-987654">go</div>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_hex_letter_only_english_words_in_suspect_attrs(self) -> None:
+        """Hex-letter-only strings like 'facade' or 'decade' are English words, not random IDs."""
+        h1 = '<div id="zone-facade">go</div>'
+        h2 = '<div id="zone-decade">go</div>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_non_v4_uuid_in_suspect_attrs(self) -> None:
+        """v1/v3/v5 UUIDs are deterministic / namespace-based and can be stable business keys."""
+        # v1 UUID (version nibble = 1) — must NOT be collapsed
+        h1 = '<div id="3f8a9b12-1234-1678-9abc-def012345678">x</div>'
+        h2 = '<div id="fedcba98-8765-1321-abcd-123456789abc">x</div>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_attr_case_insensitively(self) -> None:
+        """Even if a parser surfaces an uppercase attribute name, it must still match the suspect set."""
+        # selectolax 0.3.34 normalizes to lowercase, but we want robustness if that ever changes.
+        # Exercise via direct set membership: this test pins the lower() call.
+        h1 = '<div ID="3f8a9b12-1234-4678-9abc-def012345678">x</div>'
+        h2 = '<div ID="fedcba98-8765-4321-abcd-123456789abc">x</div>'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+
+# ---------------------------------------------------------------------------
+# compute_cache_key — structured-path canonicalization integration
+# ---------------------------------------------------------------------------
+
+
+def test_key_stable_across_nonce_params_in_url() -> None:
+    """current_url with different nonce param values should still hit."""
+    assert _key(current_url="https://x/y?a=1&_csrf=abc") == _key(current_url="https://x/y?a=1&_csrf=xyz")
+
+
+def test_key_stable_across_uuid_in_element_tree() -> None:
+    """element_tree with different UUIDs in id= attributes should still hit."""
+    h1 = '<div id="3f8a9b12-1234-4678-9abc-def012345678">doc</div>'
+    h2 = '<div id="fedcba98-8765-4321-abcd-123456789abc">doc</div>'
+    assert _key(element_tree=h1) == _key(element_tree=h2)
+
+
+def test_key_stable_across_csrf_token_in_element_tree() -> None:
+    """element_tree with different CSRF tokens should still hit."""
+    h1 = '<input name="_csrf" value="abc123">'
+    h2 = '<input name="_csrf" value="zyx987">'
+    assert _key(element_tree=h1) == _key(element_tree=h2)
+
+
+def test_key_stable_across_iso_timestamps_in_extracted_text() -> None:
+    """extracted_text with same-day ISO timestamps should still hit."""
+    t1 = "Report\n2026-04-10T08:30:15.123456\nEnd"
+    t2 = "Report\n2026-04-10T23:59:59.999999\nEnd"
+    assert _key(extracted_text=t1) == _key(extracted_text=t2)
+
+
+def test_key_changes_across_different_dates_in_extracted_text() -> None:
+    """Midnight crossing in extracted_text must produce a different key."""
+    t1 = "Report\n2026-04-10T23:59:59\nEnd"
+    t2 = "Report\n2026-04-11T00:00:01\nEnd"
+    assert _key(extracted_text=t1) != _key(extracted_text=t2)
+
+
+def test_call_path_discriminator_isolates_otherwise_identical_keys() -> None:
+    """Different call_paths must produce different keys even when every other
+    input is identical — guards against silent cross-path cache hits (e.g.
+    script path replaying an agent-path extraction result)."""
+    assert _key(call_path="handler") != _key(call_path="script")
+    assert _key(call_path="handler") != _key(call_path="agent")
+    assert _key(call_path="script") != _key(call_path="agent")
+
+
+def test_key_stable_across_iso_timestamps_in_data_extraction_goal() -> None:
+    """Same-day ISO timestamps in the goal (e.g. 'extract updated after <ts>')
+    must not cause per-second key churn."""
+    g1 = "Extract records updated after\n2026-04-10T08:30:15.123456\nonward"
+    g2 = "Extract records updated after\n2026-04-10T23:59:59.999999\nonward"
+    assert _key(data_extraction_goal=g1) == _key(data_extraction_goal=g2)

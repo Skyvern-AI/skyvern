@@ -42,7 +42,7 @@ Inputs:
 6. **Max Retries *(optional):*** the number of times a step can be retried if it fails
 7. **Complete on Download *(optional):*** Allows Skyvern to complete the task after a file has been downloaded
 8. **File Suffix *(optional):*** an identifier attached to the downloaded file
-9. **TOTP URL and TOTP Identifier *(optional):*** if you have an internal system where you can store the 2FA TOTP code, this URL calls on this storage space. The identifier allows you to link the code to the task, this is critical if you are running multiple tasks concurrently. [Contact us](https://www.skyvern.com/contact)
+9. **TOTP URL and TOTP Identifier *(optional):*** if you have an internal system where you can store the 2FA TOTP code, this URL calls on this storage space. The identifier allows you to link the code to the task, this is critical if you are running multiple tasks concurrently. [Contact us](https://www.skyvern.com/contact) if you would like to set up 2FA retreival in your workflows.
 10. **Parameters *(optional):*** parameters are self-defined placeholders that are specified run-to-run. They can either be workflow parameters, passed in via an API call, or output parameters, extracted from a previous task block. If specified, they are used by Skyvern to assist in the navigation, to fill out forms or further influence what actions to take on a website.
 
 
@@ -78,7 +78,7 @@ Iterate over something such as a CSV or the output of a previous block. The bloc
 Inputs: 
 
 1. **Loop Value *(required):*** This is the value that the loop will iterate over. For instance, if you have for every invoice ID, do X, invoice ID would be the value for this input.
-    * Please [contact us](https://www.skyvern.com/contact)
+    * Please [contact us](https://www.skyvern.com/contact) if you would like to add a loop block. Since we're in beta, the loop value needs to be parameterized from the backend.
   2. **Another block nested within the loop (required)**
 
 
@@ -222,7 +222,7 @@ Inputs:
 
 1. **Recipients *(required):*** a list of people who will receive the email separated by commas
 2. **Subject/Body *(optional):*** the header and body of an email
-3. **File attachments *(optional):*** since we’re still in beta, you will need to [contact us](https://www.skyvern.com/contact)
+3. **File attachments *(optional):*** since we’re still in beta, you will need to [contact us](https://www.skyvern.com/contact) to upload attachments to the email
 
 ## FileParserBlock
 
@@ -240,4 +240,4 @@ Downloads and parses a file to be used within other workflow blocks.
 Inputs: 
 
 1. **File URL *(required):*** This block allows you to use CSV, TSV, Excel, and PDF files within your workflow. 
-    * Since we’re still in beta, you will need to [contact us](https://www.skyvern.com/contact)
+    * Since we’re still in beta, you will need to [contact us](https://www.skyvern.com/contact) to load a value into this block

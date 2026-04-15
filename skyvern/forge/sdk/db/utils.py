@@ -225,6 +225,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         complete_criterion=task_obj.complete_criterion,
         terminate_criterion=task_obj.terminate_criterion,
         include_action_history_in_verification=task_obj.include_action_history_in_verification,
+        include_extracted_text=task_obj.include_extracted_text,
         webhook_callback_url=task_obj.webhook_callback_url,
         webhook_failure_reason=task_obj.webhook_failure_reason,
         totp_verification_url=task_obj.totp_verification_url,
@@ -298,6 +299,7 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
         reasoning_token_count=step_model.reasoning_token_count,
         cached_token_count=step_model.cached_token_count,
         step_cost=step_model.step_cost,
+        last_llm_model=step_model.last_llm_model,
         created_by=step_model.created_by,
     )
 
@@ -697,6 +699,7 @@ def convert_to_workflow_run_block(
         block.terminate_criterion = task.terminate_criterion
         block.complete_criterion = task.complete_criterion
         block.include_action_history_in_verification = task.include_action_history_in_verification
+        block.include_extracted_text = task.include_extracted_text
 
     return block
 

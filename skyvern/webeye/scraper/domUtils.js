@@ -2426,6 +2426,16 @@ function scrollToElementTop(element) {
  * https://stackoverflow.com/questions/17226676/how-to-simulate-a-mouseover-in-pure-javascript-that-activates-the-css-hover
  */
 async function getHoverStylesMap() {
+  // Cache hover styles for the page lifecycle. This means stylesheets
+  // injected after the first call (e.g., SPA lazy-loaded CSS) won't be
+  // parsed for hover rules — a known limitation, acceptable because:
+  // 1. Cross-origin sheets (Google Fonts, CDN) are static per page load
+  // 2. Dynamic CSS-in-JS (Emotion, styled-components) is same-origin and
+  //    readable via cssRules directly, not affected by this cache
+  if (window.globalHoverStylesMap) {
+    return window.globalHoverStylesMap;
+  }
+
   const hoverMap = new Map();
   const sheets = [...document.styleSheets];
 
@@ -2498,37 +2508,24 @@ async function getHoverStylesMap() {
             return;
           }
 
-          let newLink = null;
+          // Fetch cross-origin CSS and parse in memory to avoid modifying
+          // the DOM (which breaks React/MUI reconciliation). See SKY-8867.
           try {
-            const oldLink = sheet.ownerNode;
-            const url = new URL(sheet.href);
-            _jsConsoleLog("recreating the link element: ", sheet.href);
-            newLink = document.createElement("link");
-            newLink.rel = "stylesheet";
-            url.searchParams.set("v", Date.now());
-            newLink.href = url.toString();
-            newLink.crossOrigin = "anonymous";
-            // until the new link loaded, removing the old one
-            document.head.append(newLink);
-
-            // wait for a while until the sheet is fully loaded
-            await asyncSleepFor(1500);
-            const newSheets = [...document.styleSheets];
-            const refreshedSheet = newSheets.find(
-              (s) => s.href === newLink.href,
+            const response = await fetch(sheet.href, { mode: "cors" });
+            if (!response.ok) return;
+            const cssText = await response.text();
+            // Strip @import rules since replaceSync() doesn't support them.
+            // Hover styles behind @import are lost — acceptable tradeoff vs DOM mutation.
+            const cleanedCss = cssText.replace(/@import[^;]+;/g, "");
+            const tempSheet = new CSSStyleSheet();
+            tempSheet.replaceSync(cleanedCss);
+            parseCssSheet(tempSheet);
+          } catch (fetchError) {
+            _jsConsoleWarn(
+              "Could not fetch cross-origin stylesheet for hover analysis, skipping:",
+              sheet.href,
+              fetchError,
             );
-            if (!refreshedSheet) {
-              newLink.remove();
-              return;
-            }
-            _jsConsoleLog("parsing recreated the link element: ", newLink.href);
-            parseCssSheet(refreshedSheet);
-            oldLink.remove();
-          } catch (e) {
-            _jsConsoleWarn("Error recreating the link element:", e);
-            if (newLink) {
-              newLink.remove();
-            }
           }
         }
       }),
@@ -2537,6 +2534,7 @@ async function getHoverStylesMap() {
     _jsConsoleError("Error processing stylesheets:", e);
   }
 
+  window.globalHoverStylesMap = hoverMap;
   return hoverMap;
 }
 
@@ -2776,7 +2774,7 @@ async function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
-  window.globalHoverStylesMap = await getHoverStylesMap();
+  await getHoverStylesMap();
   window.globalParsedElementCounter = new SafeCounter();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   window.globalObserverForDOMIncrement.observe(document.body, {

@@ -1,9 +1,9 @@
-import CodeMirror, { EditorView } from "@uiw/react-codemirror";
+import CodeMirror, { EditorView, type Extension } from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { html } from "@codemirror/lang-html";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { useDebouncedCallback } from "use-debounce";
 
@@ -31,6 +31,13 @@ type Props = {
   className?: string;
   fontSize?: number;
   fullHeight?: boolean;
+  /**
+   * Additional CodeMirror extensions. Useful for per-use-case concerns
+   * like linting — e.g. the error_code_mapping editor passes a linter
+   * that flags whitespace-bearing keys inline on the offending line.
+   * Pass a stable (e.g. module-level) reference to avoid editor churn.
+   */
+  extraExtensions?: Extension[];
 } & Pick<React.HTMLAttributes<HTMLDivElement>, "aria-required">;
 
 const fullHeightExtension = EditorView.theme({
@@ -49,6 +56,7 @@ function CodeEditor({
   readOnly = false,
   fontSize = 12,
   fullHeight = false,
+  extraExtensions,
   ...restProps
 }: Props) {
   const viewRef = useRef<EditorView | null>(null);
@@ -67,13 +75,28 @@ function CodeEditor({
     debouncedOnChange(newValue);
   };
 
-  const extensions = language
-    ? [getLanguageExtension(language), lineWrap ? EditorView.lineWrapping : []]
-    : [lineWrap ? EditorView.lineWrapping : []];
+  // Memoize the extension tuple so React hands CodeMirror a stable
+  // reference across renders. Without this, a parent re-render would
+  // rebuild the array (and anything spread in) every cycle and trigger
+  // unnecessary editor state reconfiguration.
+  const extensions = useMemo<Extension[]>(() => {
+    const exts: Extension[] = language
+      ? [
+          getLanguageExtension(language),
+          lineWrap ? EditorView.lineWrapping : [],
+        ]
+      : [lineWrap ? EditorView.lineWrapping : []];
+    if (extraExtensions) {
+      exts.push(...extraExtensions);
+    }
+    if (fullHeight) {
+      exts.push(fullHeightExtension);
+    }
+    return exts;
+  }, [language, lineWrap, extraExtensions, fullHeight]);
 
   const style: React.CSSProperties = { fontSize };
   if (fullHeight) {
-    extensions.push(fullHeightExtension);
     style.height = "100%";
   }
 

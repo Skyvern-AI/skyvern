@@ -49,8 +49,10 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import structlog
+from selectolax.parser import HTMLParser
 
 LOG = structlog.get_logger()
 
@@ -117,14 +119,203 @@ _HIT_RATE_LOG_INTERVAL = 50  # log hit rate every N lookups
 _ISO_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T[\d:.+\-]+$", re.MULTILINE)
 
 
-def _normalize_prompt_datetime(prompt: str) -> str:
-    """Replace ISO timestamp lines in the prompt with their date-only prefix.
-
-    This lets us hash the rendered prompt directly without microsecond-level
-    timestamp churn defeating the cache. The actual prompt sent to the LLM is
-    unchanged; only the key-derivation copy is normalized.
+def _normalize_datetime_lines(text: str) -> str:
+    """Collapse ISO-timestamp-only lines to their date prefix so same-day calls
+    hash identically. Operates on any plain-text input (rendered prompts,
+    extracted text, etc.); only the key-derivation copy is normalized.
     """
-    return _ISO_LINE_RE.sub(lambda m: m.group(1), prompt)
+    return _ISO_LINE_RE.sub(lambda m: m.group(1), text)
+
+
+# Query parameter names treated as nondeterministic nonces/session tokens.
+# Values are replaced with a placeholder; the param is still kept so the
+# presence/absence of the param still matters. Only names that are
+# unambiguously cachebusters/CSRF/session markers are listed — ambiguous
+# short names like `state`, `token`, `sid`, `ts`, and `cb` (callback,
+# category, customer bucket) are excluded because redacting them risks
+# false cache hits when they're primary differentiators.
+_NONCE_PARAM_NAMES = frozenset(
+    {
+        "_",
+        "_csrf",
+        "authenticity_token",
+        "cache_buster",
+        "cachebuster",
+        "csrf",
+        "csrf_token",
+        "csrfmiddlewaretoken",
+        "csrftoken",
+        "nonce",
+        "session_id",
+        "sessionid",
+        "timestamp",
+    }
+)
+
+
+# Element attribute names whose values are treated as nondeterministic and
+# replaced with a sentinel during cache-key derivation. Scoped to identifier
+# attributes — values of `class`, `href`, `src`, `alt`, `title`, and `name`
+# are preserved because they typically differentiate real pages.
+# NOTE: `name` is intentionally excluded — <input name="field_name"> carries
+# semantic field identity (not a transient ID) and must differentiate pages.
+_SUSPECT_ATTR_NAMES = frozenset(
+    {
+        "id",
+        "for",
+        "aria-labelledby",
+        "aria-describedby",
+        "data-testid",
+    }
+)
+
+# <input name="..."> values that are CSRF/anti-forgery tokens. The value is
+# replaced with "" (empty string) during canonicalization.
+_CSRF_INPUT_NAMES = frozenset(
+    {
+        "_csrf",
+        "_token",
+        "authenticity_token",
+        "csrf",
+        "csrf_token",
+        "csrfmiddlewaretoken",
+        "csrftoken",
+        "__requestverificationtoken",
+    }
+)
+
+# <meta name="..."> values that carry CSRF tokens in `content=`.
+_CSRF_META_NAMES = frozenset({"csrf-token", "csrf_token", "_csrf"})
+
+_NONCE_VALUE_SENTINEL = "__NONCE__"
+
+# Matches UUID v4 substrings inside an attribute value. v4 is random; v1/v3/v5
+# are time- or namespace-based and can be stable business keys, so we leave
+# them alone to avoid collapsing genuinely different entities into one key.
+_UUID_V4_IN_VALUE_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+# Matches a random-looking hex suffix preceded by a `-`, `_`, or `:` delimiter
+# inside an attribute value. Two lookaheads anchor the "random" shape:
+#   - ``(?=[0-9a-f]*[a-f])`` keeps purely numeric suffixes like ``order-123456``
+#     intact — those are typically stable business IDs.
+#   - ``(?=[0-9a-f]*[0-9])`` keeps hex-letter-only English words like ``facade``
+#     or ``decade`` intact — collapsing them would introduce false cache hits.
+_TRANSIENT_HEX_SUFFIX_IN_VALUE_RE = re.compile(
+    r"(?<=[-_:])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{6,}",
+    re.IGNORECASE,
+)
+
+
+def _redact_transient_in_value(value: str) -> str:
+    """Replace UUID-v4 and random-hex-suffix substrings within an attribute value.
+
+    Preserves stable business IDs (``id="submit-button"``, ``id="order-123456"``,
+    ``id="zone-facade"``) while collapsing rotating IDs (``id="item-3f8a9b12…"``,
+    ``data-testid="btn-1a2b3c4d"``).
+    """
+    value = _UUID_V4_IN_VALUE_RE.sub("__UUID__", value)
+    value = _TRANSIENT_HEX_SUFFIX_IN_VALUE_RE.sub("__TID__", value)
+    return value
+
+
+def _canonical_url(url: str | None) -> str | None:
+    """Return a canonical form of ``url`` for cache-key derivation.
+
+    Redacts nonce query *values* (keys in ``_NONCE_PARAM_NAMES``) to
+    ``_NONCE_VALUE_SENTINEL`` while keeping the param itself so presence/absence
+    still differentiates cache keys, and sorts remaining pairs by lowercased key.
+    Fragments are preserved because SPAs use hash routing
+    (``#/orders/123`` vs ``#/orders/456``) to encode page identity; stripping
+    would collapse structurally-different pages into the same key.
+    Scheme and host casing are NOT normalized — URLs come from the browser so
+    case variance is rare; flag if we see misses driven by it.
+    Path segments are NOT normalized — URLs that embed session tokens in the
+    path (``/session/abc123/docs``) will produce distinct keys per session; if
+    this becomes a hit-rate concern we can extend the canonicalization.
+    Never raises; on a malformed input that ``urlparse`` can't round-trip we
+    return the original string so cache lookup degrades gracefully.
+    """
+    if url is None:
+        return None
+    if url == "":
+        return ""
+    try:
+        parsed = urlparse(url)
+        # Manual split so `?flag` (bare) and `?flag=` (empty value) stay
+        # distinct. parse_qsl collapses both to ('flag', ''), which produced
+        # false cache hits when both forms appeared for the same key.
+        triples: list[tuple[str, str, bool]] = []
+        for seg in parsed.query.split("&"):
+            if not seg:
+                continue
+            if "=" in seg:
+                k, _, v = seg.partition("=")
+                triples.append((k, v, True))
+            else:
+                triples.append((seg, "", False))
+        # Only redact when the nonce has a non-empty value; `?nonce=` keeps
+        # its empty value so it doesn't collide with `?nonce=abc`.
+        canonicalized = [
+            (k, _NONCE_VALUE_SENTINEL if v and k.lower() in _NONCE_PARAM_NAMES else v, has_eq)
+            for k, v, has_eq in triples
+        ]
+        canonicalized.sort(key=lambda p: p[0].lower())
+        new_query = "&".join(f"{k}={v}" if has_eq else k for k, v, has_eq in canonicalized)
+        return urlunparse(parsed._replace(query=new_query))
+    except (ValueError, TypeError):
+        return url
+
+
+def _canonical_element_tree(html: str | None) -> str | None:
+    """Return a canonicalized HTML string for cache-key derivation.
+
+    Redacts UUID-v4 / random-hex-suffix substrings within identifier-style
+    attribute values (id/for/aria-*/data-testid) and zeros CSRF-token
+    <input>/<meta> contents. Stable business IDs (``id='submit-button'``,
+    ``id='order-123456'``) and semantic fields (``class``, ``href``, ``src``,
+    ``name``, text content, document structure) are preserved.
+
+    Never raises. Returns the input unchanged if parsing fails.
+    """
+    if html is None:
+        return None
+    if html == "":
+        return ""
+    try:
+        tree = HTMLParser(html)
+        for node in tree.root.traverse(include_text=False):
+            if not node.attributes:
+                continue
+            tag = node.tag
+
+            # CSRF scrubbing reads `name` before the sentinel pass so it is
+            # always available regardless of _SUSPECT_ATTR_NAMES membership.
+            if tag == "input":
+                input_name = (node.attributes.get("name", "") or "").lower()
+                if input_name in _CSRF_INPUT_NAMES:
+                    node.attrs["value"] = ""
+            elif tag == "meta":
+                meta_name = (node.attributes.get("name", "") or "").lower()
+                if meta_name in _CSRF_META_NAMES:
+                    node.attrs["content"] = ""
+
+            # Pattern-based value redaction inside suspect attributes: UUIDs
+            # and random hex suffixes collapse; stable business IDs survive.
+            for attr_name in list(node.attributes.keys()):
+                if attr_name.lower() in _SUSPECT_ATTR_NAMES:
+                    current_val = node.attributes.get(attr_name) or ""
+                    node.attrs[attr_name] = _redact_transient_in_value(current_val)
+
+        # selectolax's html property returns the full serialized tree
+        return tree.html or html
+    except Exception:
+        # WARNING rather than DEBUG so a transient parser regression surfaces
+        # in Datadog instead of silently degrading cache hits.
+        LOG.warning("canonical_element_tree_failed", exc_info=True)
+        return html
 
 
 def _normalize(value: Any) -> str:
@@ -141,6 +332,7 @@ def _normalize(value: Any) -> str:
 
 def compute_cache_key(
     *,
+    call_path: str,
     element_tree: str | None = None,
     extracted_text: str | None = None,
     current_url: str | None = None,
@@ -151,57 +343,41 @@ def compute_cache_key(
     previous_extracted_information: Any = None,
     llm_key: str | None = None,
     local_datetime: str | None = None,
-    rendered_prompt: str | None = None,
 ) -> str:
     """Return a stable sha256 hex digest for the inputs that affect extraction output.
 
-    Preferred usage: pass `rendered_prompt` (the fully-rendered extract-information
-    prompt string) together with `llm_key` and `local_datetime`. This captures
-    any prompt transformations (economy element tree, 2/3 truncation) applied
-    inside `load_prompt_with_elements`, so the cache key matches exactly what
-    goes to the LLM.
-
-    Legacy usage: the loose-field parameters (element_tree, extracted_text, …)
-    are retained for tests and backward compatibility. They are ignored when
-    `rendered_prompt` is provided.
-
-    Note: screenshots are passed to the LLM as multimodal input but are NOT
-    included in the cache key. For the target loop pattern (same URL, same DOM
-    on each re-visit), screenshots are expected to be visually identical when
-    the element tree and extracted text match. If this assumption proves wrong
-    (e.g. dynamic overlays), we can add a SHA-256 of the screenshot bytes as
-    a follow-up.
+    ``call_path`` is a required discriminator so different callsites (agent,
+    handler, script) never collide even when their other inputs happen to
+    hash identically — e.g. when ``ai_extract`` runs on a goal with no
+    ``{{ var }}`` substitutions and no nav context, all other parts can match
+    ``extract_information_for_navigation_goal``'s inputs and produce the same
+    SHA otherwise.
     """
 
     def _s(v: str | None) -> str:
         """Map None to a sentinel so None and '' hash differently."""
         return _NULL_SENTINEL if v is None else v
 
-    # Truncate local_datetime to date-only (YYYY-MM-DD) so the key is stable
-    # within a single run but changes across midnight for date-relative goals.
     date_only = local_datetime[:10] if local_datetime and len(local_datetime) >= 10 else _s(local_datetime)
 
-    if rendered_prompt is not None:
-        # Normalize the local_datetime line inside the rendered prompt so that
-        # two calls on the same day produce the same hash. The template emits
-        # the full ISO timestamp on its own line; strip sub-date precision
-        # before hashing.
-        normalized_prompt = _normalize_prompt_datetime(rendered_prompt)
-        parts = [normalized_prompt, _s(llm_key)]
-    else:
-        parts = [
-            _s(element_tree),
-            _s(extracted_text),
-            _s(current_url),
-            _s(data_extraction_goal),
-            _normalize(extracted_information_schema),
-            _normalize(navigation_payload),
-            _normalize(error_code_mapping),
-            _normalize(previous_extracted_information),
-            _s(llm_key),
-            date_only,
-        ]
-    # Use a delimiter that cannot appear inside any part naturally.
+    canonical_url = _canonical_url(current_url)
+    canonical_element_tree = _canonical_element_tree(element_tree)
+    canonical_extracted_text = _normalize_datetime_lines(extracted_text) if extracted_text is not None else None
+    canonical_goal = _normalize_datetime_lines(data_extraction_goal) if data_extraction_goal is not None else None
+
+    parts = [
+        call_path,
+        _s(canonical_element_tree),
+        _s(canonical_extracted_text),
+        _s(canonical_url),
+        _s(canonical_goal),
+        _normalize(extracted_information_schema),
+        _normalize(navigation_payload),
+        _normalize(error_code_mapping),
+        _normalize(previous_extracted_information),
+        _s(llm_key),
+        date_only,
+    ]
     joined = "\x1f".join(parts).encode("utf-8", errors="replace")
     return hashlib.sha256(joined).hexdigest()
 
@@ -282,7 +458,11 @@ def _maybe_log_hit_rate() -> None:
 
 
 def store(workflow_run_id: str | None, cache_key: str, result: Any) -> None:
-    """Store an extraction result for later reuse within the same workflow run."""
+    """Store an extraction result for later reuse within the same workflow run.
+
+    No size bound today — extraction results are typically small JSON. Revisit
+    when the v4 Redis transition lands and introduces a per-entry byte cap.
+    """
     if not workflow_run_id:
         return
     if workflow_run_id in _CACHE:

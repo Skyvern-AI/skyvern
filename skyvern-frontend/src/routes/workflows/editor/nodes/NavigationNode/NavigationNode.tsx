@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Flippable } from "@/components/Flippable";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
@@ -7,7 +7,6 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -16,14 +15,12 @@ import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
-import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
-import type { NavigationNode } from "./types";
-import { MAX_STEPS_DEFAULT } from "./types";
+import { type NavigationNode, MAX_STEPS_DEFAULT } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import {
@@ -399,7 +396,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 />
               </div>
               <div className="space-y-2">
-                <div className="flex gap-4">
+                <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
                       Error Messages
@@ -408,30 +405,31 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       content={helpTooltips["navigation"]["errorCodeMapping"]}
                     />
                   </div>
-                  <Checkbox
-                    checked={data.errorCodeMapping !== "null"}
-                    disabled={!editable}
-                    onCheckedChange={(checked) => {
-                      update({
-                        errorCodeMapping: checked
-                          ? JSON.stringify(errorMappingExampleValue, null, 2)
-                          : "null",
-                      });
-                    }}
-                  />
-                </div>
-                {data.errorCodeMapping !== "null" && (
-                  <div>
-                    <CodeEditor
-                      language="json"
-                      value={data.errorCodeMapping}
-                      onChange={(value) => {
-                        update({ errorCodeMapping: value });
+                  <div className="w-52">
+                    <Switch
+                      checked={data.errorCodeMapping !== "null"}
+                      onCheckedChange={(checked) => {
+                        if (!editable) {
+                          return;
+                        }
+                        update({
+                          errorCodeMapping: checked
+                            ? JSON.stringify(errorMappingExampleValue, null, 2)
+                            : "null",
+                        });
                       }}
-                      className="nopan"
-                      fontSize={8}
                     />
                   </div>
+                </div>
+                {data.errorCodeMapping !== "null" && (
+                  <ErrorCodeMappingEditor
+                    label={data.label}
+                    value={data.errorCodeMapping}
+                    onChange={(value) => {
+                      update({ errorCodeMapping: value });
+                    }}
+                    readOnly={!editable}
+                  />
                 )}
               </div>
               <BlockExecutionOptions

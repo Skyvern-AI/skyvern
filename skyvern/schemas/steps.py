@@ -22,6 +22,7 @@ class AgentStepOutput(BaseModel):
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None = None
     errors: list[UserDefinedError] = []
     browser_metadata: BrowserMetadata | None = None
+    step_exception: str | None = None
 
     def __repr__(self) -> str:
         return f"AgentStepOutput({self.model_dump()})"

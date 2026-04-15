@@ -2,6 +2,7 @@
 
 import * as Skyvern from "./api/index.js";
 import { Artifacts } from "./api/resources/artifacts/client/Client.js";
+import { Schedules } from "./api/resources/schedules/client/Client.js";
 import { Scripts } from "./api/resources/scripts/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
@@ -19,6 +20,7 @@ export class SkyvernClient {
     protected readonly _options: SkyvernClient.Options;
     protected _artifacts: Artifacts | undefined;
     protected _scripts: Scripts | undefined;
+    protected _schedules: Schedules | undefined;
 
     constructor(_options: SkyvernClient.Options = {}) {
         this._options = {
@@ -28,8 +30,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.30",
-                    "User-Agent": "@skyvern/client/1.0.30",
+                    "X-Fern-SDK-Version": "1.0.31",
+                    "User-Agent": "@skyvern/client/1.0.31",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -44,6 +46,10 @@ export class SkyvernClient {
 
     public get scripts(): Scripts {
         return (this._scripts ??= new Scripts(this._options));
+    }
+
+    public get schedules(): Schedules {
+        return (this._schedules ??= new Schedules(this._options));
     }
 
     /**
@@ -1970,7 +1976,7 @@ export class SkyvernClient {
      * @example
      *     import { createReadStream } from "fs";
      *     await client.uploadFile({
-     *         file: fs.createReadStream("/path/to/your/file")
+     *         file: "file"
      *     })
      */
     public uploadFile(
@@ -1985,7 +1991,7 @@ export class SkyvernClient {
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.UploadFileResponse>> {
         const _request = await core.newFormData();
-        await _request.appendFile("file", request.file);
+        _request.append("file", request.file);
         const _maybeEncodedRequest = await _request.getRequest();
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,

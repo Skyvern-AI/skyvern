@@ -22,6 +22,7 @@ from skyvern.client.types import WorkflowCreateYamlRequest
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
@@ -526,7 +527,7 @@ def _load_definition_dict(definition: str, fmt: str) -> tuple[dict[str, Any] | N
 
     if fmt == "yaml":
         try:
-            return _as_dict(yaml.safe_load(definition), "yaml")
+            return _as_dict(safe_load_no_dates(definition), "yaml")
         except yaml.YAMLError:
             return None, None
 
@@ -534,7 +535,7 @@ def _load_definition_dict(definition: str, fmt: str) -> tuple[dict[str, Any] | N
         return _as_dict(json.loads(definition), "json")
     except (json.JSONDecodeError, TypeError):
         try:
-            return _as_dict(yaml.safe_load(definition), "yaml")
+            return _as_dict(safe_load_no_dates(definition), "yaml")
         except yaml.YAMLError:
             return None, None
 

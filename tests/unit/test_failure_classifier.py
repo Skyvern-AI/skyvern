@@ -310,6 +310,22 @@ class TestLLMReasoningError:
         assert "LLM_REASONING_ERROR" in categories
 
 
+class TestParameterBindingError:
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "Value should have already been set through workflow run parameters",
+            "Context should have already been set through workflow run context init",
+            "Pre-run invariant: workflow_definition and persisted parameter rows disagree",
+        ],
+    )
+    def test_keywords_match(self, reason: str) -> None:
+        result = classify_from_failure_reason(reason)
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "PARAMETER_BINDING_ERROR" in categories
+
+
 class TestMultipleCategories:
     def test_captcha_and_max_steps(self) -> None:
         """A max_steps failure caused by captcha should return both categories."""

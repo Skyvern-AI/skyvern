@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from sqlalchemy import exists, func, or_, select, update
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.forge.sdk.db._error_handling import db_operation
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db._soft_delete import exclude_deleted
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -27,12 +28,44 @@ from skyvern.forge.sdk.db.models import (
     WorkflowScheduleModel,
     WorkflowTemplateModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import convert_to_workflow, serialize_proxy_location
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
 
 LOG = structlog.get_logger()
+
+
+def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> None:
+    """Rebind each block's ``output_parameter`` to the reconciled instance
+    from ``workflow_definition.parameters`` by key, recursing into
+    ``ForLoopBlock.loop_blocks``.
+
+    The reconcile helper mutates IDs on the top-level parameters list only.
+    When a caller round-trips the definition through
+    ``model_validate(model_dump(...))`` or constructs blocks with fresh
+    ``OutputParameter`` instances, the block-level field is a distinct
+    object from the top-level entry and won't pick up the reconciled ID
+    unless we rebind it here.
+    """
+    key_to_output_parameter: dict[str, OutputParameter] = {
+        p.key: p for p in workflow_definition.parameters if isinstance(p, OutputParameter)
+    }
+    if not key_to_output_parameter:
+        return
+
+    def _visit(blocks: list[Block]) -> None:
+        for block in blocks:
+            canonical = key_to_output_parameter.get(block.output_parameter.key)
+            if canonical is not None and canonical is not block.output_parameter:
+                block.output_parameter = canonical
+            if isinstance(block, ForLoopBlock):
+                _visit(block.loop_blocks)
+
+    _visit(workflow_definition.blocks)
 
 
 class WorkflowsRepository(BaseRepository):
@@ -551,6 +584,15 @@ class WorkflowsRepository(BaseRepository):
         cache_key: str | None = None,
         status: str | None = None,
         import_error: str | None = None,
+        proxy_location: ProxyLocationInput | object = _UNSET,
+        webhook_callback_url: str | None | object = _UNSET,
+        persist_browser_session: bool | None = None,
+        model: dict[str, Any] | None | object = _UNSET,
+        max_screenshot_scrolling_times: int | None | object = _UNSET,
+        extra_http_headers: dict[str, str] | None | object = _UNSET,
+        ai_fallback: bool | None = None,
+        run_sequentially: bool | None = None,
+        sequential_key: str | None | object = _UNSET,
     ) -> Workflow:
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -575,6 +617,24 @@ class WorkflowsRepository(BaseRepository):
                     workflow.status = status
                 if import_error is not None:
                     workflow.import_error = import_error
+                if proxy_location is not _UNSET:
+                    workflow.proxy_location = serialize_proxy_location(cast(ProxyLocationInput, proxy_location))
+                if webhook_callback_url is not _UNSET:
+                    workflow.webhook_callback_url = webhook_callback_url
+                if persist_browser_session is not None:
+                    workflow.persist_browser_session = persist_browser_session
+                if model is not _UNSET:
+                    workflow.model = model
+                if max_screenshot_scrolling_times is not _UNSET:
+                    workflow.max_screenshot_scrolling_times = max_screenshot_scrolling_times
+                if extra_http_headers is not _UNSET:
+                    workflow.extra_http_headers = extra_http_headers
+                if ai_fallback is not None:
+                    workflow.ai_fallback = ai_fallback
+                if run_sequentially is not None:
+                    workflow.run_sequentially = run_sequentially
+                if sequential_key is not _UNSET:
+                    workflow.sequential_key = sequential_key
                 await session.commit()
                 await session.refresh(workflow)
                 is_template = (
@@ -592,6 +652,123 @@ class WorkflowsRepository(BaseRepository):
                 )
             else:
                 raise NotFoundError("Workflow not found")
+
+    @db_operation("update_workflow_and_reconcile_definition_params")
+    async def update_workflow_and_reconcile_definition_params(
+        self,
+        workflow_id: str,
+        organization_id: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        workflow_definition: WorkflowDefinition | None = None,
+        version: int | None = None,
+        run_with: str | None = None,
+        cache_key: str | None = None,
+        status: str | None = None,
+        import_error: str | None = None,
+        proxy_location: ProxyLocationInput | object = _UNSET,
+        webhook_callback_url: str | None | object = _UNSET,
+        persist_browser_session: bool | None = None,
+        model: dict[str, Any] | None | object = _UNSET,
+        max_screenshot_scrolling_times: int | None | object = _UNSET,
+        extra_http_headers: dict[str, str] | None | object = _UNSET,
+        ai_fallback: bool | None = None,
+        run_sequentially: bool | None = None,
+        sequential_key: str | None | object = _UNSET,
+    ) -> Workflow:
+        """One-session, one-commit update of the workflow row + definition-parameter rows.
+
+        Reconciles ``WorkflowParameter`` and ``OutputParameter`` rows in the
+        same session as the JSON dump so those two stay aligned.
+
+        Credential-subclass parameters (``AWSSecretParameter``, ``Bitwarden*``,
+        ``CredentialParameter``, ``OnePasswordCredentialParameter``,
+        ``AzureVaultCredentialParameter``) and ``ContextParameter`` are
+        intentionally out of scope: runtime resolves them off the JSON
+        ``workflow_definition`` column (see
+        ``WorkflowService._resolve_login_block_browser_profile_id`` which
+        reads ``credential_id`` directly off the ``CredentialParameter``
+        pydantic instance), not by joining the credential side tables.  The
+        side tables remain populated by the YAML create path via
+        ``save_workflow_definition_parameters`` and are used for workflow
+        search/metadata; in-place edits via this method may leave the
+        side-table metadata stale relative to the JSON until the next YAML
+        round-trip.  That trade-off is deliberate — the alternative (sync
+        every credential subclass's columns on every write) pulls a
+        significant amount of orthogonal logic into this path.
+        """
+        async with self.Session() as session:
+            get_workflow_query = exclude_deleted(
+                select(WorkflowModel).filter_by(workflow_id=workflow_id), WorkflowModel
+            )
+            if organization_id:
+                get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+            workflow = (await session.scalars(get_workflow_query)).first()
+            if not workflow:
+                raise NotFoundError("Workflow not found")
+
+            if title is not None:
+                workflow.title = title
+            if description is not None:
+                workflow.description = description
+            # Reconcile first: it mutates parameter IDs to match preserved DB
+            # rows, so the subsequent JSON dump carries the canonical IDs.
+            if workflow_definition is not None:
+                await WorkflowParametersRepository._reconcile_definition_parameters_in_session(
+                    session,
+                    workflow_id,
+                    list(workflow_definition.parameters),
+                )
+                # Propagate reconciled output-parameter IDs onto block-level
+                # `output_parameter` references so the serialized JSON does
+                # not depend on caller-side object identity between the
+                # top-level parameters list and each block's field.
+                _align_block_output_parameters(workflow_definition)
+                workflow.workflow_definition = workflow_definition.model_dump(mode="json")
+            if version is not None:
+                workflow.version = version
+            if run_with is not None:
+                workflow.run_with = run_with
+            if cache_key is not None:
+                workflow.cache_key = cache_key
+            if status is not None:
+                workflow.status = status
+            if import_error is not None:
+                workflow.import_error = import_error
+            if proxy_location is not _UNSET:
+                workflow.proxy_location = serialize_proxy_location(cast(ProxyLocationInput, proxy_location))
+            if webhook_callback_url is not _UNSET:
+                workflow.webhook_callback_url = webhook_callback_url
+            if persist_browser_session is not None:
+                workflow.persist_browser_session = persist_browser_session
+            if model is not _UNSET:
+                workflow.model = model
+            if max_screenshot_scrolling_times is not _UNSET:
+                workflow.max_screenshot_scrolling_times = max_screenshot_scrolling_times
+            if extra_http_headers is not _UNSET:
+                workflow.extra_http_headers = extra_http_headers
+            if ai_fallback is not None:
+                workflow.ai_fallback = ai_fallback
+            if run_sequentially is not None:
+                workflow.run_sequentially = run_sequentially
+            if sequential_key is not _UNSET:
+                workflow.sequential_key = sequential_key
+
+            await session.commit()
+            await session.refresh(workflow)
+            is_template = (
+                await self.is_workflow_template(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=workflow.organization_id,
+                )
+                if organization_id
+                else False
+            )
+            return convert_to_workflow(
+                workflow,
+                self.debug_enabled,
+                is_template=is_template,
+            )
 
     @db_operation("soft_delete_workflow_and_schedules_by_permanent_id")
     async def soft_delete_workflow_and_schedules_by_permanent_id(

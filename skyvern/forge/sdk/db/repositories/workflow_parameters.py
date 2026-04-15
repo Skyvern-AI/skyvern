@@ -259,11 +259,120 @@ class WorkflowParametersRepository(BaseRepository):
                 session.add(model)
             await session.commit()
 
+    @staticmethod
+    def _encode_workflow_parameter_default(parameter: WorkflowParameter) -> str | None:
+        if parameter.default_value is None:
+            return None
+        if parameter.workflow_parameter_type == WorkflowParameterType.JSON:
+            return json.dumps(parameter.default_value)
+        return str(parameter.default_value)
+
+    @staticmethod
+    async def _reconcile_definition_parameters_in_session(
+        session: Any,
+        workflow_id: str,
+        parameters: list[PARAMETER_TYPE],
+    ) -> None:
+        """Reconcile persisted WorkflowParameter + OutputParameter rows against ``parameters``.
+
+        Preserves primary keys on in-place updates (workflow-run FKs reference
+        them) and mutates each matched incoming parameter so its ID equals the
+        DB row's ID — the caller must re-serialize ``workflow_definition``
+        AFTER this call so the JSON carries the preserved IDs.
+        """
+        desired_workflow_params: list[WorkflowParameter] = [p for p in parameters if isinstance(p, WorkflowParameter)]
+        desired_output_params: list[OutputParameter] = [p for p in parameters if isinstance(p, OutputParameter)]
+
+        existing_workflow_rows = (
+            await session.scalars(select(WorkflowParameterModel).filter_by(workflow_id=workflow_id))
+        ).all()
+        existing_by_identity: dict[tuple[str, str], WorkflowParameterModel] = {}
+        existing_by_key_all_types: dict[str, list[WorkflowParameterModel]] = {}
+        for row in existing_workflow_rows:
+            existing_by_identity[(row.key, row.workflow_parameter_type)] = row
+            existing_by_key_all_types.setdefault(row.key, []).append(row)
+
+        desired_workflow_keys: set[str] = set()
+        # Naive UTC to match the column's `datetime.utcnow` default.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        for parameter in desired_workflow_params:
+            desired_workflow_keys.add(parameter.key)
+            encoded_default = WorkflowParametersRepository._encode_workflow_parameter_default(parameter)
+            type_value = parameter.workflow_parameter_type.value
+            existing = existing_by_identity.get((parameter.key, type_value))
+            if existing is not None:
+                existing.description = parameter.description
+                existing.default_value = encoded_default
+                if existing.deleted_at is not None:
+                    existing.deleted_at = None
+                parameter.workflow_parameter_id = existing.workflow_parameter_id
+                for other in existing_by_key_all_types.get(parameter.key, []):
+                    if other is existing:
+                        continue
+                    if other.deleted_at is None:
+                        other.deleted_at = now
+                continue
+
+            for other in existing_by_key_all_types.get(parameter.key, []):
+                if other.deleted_at is None:
+                    other.deleted_at = now
+            new_row = WorkflowParameterModel(
+                workflow_parameter_id=parameter.workflow_parameter_id,
+                workflow_parameter_type=type_value,
+                key=parameter.key,
+                description=parameter.description,
+                workflow_id=workflow_id,
+                default_value=encoded_default,
+            )
+            session.add(new_row)
+
+        for row in existing_workflow_rows:
+            if row.key in desired_workflow_keys:
+                continue
+            if row.deleted_at is None:
+                row.deleted_at = now
+
+        existing_output_rows = (
+            await session.scalars(select(OutputParameterModel).filter_by(workflow_id=workflow_id))
+        ).all()
+        existing_output_by_key: dict[str, OutputParameterModel] = {row.key: row for row in existing_output_rows}
+        desired_output_keys: set[str] = set()
+        for parameter in desired_output_params:
+            desired_output_keys.add(parameter.key)
+            existing = existing_output_by_key.get(parameter.key)
+            if existing is not None:
+                existing.description = parameter.description
+                if existing.deleted_at is not None:
+                    existing.deleted_at = None
+                # Blocks in workflow_definition hold the same OutputParameter
+                # instance (see workflow_definition_converter.block_yaml_to_block),
+                # so this patch aligns every block reference on re-serialize.
+                parameter.output_parameter_id = existing.output_parameter_id
+                continue
+            new_row = OutputParameterModel(
+                output_parameter_id=parameter.output_parameter_id,
+                key=parameter.key,
+                description=parameter.description,
+                workflow_id=workflow_id,
+            )
+            session.add(new_row)
+
+        for row in existing_output_rows:
+            if row.key in desired_output_keys:
+                continue
+            if row.deleted_at is None:
+                row.deleted_at = now
+
     @db_operation("get_workflow_output_parameters")
     async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:
         async with self.Session() as session:
             output_parameters = (
-                await session.scalars(select(OutputParameterModel).filter_by(workflow_id=workflow_id))
+                await session.scalars(
+                    select(OutputParameterModel)
+                    .filter_by(workflow_id=workflow_id)
+                    .where(OutputParameterModel.deleted_at.is_(None))
+                )
             ).all()
             return [convert_to_output_parameter(parameter) for parameter in output_parameters]
 
@@ -283,7 +392,11 @@ class WorkflowParametersRepository(BaseRepository):
     async def get_workflow_parameters(self, workflow_id: str) -> list[WorkflowParameter]:
         async with self.Session() as session:
             workflow_parameters = (
-                await session.scalars(select(WorkflowParameterModel).filter_by(workflow_id=workflow_id))
+                await session.scalars(
+                    select(WorkflowParameterModel)
+                    .filter_by(workflow_id=workflow_id)
+                    .where(WorkflowParameterModel.deleted_at.is_(None))
+                )
             ).all()
             return [convert_to_workflow_parameter(parameter) for parameter in workflow_parameters]
 

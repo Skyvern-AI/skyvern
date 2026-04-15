@@ -72,4 +72,5 @@ class DetailedAgentStepOutput(BaseModel):
             actions_and_results=(clean_output.actions_and_results if clean_output.actions_and_results else []),
             errors=clean_output.extract_errors(),
             browser_metadata=browser_metadata,
+            step_exception=clean_output.step_exception,
         )

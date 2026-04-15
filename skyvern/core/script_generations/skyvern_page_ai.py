@@ -66,6 +66,7 @@ class SkyvernPageAi(Protocol):
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
+        include_extracted_text: bool = True,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
         ...

@@ -6,6 +6,8 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 
 DownloadedFileSignature: TypeAlias = tuple[str | None, str | None, str | None]
 
+DOWNLOADED_FILE_SIGS_KEY = "downloaded_file_signatures_before_iteration"
+
 
 def _normalize_downloaded_file_signature(value: Any) -> DownloadedFileSignature | None:
     """Returns a valid downloaded file signature tuple or None for invalid values."""
@@ -34,7 +36,7 @@ def filter_downloaded_files_for_current_iteration(
     if not loop_internal_state:
         return downloaded_files
 
-    before_iteration = loop_internal_state.get("downloaded_file_signatures_before_iteration")
+    before_iteration = loop_internal_state.get(DOWNLOADED_FILE_SIGS_KEY)
     if not isinstance(before_iteration, list):
         return downloaded_files
 
@@ -59,6 +61,7 @@ def filter_downloaded_files_for_current_iteration(
 
 
 __all__ = [
+    "DOWNLOADED_FILE_SIGS_KEY",
     "filter_downloaded_files_for_current_iteration",
     "to_downloaded_file_signature",
 ]
