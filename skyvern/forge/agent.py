@@ -164,6 +164,20 @@ class _PromptCeilingExceeded(Exception):
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
 
+# Exception types that indicate an LLM-specific step failure (context window, provider errors).
+# Used by summary_failure_reason_for_max_retries to distinguish LLM failures from browser/runtime crashes.
+_LLM_STEP_EXCEPTIONS = frozenset(
+    {
+        "SkyvernContextWindowExceededError",
+        "LLMProviderError",
+        "LLMProviderErrorRetryableTask",
+    }
+)
+
+
+def _llm_error_category(reasoning: str) -> list[dict]:
+    return [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": reasoning}]
+
 
 @dataclass
 class SpeculativePlan:
@@ -4431,7 +4445,10 @@ class ForgeAgent:
                 task_status="failed",
                 failure_category=failure_category,
                 primary_failure_category=failure_category[0].get("category") if failure_category else None,
-                failure_category_source="llm" if failure_response.failure_categories else "code_level",
+                failure_category_source=(
+                    failure_response.failure_category_source
+                    or ("llm" if failure_response.failure_categories else "code_level")
+                ),
                 failure_category_path="max_retries",
             )
             await self.update_task(
@@ -4592,10 +4609,14 @@ class ForgeAgent:
             # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
                 if cur_step.status == StepStatus.failed:
-                    # Only count steps where the LLM call itself failed (no output at all).
-                    # Steps with output but empty actions mean the LLM worked fine but found
-                    # nothing to interact with — those fall through to normal summarization.
-                    if not cur_step.output:
+                    # Count steps that failed without producing actions due to LLM issues:
+                    # - No output at all (catastrophic failure before any result persisted)
+                    # - Output exists but no actions AND step_exception confirms an
+                    #   LLM-specific failure (e.g. context window exceeded)
+                    if not cur_step.output or (
+                        not cur_step.output.actions_and_results
+                        and cur_step.output.step_exception in _LLM_STEP_EXCEPTIONS
+                    ):
                         steps_without_actions += 1
 
                 if cur_step.output and cur_step.output.actions_and_results:
@@ -4636,6 +4657,10 @@ class ForgeAgent:
                         f"Error details: {llm_error_details}"
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        f"LLM provider errors detected across retry steps: {llm_error_details}"
+                    ),
+                    failure_category_source="code_level",
                 )
 
             # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
@@ -4644,10 +4669,16 @@ class ForgeAgent:
                     page_info="",
                     reasoning=(
                         f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                        f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
-                        f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                        f"This is typically caused by the page content exceeding the LLM context window, "
+                        f"LLM service errors during action extraction (rate limiting, service outages), "
+                        f"or oversized input data. Please reduce the page content or input data size and try again."
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        "All retry steps failed without producing actions — "
+                        "LLM context window exceeded or provider error during action extraction."
+                    ),
+                    failure_category_source="code_level",
                 )
 
             if page is not None:
@@ -4684,6 +4715,10 @@ class ForgeAgent:
                         f"Error details: {llm_error_details}"
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        f"LLM provider errors detected across retry steps: {llm_error_details}"
+                    ),
+                    failure_category_source="code_level",
                 )
             # If multiple steps failed without actions during summarization failure, still report it
             if steps_without_actions >= max_retries:
@@ -4694,6 +4729,11 @@ class ForgeAgent:
                         f"This is typically caused by LLM service errors during action extraction."
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        "All retry steps failed without producing actions — "
+                        "LLM context window exceeded or provider error during action extraction."
+                    ),
+                    failure_category_source="code_level",
                 )
             if steps_results:
                 last_step_result = steps_results[-1]
