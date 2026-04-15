@@ -1,4 +1,7 @@
 import { FileIcon } from "@radix-ui/react-icons";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { Button } from "@/components/ui/button";
 import { CodeEditor } from "../components/CodeEditor";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useActiveWorkflowRunItem } from "./useActiveWorkflowRunItem";
@@ -13,24 +16,24 @@ import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
+import { getBlockDownloadedFileUrls } from "./blockDownloadedFiles";
 
 function WorkflowRunOutput() {
+  const [searchParams] = useSearchParams();
+  const hasExplicitSelection = searchParams.has("active");
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
 
-  if (workflowRunTimelineIsLoading) {
-    return <div>Loading...</div>;
-  }
+  // Local override so users on finalized runs (where there is no neutral
+  // timeline selection to return to) can still view the full workflow-level
+  // file list without clearing their block selection elsewhere on the page.
+  const [showAllFilesOverride, setShowAllFilesOverride] = useState(false);
 
-  if (!workflowRunTimeline) {
-    return null;
-  }
-
-  function getActiveBlock() {
+  const activeBlock = (() => {
     if (!workflowRunTimeline) {
-      return;
+      return undefined;
     }
     if (isWorkflowRunBlock(activeItem)) {
       return activeItem;
@@ -41,9 +44,20 @@ function WorkflowRunOutput() {
         activeItem.action_id,
       );
     }
+    return undefined;
+  })();
+  const activeBlockId = activeBlock?.workflow_run_block_id;
+  useEffect(() => {
+    setShowAllFilesOverride(false);
+  }, [activeBlockId]);
+
+  if (workflowRunTimelineIsLoading) {
+    return <div>Loading...</div>;
   }
 
-  const activeBlock = getActiveBlock();
+  if (!workflowRunTimeline) {
+    return null;
+  }
 
   const showExtractedInformation =
     activeBlock &&
@@ -57,7 +71,18 @@ function WorkflowRunOutput() {
       activeBlock.status === Status.Canceled);
 
   const outputs = workflowRun?.outputs;
-  const fileUrls = workflowRun?.downloaded_file_urls ?? [];
+  const allFileUrls = workflowRun?.downloaded_file_urls ?? [];
+
+  // Scope to the surrounding block whenever the user explicitly selected a
+  // block or any action inside it, so drilling from a block into its child
+  // steps keeps the files section anchored to that block. The helper swaps
+  // expired block URLs for matching fresh run-level ones when available.
+  const userSelectedBlock = Boolean(hasExplicitSelection && activeBlock);
+  const showBlockFiles = userSelectedBlock && !showAllFilesOverride;
+  const fileUrls =
+    showBlockFiles && activeBlock
+      ? getBlockDownloadedFileUrls(activeBlock.output, allFileUrls)
+      : allFileUrls;
   const observerOutput = workflowRun?.task_v2?.output;
   const webhookFailureReasonData =
     workflowRun?.task_v2?.webhook_failure_reason ??
@@ -153,7 +178,25 @@ function WorkflowRunOutput() {
       </div>
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
-          <h1 className="text-lg font-bold">Workflow Run Downloaded Files</h1>
+          <div className="flex items-center justify-between">
+            <h1 className="text-lg font-bold">
+              {showBlockFiles
+                ? "Block Downloaded Files"
+                : "Workflow Run Downloaded Files"}
+            </h1>
+            {userSelectedBlock ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setShowAllFilesOverride((v) => !v)}
+              >
+                {showAllFilesOverride
+                  ? "Show block files"
+                  : "Show all workflow files"}
+              </Button>
+            ) : null}
+          </div>
           <div className="space-y-2">
             {fileUrls.length > 0 ? (
               fileUrls.map((url) => {

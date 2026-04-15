@@ -69,6 +69,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
@@ -95,6 +96,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoValidEmailRecipient,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
+    DOWNLOADED_FILE_SIGS_KEY,
     filter_downloaded_files_for_current_iteration,
     to_downloaded_file_signature,
 )
@@ -149,6 +151,62 @@ def warn_if_file_download_max_steps_low(
         recommended_minimum=MAX_STEPS_DOWNLOAD_WARNING_THRESHOLD,
         workflow_run_id=workflow_run_id,
     )
+
+
+BLOCK_BASELINE_MARKER = "_set_by_block"
+
+
+async def capture_block_download_baseline(
+    context: SkyvernContext,
+    organization_id: str,
+    workflow_run_id: str,
+    block_label: str,
+) -> None:
+    """Snapshot downloaded files before a task block runs.
+
+    Sets ``loop_internal_state`` so ``filter_downloaded_files_for_current_iteration``
+    scopes the block's output to only files it downloaded.  Skips capture when the
+    baseline was already set by a ForLoopBlock (no marker).
+    """
+    existing = context.loop_internal_state
+    if existing and BLOCK_BASELINE_MARKER not in existing:
+        return
+    try:
+        async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+            baseline_files = await app.STORAGE.get_downloaded_files(
+                organization_id=organization_id,
+                run_id=context.run_id or workflow_run_id,
+            )
+            context.loop_internal_state = {
+                DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(fi) for fi in baseline_files],
+                BLOCK_BASELINE_MARKER: True,
+            }
+            LOG.debug(
+                "Captured block download baseline",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                block_label=block_label,
+                file_count=len(baseline_files),
+            )
+    except asyncio.TimeoutError:
+        context.loop_internal_state = None
+        LOG.warning(
+            "Timeout capturing baseline downloaded files for task block",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            block_label=block_label,
+        )
+    except Exception:
+        # Baseline capture is best-effort — transient S3/network errors should
+        # not abort the block. Degrade to unscoped filtering (the pre-fix behavior).
+        context.loop_internal_state = None
+        LOG.warning(
+            "Failed to capture baseline downloaded files for task block",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            block_label=block_label,
+            exc_info=True,
+        )
 
 
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
@@ -671,6 +729,7 @@ class BaseTaskBlock(Block):
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
+    include_extracted_text: bool = True
 
     def get_all_parameters(
         self,
@@ -735,14 +794,22 @@ class BaseTaskBlock(Block):
                 self.terminate_criterion, workflow_run_context
             )
 
-        if self.error_code_mapping:
+        # Inherit workflow-level error_code_mapping; block-level entries override on key conflicts.
+        workflow = getattr(workflow_run_context, "workflow", None)
+        workflow_error_code_mapping: dict[str, str] | None = None
+        if workflow is not None and workflow.workflow_definition is not None:
+            workflow_error_code_mapping = workflow.workflow_definition.error_code_mapping
+
+        if workflow_error_code_mapping or self.error_code_mapping:
+            merged_mapping = dict(workflow_error_code_mapping or {})
+            merged_mapping.update(self.error_code_mapping or {})
             self.error_code_mapping = {
                 self.format_block_parameter_template_from_workflow_run_context(error_code, workflow_run_context): (
                     self.format_block_parameter_template_from_workflow_run_context(
                         error_description, workflow_run_context
                     )
                 )
-                for error_code, error_description in self.error_code_mapping.items()
+                for error_code, error_description in merged_mapping.items()
             }
 
     @staticmethod
@@ -837,6 +904,12 @@ class BaseTaskBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
+
+        # Scope downloaded files to this block only.
+        block_context = skyvern_context.current()
+        if block_context:
+            await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
+
         # Get workflow from context if available, otherwise query database
         workflow = workflow_run_context.workflow
         if workflow is None:
@@ -1954,7 +2027,7 @@ class ForLoopBlock(Block):
                     loop_context.loop_internal_state = None
                 else:
                     loop_context.loop_internal_state = {
-                        "downloaded_file_signatures_before_iteration": downloaded_file_sigs_before,
+                        DOWNLOADED_FILE_SIGS_KEY: downloaded_file_sigs_before,
                     }
 
             # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
@@ -2212,6 +2285,31 @@ class ForLoopBlock(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
+        # Save the caller's loop_internal_state so we can restore it after this
+        # loop finishes. Supports nested loops (parent's state is preserved) and
+        # ensures stale per-iteration baselines don't leak into subsequent blocks.
+        outer_context = skyvern_context.current()
+        outer_loop_state = outer_context.loop_internal_state if outer_context else None
+        try:
+            return await self._run_loop(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                **kwargs,
+            )
+        finally:
+            if outer_context:
+                outer_context.loop_internal_state = outer_loop_state
+
+    async def _run_loop(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
             loop_over_values = await self.get_loop_over_parameter_values(
@@ -2310,6 +2408,7 @@ class ForLoopBlock(Block):
         await self.record_output_parameter_value(
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
         )
+
         block_status = BlockStatus.failed
         success = False
 
@@ -4586,6 +4685,7 @@ class ExtractionBlock(BaseTaskBlock):
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
     data_extraction_goal: str
+    include_extracted_text: bool = False
 
 
 class LoginBlock(BaseTaskBlock):
@@ -4657,6 +4757,11 @@ class TaskV2Block(Block):
     ) -> BlockResult:
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
         from skyvern.services import task_v2_service  # noqa: PLC0415
+
+        # Scope downloaded files to this block only.
+        block_context = skyvern_context.current()
+        if block_context:
+            await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
 

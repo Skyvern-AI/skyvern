@@ -107,6 +107,7 @@ class TaskModel(Base):
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
     include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
+    include_extracted_text = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -155,6 +156,7 @@ class StepModel(Base):
     reasoning_token_count = Column(Integer, default=0)
     cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
+    last_llm_model = Column(String, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_by = Column(String, nullable=True)
 
@@ -892,6 +894,7 @@ class ThoughtModel(Base):
     reasoning_token_count = Column(Integer, nullable=True)
     cached_token_count = Column(Integer, nullable=True)
     thought_cost = Column(Numeric, nullable=True)
+    last_llm_model = Column(String, nullable=True)
 
     observer_thought_type = Column(String, nullable=True, default=ThoughtType.plan)
     observer_thought_scenario = Column(String, nullable=True)

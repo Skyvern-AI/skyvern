@@ -10,6 +10,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from skyvern.cli.core.telemetry import capture_cli_tool_call
+
 console = Console()
 
 ENVELOPE_SCHEMA_VERSION = "1.0"
@@ -79,8 +81,17 @@ def output_error(
     raise SystemExit(exit_code)
 
 
-def emit_tool_result(result: dict[str, Any], *, json_output: bool) -> None:
+def emit_tool_result(
+    result: dict[str, Any],
+    *,
+    json_output: bool,
+    action: str | None = None,
+    telemetry_tool_name: str | None = None,
+) -> None:
     """Emit an MCP tool result, preserving the full MCP envelope shape in JSON mode."""
+    if telemetry_tool_name is not None:
+        capture_cli_tool_call(telemetry_tool_name, ok=bool(result.get("ok", False)))
+
     if json_output:
         envelope = {**result}
         envelope.setdefault("schema_version", ENVELOPE_SCHEMA_VERSION)
@@ -95,14 +106,14 @@ def emit_tool_result(result: dict[str, Any], *, json_output: bool) -> None:
         return
 
     if result.get("ok", False):
-        output(result.get("data"), action=str(result.get("action", "")), json_mode=False)
+        output(result.get("data"), action=action or str(result.get("action", "")), json_mode=False)
         return
 
     err = result.get("error") or {}
     output_error(
         str(err.get("message") or "Unknown error"),
         hint=str(err.get("hint") or ""),
-        action=str(result.get("action") or ""),
+        action=action or str(result.get("action") or ""),
         json_mode=False,
     )
 
@@ -113,14 +124,17 @@ def run_tool(
     json_output: bool,
     hint_on_exception: str,
     action: str = "",
+    telemetry_tool_name: str | None = None,
 ) -> None:
     """Run an async MCP tool and emit the result."""
     try:
         result: dict[str, Any] = asyncio.run(runner())
-        emit_tool_result(result, json_output=json_output)
+        emit_tool_result(result, json_output=json_output, telemetry_tool_name=telemetry_tool_name)
     except typer.BadParameter:
         raise
     except Exception as e:
+        if telemetry_tool_name is not None:
+            capture_cli_tool_call(telemetry_tool_name, ok=False, error=e)
         output_error(str(e), hint=hint_on_exception, action=action, json_mode=json_output)
 
 

@@ -167,12 +167,14 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
+        include_extracted_text: bool = True,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI via API call.
 
-        Note: skip_refresh is accepted for Protocol compatibility but not forwarded
-        to the API. The server-side always refreshes when called via the SDK HTTP path.
-        The optimization only takes effect on the direct RealSkyvernPageAI path (MCP local browser).
+        Note: skip_refresh and include_extracted_text are accepted for Protocol
+        compatibility but not forwarded to the API. The server-side controls
+        both via the Task record on the SDK HTTP path. The optimizations only
+        take effect on the direct RealSkyvernPageAI path (MCP local browser).
         """
 
         LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)

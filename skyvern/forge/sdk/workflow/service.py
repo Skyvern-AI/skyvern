@@ -59,6 +59,7 @@ from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -3362,13 +3363,56 @@ class WorkflowService:
         title: str | None = None,
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
+        proxy_location: ProxyLocationInput | object = _UNSET,
+        webhook_callback_url: str | None | object = _UNSET,
+        persist_browser_session: bool | None = None,
+        model: dict[str, Any] | None | object = _UNSET,
+        max_screenshot_scrolling_times: int | None | object = _UNSET,
+        extra_http_headers: dict[str, str] | None | object = _UNSET,
+        run_with: str | None = None,
+        ai_fallback: bool | None = None,
+        cache_key: str | None = None,
+        run_sequentially: bool | None = None,
+        sequential_key: str | None | object = _UNSET,
     ) -> Workflow:
+        if workflow_definition is not None:
+            updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
+                workflow_id=workflow_id,
+                title=title,
+                organization_id=organization_id,
+                description=description,
+                workflow_definition=workflow_definition,
+                proxy_location=proxy_location,
+                webhook_callback_url=webhook_callback_url,
+                persist_browser_session=persist_browser_session,
+                model=model,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                extra_http_headers=extra_http_headers,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                cache_key=cache_key,
+                run_sequentially=run_sequentially,
+                sequential_key=sequential_key,
+            )
+            return updated_workflow
+
         updated_workflow = await app.DATABASE.workflows.update_workflow(
             workflow_id=workflow_id,
             title=title,
             organization_id=organization_id,
             description=description,
-            workflow_definition=(workflow_definition.model_dump(mode="json") if workflow_definition else None),
+            workflow_definition=None,
+            proxy_location=proxy_location,
+            webhook_callback_url=webhook_callback_url,
+            persist_browser_session=persist_browser_session,
+            model=model,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            extra_http_headers=extra_http_headers,
+            run_with=run_with,
+            ai_fallback=ai_fallback,
+            cache_key=cache_key,
+            run_sequentially=run_sequentially,
+            sequential_key=sequential_key,
         )
 
         return updated_workflow
@@ -3953,6 +3997,34 @@ class WorkflowService:
             run_with=run_with,
         )
 
+    async def mark_workflow_run_as_canceled_if_not_final(
+        self,
+        workflow_run_id: str,
+    ) -> WorkflowRun | None:
+        """Conditional cancel that is a no-op when the run has already reached a
+        terminal state. Safe to call from cancellation cleanup paths (e.g. the
+        copilot tool's timeout branch) that race with the run's own
+        ``_finalize_workflow_run_status`` writes.
+        """
+        updated = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.canceled,
+        )
+        if updated is None:
+            return None
+
+        LOG.info(
+            f"Marked workflow run {workflow_run_id} as canceled (conditional)",
+            workflow_run_id=workflow_run_id,
+            workflow_status="canceled",
+        )
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.canceled)
+
+        # Match the side effects of ``_update_workflow_run_status`` on a terminal
+        # transition: clear the per-run extraction cache.
+        extraction_cache.clear_workflow_run(workflow_run_id)
+        return updated
+
     async def mark_workflow_run_as_timed_out(
         self,
         workflow_run_id: str,
@@ -4272,8 +4344,18 @@ class WorkflowService:
         organization_id: str | None = None,
         include_cost: bool = False,
         include_step_count: bool = False,
+        allow_deleted: bool = False,
     ) -> WorkflowRunResponseBase:
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
+        # ``allow_deleted=True`` is used by the cleanup/webhook path after a
+        # long-running run completes: the workflow row may have been
+        # soft-deleted (e.g. eval harness teardown fired while the orphan
+        # workflow was still executing). We still need to build a status
+        # response so the webhook gets delivered with whatever state exists.
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id,
+            organization_id=organization_id,
+            filter_deleted=not allow_deleted,
+        )
         if workflow is None:
             LOG.error(f"Workflow {workflow_permanent_id} not found")
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
@@ -4537,12 +4619,26 @@ class WorkflowService:
         api_key: str | None = None,
     ) -> None:
         workflow_id = workflow_run.workflow_id
-        workflow_run_status_response = await self.build_workflow_run_status_response(
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=workflow_run.organization_id,
-            include_step_count=True,
-        )
+        # Cleanup path: tolerate soft-deleted workflows. If the workflow row
+        # has been deleted between run start and cleanup (common when an eval
+        # harness tears down a workflow while the run is still executing in
+        # the background), we still want webhook delivery to succeed.
+        try:
+            workflow_run_status_response = await self.build_workflow_run_status_response(
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                include_step_count=True,
+                allow_deleted=True,
+            )
+        except WorkflowNotFound:
+            LOG.warning(
+                "Workflow missing during webhook build; skipping webhook delivery",
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+            )
+            return
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",

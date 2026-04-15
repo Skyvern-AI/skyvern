@@ -113,7 +113,14 @@ from skyvern.services.otp_service import (
     try_generate_totp_from_credential,
 )
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
+from skyvern.utils.prompt_engine import (
+    PROMPT_HARD_CEILING_TOKENS,
+    MaxStepsReasonResponse,
+    enforce_prompt_ceiling_tracked,
+    load_prompt_with_elements,
+)
+from skyvern.utils.prompt_truncation import truncate_extraction_schema
+from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -145,6 +152,15 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
+
+
+class _PromptCeilingExceeded(Exception):
+    """Internal signal: the cached split-template prompt blew past the
+    PROMPT_HARD_CEILING_TOKENS budget. Raised inside the cached extract-action
+    branch to trigger the fall-through to load_prompt_with_elements, which
+    applies the per-template fallback drop chain."""
+
+
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
 
@@ -168,6 +184,82 @@ class ActionLinkedNode:
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
+
+    async def _finalize_downloaded_files_for_task(
+        self,
+        task: Task,
+        *,
+        organization_id: str,
+        download_suffix: str | None,
+        list_files_before: list[str],
+        randomize_if_missing: bool,
+    ) -> list[str]:
+        """Rename newly downloaded files for a task before persistence.
+
+        Returns the list of pre-rename file names discovered as new since
+        ``list_files_before``, for logging continuity with the legacy inline
+        path.
+        """
+        if not task.workflow_run_id:
+            return []
+
+        context = skyvern_context.current()
+        workflow_download_directory = get_path_for_workflow_download_directory(
+            context.run_id if context and context.run_id else task.workflow_run_id
+        )
+        list_files_after = list_files_in_directory(workflow_download_directory)
+        if task.browser_session_id:
+            browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
+                organization_id=organization_id,
+                browser_session_id=task.browser_session_id,
+            )
+            list_files_after = list_files_after + browser_session_downloaded_files_after
+
+        files_to_rename = list(set(list_files_after) - set(list_files_before))
+        if not files_to_rename:
+            return []
+        for file in files_to_rename:
+            local_file_name = file
+            if file.startswith("s3://"):
+                file_data = await get_aws_client().download_file(file, log_exception=False)
+                if not file_data:
+                    continue
+                local_file_name = file.split("/")[-1]
+                with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
+                    f.write(file_data)
+
+            file_extension = Path(local_file_name).suffix
+            if file_extension == BROWSER_DOWNLOADING_SUFFIX:
+                LOG.warning(
+                    "Detecting incompleted download file, skip the rename",
+                    file=local_file_name,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                continue
+
+            if download_suffix:
+                final_file_name = download_suffix
+            elif randomize_if_missing:
+                random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
+            else:
+                continue
+
+            base_final_file_name = final_file_name
+            target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+            counter = 1
+            while os.path.exists(target_path):
+                final_file_name = f"{base_final_file_name}_{counter}"
+                target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+                counter += 1
+
+            rename_file(
+                os.path.join(workflow_download_directory, local_file_name),
+                final_file_name + file_extension,
+            )
+
+        return files_to_rename
 
     async def create_task_and_step_from_block(
         self,
@@ -232,6 +324,7 @@ class ForgeAgent:
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
             download_timeout=task_block.download_timeout,
+            include_extracted_text=task_block.include_extracted_text,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -300,6 +393,7 @@ class ForgeAgent:
             extra_http_headers=task_request.extra_http_headers,
             browser_session_id=task_request.browser_session_id,
             browser_address=task_request.browser_address,
+            include_extracted_text=task_request.include_extracted_text,
         )
         LOG.info(
             "Created new task",
@@ -328,6 +422,7 @@ class ForgeAgent:
         engine: RunEngine = RunEngine.skyvern_v1,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
+        download_baseline_files: list[str] | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
@@ -405,6 +500,8 @@ class ForgeAgent:
                 need_call_webhook=True,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=download_baseline_files,
             )
             return step, None, None
 
@@ -423,16 +520,16 @@ class ForgeAgent:
             )
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
-        list_files_before: list[str] = []
+        list_files_before: list[str] = download_baseline_files.copy() if download_baseline_files is not None else []
         browser_state: BrowserState | None = None
         try:
-            if task.workflow_run_id:
+            if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(
                         context.run_id if context and context.run_id else task.workflow_run_id
                     )
                 )
-            if task.browser_session_id:
+            if task.browser_session_id and download_baseline_files is None:
                 browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
                     organization_id=organization.organization_id,
                     browser_session_id=task.browser_session_id,
@@ -545,59 +642,19 @@ class ForgeAgent:
                             workflow_run_id=task.workflow_run_id,
                         )
 
-                list_files_after = list_files_in_directory(workflow_download_directory)
-                if task.browser_session_id:
-                    browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
-                        organization_id=organization.organization_id,
-                        browser_session_id=task.browser_session_id,
-                    )
-                    list_files_after = list_files_after + browser_session_downloaded_files_after
-                if len(list_files_after) > len(list_files_before):
-                    files_to_rename = list(set(list_files_after) - set(list_files_before))
-                    for file in files_to_rename:
-                        if file.startswith("s3://"):
-                            file_data = await get_aws_client().download_file(file, log_exception=False)
-                            if not file_data:
-                                continue
-                            file = file.split("/")[-1]  # Extract filename from the end of S3 URI
-                            with open(os.path.join(workflow_download_directory, file), "wb") as f:
-                                f.write(file_data)
-
-                        file_extension = Path(file).suffix
-                        if file_extension == BROWSER_DOWNLOADING_SUFFIX:
-                            LOG.warning(
-                                "Detecting incompleted download file, skip the rename",
-                                file=file,
-                                task_id=task.task_id,
-                                workflow_run_id=task.workflow_run_id,
-                            )
-                            continue
-
-                        if task_block.download_suffix:
-                            # Use download_suffix as the complete filename (without extension)
-                            final_file_name = task_block.download_suffix
-                        else:
-                            # Fallback to random filename if no download_suffix provided
-                            random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-                            final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
-
-                        # Check if file with this name already exists
-                        final_file_name = final_file_name
-                        target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
-                        counter = 1
-                        while os.path.exists(target_path):
-                            # If file exists, append counter to filename
-                            final_file_name = f"{final_file_name}_{counter}"
-                            target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
-                            counter += 1
-
-                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
-
+                files_to_rename = await self._finalize_downloaded_files_for_task(
+                    task,
+                    organization_id=organization.organization_id,
+                    download_suffix=task_block.download_suffix,
+                    list_files_before=list_files_before,
+                    randomize_if_missing=True,
+                )
+                if files_to_rename:
                     LOG.info(
                         "Task marked as completed due to download",
                         task_id=task.task_id,
                         num_files_before=len(list_files_before),
-                        num_files_after=len(list_files_after),
+                        num_files_after=len(list_files_before) + len(files_to_rename),
                         new_files=files_to_rename,
                     )
                     last_step = await self.update_step(step, is_last=True)
@@ -607,6 +664,9 @@ class ForgeAgent:
                     )
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                     # Skip per-step video sync: clean_up_task performs the authoritative final upload.
+                    # Do not pass download finalization inputs into cleanup here:
+                    # the early complete_on_download path already finalized files
+                    # against the pre-step baseline and cleanup must not do it again.
                     await self.clean_up_task(
                         task=completed_task,
                         last_step=last_step,
@@ -634,6 +694,8 @@ class ForgeAgent:
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        download_suffix=task_block.download_suffix if task_block else None,
+                        list_files_before=list_files_before,
                     )
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
@@ -666,6 +728,8 @@ class ForgeAgent:
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        download_suffix=task_block.download_suffix if task_block else None,
+                        list_files_before=list_files_before,
                     )
                     return last_step, detailed_output, None
                 elif maybe_next_step:
@@ -693,6 +757,9 @@ class ForgeAgent:
             if not cua_response_param and cua_response:
                 cua_response_param = cua_response
 
+            # Forward the initial download baseline into recursive execute_step calls so
+            # files downloaded on this step are still seen as "new" by cleanup on a later step.
+            # Any additional recursive execute_step call site must preserve this kwarg.
             if retry and next_step:
                 return await self.execute_step(
                     organization,
@@ -706,6 +773,7 @@ class ForgeAgent:
                     engine=engine,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
+                    download_baseline_files=list_files_before,
                 )
             elif settings.execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -720,6 +788,7 @@ class ForgeAgent:
                     engine=engine,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
+                    download_baseline_files=list_files_before,
                 )
             else:
                 LOG.info(
@@ -742,6 +811,8 @@ class ForgeAgent:
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except StepTerminationError as e:
@@ -757,6 +828,8 @@ class ForgeAgent:
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after step termination. NOT clean up the task")
@@ -784,6 +857,8 @@ class ForgeAgent:
                     close_browser_on_completion=close_browser_on_completion,
                     need_final_screenshot=False,
                     browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after navigation failure. NOT clean up the task")
@@ -800,6 +875,8 @@ class ForgeAgent:
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except InvalidTaskStatusTransition:
@@ -812,6 +889,8 @@ class ForgeAgent:
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -828,6 +907,8 @@ class ForgeAgent:
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except ScrapingFailed as sfe:
@@ -850,6 +931,8 @@ class ForgeAgent:
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except MissingBrowserStatePage as e:
@@ -867,6 +950,8 @@ class ForgeAgent:
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except Exception as e:
@@ -882,6 +967,8 @@ class ForgeAgent:
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after unexpected exception. NOT clean up the task")
@@ -3155,6 +3242,16 @@ class ForgeAgent:
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
+                if count_tokens(combined_prompt) > PROMPT_HARD_CEILING_TOKENS:
+                    # The cached split-template path renders static+dynamic separately,
+                    # so the load_prompt_with_elements ceiling logic never sees this
+                    # prompt. Raise the dedicated sentinel to trigger the except below,
+                    # which falls through to the full load_prompt_with_elements render
+                    # where the fallback drop chain can apply.
+                    raise _PromptCeilingExceeded(
+                        f"cached extract-action prompt exceeded {PROMPT_HARD_CEILING_TOKENS} tokens"
+                    )
+
                 LOG.info(
                     "Using cached prompt",
                     task_id=task.task_id,
@@ -3493,6 +3590,8 @@ class ForgeAgent:
         close_browser_on_completion: bool = True,
         need_final_screenshot: bool = True,
         browser_session_id: str | None = None,
+        download_suffix: str | None = None,
+        list_files_before: list[str] | None = None,
     ) -> None:
         """
         send the task response to the webhook callback url
@@ -3545,7 +3644,18 @@ class ForgeAgent:
 
         if task.organization_id:
             try:
+                # Keep both finalize and save inside a single timeout budget so a hung
+                # finalize call cannot block persistence forever; accept the trade-off
+                # that a very slow finalize on many files could crowd out save.
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                    if download_suffix and list_files_before is not None:
+                        await self._finalize_downloaded_files_for_task(
+                            task,
+                            organization_id=task.organization_id,
+                            download_suffix=download_suffix,
+                            list_files_before=list_files_before,
+                            randomize_if_missing=False,
+                        )
                     context = skyvern_context.current()
                     await app.STORAGE.save_downloaded_files(
                         organization_id=task.organization_id,
@@ -4957,13 +5067,21 @@ class ForgeAgent:
     @staticmethod
     async def create_extract_action(task: Task, step: Step, scraped_page: ScrapedPage) -> ExtractAction:
         context = skyvern_context.ensure_context()
+        local_datetime_str = datetime.now(context.tz_info).isoformat()
+        capped_schema = truncate_extraction_schema(task.extracted_information_schema)
         # generate reasoning by prompt llm to think briefly what data to extract
-        prompt = prompt_engine.load_prompt(
-            "data-extraction-summary",
-            data_extraction_goal=task.data_extraction_goal,
-            data_extraction_schema=task.extracted_information_schema,
-            current_url=scraped_page.url,
-            local_datetime=datetime.now(context.tz_info).isoformat(),
+        summary_kwargs: dict[str, Any] = {
+            "data_extraction_goal": task.data_extraction_goal,
+            "data_extraction_schema": capped_schema,
+            "current_url": scraped_page.url,
+            "local_datetime": local_datetime_str,
+        }
+        prompt = prompt_engine.load_prompt("data-extraction-summary", **summary_kwargs)
+        prompt, post_ceiling_kwargs = enforce_prompt_ceiling_tracked(
+            prompt,
+            prompt_engine=prompt_engine,
+            template_name="data-extraction-summary",
+            kwargs=summary_kwargs,
         )
 
         # Cache the summary LLM call — the inputs (goal, schema, URL) are
@@ -4974,8 +5092,18 @@ class ForgeAgent:
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
+            # data-extraction-summary is goal-agnostic: only goal/schema/URL/datetime
+            # affect the rendered prompt, so everything else is intentionally omitted.
+            # Hash the post-ceiling value for `data_extraction_schema` — when the
+            # rendered prompt exceeds PROMPT_HARD_CEILING_TOKENS the ceiling drops
+            # that field to None, so two oversized-schema requests that both get
+            # dropped produce an identical LLM prompt and must share a cache key.
             cache_key = extraction_cache.compute_cache_key(
-                rendered_prompt=prompt,
+                call_path="agent",
+                data_extraction_goal=task.data_extraction_goal,
+                extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
+                current_url=scraped_page.url,
+                local_datetime=local_datetime_str,
                 llm_key=None,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
@@ -4994,7 +5122,7 @@ class ForgeAgent:
             # Preserve cache_key so the store() below can still warm the cache
             # for subsequent identical calls even when lookup() fails transiently.
 
-        if lookup_result is not None and lookup_result.hit:
+        if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, dict):
             LOG.info(
                 "data-extraction-summary cache hit — skipping LLM call",
                 workflow_run_id=workflow_run_id,
@@ -5007,7 +5135,17 @@ class ForgeAgent:
             )
             data_extraction_summary_resp = lookup_result.value
         else:
-            if lookup_result is not None:
+            if lookup_result is not None and lookup_result.hit and not isinstance(lookup_result.value, dict):
+                LOG.warning(
+                    "data-extraction-summary cache hit returned non-dict value; falling through to LLM",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    value_type=type(lookup_result.value).__name__,
+                    cache_path="agent",
+                )
+            elif lookup_result is not None:
+                # Genuine miss only — non-dict hits are logged as a warning above and
+                # must NOT also emit a miss log (would double-count in Datadog).
                 LOG.info(
                     "data-extraction-summary cache miss",
                     workflow_run_id=workflow_run_id,
@@ -5021,11 +5159,7 @@ class ForgeAgent:
             data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
                 prompt=prompt, step=step, prompt_name="data-extraction-summary"
             )
-            # Guard on both cache_key and response to match the other two call sites
-            # and avoid caching None — a cached None would later produce hit=True/value=None,
-            # which would then trip the RuntimeError below instead of falling through to a
-            # fresh LLM call as the pre-telemetry get()-returns-None path did.
-            if cache_key and data_extraction_summary_resp is not None:
+            if cache_key and isinstance(data_extraction_summary_resp, dict):
                 extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
 
         if data_extraction_summary_resp is None:

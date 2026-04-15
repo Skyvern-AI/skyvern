@@ -780,10 +780,15 @@ def _action_to_stmt(
         label = option.get("label")
         value = value or label
         if value:
-            # TODO: consider supporting fallback mode for select_option actions
-            # ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
-            # if _requires_mini_agent(act):
-            ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
+            # Mirror the click branch: with semantic selectors we have a real
+            # CSS selector + value, so try the selector path first and fall
+            # back to AI only if it misses.  Without semantic selectors the
+            # selector is an xpath harvested from iteration 0 and unlikely to
+            # be reliable, so go straight to AI.
+            if use_semantic_selectors:
+                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+            else:
+                ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
             if act.get("field_name"):
                 option_value = cst.Subscript(
                     value=cst.Attribute(
@@ -1030,58 +1035,6 @@ def _collect_block_input_fields(
     return all_fields
 
 
-def _is_form_filling_block(
-    actions: list[dict[str, Any]],
-) -> bool:
-    """Check if a block's actions indicate a form-filling pattern (4+ input/select actions)."""
-    form_action_count = sum(
-        1 for a in actions if a.get("action_type") in (ActionType.INPUT_TEXT, ActionType.SELECT_OPTION)
-    )
-    return form_action_count >= 4
-
-
-def _build_form_filling_block_fn(
-    block: dict[str, Any],
-    actions: list[dict[str, Any]],
-    value_to_param: dict[str, str] | None = None,
-) -> FunctionDef:
-    """Generate a form-filling block function that uses page.fill_form().
-
-    Produces a simple function that calls page.fill_form(context.parameters)
-    which internally uses LLM-based field mapping (extract → map → fill).
-    """
-    name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
-    cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
-
-    navigation_goal = block.get("navigation_goal") or "Fill out the form"
-
-    # Include page.goto(url) if the block has a URL, just like _build_block_fn does.
-    # Templated URLs (e.g. {{ outer_loop.current_value.url }}) are wrapped in
-    # skyvern.render_template() so they resolve at runtime.
-    goto_line = ""
-    if block.get("url"):
-        url_str = block["url"]
-        if isinstance(url_str, str) and "{{" in url_str and "}}" in url_str:
-            goto_line = f"    await page.goto(skyvern.render_template({repr(url_str)}))\n"
-        else:
-            goto_line = f"    await page.goto({repr(url_str)})\n"
-
-    func_code = (
-        f"async def {name}(page: SkyvernPage, context: RunContext):\n"
-        f"{goto_line}"
-        f"    await page.fill_form(context.parameters, prompt={repr(navigation_goal)})\n"
-    )
-
-    # Parse and add decorator
-    parsed = cst.parse_module(func_code)
-    func_def = parsed.body[0]
-    assert isinstance(func_def, FunctionDef)
-
-    # Add the @skyvern.cached decorator
-    decorated = func_def.with_changes(decorators=[make_decorator(cache_key, block)])
-    return decorated
-
-
 def _detect_block_ats_platform(block: dict[str, Any], all_blocks: list[dict[str, Any]] | None = None) -> str | None:
     """Check if a block belongs to a known platform with optimized scripts.
 
@@ -1132,9 +1085,11 @@ def _build_block_fn(
                 )
                 return pipeline_fn
 
-    # Check if this block is form-filling (4+ input_text/select actions)
-    if use_semantic_selectors and _is_form_filling_block(actions):
-        return _build_form_filling_block_fn(block, actions, value_to_param)
+    # NOTE: page.fill_form() is intentionally NOT generated here.  fill_form
+    # delegates entirely to AI at runtime, defeating the purpose of caching.
+    # ATS workflows use their own optimized pipeline via the
+    # _detect_block_ats_platform → build_ats_pipeline_block_fn path above.
+    # See PR #10043 (reviewer restriction) and PR #10195 (this change).
 
     name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"

@@ -153,6 +153,11 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
     last_used_element_tree: list[dict] | None = None
+    # Last HTML variant built for the LLM (captures economy / truncation).
+    # None when the last build used fmt=JSON or no build has run yet. The
+    # extraction cache reads this to hash the exact HTML the LLM saw; JSON
+    # callers fall back to a fresh HTML rebuild at the cache callsite.
+    last_used_element_tree_html: str | None = None
     screenshots: list[bytes] = []
     url: str = ""
     html: str = ""
@@ -227,15 +232,22 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     def build_element_tree(
         self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
     ) -> str:
+        # Side effect: writes self.last_used_element_tree (always) and
+        # self.last_used_element_tree_html (HTML → string, JSON → None). The
+        # extraction cache reads the latter to hash the exact variant sent to
+        # the LLM. Callers that don't want the write must snapshot first.
         self.last_used_element_tree = self.element_tree_trimmed
         if fmt == ElementTreeFormat.JSON:
+            self.last_used_element_tree_html = None
             return json.dumps(self.element_tree_trimmed)
 
         if fmt == ElementTreeFormat.HTML:
-            return "".join(
+            result = "".join(
                 json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
                 for element in self.element_tree_trimmed
             )
+            self.last_used_element_tree_html = result
+            return result
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
@@ -263,6 +275,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self.last_used_element_tree = self.economy_element_tree
 
         if fmt == ElementTreeFormat.JSON:
+            self.last_used_element_tree_html = None
             element_str = json.dumps(self.economy_element_tree)
             return element_str[: int(len(element_str) * percent_to_keep)]
 
@@ -271,7 +284,9 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
                 json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
                 for element in self.economy_element_tree
             )
-            return element_str[: int(len(element_str) * percent_to_keep)]
+            result = element_str[: int(len(element_str) * percent_to_keep)]
+            self.last_used_element_tree_html = result
+            return result
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
@@ -315,6 +330,9 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self.html = refreshed_page.html
         self.extracted_text = refreshed_page.extracted_text
         self.url = refreshed_page.url
+        # Defensive: callers today rebuild before reading, but future direct
+        # reads of this field post-refresh would otherwise see stale HTML.
+        self.last_used_element_tree_html = None
         return self
 
     async def generate_scraped_page(

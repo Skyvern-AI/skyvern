@@ -1,5 +1,4 @@
 import time
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +48,7 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
@@ -99,18 +99,6 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
         failure_reason=block.failure_reason,
         html=html,
     )
-
-
-def _escape_code_fences(text: str) -> str:
-    """Escape code fence delimiters in user content to prevent fence breakout.
-
-    The user-role template wraps untrusted variables in triple-backtick fences.
-    If user content contains ``` or ~~~ (both valid CommonMark fence delimiters),
-    the fence could close early and the remainder renders as raw text (potential
-    instructions). Replace both with spaced versions to neutralize the breakout.
-    """
-    text = unicodedata.normalize("NFKC", text)
-    return text.replace("```", "` ` `").replace("~~~", "~ ~ ~")
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -164,11 +152,11 @@ async def copilot_call_llm(
     # Escape triple backticks to prevent code fence breakout
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
-        workflow_yaml=_escape_code_fences(chat_request.workflow_yaml or ""),
-        user_message=_escape_code_fences(chat_request.message),
-        chat_history=_escape_code_fences(chat_history_text),
-        global_llm_context=_escape_code_fences(global_llm_context or ""),
-        debug_run_info=_escape_code_fences(debug_run_info_text),
+        workflow_yaml=escape_code_fences(chat_request.workflow_yaml or ""),
+        user_message=escape_code_fences(chat_request.message),
+        chat_history=escape_code_fences(chat_history_text),
+        global_llm_context=escape_code_fences(global_llm_context or ""),
+        debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
     LOG.info(
@@ -315,11 +303,11 @@ async def _auto_correct_workflow_yaml(
 
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
-        workflow_yaml=_escape_code_fences(workflow_yaml),
-        user_message=_escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
-        chat_history=_escape_code_fences(_format_chat_history(new_chat_history)),
-        global_llm_context=_escape_code_fences(global_llm_context or ""),
-        debug_run_info=_escape_code_fences(debug_run_info_text),
+        workflow_yaml=escape_code_fences(workflow_yaml),
+        user_message=escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
+        chat_history=escape_code_fences(_format_chat_history(new_chat_history)),
+        global_llm_context=escape_code_fences(global_llm_context or ""),
+        debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
     llm_start_time = time.monotonic()

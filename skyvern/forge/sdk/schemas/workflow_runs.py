@@ -39,6 +39,7 @@ class WorkflowRunBlock(BaseModel):
     created_at: datetime
     modified_at: datetime
     include_action_history_in_verification: bool | None = False
+    include_extracted_text: bool = True
     duration: float | None = None
 
     # for loop block

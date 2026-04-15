@@ -117,6 +117,17 @@ class TestEmitToolResult:
             emit_tool_result(error_result, json_output=True)
         assert exc_info.value.code == 1
 
+    def test_captures_cli_telemetry_when_tool_name_provided(self):
+        result = {"ok": True, "action": "test", "data": {}, "error": None}
+        buf = io.StringIO()
+        with (
+            patch("sys.stdout", buf),
+            patch("skyvern.cli.commands._output.capture_cli_tool_call") as capture_mock,
+        ):
+            emit_tool_result(result, json_output=True, telemetry_tool_name="skyvern_test")
+
+        capture_mock.assert_called_once_with("skyvern_test", ok=True)
+
 
 # ---------------------------------------------------------------------------
 # run_tool tests
@@ -140,11 +151,24 @@ class TestRunTool:
             raise RuntimeError("network error")
 
         buf = io.StringIO()
-        with patch("sys.stdout", buf), pytest.raises(SystemExit):
-            run_tool(failing, json_output=True, hint_on_exception="check connection", action="workflow.create")
+        with (
+            patch("sys.stdout", buf),
+            patch("skyvern.cli.commands._output.capture_cli_tool_call") as capture_mock,
+            pytest.raises(SystemExit),
+        ):
+            run_tool(
+                failing,
+                json_output=True,
+                hint_on_exception="check connection",
+                action="workflow.create",
+                telemetry_tool_name="skyvern_workflow_create",
+            )
         envelope = json.loads(buf.getvalue())
         assert envelope["ok"] is False
         assert envelope["action"] == "workflow.create"
+        capture_mock.assert_called_once()
+        assert capture_mock.call_args.args[0] == "skyvern_workflow_create"
+        assert capture_mock.call_args.kwargs["ok"] is False
 
     def test_passes_bad_parameter_through(self):
         import typer
@@ -152,8 +176,17 @@ class TestRunTool:
         async def bad_param():
             raise typer.BadParameter("invalid value")
 
-        with pytest.raises(typer.BadParameter):
-            run_tool(bad_param, json_output=False, hint_on_exception="")
+        with (
+            patch("skyvern.cli.commands._output.capture_cli_tool_call") as capture_mock,
+            pytest.raises(typer.BadParameter),
+        ):
+            run_tool(
+                bad_param,
+                json_output=False,
+                hint_on_exception="",
+                telemetry_tool_name="skyvern_workflow_create",
+            )
+        capture_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
