@@ -322,6 +322,7 @@ def convert_workflow_definition(
         blocks=blocks,
         version=dag_version,
         finally_block_label=workflow_definition_yaml.finally_block_label,
+        error_code_mapping=workflow_definition_yaml.error_code_mapping,
     )
 
     LOG.info(

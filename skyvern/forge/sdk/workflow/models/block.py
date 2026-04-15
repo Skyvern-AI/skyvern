@@ -794,14 +794,22 @@ class BaseTaskBlock(Block):
                 self.terminate_criterion, workflow_run_context
             )
 
-        if self.error_code_mapping:
+        # Inherit workflow-level error_code_mapping; block-level entries override on key conflicts.
+        workflow = getattr(workflow_run_context, "workflow", None)
+        workflow_error_code_mapping: dict[str, str] | None = None
+        if workflow is not None and workflow.workflow_definition is not None:
+            workflow_error_code_mapping = workflow.workflow_definition.error_code_mapping
+
+        if workflow_error_code_mapping or self.error_code_mapping:
+            merged_mapping = dict(workflow_error_code_mapping or {})
+            merged_mapping.update(self.error_code_mapping or {})
             self.error_code_mapping = {
                 self.format_block_parameter_template_from_workflow_run_context(error_code, workflow_run_context): (
                     self.format_block_parameter_template_from_workflow_run_context(
                         error_description, workflow_run_context
                     )
                 )
-                for error_code, error_description in self.error_code_mapping.items()
+                for error_code, error_description in merged_mapping.items()
             }
 
     @staticmethod
