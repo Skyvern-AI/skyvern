@@ -5435,6 +5435,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -8864,6 +8869,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": false
           }
         },
         "type": "object",
@@ -9296,6 +9306,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -11373,6 +11388,11 @@
             ],
             "title": "Download Timeout"
           },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
+          },
           "instructions": {
             "type": "string",
             "title": "Instructions",
@@ -12046,6 +12066,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -12785,6 +12810,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -15294,6 +15324,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -16850,6 +16885,17 @@
             ],
             "title": "Thought Cost"
           },
+          "last_llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Llm Model"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -17438,6 +17484,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -17855,6 +17906,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -19859,6 +19915,11 @@
             ],
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           },
           "duration": {
             "anyOf": [
