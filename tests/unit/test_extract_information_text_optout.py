@@ -77,18 +77,26 @@ def _capture_extract_information_kwargs(monkeypatch, include_extracted_text: boo
 
     captured: dict = {}
 
-    def fake_load_prompt_with_elements(**kwargs):
-        captured.update(kwargs)
-        return "rendered-prompt"
+    def fake_load_prompt_with_elements_tracked(**kwargs):
+        # Drop the non-kwargs args (element_tree_builder, prompt_engine, etc.)
+        # so captured reflects the rendered-prompt template vars only.
+        captured.update(
+            {
+                k: v
+                for k, v in kwargs.items()
+                if k not in {"element_tree_builder", "prompt_engine", "template_name", "html_need_skyvern_attrs"}
+            }
+        )
+        return "rendered-prompt", dict(captured)
 
     async def fake_handler_call(**kwargs):
         captured["prompt"] = kwargs.get("prompt")
         return {}
 
     # The handler calls compute_cache_key (may raise), LOG, LLMAPIHandlerFactory,
-    # service_utils.is_cua_task. Monkey-patch just enough to reach load_prompt_with_elements
-    # and the handler call.
-    monkeypatch.setattr(handler, "load_prompt_with_elements", fake_load_prompt_with_elements)
+    # service_utils.is_cua_task. Monkey-patch just enough to reach the prompt
+    # builder and the handler call.
+    monkeypatch.setattr(handler, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
     monkeypatch.setattr(handler, "ensure_context", lambda: MagicMock(tz_info=None))
     monkeypatch.setattr(handler.service_utils, "is_cua_task", AsyncMock(return_value=False))
     monkeypatch.setattr(
@@ -160,9 +168,15 @@ def _capture_ai_extract_kwargs(monkeypatch, include_extracted_text: bool):
 
     captured: dict = {}
 
-    def fake_load_prompt_with_elements(**kwargs):
-        captured.update(kwargs)
-        return "rendered-prompt"
+    def fake_load_prompt_with_elements_tracked(**kwargs):
+        captured.update(
+            {
+                k: v
+                for k, v in kwargs.items()
+                if k not in {"element_tree_builder", "prompt_engine", "template_name", "html_need_skyvern_attrs"}
+            }
+        )
+        return "rendered-prompt", dict(captured)
 
     scraped_page = MagicMock()
     scraped_page.url = "https://example.test"
@@ -181,7 +195,7 @@ def _capture_ai_extract_kwargs(monkeypatch, include_extracted_text: bool):
     async def fake_handler(*, prompt, step, screenshots, prompt_name, force_dict):
         return {}
 
-    monkeypatch.setattr(module, "load_prompt_with_elements", fake_load_prompt_with_elements)
+    monkeypatch.setattr(module, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
     monkeypatch.setattr(module.app, "EXTRACTION_LLM_API_HANDLER", fake_handler)
     monkeypatch.setattr(module.extraction_cache, "compute_cache_key", lambda **_: None)
     monkeypatch.setattr(page, "_refresh_scraped_page", fake_refresh)
@@ -216,9 +230,15 @@ def _capture_ai_extract_kwargs_with_schema(monkeypatch, schema):
 
     captured: dict = {}
 
-    def fake_load_prompt_with_elements(**kwargs):
-        captured.update(kwargs)
-        return "rendered-prompt"
+    def fake_load_prompt_with_elements_tracked(**kwargs):
+        captured.update(
+            {
+                k: v
+                for k, v in kwargs.items()
+                if k not in {"element_tree_builder", "prompt_engine", "template_name", "html_need_skyvern_attrs"}
+            }
+        )
+        return "rendered-prompt", dict(captured)
 
     scraped_page = MagicMock()
     scraped_page.url = "https://example.test"
@@ -237,7 +257,7 @@ def _capture_ai_extract_kwargs_with_schema(monkeypatch, schema):
     async def fake_handler(*, prompt, step, screenshots, prompt_name, force_dict):
         return {}
 
-    monkeypatch.setattr(module, "load_prompt_with_elements", fake_load_prompt_with_elements)
+    monkeypatch.setattr(module, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
     monkeypatch.setattr(module.app, "EXTRACTION_LLM_API_HANDLER", fake_handler)
     monkeypatch.setattr(module.extraction_cache, "compute_cache_key", lambda **_: None)
     monkeypatch.setattr(page, "_refresh_scraped_page", fake_refresh)

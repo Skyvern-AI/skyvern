@@ -107,3 +107,78 @@ def test_load_prompt_with_elements_respects_ceiling_for_small_prompts() -> None:
 
     assert "small blob" in rendered
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
+
+
+def test_enforce_prompt_ceiling_tracked_reports_dropped_keys() -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, enforce_prompt_ceiling_tracked
+    from skyvern.utils.token_counter import count_tokens
+
+    giant_schema = {"type": "object", "_blob": "lorem " * 300_000}
+    kwargs = {
+        "data_extraction_goal": "Extract",
+        "data_extraction_schema": giant_schema,
+        "current_url": "https://example.test",
+        "local_datetime": "2026-04-14T12:00:00",
+    }
+    rendered = engine_module.load_prompt("data-extraction-summary", **kwargs)
+    assert count_tokens(rendered) > PROMPT_HARD_CEILING_TOKENS
+
+    rendered, post_kwargs = enforce_prompt_ceiling_tracked(
+        rendered,
+        prompt_engine=engine_module,
+        template_name="data-extraction-summary",
+        kwargs=kwargs,
+    )
+    assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
+    assert post_kwargs["data_extraction_schema"] is None
+    # kwargs dict is not mutated in place
+    assert kwargs["data_extraction_schema"] is giant_schema
+
+
+def test_enforce_prompt_ceiling_tracked_noop_under_ceiling() -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import enforce_prompt_ceiling_tracked
+
+    kwargs = {
+        "data_extraction_goal": "Extract",
+        "data_extraction_schema": {"type": "object"},
+        "current_url": "https://example.test",
+        "local_datetime": "2026-04-14T12:00:00",
+    }
+    rendered = engine_module.load_prompt("data-extraction-summary", **kwargs)
+
+    rendered_after, post_kwargs = enforce_prompt_ceiling_tracked(
+        rendered,
+        prompt_engine=engine_module,
+        template_name="data-extraction-summary",
+        kwargs=kwargs,
+    )
+    assert rendered_after == rendered
+    assert post_kwargs["data_extraction_schema"] == {"type": "object"}
+
+
+def test_load_prompt_with_elements_tracked_reports_dropped_keys() -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements_tracked
+    from skyvern.utils.token_counter import count_tokens
+
+    oversized_prev = [{"iter": i, "marker": f"UNIQUE_BLOCK_{i}_" + ("lorem ipsum " * 200)} for i in range(3000)]
+
+    rendered, post_kwargs = load_prompt_with_elements_tracked(
+        element_tree_builder=_make_element_tree_builder(),
+        prompt_engine=engine_module,
+        template_name="extract-information",
+        data_extraction_goal="Extract documents",
+        extracted_information_schema={"type": "object"},
+        current_url="https://example.test",
+        extracted_text=None,
+        error_code_mapping_str=None,
+        navigation_payload=None,
+        local_datetime="2026-04-14T12:00:00",
+        previous_extracted_information=oversized_prev,
+    )
+
+    assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
+    # previous_extracted_information is first in the drop chain and large enough to have been dropped
+    assert post_kwargs["previous_extracted_information"] is None
