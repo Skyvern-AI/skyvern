@@ -53,13 +53,20 @@ CEILING_FALLBACK_KEYS_BY_TEMPLATE: dict[str, list[str]] = {
 }
 
 
-def load_prompt_with_elements(
+def load_prompt_with_elements_tracked(
     element_tree_builder: ElementTreeBuilder,
     prompt_engine: PromptEngine,
     template_name: str,
     html_need_skyvern_attrs: bool = True,
     **kwargs: Any,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
+    """Same as load_prompt_with_elements but also returns post-ceiling kwargs.
+
+    The returned kwargs dict reflects every fallback key that was set to None
+    to bring the prompt under the hard ceiling. Callers that hash prompt
+    inputs for caching should use these values instead of the pre-drop kwargs
+    so two requests that render to the same final prompt share a cache key.
+    """
     elements = element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
     prompt = prompt_engine.load_prompt(
         template_name,
@@ -97,7 +104,7 @@ def load_prompt_with_elements(
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
 
-    return enforce_prompt_ceiling(
+    return enforce_prompt_ceiling_tracked(
         prompt,
         prompt_engine=prompt_engine,
         template_name=template_name,
@@ -106,25 +113,42 @@ def load_prompt_with_elements(
     )
 
 
-def enforce_prompt_ceiling(
+def load_prompt_with_elements(
+    element_tree_builder: ElementTreeBuilder,
+    prompt_engine: PromptEngine,
+    template_name: str,
+    html_need_skyvern_attrs: bool = True,
+    **kwargs: Any,
+) -> str:
+    prompt, _ = load_prompt_with_elements_tracked(
+        element_tree_builder=element_tree_builder,
+        prompt_engine=prompt_engine,
+        template_name=template_name,
+        html_need_skyvern_attrs=html_need_skyvern_attrs,
+        **kwargs,
+    )
+    return prompt
+
+
+def enforce_prompt_ceiling_tracked(
     prompt: str,
     *,
     prompt_engine: PromptEngine,
     template_name: str,
     kwargs: dict[str, Any],
     elements: Any | None = None,
-) -> str:
-    """Drop fallback-chain keys in priority order until the prompt fits.
+) -> tuple[str, dict[str, Any]]:
+    """Same as enforce_prompt_ceiling but also returns post-drop kwargs.
 
-    Use this at any call site that builds a prompt via prompt_engine.load_prompt
-    directly, so the 180k hard ceiling is enforced regardless of whether the
-    caller went through load_prompt_with_elements.
+    Callers that derive a cache key from the prompt inputs should hash the
+    returned kwargs so requests that render to the same final LLM prompt
+    (because dropped fields differed but were both dropped) share a key.
     """
+    working_kwargs = dict(kwargs)
     final_token_count = count_tokens(prompt)
     if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
-        return prompt
+        return prompt, working_kwargs
     fallback_keys = CEILING_FALLBACK_KEYS_BY_TEMPLATE.get(template_name, [])
-    working_kwargs = dict(kwargs)
     for drop_key in fallback_keys:
         if working_kwargs.get(drop_key) is None:
             continue
@@ -142,11 +166,35 @@ def enforce_prompt_ceiling(
             prompt = prompt_engine.load_prompt(template_name, elements=elements, **working_kwargs)
         final_token_count = count_tokens(prompt)
         if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
-            return prompt
+            return prompt, working_kwargs
     LOG.error(
         "Prompt still exceeds hard ceiling after all fallback drops",
         template_name=template_name,
         final_token_count=final_token_count,
         hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
+    )
+    return prompt, working_kwargs
+
+
+def enforce_prompt_ceiling(
+    prompt: str,
+    *,
+    prompt_engine: PromptEngine,
+    template_name: str,
+    kwargs: dict[str, Any],
+    elements: Any | None = None,
+) -> str:
+    """Drop fallback-chain keys in priority order until the prompt fits.
+
+    Use this at any call site that builds a prompt via prompt_engine.load_prompt
+    directly, so the 180k hard ceiling is enforced regardless of whether the
+    caller went through load_prompt_with_elements.
+    """
+    prompt, _ = enforce_prompt_ceiling_tracked(
+        prompt,
+        prompt_engine=prompt_engine,
+        template_name=template_name,
+        kwargs=kwargs,
+        elements=elements,
     )
     return prompt
