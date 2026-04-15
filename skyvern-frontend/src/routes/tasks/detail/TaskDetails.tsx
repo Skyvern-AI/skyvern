@@ -28,7 +28,6 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { runsApiBaseUrl } from "@/util/env";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
@@ -243,7 +242,7 @@ function TaskDetails() {
 
                 return {
                   method: "POST",
-                  url: `${runsApiBaseUrl}/run/tasks`,
+                  url: `${env.runsApiBaseUrl}/run/tasks`,
                   body: buildTaskRunPayload(
                     createTaskRequestObject(task),
                     RunEngine.SkyvernV1,

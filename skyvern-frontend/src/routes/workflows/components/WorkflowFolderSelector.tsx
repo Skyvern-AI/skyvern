@@ -13,10 +13,9 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Input } from "@/components/ui/input";
-import { cn } from "@/util/utils";
+import { cn, handleInfiniteScroll } from "@/util/utils";
 import { useInfiniteFoldersQuery } from "../hooks/useInfiniteFoldersQuery";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
-import { handleInfiniteScroll } from "@/util/utils";
 import { useDebounce } from "use-debounce";
 import { Skeleton } from "@/components/ui/skeleton";
 

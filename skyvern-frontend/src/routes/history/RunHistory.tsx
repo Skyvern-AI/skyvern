@@ -329,9 +329,9 @@ function RunHistory() {
           </TableHeader>
           <TableBody>{displayTableBody()}</TableBody>
         </Table>
-        <div className="flex items-center justify-between px-3 py-3">
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-slate-400">Items per page</span>
+        <div className="relative px-3 py-3">
+          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+            <span className="text-slate-400">Items per page</span>
             <Select
               value={String(itemsPerPage)}
               onValueChange={(size) => {
@@ -352,7 +352,7 @@ function RunHistory() {
               </SelectContent>
             </Select>
           </div>
-          <Pagination className="mx-0 w-auto pt-0">
+          <Pagination className="pt-0">
             <PaginationContent>
               <PaginationItem>
                 <PaginationPrevious

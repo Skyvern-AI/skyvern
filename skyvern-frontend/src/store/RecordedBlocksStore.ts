@@ -1,6 +1,8 @@
 import { create } from "zustand";
-import type { WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
-import type { WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
+import type {
+  WorkflowBlock,
+  WorkflowParameter,
+} from "@/routes/workflows/types/workflowTypes";
 
 type InsertionPoint = {
   previous: string | null;
