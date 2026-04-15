@@ -55,6 +55,7 @@ class WorkflowDefinition(BaseModel):
     parameters: list[PARAMETER_TYPE]
     blocks: List[BlockTypeVar]
     finally_block_label: str | None = None
+    error_code_mapping: dict[str, str] | None = None
 
     def validate(self) -> None:
         all_labels: set[str] = set()
