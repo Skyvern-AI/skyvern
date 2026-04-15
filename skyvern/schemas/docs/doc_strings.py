@@ -25,6 +25,7 @@ Available geotargeting options:
 - RESIDENTIAL_NZ: New Zealand
 - RESIDENTIAL_PH: Philippines
 - RESIDENTIAL_KR: South Korea
+- RESIDENTIAL_SA: Saudi Arabia
 - RESIDENTIAL_ZA: South Africa
 - RESIDENTIAL_AR: Argentina
 - RESIDENTIAL_AU: Australia
