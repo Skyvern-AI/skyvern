@@ -81,6 +81,16 @@ dependencies = [
     "aiosqlite>=0.21.0,<0.23",
 ]
 
+# Optional extras gate capabilities that are dormant in this stack. The
+# copilot extra pulls openai-agents, required once the copilot runtime is
+# wired up in the activation PR. Until then, any environment that imports
+# skyvern.forge.sdk.copilot (tests, dev activation) should install
+# `skyvern[copilot]` instead of plain `skyvern`.
+[project.optional-dependencies]
+copilot = [
+    "openai-agents>=0.13.4,<0.14",
+]
+
 [dependency-groups]
 cloud = [
     "stripe>=9.7.0,<10",
