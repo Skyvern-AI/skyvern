@@ -97,7 +97,7 @@ const result = await skyvern.runTask({
   body: {
     prompt: string,                                  // Required. Natural language instructions.
     url?: string,                                    // Starting page URL.
-    engine?: RunEngine,                              // "skyvern_v1" (default), "skyvern_v2", "openai_cua", "anthropic_cua", "ui_tars"
+    engine?: RunEngine,                              // "skyvern_v2" (default), "skyvern_v1", "openai_cua", "anthropic_cua", "ui_tars"
     max_steps?: number,                              // Cap AI steps to limit cost.
     data_extraction_schema?: Record<string, unknown> | string,  // JSON Schema for output.
     browser_session_id?: string,                     // Run in existing session.
