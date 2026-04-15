@@ -116,7 +116,7 @@ from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
     PROMPT_HARD_CEILING_TOKENS,
     MaxStepsReasonResponse,
-    enforce_prompt_ceiling,
+    enforce_prompt_ceiling_tracked,
     load_prompt_with_elements,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
@@ -5067,16 +5067,17 @@ class ForgeAgent:
     @staticmethod
     async def create_extract_action(task: Task, step: Step, scraped_page: ScrapedPage) -> ExtractAction:
         context = skyvern_context.ensure_context()
+        local_datetime_str = datetime.now(context.tz_info).isoformat()
         capped_schema = truncate_extraction_schema(task.extracted_information_schema)
         # generate reasoning by prompt llm to think briefly what data to extract
         summary_kwargs: dict[str, Any] = {
             "data_extraction_goal": task.data_extraction_goal,
             "data_extraction_schema": capped_schema,
             "current_url": scraped_page.url,
-            "local_datetime": datetime.now(context.tz_info).isoformat(),
+            "local_datetime": local_datetime_str,
         }
         prompt = prompt_engine.load_prompt("data-extraction-summary", **summary_kwargs)
-        prompt = enforce_prompt_ceiling(
+        prompt, post_ceiling_kwargs = enforce_prompt_ceiling_tracked(
             prompt,
             prompt_engine=prompt_engine,
             template_name="data-extraction-summary",
@@ -5091,8 +5092,18 @@ class ForgeAgent:
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
+            # data-extraction-summary is goal-agnostic: only goal/schema/URL/datetime
+            # affect the rendered prompt, so everything else is intentionally omitted.
+            # Hash the post-ceiling value for `data_extraction_schema` — when the
+            # rendered prompt exceeds PROMPT_HARD_CEILING_TOKENS the ceiling drops
+            # that field to None, so two oversized-schema requests that both get
+            # dropped produce an identical LLM prompt and must share a cache key.
             cache_key = extraction_cache.compute_cache_key(
-                rendered_prompt=prompt,
+                call_path="agent",
+                data_extraction_goal=task.data_extraction_goal,
+                extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
+                current_url=scraped_page.url,
+                local_datetime=local_datetime_str,
                 llm_key=None,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
@@ -5111,7 +5122,7 @@ class ForgeAgent:
             # Preserve cache_key so the store() below can still warm the cache
             # for subsequent identical calls even when lookup() fails transiently.
 
-        if lookup_result is not None and lookup_result.hit:
+        if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, dict):
             LOG.info(
                 "data-extraction-summary cache hit — skipping LLM call",
                 workflow_run_id=workflow_run_id,
@@ -5124,7 +5135,17 @@ class ForgeAgent:
             )
             data_extraction_summary_resp = lookup_result.value
         else:
-            if lookup_result is not None:
+            if lookup_result is not None and lookup_result.hit and not isinstance(lookup_result.value, dict):
+                LOG.warning(
+                    "data-extraction-summary cache hit returned non-dict value; falling through to LLM",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    value_type=type(lookup_result.value).__name__,
+                    cache_path="agent",
+                )
+            elif lookup_result is not None:
+                # Genuine miss only — non-dict hits are logged as a warning above and
+                # must NOT also emit a miss log (would double-count in Datadog).
                 LOG.info(
                     "data-extraction-summary cache miss",
                     workflow_run_id=workflow_run_id,
@@ -5138,11 +5159,7 @@ class ForgeAgent:
             data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
                 prompt=prompt, step=step, prompt_name="data-extraction-summary"
             )
-            # Guard on both cache_key and response to match the other two call sites
-            # and avoid caching None — a cached None would later produce hit=True/value=None,
-            # which would then trip the RuntimeError below instead of falling through to a
-            # fresh LLM call as the pre-telemetry get()-returns-None path did.
-            if cache_key and data_extraction_summary_resp is not None:
+            if cache_key and isinstance(data_extraction_summary_resp, dict):
                 extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
 
         if data_extraction_summary_resp is None:

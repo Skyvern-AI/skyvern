@@ -27,15 +27,21 @@ def _capture_handler_kwargs(monkeypatch, previous_extracted_information):
 
     captured: dict = {}
 
-    def fake_load_prompt_with_elements(**kwargs):
-        captured.update(kwargs)
-        return "rendered-prompt"
+    def fake_load_prompt_with_elements_tracked(**kwargs):
+        captured.update(
+            {
+                k: v
+                for k, v in kwargs.items()
+                if k not in {"element_tree_builder", "prompt_engine", "template_name", "html_need_skyvern_attrs"}
+            }
+        )
+        return "rendered-prompt", dict(captured)
 
     async def fake_handler_call(**kwargs):
         captured["prompt"] = kwargs.get("prompt")
         return {}
 
-    monkeypatch.setattr(handler, "load_prompt_with_elements", fake_load_prompt_with_elements)
+    monkeypatch.setattr(handler, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
     monkeypatch.setattr(handler, "ensure_context", lambda: MagicMock(tz_info=None))
     monkeypatch.setattr(handler.service_utils, "is_cua_task", AsyncMock(return_value=False))
     monkeypatch.setattr(
@@ -97,15 +103,21 @@ def _capture_handler_schema(monkeypatch, extracted_information_schema):
 
     captured: dict = {}
 
-    def fake_load_prompt_with_elements(**kwargs):
-        captured.update(kwargs)
-        return "rendered-prompt"
+    def fake_load_prompt_with_elements_tracked(**kwargs):
+        captured.update(
+            {
+                k: v
+                for k, v in kwargs.items()
+                if k not in {"element_tree_builder", "prompt_engine", "template_name", "html_need_skyvern_attrs"}
+            }
+        )
+        return "rendered-prompt", dict(captured)
 
     async def fake_handler_call(**kwargs):
         captured["prompt"] = kwargs.get("prompt")
         return {}
 
-    monkeypatch.setattr(handler, "load_prompt_with_elements", fake_load_prompt_with_elements)
+    monkeypatch.setattr(handler, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
     monkeypatch.setattr(handler, "ensure_context", lambda: MagicMock(tz_info=None))
     monkeypatch.setattr(handler.service_utils, "is_cua_task", AsyncMock(return_value=False))
     monkeypatch.setattr(

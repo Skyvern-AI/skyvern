@@ -83,6 +83,7 @@ from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
     load_prompt_with_elements,
+    load_prompt_with_elements_tracked,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
 from skyvern.webeye.actions import actions, handler_utils
@@ -4274,11 +4275,18 @@ async def extract_information_for_navigation_goal(
 
     previous_info_capped = truncate_previous_extracted_information(task.extracted_information)
     capped_schema = truncate_extraction_schema(task.extracted_information_schema)
+    # Normalize error_code_mapping to the exact string the prompt will render
+    # (None when falsy). Hashing this value below — instead of the raw dict —
+    # means None and {} collapse to one key since both drop the prompt block.
+    error_code_mapping_str = json.dumps(task.error_code_mapping) if task.error_code_mapping else None
 
     # Render the prompt FIRST so the cache key hashes the exact string that
     # will be sent to the LLM (captures economy-tree swaps and 2/3 truncation
-    # inside load_prompt_with_elements).
-    extract_information_prompt = load_prompt_with_elements(
+    # inside load_prompt_with_elements). Use the _tracked variant so the cache
+    # key below can hash the post-ceiling values — when the prompt exceeds the
+    # hard ceiling, `enforce_prompt_ceiling` drops fields to None, and two
+    # requests that render to the same final LLM prompt must share a key.
+    extract_information_prompt, post_ceiling_kwargs = load_prompt_with_elements_tracked(
         element_tree_builder=scraped_page_refreshed,
         prompt_engine=prompt_engine,
         template_name="extract-information",
@@ -4290,7 +4298,7 @@ async def extract_information_for_navigation_goal(
         extracted_information_schema=capped_schema,
         current_url=scraped_page_refreshed.url,
         extracted_text=extracted_text_for_prompt,
-        error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+        error_code_mapping_str=error_code_mapping_str,
         local_datetime=local_datetime_str,
     )
 
@@ -4301,9 +4309,32 @@ async def extract_information_for_navigation_goal(
     cache_key: str | None = None
     lookup_result: extraction_cache.LookupResult | None = None
     try:
+        # Use the variant of the element tree that load_prompt_with_elements
+        # actually rendered (could be economy or 2/3-truncated under token
+        # pressure). Falls back to a fresh HTML build when the prior build
+        # used fmt=JSON (field is None in that case). The fallback call
+        # mutates `last_used_element_tree{_html}` on scraped_page_refreshed;
+        # this is intentional — nothing downstream reads those fields after
+        # the cache key is computed.
+        # Hash the post-ceiling values for fields that enforce_prompt_ceiling
+        # may drop (previous_extracted_information / extracted_information_schema /
+        # extracted_text). When those fields are dropped, two requests that
+        # differ only in the dropped values render identical final prompts and
+        # must share a cache key. `extracted_text` also respects
+        # include_extracted_text (None when disabled).
         cache_key = extraction_cache.compute_cache_key(
-            rendered_prompt=extract_information_prompt,
+            call_path="handler",
+            element_tree=scraped_page_refreshed.last_used_element_tree_html
+            or scraped_page_refreshed.build_element_tree(html_need_skyvern_attrs=False),
+            extracted_text=post_ceiling_kwargs["extracted_text"],
+            current_url=scraped_page_refreshed.url,
+            data_extraction_goal=task.data_extraction_goal,
+            extracted_information_schema=post_ceiling_kwargs["extracted_information_schema"],
+            navigation_payload=task.navigation_payload,
+            error_code_mapping=error_code_mapping_str,
+            previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
+            local_datetime=local_datetime_str,
         )
         lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
     except Exception:
@@ -4316,13 +4347,13 @@ async def extract_information_for_navigation_goal(
             cache_scope=extraction_cache.SCOPE_RUN,
             cache_age_seconds=None,
             fallback_reason=extraction_cache.FALLBACK_LOOKUP_ERROR,
-            cache_path="agent",
+            cache_path="handler",
             exc_info=True,
         )
         # Preserve cache_key so the downstream store() can still warm the cache
         # for subsequent identical calls even when lookup() fails transiently.
 
-    if lookup_result is not None and lookup_result.hit:
+    if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, (dict, list, str)):
         LOG.info(
             "extract_information cache hit — skipping LLM call",
             task_id=task.task_id,
@@ -4332,7 +4363,7 @@ async def extract_information_for_navigation_goal(
             cache_scope=lookup_result.scope,
             cache_age_seconds=lookup_result.age_seconds,
             fallback_reason=None,
-            cache_path="agent",
+            cache_path="handler",
         )
         # Fire-and-forget shadow sampling on sampled hits. Flag lookup happens
         # inside the background task so the cache-hit return is not blocked
@@ -4390,7 +4421,16 @@ async def extract_information_for_navigation_goal(
                 schema=shadow_schema,
             )
         return ScrapeResult(scraped_data=lookup_result.value)
-    if lookup_result is not None:
+    if lookup_result is not None and lookup_result.hit:
+        LOG.warning(
+            "extract_information cache hit returned non-cacheable value type; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            value_type=type(lookup_result.value).__name__,
+            cache_path="handler",
+        )
+    elif lookup_result is not None:
         LOG.info(
             "extract_information cache miss",
             task_id=task.task_id,
@@ -4400,7 +4440,7 @@ async def extract_information_for_navigation_goal(
             cache_scope=lookup_result.scope,
             cache_age_seconds=None,
             fallback_reason=lookup_result.fallback_reason,
-            cache_path="agent",
+            cache_path="handler",
         )
 
     # Use the appropriate LLM handler based on the feature flag
@@ -4423,8 +4463,11 @@ async def extract_information_for_navigation_goal(
         )
 
     # Cache the post-validation result so cache hits return the same shape as
-    # a fresh LLM call (schema-validated with missing fields filled).
-    if cache_key is not None and json_response is not None:
+    # a fresh LLM call (schema-validated with missing fields filled). Accept
+    # dict / list / str — the `extract-information` prompt uses
+    # `force_dict=False`, so root `type: array` or scalar schemas are valid
+    # return shapes (matches ``ScrapeResult.scraped_data``).
+    if cache_key is not None and isinstance(json_response, (dict, list, str)):
         try:
             extraction_cache.store(task.workflow_run_id, cache_key, json_response)
         except Exception:

@@ -14,7 +14,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-07T17:49:42.509853Z"
+exclude-newer = "2026-04-07T19:07:49.173655Z"
 exclude-newer-span = "P7D"
 
 [manifest]
@@ -5486,6 +5486,35 @@ wheels = [
 ]
 
 [[package]]
+name = "selectolax"
+version = "0.3.34"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bf/8c/8bbe1b17098b4e2a63a251361870303c37ad4c3170536277096575c24ca4/selectolax-0.3.34.tar.gz", hash = "sha256:c2cdb30b60994f1e0b74574dd408f1336d2fadd68a3ebab8ea573740dcbf17e2", size = 4706599, upload-time = "2025-08-28T23:17:44.131Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/1e/146ce1f51d472677777422ce4442eff081ac54331667a6558a98f7c47e6c/selectolax-0.3.34-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:aa1abb8ca78c832808661a9ac13f7fe23fbab4b914afb5d99b7f1349cc78586a", size = 2002899, upload-time = "2025-08-28T23:16:36.774Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/9f/30cb6a68d2e6d75da8fa3910d1f80a9b8b7338689894d24cfddb184adeaa/selectolax-0.3.34-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:88596b9f250ce238b7830e5987780031ffd645db257f73dcd816ec93523d7c04", size = 1994898, upload-time = "2025-08-28T23:16:38.153Z" },
+    { url = "https://files.pythonhosted.org/packages/79/63/b207c894c54b426ae69e08c85a5dc85c22f4d10872efd17a599f8dfb94e2/selectolax-0.3.34-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7755dfe7dd7455ca1f7194c631d409508fa26be8db94874760a27ae27d98a1c3", size = 2209542, upload-time = "2025-08-28T23:16:39.975Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/50/76285317fafbb80f01853c05256c584f32184371f609ecb9f0bab372a785/selectolax-0.3.34-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:579fdefcb302a7cc632a094ec69e7db24865ec475b1f34f5b2f0e9d05d8ec428", size = 2242685, upload-time = "2025-08-28T23:16:41.327Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/ba/56be3f947cda174f1923fc08b216b63ec5c433c41b7b02c9ac05170a2b30/selectolax-0.3.34-cp311-cp311-win32.whl", hash = "sha256:a568d2f4581d54c74ec44102d189fe255efed2d8160fda927b3d8ed41fe69178", size = 1690600, upload-time = "2025-08-28T23:16:43.071Z" },
+    { url = "https://files.pythonhosted.org/packages/53/f2/d44f44fe11a28be31a3f55cff298364cd5f0baa2dca2eed20d4e4ac230f5/selectolax-0.3.34-cp311-cp311-win_amd64.whl", hash = "sha256:ff0853d10a7e8f807113a155e93cd612a41aedd009fac02992f10c388fcdd6fe", size = 1792859, upload-time = "2025-08-28T23:16:44.77Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/a1/d4168930f1b377befa2e3b6db1a81a600c12a800689aef047ec4407ac933/selectolax-0.3.34-cp311-cp311-win_arm64.whl", hash = "sha256:f28ebdb0f376dae6f2e80d41731076ce4891403584f15cec13593f561cfb4db0", size = 1744909, upload-time = "2025-08-28T23:16:46.526Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/eb/6cf9dd52e20922ea5d5be8f8c448e9501a8503ad6c8d7f70be737f76e76b/selectolax-0.3.34-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:a913371fe79d6f795fc36c0c0753aab1593e198af78dc0654a7615a6581ada14", size = 2003247, upload-time = "2025-08-28T23:16:48.206Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/ec/58682f69bddfe1b64e44e235e6ad2585742b4d8d805c4c0d7f2a9c0d97f5/selectolax-0.3.34-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:11b0e913897727563b2689b38a63696a21084c3c7fd93042dc8af259a4020809", size = 1995861, upload-time = "2025-08-28T23:16:49.641Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/68/38b8bc49d19feefd20d65661ee0ffad8537cb21bdbeaa23be3cf42f7445d/selectolax-0.3.34-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7b49f0e0af267274c39a0dc7e807c556ecf2e189f44cf95dd5d2398f36c17ce9", size = 2202808, upload-time = "2025-08-28T23:16:51.564Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/42/1f5e5fc7c9ac362ac259a94d2d4040e1e2c57ab2c552db7bd830884d610a/selectolax-0.3.34-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d0a5a1a8b62e204aba7030b49c5b696ee24cabb243ba757328eb54681a74340c", size = 2241858, upload-time = "2025-08-28T23:16:53.589Z" },
+    { url = "https://files.pythonhosted.org/packages/90/d7/fa4d3f8fa1cfdeb36f0a4f14db362fa45b913679a15e82f3618fd62526ce/selectolax-0.3.34-cp312-cp312-win32.whl", hash = "sha256:cb49af5de5b5e99068bc7845687b40d4ded88c5e80868a7f1aa004f2380c2444", size = 1686857, upload-time = "2025-08-28T23:16:55.247Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/2c/f0112f0de82e7b72773f5289481fa8e31c65992d687a36048ade7e2d5703/selectolax-0.3.34-cp312-cp312-win_amd64.whl", hash = "sha256:33862576e7d9bb015b1580752316cc4b0ca2fb54347cb671fabb801c8032c67e", size = 1789407, upload-time = "2025-08-28T23:16:56.622Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/09/8972f0fed462739ad8a5fe1f0191f19edfc95ff7c1b09de4c940c9fe744c/selectolax-0.3.34-cp312-cp312-win_arm64.whl", hash = "sha256:8a663d762c9b6e64888489293d9b37d6727ac8f447dca221e044b61203c0f1e1", size = 1737885, upload-time = "2025-08-28T23:16:58.161Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/29/eeb77d1a77599023387d4d00655960dfa3d760557b42a65ef347e29b40b0/selectolax-0.3.34-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:2bb74e079098d758bd3d5c77b1c66c90098de305e4084b60981e561acf52c12a", size = 2001199, upload-time = "2025-08-28T23:16:59.467Z" },
+    { url = "https://files.pythonhosted.org/packages/21/80/326b9dd2901b64c3c654db9e8841ddc412b9c2af0047b7d43290bbb276be/selectolax-0.3.34-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:cc39822f714e6e434ceb893e1ccff873f3f88c8db8226ba2f8a5f4a7a0e2aa29", size = 1994171, upload-time = "2025-08-28T23:17:01.206Z" },
+    { url = "https://files.pythonhosted.org/packages/15/af/1265e4f9429b3c3cf098ba08cb3264d7e16990ed3029d89e9890012aae76/selectolax-0.3.34-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:181b67949ec23b4f11b6f2e426ba9904dd25c73d12c2cb22caf8fae21a363e99", size = 2196092, upload-time = "2025-08-28T23:17:02.574Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/41/e67100abd8b0b2a5e1d5d7fa864c31d31e9a2c0bbd08ce4e951235f13143/selectolax-0.3.34-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0b09f9d7b22bbb633966ac2019ec059caf735a5bdb4a5784bab0f4db2198fd6a", size = 2233674, upload-time = "2025-08-28T23:17:03.928Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/24/7ad043805c9292b4f535071c223d10aad7703b4460d68de1dce9dcf21d3f/selectolax-0.3.34-cp313-cp313-win32.whl", hash = "sha256:6e2ae8a984f82c9373e8a5ec0450f67603fde843fed73675f5187986e9e45b59", size = 1686489, upload-time = "2025-08-28T23:17:05.341Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/79/62666fbfcd847c0cfc2b75b496bfa8382d765e7a3d5a2c792004760a6e61/selectolax-0.3.34-cp313-cp313-win_amd64.whl", hash = "sha256:96acd5414aaf0bb8677258ff7b0f494953b2621f71be1e3d69e01743545509ec", size = 1789924, upload-time = "2025-08-28T23:17:06.708Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/b5/0bb579210a7de36d97c359016e77119513d3e810c61e99ade72089bc1b4d/selectolax-0.3.34-cp313-cp313-win_arm64.whl", hash = "sha256:1d309fd17ba72bb46a282154f75752ed7746de6f00e2c1eec4cd421dcdadf008", size = 1737480, upload-time = "2025-08-28T23:17:08.575Z" },
+]
+
+[[package]]
 name = "send2trash"
 version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5581,6 +5610,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "requests-toolbelt" },
     { name = "rich", extra = ["jupyter"] },
+    { name = "selectolax" },
     { name = "sqlalchemy", extra = ["mypy"] },
     { name = "sse-starlette" },
     { name = "starlette-context" },
@@ -5704,6 +5734,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.22,<1" },
     { name = "requests-toolbelt", specifier = ">=1.0.0,<2" },
     { name = "rich", extras = ["jupyter"], specifier = ">=13.7.0,<14" },
+    { name = "selectolax", specifier = ">=0.3.28,<0.4" },
     { name = "sqlalchemy", extras = ["mypy"], specifier = ">=2.0.29,<3" },
     { name = "sse-starlette", specifier = ">=3.0.3,<4" },
     { name = "starlette-context", specifier = ">=0.3.6,<0.6" },

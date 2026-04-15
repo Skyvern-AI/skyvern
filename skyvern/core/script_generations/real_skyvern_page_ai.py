@@ -23,7 +23,7 @@ from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.css_selector import compute_selector_options
-from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_engine import load_prompt_with_elements, load_prompt_with_elements_tracked
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
@@ -919,33 +919,69 @@ class RealSkyvernPageAi(SkyvernPageAi):
         # that will be sent to the LLM (captures economy-tree swaps and 2/3
         # truncation inside load_prompt_with_elements).
         extracted_text_for_prompt = self.scraped_page.extracted_text if include_extracted_text else None
+        capped_schema = truncate_extraction_schema(schema)
+        # Normalize error_code_mapping to the exact string the prompt will
+        # render (None when falsy). Hashing this string below means None and
+        # {} collapse to one key since both drop the prompt block.
+        error_code_mapping_str = json.dumps(error_code_mapping) if error_code_mapping else None
 
-        extract_information_prompt = load_prompt_with_elements(
+        # Use the _tracked variant so the cache key below can hash post-ceiling
+        # values — when the prompt exceeds the hard ceiling,
+        # enforce_prompt_ceiling drops fields to None and two requests that
+        # render to the same final LLM prompt must share a cache key.
+        extract_information_prompt, post_ceiling_kwargs = load_prompt_with_elements_tracked(
             element_tree_builder=self.scraped_page,
             prompt_engine=prompt_engine,
             template_name="extract-information",
             html_need_skyvern_attrs=False,
             data_extraction_goal=prompt,
-            extracted_information_schema=truncate_extraction_schema(schema),
+            extracted_information_schema=capped_schema,
             current_url=self.scraped_page.url,
             extracted_text=extracted_text_for_prompt,
-            error_code_mapping_str=(json.dumps(error_code_mapping) if error_code_mapping else None),
+            error_code_mapping_str=error_code_mapping_str,
             local_datetime=local_datetime_str,
         )
 
-        # Share the extract-information cache with the agent path. Best-effort
-        # per the RFC review — any exception falls through to the full LLM
-        # call below. The `try` is narrowed to just compute_cache_key + lookup
-        # so a downstream log failure can't re-enter the except block and
-        # double-count the call as both a hit/miss and a `lookup_error` in
-        # the Datadog miss-reason metric.
+        # Cache extract-information within this script-generation path. The
+        # `call_path="script"` discriminator structurally isolates these keys
+        # from the agent/handler paths so a script-path hit can never replay
+        # an agent-path result (or vice versa), even when all other inputs
+        # happen to hash identically (e.g. a goal with no `{{ var }}`
+        # substitutions and no nav/prev context).
+        #
+        # Best-effort per the RFC review — any exception falls through to the
+        # full LLM call below. The `try` is narrowed to just compute_cache_key
+        # + lookup so a downstream log failure can't re-enter the except block
+        # and double-count the call as both a hit/miss and a `lookup_error`
+        # in the Datadog miss-reason metric.
         workflow_run_id = context.workflow_run_id if context else None
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
+            # Use the variant of the element tree that load_prompt_with_elements
+            # actually rendered (could be economy or 2/3-truncated under token
+            # pressure). Falls back to a fresh HTML build when the prior build
+            # used fmt=JSON (field is None in that case). The fallback call
+            # mutates `last_used_element_tree{_html}` on self.scraped_page;
+            # this is intentional — nothing downstream reads those fields after
+            # the cache key is computed.
+            # navigation_payload / previous_extracted_information intentionally
+            # omitted — ai_extract is the script-generation extract path and
+            # doesn't carry navigation context.
+            # Hash the post-ceiling values so two requests that differ only in
+            # dropped fields (schema/extracted_text on oversized prompts) and
+            # render to the same final LLM prompt share a cache key.
             cache_key = extraction_cache.compute_cache_key(
-                rendered_prompt=extract_information_prompt,
+                call_path="script",
+                element_tree=self.scraped_page.last_used_element_tree_html
+                or self.scraped_page.build_element_tree(html_need_skyvern_attrs=False),
+                extracted_text=post_ceiling_kwargs["extracted_text"],
+                current_url=self.scraped_page.url,
+                data_extraction_goal=prompt,
+                extracted_information_schema=post_ceiling_kwargs["extracted_information_schema"],
+                error_code_mapping=error_code_mapping_str,
                 llm_key=None,
+                local_datetime=local_datetime_str,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
@@ -963,7 +999,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             # Preserve cache_key so the downstream store() can still warm the cache
             # for subsequent identical calls even when lookup() fails transiently.
 
-        if lookup_result is not None and lookup_result.hit:
+        if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, (dict, list, str)):
             LOG.info(
                 "ai_extract cache hit — skipping LLM call",
                 workflow_run_id=workflow_run_id,
@@ -974,8 +1010,16 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 fallback_reason=None,
                 cache_path="script",
             )
-            return lookup_result.value  # type: ignore[return-value]
-        if lookup_result is not None:
+            return lookup_result.value
+        if lookup_result is not None and lookup_result.hit:
+            LOG.warning(
+                "ai_extract cache hit returned non-cacheable value type; falling through to LLM",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                value_type=type(lookup_result.value).__name__,
+                cache_path="script",
+            )
+        elif lookup_result is not None:
             LOG.info(
                 "ai_extract cache miss",
                 workflow_run_id=workflow_run_id,
@@ -1009,8 +1053,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         # Cache the post-validation result so cache hits return the same
-        # schema-validated shape as a fresh LLM call.
-        if cache_key is not None and result is not None:
+        # schema-validated shape as a fresh LLM call. Accept dict / list / str
+        # — the `extract-information` prompt uses `force_dict=False`, so root
+        # `type: array` or scalar schemas are valid return shapes.
+        if cache_key is not None and isinstance(result, (dict, list, str)):
             try:
                 extraction_cache.store(workflow_run_id, cache_key, result)
             except Exception:
