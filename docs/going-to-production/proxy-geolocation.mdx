@@ -252,13 +252,14 @@ export const PROXY_LOCATIONS = [
   { code: "IN", name: "India", value: "RESIDENTIAL_IN", timezone: "Asia/Kolkata", flag: "🇮🇳" },
   { code: "PH", name: "Philippines", value: "RESIDENTIAL_PH", timezone: "Asia/Manila", flag: "🇵🇭" },
   { code: "KR", name: "South Korea", value: "RESIDENTIAL_KR", timezone: "Asia/Seoul", flag: "🇰🇷" },
+  { code: "SA", name: "Saudi Arabia", value: "RESIDENTIAL_SA", timezone: "Asia/Riyadh", flag: "🇸🇦" },
   { code: "JP", name: "Japan", value: "RESIDENTIAL_JP", timezone: "Asia/Tokyo", flag: "🇯🇵" },
   { code: "AU", name: "Australia", value: "RESIDENTIAL_AU", timezone: "Australia/Sydney", flag: "🇦🇺" },
   { code: "NZ", name: "New Zealand", value: "RESIDENTIAL_NZ", timezone: "Pacific/Auckland", flag: "🇳🇿" },
   { code: "NONE", name: "No Proxy", value: "NONE", timezone: "—", flag: "🚫" },
 ]
 
-export const AVAILABLE_COUNTRIES = ["US", "CA", "MX", "AR", "BR", "GB", "IE", "NL", "DE", "FR", "ES", "IT", "TR", "ZA", "IN", "PH", "KR", "JP", "AU", "NZ"]
+export const AVAILABLE_COUNTRIES = ["US", "CA", "MX", "AR", "BR", "GB", "IE", "NL", "DE", "FR", "ES", "IT", "TR", "ZA", "IN", "PH", "KR", "SA", "JP", "AU", "NZ"]
 
 export const ProxyMapSelector = () => {
   const [selected, setSelected] = useState("US")
@@ -597,6 +598,7 @@ Use these enum values for country-level targeting. Each routes through a residen
 | `RESIDENTIAL_NZ` | New Zealand | Pacific/Auckland |
 | `RESIDENTIAL_PH` | Philippines | Asia/Manila |
 | `RESIDENTIAL_KR` | South Korea | Asia/Seoul |
+| `RESIDENTIAL_SA` | Saudi Arabia | Asia/Riyadh |
 | `RESIDENTIAL_TR` | Türkiye | Europe/Istanbul |
 | `RESIDENTIAL_ZA` | South Africa | Africa/Johannesburg |
 | `NONE` | No proxy | — |
