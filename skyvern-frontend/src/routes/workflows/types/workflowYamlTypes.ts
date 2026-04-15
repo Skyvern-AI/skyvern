@@ -1,6 +1,5 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
-import { WorkflowBlockType } from "./workflowTypes";
-import { WorkflowModel } from "./workflowTypes";
+import { WorkflowBlockType, WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;

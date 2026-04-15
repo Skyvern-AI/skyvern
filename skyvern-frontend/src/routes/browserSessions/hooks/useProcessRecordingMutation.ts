@@ -5,8 +5,10 @@ import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { type WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
-import { type WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
+import {
+  type WorkflowBlock,
+  type WorkflowParameter,
+} from "@/routes/workflows/types/workflowTypes";
 
 const FAIL_QUIET_NO_EVENTS = "FAIL-QUIET:NO-EVENTS" as const;
 

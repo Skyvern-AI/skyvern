@@ -5,13 +5,13 @@ import {
   Position,
   useNodes,
   useReactFlow,
+  type Node,
 } from "@xyflow/react";
 import {
   PlusIcon,
   ChevronDownIcon,
   DotsVerticalIcon,
 } from "@radix-ui/react-icons";
-import type { Node } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -31,8 +31,8 @@ import {
   getLoopNodeWidth,
   updateNodeAndDescendantsVisibility,
 } from "../../workflowEditorUtils";
-import type { ConditionalNode } from "./types";
 import {
+  type ConditionalNode,
   ConditionalNodeData,
   createBranchCondition,
   defaultBranchCriteria,

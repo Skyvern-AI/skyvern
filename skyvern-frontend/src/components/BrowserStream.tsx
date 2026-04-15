@@ -9,10 +9,10 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
-import { Status } from "@/api/types";
-import type {
-  TaskApiResponse,
-  WorkflowRunStatusApiResponse,
+import {
+  Status,
+  type TaskApiResponse,
+  type WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { Tip } from "@/components/Tip";
 import { Button } from "@/components/ui/button";

@@ -29,7 +29,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
-import { DebugSessionApiResponse } from "@/api/types";
+import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
@@ -90,20 +90,15 @@ import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
-import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
+import {
+  WorkflowComparisonPanel,
+  type CopilotReviewStatus,
+} from "./panels/WorkflowComparisonPanel";
 import {
   getWorkflowErrors,
   getElements,
   getAffectedBlocks,
   getOutputParameterKey,
-} from "./workflowEditorUtils";
-import { WorkflowHeader } from "./WorkflowHeader";
-import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
-import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
-import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import { WorkflowSettings } from "../types/workflowTypes";
-import { ProxyLocation } from "@/api/types";
-import {
   nodeAdderNode,
   createNode,
   defaultEdge,
@@ -111,10 +106,16 @@ import {
   layout,
   startNode,
 } from "./workflowEditorUtils";
+import { WorkflowHeader } from "./WorkflowHeader";
+import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
+import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
+import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
+import { WorkflowSettings } from "../types/workflowTypes";
+
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
-import type { CopilotReviewStatus } from "./panels/WorkflowComparisonPanel";
+
 import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
 

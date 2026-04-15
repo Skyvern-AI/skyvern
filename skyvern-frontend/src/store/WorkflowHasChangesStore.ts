@@ -8,15 +8,15 @@ import { usePostHog } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import type {
-  BlockYAML,
-  ParameterYAML,
+import {
+  type BlockYAML,
+  type ParameterYAML,
+  WorkflowCreateYAMLRequest,
 } from "@/routes/workflows/types/workflowYamlTypes";
 import type {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
-import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 type SaveData = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;

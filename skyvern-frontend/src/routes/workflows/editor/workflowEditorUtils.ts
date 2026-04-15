@@ -1,6 +1,5 @@
 import Dagre from "@dagrejs/dagre";
-import type { Node } from "@xyflow/react";
-import { Edge } from "@xyflow/react";
+import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
