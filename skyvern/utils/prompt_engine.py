@@ -36,6 +36,9 @@ class MaxStepsReasonResponse(BaseModel):
     reasoning: str
     errors: list[UserDefinedError] = []
     failure_categories: list[dict] = []
+    # Explicit provenance for failure_categories. Set by short-circuit paths
+    # to avoid the caller inferring "llm" from the presence of categories.
+    failure_category_source: str | None = None
 
 
 PROMPT_HARD_CEILING_TOKENS = 180_000
