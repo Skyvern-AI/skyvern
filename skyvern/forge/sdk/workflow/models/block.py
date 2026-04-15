@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import asyncio
+import codecs
 import copy
 import csv
 import json
@@ -3738,6 +3739,13 @@ class FileParserBlock(Block):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
 
+    # FileParserBlock CSV constants
+    _CSV_SNIFF_LINES = 5
+    _CSV_BINARY_PREFIX_BYTES = 4096
+    _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+    # Bounded cap for legitimate wide cells (JSON blobs, long descriptions); applied only while parsing.
+    _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
+
     file_url: str
     file_type: FileType
     json_schema: dict[str, Any] | None = None
@@ -3840,12 +3848,46 @@ class FileParserBlock(Block):
         # latin-1 always succeeds (1:1 byte mapping), so this is a safety fallback
         return "latin-1"
 
+    def _sniff_csv_delimiter(self, file_path: str) -> tuple[str, str]:
+        """Return (delimiter, encoding). Samples full lines to avoid mid-row truncation."""
+        # Read small raw byte prefix to quickly detect empty binary files before attempting text decoding/sniffing
+        with open(file_path, "rb") as f:
+            raw_prefix = f.read(self._CSV_BINARY_PREFIX_BYTES)
+        # Reject files that contain no meaningful bytes
+        if not raw_prefix.strip():
+            raise csv.Error("File is empty")
+        # Reject likely binary content:
+        # - Presence of null bytes is a strong binary signal
+        # - Exception: UTF-16/UTF-32 text often starts with BOM and may contain null bytes
+        if b"\x00" in raw_prefix and not raw_prefix.startswith(self._CSV_UTF_BOMS):
+            raise csv.Error("File contains binary data")
+
+        # Detect best text encoding for file, then read only the first N full lines so csv.Sniffer sees complete rows
+        encoding = self._detect_file_encoding(file_path)
+        with open(file_path, encoding=encoding, errors="replace", newline="") as file:
+            lines: list[str] = []
+            for _ in range(self._CSV_SNIFF_LINES):
+                line = file.readline()
+                if not line:
+                    break
+                lines.append(line)
+
+        # Build the sniffer sample from complete lines only
+        sample = "".join(lines)
+        # Guard against files that decode but still contain no meaningful text
+        if not sample.strip():
+            raise csv.Error("File is empty")
+
+        try:
+            delimiter = csv.Sniffer().sniff(sample).delimiter
+        except csv.Error:
+            delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
+        return delimiter, encoding
+
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
         if self.file_type == FileType.CSV:
             try:
-                encoding = self._detect_file_encoding(file_path)
-                with open(file_path, encoding=encoding, errors="replace") as file:
-                    csv.Sniffer().sniff(file.read(1024))
+                self._sniff_csv_delimiter(file_path)
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
         elif self.file_type == FileType.EXCEL:
@@ -3878,25 +3920,14 @@ class FileParserBlock(Block):
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse CSV/TSV file and return list of dictionaries."""
-        parsed_data = []
-        encoding = self._detect_file_encoding(file_path)
-        with open(file_path, encoding=encoding, errors="replace") as file:
-            # Try to detect the delimiter (comma for CSV, tab for TSV)
-            sample = file.read(1024)
-            file.seek(0)  # Reset file pointer
-
-            # Use csv.Sniffer to detect the delimiter
-            try:
-                dialect = csv.Sniffer().sniff(sample)
-                delimiter = dialect.delimiter
-            except csv.Error:
-                # Default to comma if detection fails
-                delimiter = ","
-
-            reader = csv.DictReader(file, delimiter=delimiter)
-            for row in reader:
-                parsed_data.append(row)
-        return parsed_data
+        delimiter, encoding = self._sniff_csv_delimiter(file_path)
+        previous_limit = csv.field_size_limit(self._MAX_CSV_FIELD_SIZE_BYTES)
+        try:
+            with open(file_path, encoding=encoding, errors="replace", newline="") as file:
+                reader = csv.DictReader(file, delimiter=delimiter)
+                return list(reader)
+        finally:
+            csv.field_size_limit(previous_limit)
 
     def _clean_dataframe_for_json(self, df: pd.DataFrame) -> list[dict[str, Any]]:
         """Clean DataFrame to ensure it can be serialized to JSON."""
