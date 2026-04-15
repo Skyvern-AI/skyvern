@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
+    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 5.0
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
