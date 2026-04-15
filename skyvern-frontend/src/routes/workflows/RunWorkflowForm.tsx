@@ -47,7 +47,6 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -552,7 +551,7 @@ function RunWorkflowForm({
 
                 return {
                   method: "POST",
-                  url: `${runsApiBaseUrl}/run/workflows`,
+                  url: `${env.runsApiBaseUrl}/run/workflows`,
                   body: transformedBody,
                   headers,
                 } satisfies ApiCommandOptions;

@@ -1,6 +1,12 @@
 import { Textarea } from "@/components/ui/textarea";
-import type { ChangeEventHandler, HTMLAttributes } from "react";
-import { forwardRef, useRef, useCallback, useLayoutEffect } from "react";
+import {
+  type ChangeEventHandler,
+  type HTMLAttributes,
+  forwardRef,
+  useRef,
+  useCallback,
+  useLayoutEffect,
+} from "react";
 import { cn } from "@/util/utils";
 
 type Props = {

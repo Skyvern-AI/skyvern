@@ -8,8 +8,8 @@ import {
 import {
   useCredentialModalState,
   CredentialModalTypes,
+  type CredentialModalType,
 } from "./useCredentialModalState";
-import type { CredentialModalType } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -33,6 +33,7 @@ import {
   CheckCircledIcon,
   CrossCircledIcon,
   ExclamationTriangleIcon,
+  ExternalLinkIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -42,7 +43,6 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
-import { ExternalLinkIcon } from "@radix-ui/react-icons";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {

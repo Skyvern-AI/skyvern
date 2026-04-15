@@ -95,8 +95,8 @@ import {
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
   upgradeWorkflowDefinitionToVersionTwo,
+  getWorkflowErrors,
 } from "./workflowEditorUtils";
-import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";

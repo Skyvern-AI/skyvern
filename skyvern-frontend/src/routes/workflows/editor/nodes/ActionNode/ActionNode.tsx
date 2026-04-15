@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Flippable } from "@/components/Flippable";
 import {
   Accordion,
@@ -9,7 +9,6 @@ import {
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
-import { useState } from "react";
 import type { ActionNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { errorMappingExampleValue } from "../types";

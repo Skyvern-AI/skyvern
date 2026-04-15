@@ -3,13 +3,13 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
-import type { Node } from "@xyflow/react";
 import {
   Handle,
   NodeProps,
   Position,
   useNodes,
   useReactFlow,
+  type Node,
 } from "@xyflow/react";
 import { AppNode } from "..";
 import { helpTooltips } from "../../helpContent";

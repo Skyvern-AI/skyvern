@@ -1,7 +1,13 @@
-import { LightningBoltIcon } from "@radix-ui/react-icons";
+import {
+  LightningBoltIcon,
+  CodeIcon,
+  MixerHorizontalIcon,
+  Pencil2Icon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
 
 import { Tip } from "@/components/Tip";
-import { Status } from "@/api/types";
+import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
@@ -35,12 +41,6 @@ import {
   formatExecutionTime,
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import {
-  CodeIcon,
-  MixerHorizontalIcon,
-  Pencil2Icon,
-  PlayIcon,
-} from "@radix-ui/react-icons";
 import React, { useEffect, useState } from "react";
 import {
   Link,
@@ -61,7 +61,6 @@ import {
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
 import * as env from "@/util/env";
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
@@ -331,9 +330,9 @@ function WorkflowPage() {
             workflowPermanentId={workflowPermanentId}
             workflowRunId={openRunParams}
           />
-          <div className="flex items-center justify-between px-3 py-3">
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-slate-400">Items per page</span>
+          <div className="relative px-3 py-3">
+            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <span className="text-slate-400">Items per page</span>
               <Select
                 value={String(pageSize)}
                 onValueChange={(size) => {
@@ -355,7 +354,7 @@ function WorkflowPage() {
                 </SelectContent>
               </Select>
             </div>
-            <Pagination className="ml-auto w-auto">
+            <Pagination className="pt-0">
               <PaginationContent>
                 <PaginationItem>
                   <PaginationPrevious

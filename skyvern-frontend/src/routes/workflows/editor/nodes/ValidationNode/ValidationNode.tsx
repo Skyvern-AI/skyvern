@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Flippable } from "@/components/Flippable";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
@@ -15,7 +15,6 @@ import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
-import { useState } from "react";
 import { helpTooltips } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
 import type { ValidationNode } from "./types";
