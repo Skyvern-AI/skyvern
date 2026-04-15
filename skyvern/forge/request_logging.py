@@ -87,7 +87,7 @@ def _is_sensitive_key(key: str) -> bool:
     return key.lower() in _SENSITIVE_FIELDS
 
 
-def _redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
+def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
     """Redact dict values whose *key name* exactly matches a known sensitive field.
 
     Uses exact-match (case-insensitive) rather than substring/regex to avoid
@@ -101,10 +101,10 @@ def _redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
         return obj
     if isinstance(obj, dict):
         return {
-            k: _REDACTED if _is_sensitive_key(k) else _redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
+            k: _REDACTED if _is_sensitive_key(k) else redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [_redact_sensitive_fields(item, _depth + 1) for item in obj]
+        return [redact_sensitive_fields(item, _depth + 1) for item in obj]
     return obj
 
 
@@ -125,7 +125,7 @@ def _sanitize_response_body(request: Request, body_str: str | None, content_type
         return _BINARY_PLACEHOLDER
     try:
         parsed = json.loads(body_str)
-        redacted = _redact_sensitive_fields(parsed)
+        redacted = redact_sensitive_fields(parsed)
         text = json.dumps(redacted)
     except (json.JSONDecodeError, TypeError):
         text = body_str

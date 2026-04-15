@@ -14,7 +14,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-07T19:07:49.173655Z"
+exclude-newer = "2026-04-08T21:26:23.576693Z"
 exclude-newer-span = "P7D"
 
 [manifest]
@@ -1662,6 +1662,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/c4/2570fc07f34a39f2caf0bf9f24b0a1a0a47bc2e8e465b2c2424821389dfc/greenlet-3.3.2-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:1a9172f5bf6bd88e6ba5a84e0a68afeac9dc7b6b412b245dd64f52d83c81e55b", size = 1640455, upload-time = "2026-02-20T20:21:10.261Z" },
     { url = "https://files.pythonhosted.org/packages/91/39/5ef5aa23bc545aa0d31e1b9b55822b32c8da93ba657295840b6b34124009/greenlet-3.3.2-cp313-cp313-win_amd64.whl", hash = "sha256:a7945dd0eab63ded0a48e4dcade82939783c172290a7903ebde9e184333ca124", size = 230961, upload-time = "2026-02-20T20:16:58.461Z" },
     { url = "https://files.pythonhosted.org/packages/62/6b/a89f8456dcb06becff288f563618e9f20deed8dd29beea14f9a168aef64b/greenlet-3.3.2-cp313-cp313-win_arm64.whl", hash = "sha256:394ead29063ee3515b4e775216cb756b2e3b4a7e55ae8fd884f17fa579e6b327", size = 230221, upload-time = "2026-02-20T20:17:37.152Z" },
+]
+
+[[package]]
+name = "griffelib"
+version = "2.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9d/82/74f4a3310cdabfbb10da554c3a672847f1ed33c6f61dd472681ce7f1fe67/griffelib-2.0.2.tar.gz", hash = "sha256:3cf20b3bc470e83763ffbf236e0076b1211bac1bc67de13daf494640f2de707e", size = 166461, upload-time = "2026-03-27T11:34:51.091Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/11/8c/c9138d881c79aa0ea9ed83cbd58d5ca75624378b38cee225dcf5c42cc91f/griffelib-2.0.2-py3-none-any.whl", hash = "sha256:925c857658fb1ba40c0772c37acbc2ab650bd794d9c1b9726922e36ea4117ea1", size = 142357, upload-time = "2026-03-27T11:34:46.275Z" },
 ]
 
 [[package]]
@@ -3378,6 +3387,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/88/15/52580c8fbc16d0675d516e8749806eda679b16de1e4434ea06fb6feaa610/openai-2.30.0.tar.gz", hash = "sha256:92f7661c990bda4b22a941806c83eabe4896c3094465030dd882a71abe80c885", size = 676084, upload-time = "2026-03-25T22:08:59.96Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/9e/5bfa2270f902d5b92ab7d41ce0475b8630572e71e349b2a4996d14bdda93/openai-2.30.0-py3-none-any.whl", hash = "sha256:9a5ae616888eb2748ec5e0c5b955a51592e0b201a11f4262db920f2a78c5231d", size = 1146656, upload-time = "2026-03-25T22:08:58.2Z" },
+]
+
+[[package]]
+name = "openai-agents"
+version = "0.13.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "griffelib" },
+    { name = "mcp" },
+    { name = "openai" },
+    { name = "pydantic" },
+    { name = "requests" },
+    { name = "types-requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/27/e3e60cc77abf588fd95e27b15b1a6806fd7107bb9fc4b2f36acfaaeff64c/openai_agents-0.13.5.tar.gz", hash = "sha256:ebe5bfb3d7d702d133ff9fb335718d61b741300de25b409ab4a6c8212ee945c0", size = 2699666, upload-time = "2026-04-06T04:11:47.575Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/54/5f85e18235f5bf7947c84323e3214757c6a22531529914f44077eb5a1198/openai_agents-0.13.5-py3-none-any.whl", hash = "sha256:672c76830d25b7eb3d85580539ba7caca975288df4395fe80c84cb4edfe4665f", size = 470837, upload-time = "2026-04-06T04:11:45.552Z" },
 ]
 
 [[package]]
@@ -5628,6 +5655,11 @@ dependencies = [
     { name = "zstandard" },
 ]
 
+[package.optional-dependencies]
+copilot = [
+    { name = "openai-agents" },
+]
+
 [package.dev-dependencies]
 cloud = [
     { name = "kr8s" },
@@ -5710,6 +5742,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.83.0" },
     { name = "onepassword-sdk", specifier = "==0.4.0" },
     { name = "openai", specifier = ">=1.68.2" },
+    { name = "openai-agents", marker = "extra == 'copilot'", specifier = ">=0.13.4,<0.14" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2" },
     { name = "orjson", specifier = ">=3.9.10,<4" },
     { name = "pandas", specifier = ">=2.3.1,<4" },
@@ -5751,6 +5784,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=12.0,<15.1" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
+provides-extras = ["copilot"]
 
 [package.metadata.requires-dev]
 cloud = [
