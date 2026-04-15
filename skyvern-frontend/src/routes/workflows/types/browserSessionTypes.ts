@@ -1,5 +1,5 @@
 type BrowserSessionExtension = "ad-blocker" | "captcha-solver";
-type BrowserSessionType = "msedge" | "chrome";
+type BrowserSessionType = "msedge" | "chrome" | "stealth-chromium";
 
 interface BrowserSession {
   browser_address: string | null;

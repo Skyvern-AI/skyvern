@@ -441,6 +441,31 @@ export type WorkflowRunApiResponse = {
   workflow_title: string | null;
 };
 
+export const TaskRunType = {
+  TaskV1: "task_v1",
+  TaskV2: "task_v2",
+  WorkflowRun: "workflow_run",
+  OpenaiCua: "openai_cua",
+  AnthropicCua: "anthropic_cua",
+  UiTars: "ui_tars",
+} as const;
+
+export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
+
+export type TaskRunListItem = {
+  task_run_id: string;
+  task_run_type: TaskRunType;
+  run_id: string;
+  title: string | null;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  workflow_permanent_id: string | null;
+  script_run: boolean;
+  searchable_text: string | null;
+};
+
 export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
   workflow_run_id: string;
@@ -616,6 +641,7 @@ export type CreateCredentialRequest = {
   name: string;
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
+  vault_type?: "custom";
 };
 
 export type PasswordCredential = {

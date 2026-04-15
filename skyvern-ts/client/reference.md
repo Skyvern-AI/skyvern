@@ -1,5 +1,5 @@
 # Reference
-<details><summary><code>client.<a href="/src/Client.ts">changeTierApiV1BillingChangeTierPost</a>({ ...params }) -> Skyvern.ChangeTierResponse</code></summary>
+<details><summary><code>client.<a href="/src/Client.ts">runSdkAction</a>({ ...params }) -> Skyvern.RunSdkActionResponse</code></summary>
 <dl>
 <dd>
 
@@ -11,10 +11,7 @@
 <dl>
 <dd>
 
-Redirect to Stripe Portal for tier changes.
-Portal handles proration based on configured settings:
-- Upgrades: Immediate proration charge
-- Downgrades: Apply at end of billing period
+Execute a single SDK action with the specified parameters
 </dd>
 </dl>
 </dd>
@@ -29,8 +26,11 @@ Portal handles proration based on configured settings:
 <dd>
 
 ```typescript
-await client.changeTierApiV1BillingChangeTierPost({
-    tier: "free"
+await client.runSdkAction({
+    url: "url",
+    action: {
+        type: "ai_act"
+    }
 });
 
 ```
@@ -47,7 +47,7 @@ await client.changeTierApiV1BillingChangeTierPost({
 <dl>
 <dd>
 
-**request:** `Skyvern.ChangeTierRequest` 
+**request:** `Skyvern.RunSdkActionRequest` 
     
 </dd>
 </dl>
@@ -196,8 +196,8 @@ await client.scripts.runScript("s_abc123");
 </dl>
 </details>
 
-## Agent
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">listOrganizationSchedules</a>({ ...params }) -> Skyvern.OrganizationScheduleListResponse</code></summary>
+## Schedules
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">listAll</a>({ ...params }) -> Skyvern.OrganizationScheduleListResponse</code></summary>
 <dl>
 <dd>
 
@@ -210,7 +210,7 @@ await client.scripts.runScript("s_abc123");
 <dd>
 
 ```typescript
-await client.agent.listOrganizationSchedules({
+await client.schedules.listAll({
     page: 1,
     page_size: 1,
     status: "active",
@@ -231,7 +231,7 @@ await client.agent.listOrganizationSchedules({
 <dl>
 <dd>
 
-**request:** `Skyvern.ListOrganizationSchedulesApiV1SchedulesGetRequest` 
+**request:** `Skyvern.SchedulesListAllRequest` 
     
 </dd>
 </dl>
@@ -239,7 +239,7 @@ await client.agent.listOrganizationSchedules({
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -251,7 +251,7 @@ await client.agent.listOrganizationSchedules({
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">listWorkflowSchedules</a>(workflowPermanentId) -> Skyvern.WorkflowScheduleListResponse</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">list</a>(workflowPermanentId) -> Skyvern.WorkflowScheduleListResponse</code></summary>
 <dl>
 <dd>
 
@@ -264,7 +264,7 @@ await client.agent.listOrganizationSchedules({
 <dd>
 
 ```typescript
-await client.agent.listWorkflowSchedules("workflow_permanent_id");
+await client.schedules.list("workflow_permanent_id");
 
 ```
 </dd>
@@ -288,7 +288,7 @@ await client.agent.listWorkflowSchedules("workflow_permanent_id");
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -300,7 +300,7 @@ await client.agent.listWorkflowSchedules("workflow_permanent_id");
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">createWorkflowSchedule</a>(workflowPermanentId, { ...params }) -> Skyvern.WorkflowScheduleResponse</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">create</a>(workflowPermanentId, { ...params }) -> Skyvern.WorkflowScheduleResponse</code></summary>
 <dl>
 <dd>
 
@@ -313,7 +313,7 @@ await client.agent.listWorkflowSchedules("workflow_permanent_id");
 <dd>
 
 ```typescript
-await client.agent.createWorkflowSchedule("workflow_permanent_id", {
+await client.schedules.create("workflow_permanent_id", {
     cron_expression: "cron_expression",
     timezone: "timezone"
 });
@@ -348,7 +348,7 @@ await client.agent.createWorkflowSchedule("workflow_permanent_id", {
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -360,7 +360,7 @@ await client.agent.createWorkflowSchedule("workflow_permanent_id", {
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">getWorkflowSchedule</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.WorkflowScheduleResponse</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">get</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.WorkflowScheduleResponse</code></summary>
 <dl>
 <dd>
 
@@ -373,7 +373,7 @@ await client.agent.createWorkflowSchedule("workflow_permanent_id", {
 <dd>
 
 ```typescript
-await client.agent.getWorkflowSchedule("workflow_permanent_id", "workflow_schedule_id");
+await client.schedules.get("workflow_permanent_id", "workflow_schedule_id");
 
 ```
 </dd>
@@ -405,7 +405,7 @@ await client.agent.getWorkflowSchedule("workflow_permanent_id", "workflow_schedu
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -417,7 +417,7 @@ await client.agent.getWorkflowSchedule("workflow_permanent_id", "workflow_schedu
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">updateWorkflowSchedule</a>(workflowPermanentId, workflowScheduleId, { ...params }) -> Skyvern.WorkflowScheduleResponse</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">update</a>(workflowPermanentId, workflowScheduleId, { ...params }) -> Skyvern.WorkflowScheduleResponse</code></summary>
 <dl>
 <dd>
 
@@ -430,7 +430,7 @@ await client.agent.getWorkflowSchedule("workflow_permanent_id", "workflow_schedu
 <dd>
 
 ```typescript
-await client.agent.updateWorkflowSchedule("workflow_permanent_id", "workflow_schedule_id", {
+await client.schedules.update("workflow_permanent_id", "workflow_schedule_id", {
     cron_expression: "cron_expression",
     timezone: "timezone"
 });
@@ -473,7 +473,7 @@ await client.agent.updateWorkflowSchedule("workflow_permanent_id", "workflow_sch
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -485,7 +485,7 @@ await client.agent.updateWorkflowSchedule("workflow_permanent_id", "workflow_sch
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">deleteWorkflowScheduleRoute</a>(workflowPermanentId, workflowScheduleId) -> Record&lt;string, boolean&gt;</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">delete</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.DeleteScheduleResponse</code></summary>
 <dl>
 <dd>
 
@@ -498,7 +498,7 @@ await client.agent.updateWorkflowSchedule("workflow_permanent_id", "workflow_sch
 <dd>
 
 ```typescript
-await client.agent.deleteWorkflowScheduleRoute("workflow_permanent_id", "workflow_schedule_id");
+await client.schedules.delete("workflow_permanent_id", "workflow_schedule_id");
 
 ```
 </dd>
@@ -530,7 +530,7 @@ await client.agent.deleteWorkflowScheduleRoute("workflow_permanent_id", "workflo
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -542,7 +542,7 @@ await client.agent.deleteWorkflowScheduleRoute("workflow_permanent_id", "workflo
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">enableWorkflowSchedule</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.WorkflowScheduleResponse</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">enable</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.WorkflowScheduleResponse</code></summary>
 <dl>
 <dd>
 
@@ -555,7 +555,7 @@ await client.agent.deleteWorkflowScheduleRoute("workflow_permanent_id", "workflo
 <dd>
 
 ```typescript
-await client.agent.enableWorkflowSchedule("workflow_permanent_id", "workflow_schedule_id");
+await client.schedules.enable("workflow_permanent_id", "workflow_schedule_id");
 
 ```
 </dd>
@@ -587,7 +587,7 @@ await client.agent.enableWorkflowSchedule("workflow_permanent_id", "workflow_sch
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>
@@ -599,7 +599,7 @@ await client.agent.enableWorkflowSchedule("workflow_permanent_id", "workflow_sch
 </dl>
 </details>
 
-<details><summary><code>client.agent.<a href="/src/api/resources/agent/client/Client.ts">disableWorkflowSchedule</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.WorkflowScheduleResponse</code></summary>
+<details><summary><code>client.schedules.<a href="/src/api/resources/schedules/client/Client.ts">disable</a>(workflowPermanentId, workflowScheduleId) -> Skyvern.WorkflowScheduleResponse</code></summary>
 <dl>
 <dd>
 
@@ -612,7 +612,7 @@ await client.agent.enableWorkflowSchedule("workflow_permanent_id", "workflow_sch
 <dd>
 
 ```typescript
-await client.agent.disableWorkflowSchedule("workflow_permanent_id", "workflow_schedule_id");
+await client.schedules.disable("workflow_permanent_id", "workflow_schedule_id");
 
 ```
 </dd>
@@ -644,7 +644,7 @@ await client.agent.disableWorkflowSchedule("workflow_permanent_id", "workflow_sc
 <dl>
 <dd>
 
-**requestOptions:** `Agent.RequestOptions` 
+**requestOptions:** `Schedules.RequestOptions` 
     
 </dd>
 </dl>

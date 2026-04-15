@@ -390,9 +390,17 @@ class RealBrowserManager(BrowserManager):
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
         organization_id: str | None = None,
+        child_workflow_run_ids: list[str] | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.get(workflow_run_id)
+
+        # Pop child workflow_run entries first — these are orphaned because child
+        # workflows skip clean_up_workflow. Must happen before the shared check
+        # so the task loop can correctly detect when the browser is no longer shared.
+        if child_workflow_run_ids:
+            for child_id in child_workflow_run_ids:
+                self.pages.pop(child_id, None)
 
         from skyvern.forge.sdk.routes.streaming.registries import set_deferred_close_params, stream_ref_active
 

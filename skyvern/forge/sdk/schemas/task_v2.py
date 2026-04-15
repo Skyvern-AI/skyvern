@@ -54,6 +54,7 @@ class TaskV2(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -173,6 +174,7 @@ class Thought(BaseModel):
     reasoning_token_count: int | None = None
     cached_token_count: int | None = None
     thought_cost: float | None = None
+    last_llm_model: str | None = None
 
     created_at: datetime
     modified_at: datetime

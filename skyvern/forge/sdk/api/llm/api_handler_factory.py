@@ -51,6 +51,11 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.trace import traced
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
+try:
+    from opentelemetry import trace as _otel_trace
+except ImportError:  # pragma: no cover
+    _otel_trace = None  # type: ignore[assignment]
+
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
@@ -152,6 +157,25 @@ def _log_vertex_cache_hit_if_needed(
             cache_key=context.vertex_cache_key,
             cache_variant=context.vertex_cache_variant,
         )
+
+
+def _normalize_llm_model(model: str | None) -> str | None:
+    # LiteLLM's response.model can include a provider prefix
+    # (e.g. "vertex_ai/gemini-2.5-flash", "openai/gpt-4.1-mini") while
+    # config-side fallbacks tend to use the bare model name. Strip the
+    # prefix so dbt aggregates the same model under one bucket.
+    if not model:
+        return model
+    return model.split("/")[-1]
+
+
+def _assert_step_thought_exclusive(step: Step | None, thought: Thought | None) -> None:
+    # step and thought write the same llm_cost to different tables
+    # (steps.step_cost vs observer_thoughts.thought_cost). int_org_llm_costs
+    # UNION ALLs them, so setting both would double-count cost in
+    # fct_org_margin.llm_cost.
+    if step is not None and thought is not None:
+        raise ValueError("LLM API handler invoked with both step and thought set — these are mutually exclusive")
 
 
 def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
@@ -507,6 +531,7 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
+            _assert_step_thought_exclusive(step, thought)
             start_time = time.time()
 
             if parameters is None:
@@ -756,7 +781,7 @@ class LLMAPIHandlerFactory:
                                 fallback_model=response_model,
                             )
                 except litellm.exceptions.APIError as e:
-                    raise LLMProviderErrorRetryableTask(llm_key) from e
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -766,7 +791,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise SkyvernContextWindowExceededError() from e
+                    raise SkyvernContextWindowExceededError(model=main_model_group, prompt_name=prompt_name) from e
                 except ValueError as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -776,7 +801,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise LLMProviderErrorRetryableTask(llm_key) from e
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -786,7 +811,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise LLMProviderError(llm_key) from e
+                    raise LLMProviderError(llm_key, cause=e) from e
 
                 llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
@@ -835,8 +860,18 @@ class LLMAPIHandlerFactory:
                     # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
                     if cached_tokens == 0:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+
+                # Prefer the actual backing model returned by LiteLLM so we don't persist the
+                # router group name (e.g. "GEMINI_2_5_FLASH_WITH_FALLBACK") when the router
+                # falls back. Mirrors the pattern in llm_api_handler/call.
+                # Phase 1 tradeoff: last_llm_model records the most recent model used in
+                # the step. dbt attributes the full step_cost to it, which is accurate
+                # only for single-model steps. For multi-model steps (router fallback,
+                # secondary LLM) the attribution is lossy — resolved in Phase 2 by a
+                # per-call tracking table.
+                actual_model = _normalize_llm_model(getattr(response, "model", None) or model_used)
                 if step and not is_speculative_step:
-                    await app.DATABASE.update_step(
+                    await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
                         organization_id=step.organization_id,
@@ -845,9 +880,10 @@ class LLMAPIHandlerFactory:
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                         incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 if thought:
-                    await app.DATABASE.update_thought(
+                    await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
@@ -855,6 +891,7 @@ class LLMAPIHandlerFactory:
                         thought_cost=llm_cost,
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
@@ -909,6 +946,7 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
                 )
 
                 if step and is_speculative_step:
@@ -996,6 +1034,7 @@ class LLMAPIHandlerFactory:
             force_dict: bool = True,
             system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
+            _assert_step_thought_exclusive(step, thought)
             start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
@@ -1207,7 +1246,7 @@ class LLMAPIHandlerFactory:
                         **active_parameters,
                     )
                 except litellm.exceptions.APIError as e:
-                    raise LLMProviderErrorRetryableTask(llm_key) from e
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.time() - start_time
                     LOG.exception(
@@ -1217,7 +1256,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise SkyvernContextWindowExceededError() from e
+                    raise SkyvernContextWindowExceededError(model=model_name, prompt_name=prompt_name) from e
                 except CancelledError:
                     # Speculative steps are intentionally cancelled when goal verification completes first,
                     # so we log at debug level. Non-speculative cancellations are unexpected errors.
@@ -1249,7 +1288,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
-                    raise LLMProviderError(llm_key) from e
+                    raise LLMProviderError(llm_key, cause=e) from e
 
                 llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
@@ -1301,8 +1340,9 @@ class LLMAPIHandlerFactory:
 
                 _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
 
+                actual_model = _normalize_llm_model(getattr(response, "model", None) or model_name)
                 if step and not is_speculative_step:
-                    await app.DATABASE.update_step(
+                    await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
                         organization_id=step.organization_id,
@@ -1311,9 +1351,10 @@ class LLMAPIHandlerFactory:
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                         incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 if thought:
-                    await app.DATABASE.update_thought(
+                    await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
@@ -1321,6 +1362,7 @@ class LLMAPIHandlerFactory:
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         thought_cost=llm_cost,
+                        last_llm_model=actual_model,
                     )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
@@ -1375,6 +1417,7 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
                 )
 
                 if step and is_speculative_step:
@@ -1526,6 +1569,7 @@ class LLMCaller:
         system_prompt: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
+        _assert_step_thought_exclusive(step, thought)
         start_time = time.perf_counter()
         active_parameters = self.base_parameters or {}
         if parameters is None:
@@ -1657,14 +1701,14 @@ class LLMCaller:
                     # only update message_history when the request is successful
                     self.message_history = messages
             except litellm.exceptions.APIError as e:
-                raise LLMProviderErrorRetryableTask(self.llm_key) from e
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
                 LOG.exception(
                     "Context window exceeded",
                     llm_key=self.llm_key,
                     model=self.llm_config.model_name,
                 )
-                raise SkyvernContextWindowExceededError() from e
+                raise SkyvernContextWindowExceededError(model=self.llm_config.model_name) from e
             except CancelledError:
                 # Speculative steps are intentionally cancelled when goal verification returns completed,
                 # so we log at debug level. Non-speculative cancellations are unexpected errors.
@@ -1687,7 +1731,7 @@ class LLMCaller:
                     raise LLMProviderError(self.llm_key) from None
             except Exception as e:
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
-                raise LLMProviderError(self.llm_key) from e
+                raise LLMProviderError(self.llm_key, cause=e) from e
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
@@ -1703,8 +1747,9 @@ class LLMCaller:
                     )
 
             call_stats = await self.get_call_stats(response)
+            actual_model = _normalize_llm_model(getattr(response, "model", None) or self.llm_config.model_name)
             if step and not is_speculative_step:
-                await app.DATABASE.update_step(
+                await app.DATABASE.tasks.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
                     organization_id=step.organization_id,
@@ -1713,9 +1758,10 @@ class LLMCaller:
                     incremental_output_tokens=call_stats.output_tokens,
                     incremental_reasoning_tokens=call_stats.reasoning_tokens,
                     incremental_cached_tokens=call_stats.cached_tokens,
+                    last_llm_model=actual_model,
                 )
             if thought:
-                await app.DATABASE.update_thought(
+                await app.DATABASE.observer.update_thought(
                     thought_id=thought.observer_thought_id,
                     organization_id=thought.organization_id,
                     input_token_count=call_stats.input_tokens,
@@ -1723,6 +1769,7 @@ class LLMCaller:
                     reasoning_token_count=call_stats.reasoning_tokens,
                     cached_token_count=call_stats.cached_tokens,
                     thought_cost=call_stats.llm_cost,
+                    last_llm_model=actual_model,
                 )
 
             organization_id = organization_id or (
@@ -1741,12 +1788,32 @@ class LLMCaller:
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
-                reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
+                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
+                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
+                reasoning_tokens=call_stats.reasoning_tokens
+                if call_stats and call_stats.reasoning_tokens is not None
+                else None,
+                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
+                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
             )
+
+            # Propagate token stats to the current OTel span so they appear
+            # in Logfire traces (gen_ai semantic conventions).
+            if _otel_trace and call_stats:
+                span = _otel_trace.get_current_span()
+                if span and span.is_recording():
+                    _token_attrs = {
+                        "gen_ai.usage.input_tokens": call_stats.input_tokens,
+                        "gen_ai.usage.output_tokens": call_stats.output_tokens,
+                        "gen_ai.usage.reasoning_tokens": call_stats.reasoning_tokens,
+                        "gen_ai.usage.cached_tokens": call_stats.cached_tokens,
+                        "gen_ai.usage.cost": call_stats.llm_cost,
+                    }
+                    for attr_key, attr_val in _token_attrs.items():
+                        if attr_val is not None:
+                            span.set_attribute(attr_key, attr_val)
+                    span.set_attribute("gen_ai.request.model", self.llm_config.model_name)
+                    span.set_attribute("llm_key", self.llm_key)
 
             # Raw response is used for CUA engine LLM calls.
             if raw_response:

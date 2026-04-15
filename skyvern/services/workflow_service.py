@@ -5,6 +5,7 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
@@ -25,6 +26,7 @@ async def prepare_workflow(
     debug_session_id: str | None = None,
     code_gen: bool | None = None,
     parent_workflow_run_id: str | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -44,6 +46,7 @@ async def prepare_workflow(
         debug_session_id=debug_session_id,
         code_gen=code_gen,
         parent_workflow_run_id=parent_workflow_run_id,
+        trigger_type=trigger_type,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
@@ -52,11 +55,15 @@ async def prepare_workflow(
         version=version,
     )
 
-    await app.DATABASE.create_task_run(
+    await app.DATABASE.tasks.create_task_run(
         task_run_type=RunType.workflow_run,
         organization_id=organization.organization_id,
         run_id=workflow_run.workflow_run_id,
         title=workflow.title,
+        status=RunStatus.queued,
+        workflow_permanent_id=workflow_id,
+        parent_workflow_run_id=parent_workflow_run_id,
+        debug_session_id=debug_session_id,
     )
 
     if max_steps:
@@ -79,6 +86,7 @@ async def run_workflow(
     block_labels: list[str] | None = None,
     block_outputs: dict[str, t.Any] | None = None,
     parent_workflow_run_id: str | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -89,6 +97,7 @@ async def run_workflow(
         max_steps=max_steps,
         request_id=request_id,
         parent_workflow_run_id=parent_workflow_run_id,
+        trigger_type=trigger_type,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -111,7 +120,7 @@ async def run_workflow(
 async def get_workflow_run_response(
     workflow_run_id: str, organization_id: str | None = None
 ) -> WorkflowRunResponse | None:
-    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id=organization_id)
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         return None
     workflow_run_resp = await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
@@ -135,6 +144,7 @@ async def get_workflow_run_response(
         app_url=app_url,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
+        run_with=workflow_run.run_with,
         browser_profile_id=workflow_run.browser_profile_id,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,

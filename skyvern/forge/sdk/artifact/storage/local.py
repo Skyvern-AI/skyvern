@@ -164,10 +164,10 @@ class LocalStorage(BaseStorage):
             return None
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        return None
+        return artifact.uri if artifact.uri else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return None
+        return [artifact.uri for artifact in artifacts] or None
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         return

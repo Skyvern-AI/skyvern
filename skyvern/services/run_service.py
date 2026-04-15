@@ -10,12 +10,12 @@ from skyvern.services import task_v1_service, task_v2_service, webhook_service, 
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
-    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         # try to see if it's a workflow run id for task v2
-        task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(run_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(run_id, organization_id=organization_id)
         if task_v2:
-            run = await app.DATABASE.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
+            run = await app.DATABASE.tasks.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
 
     if not run:
         return None
@@ -73,7 +73,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             step_count=task_v1_response.step_count,
         )
     elif run.task_run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
         return await task_v2_service.build_task_v2_run_response(task_v2)
@@ -83,7 +83,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
 
 
 async def cancel_task_v1(task_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
-    task = await app.DATABASE.get_task(task_id, organization_id=organization_id)
+    task = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
     if not task:
         raise TaskNotFound(task_id=task_id)
     task = await app.agent.update_task(task, status=TaskStatus.canceled)
@@ -91,7 +91,7 @@ async def cancel_task_v1(task_id: str, organization_id: str | None = None, api_k
 
 
 async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> None:
-    task_v2 = await app.DATABASE.get_task_v2(task_id, organization_id=organization_id)
+    task_v2 = await app.DATABASE.observer.get_task_v2(task_id, organization_id=organization_id)
     if not task_v2:
         raise TaskNotFound(task_id=task_id)
     await task_v2_service.mark_task_v2_as_canceled(
@@ -102,7 +102,7 @@ async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> No
 async def cancel_workflow_run(
     workflow_run_id: str, organization_id: str | None = None, api_key: str | None = None
 ) -> None:
-    workflow_run = await app.DATABASE.get_workflow_run(
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
@@ -110,7 +110,7 @@ async def cancel_workflow_run(
         raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
 
     # get all the child workflow runs and cancel them
-    child_workflow_runs = await app.DATABASE.get_workflow_runs_by_parent_workflow_run_id(
+    child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
         parent_workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
@@ -128,7 +128,7 @@ async def cancel_workflow_run(
 
 
 async def cancel_run(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
-    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -156,7 +156,7 @@ async def retry_run_webhook(
 ) -> None:
     """Retry sending the webhook for a run."""
 
-    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -175,19 +175,19 @@ async def retry_run_webhook(
         return
 
     if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
-        task = await app.DATABASE.get_task(run_id, organization_id=organization_id)
+        task = await app.DATABASE.tasks.get_task(run_id, organization_id=organization_id)
         if not task:
             raise TaskNotFound(task_id=run_id)
-        latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
+        latest_step = await app.DATABASE.tasks.get_latest_step(run_id, organization_id=organization_id)
         if latest_step:
             await app.agent.execute_task_webhook(task=task, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(run_id, organization_id=organization_id)
         if not task_v2:
             raise TaskNotFound(task_id=run_id)
         await task_v2_service.send_task_v2_webhook(task_v2)
     elif run.task_run_type == RunType.workflow_run:
-        workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=run_id,
             organization_id=organization_id,
         )

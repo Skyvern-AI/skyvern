@@ -42,7 +42,7 @@ function WorkflowRunParameters() {
     ? (location.state.extraHttpHeaders as Record<string, string>)
     : null;
 
-  const runWith = (location.state?.runWith as string) ?? null;
+  const runWith = (location.state?.runWith as string) ?? undefined;
 
   const initialValues = getInitialValues(location, workflowParameters ?? []);
 

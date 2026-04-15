@@ -468,7 +468,7 @@ function WorkflowRun() {
                     proxyLocation,
                     webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
                     maxScreenshotScrolls,
-                    runWith: workflowRun?.run_with,
+                    runWith: workflowRun?.run_with ?? "agent",
                   }}
                 >
                   <PlayIcon className="mr-2 h-4 w-4" />
@@ -556,10 +556,10 @@ function WorkflowRun() {
         </div>
       )}
       <div className="flex h-[42rem] gap-6">
-        <div className="w-2/3">
+        <div className="min-w-0 flex-[2]">
           <Outlet />
         </div>
-        <div className="w-1/3">
+        <div className="min-w-0 flex-1 overflow-hidden">
           <WorkflowRunTimeline
             activeItem={selection}
             onActionItemSelected={(item) => {

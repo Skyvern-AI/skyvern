@@ -1,10 +1,26 @@
 # Tool Map by Outcome
 
-## Run a one-off task
+## Quick check or extraction
 
 | Tool | Purpose |
 |------|---------|
-| `skyvern_run_task` | Execute a single automation with a prompt and URL |
+| `skyvern_validate` | Answer a yes/no question about the current page |
+| `skyvern_extract` | Pull structured data from the current page |
+
+## Single action
+
+| Tool | Purpose |
+|------|---------|
+| `skyvern_click` | Click an element when you know the target |
+| `skyvern_type` | Type text into an element when you know the target |
+| `skyvern_select_option` | Select a dropdown option |
+| `skyvern_act` | Perform a natural-language action when you do not know exact selectors |
+
+## Throwaway autonomous trial
+
+| Tool | Purpose |
+|------|---------|
+| `skyvern_run_task` | Execute a one-off exploratory automation with a prompt and URL |
 
 ## Open and operate a website
 
@@ -25,16 +41,13 @@
 
 | Tool | Purpose |
 |------|---------|
-| `skyvern_click` | Click an element |
-| `skyvern_type` | Type text into an element |
-| `skyvern_select_option` | Select a dropdown option |
 | `skyvern_hover` | Hover over an element |
 | `skyvern_scroll` | Scroll the page |
 | `skyvern_press_key` | Press a keyboard key |
 | `skyvern_wait` | Wait for a condition or duration |
 | `skyvern_evaluate` | Execute JavaScript in the page |
 
-## Build reusable automation
+## Build reusable or multi-page automation
 
 | Tool | Purpose |
 |------|---------|

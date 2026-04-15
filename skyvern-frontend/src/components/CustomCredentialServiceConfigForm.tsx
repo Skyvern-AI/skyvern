@@ -42,6 +42,8 @@ export function CustomCredentialServiceConfigForm() {
     isLoading,
     createOrUpdateConfig,
     isUpdating,
+    testConnection,
+    isTesting,
   } = useCustomCredentialServiceConfig();
 
   const form = useForm<FormData>({
@@ -56,6 +58,13 @@ export function CustomCredentialServiceConfigForm() {
 
   const onSubmit = (data: FormData) => {
     createOrUpdateConfig(data);
+  };
+
+  const onTestConnection = async () => {
+    const valid = await form.trigger();
+    if (!valid) return;
+    const values = form.getValues();
+    testConnection(values);
   };
 
   const toggleApiTokenVisibility = () => {
@@ -159,8 +168,19 @@ export function CustomCredentialServiceConfigForm() {
           />
 
           <div className="flex items-center gap-4">
-            <Button type="submit" disabled={isLoading || isUpdating}>
+            <Button
+              type="submit"
+              disabled={isLoading || isUpdating || isTesting}
+            >
               {isUpdating ? "Updating..." : "Update Configuration"}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isLoading || isUpdating || isTesting}
+              onClick={onTestConnection}
+            >
+              {isTesting ? "Testing..." : "Test Connection"}
             </Button>
 
             {customCredentialServiceAuthToken && (

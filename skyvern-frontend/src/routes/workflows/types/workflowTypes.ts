@@ -600,7 +600,7 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  run_with: string | null; // 'agent' or 'code'
+  run_with: string; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
   adaptive_caching: boolean | null;
@@ -618,7 +618,7 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: string | null; // 'agent' or 'code'
+  runWith: string; // 'agent' or 'code'
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;

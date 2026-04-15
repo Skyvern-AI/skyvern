@@ -1043,7 +1043,12 @@ class BitwardenService:
             data=collection_template,
         )
         if not response or response.get("success") is False:
-            raise BitwardenCreateCollectionError("Failed to create collection")
+            bw_message = response.get("message", "Unknown error") if response else "No response from Bitwarden server"
+            raise BitwardenCreateCollectionError(
+                f"Failed to create Bitwarden collection for org '{name}': {bw_message}. "
+                f"Ensure the Bitwarden vault is unlocked (POST {BITWARDEN_SERVER_BASE_URL}/unlock) "
+                f"and the organization ID '{bw_organization_id}' is valid."
+            )
 
         return response["data"]["id"]
 

@@ -118,6 +118,10 @@ class TaskBase(BaseModel):
         description="The maximum time to wait for downloads to complete, in seconds. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT seconds.",
         examples=[15.0],
     )
+    include_extracted_text: bool = Field(
+        default=True,
+        description="If False, omit the scraped page text dump from the extract-information prompt. ExtractionBlock opts out; everything else keeps the default.",
+    )
 
 
 class TaskRequest(TaskBase):
@@ -284,6 +288,7 @@ class Task(TaskBase):
     retry: int | None = None
     max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
+    failure_category: list[dict[str, Any]] | None = None
     model: dict[str, Any] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -400,6 +405,7 @@ class TaskOutput(BaseModel):
     extracted_information: list | dict[str, Any] | str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
+    failure_category: list[dict[str, Any]] | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None  # For backward compatibility
     task_screenshots: list[str] | None = None
@@ -423,6 +429,7 @@ class TaskOutput(BaseModel):
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
             errors=task.errors,
+            failure_category=task.failure_category,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             task_screenshot_artifact_ids=task_screenshot_artifact_ids,

@@ -27,7 +27,7 @@ class Constants:
 
 
 async def get_x_api_key(organization_id: str) -> str:
-    token = await app.DATABASE.get_valid_org_auth_token(
+    token = await app.DATABASE.organizations.get_valid_org_auth_token(
         organization_id,
         OrganizationAuthTokenType.api.value,
     )

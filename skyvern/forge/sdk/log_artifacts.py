@@ -127,7 +127,7 @@ async def _save_log_artifacts(
             return
         log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
 
-        log_artifact = await app.DATABASE.get_artifact_by_entity_id(
+        log_artifact = await app.DATABASE.artifacts.get_artifact_by_entity_id(
             artifact_type=ArtifactType.SKYVERN_LOG_RAW,
             step_id=step_id,
             task_id=task_id,
@@ -158,7 +158,7 @@ async def _save_log_artifacts(
 
         formatted_log = SkyvernLogEncoder.encode(log)
 
-        formatted_log_artifact = await app.DATABASE.get_artifact_by_entity_id(
+        formatted_log_artifact = await app.DATABASE.artifacts.get_artifact_by_entity_id(
             artifact_type=ArtifactType.SKYVERN_LOG,
             step_id=step_id,
             task_id=task_id,

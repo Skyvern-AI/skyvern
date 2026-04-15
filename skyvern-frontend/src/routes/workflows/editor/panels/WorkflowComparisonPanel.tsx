@@ -156,7 +156,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,
-    runWith: version.run_with,
+    runWith: version.run_with ?? "agent",
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,

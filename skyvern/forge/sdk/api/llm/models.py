@@ -14,6 +14,7 @@ class LiteLLMParams(TypedDict, total=False):
     thinking: dict[str, Any] | None
     thinking_level: str | None
     service_tier: str | None
+    extra_headers: dict[str, str] | None
     timeout: float | None
 
 

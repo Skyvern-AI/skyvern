@@ -15,6 +15,8 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from starlette.middleware import Middleware
 
+from skyvern.cli.commands._output import output_error
+from skyvern.cli.commands._tty import is_interactive
 from skyvern.cli.console import console
 from skyvern.cli.core.client import close_skyvern
 from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware, close_auth_db
@@ -115,25 +117,52 @@ def run_server() -> None:
     )
 
 
-@run_app.command(name="ui")
-def run_ui() -> None:
-    """Run the Skyvern UI server."""
-    console.print(Panel("[bold blue]Starting Skyvern UI Server...[/bold blue]", border_style="blue"))
+def _handle_port_conflict(port: int, *, force: bool, command_hint: str) -> bool:
+    """Check for existing process on port and handle it.
+
+    Returns True if the caller should proceed (port is free or was freed).
+    Returns False if the user declined to kill the existing process.
+    Exits with error if non-interactive and --force was not passed.
+    """
     try:
-        with console.status("[bold green]Checking for existing process on port 8080...") as status:
-            pids = get_pids_on_port(8080)
-            if pids:
-                status.stop()
-                response = Confirm.ask("Process already running on port 8080. [yellow]Kill it?[/yellow]")
-                if response:
-                    kill_pids(pids)
-                    console.print("✅ [green]Process killed.[/green]")
-                else:
-                    console.print("[yellow]UI server not started. Process already running on port 8080.[/yellow]")
-                    return
-            status.stop()
+        pids = get_pids_on_port(port)
+        if not pids:
+            return True
+        if force:
+            kill_pids(pids)
+            console.print("[green]Process killed (--force).[/green]")
+            return True
+        if not is_interactive():
+            output_error(
+                f"Process already running on port {port}.",
+                hint=command_hint,
+            )
+        response = Confirm.ask(f"Process already running on port {port}. [yellow]Kill it?[/yellow]")
+        if response:
+            kill_pids(pids)
+            console.print("[green]Process killed.[/green]")
+        else:
+            console.print(f"[yellow]Server not started. Process already running on port {port}.[/yellow]")
+            return False
     except Exception as e:  # pragma: no cover - CLI safeguards
-        console.print(f"[red]Error checking for process: {e}[/red]")
+        console.print(f"[red]Error checking for process on port {port}: {e}[/red]")
+        return False
+    return True
+
+
+@run_app.command(name="ui")
+def run_ui(
+    force: bool = typer.Option(False, "--force", help="Kill existing process on port 8080 without prompting."),
+) -> None:
+    """Run the Skyvern UI server.
+
+    Examples:
+      skyvern run ui
+      skyvern run ui --force
+    """
+    console.print(Panel("[bold blue]Starting Skyvern UI Server...[/bold blue]", border_style="blue"))
+    if not _handle_port_conflict(8080, force=force, command_hint="skyvern run ui --force"):
+        return
 
     frontend_env_path = resolve_frontend_env_path()
     if frontend_env_path is None:
@@ -171,24 +200,18 @@ def run_ui() -> None:
 
 
 @run_app.command(name="ui-dev")
-def run_ui_dev() -> None:
-    """Run the Skyvern UI server in development mode (npm run start-local)."""
+def run_ui_dev(
+    force: bool = typer.Option(False, "--force", help="Kill existing process on port 8080 without prompting."),
+) -> None:
+    """Run the Skyvern UI server in development mode (npm run start-local).
+
+    Examples:
+      skyvern run ui-dev
+      skyvern run ui-dev --force
+    """
     console.print(Panel("[bold blue]Starting Skyvern UI Server (dev mode)...[/bold blue]", border_style="blue"))
-    try:
-        with console.status("[bold green]Checking for existing process on port 8080...") as status:
-            pids = get_pids_on_port(8080)
-            if pids:
-                status.stop()
-                response = Confirm.ask("Process already running on port 8080. [yellow]Kill it?[/yellow]")
-                if response:
-                    kill_pids(pids)
-                    console.print("✅ [green]Process killed.[/green]")
-                else:
-                    console.print("[yellow]UI server not started. Process already running on port 8080.[/yellow]")
-                    return
-            status.stop()
-    except Exception as e:  # pragma: no cover - CLI safeguards
-        console.print(f"[red]Error checking for process: {e}[/red]")
+    if not _handle_port_conflict(8080, force=force, command_hint="skyvern run ui-dev --force"):
+        return
 
     frontend_env_path = resolve_frontend_env_path()
     if frontend_env_path is None:

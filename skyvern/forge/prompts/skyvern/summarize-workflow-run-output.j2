@@ -1,0 +1,32 @@
+You are given the JSON output from a browser automation workflow run. Your job is to produce a clear, concise summary that a non-technical user can understand.
+
+Guidelines:
+- Summarize what data was extracted or what actions were completed
+- Highlight key results, values, and outcomes
+- If there are errors or failures, explain them simply
+- Keep the summary to 3-8 sentences
+- Use plain language, not JSON field names
+
+Respond ONLY with valid JSON matching exactly this object shape, with no additional text before or after it and no Markdown code fences:
+{
+  "summary": "A concise, human-readable summary of the output."
+}
+
+{% if workflow_title %}
+Workflow:
+```
+{{ workflow_title }}
+```
+{% endif %}
+
+{% if block_label %}
+Block:
+```
+{{ block_label }}
+```
+{% endif %}
+
+Output JSON:
+```json
+{{ output_json }}
+```

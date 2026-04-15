@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import itertools
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -14,7 +17,11 @@ from .result import BrowserContext, ErrorCode, make_error
 
 LOG = structlog.get_logger(__name__)
 
+_BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
+
 if TYPE_CHECKING:
+    from playwright.async_api import Frame, Page
+
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 
@@ -27,11 +34,35 @@ class SessionState:
     console_messages: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    page_errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     tracing_active: bool = False
     har_enabled: bool = False
-    _hooked_page_id: int | None = None
-    _hooked_raw_page: Any = None
-    _hooked_handlers: dict[str, Any] = field(default_factory=dict)
+    _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
+    # -- Active page tracking (tab management) --
+    _active_page: Page | None = None
+    # -- Page event buffer for tab_wait_for_new --
+    _page_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
+    _page_event_signal: asyncio.Event = field(default_factory=lambda: asyncio.Event())
+    _page_event_listener_installed: bool = False
+    # -- Multi-page inspection hooks --
+    _hooked_page_ids: set[int] = field(default_factory=set)
+    _hooked_handlers_map: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Per-request network state: ID counter, body cache, concurrency limiter, route interceptions
+    _request_id_counter: itertools.count[int] = field(default_factory=itertools.count)
+    # Body store keyed by request_id. Evicts by completion order (FIFO on dict insertion),
+    # capped at _BODY_STORE_MAX. Entries may outlive their network_requests deque counterparts
+    # (deque maxlen=1000 vs store max=100) — bounded at ~25MB worst case, acceptable.
+    _body_store: dict[int, str] = field(default_factory=dict)
+    _body_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_BODY_SEMAPHORE_LIMIT))
+    _pending_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
+    active_routes: dict[int, set[str]] = field(default_factory=dict)
+    # -- Iframe frame context --
+    _working_frame: Frame | None = None
+
+    def get_response_body(self, request_id: int) -> str | None:
+        """Public accessor for cached response bodies (keyed by request_id)."""
+        return self._body_store.get(request_id)
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
@@ -188,6 +219,12 @@ async def close_current_session() -> None:
                     session_id=current.context.session_id,
                     exc_info=True,
                 )
+        # Cancel pending body-capture tasks before closing the browser to avoid
+        # "target closed" noise from CDP calls against a defunct context.
+        for task in current._pending_tasks:
+            task.cancel()
+        current._pending_tasks.clear()
+        current.active_routes.clear()
         if current.browser is not None:
             await current.browser.close()
     finally:
@@ -198,20 +235,101 @@ async def get_page(
     session_id: str | None = None,
     cdp_url: str | None = None,
 ) -> tuple[SkyvernBrowserPage, BrowserContext]:
-    """Get the working page from the current or specified browser session."""
+    """Get the working page from the current or specified browser session.
+
+    If an active page was set via tab_switch, returns that page.
+    Otherwise falls back to the most recent page (browser.get_working_page()).
+    """
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
-    page = await browser.get_working_page()
-
-    # Register inspection hooks (console, network, dialog) on the underlying
-    # Playwright page. Idempotent — only registers when the page object changes
-    # (e.g., after tab switch). Import here to avoid circular imports.
-    from skyvern.cli.mcp_tools.inspection import ensure_hooks_registered
-
     state = get_current_session()
-    if state is not None:
-        ensure_hooks_registered(state, page)
+
+    # Use explicitly set active page if still valid
+    if state._active_page is not None and not state._active_page.is_closed():
+        try:
+            context_pages = browser._browser_context.pages
+            if state._active_page in context_pages:
+                page = await browser.get_page_for(state._active_page)
+            else:
+                state._active_page = None
+                page = await browser.get_working_page()
+        except Exception:
+            state._active_page = None
+            page = await browser.get_working_page()
+    else:
+        if state._active_page is not None:
+            state._active_page = None
+        page = await browser.get_working_page()
+
+    # Register inspection hooks on all pages in the context.
+    # Import here to avoid circular imports.
+    from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
+
+    ensure_hooks_on_all_pages(state, browser._browser_context.pages)
+
+    # Install page event listener for tab_wait_for_new (once per session)
+    _install_page_event_listener(state, browser)
+
+    # Propagate iframe frame context from session state to the page
+    if state._working_frame is not None:
+        # Guard against stale (detached) frame references
+        detached = False
+        try:
+            detached = state._working_frame.is_detached()
+        except AttributeError:
+            pass  # frame object doesn't support is_detached (e.g., test mocks)
+        if detached:
+            LOG.debug("Clearing detached _working_frame from session state")
+            state._working_frame = None
+        else:
+            page._working_frame = state._working_frame
 
     return page, ctx
+
+
+def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -> None:
+    """Register a browser_context.on('page') listener to buffer new page events."""
+    if state._page_event_listener_installed:
+        return
+
+    def _on_new_page(page: Page) -> None:
+        event = {
+            "tab_id": str(id(page)),
+            "url": page.url,
+            "timestamp": time.time(),
+            "page": page,
+        }
+        state._page_events.append(event)
+        state._page_event_signal.set()
+
+        # Eagerly clean up when the page closes
+        def _on_close() -> None:
+            try:
+                state._page_events = deque(
+                    (e for e in state._page_events if e is not event),
+                    maxlen=state._page_events.maxlen,
+                )
+                # Remove hook tracking so a new page with a recycled id() gets hooked
+                page_id = id(page)
+                state._hooked_page_ids.discard(page_id)
+                state._hooked_handlers_map.pop(page_id, None)
+            except Exception:
+                LOG.debug("Failed to clean up closed page state", exc_info=True)
+
+        page.on("close", _on_close)
+
+        # Register inspection hooks eagerly so early popup events are captured
+        try:
+            from skyvern.cli.mcp_tools.inspection import _register_hooks_on_page
+
+            _register_hooks_on_page(state, page)
+        except Exception:
+            LOG.debug("Failed to register inspection hooks on new page", exc_info=True)
+
+    try:
+        browser._browser_context.on("page", _on_new_page)
+        state._page_event_listener_installed = True
+    except Exception:
+        LOG.debug("Failed to install page event listener", exc_info=True)
 
 
 @asynccontextmanager

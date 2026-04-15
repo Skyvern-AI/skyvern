@@ -22,9 +22,10 @@ type Props = {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  required?: boolean;
 };
 
-function CredentialSelector({ value, onChange, placeholder }: Props) {
+function CredentialSelector({ value, onChange, placeholder, required }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const { data: credentials, isLoading } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
@@ -51,7 +52,7 @@ function CredentialSelector({ value, onChange, placeholder }: Props) {
           }
         }}
       >
-        <SelectTrigger>
+        <SelectTrigger aria-required={required || undefined}>
           <SelectValue placeholder={placeholder ?? "Select a credential"} />
         </SelectTrigger>
         <SelectContent>

@@ -21,7 +21,7 @@ async def create_org_api_token(org_id: str) -> OrganizationAuthToken:
         The API token created for the specified org_id.
     """
     # get the organization
-    organization = await app.DATABASE.get_organization(org_id)
+    organization = await app.DATABASE.organizations.get_organization(org_id)
     if not organization:
         raise Exception(f"Organization id {org_id} not found")
 
@@ -31,7 +31,7 @@ async def create_org_api_token(org_id: str) -> OrganizationAuthToken:
         expires_delta=API_KEY_LIFETIME,
     )
     # generate OrganizationAutoToken
-    org_auth_token = await app.DATABASE.create_org_auth_token(
+    org_auth_token = await app.DATABASE.organizations.create_org_auth_token(
         organization_id=org_id,
         token=api_key,
         token_type=OrganizationAuthTokenType.api,

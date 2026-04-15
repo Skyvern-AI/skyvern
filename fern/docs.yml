@@ -58,7 +58,7 @@ tabs:
   demo:
     display-name: Book a demo
     icon: calendar
-    href: https://meetings.hubspot.com/skyvern/demo
+    href: https://www.skyvern.com/contact
 navigation:
   - tab: home
     layout:

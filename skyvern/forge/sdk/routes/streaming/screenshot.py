@@ -86,7 +86,7 @@ async def task_stream(
                 )
                 return
 
-            task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+            task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
             if not task:
                 LOG.info("Task not found. Closing connection", task_id=task_id, organization_id=organization_id)
                 await websocket.send_json(
@@ -210,7 +210,7 @@ async def workflow_run_streaming(
                 )
                 return
 
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
@@ -403,7 +403,7 @@ async def _local_screencast_for_workflow_run(
     async def wait_for_running() -> str | None:
         deadline = time.monotonic() + WAIT_FOR_RUNNING_TIMEOUT
         while True:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
@@ -423,14 +423,14 @@ async def _local_screencast_for_workflow_run(
             await asyncio.sleep(1)
 
     async def check_finalized() -> bool:
-        wr = await app.DATABASE.get_workflow_run(
+        wr = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
         return wr is None or wr.status.is_final()
 
     async def get_current_status() -> str | None:
-        wr = await app.DATABASE.get_workflow_run(
+        wr = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
@@ -457,7 +457,7 @@ async def _local_screencast_for_task(
         nonlocal task_workflow_run_id
         deadline = time.monotonic() + WAIT_FOR_RUNNING_TIMEOUT
         while True:
-            task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+            task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
             if not task:
                 return "not_found"
             if task.status.is_final():
@@ -475,11 +475,11 @@ async def _local_screencast_for_task(
             await asyncio.sleep(1)
 
     async def check_finalized() -> bool:
-        task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+        task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
         return task is None or task.status.is_final()
 
     async def get_current_status() -> str | None:
-        task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+        task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
         return task.status if task else None
 
     await _run_local_screencast(

@@ -31,6 +31,31 @@ Each entry in FIELD_MAP is a dict with these keys:
 ```
 {{ navigation_goal }}
 ```
+{% if terminate_criterion %}
+
+## Block Termination Criterion
+When this condition is met, call `await page.terminate(errors=["<error_code>: <reason>"])`:
+```
+{{ terminate_criterion }}
+```
+You MUST check for this condition using `page.classify()` or `page.extract()` and terminate inside an `if`/`elif` branch when it is satisfied.
+{% endif %}
+{% if complete_criterion %}
+
+## Block Completion Criterion
+The block should call `await page.complete()` when this condition is met:
+```
+{{ complete_criterion }}
+```
+{% endif %}
+{% if error_code_mapping %}
+
+## Error Code Mapping
+These are the specific error codes defined for this block. When terminating, use the matching error code:
+{% for code, description in error_code_mapping.items() %}
+- **{{ code }}**: {{ description }}
+{% endfor %}
+{% endif %}
 {% if parameter_keys %}
 
 ## Workflow Parameter Keys
@@ -39,6 +64,14 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 - `{{ key }}`
 {% endfor %}
 For fields not covered by these parameters, use `"ai": "proactive"` with a descriptive prompt (see Rule 9b).
+{% endif %}
+{% if run_parameter_values %}
+
+## Current Run Parameter Values
+These are the ACTUAL values for this run. If any of these appear (even partially) in a FIELD_MAP value or hardcoded string, that value is per-run and MUST use `context.parameters['key']` instead.
+{% for key, value in run_parameter_values.items() %}
+- `{{ key }}` = `{{ value[:80] }}{% if value|length > 80 %}…{% endif %}`
+{% endfor %}
 {% endif %}
 
 ## Existing Cached Code
@@ -96,9 +129,11 @@ The following failures occurred in PREVIOUS runs. Learn from these — do NOT re
 - **Error**: {{ h.error_message or "N/A" }}
 - **Reviewer fix applied**: {{ h.reviewer_output or "No fix recorded" }}
 - **Did the AI fallback succeed?**: {{ "Yes" if h.fallback_succeeded else ("No" if h.fallback_succeeded is sameas false else "Unknown") }}
+{% if h.run_parameters %}- **Run parameters**: {% for k, v in h.run_parameters.items() %}`{{ k }}={{ v[:60] }}{% if v|length > 60 %}…{% endif %}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
 {% endfor %}
 
-**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach.
+**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach. **If different past episodes show different values for the same parameter**, the block handles per-run data — any hardcoded reference to those values must use `context.parameters['key']` instead.
 {% endif %}
 
 {% if user_instructions %}
@@ -124,7 +159,31 @@ Do NOT add FIELD_MAP entries for any of these standard categories — they are m
 Only add FIELD_MAP entries for truly **custom/company-specific** fields that don't fit any standard category above.
 
 ## Slow Page Load / Page Not Ready
-When the error or page text suggests the page wasn't ready for interaction, the script acted too soon. Signs include: blank page messages, "still on X page", loading spinners/overlays, progress indicators, or the page text showing a transitional state rather than the expected content. Fix this by adding `await page.wait(timeout_ms=5000)` **before the first action that failed**. If the existing code already has a `page.wait()` before that action and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
+When the error or page text suggests the page wasn't ready for interaction, the script acted too soon. Signs include: blank page messages, "still on X page", loading spinners/overlays, progress indicators, or the page text showing a transitional state rather than the expected content.
+
+**Where to place `page.wait()`** depends on WHY the page wasn't ready:
+
+1. **After `page.goto()` / navigation** — If the error is "blank page", "page not loaded", or the page text is empty/minimal after navigating to a URL, the page hasn't finished rendering. Add `await page.wait(timeout_ms=5000)` **after** the `page.goto()` call, before the next interaction:
+   ```python
+   await page.goto('https://example.com/login')
+   await page.wait(timeout_ms=5000)  # wait for JS-heavy page to render
+   await page.fill(selector='#username', value=..., ai='fallback', prompt='...')
+   ```
+
+2. **Before an interaction** — If the page has loaded but a specific element isn't ready yet (loading spinner, overlay, lazy-loaded section), add `await page.wait(timeout_ms=5000)` **before** the action that failed:
+   ```python
+   await page.wait(timeout_ms=5000)  # wait for element to appear
+   await page.click(selector='button:has-text("Submit")', ai='fallback', prompt='...')
+   ```
+
+If the existing code already has a `page.wait()` and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
+
+3. **Before `fill_form()` when 0 fields are found** — If the error message says "fill_form found 0 form fields", the page hasn't finished rendering its form inputs. Add `await page.wait(timeout_ms=5000)` **before** the `fill_form()` call:
+   ```python
+   await page.goto(url)
+   await page.wait(timeout_ms=5000)  # wait for form fields to render
+   await page.fill_form(context.parameters, prompt='...')
+   ```
 
 ## What to do
 1. Compare the episode's form fields to the existing FIELD_MAP.

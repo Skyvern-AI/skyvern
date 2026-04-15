@@ -224,6 +224,8 @@ class TestBrowserCommands:
     ) -> None:
         from skyvern.cli.commands import browser as browser_cmd
 
+        capture_mock = MagicMock()
+        monkeypatch.setattr(browser_cmd, "capture_cli_tool_call", capture_mock)
         monkeypatch.setattr(
             browser_cmd,
             "_resolve_connection",
@@ -245,6 +247,7 @@ class TestBrowserCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert "Must provide intent, selector, or both" in parsed["error"]["message"]
+        capture_mock.assert_not_called()
 
     def test_click_with_intent_uses_proactive_ai_mode(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
@@ -261,6 +264,8 @@ class TestBrowserCommands:
             lambda _session, _cdp: browser_cmd.ConnectionTarget(mode="cloud", session_id="pbs_123"),
         )
         monkeypatch.setattr(browser_cmd, "_connect_browser", AsyncMock(return_value=browser))
+        capture_mock = MagicMock()
+        monkeypatch.setattr(browser_cmd, "capture_cli_tool_call", capture_mock)
 
         browser_cmd.click(
             intent="the Submit button",
@@ -278,6 +283,7 @@ class TestBrowserCommands:
         assert parsed["action"] == "click"
         assert parsed["data"]["ai_mode"] == "proactive"
         assert parsed["data"]["resolved_selector"] == "xpath=//button[@id='submit']"
+        capture_mock.assert_called_once_with("skyvern_click", ok=True)
 
     def test_wait_rejects_invalid_state_before_connection(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
@@ -325,7 +331,10 @@ class TestWorkflowCommands:
         workflow_cmd.workflow_get(workflow_id="wpid_123", version=2, json_output=True)
 
         parsed = json.loads(capsys.readouterr().out)
-        assert parsed == expected
+        # emit_tool_result adds schema_version and warnings defaults to the output copy
+        assert parsed["ok"] is True
+        assert parsed["data"] == expected["data"]
+        assert parsed["schema_version"] == "1.0"
         assert tool.await_args.kwargs == {"workflow_id": "wpid_123", "version": 2}
 
     def test_workflow_create_reads_definition_from_file(
@@ -369,6 +378,42 @@ class TestWorkflowCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is True
         assert parsed["data"]["workflow_permanent_id"] == "wpid_new"
+
+    def test_workflow_create_preserves_empty_definition_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        definition_file = tmp_path / "workflow.json"
+        definition_file.write_text("")
+
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_create",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflow_permanent_id": "wpid_empty"},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_create", tool)
+
+        workflow_cmd.workflow_create(
+            definition=f"@{definition_file}",
+            definition_format="json",
+            folder_id=None,
+            json_output=True,
+        )
+
+        assert tool.await_args.kwargs["definition"] == ""
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
 
     def test_workflow_run_reads_params_file_and_maps_options(
         self,
@@ -496,6 +541,42 @@ class TestWorkflowCommands:
             )
 
         tool.assert_not_called()
+
+    def test_workflow_update_preserves_empty_definition_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        definition_file = tmp_path / "workflow.json"
+        definition_file.write_text("")
+
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_update",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflow_permanent_id": "wpid_123"},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_update", tool)
+
+        workflow_cmd.workflow_update(
+            workflow_id="wpid_123",
+            definition=f"@{definition_file}",
+            definition_format="json",
+            json_output=True,
+        )
+
+        assert tool.await_args.kwargs["definition"] == ""
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +725,87 @@ class TestBlockParityCommands:
         assert parsed["ok"] is True
         assert parsed["data"]["valid"] is True
 
+    def test_block_validate_preserves_empty_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli import block as block_cmd
+
+        block_file = tmp_path / "block.json"
+        block_file.write_text("")
+
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_block_validate",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"valid": False},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(block_cmd, "tool_block_validate", tool)
+
+        block_cmd.block_validate(block_json=f"@{block_file}", json_output=True)
+
+        assert tool.await_args.kwargs["block_json"] == ""
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
+
+
+class TestTasksCommands:
+    def test_tasks_list_json_error_includes_action(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli import tasks as tasks_cmd
+
+        monkeypatch.setattr(tasks_cmd, "_get_client", lambda _api_key=None: object())
+        monkeypatch.setattr(
+            tasks_cmd, "_list_workflow_tasks", lambda _client, _run_id: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        with pytest.raises(SystemExit, match="1"):
+            tasks_cmd.list_tasks(
+                ctx=SimpleNamespace(obj={}),
+                workflow_run_id="wr_123",
+                json_output=True,
+            )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert parsed["action"] == "tasks.list"
+
+
+class TestCredentialsCommands:
+    def test_add_credential_invalid_type_json_error_includes_action(self, capsys: pytest.CaptureFixture) -> None:
+        from skyvern.cli import credentials as credentials_cmd
+
+        ctx = SimpleNamespace(obj={})
+
+        with pytest.raises(SystemExit, match="1"):
+            credentials_cmd.add_credential(
+                ctx=ctx,
+                name="Bad",
+                credential_type="not-real",
+                username=None,
+                password=None,
+                totp=None,
+                card_number=None,
+                cvv=None,
+                exp_month=None,
+                exp_year=None,
+                card_brand=None,
+                holder_name=None,
+                secret_value=None,
+                secret_label=None,
+                json_output=True,
+            )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert parsed["action"] == "credentials.add"
+
 
 class TestBrowserPRCCommands:
     def test_run_task_uses_resolved_connection(
@@ -697,6 +859,7 @@ class TestBrowserPRCCommands:
     def test_login_json_error_exits_nonzero(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
+        from skyvern.cli.commands import _output as output_mod
         from skyvern.cli.commands import browser as browser_cmd
 
         monkeypatch.setattr(
@@ -722,6 +885,8 @@ class TestBrowserPRCCommands:
             }
         )
         monkeypatch.setattr(browser_cmd, "tool_login", tool)
+        capture_mock = MagicMock()
+        monkeypatch.setattr(output_mod, "capture_cli_tool_call", capture_mock)
 
         with pytest.raises(SystemExit, match="1"):
             browser_cmd.login(
@@ -738,24 +903,51 @@ class TestBrowserPRCCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert "Missing required fields" in parsed["error"]["message"]
+        capture_mock.assert_called_once_with("skyvern_login", ok=False)
+
+    def test_workflow_create_missing_definition_file_does_not_emit_cli_telemetry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        capture_mock = MagicMock()
+        monkeypatch.setattr("skyvern.cli.commands._output.capture_cli_tool_call", capture_mock)
+
+        with pytest.raises(typer.BadParameter):
+            workflow_cmd.workflow_create(
+                definition="@/does/not/exist.json",
+                definition_format="json",
+                folder_id=None,
+                json_output=False,
+            )
+
+        capture_mock.assert_not_called()
 
 
 class TestParityErrorFormatting:
     def test_credential_emit_tool_result_handles_none_message_and_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.cli import credential as credential_cmd
+        from skyvern.cli.commands import _output as output_mod
 
         captured: dict[str, str | bool] = {}
 
-        def _fake_output_error(message: str, *, hint: str = "", json_mode: bool = False, exit_code: int = 1) -> None:
+        def _fake_output_error(
+            message: str,
+            *,
+            hint: str = "",
+            action: str = "",
+            json_mode: bool = False,
+            exit_code: int = 1,
+        ) -> None:
             captured["message"] = message
             captured["hint"] = hint
             captured["json_mode"] = json_mode
             raise SystemExit(exit_code)
 
-        monkeypatch.setattr(credential_cmd, "output_error", _fake_output_error)
+        monkeypatch.setattr(output_mod, "output_error", _fake_output_error)
 
         with pytest.raises(SystemExit, match="1"):
-            credential_cmd._emit_tool_result(
+            output_mod.emit_tool_result(
                 {"ok": False, "error": {"message": None, "hint": None}},
                 json_output=False,
             )
@@ -763,20 +955,27 @@ class TestParityErrorFormatting:
         assert captured == {"message": "Unknown error", "hint": "", "json_mode": False}
 
     def test_block_emit_tool_result_handles_none_message_and_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.cli import block as block_cmd
+        from skyvern.cli.commands import _output as output_mod
 
         captured: dict[str, str | bool] = {}
 
-        def _fake_output_error(message: str, *, hint: str = "", json_mode: bool = False, exit_code: int = 1) -> None:
+        def _fake_output_error(
+            message: str,
+            *,
+            hint: str = "",
+            action: str = "",
+            json_mode: bool = False,
+            exit_code: int = 1,
+        ) -> None:
             captured["message"] = message
             captured["hint"] = hint
             captured["json_mode"] = json_mode
             raise SystemExit(exit_code)
 
-        monkeypatch.setattr(block_cmd, "output_error", _fake_output_error)
+        monkeypatch.setattr(output_mod, "output_error", _fake_output_error)
 
         with pytest.raises(SystemExit, match="1"):
-            block_cmd._emit_tool_result(
+            output_mod.emit_tool_result(
                 {"ok": False, "error": {"message": None, "hint": None}},
                 json_output=False,
             )
@@ -784,17 +983,25 @@ class TestParityErrorFormatting:
         assert captured == {"message": "Unknown error", "hint": "", "json_mode": False}
 
     def test_browser_emit_tool_result_handles_none_message_and_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli.commands import _output as output_mod
         from skyvern.cli.commands import browser as browser_cmd
 
         captured: dict[str, str | bool] = {}
 
-        def _fake_output_error(message: str, *, hint: str = "", json_mode: bool = False, exit_code: int = 1) -> None:
+        def _fake_output_error(
+            message: str,
+            *,
+            hint: str = "",
+            action: str = "",
+            json_mode: bool = False,
+            exit_code: int = 1,
+        ) -> None:
             captured["message"] = message
             captured["hint"] = hint
             captured["json_mode"] = json_mode
             raise SystemExit(exit_code)
 
-        monkeypatch.setattr(browser_cmd, "output_error", _fake_output_error)
+        monkeypatch.setattr(output_mod, "output_error", _fake_output_error)
 
         with pytest.raises(SystemExit, match="1"):
             browser_cmd._emit_tool_result(
@@ -804,3 +1011,21 @@ class TestParityErrorFormatting:
             )
 
         assert captured == {"message": "Unknown error", "hint": "", "json_mode": False}
+
+
+class TestStopCommands:
+    def test_stop_all_json_reports_failure_when_nothing_running(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli import stop_commands as stop_cmd
+
+        monkeypatch.setattr(stop_cmd, "get_pids_on_port", lambda _port: [])
+        monkeypatch.setattr(stop_cmd, "kill_pids", lambda pids, service_name, quiet=False: False)
+
+        with pytest.raises(SystemExit, match="1"):
+            stop_cmd.stop_all(json_output=True)
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert parsed["action"] == "stop.all"
+        assert parsed["error"]["message"] == "No Skyvern services found running on ports 8000, 8080, or 9090."

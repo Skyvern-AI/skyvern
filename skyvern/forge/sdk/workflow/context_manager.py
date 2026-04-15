@@ -396,7 +396,9 @@ class WorkflowRunContext:
         parameter: Parameter,
         organization: Organization,
     ) -> None:
-        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        db_credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=organization.organization_id
+        )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
@@ -519,7 +521,7 @@ class WorkflowRunContext:
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization.organization_id,
             OrganizationAuthTokenType.onepassword_service_account.value,
         )
@@ -635,7 +637,7 @@ class WorkflowRunContext:
         | BitwardenSensitiveInformationParameter
         | BitwardenCreditCardDataParameter,
     ) -> list[BitwardenCredentials]:
-        org_bw_token = await app.DATABASE.get_valid_org_auth_token(
+        org_bw_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization_id=organization.organization_id,
             token_type=OrganizationAuthTokenType.bitwarden_credential.value,
         )
@@ -1060,7 +1062,10 @@ class WorkflowRunContext:
             current_value = self.values[block_label]
             # only able to merge the value when the current value and the pending value are both dicts
             if isinstance(current_value, dict) and isinstance(block_reference_value, dict):
-                block_reference_value.update(current_value)
+                # Merge old into new so that new values (e.g. from the latest loop
+                # iteration) take precedence over stale ones.
+                merged = {**current_value, **block_reference_value}
+                block_reference_value = merged
             else:
                 LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
@@ -1203,7 +1208,7 @@ class WorkflowRunContext:
 
     @staticmethod
     async def _get_azure_vault_client_for_organization(organization: Organization) -> AsyncAzureVaultClient:
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential.value
         )
         if org_auth_token:

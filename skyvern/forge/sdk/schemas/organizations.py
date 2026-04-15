@@ -146,6 +146,12 @@ class CustomCredentialServiceConfigResponse(BaseModel):
     )
 
 
+class TestConnectionResponse(BaseModel):
+    """Response model for the custom credential service connection test."""
+
+    success: bool
+
+
 class CreateCustomCredentialServiceConfigRequest(BaseModel):
     """Request model for creating or updating custom credential service configuration."""
 

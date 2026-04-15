@@ -1,0 +1,26 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "maintainers": [
+    "marcmuon",
+    "LawyZheng",
+    "AronPerez",
+    "suchintan",
+    "pedrohsdb",
+    "celalzamanoglu",
+    "wintonzheng"
+  ],
+  "name": "skyvern",
+  "description": "AI-powered browser automation MCP server. Automate any website using LLMs and computer vision — click, fill forms, extract data, navigate pages, upload files, and run full browser workflows.",
+  "keywords": [
+    "browser",
+    "automation",
+    "mcp",
+    "playwright",
+    "web-scraping",
+    "ai-agent",
+    "computer-vision",
+    "llm",
+    "browser-automation",
+    "rpa"
+  ]
+}

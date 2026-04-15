@@ -566,7 +566,7 @@ function FloatingWindow({
         onStart={() => setIsDragging(true)}
         onDrag={(_, data) => onDrag(data)}
         onStop={() => setIsDragging(false)}
-        bounds={bounded ?? true ? "parent" : undefined}
+        bounds={(bounded ?? true) ? "parent" : undefined}
         disabled={isResizing}
       >
         <Resizable

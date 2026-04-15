@@ -21,9 +21,35 @@ class SkyvernHTTPException(SkyvernException):
         super().__init__(message)
 
 
+_BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
+
+# Patterns that indicate a browser session connection failure (e.g. CDP WebSocket errors).
+# These errors contain internal URLs and raw HTML that should never be shown to end users.
+_BROWSER_CONNECTION_PATTERNS = (
+    "connect_over_cdp",
+    "WebSocket error",
+    "WebSocket was closed",
+    "ws connecting",
+    "ws unexpected response",
+    "ws error",
+)
+
+
+def _is_browser_connection_error(message: str) -> bool:
+    return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
+
+
 def get_user_facing_exception_message(exception: Exception) -> str:
     if isinstance(exception, SkyvernException):
         return exception.message or str(exception)
+
+    raw = str(exception)
+    if _is_browser_connection_error(raw):
+        return (
+            f"Failed to connect to the browser session. "
+            f"This is usually caused by high demand and is transient. {_BROWSER_CONNECTION_GUIDANCE}"
+        )
+
     return f"Unexpected error: {exception}"
 
 
@@ -319,6 +345,32 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
     @staticmethod
     def _get_detail(exception: Exception) -> str:
         raw_message = str(exception).strip()
+        raw_lower = raw_message.lower()
+
+        # Browser launch environment errors: worker cannot initialize the
+        # headed browser display/graphics stack (X display or EGL/SwiftShader).
+        if any(
+            indicator in raw_lower
+            for indicator in (
+                "missing x server",
+                "xserver running",
+                "no display",
+                "$display",
+                "the platform failed to initialize",
+                "no suitable egl configs found",
+                "failed to get config for surface",
+                "collectgraphicsinfo failed",
+                "glcontext::createoffscreenglsurface failed",
+                "exiting gpu process due to errors during initialization",
+            )
+        ):
+            return (
+                "Browser launch failed: worker node could not initialize the browser display/graphics stack "
+                "(X display/EGL). This is an infrastructure or browser-environment issue on the worker node, "
+                "not a browser profile problem. "
+                f"{UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+            )
+
         # Patchright timeout errors include a verbose "Call log" section with launch args.
         trimmed_message = raw_message.split("Call log:")[0].strip()
         normalized_message = " ".join(trimmed_message.split())
@@ -656,6 +708,9 @@ class NoSelectableElementFound(SkyvernException):
 
 class HttpException(SkyvernException):
     def __init__(self, status_code: int, url: str, msg: str | None = None) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.error_message = msg
         super().__init__(f"HTTP Exception, status_code={status_code}, url={url}" + (f", msg={msg}" if msg else ""))
 
 
@@ -866,8 +921,14 @@ class FailedToGetTOTPVerificationCode(SkyvernException):
 
 
 class SkyvernContextWindowExceededError(SkyvernException):
-    def __init__(self) -> None:
-        message = "Context window exceeded. Please contact support@skyvern.com for help."
+    def __init__(self, model: str | None = None, prompt_name: str | None = None) -> None:
+        details = []
+        if model:
+            details.append(f"model: {model}")
+        if prompt_name:
+            details.append(f"prompt: {prompt_name}")
+        detail_str = f" ({', '.join(details)})" if details else ""
+        message = f"LLM context window exceeded{detail_str}. The page may have too much content for the AI model to process. Please try again or contact support@skyvern.com for help."
         super().__init__(message)
 
 
@@ -889,6 +950,14 @@ class BrowserSessionNotRenewable(SkyvernException):
 class MissingBrowserAddressError(SkyvernException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} does not have an address.")
+
+
+class BrowserSessionClosed(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} is closed.",
+            status_code=status.HTTP_410_GONE,
+        )
 
 
 class BrowserSessionNotFound(SkyvernHTTPException):

@@ -53,7 +53,7 @@ def mock_app():
     mock = MagicMock()
     mock.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(return_value={"actions": []})
     mock.DATABASE = MagicMock()
-    mock.DATABASE.get_step = AsyncMock(return_value=MagicMock())
+    mock.DATABASE.tasks.get_step = AsyncMock(return_value=MagicMock())
     return mock
 
 

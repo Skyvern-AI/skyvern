@@ -17,11 +17,17 @@ import { useState } from "react";
 type Props = {
   value: string;
   onChange: (value: string) => void;
+  vault_type?: string;
 };
 
-function CredentialParameterSourceSelector({ value, onChange }: Props) {
+function CredentialParameterSourceSelector({
+  value,
+  onChange,
+  vault_type,
+}: Props) {
   const { data: credentials, isLoading } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
+    vault_type,
   });
   // Use local state for modal to avoid conflicts with other CredentialsModal instances
   const [isModalOpen, setIsModalOpen] = useState(false);
