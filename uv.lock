@@ -14,7 +14,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-08T21:26:23.576693Z"
+exclude-newer = "2026-04-08T23:24:25.268001Z"
 exclude-newer-span = "P7D"
 
 [manifest]
@@ -5614,6 +5614,7 @@ dependencies = [
     { name = "litellm" },
     { name = "onepassword-sdk" },
     { name = "openai" },
+    { name = "openai-agents" },
     { name = "opentelemetry-api" },
     { name = "orjson" },
     { name = "pandas" },
@@ -5653,11 +5654,6 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
     { name = "zstandard" },
-]
-
-[package.optional-dependencies]
-copilot = [
-    { name = "openai-agents" },
 ]
 
 [package.dev-dependencies]
@@ -5742,7 +5738,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.83.0" },
     { name = "onepassword-sdk", specifier = "==0.4.0" },
     { name = "openai", specifier = ">=1.68.2" },
-    { name = "openai-agents", marker = "extra == 'copilot'", specifier = ">=0.13.4,<0.14" },
+    { name = "openai-agents", specifier = ">=0.13.4,<0.14" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2" },
     { name = "orjson", specifier = ">=3.9.10,<4" },
     { name = "pandas", specifier = ">=2.3.1,<4" },
@@ -5784,7 +5780,6 @@ requires-dist = [
     { name = "websockets", specifier = ">=12.0,<15.1" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
-provides-extras = ["copilot"]
 
 [package.metadata.requires-dev]
 cloud = [
