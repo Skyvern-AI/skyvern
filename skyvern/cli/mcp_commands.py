@@ -15,6 +15,7 @@ from urllib.parse import urlparse, urlunparse
 
 import toml
 import typer
+import yaml
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
@@ -31,8 +32,10 @@ from .setup_commands import (
     _find_server_key,
     _get_env_credentials,
     _load_mcp_config,
+    _load_yaml_config,
     _mask_key,
     _mask_secrets,
+    _save_yaml_config,
     _windsurf_config_path,
     _write_mcp_config,
 )
@@ -47,6 +50,7 @@ _PROFILE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _CONFIG_FORMAT_JSON = "json"
 _CONFIG_FORMAT_CODEX = "codex_toml"
+_CONFIG_FORMAT_YAML = "yaml"
 
 
 @dataclass(frozen=True)
@@ -254,7 +258,9 @@ def _extract_entry_base_url(entry: dict) -> str:
 
 
 def _server_block_key(config_format: str) -> str:
-    return "mcp_servers" if config_format == _CONFIG_FORMAT_CODEX else "mcpServers"
+    if config_format in (_CONFIG_FORMAT_CODEX, _CONFIG_FORMAT_YAML):
+        return "mcp_servers"
+    return "mcpServers"
 
 
 def _load_codex_config(config_path: Path) -> tuple[dict | None, str | None]:
@@ -279,6 +285,11 @@ def _load_codex_config(config_path: Path) -> tuple[dict | None, str | None]:
 def _load_switch_config(config_path: Path, config_format: str) -> tuple[dict | None, str | None]:
     if config_format == _CONFIG_FORMAT_CODEX:
         return _load_codex_config(config_path)
+    if config_format == _CONFIG_FORMAT_YAML:
+        data = _load_yaml_config(config_path)
+        if data is None:
+            return None, f"Cannot parse {config_path}. Fix the YAML and re-run."
+        return data, None
     return _load_mcp_config(config_path)
 
 
@@ -299,18 +310,49 @@ def _write_codex_config(config_path: Path, config: dict, create_backup: bool = T
 def _write_switch_config(config_path: Path, config: dict, config_format: str) -> Path | None:
     if config_format == _CONFIG_FORMAT_CODEX:
         return _write_codex_config(config_path, config, create_backup=True)
+    if config_format == _CONFIG_FORMAT_YAML:
+        backup_path: Path | None = None
+        if config_path.exists():
+            backup_path = _backup_config_path(config_path)
+            shutil.copy2(config_path, backup_path)
+        _save_yaml_config(config_path, config)
+        return backup_path
     return _write_mcp_config(config_path, config, create_backup=True)
 
 
+def _hermes_config_path() -> Path:
+    return Path.home() / ".hermes" / "config.yaml"
+
+
 def _switch_target_specs() -> list[SwitchTargetSpec]:
-    return [
+    specs = [
         SwitchTargetSpec("Claude Code (global)", _claude_code_global_config_path),
         SwitchTargetSpec("Claude Code (project)", _claude_code_project_config_path),
         SwitchTargetSpec("Claude Desktop", _claude_desktop_config_path),
         SwitchTargetSpec("Cursor", _cursor_config_path),
         SwitchTargetSpec("Windsurf", _windsurf_config_path),
         SwitchTargetSpec("Codex", _codex_config_path, config_format=_CONFIG_FORMAT_CODEX),
+        SwitchTargetSpec("Hermes", _hermes_config_path, config_format=_CONFIG_FORMAT_YAML),
     ]
+    # Discover per-profile Hermes configs alongside the global one
+    profiles_dir = Path.home() / ".hermes" / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir()):
+            profile_config = profile_dir / "config.yaml"
+            if profile_dir.is_dir() and profile_config.exists():
+                profile_name = profile_dir.name
+
+                def _make_path_fn(p: Path = profile_config) -> Path:
+                    return p
+
+                specs.append(
+                    SwitchTargetSpec(
+                        f"Hermes ({profile_name})",
+                        _make_path_fn,
+                        config_format=_CONFIG_FORMAT_YAML,
+                    )
+                )
+    return specs
 
 
 def _entry_kind(entry: dict | None) -> str:
@@ -645,7 +687,8 @@ def _patch_entry_with_profile(
         headers = dict(patched.get("headers") or {})
         headers["x-api-key"] = profile.api_key
         patched["headers"] = headers
-        patched["type"] = "http"
+        if config_format != _CONFIG_FORMAT_YAML:
+            patched["type"] = "http"
         patched["url"] = target_url
         return patched
 
@@ -687,6 +730,13 @@ def _render_patched_entry(target: SwitchTarget, patched: dict) -> Syntax:
     if target.config_format == _CONFIG_FORMAT_CODEX and target.entry_key:
         snippet = toml.dumps({_server_block_key(target.config_format): {target.entry_key: masked}})
         return Syntax(snippet, "toml")
+    if target.config_format == _CONFIG_FORMAT_YAML and target.entry_key:
+        snippet = yaml.dump(
+            {_server_block_key(target.config_format): {target.entry_key: masked}},
+            default_flow_style=False,
+            sort_keys=False,
+        )
+        return Syntax(snippet, "yaml")
     return Syntax(json.dumps(masked, indent=2), "json")
 
 

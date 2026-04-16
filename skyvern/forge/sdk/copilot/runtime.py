@@ -50,6 +50,18 @@ class AgentContext:
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
 
+    # Cross-turn agent state accumulated by tools.py as the agent runs.
+    # Read back by failure_tracking / loop_detection to detect stuck loops,
+    # preserve verified prefixes across partial runs, etc. All optional —
+    # downstream accessors use ``getattr(ctx, name, default)`` where
+    # tolerant-to-unset is the right default.
+    last_requested_block_labels: list[str] = field(default_factory=list)
+    last_executed_block_labels: list[str] = field(default_factory=list)
+    last_frontier_start_label: str | None = None
+    pending_action_sequence_fingerprint: str | None = None
+    verified_block_outputs: dict[str, Any] = field(default_factory=dict)
+    verified_prefix_labels: list[str] = field(default_factory=list)
+
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     """Convert an MCP result dict to the copilot {ok, data, error} format."""

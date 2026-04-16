@@ -1077,6 +1077,13 @@ class WorkflowService:
                 name=f"browser_session_renewal_{workflow_run_id}",
             )
 
+        # Captured inside the try and consumed in the outer finally so status
+        # finalization runs even when the body is cancelled or raises. Stays
+        # None if we were cancelled before the block-execution step completed;
+        # in that case there's no terminal-state intent to restore.
+        pre_finally_status: WorkflowRunStatus | None = None
+        pre_finally_failure_reason: str | None = None
+
         try:
             # Check if there's a related workflow script that should be used instead
             workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
@@ -1205,14 +1212,37 @@ class WorkflowService:
                     organization=organization,
                     browser_session_id=browser_session_id,
                 )
-
-            workflow_run = await self._finalize_workflow_run_status(
-                workflow_run_id=workflow_run_id,
-                workflow_run=workflow_run,
-                pre_finally_status=pre_finally_status,
-                pre_finally_failure_reason=pre_finally_failure_reason,
-            )
         finally:
+            # Shielded finalize runs even when the try body was cancelled
+            # mid-flight (e.g. the copilot tool's orphan-task cancel path, or
+            # any outer caller that cancels execute_workflow). Without this,
+            # cancellation between the temporary ``running`` write above and
+            # the original finalize call leaked ``running``/``canceled`` rows
+            # in place of the real terminal reason. When pre_finally_status is
+            # still ``None`` (cancellation landed before block execution
+            # completed), there's no captured intent to restore and we skip.
+            if pre_finally_status is not None:
+                try:
+                    workflow_run = await asyncio.shield(
+                        self._finalize_workflow_run_status(
+                            workflow_run_id=workflow_run_id,
+                            workflow_run=workflow_run,
+                            pre_finally_status=pre_finally_status,
+                            pre_finally_failure_reason=pre_finally_failure_reason,
+                        )
+                    )
+                except BaseException:
+                    # Catch BaseException (not Exception) so a second
+                    # ``CancelledError`` arriving during the shielded await —
+                    # plausible when the copilot's detached cancellation
+                    # fallback re-cancels ``run_task`` — does not escape this
+                    # block and skip ``clean_up_workflow`` below.
+                    LOG.warning(
+                        "Finalize failed during execute_workflow cleanup",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+
             if renewal_task is not None and not renewal_task.done():
                 renewal_task.cancel()
                 try:
