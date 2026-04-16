@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     _canonical_block_config,
     compute_action_sequence_fingerprint,
@@ -663,7 +664,7 @@ def _seed_for_frontier(
 
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
-    ctx: AgentContext,
+    ctx: CopilotContext,
     *,
     labels_to_execute: list[str] | None = None,
     block_outputs_to_seed: dict[str, Any] | None = None,

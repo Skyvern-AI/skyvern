@@ -25,7 +25,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.agent import CopilotContext
+    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 
 _FAILURE_REASON_MAX_CHARS = 200

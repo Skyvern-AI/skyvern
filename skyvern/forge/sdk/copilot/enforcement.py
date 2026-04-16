@@ -6,13 +6,10 @@ import copy
 import json
 import re
 import time
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from agents import RunConfig
 from agents.run import Runner
-from agents.run_config import CallModelData, ModelInputData
 
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -66,6 +63,10 @@ KEEP_RECENT_TOOL_OUTPUTS = 3
 _RECENT_TOOL_OUTPUT_CHAR_CAP = 2000
 _TOOL_OUTPUT_SUMMARIZE_THRESHOLD = 300
 _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
+# Head-truncation marker for the recent tool-output window. Kept on a
+# module-level constant so session_factory can import the same string and
+# the two paths stay in sync if the wording ever changes.
+_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX = "\n... [truncated]"
 
 POST_UPDATE_NUDGE = (
     "You updated the workflow but did not test it. "
@@ -640,7 +641,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
             if isinstance(output, str):
                 if i in recent_fco_set:
                     new_output = (
-                        output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + "\n... [truncated]"
+                        output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
                         if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP
                         else output
                     )
@@ -834,30 +835,6 @@ class _SendTrackingStream:
         await self._inner.close()
 
 
-async def _session_pruning_filter(data: CallModelData[Any]) -> ModelInputData:
-    """call_model_input_filter hook: applies _prune_input_list to the input the
-    Agents SDK materializes from session history on every model call. Keeps
-    session-backed runs under the context budget."""
-    model_data = data.model_data
-    pruned = _prune_input_list(list(model_data.input))
-    return ModelInputData(input=pruned, instructions=model_data.instructions)
-
-
-def _build_run_config(existing: RunConfig | None) -> RunConfig:
-    """Return a RunConfig that carries the session pruning filter, merging with
-    any RunConfig a caller already provided. If the caller already set their
-    own ``call_model_input_filter``, respect it.
-
-    Never mutates the caller's RunConfig — a shared default passed in from
-    elsewhere would otherwise leak filter state across unrelated runs.
-    """
-    if existing is None:
-        return RunConfig(call_model_input_filter=_session_pruning_filter)
-    if existing.call_model_input_filter is not None:
-        return existing
-    return replace(existing, call_model_input_filter=_session_pruning_filter)
-
-
 async def run_with_enforcement(
     agent: Agent,
     initial_input: str | list,
@@ -870,7 +847,6 @@ async def run_with_enforcement(
     from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
 
     session = runner_kwargs.pop("session", None)
-    runner_kwargs["run_config"] = _build_run_config(runner_kwargs.get("run_config"))
     current_input: str | list = initial_input
     start_time = time.monotonic()
     iteration = 0
