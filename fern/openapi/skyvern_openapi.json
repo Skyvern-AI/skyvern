@@ -5435,6 +5435,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -7665,7 +7670,7 @@
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
           },
           "extensions": {
             "anyOf": [
@@ -8864,6 +8869,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": false
           }
         },
         "type": "object",
@@ -9296,6 +9306,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -11373,6 +11388,11 @@
             ],
             "title": "Download Timeout"
           },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
+          },
           "instructions": {
             "type": "string",
             "title": "Instructions",
@@ -12046,6 +12066,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -12785,6 +12810,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -14048,6 +14078,7 @@
           "RESIDENTIAL_NL",
           "RESIDENTIAL_PH",
           "RESIDENTIAL_KR",
+          "RESIDENTIAL_SA",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -15294,6 +15325,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -15687,7 +15723,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -16850,6 +16886,17 @@
             ],
             "title": "Thought Cost"
           },
+          "last_llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Llm Model"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -17438,6 +17485,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -17855,6 +17907,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -18848,6 +18905,20 @@
               }
             ],
             "title": "Finally Block Label"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           }
         },
         "type": "object",
@@ -19036,6 +19107,20 @@
               }
             ],
             "title": "Finally Block Label"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           }
         },
         "type": "object",
@@ -19860,6 +19945,11 @@
             "title": "Include Action History In Verification",
             "default": false
           },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
+          },
           "duration": {
             "anyOf": [
               {
@@ -20096,7 +20186,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
