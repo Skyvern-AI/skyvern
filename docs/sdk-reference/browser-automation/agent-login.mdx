@@ -5,6 +5,23 @@ slug: sdk-reference/browser-automation/agent-login
 
 Run a login workflow in the context of the current page. Supports multiple credential providers.
 
+<CodeGroup>
+```python Python
+from skyvern.schemas.run_blocks import CredentialType
+
+await page.agent.login(
+    credential_type=CredentialType.skyvern,
+    credential_id="cred_123",
+)
+```
+
+```typescript TypeScript
+await page.agent.login("skyvern", {
+  credentialId: "cred_123",
+});
+```
+</CodeGroup>
+
 ## Parameters
 
 | Parameter (Python) | Parameter (TS) | Type | Required | Default | Description |
@@ -28,12 +45,6 @@ Provider-specific parameters (`bitwarden_item_id`, `onepassword_vault_id`, etc.)
 <CodeGroup>
 ```python Python
 from skyvern.schemas.run_blocks import CredentialType
-
-# Skyvern credentials
-await page.agent.login(
-    credential_type=CredentialType.skyvern,
-    credential_id="cred_123",
-)
 
 # Bitwarden
 await page.agent.login(
@@ -59,11 +70,6 @@ await page.agent.login(
 ```
 
 ```typescript TypeScript
-// Skyvern credentials
-await page.agent.login("skyvern", {
-  credentialId: "cred_123",
-});
-
 // Bitwarden
 await page.agent.login("bitwarden", {
   bitwardenItemId: "item_id",
