@@ -82,15 +82,45 @@ def compute_failure_signature(
 
 
 def _canonical_block_config(block: Any) -> dict[str, Any]:
+    """Stable dict view of a block's material config, with fields that don't
+    affect downstream behavior (``output_parameter``) dropped.
+    """
     dump = getattr(block, "model_dump", None)
     if callable(dump):
         try:
-            return dump(mode="json", exclude_none=True)
+            cfg = dump(mode="json", exclude_none=True)
         except TypeError:
-            return dump()
-    if isinstance(block, dict):
-        return block
-    return {"repr": repr(block)}
+            cfg = dump()
+    elif isinstance(block, dict):
+        cfg = dict(block)
+    else:
+        return {"repr": repr(block)}
+    cfg.pop("output_parameter", None)
+    return cfg
+
+
+def compute_action_sequence_fingerprint(results: list[dict[str, Any]]) -> str | None:
+    """Hash the ordered ``(action_type, element_id)`` pairs across every
+    block's ``action_trace`` in ``results``. Returns ``None`` when the trace is
+    empty (e.g. fully-successful run where ``_attach_action_traces`` did not
+    attach anything). Stable across runs: a form-fill→click→re-fill loop that
+    retargets the same elements will produce the same fingerprint.
+    """
+    pairs: list[str] = []
+    for entry in results:
+        trace = entry.get("action_trace")
+        if not isinstance(trace, list):
+            continue
+        for action in trace:
+            if not isinstance(action, dict):
+                continue
+            action_type = action.get("action") or ""
+            element = action.get("element") or ""
+            pairs.append(f"{action_type}\x1f{element}")
+    if not pairs:
+        return None
+    payload = "\x1e".join(pairs).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def compute_frontier_fingerprint(
@@ -118,9 +148,7 @@ def compute_frontier_fingerprint(
         if block is None:
             payload.append({"label": label, "missing": True})
             continue
-        config = _canonical_block_config(block)
-        config.pop("output_parameter", None)
-        payload.append({"label": label, "config": config})
+        payload.append({"label": label, "config": _canonical_block_config(block)})
     try:
         serialized = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
     except (TypeError, ValueError):
