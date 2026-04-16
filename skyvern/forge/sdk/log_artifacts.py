@@ -31,7 +31,16 @@ async def save_step_logs(step_id: str) -> None:
     if not settings.ENABLE_LOG_ARTIFACTS:
         return
 
-    context = skyvern_context.ensure_context()
+    # The in-memory log buffer lives on the current skyvern_context. If we're
+    # invoked from a code path without one (e.g. a Temporal cleanup activity),
+    # there's nothing to flush — degrade to a no-op instead of crashing. Kept
+    # at debug because Temporal cleanup is a known routine no-context caller;
+    # bumping it higher produces steady-state noise.
+    context = skyvern_context.current()
+    if context is None:
+        LOG.debug("No skyvern context available, skipping step log save", step_id=step_id)
+        return
+
     log = context.log
     organization_id = context.organization_id
 
@@ -50,7 +59,11 @@ async def save_task_logs(task_id: str) -> None:
     if not settings.ENABLE_LOG_ARTIFACTS:
         return
 
-    context = skyvern_context.ensure_context()
+    context = skyvern_context.current()
+    if context is None:
+        LOG.debug("No skyvern context available, skipping task log save", task_id=task_id)
+        return
+
     log = context.log
     organization_id = context.organization_id
 
@@ -69,7 +82,20 @@ async def save_workflow_run_logs(workflow_run_id: str) -> None:
     if not settings.ENABLE_LOG_ARTIFACTS:
         return
 
-    context = skyvern_context.ensure_context()
+    # This function is called from ``update_workflow_run`` in the DB layer, which
+    # can be invoked from cleanup paths that don't carry a skyvern_context (e.g.
+    # the Temporal timeout activity). The in-memory log buffer lives on the
+    # context, so without one there's nothing to flush — degrade to a no-op
+    # instead of crashing the surrounding DB update. Kept at debug because
+    # Temporal cleanup is a known routine caller; warning would be steady noise.
+    context = skyvern_context.current()
+    if context is None:
+        LOG.debug(
+            "No skyvern context available, skipping workflow run log save",
+            workflow_run_id=workflow_run_id,
+        )
+        return
+
     log = context.log
     organization_id = context.organization_id
 
@@ -88,7 +114,14 @@ async def save_workflow_run_block_logs(workflow_run_block_id: str) -> None:
     if not settings.ENABLE_LOG_ARTIFACTS:
         return
 
-    context = skyvern_context.ensure_context()
+    context = skyvern_context.current()
+    if context is None:
+        LOG.debug(
+            "No skyvern context available, skipping workflow run block log save",
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        return
+
     log = context.log
     organization_id = context.organization_id
     current_workflow_run_block_log = [
