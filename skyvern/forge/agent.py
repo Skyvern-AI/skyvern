@@ -5113,7 +5113,6 @@ class ForgeAgent:
         summary_kwargs: dict[str, Any] = {
             "data_extraction_goal": task.data_extraction_goal,
             "data_extraction_schema": capped_schema,
-            "current_url": scraped_page.url,
             "local_datetime": local_datetime_str,
         }
         prompt = prompt_engine.load_prompt("data-extraction-summary", **summary_kwargs)
@@ -5124,25 +5123,27 @@ class ForgeAgent:
             kwargs=summary_kwargs,
         )
 
-        # Cache the summary LLM call — the inputs (goal, schema, URL) are
-        # identical across download-loop iterations that revisit the same page.
-        # The `try` is narrowed to just compute_cache_key + lookup so a
-        # downstream log failure can't double-count as a lookup_error.
+        # Cache the summary LLM call — the inputs (goal, schema) are identical
+        # across loop iterations that share an extraction configuration, even
+        # when each iteration navigates to a different URL. The `try` is
+        # narrowed to just compute_cache_key + lookup so a downstream log
+        # failure can't double-count as a lookup_error.
         workflow_run_id = context.workflow_run_id if context else None
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
-            # data-extraction-summary is goal-agnostic: only goal/schema/URL/datetime
-            # affect the rendered prompt, so everything else is intentionally omitted.
-            # Hash the post-ceiling value for `data_extraction_schema` — when the
-            # rendered prompt exceeds PROMPT_HARD_CEILING_TOKENS the ceiling drops
-            # that field to None, so two oversized-schema requests that both get
-            # dropped produce an identical LLM prompt and must share a cache key.
+            # data-extraction-summary plans *what* will be extracted from
+            # goal + schema; only those inputs, plus the date (via datetime),
+            # affect the rendered prompt, so everything else is intentionally
+            # omitted. Hash the post-ceiling value for `data_extraction_schema`
+            # — when the rendered prompt exceeds PROMPT_HARD_CEILING_TOKENS the
+            # ceiling drops that field to None, so two oversized-schema requests
+            # that both get dropped produce an identical LLM prompt and must
+            # share a cache key.
             cache_key = extraction_cache.compute_cache_key(
                 call_path="agent",
                 data_extraction_goal=task.data_extraction_goal,
                 extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
-                current_url=scraped_page.url,
                 local_datetime=local_datetime_str,
                 llm_key=None,
             )

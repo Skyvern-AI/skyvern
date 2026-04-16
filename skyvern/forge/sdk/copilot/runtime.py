@@ -50,6 +50,45 @@ class AgentContext:
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
 
+    # Cross-turn agent state accumulated by tools.py as the agent runs.
+    # Read back by failure_tracking / loop_detection to detect stuck loops,
+    # preserve verified prefixes across partial runs, etc. All optional —
+    # downstream accessors use ``getattr(ctx, name, default)`` where
+    # tolerant-to-unset is the right default.
+    last_requested_block_labels: list[str] = field(default_factory=list)
+    last_executed_block_labels: list[str] = field(default_factory=list)
+    last_frontier_start_label: str | None = None
+    pending_action_sequence_fingerprint: str | None = None
+    verified_block_outputs: dict[str, Any] = field(default_factory=dict)
+    verified_prefix_labels: list[str] = field(default_factory=list)
+
+    # Enforcement state. Set lazily by streaming_adapter, tools, and
+    # failure_tracking; declared here so _check_enforcement can read them on a
+    # fresh context without AttributeError.
+    navigate_called: bool = False
+    observation_after_navigate: bool = False
+    navigate_enforcement_done: bool = False
+    update_workflow_called: bool = False
+    test_after_update_done: bool = False
+    post_update_nudge_count: int = 0
+    coverage_nudge_count: int = 0
+    format_nudge_count: int = 0
+    failed_test_nudge_count: int = 0
+    explore_without_workflow_nudge_count: int = 0
+    null_data_streak_count: int = 0
+    last_test_ok: bool | None = None
+    last_test_suspicious_success: bool = False
+    last_test_anti_bot: str | None = None
+    last_test_failure_reason: str | None = None
+    last_failure_category_top: str | None = None
+    last_update_block_count: int | None = None
+    last_failed_workflow_yaml: str | None = None
+    repeated_failure_streak_count: int = 0
+    repeated_failure_nudge_emitted_at_streak: int = 0
+    workflow_persisted: bool = False
+    last_workflow: Any | None = None
+    last_workflow_yaml: str | None = None
+
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     """Convert an MCP result dict to the copilot {ok, data, error} format."""

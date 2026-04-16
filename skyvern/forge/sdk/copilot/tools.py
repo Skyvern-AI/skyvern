@@ -1,0 +1,1753 @@
+"""Copilot agent tools — native handlers, hooks, and registration."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import re
+from collections import defaultdict
+from typing import Any
+
+import structlog
+import yaml
+from agents import function_tool
+from agents.run_context import RunContextWrapper
+from pydantic import ValidationError
+
+from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    _canonical_block_config,
+    compute_action_sequence_fingerprint,
+    update_repeated_failure_state,
+)
+from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
+from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.output_utils import (
+    sanitize_tool_result_for_llm,
+    truncate_output,
+)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunStatus
+
+LOG = structlog.get_logger()
+
+_FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        WorkflowRunStatus.failed.value,
+        WorkflowRunStatus.terminated.value,
+        WorkflowRunStatus.canceled.value,
+        WorkflowRunStatus.timed_out.value,
+    }
+)
+_DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
+RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS = 180
+
+# Detached cleanup tasks held here so the garbage collector does not drop them
+# while they still have work to do, and so the "task exception was never
+# retrieved" warning cannot fire — each task adds a done-callback that logs
+# exceptions and removes itself from this set.
+_DETACHED_CLEANUP_TASKS: set[asyncio.Task] = set()
+
+
+async def _cancel_run_task_if_not_final(
+    run_task: asyncio.Task,
+    workflow_run_id: str,
+) -> None:
+    """Cancel ``run_task`` and reconcile the workflow run row to a terminal
+    state.
+
+    ``run_task.cancel()`` is synchronous — it just flips the cancel flag. We
+    then wait briefly for ``execute_workflow``'s outer ``finally`` to drain
+    its shielded ``_finalize_workflow_run_status`` call, which restores the
+    real terminal status (``failed``/``terminated``/``timed_out``) even when
+    we cancel mid-flight. After that we issue a conditional DB cancel that
+    is a no-op when the row is already terminal — so a run whose finally
+    block produced a proper terminal status keeps it, and a run that truly
+    never finalized (e.g. cancel landed before block execution captured a
+    ``pre_finally_status``) lands as ``canceled``. All awaits are
+    exception-contained so teardown of the enclosing tool task doesn't
+    surface a secondary error over the original cancellation.
+    """
+    run_task.cancel()
+    try:
+        # Shield run_task so OUR wait timeout does not send another cancel
+        # through to it — the cancel we want is already pending.
+        await asyncio.wait_for(asyncio.shield(run_task), timeout=5.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    except Exception:
+        LOG.warning(
+            "Run task raised during cancellation grace window",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+    try:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
+            workflow_run_id=workflow_run_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Conditional cancel write failed",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+
+
+def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
+    exc = task.exception() if task.done() and not task.cancelled() else None
+    if exc is not None:
+        LOG.warning("Detached cancel fallback failed", exc_info=exc)
+
+
+# Streak threshold at which the copilot hard-aborts a tool call because the
+# same action sequence has repeated run-over-run with no intervening success.
+# The streak counter is incremented in ``update_repeated_failure_state`` AFTER
+# each run, so the abort fires when the 4th consecutive run against the same
+# action fingerprint enters ``_tool_loop_error`` (streak == 3 at entry, one
+# per each of the three preceding identical runs). Calibration note: the
+# repeated-frontier streak in failure_tracking.py uses STOP_AT=3 for the same
+# shape of escalation.
+REPEATED_ACTION_STREAK_ABORT_AT = 3
+
+
+def _is_meaningful_extracted_data(extracted: Any) -> bool:
+    """Return True when extracted data contains at least one non-null, non-empty value.
+
+    A dict like ``{"price": None}`` is technically present but carries no signal —
+    treat it the same as no output at all so enforcement can nudge the agent to
+    investigate instead of declaring success.
+    """
+    if extracted is None:
+        return False
+    if isinstance(extracted, (str, bytes)):
+        return bool(extracted)
+    if isinstance(extracted, dict):
+        return any(_is_meaningful_extracted_data(v) for v in extracted.values())
+    if isinstance(extracted, (list, tuple, set)):
+        return any(_is_meaningful_extracted_data(v) for v in extracted)
+    # Numbers, booleans, and other scalars count as meaningful output.
+    return True
+
+
+async def _attach_action_traces(
+    blocks: list,
+    results: list[dict[str, Any]],
+    organization_id: str,
+) -> None:
+    """For non-success blocks with a task_id, fetch and attach a compact action trace."""
+    failed_task_ids = [
+        b.task_id for b, r in zip(blocks, results) if b.task_id and r.get("status") in _FAILED_BLOCK_STATUSES
+    ]
+    if not failed_task_ids:
+        return
+
+    rows = await app.DATABASE.tasks.get_recent_actions_for_tasks(
+        task_ids=failed_task_ids,
+        organization_id=organization_id,
+    )
+
+    actions_by_task: dict[str, list] = defaultdict(list)
+    for row in rows:
+        if row.task_id is not None:
+            actions_by_task[row.task_id].append(row)
+
+    for block, block_result in zip(blocks, results):
+        if block_result.get("status") not in _FAILED_BLOCK_STATUSES or not block.task_id:
+            continue
+        task_actions = actions_by_task.get(block.task_id, [])
+        block_result["action_trace"] = [
+            {
+                "action": a.action_type,
+                "status": a.status,
+                "reasoning": a.reasoning[:150] if a.reasoning else None,
+                "element": a.element_id,
+            }
+            for a in task_actions
+        ]
+
+
+async def _fetch_last_screenshot_b64(task_id: str, organization_id: str) -> str | None:
+    try:
+        artifacts = await app.DATABASE.artifacts.get_artifacts_for_task_v2(
+            task_v2_id=task_id,
+            organization_id=organization_id,
+            artifact_types=[ArtifactType.SCREENSHOT_LLM],
+        )
+        if not artifacts:
+            return None
+        # The last artifact is the one captured closest to the failure.
+        artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifacts[-1])
+        if not artifact_bytes:
+            return None
+        return base64.b64encode(artifact_bytes).decode("utf-8")
+    except Exception:
+        LOG.debug("Failed to fetch screenshot for failed block", task_id=task_id, exc_info=True)
+        return None
+
+
+async def _attach_failed_block_screenshots(
+    blocks: list,
+    results: list[dict[str, Any]],
+    organization_id: str,
+) -> None:
+    """For failed blocks with a task_id, fetch the last SCREENSHOT_LLM artifact."""
+    task_id_to_block: dict[str, dict] = {
+        block.task_id: block_result
+        for block, block_result in zip(blocks, results)
+        if block.task_id and block_result.get("status") in _FAILED_BLOCK_STATUSES
+    }
+    if not task_id_to_block:
+        return
+
+    task_ids = list(task_id_to_block.keys())
+    screenshots = await asyncio.gather(
+        *(_fetch_last_screenshot_b64(task_id, organization_id) for task_id in task_ids),
+    )
+    for task_id, b64 in zip(task_ids, screenshots):
+        if b64 is not None:
+            task_id_to_block[task_id]["screenshot_b64"] = b64
+
+
+_BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+
+
+def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
+    tracker = getattr(ctx, "consecutive_tool_tracker", None)
+    if isinstance(tracker, list):
+        detected = detect_tool_loop(tracker, tool_name)
+        if detected is not None:
+            return detected
+
+    # Hard-abort when the agent has re-fired the same action sequence against
+    # the page N times without intervening success. This is the signal that
+    # the form is blocked (captcha / anti-bot / error banner the agent isn't
+    # detecting) and further attempts will just burn the tool timeout. Scoped
+    # to block-running tools so planning/metadata tools (update_workflow,
+    # list_credentials, get_run_results) stay unaffected.
+    if tool_name in _BLOCK_RUNNING_TOOLS:
+        streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
+        streak = streak_raw if isinstance(streak_raw, int) else 0
+        if streak >= REPEATED_ACTION_STREAK_ABORT_AT:
+            return (
+                f"Repeated-action abort: the last {streak} runs fired the same "
+                "action sequence against the page without making progress. "
+                "The site is likely blocked by a captcha, popup, anti-bot "
+                "challenge, or hidden validation error that the agent is not "
+                "detecting. Do NOT retry this tool — conclude the workflow is "
+                "not automatable as-is and report back to the user."
+            )
+    return None
+
+
+_PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
+    WorkflowParameterType.STRING: "",
+    WorkflowParameterType.INTEGER: 0,
+    WorkflowParameterType.FLOAT: 0.0,
+    WorkflowParameterType.BOOLEAN: False,
+    WorkflowParameterType.JSON: {},
+    WorkflowParameterType.FILE_URL: "",
+}
+
+
+def _placeholder_for_parameter_type(param_type: WorkflowParameterType) -> Any:
+    return _PARAMETER_TYPE_PLACEHOLDERS.get(param_type)
+
+
+def _parameter_binding_invariant_error(
+    workflow: Workflow,
+    persisted_workflow_params: list[WorkflowParameter],
+    persisted_output_params: list[OutputParameter],
+) -> tuple[str, dict[str, list[str]], dict[str, list[str]]] | None:
+    """Return a ``(summary, missing_persisted, missing_from_definition)`` tuple
+    when ``workflow.workflow_definition`` disagrees with persisted
+    definition-parameter rows for runtime-relevant classes. Returns ``None``
+    when aligned.
+
+    Compares ``WorkflowParameter`` rows by ``(key, workflow_parameter_type)``
+    and ``OutputParameter`` rows by ``key``. Secret/credential and context
+    parameters are intentionally out of scope — runtime reads those from the
+    definition JSON.
+    """
+    definition = getattr(workflow, "workflow_definition", None)
+    parameters = getattr(definition, "parameters", None) if definition else None
+    parameters = list(parameters) if parameters else []
+
+    def_workflow_ids: set[tuple[str, str]] = set()
+    def_output_keys: set[str] = set()
+    for parameter in parameters:
+        if isinstance(parameter, WorkflowParameter):
+            def_workflow_ids.add((parameter.key, parameter.workflow_parameter_type.value))
+        elif isinstance(parameter, OutputParameter):
+            def_output_keys.add(parameter.key)
+
+    persisted_workflow_ids: set[tuple[str, str]] = {
+        (wp.key, wp.workflow_parameter_type.value) for wp in persisted_workflow_params
+    }
+    persisted_output_keys: set[str] = {op.key for op in persisted_output_params}
+
+    missing_persisted_workflow = sorted(
+        f"{key} ({ptype})" for (key, ptype) in def_workflow_ids - persisted_workflow_ids
+    )
+    extra_persisted_workflow = sorted(f"{key} ({ptype})" for (key, ptype) in persisted_workflow_ids - def_workflow_ids)
+    missing_persisted_output = sorted(def_output_keys - persisted_output_keys)
+    extra_persisted_output = sorted(persisted_output_keys - def_output_keys)
+
+    if (
+        not missing_persisted_workflow
+        and not extra_persisted_workflow
+        and not missing_persisted_output
+        and not extra_persisted_output
+    ):
+        return None
+
+    summary = (
+        "Pre-run invariant: workflow_definition and persisted parameter rows disagree. "
+        f"workflow missing persisted: {missing_persisted_workflow or '[]'}; "
+        f"workflow missing from definition: {extra_persisted_workflow or '[]'}; "
+        f"output missing persisted: {missing_persisted_output or '[]'}; "
+        f"output missing from definition: {extra_persisted_output or '[]'}"
+    )
+    return (
+        summary,
+        {"workflow": missing_persisted_workflow, "output": missing_persisted_output},
+        {"workflow": extra_persisted_workflow, "output": extra_persisted_output},
+    )
+
+
+async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+    workflow_yaml = params["workflow_yaml"]
+    try:
+        workflow = _process_workflow_yaml(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+            workflow_yaml=workflow_yaml,
+        )
+        await app.WORKFLOW_SERVICE.update_workflow_definition(
+            workflow_id=ctx.workflow_id,
+            organization_id=ctx.organization_id,
+            title=workflow.title,
+            description=workflow.description,
+            workflow_definition=workflow.workflow_definition,
+            proxy_location=workflow.proxy_location,
+            webhook_callback_url=workflow.webhook_callback_url,
+            persist_browser_session=workflow.persist_browser_session,
+            model=workflow.model,
+            max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
+            extra_http_headers=workflow.extra_http_headers,
+            run_with=workflow.run_with,
+            ai_fallback=workflow.ai_fallback,
+            cache_key=workflow.cache_key,
+            run_sequentially=workflow.run_sequentially,
+            sequential_key=workflow.sequential_key,
+        )
+        ctx.workflow_yaml = workflow_yaml
+        return {
+            "ok": True,
+            "data": {
+                "message": "Workflow updated successfully.",
+                "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
+            },
+            "_workflow": workflow,
+        }
+    except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
+        return {
+            "ok": False,
+            "error": f"Workflow validation failed: {e}",
+        }
+
+
+async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+    page = params.get("page", 1)
+    page_size = min(params.get("page_size", 10), 50)
+    credentials = await app.DATABASE.credentials.get_credentials(
+        organization_id=ctx.organization_id,
+        page=page,
+        page_size=page_size,
+    )
+    serialized = []
+    for cred in credentials:
+        entry: dict[str, Any] = {
+            "credential_id": cred.credential_id,
+            "name": cred.name,
+            "credential_type": str(cred.credential_type),
+        }
+        if cred.username:
+            entry["username"] = cred.username
+            entry["totp_type"] = str(cred.totp_type) if cred.totp_type else None
+        elif cred.card_last4:
+            entry["card_last_four"] = cred.card_last4
+            entry["card_brand"] = cred.card_brand
+        elif cred.secret_label:
+            entry["secret_label"] = cred.secret_label
+        serialized.append(entry)
+    return {
+        "ok": True,
+        "data": {
+            "credentials": serialized,
+            "page": page,
+            "page_size": page_size,
+            "count": len(serialized),
+            "has_more": len(serialized) == page_size,
+        },
+    }
+
+
+# Block types that establish browser state (loaded page / authenticated
+# session / navigation target). These are valid upstream anchors to walk back
+# to when a downstream edit invalidates part of the chain.
+#
+# We intentionally do NOT maintain a companion "rerunnable from current
+# browser state" set. We have no signal that the persistent browser session
+# is actually anchored at the frontier boundary — after a successful
+# [A, B, C] the browser is at post-C state, not pre-C — so rerunning only
+# an edited block is unsafe even for read-only types. Every edit walks back
+# to an upstream state-establisher, or falls back to the full requested list.
+_BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
+
+_OUTPUT_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)_output\s*[\.}|]")
+
+
+def _block_type_name(block: Any) -> str:
+    """Lowercase string name of a block's type, for both YAML and runtime blocks."""
+    bt = getattr(block, "block_type", None)
+    if bt is None:
+        return ""
+    name = getattr(bt, "value", None) or getattr(bt, "name", None) or str(bt)
+    return str(name).lower()
+
+
+def _blocks_by_label(workflow_definition: Any) -> dict[str, Any]:
+    blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
+    by_label: dict[str, Any] = {}
+    if not blocks:
+        return by_label
+    for block in blocks:
+        label = getattr(block, "label", None)
+        if isinstance(label, str):
+            by_label[label] = block
+    return by_label
+
+
+def _find_invalidated_labels(
+    old_definition: Any,
+    new_definition: Any,
+    requested_labels: list[str],
+) -> set[str]:
+    """Return the set of requested labels whose behavior is invalidated.
+
+    A label is invalidated when its own config changed or when any upstream
+    label in the requested chain was invalidated (downstream trust propagates
+    forward).
+    """
+    old_by_label = _blocks_by_label(old_definition)
+    new_by_label = _blocks_by_label(new_definition)
+    invalidated: set[str] = set()
+    upstream_invalidated = False
+    for label in requested_labels:
+        if upstream_invalidated:
+            invalidated.add(label)
+            continue
+        old_block = old_by_label.get(label)
+        new_block = new_by_label.get(label)
+        if old_block is None or new_block is None:
+            invalidated.add(label)
+            upstream_invalidated = True
+            continue
+        if _canonical_block_config(old_block) != _canonical_block_config(new_block):
+            invalidated.add(label)
+            upstream_invalidated = True
+    return invalidated
+
+
+def _earliest_invalidated(requested_labels: list[str], invalidated: set[str]) -> str | None:
+    for label in requested_labels:
+        if label in invalidated:
+            return label
+    return None
+
+
+def _nearest_upstream_state_establisher(
+    requested_labels: list[str], target_label: str, new_definition: Any
+) -> str | None:
+    by_label = _blocks_by_label(new_definition)
+    try:
+        idx = requested_labels.index(target_label)
+    except ValueError:
+        return None
+    for candidate in reversed(requested_labels[:idx]):
+        block = by_label.get(candidate)
+        if block is None:
+            continue
+        if _block_type_name(block) in _BLOCK_TYPES_STATE_ESTABLISHER:
+            return candidate
+    return None
+
+
+def _referenced_output_labels(frontier_labels: list[str], new_definition: Any) -> set[str]:
+    by_label = _blocks_by_label(new_definition)
+    needed: set[str] = set()
+    for label in frontier_labels:
+        block = by_label.get(label)
+        if block is None:
+            continue
+        try:
+            serialized = json.dumps(_canonical_block_config(block), default=str, separators=(",", ":"))
+        except (TypeError, ValueError):
+            serialized = repr(block)
+        for match in _OUTPUT_REF_RE.findall(serialized):
+            needed.add(match)
+    return needed
+
+
+def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
+    """Compact, stringified summary of action entries for the compact packet."""
+    if not action_trace:
+        return []
+    summary: list[str] = []
+    for entry in action_trace[-6:]:
+        if not isinstance(entry, dict):
+            continue
+        action = entry.get("action") or "?"
+        status = entry.get("status") or ""
+        element = entry.get("element")
+        bits = [str(action)]
+        if element:
+            bits.append(str(element))
+        if status:
+            bits.append(str(status))
+        summary.append(" ".join(bits).strip())
+    return summary
+
+
+async def _get_prior_workflow_definition(ctx: AgentContext) -> Any:
+    """Hybrid: prefer ctx.last_workflow, fall back to DB fetch on cold start."""
+    last_workflow = getattr(ctx, "last_workflow", None)
+    if last_workflow is not None:
+        definition = getattr(last_workflow, "workflow_definition", None)
+        if definition is not None:
+            return definition
+    last_yaml = getattr(ctx, "last_workflow_yaml", None)
+    if last_yaml:
+        try:
+            workflow = _process_workflow_yaml(
+                workflow_id=ctx.workflow_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                organization_id=ctx.organization_id,
+                workflow_yaml=last_yaml,
+            )
+            return workflow.workflow_definition
+        except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException):
+            pass
+    try:
+        fetched = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+        )
+        if fetched is not None:
+            return fetched.workflow_definition
+    except Exception:
+        LOG.debug("Failed to fetch prior workflow definition for frontier diff", exc_info=True)
+    return None
+
+
+def _plan_frontier(
+    ctx: Any,
+    requested_labels: list[str],
+    old_definition: Any,
+    new_definition: Any,
+) -> tuple[list[str], dict[str, Any], str | None]:
+    """Plan the frontier execution.
+
+    Returns ``(labels_to_execute, block_outputs_to_seed, frontier_start_label)``.
+
+    Falls back to the full requested list on any ambiguity. When there is no
+    workflow change (plain run path) the frontier is the first requested label
+    and we seed any verified outputs referenced by the suffix.
+    """
+    if not requested_labels:
+        return requested_labels, {}, None
+    if new_definition is None:
+        return requested_labels, {}, requested_labels[0]
+
+    verified_outputs: dict[str, Any] = dict(getattr(ctx, "verified_block_outputs", {}) or {})
+    verified_prefix: list[str] = list(getattr(ctx, "verified_prefix_labels", []) or [])
+    verified_prefix_set = set(verified_prefix)
+
+    # No old definition (cold start or parse failure) OR no diff signal → plain path.
+    if old_definition is None:
+        frontier = requested_labels[0]
+        return _seed_for_frontier(requested_labels, frontier, verified_outputs, new_definition)
+
+    try:
+        invalidated = _find_invalidated_labels(old_definition, new_definition, requested_labels)
+    except Exception:
+        LOG.debug("Frontier diff failed, falling back to full run", exc_info=True)
+        return requested_labels, {}, requested_labels[0]
+
+    earliest = _earliest_invalidated(requested_labels, invalidated)
+    if earliest is None:
+        # No invalidation at all — unchanged request. Use first requested as frontier.
+        frontier = requested_labels[0]
+        return _seed_for_frontier(requested_labels, frontier, verified_outputs, new_definition)
+
+    # Ensure the prefix before the earliest invalidated label is all in the
+    # verified prefix from a successful prior run. Otherwise we have no
+    # trusted anchor — fall back to the full requested list.
+    prefix_in_requested = [label for label in requested_labels if label != earliest]
+    prefix_in_requested = prefix_in_requested[: requested_labels.index(earliest)]
+    if not all(label in verified_prefix_set for label in prefix_in_requested):
+        return requested_labels, {}, requested_labels[0]
+
+    old_by_label = _blocks_by_label(old_definition)
+    is_append_only = earliest not in old_by_label
+    if is_append_only:
+        # Case A — append-after-success. The earliest invalidated label is a
+        # new block that didn't exist in the prior definition, so the verified
+        # prefix represents the browser state just before it. Start there.
+        return _seed_for_frontier(requested_labels, earliest, verified_outputs, new_definition)
+
+    # Edit-in-place. We lack a browser-anchor signal, so we cannot safely
+    # rerun just the edited block (the browser is at post-prefix state, not
+    # pre-edit state). Walk back to the nearest upstream state-establishing
+    # block within the requested chain. Falls back to the full requested list
+    # if no safe upstream anchor can be identified.
+    anchor = _nearest_upstream_state_establisher(requested_labels, earliest, new_definition)
+    if anchor is None:
+        return requested_labels, {}, requested_labels[0]
+    return _seed_for_frontier(requested_labels, anchor, verified_outputs, new_definition)
+
+
+def _seed_for_frontier(
+    requested_labels: list[str],
+    frontier: str,
+    verified_outputs: dict[str, Any],
+    new_definition: Any,
+) -> tuple[list[str], dict[str, Any], str]:
+    try:
+        idx = requested_labels.index(frontier)
+    except ValueError:
+        return requested_labels, {}, requested_labels[0]
+    labels_to_execute = requested_labels[idx:]
+    prefix_labels = requested_labels[:idx]
+    if not prefix_labels:
+        return labels_to_execute, {}, frontier
+    # Only seed outputs that are actually referenced by the frontier suffix.
+    # Over-seeding would weaken the "seed what downstream needs" discipline
+    # and risks masking bugs where a block references an output that doesn't
+    # flow through the normal {{label_output}} path.
+    needed = _referenced_output_labels(labels_to_execute, new_definition)
+    prefix_needed = [label for label in prefix_labels if label in needed]
+    seed: dict[str, Any] = {}
+    for label in prefix_needed:
+        if label in verified_outputs:
+            seed[label] = verified_outputs[label]
+        else:
+            # A referenced output is missing from the verified cache — we
+            # can't safely seed just the suffix. Fall back to the full list.
+            return requested_labels, {}, requested_labels[0]
+    return labels_to_execute, seed, frontier
+
+
+async def _run_blocks_and_collect_debug(
+    params: dict[str, Any],
+    ctx: AgentContext,
+    *,
+    labels_to_execute: list[str] | None = None,
+    block_outputs_to_seed: dict[str, Any] | None = None,
+    frontier_start_label: str | None = None,
+) -> dict[str, Any]:
+    block_labels = params["block_labels"]
+    if not block_labels:
+        return {"ok": False, "error": "block_labels must not be empty"}
+
+    labels_to_execute = list(labels_to_execute) if labels_to_execute else list(block_labels)
+    block_outputs_to_seed = block_outputs_to_seed or {}
+    if frontier_start_label is None:
+        frontier_start_label = labels_to_execute[0] if labels_to_execute else None
+
+    ctx.last_requested_block_labels = list(block_labels)
+    ctx.last_executed_block_labels = list(labels_to_execute)
+    ctx.last_frontier_start_label = frontier_start_label
+
+    # Verified state is NOT invalidated pre-run. On a failed / partial run we
+    # want the prior verified prefix preserved so the next edit can still use
+    # the optimization. YAML-diff-based invalidation for edited/downstream
+    # labels happens in update_and_run_blocks_tool at edit time, which is the
+    # right moment to drop stale outputs. Full success at the end of this
+    # function updates verified state in place (overwriting re-run labels).
+
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+    )
+    if not workflow:
+        return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
+
+    for label in block_labels:
+        if not workflow.get_output_parameter(label):
+            return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
+
+    from skyvern.forge.sdk.schemas.organizations import Organization
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+    from skyvern.services import workflow_service
+
+    org = await app.DATABASE.organizations.get_organization(organization_id=ctx.organization_id)
+    if not org:
+        return {"ok": False, "error": "Organization not found"}
+
+    organization = Organization.model_validate(org)
+
+    user_params: dict[str, Any] = params.get("parameters") or {}
+    all_workflow_params, all_output_params = await asyncio.gather(
+        app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id),
+        app.DATABASE.workflow_params.get_workflow_output_parameters(workflow_id=workflow.workflow_id),
+    )
+
+    # Short-circuit before a wasted workflow execution when the definition
+    # JSON has drifted from the persisted parameter rows that runtime reads.
+    invariant_error = _parameter_binding_invariant_error(workflow, all_workflow_params, all_output_params)
+    if invariant_error is not None:
+        summary, missing_persisted, missing_from_definition = invariant_error
+        return {
+            "ok": False,
+            "error": summary,
+            "data": {
+                "workflow_run_id": None,
+                "overall_status": "failed",
+                "failure_reason": summary,
+                "requested_block_labels": list(block_labels),
+                "executed_block_labels": [],
+                "frontier_start_label": None,
+                "blocks": [],
+                "failure_categories": [
+                    {
+                        "category": "PARAMETER_BINDING_ERROR",
+                        "confidence_float": 0.99,
+                        "reasoning": "Pre-run invariant: workflow_definition and persisted parameter rows disagree",
+                    }
+                ],
+                "missing_persisted": missing_persisted,
+                "missing_from_definition": missing_from_definition,
+            },
+        }
+
+    data: dict[str, Any] = {}
+    for wp in all_workflow_params:
+        if wp.key in user_params:
+            data[wp.key] = user_params[wp.key]
+        elif wp.default_value is not None:
+            data[wp.key] = wp.default_value
+        else:
+            placeholder = _placeholder_for_parameter_type(wp.workflow_parameter_type)
+            if placeholder is not None:
+                data[wp.key] = placeholder
+                LOG.info(
+                    "Auto-filled missing workflow parameter for copilot test run",
+                    parameter_key=wp.key,
+                    parameter_type=str(wp.workflow_parameter_type),
+                )
+
+    workflow_request = WorkflowRequestBody(
+        data=data if data else None,
+        browser_session_id=ctx.browser_session_id,
+        # Copilot test runs don't need scrolling post-action screenshots;
+        # the ForgeAgent's split screenshots (used for LLM context) are unaffected.
+        max_screenshot_scrolls=0,
+    )
+
+    workflow_run = await workflow_service.prepare_workflow(
+        workflow_id=ctx.workflow_permanent_id,
+        organization=organization,
+        workflow_request=workflow_request,
+        template=False,
+        version=None,
+        max_steps=None,
+        request_id=None,
+    )
+
+    from skyvern.utils.files import initialize_skyvern_state_file
+
+    await initialize_skyvern_state_file(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=ctx.organization_id,
+    )
+
+    run_task = asyncio.create_task(
+        app.WORKFLOW_SERVICE.execute_workflow(
+            workflow_run_id=workflow_run.workflow_run_id,
+            api_key="copilot-agent",
+            organization=organization,
+            browser_session_id=ctx.browser_session_id,
+            block_labels=labels_to_execute,
+            block_outputs=block_outputs_to_seed or None,
+        )
+    )
+
+    # Internal poll budget strictly below the SDK timeout. The OpenAI Agents
+    # SDK wraps this tool in ``asyncio.wait_for(..., timeout=RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS)``
+    # (see openai-agents-python tool.py:invoke_function_tool). If our poll and
+    # the SDK timeout share the same budget, the SDK wins the race, cancels
+    # the tool coroutine, and our orderly cleanup branch below never runs —
+    # leaving ``run_task`` as an orphan that runs to natural completion.
+    # Leaving 10 s headroom ensures the orderly path fires first in the
+    # normal-slow case; the outer ``except asyncio.CancelledError`` covers
+    # the abnormal case where we get cancelled anyway.
+    max_poll = max(1, RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS - 10)
+    poll_interval = 2.0
+    elapsed = 0.0
+    final_status = None
+    run: Any = None
+
+    try:
+        while elapsed < max_poll:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            if run_task.done():
+                run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=ctx.organization_id,
+                )
+                if run and WorkflowRunStatus(run.status).is_final():
+                    final_status = run.status
+                break
+
+            if await ctx.stream.is_disconnected():
+                await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                return {"ok": False, "error": "Client disconnected during block execution."}
+
+            run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=ctx.organization_id,
+            )
+            if run and WorkflowRunStatus(run.status).is_final():
+                final_status = run.status
+                break
+
+        if final_status is None:
+            await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+            timeout_msg = (
+                f"Block execution timed out after {max_poll}s. "
+                f"Run ID: {workflow_run.workflow_run_id}. "
+                f"The task was likely stuck repeating failing actions. "
+                f"Consider: simplifying the navigation_goal, using a more specific URL, "
+                f"adding a dismiss-popup step, or concluding the site is not automatable."
+            )
+            if ctx.browser_session_id:
+                try:
+                    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                        session_id=ctx.browser_session_id,
+                        organization_id=ctx.organization_id,
+                    )
+                    if browser_state:
+                        page = await browser_state.get_or_create_page()
+                        timeout_msg += f" Browser was on: {page.url}"
+                except Exception:
+                    pass
+            return {"ok": False, "error": timeout_msg}
+    except asyncio.CancelledError:
+        # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
+        # the cleanup so the parent cancellation can't interrupt it mid-await.
+        # If the shield itself is cancelled, fall back to a detached task
+        # that outlives tool teardown and still reconciles workflow state.
+        try:
+            await asyncio.shield(_cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id))
+        except asyncio.CancelledError:
+            fallback = asyncio.ensure_future(_cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id))
+            _DETACHED_CLEANUP_TASKS.add(fallback)
+            fallback.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+            fallback.add_done_callback(_log_detached_cleanup_failure)
+        raise
+    finally:
+        # Belt and braces. If any exit path above missed a cancel — e.g. an
+        # unexpected exception bubbling out of the poll loop — make sure the
+        # run_task is at least signaled to cancel so we don't leak it.
+        if not run_task.done():
+            run_task.cancel()
+
+    if run and run.browser_session_id:
+        ctx.browser_session_id = run.browser_session_id
+
+    blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=ctx.organization_id,
+    )
+
+    results = []
+    block_outputs_by_label: dict[str, Any] = {}
+    for block in blocks:
+        block_result: dict[str, Any] = {
+            "label": block.label,
+            "block_type": block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type),
+            "status": block.status,
+        }
+        if block.failure_reason:
+            block_result["failure_reason"] = block.failure_reason
+        if hasattr(block, "output") and block.output:
+            block_result["extracted_data"] = block.output
+            if block.label is not None:
+                block_outputs_by_label[block.label] = block.output
+        results.append(block_result)
+
+    await _attach_action_traces(blocks, results, ctx.organization_id)
+
+    run_ok = WorkflowRunStatus(final_status) == WorkflowRunStatus.completed
+
+    action_trace_summary: list[str] = []
+    first_failed = next(
+        (r for r in results if r.get("status") in _FAILED_BLOCK_STATUSES and r.get("action_trace")),
+        None,
+    )
+    if first_failed is not None:
+        action_trace_summary = _summarize_action_trace(first_failed.get("action_trace"))
+
+    # Compute the action-sequence fingerprint BEFORE we strip action_trace.
+    # Stash it on a pending ctx field so update_repeated_failure_state can
+    # compare the NEW fingerprint against ctx.last_action_sequence_fingerprint
+    # (the PRIOR value) and increment the streak. Never enters the LLM-visible
+    # packet. Drives the repeated-action streak that hard-aborts a stuck
+    # fill→click→re-fill loop in _tool_loop_error.
+    ctx.pending_action_sequence_fingerprint = compute_action_sequence_fingerprint(results)
+
+    # Per-block action_trace is for derivation only — keep it out of the
+    # compact packet. get_run_results remains the heavier inspection path.
+    for entry in results:
+        entry.pop("action_trace", None)
+
+    current_url, page_title = await _fallback_page_info(ctx)
+
+    screenshot_b64: str | None = None
+    if not run_ok and ctx.browser_session_id:
+        try:
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+            if browser_state:
+                page = await browser_state.get_or_create_page()
+                screenshot_bytes = await page.screenshot(type="png")
+                screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception:
+            LOG.debug("Failed to capture post-run screenshot", exc_info=True)
+
+    result_data: dict[str, Any] = {
+        "workflow_run_id": workflow_run.workflow_run_id,
+        "browser_session_id": ctx.browser_session_id,
+        "overall_status": final_status,
+        "requested_block_labels": list(block_labels),
+        "executed_block_labels": list(labels_to_execute),
+        "frontier_start_label": frontier_start_label,
+        "blocks": results,
+        "current_url": current_url,
+        "page_title": page_title,
+        "action_trace_summary": action_trace_summary,
+    }
+    if screenshot_b64 is not None:
+        result_data["screenshot_base64"] = screenshot_b64
+    if not run_ok and run and getattr(run, "failure_reason", None):
+        result_data["failure_reason"] = run.failure_reason
+
+    # Update verified prefix state ONLY on a fully-successful run. A failed
+    # suffix run leaves the browser in post-failure state, so we must not
+    # trust blocks that individually succeeded inside it.
+    if run_ok and all(r.get("status") == "completed" for r in results):
+        for label, output in block_outputs_by_label.items():
+            ctx.verified_block_outputs[label] = output
+        existing_prefix = list(getattr(ctx, "verified_prefix_labels", []) or [])
+        existing_set = set(existing_prefix)
+        for label in labels_to_execute:
+            if label not in existing_set:
+                existing_prefix.append(label)
+                existing_set.add(label)
+        ctx.verified_prefix_labels = existing_prefix
+
+    return {
+        "ok": run_ok,
+        "data": result_data,
+    }
+
+
+async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+    workflow_run_id = params.get("workflow_run_id")
+
+    if not workflow_run_id:
+        # Include every final state so the agent can inspect failures via the
+        # fallback. Non-final states (created/queued/running/paused) remain
+        # excluded — reading block records from an in-flight run is unsafe.
+        runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+            page=1,
+            page_size=1,
+            status=[
+                WorkflowRunStatus.completed,
+                WorkflowRunStatus.failed,
+                WorkflowRunStatus.terminated,
+                WorkflowRunStatus.canceled,
+                WorkflowRunStatus.timed_out,
+            ],
+        )
+        if not runs:
+            return {"ok": False, "error": "No runs found for this workflow."}
+        workflow_run_id = runs[0].workflow_run_id
+
+    run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=ctx.organization_id,
+    )
+    if not run:
+        return {"ok": False, "error": f"Workflow run not found: {workflow_run_id}"}
+
+    blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+        workflow_run_id=workflow_run_id,
+        organization_id=ctx.organization_id,
+    )
+
+    results = []
+    for block in blocks:
+        block_result: dict[str, Any] = {
+            "label": block.label,
+            "block_type": block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type),
+            "status": block.status,
+        }
+        if block.failure_reason:
+            block_result["failure_reason"] = block.failure_reason
+        output = truncate_output(getattr(block, "output", None))
+        if output:
+            block_result["output"] = output
+        results.append(block_result)
+
+    await _attach_action_traces(blocks, results, ctx.organization_id)
+    await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
+
+    result_data: dict[str, Any] = {
+        "workflow_run_id": workflow_run_id,
+        "overall_status": run.status,
+        "blocks": results,
+    }
+    if getattr(run, "failure_reason", None):
+        result_data["failure_reason"] = run.failure_reason
+
+    return {
+        "ok": True,
+        "data": result_data,
+    }
+
+
+async def _fallback_page_info(ctx: AgentContext) -> tuple[str, str]:
+    if not ctx.browser_session_id:
+        return "", ""
+    try:
+        from skyvern.cli.core.session_manager import get_page
+
+        page, _ = await get_page(session_id=ctx.browser_session_id)
+        if page:
+            return page.url, await page.title()
+    except Exception:
+        pass
+    return "", ""
+
+
+async def _resolve_url_title(raw: dict[str, Any], ctx: AgentContext) -> tuple[str, str]:
+    """Extract URL and title from raw MCP result, falling back to live page info."""
+    browser_ctx = raw.get("browser_context", {})
+    url = browser_ctx.get("url", "")
+    title = browser_ctx.get("title", "")
+    if not url:
+        url, fallback_title = await _fallback_page_info(ctx)
+        if fallback_title:
+            title = fallback_title
+    return url, title
+
+
+async def _evaluate_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    expr = params.get("expression", "").lower()
+    if ".click()" in expr or ".click(" in expr:
+        return {
+            "ok": False,
+            "error": "Do not use evaluate to click elements. Use the 'click' tool with a CSS selector instead.",
+        }
+    return None
+
+
+_JQUERY_SELECTOR_RE = re.compile(
+    r":(?:contains|eq|first|last|gt|lt|nth|has|visible|hidden|checked)\s*\(", re.IGNORECASE
+)
+
+
+async def _click_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    selector = params.get("selector", "")
+    if not selector:
+        return None
+    if _JQUERY_SELECTOR_RE.search(selector):
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid selector: {selector!r}. "
+                "jQuery pseudo-selectors like :contains(), :eq(), :first, :visible are NOT valid CSS. "
+                "Use standard CSS selectors instead. Examples: "
+                "nth-of-type() instead of :eq(), "
+                "[data-attr] or tag.class for filtering, "
+                "or use the 'evaluate' tool with JS: "
+                "document.querySelectorAll('button').forEach("
+                "b => {{ if (b.textContent.includes('Download')) b.click() }})"
+            ),
+        }
+    return None
+
+
+async def _navigate_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok"):
+        data = result.pop("data", {})
+        result["url"] = data.get("url", "")
+        result["next_step"] = (
+            "Page loaded. You MUST now use evaluate, "
+            "get_browser_screenshot, or click to inspect page content "
+            "before responding."
+        )
+    return result
+
+
+async def _screenshot_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        data = result["data"]
+        url, title = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "screenshot_base64": data.get("data", ""),
+            "url": url,
+            "title": title,
+        }
+    return result
+
+
+async def _click_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        data = result["data"]
+        url, title = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "selector": data.get("selector", ""),
+            "url": url,
+            "title": title,
+        }
+    return result
+
+
+async def _type_text_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        data = result["data"]
+        url, _ = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "selector": data.get("selector", ""),
+            "typed_length": data.get("text_length", 0),
+            "url": url,
+        }
+    return result
+
+
+async def _evaluate_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        result["data"].pop("sdk_equivalent", None)
+        if "url" not in result["data"]:
+            url, _ = await _resolve_url_title(raw, ctx)
+            if url:
+                result["data"]["url"] = url
+    return result
+
+
+async def _scroll_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        data = result["data"]
+        url, _ = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "direction": data.get("direction", ""),
+            "amount": data.get("pixels") or data.get("amount"),
+            "url": url,
+        }
+    return result
+
+
+async def _select_option_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        data = result["data"]
+        url, _ = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "selector": data.get("selector", ""),
+            "value": data.get("value", ""),
+            "url": url,
+        }
+    return result
+
+
+async def _press_key_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    if result.get("ok") and result.get("data"):
+        data = result["data"]
+        url, _ = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "key": data.get("key", ""),
+            "selector": data.get("selector", ""),
+            "url": url,
+        }
+    return result
+
+
+def get_skyvern_mcp_alias_map() -> dict[str, str]:
+    return {
+        "get_block_schema": "skyvern_block_schema",
+        "validate_block": "skyvern_block_validate",
+        "navigate_browser": "skyvern_navigate",
+        "get_browser_screenshot": "skyvern_screenshot",
+        "evaluate": "skyvern_evaluate",
+        "click": "skyvern_click",
+        "type_text": "skyvern_type",
+        "scroll": "skyvern_scroll",
+        "console_messages": "skyvern_console_messages",
+        "select_option": "skyvern_select_option",
+        "press_key": "skyvern_press_key",
+    }
+
+
+def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
+    return {
+        "get_block_schema": SchemaOverlay(),
+        "validate_block": SchemaOverlay(),
+        "navigate_browser": SchemaOverlay(
+            description=(
+                "Navigate the debug browser to a URL. "
+                "Use this to reset browser state or navigate to a starting page before running blocks."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            requires_browser=True,
+            post_hook=_navigate_post_hook,
+        ),
+        "get_browser_screenshot": SchemaOverlay(
+            description=(
+                "Take a screenshot of the current debug browser session. "
+                "Returns a base64-encoded PNG image. "
+                "Use this to see what the browser looks like after running blocks."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url", "selector"}),
+            forced_args={"inline": True},
+            requires_browser=True,
+            post_hook=_screenshot_post_hook,
+        ),
+        "evaluate": SchemaOverlay(
+            description=(
+                "Execute JavaScript in the browser and return the result. "
+                "Use this to inspect DOM state, read values, or run arbitrary JS."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            requires_browser=True,
+            timeout=30,
+            pre_hook=_evaluate_pre_hook,
+            post_hook=_evaluate_post_hook,
+        ),
+        "click": SchemaOverlay(
+            description=(
+                "Click an element in the browser. Use a CSS selector, an AI intent "
+                "description, or both for resilient targeting. "
+                "IMPORTANT: jQuery pseudo-selectors like :contains(), :eq(), :first, "
+                ":visible are NOT valid CSS. Use standard selectors: "
+                "'button.download', 'a[href*=\"pdf\"]', '#submit-btn', "
+                "'table tr:nth-of-type(2) td a'."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url", "button", "click_count"}),
+            requires_browser=True,
+            timeout=15,
+            pre_hook=_click_pre_hook,
+            post_hook=_click_post_hook,
+        ),
+        "type_text": SchemaOverlay(
+            description=(
+                "Type text into an input element. Use a CSS selector, an AI intent "
+                "description, or both to target the field. "
+                "Optionally clear the field first. Use this for form filling."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url", "delay"}),
+            required_overrides=["text"],
+            arg_transforms={"clear_first": "clear"},
+            requires_browser=True,
+            timeout=15,
+            post_hook=_type_text_post_hook,
+        ),
+        "scroll": SchemaOverlay(
+            description=(
+                "Scroll the page in a direction (up/down/left/right) by pixel amount, "
+                "or scroll a specific element into view using intent or selector. "
+                "Use this to reveal content below the fold."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            requires_browser=True,
+            post_hook=_scroll_post_hook,
+        ),
+        "console_messages": SchemaOverlay(
+            description=(
+                "Read console log messages from the browser. "
+                "Use level='error' to find JavaScript errors. "
+                "This is a read-only diagnostic tool."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            requires_browser=True,
+        ),
+        "select_option": SchemaOverlay(
+            description=(
+                "Select an option from a <select> dropdown. Provide the value to select "
+                "and use selector or intent to target the element. "
+                "For free-text inputs, use type_text instead."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url", "timeout"}),
+            required_overrides=["value"],
+            requires_browser=True,
+            timeout=15,
+            post_hook=_select_option_post_hook,
+        ),
+        "press_key": SchemaOverlay(
+            description=(
+                "Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.). "
+                "Optionally focus an element first via selector or intent. "
+                "Use for form submission, tab navigation, or closing dialogs."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            required_overrides=["key"],
+            requires_browser=True,
+            post_hook=_press_key_post_hook,
+        ),
+    }
+
+
+def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
+    if not (result.get("ok") and "_workflow" in result):
+        return
+
+    wf = result["_workflow"]
+    copilot_ctx.last_workflow = wf
+    copilot_ctx.last_workflow_yaml = copilot_ctx.workflow_yaml or None
+    data = result.get("data")
+    if isinstance(data, dict):
+        block_count = data.get("block_count")
+        if isinstance(block_count, int):
+            copilot_ctx.last_update_block_count = block_count
+    copilot_ctx.last_test_ok = None
+    copilot_ctx.last_test_failure_reason = None
+    copilot_ctx.workflow_persisted = True
+
+
+def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
+    """Single-pass analysis of run result blocks.
+
+    Returns ``(anti_bot_match, has_empty_data_blocks, failure_categories)``
+    by iterating the block list once. Classification delegates to
+    :func:`~skyvern.forge.failure_classifier.classify_from_failure_reason`.
+    When ``data["failure_categories"]`` is already populated (pre-run
+    short-circuit with no blocks), honor it instead of re-classifying.
+    """
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None, False, None
+
+    anti_bot_match: str | None = None
+
+    precomputed_categories = data.get("failure_categories")
+    if isinstance(precomputed_categories, list) and precomputed_categories:
+        for cat in precomputed_categories:
+            if isinstance(cat, dict) and cat.get("category") == "ANTI_BOT_DETECTION":
+                anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
+                break
+        return anti_bot_match, False, precomputed_categories
+
+    # Collect texts for scanning and data-block stats in one pass
+    texts_to_scan: list[str] = []
+    html = data.get("visible_elements_html")
+    if isinstance(html, str):
+        texts_to_scan.append(html)
+
+    has_data_blocks = False
+    any_data_output = False
+
+    blocks = data.get("blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            reason = block.get("failure_reason")
+            if isinstance(reason, str):
+                texts_to_scan.append(reason)
+            if block.get("block_type") in _DATA_PRODUCING_BLOCK_TYPES and block.get("status") == "completed":
+                has_data_blocks = True
+                if _is_meaningful_extracted_data(block.get("extracted_data")):
+                    any_data_output = True
+
+    combined = "\n".join(texts_to_scan)
+    categories = classify_from_failure_reason(combined)
+    if categories:
+        for cat in categories:
+            if cat.get("category") == "ANTI_BOT_DETECTION":
+                anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
+                break
+
+    empty_data_blocks = has_data_blocks and not any_data_output
+    return anti_bot_match, empty_data_blocks, categories
+
+
+def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
+    run_ok = bool(result.get("ok", False))
+    copilot_ctx.last_test_ok = run_ok
+    copilot_ctx.last_test_failure_reason = None
+    copilot_ctx.last_test_suspicious_success = False
+    copilot_ctx.last_test_anti_bot = None
+    copilot_ctx.last_failure_category_top = None
+
+    anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result)
+    if anti_bot_match:
+        copilot_ctx.last_test_anti_bot = anti_bot_match
+    if failure_categories:
+        top = failure_categories[0]
+        if isinstance(top, dict):
+            top_category = top.get("category")
+            if isinstance(top_category, str):
+                copilot_ctx.last_failure_category_top = top_category
+
+    # Expose full failure classification in tool output for agent reasoning
+    if failure_categories:
+        data = result.get("data")
+        if isinstance(data, dict):
+            data["failure_categories"] = failure_categories
+
+    if run_ok:
+        if empty_data_blocks:
+            copilot_ctx.last_test_ok = None
+            copilot_ctx.last_test_suspicious_success = True
+            copilot_ctx.null_data_streak_count = getattr(copilot_ctx, "null_data_streak_count", 0) + 1
+            copilot_ctx.last_test_failure_reason = (
+                "All blocks completed but data-producing blocks "
+                "(extraction/text_prompt) produced no meaningful output "
+                "(missing, empty, or all-null fields). "
+                "The workflow may not be working correctly."
+            )
+            update_repeated_failure_state(copilot_ctx, result)
+            return
+        copilot_ctx.failed_test_nudge_count = 0
+        copilot_ctx.null_data_streak_count = 0
+        copilot_ctx.last_failed_workflow_yaml = None
+        update_repeated_failure_state(copilot_ctx, result)
+        return
+
+    copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
+
+    data = result.get("data")
+    if isinstance(data, dict):
+        blocks = data.get("blocks")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if isinstance(block, dict) and block.get("failure_reason"):
+                    copilot_ctx.last_test_failure_reason = str(block["failure_reason"])
+                    break
+    if result.get("error") and copilot_ctx.last_test_failure_reason is None:
+        copilot_ctx.last_test_failure_reason = str(result["error"])
+    update_repeated_failure_state(copilot_ctx, result)
+
+
+@function_tool(name_override="update_workflow")
+async def update_workflow_tool(
+    ctx: RunContextWrapper,
+    workflow_yaml: str,
+) -> str:
+    """Validate and update the workflow YAML definition.
+    Provide the complete workflow YAML as a string.
+    Returns the validated workflow or validation errors.
+    """
+    copilot_ctx = ctx.context
+    loop_error = _tool_loop_error(copilot_ctx, "update_workflow")
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
+        result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        _record_workflow_update_result(copilot_ctx, result)
+    sanitized = sanitize_tool_result_for_llm("update_workflow", result)
+    return json.dumps(sanitized)
+
+
+@function_tool(name_override="list_credentials")
+async def list_credentials_tool(
+    ctx: RunContextWrapper,
+    page: int = 1,
+    page_size: int = 10,
+) -> str:
+    """List stored credentials (metadata only — never passwords or secrets).
+    Use this to find credential IDs for login blocks.
+    """
+    copilot_ctx = ctx.context
+    loop_error = _tool_loop_error(copilot_ctx, "list_credentials")
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    result = await _list_credentials({"page": page, "page_size": page_size}, copilot_ctx)
+    sanitized = sanitize_tool_result_for_llm("list_credentials", result)
+    return json.dumps(sanitized)
+
+
+async def _frontier_plan_for_current_workflow(
+    ctx: AgentContext, block_labels: list[str]
+) -> tuple[list[str], dict[str, Any], str | None]:
+    """Plan execution for the plain (no YAML update) path."""
+    prior_definition = await _get_prior_workflow_definition(ctx)
+    return _plan_frontier(ctx, block_labels, prior_definition, prior_definition)
+
+
+def _run_blocks_span_data(
+    block_labels: list[str],
+    labels_to_execute: list[str],
+    frontier_start_label: str | None,
+    seeded_outputs: dict[str, Any],
+    ctx: Any,
+) -> dict[str, Any]:
+    return {
+        "requested_block_labels": block_labels,
+        "executed_block_labels": labels_to_execute,
+        "frontier_start_label": frontier_start_label,
+        "seeded_output_count": len(seeded_outputs or {}),
+        "repeated_failure_streak_count": int(getattr(ctx, "repeated_failure_streak_count", 0) or 0),
+        "block_count": len(block_labels),
+    }
+
+
+@function_tool(
+    name_override="run_blocks_and_collect_debug",
+    timeout=RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS,
+    strict_mode=False,
+)
+async def run_blocks_tool(
+    ctx: RunContextWrapper,
+    block_labels: list[str],
+    parameters: dict[str, Any] | None = None,
+) -> Any:
+    """Run one or more blocks of the current workflow, wait for completion,
+    and return compact debug output (status, failure reason, visible elements).
+    The workflow must be saved before running blocks.
+    Block labels must match labels in the saved workflow.
+
+    Pass runtime values for workflow parameters via the `parameters` dict —
+    keys must match the workflow parameter `key` field. When the user has
+    supplied concrete values in their message (names, emails, IDs), pass them
+    on the first call rather than letting the workflow fall back to
+    placeholders. For sensitive values (password, secret, token, api_key,
+    credential, totp, otp, one_time_code, private_key, auth), prefer calling
+    list_credentials first; if a stored credential matches, reference its
+    credential_id via a credential parameter. If no matching credential
+    exists and the user supplied an inline value, you may pass it via
+    `parameters` — values under those sensitive key names are redacted from
+    the outbound client stream and the tool-execution trace.
+    """
+    copilot_ctx = ctx.context
+    loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    labels_to_execute, block_outputs_to_seed, frontier_start_label = await _frontier_plan_for_current_workflow(
+        copilot_ctx, block_labels
+    )
+
+    with copilot_span(
+        "run_blocks",
+        data=_run_blocks_span_data(
+            block_labels,
+            labels_to_execute,
+            frontier_start_label,
+            block_outputs_to_seed,
+            copilot_ctx,
+        ),
+    ):
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": block_labels, "parameters": parameters or {}},
+            copilot_ctx,
+            labels_to_execute=labels_to_execute,
+            block_outputs_to_seed=block_outputs_to_seed,
+            frontier_start_label=frontier_start_label,
+        )
+        _record_run_blocks_result(copilot_ctx, result)
+        enqueue_screenshot_from_result(copilot_ctx, result)
+
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    return json.dumps(sanitized)
+
+
+@function_tool(name_override="get_run_results")
+async def get_run_results_tool(
+    ctx: RunContextWrapper,
+    workflow_run_id: str | None = None,
+) -> str:
+    """Fetch results from a previous workflow run.
+    Returns block statuses, failure reasons, and output data.
+    If workflow_run_id is omitted, fetches the most recently created finished
+    run (completed, failed, canceled, terminated, or timed_out — excludes
+    in-flight runs). For unambiguous results in concurrent-run scenarios,
+    pass an explicit workflow_run_id from a prior tool response.
+    """
+    copilot_ctx = ctx.context
+    loop_error = _tool_loop_error(copilot_ctx, "get_run_results")
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    params: dict[str, Any] = {}
+    if workflow_run_id:
+        params["workflow_run_id"] = workflow_run_id
+    result = await _get_run_results(params, copilot_ctx)
+    sanitized = sanitize_tool_result_for_llm("get_run_results", result)
+    return json.dumps(sanitized)
+
+
+@function_tool(
+    name_override="update_and_run_blocks",
+    timeout=RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS,
+    strict_mode=False,
+)
+async def update_and_run_blocks_tool(
+    ctx: RunContextWrapper,
+    workflow_yaml: str,
+    block_labels: list[str],
+    parameters: dict[str, Any] | None = None,
+) -> Any:
+    """Update the workflow YAML and immediately run the specified blocks in one step.
+    Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
+    The workflow must validate successfully before blocks are run.
+
+    Pass runtime values for workflow parameters via the `parameters` dict —
+    keys must match the workflow parameter `key` field. When the user has
+    supplied concrete values in their message (names, emails, IDs), pass them
+    on the first call rather than letting the workflow fall back to
+    placeholders. For sensitive values (password, secret, token, api_key,
+    credential, totp, otp, one_time_code, private_key, auth), prefer calling
+    list_credentials first; if a stored credential matches, reference its
+    credential_id via a credential parameter. If no matching credential
+    exists and the user supplied an inline value, you may pass it via
+    `parameters` — values under those sensitive key names are redacted from
+    the outbound client stream and the tool-execution trace.
+    """
+    copilot_ctx = ctx.context
+    loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks")
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    # Snapshot the prior workflow definition BEFORE _update_workflow saves
+    # the new one — we need the pre-update state to diff against.
+    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+
+    # Step 1: Update the workflow
+    with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
+        update_result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        _record_workflow_update_result(copilot_ctx, update_result)
+
+    if not update_result.get("ok"):
+        sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
+        return json.dumps(sanitized)
+
+    # Step 2: Compute frontier and run the blocks
+    new_definition = None
+    if copilot_ctx.last_workflow is not None:
+        new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
+
+    # YAML-diff-based invalidation: drop any verified-prefix entries whose
+    # block config changed (or are downstream of a change) BEFORE the next
+    # run plans the frontier. This is the only point where we shrink verified
+    # state — failed runs leave it intact so subsequent edits can still use
+    # the optimization. On append-only diffs this is a no-op.
+    if prior_definition is not None and new_definition is not None and copilot_ctx.verified_prefix_labels:
+        try:
+            edit_invalidated = _find_invalidated_labels(
+                prior_definition, new_definition, list(copilot_ctx.verified_prefix_labels)
+            )
+        except Exception:
+            edit_invalidated = set()
+        if edit_invalidated:
+            for label in edit_invalidated:
+                copilot_ctx.verified_block_outputs.pop(label, None)
+            copilot_ctx.verified_prefix_labels = [
+                label for label in copilot_ctx.verified_prefix_labels if label not in edit_invalidated
+            ]
+
+    labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
+        copilot_ctx, block_labels, prior_definition, new_definition
+    )
+
+    with copilot_span(
+        "run_blocks",
+        data=_run_blocks_span_data(
+            block_labels,
+            labels_to_execute,
+            frontier_start_label,
+            block_outputs_to_seed,
+            copilot_ctx,
+        ),
+    ):
+        run_result = await _run_blocks_and_collect_debug(
+            {"block_labels": block_labels, "parameters": parameters or {}},
+            copilot_ctx,
+            labels_to_execute=labels_to_execute,
+            block_outputs_to_seed=block_outputs_to_seed,
+            frontier_start_label=frontier_start_label,
+        )
+        _record_run_blocks_result(copilot_ctx, run_result)
+        enqueue_screenshot_from_result(copilot_ctx, run_result)
+
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
+    return json.dumps(sanitized)
+
+
+NATIVE_TOOLS = [
+    update_workflow_tool,
+    list_credentials_tool,
+    run_blocks_tool,
+    get_run_results_tool,
+    update_and_run_blocks_tool,
+]
