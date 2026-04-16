@@ -1,0 +1,23 @@
+---
+title: fill_from_mapping
+slug: sdk-reference/browser-automation/fill-from-mapping
+---
+
+Fill form fields using an explicit index-based mapping produced by `extract_form_fields`.
+
+```python
+fields = await page.extract_form_fields()
+await page.fill_from_mapping(
+    form_fields=fields,
+    mapping={0: "John", 1: "Doe"},  # keys are field indices from extract_form_fields
+    data={"name": "John Doe"},
+)
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `form_fields` | `list[dict[str, Any]]` | Yes | Field metadata returned by `extract_form_fields`. |
+| `mapping` | `dict[int, str \| list \| bool \| None]` | Yes | Map of field index to the value to fill. |
+| `data` | `dict[str, Any] \| None` | No | Optional source data for context. Defaults to `None`. |
+
+## Returns `None`

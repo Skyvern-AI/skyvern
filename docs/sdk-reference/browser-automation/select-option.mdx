@@ -1,0 +1,43 @@
+---
+title: select_option
+slug: sdk-reference/browser-automation/select-option
+---
+
+Select an option from a dropdown using a CSS selector, an AI prompt, or both.
+
+<CodeGroup>
+```python Python
+# Standard Playwright select
+await page.select_option("#country", value="us")
+
+# AI-powered select
+await page.select_option(prompt="Select 'United States' from the country dropdown")
+
+# Selector with AI fallback
+await page.select_option("#country", value="us",
+    prompt="Select United States from country")
+```
+
+```typescript TypeScript
+// Standard Playwright select
+await page.selectOption("#country", "us");
+
+// AI-powered select
+await page.selectOption({ prompt: "Select 'United States' from the country dropdown" });
+
+// Selector with AI fallback
+await page.selectOption("#country", "us", {
+  prompt: "Select United States from country",
+});
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` / `string` | No | CSS selector for the `<select>` element. |
+| `value` | `str` / `string` | No | The option value to select. |
+| `prompt` | `str` / `string` | No | Natural language description of the dropdown and the option to select. |
+| `ai` | `str` / `string` | No | Controls AI behavior. `"fallback"` (default) tries the selector first, then AI. `None` / `null` disables AI. |
+| `**kwargs` | | No | Standard Playwright select options (e.g., `timeout`, `force`). |
+
+Returns `list[str]` / `string[]` -- the selected option values.

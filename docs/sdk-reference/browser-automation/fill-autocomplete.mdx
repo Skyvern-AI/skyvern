@@ -1,0 +1,30 @@
+---
+title: fill_autocomplete
+slug: sdk-reference/browser-automation/fill-autocomplete
+---
+
+Fill an input with autocomplete/typeahead handling.
+
+```python
+await page.fill_autocomplete(
+    selector="#city",
+    value="San Francisco",
+    option_selector=".autocomplete-option",
+)
+```
+
+## Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` | No | CSS selector for the input field. |
+| `value` | `str` | No | The text value to type into the field. |
+| `prompt` | `str` | No | Natural language description of the field and value. |
+| `ai` | `str` | No | Controls AI behavior. `"fallback"` (default) tries the selector first, then AI. |
+| `option_selector` | `str` | No | CSS selector for the autocomplete dropdown options. |
+| `wait_seconds` | `float` | No | Seconds to wait for the dropdown to appear. Default `1.5`. |
+| `**kwargs` | | No | Standard Playwright fill options (e.g., `timeout`, `force`). |
+
+## Returns `str`
+
+The resolved selector used.

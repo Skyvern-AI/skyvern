@@ -1,0 +1,24 @@
+---
+title: fill_multipage_form
+slug: sdk-reference/browser-automation/fill-multipage-form
+---
+
+Fill a form that spans multiple pages, handling page transitions automatically.
+
+```python
+pages_filled = await page.fill_multipage_form(
+    data={"name": "John Doe", "email": "john@example.com", "address": "123 Main St"},
+    max_pages=5,
+)
+print(f"Filled {pages_filled} pages")
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `data` | `dict[str, Any]` | Yes | Key-value pairs of form data to fill across all pages. |
+| `prompt` | `str` | No | Instruction for the AI. Defaults to `"Fill out the form"`. |
+| `next_button` | `str` | No | Selector or description of the button to advance to the next page. |
+| `max_pages` | `int` | No | Maximum number of pages to fill. Defaults to `10`. |
+| `timeout_seconds` | `float` | No | Timeout in seconds for the entire operation. Defaults to `300`. |
+
+Returns `int` -- the number of pages filled.

@@ -224,44 +224,132 @@
       },
       {
         "tab": "SDK Reference",
-        "versions": [
+        "groups": [
           {
-            "version": "Python",
-            "groups": [
-              {
-                "group": "Python SDK",
-                "pages": [
-                  "sdk-reference/overview",
-                  "sdk-reference/tasks",
-                  "sdk-reference/workflows",
-                  "sdk-reference/browser-sessions",
-                  "sdk-reference/browser-profiles",
-                  "sdk-reference/credentials",
-                  "sdk-reference/helpers",
-                  "sdk-reference/error-handling",
-                  "sdk-reference/complete-reference"
-                ]
-              }
+            "group": "SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
             ]
           },
           {
-            "version": "TypeScript",
-            "groups": [
+            "group": "Browser Automation",
+            "pages": [
               {
-                "group": "TypeScript SDK",
+                "group": "Page",
                 "pages": [
-                  "ts-sdk-reference/overview",
-                  "ts-sdk-reference/tasks",
-                  "ts-sdk-reference/workflows",
-                  "ts-sdk-reference/browser-sessions",
-                  "ts-sdk-reference/browser-profiles",
-                  "ts-sdk-reference/credentials",
-                  "ts-sdk-reference/helpers",
-                  "ts-sdk-reference/browser-automation",
-                  "ts-sdk-reference/error-handling",
-                  "ts-sdk-reference/complete-reference"
+                  "sdk-reference/browser-automation/act",
+                  "sdk-reference/browser-automation/extract",
+                  "sdk-reference/browser-automation/validate",
+                  "sdk-reference/browser-automation/prompt",
+                  "sdk-reference/browser-automation/locator",
+                  "sdk-reference/browser-automation/click",
+                  "sdk-reference/browser-automation/fill",
+                  "sdk-reference/browser-automation/select-option",
+                  "sdk-reference/browser-automation/type",
+                  "sdk-reference/browser-automation/hover",
+                  "sdk-reference/browser-automation/scroll",
+                  "sdk-reference/browser-automation/upload-file",
+                  "sdk-reference/browser-automation/fill-form",
+                  "sdk-reference/browser-automation/fill-multipage-form",
+                  "sdk-reference/browser-automation/fill-from-mapping",
+                  "sdk-reference/browser-automation/extract-form-fields",
+                  "sdk-reference/browser-automation/validate-mapping",
+                  "sdk-reference/browser-automation/fill-autocomplete",
+                  "sdk-reference/browser-automation/frame-switch",
+                  "sdk-reference/browser-automation/frame-main",
+                  "sdk-reference/browser-automation/frame-list"
                 ]
-              }
+              },
+              {
+                "group": "Agent",
+                "pages": [
+                  "sdk-reference/browser-automation/agent-run-task",
+                  "sdk-reference/browser-automation/agent-login",
+                  "sdk-reference/browser-automation/agent-download-files",
+                  "sdk-reference/browser-automation/agent-run-workflow"
+                ]
+              },
+              {
+                "group": "Browser",
+                "pages": [
+                  "sdk-reference/browser-automation/launch-cloud-browser",
+                  "sdk-reference/browser-automation/use-cloud-browser",
+                  "sdk-reference/browser-automation/connect-to-cloud-browser-session",
+                  "sdk-reference/browser-automation/connect-to-browser-over-cdp",
+                  "sdk-reference/browser-automation/launch-local-browser",
+                  "sdk-reference/browser-automation/get-working-page",
+                  "sdk-reference/browser-automation/new-page",
+                  "sdk-reference/browser-automation/get-page-for",
+                  "sdk-reference/browser-automation/close"
+                ]
+              },
+              "sdk-reference/browser-automation/complete-example"
+            ]
+          },
+          {
+            "group": "Tasks",
+            "pages": [
+              "sdk-reference/tasks/run-task",
+              "sdk-reference/tasks/get-run",
+              "sdk-reference/tasks/cancel-run",
+              "sdk-reference/tasks/get-run-timeline",
+              "sdk-reference/tasks/get-run-artifacts",
+              "sdk-reference/tasks/get-artifact",
+              "sdk-reference/tasks/get-runs-v2",
+              "sdk-reference/tasks/retry-run-webhook"
+            ]
+          },
+          {
+            "group": "Workflows",
+            "pages": [
+              "sdk-reference/workflows/run-workflow",
+              "sdk-reference/workflows/create-workflow",
+              "sdk-reference/workflows/get-workflow",
+              "sdk-reference/workflows/get-workflows",
+              "sdk-reference/workflows/get-workflow-versions",
+              "sdk-reference/workflows/update-workflow",
+              "sdk-reference/workflows/delete-workflow",
+              "sdk-reference/workflows/get-workflow-runs",
+              "sdk-reference/workflows/update-workflow-folder"
+            ]
+          },
+          {
+            "group": "Browser Sessions",
+            "pages": [
+              "sdk-reference/browser-sessions/create-browser-session",
+              "sdk-reference/browser-sessions/get-browser-session",
+              "sdk-reference/browser-sessions/get-browser-sessions",
+              "sdk-reference/browser-sessions/close-browser-session"
+            ]
+          },
+          {
+            "group": "Browser Profiles",
+            "pages": [
+              "sdk-reference/browser-profiles/create-browser-profile",
+              "sdk-reference/browser-profiles/list-browser-profiles",
+              "sdk-reference/browser-profiles/get-browser-profile",
+              "sdk-reference/browser-profiles/delete-browser-profile"
+            ]
+          },
+          {
+            "group": "Credentials",
+            "pages": [
+              "sdk-reference/credentials/create-credential",
+              "sdk-reference/credentials/get-credential",
+              "sdk-reference/credentials/get-credentials",
+              "sdk-reference/credentials/update-credential",
+              "sdk-reference/credentials/delete-credential",
+              "sdk-reference/credentials/send-totp-code"
+            ]
+          },
+          {
+            "group": "Helpers",
+            "pages": [
+              "sdk-reference/helpers/login",
+              "sdk-reference/helpers/download-files",
+              "sdk-reference/helpers/upload-file"
             ]
           }
         ]
@@ -313,6 +401,78 @@
     }
   },
   "redirects": [
+    {
+      "source": "/sdk-reference/browser-automation/find",
+      "destination": "/sdk-reference/browser-automation/locator"
+    },
+    {
+      "source": "/sdk-reference/tasks",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/sdk-reference/workflows",
+      "destination": "/sdk-reference/workflows/run-workflow"
+    },
+    {
+      "source": "/sdk-reference/browser-sessions",
+      "destination": "/sdk-reference/browser-sessions/create-browser-session"
+    },
+    {
+      "source": "/sdk-reference/browser-profiles",
+      "destination": "/sdk-reference/browser-profiles/create-browser-profile"
+    },
+    {
+      "source": "/sdk-reference/credentials",
+      "destination": "/sdk-reference/credentials/create-credential"
+    },
+    {
+      "source": "/sdk-reference/helpers",
+      "destination": "/sdk-reference/helpers/login"
+    },
+    {
+      "source": "/sdk-reference/browser-automation",
+      "destination": "/sdk-reference/browser-automation/launch-cloud-browser"
+    },
+    {
+      "source": "/ts-sdk-reference/overview",
+      "destination": "/sdk-reference/overview"
+    },
+    {
+      "source": "/ts-sdk-reference/tasks",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/ts-sdk-reference/workflows",
+      "destination": "/sdk-reference/workflows/run-workflow"
+    },
+    {
+      "source": "/ts-sdk-reference/browser-sessions",
+      "destination": "/sdk-reference/browser-sessions/create-browser-session"
+    },
+    {
+      "source": "/ts-sdk-reference/browser-profiles",
+      "destination": "/sdk-reference/browser-profiles/create-browser-profile"
+    },
+    {
+      "source": "/ts-sdk-reference/credentials",
+      "destination": "/sdk-reference/credentials/create-credential"
+    },
+    {
+      "source": "/ts-sdk-reference/helpers",
+      "destination": "/sdk-reference/helpers/login"
+    },
+    {
+      "source": "/ts-sdk-reference/browser-automation",
+      "destination": "/sdk-reference/browser-automation/launch-cloud-browser"
+    },
+    {
+      "source": "/ts-sdk-reference/error-handling",
+      "destination": "/sdk-reference/error-handling"
+    },
+    {
+      "source": "/ts-sdk-reference/complete-reference",
+      "destination": "/sdk-reference/complete-reference"
+    },
     {
       "source": "/introduction",
       "destination": "/getting-started/quickstart"

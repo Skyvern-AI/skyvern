@@ -1,0 +1,51 @@
+---
+title: agent.run_task
+slug: sdk-reference/browser-automation/agent-run-task
+---
+
+Run a complete AI task in the context of the current page.
+
+<CodeGroup>
+```python Python
+result = await page.agent.run_task(
+    "Fill out the contact form and submit it",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "confirmation_number": {"type": "string"},
+        },
+    },
+)
+print(result.output)
+```
+
+```typescript TypeScript
+const result = await page.agent.runTask("Fill out the contact form and submit it", {
+  dataExtractionSchema: {
+    type: "object",
+    properties: {
+      confirmation_number: { type: "string" },
+    },
+  },
+});
+console.log(result.output);
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `str` / `string` | Yes | Natural language task description. |
+| `engine` | `RunEngine` | No | AI engine to use. Default: `skyvern_v1`. |
+| `model` | `dict` / `Record<string, unknown>` | No | LLM model configuration. |
+| `url` | `str` / `string` | No | URL to navigate to. Defaults to current page URL. |
+| `data_extraction_schema` / `dataExtractionSchema` | `dict \| str` | No | JSON schema for output. |
+| `max_steps` / `maxSteps` | `int` / `number` | No | Maximum AI steps. |
+| `timeout` | `float` / `number` | No | Max wait time in seconds. Default: `1800`. |
+| `webhook_url` / `webhookUrl` | `str` / `string` | No | Webhook URL for notifications. |
+| `totp_identifier` / `totpIdentifier` | `str` / `string` | No | TOTP identifier. |
+| `totp_url` / `totpUrl` | `str` / `string` | No | TOTP URL. |
+| `title` | `str` / `string` | No | Run display name. |
+| `user_agent` | `str` / `string` | No | Custom User-Agent header for the browser. |
+| `error_code_mapping` / `errorCodeMapping` | `dict` / `Record<string, string>` | No | Custom error code mapping. |
+
+Returns `TaskRunResponse`.

@@ -1,0 +1,27 @@
+---
+title: launch_local_browser
+slug: sdk-reference/browser-automation/launch-local-browser
+---
+
+Launch a local Chromium browser with CDP enabled. Only available in embedded mode (`Skyvern.local()`).
+
+```python
+skyvern = Skyvern.local()
+browser = await skyvern.launch_local_browser(headless=False)
+page = await browser.get_working_page()
+```
+
+## Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `headless` | `bool` | No | `False` | Run browser without a visible window. |
+| `port` | `int` | No | `9222` | CDP port. |
+| `args` | `list[str]` | No | `None` | Additional Chromium launch arguments. |
+| `user_data_dir` | `str` | No | `None` | Custom user data directory for the browser. |
+
+## Returns `SkyvernBrowser`
+
+<Note>
+`launch_local_browser` only works in embedded mode because a remote server cannot reach localhost. TypeScript SDK does not support local mode.
+</Note>
