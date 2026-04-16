@@ -1,0 +1,26 @@
+---
+title: connect_to_cloud_browser_session
+slug: sdk-reference/browser-automation/connect-to-cloud-browser-session
+---
+
+Connect to an existing cloud browser session by ID.
+
+<CodeGroup>
+```python Python
+browser = await skyvern.connect_to_cloud_browser_session("pbs_abc123")
+page = await browser.get_working_page()
+```
+
+```typescript TypeScript
+const browser = await skyvern.connectToCloudBrowserSession("pbs_abc123");
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+## Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browser_session_id` / `browserSessionId` | `str` / `string` | Yes | The ID of the cloud browser session. |
+
+## Returns `SkyvernBrowser`

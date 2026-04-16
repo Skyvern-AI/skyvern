@@ -1,0 +1,23 @@
+---
+title: validate_mapping
+slug: sdk-reference/browser-automation/validate-mapping
+---
+
+Validate that a field mapping is correct for the current form.
+
+```python
+fields = await page.extract_form_fields()
+is_valid = await page.validate_mapping(
+    form_fields=fields,
+    mapping={0: "John", 1: "Doe"},
+    prompt="Validate the name fields are filled correctly",
+)
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `form_fields` | `list[dict[str, Any]]` | Yes | Field metadata returned by `extract_form_fields`. |
+| `mapping` | `dict[int, str \| list \| bool \| None]` | Yes | Map of field index to the value to validate. |
+| `prompt` | `str \| None` | Yes | Instruction describing what to validate. |
+
+Returns `bool` -- `True` if the mapping is valid, `False` otherwise.

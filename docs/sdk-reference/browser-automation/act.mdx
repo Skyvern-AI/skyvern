@@ -1,0 +1,29 @@
+---
+title: act
+slug: sdk-reference/browser-automation/act
+---
+
+Perform a freeform AI action on the page. The AI agent interprets the prompt, identifies the relevant elements, and executes the appropriate browser actions.
+
+<CodeGroup>
+```python Python
+await page.act("Scroll down and click the 'Load More' button")
+```
+
+```typescript TypeScript
+await page.act("Scroll down and click the 'Load More' button");
+```
+</CodeGroup>
+
+```python
+await page.act("Click the login button")
+await page.act("Select 'United States' from the country dropdown")
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `str` / `string` | Yes | Natural language instruction describing the action to perform. |
+| `skip_refresh` / `skipRefresh` | `bool` / `boolean` | No | Skip refreshing the page state before acting. Defaults to `False`. |
+| `use_economy_tree` / `useEconomyTree` | `bool` / `boolean` | No | Use a lighter DOM representation to reduce token usage. Defaults to `False`. |
+
+Returns `None` / `void`.

@@ -1,0 +1,88 @@
+---
+title: agent.login
+slug: sdk-reference/browser-automation/agent-login
+---
+
+Run a login workflow in the context of the current page. Supports multiple credential providers.
+
+## Parameters
+
+| Parameter (Python) | Parameter (TS) | Type | Required | Default | Description |
+|-------------------|----------------|------|----------|---------|-------------|
+| `credential_type` | first positional arg | `CredentialType` / `string` | Yes | - | Provider type: `skyvern`, `bitwarden`, `onepassword`, `azure_vault`. |
+| `url` | `url` | `str` / `string` | No | `None` / `undefined` | URL to navigate to before logging in. |
+| `credential_id` | `credentialId` | `str` / `string` | No | `None` / `undefined` | Skyvern credential ID. Required when `credential_type` is `skyvern`. |
+| `prompt` | `prompt` | `str` / `string` | No | `None` / `undefined` | Additional natural-language login instructions. |
+| `webhook_url` | `webhookUrl` | `str` / `string` | No | `None` / `undefined` | URL to receive a callback when login completes. |
+| `totp_identifier` | `totpIdentifier` | `str` / `string` | No | `None` / `undefined` | Identifier for TOTP-based two-factor authentication. |
+| `totp_url` | `totpUrl` | `str` / `string` | No | `None` / `undefined` | URL for TOTP secret retrieval. |
+| `extra_http_headers` | `extraHttpHeaders` | `dict` / `object` | No | `None` / `undefined` | Additional HTTP headers to set on the browser context. |
+| `timeout` | `timeout` | `float` / `number` | No | `1800` | Maximum time in seconds to wait for login to complete. |
+
+<Note>
+Provider-specific parameters (`bitwarden_item_id`, `onepassword_vault_id`, etc.) are required based on the `credential_type` chosen. See the examples below for each provider.
+</Note>
+
+## Examples
+
+<CodeGroup>
+```python Python
+from skyvern.schemas.run_blocks import CredentialType
+
+# Skyvern credentials
+await page.agent.login(
+    credential_type=CredentialType.skyvern,
+    credential_id="cred_123",
+)
+
+# Bitwarden
+await page.agent.login(
+    credential_type=CredentialType.bitwarden,
+    bitwarden_item_id="item_id",
+    bitwarden_collection_id="collection_id",
+)
+
+# 1Password
+await page.agent.login(
+    credential_type=CredentialType.onepassword,
+    onepassword_vault_id="vault_id",
+    onepassword_item_id="item_id",
+)
+
+# Azure Vault
+await page.agent.login(
+    credential_type=CredentialType.azure_vault,
+    azure_vault_name="vault_name",
+    azure_vault_username_key="username_key",
+    azure_vault_password_key="password_key",
+)
+```
+
+```typescript TypeScript
+// Skyvern credentials
+await page.agent.login("skyvern", {
+  credentialId: "cred_123",
+});
+
+// Bitwarden
+await page.agent.login("bitwarden", {
+  bitwardenItemId: "item_id",
+  bitwardenCollectionId: "collection_id",
+});
+
+// 1Password
+await page.agent.login("1password", {
+  onepasswordVaultId: "vault_id",
+  onepasswordItemId: "item_id",
+});
+
+// Azure Vault
+await page.agent.login("azure_vault", {
+  azureVaultName: "vault_name",
+  azureVaultUsernameKey: "username_key",
+  azureVaultPasswordKey: "password_key",
+});
+```
+</CodeGroup>
+
+Returns `WorkflowRunResponse`.

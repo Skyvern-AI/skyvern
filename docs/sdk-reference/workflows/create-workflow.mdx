@@ -1,0 +1,128 @@
+---
+title: create_workflow
+slug: sdk-reference/workflows/create-workflow
+---
+
+Create a new workflow from a JSON or YAML definition.
+
+<CodeGroup>
+```python Python
+workflow = await client.create_workflow(
+    json_definition={
+        "title": "Extract Products",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "key": "target_url",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "string",
+                    "description": "URL to scrape",
+                }
+            ],
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "extract_data",
+                    "prompt": "Extract the top 3 products",
+                    "url": "{{ target_url }}",
+                }
+            ],
+        },
+    },
+)
+print(workflow.workflow_permanent_id)
+```
+
+```typescript TypeScript
+const workflow = await skyvern.createWorkflow({
+  body: {
+    json_definition: {
+      title: "Extract Products",
+      workflow_definition: {
+        parameters: [
+          {
+            key: "target_url",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+            description: "URL to scrape",
+          },
+        ],
+        blocks: [
+          {
+            block_type: "task",
+            label: "extract",
+            prompt: "Extract the top 3 products with name and price",
+            url: "{{ target_url }}",
+          },
+        ],
+      },
+    },
+  },
+});
+console.log(workflow.workflow_permanent_id);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `json_definition` | `WorkflowCreateYamlRequest` | No | Workflow definition as a JSON object. |
+| `yaml_definition` | `str` | No | Workflow definition as a YAML string. |
+| `folder_id` | `str` | No | Folder to organize the workflow in. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+You must provide either `json_definition` or `yaml_definition`.
+
+### Returns `Workflow`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `workflow_id` | `str` | Unique ID for this version. |
+| `workflow_permanent_id` | `str` | Stable ID across all versions. Use this to run workflows. |
+| `version` | `int` | Version number. |
+| `title` | `str` | Workflow title. |
+| `workflow_definition` | `WorkflowDefinition` | The full definition including blocks and parameters. |
+| `status` | `str \| None` | Workflow status. |
+| `created_at` | `datetime` | When the workflow was created. |
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

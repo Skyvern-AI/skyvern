@@ -1,0 +1,150 @@
+---
+title: "create_browser_profile"
+slug: sdk-reference/browser-profiles/create-browser-profile
+---
+
+A browser profile is a snapshot of browser state: cookies, local storage, session data. Create a profile from a completed run, then load it into future workflow runs to skip login and setup steps.
+
+For conceptual background, see [Browser Profiles](/optimization/browser-profiles).
+
+<Note>
+Python uses `snake_case` (e.g., `create_browser_profile`); TypeScript uses `camelCase` (e.g., `createBrowserProfile`). Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+</Note>
+
+Create a profile from a completed workflow run.
+
+<CodeGroup>
+```python Python
+profile = await client.create_browser_profile(
+    name="production-login",
+    workflow_run_id="wr_abc123",
+)
+print(profile.browser_profile_id)  # bpf_abc123
+```
+
+```typescript TypeScript
+const profile = await skyvern.createBrowserProfile({
+  name: "production-login",
+  workflow_run_id: "wr_abc123",
+});
+console.log(profile.browser_profile_id); // bpf_abc123
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | `str` | Yes | Display name for the profile. |
+| `description` | `str` | No | Optional description. |
+| `workflow_run_id` | `str` | Conditional | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. Required if `browser_session_id` is not provided. |
+| `browser_session_id` | `str` | Conditional | The browser session ID to snapshot. Required if `workflow_run_id` is not provided. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+You must provide either `workflow_run_id` or `browser_session_id`.
+
+### Returns `BrowserProfile`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_profile_id` | `str` | Unique ID. Starts with `bpf_`. |
+| `name` | `str` | Profile name. |
+| `description` | `str \| None` | Profile description. |
+| `created_at` | `datetime` | When the profile was created. |
+
+### Example: Create a profile from a login workflow
+
+<CodeGroup>
+```python Python
+# Step 1: Run a workflow with persist_browser_session
+run = await client.run_workflow(
+    workflow_id="wpid_login_flow",
+    parameters={"username": "demo@example.com"},
+    wait_for_completion=True,
+)
+
+# Step 2: Create a profile from the run
+profile = await client.create_browser_profile(
+    name="demo-account-login",
+    workflow_run_id=run.run_id,
+)
+
+# Step 3: Use the profile in future runs (skip login)
+result = await client.run_workflow(
+    workflow_id="wpid_extract_invoices",
+    browser_profile_id=profile.browser_profile_id,
+    wait_for_completion=True,
+)
+```
+
+```typescript TypeScript
+// Step 1: Run a workflow with persist_browser_session
+const run = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_login_flow",
+    parameters: { username: "demo@example.com" },
+  },
+  waitForCompletion: true,
+});
+
+// Step 2: Create a profile from the run
+const profile = await skyvern.createBrowserProfile({
+  name: "demo-account-login",
+  workflow_run_id: run.run_id,
+});
+
+// Step 3: Use the profile in future runs (skip login)
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_extract_invoices",
+    browser_profile_id: profile.browser_profile_id,
+  },
+  waitForCompletion: true,
+});
+```
+</CodeGroup>
+
+<Info>
+Session archiving is asynchronous. If `create_browser_profile` fails immediately after a workflow completes, wait a few seconds and retry.
+</Info>
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

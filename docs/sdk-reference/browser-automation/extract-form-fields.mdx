@@ -1,0 +1,15 @@
+---
+title: extract_form_fields
+slug: sdk-reference/browser-automation/extract-form-fields
+---
+
+Extract all form fields with metadata from the current page.
+
+```python
+fields = await page.extract_form_fields()
+# Returns list of dicts with field name, type, options, etc.
+```
+
+## Returns `list[dict[str, Any]]`
+
+Each dict contains field name, type, options, and other metadata.

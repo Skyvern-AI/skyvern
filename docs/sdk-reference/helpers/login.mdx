@@ -1,0 +1,173 @@
+---
+title: "login"
+slug: sdk-reference/helpers/login
+---
+
+These methods wrap common multi-step patterns into single API calls. Under the hood, they create and run specialized workflows.
+
+<Note>
+Python uses `snake_case` (e.g., `login`, `download_files`); TypeScript uses `camelCase` (e.g., `login`, `downloadFiles`). Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+</Note>
+
+Automate logging into a website using stored credentials. This creates a login workflow, executes it, and optionally waits for completion.
+
+<CodeGroup>
+```python Python
+from skyvern.schemas.run_blocks import CredentialType
+
+result = await client.login(
+    credential_type=CredentialType.skyvern,
+    credential_id="cred_abc123",
+    url="https://app.example.com/login",
+    wait_for_completion=True,
+)
+print(result.status)
+```
+
+```typescript TypeScript
+const result = await skyvern.login({
+  credential_type: "skyvern",
+  credential_id: "cred_abc123",
+  url: "https://app.example.com/login",
+  waitForCompletion: true,
+});
+console.log(result.status);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `credential_type` | `CredentialType` | Yes | - | How credentials are stored. Options: `skyvern`, `bitwarden`, `onepassword` (`"1password"` in TS), `azure_vault`. |
+| `url` | `str` | No | `None` | The login page URL. |
+| `credential_id` | `str` | No | `None` | The Skyvern credential ID (when using `skyvern` type). |
+| `prompt` | `str` | No | `None` | Additional instructions for the AI during login. |
+| `browser_session_id` | `str` | No | `None` | Run login inside an existing browser session. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the login finishes. |
+| `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
+| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `wait_for_completion` (Python) / `waitForCompletion` (TS) | `bool` | No | `False` | Block until the login finishes. |
+| `timeout` | `float` | No | `1800` | Max wait time in seconds. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
+| `max_screenshot_scrolling_times` | `int` | No | `None` | Number of screenshot scrolls. |
+| `browser_profile_id` | `str` | No | `None` | Load a browser profile into the session. |
+| `request_options` | `RequestOptions` | No | `None` | Per-request configuration (see below). |
+
+**Bitwarden-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bitwarden_collection_id` | `str` | Bitwarden collection ID. |
+| `bitwarden_item_id` | `str` | Bitwarden item ID. |
+
+**1Password-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `onepassword_vault_id` | `str` | 1Password vault ID. |
+| `onepassword_item_id` | `str` | 1Password item ID. |
+
+**Azure Key Vault-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `azure_vault_name` | `str` | Azure Key Vault name. |
+| `azure_vault_username_key` | `str` | Secret name for the username. |
+| `azure_vault_password_key` | `str` | Secret name for the password. |
+| `azure_vault_totp_secret_key` | `str` | Secret name for the TOTP secret. |
+
+### Returns `WorkflowRunResponse`
+
+### Example: Login then extract data
+
+<CodeGroup>
+```python Python
+from skyvern.schemas.run_blocks import CredentialType
+
+session = await client.create_browser_session()
+
+# Login
+await client.login(
+    credential_type=CredentialType.skyvern,
+    credential_id="cred_abc123",
+    url="https://app.example.com/login",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+
+# Now extract data from the authenticated session
+result = await client.run_task(
+    prompt="Go to the billing page and extract all invoices",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+print(result.output)
+```
+
+```typescript TypeScript
+const session = await skyvern.createBrowserSession({});
+
+// Login
+await skyvern.login({
+  credential_type: "skyvern",
+  credential_id: "cred_abc123",
+  url: "https://app.example.com/login",
+  browser_session_id: session.browser_session_id,
+  waitForCompletion: true,
+});
+
+// Now extract data from the authenticated session
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Go to the billing page and extract all invoices",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+</CodeGroup>
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

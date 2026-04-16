@@ -1,0 +1,33 @@
+---
+title: frame_switch
+slug: sdk-reference/browser-automation/frame-switch
+---
+
+Switch the working context to an iframe. Exactly one parameter is required.
+
+```python
+# By CSS selector
+await page.frame_switch(selector="#payment-iframe")
+
+# By frame name
+await page.frame_switch(name="checkout")
+
+# By index
+await page.frame_switch(index=0)
+```
+
+## Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` | No | CSS selector for the iframe element. |
+| `name` | `str` | No | The `name` attribute of the iframe. |
+| `index` | `int` | No | Zero-based index of the iframe on the page. |
+
+<Note>
+Exactly one of `selector`, `name`, or `index` must be provided.
+</Note>
+
+## Returns `dict[str, Any]`
+
+Frame metadata for the switched-to iframe.
