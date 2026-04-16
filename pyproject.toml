@@ -53,6 +53,7 @@ dependencies = [
     "pypdf>=6.7.5,<7",
     "pdfplumber>=0.11.0,<0.12",
     "fastmcp>=3.2.0,<4",
+    "openai-agents>=0.13.4,<0.14",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
     "anthropic>=0.50.0,<0.89",
@@ -79,16 +80,6 @@ dependencies = [
     "PyJWT>=2.12.0",
     "tornado>=6.5.5",
     "aiosqlite>=0.21.0,<0.23",
-]
-
-# Optional extras gate capabilities that are dormant in this stack. The
-# copilot extra pulls openai-agents, required once the copilot runtime is
-# wired up in the activation PR. Until then, any environment that imports
-# skyvern.forge.sdk.copilot (tests, dev activation) should install
-# `skyvern[copilot]` instead of plain `skyvern`.
-[project.optional-dependencies]
-copilot = [
-    "openai-agents>=0.13.4,<0.14",
 ]
 
 [dependency-groups]
