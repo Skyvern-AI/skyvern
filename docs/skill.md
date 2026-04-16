@@ -173,7 +173,7 @@ skyvern workflow run --id wf_xxx        # Run a workflow
 ## Key references
 
 - [API Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): First task in 5 minutes
-- [SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference): All methods and types (Python + TypeScript)
+- [SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference.md): All methods and types (Python + TypeScript)
 - [MCP Server Setup](https://skyvern.com/docs/going-to-production/mcp.md): Connect AI assistants
 - [Workflow Blocks Reference](https://skyvern.com/docs/multi-step-automations/workflow-blocks-reference.md): All block types
 - [Task Parameters](https://skyvern.com/docs/running-automations/task-parameters.md): All task options
