@@ -94,6 +94,8 @@ The referenced block must be a terminal block — it cannot have a `next_block_l
 
 Several blocks accept an `error_code_mapping` parameter. This is an object mapping custom error codes to natural language descriptions. Skyvern evaluates each description against the current page state and surfaces matching errors in the block output.
 
+You can also define `error_code_mapping` at the **workflow level** (alongside `parameters` and `blocks`). Workflow-level mappings are inherited by every block. When a block defines the same key, the block-level value takes precedence. See the [error handling guide](/going-to-production/error-handling#in-workflows) for full examples.
+
 ```json
 {
   "error_code_mapping": {

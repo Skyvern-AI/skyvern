@@ -380,7 +380,54 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 
 ### In workflows
 
-Add `error_code_mapping` to individual blocks (navigation, task, validation):
+You can define `error_code_mapping` at two levels:
+
+- **Workflow level** — applies to every block in the workflow.
+- **Block level** — applies only to that block. When a block defines a mapping for the same key as the workflow, the block-level value takes precedence.
+
+This lets you set shared error codes once at the workflow level and override them on specific blocks when needed.
+
+#### Workflow-level mapping
+
+Add `error_code_mapping` at the top of the workflow definition, next to `parameters` and `blocks`:
+
+<CodeGroup>
+```json JSON
+{
+  "parameters": [],
+  "error_code_mapping": {
+    "maintenance": "The website is down for maintenance or unavailable",
+    "session_expired": "The session has expired or timed out"
+  },
+  "blocks": [
+    {
+      "block_type": "navigation",
+      "label": "login_step",
+      "url": "https://vendor-portal.example.com/login",
+      "navigation_goal": "Log in using the stored credentials"
+    }
+  ]
+}
+```
+
+```yaml YAML
+parameters: []
+error_code_mapping:
+  maintenance: "The website is down for maintenance or unavailable"
+  session_expired: "The session has expired or timed out"
+blocks:
+  - block_type: navigation
+    label: login_step
+    url: "https://vendor-portal.example.com/login"
+    navigation_goal: "Log in using the stored credentials"
+```
+</CodeGroup>
+
+Every block in this workflow inherits the `maintenance` and `session_expired` error codes without repeating them.
+
+#### Block-level mapping
+
+Add `error_code_mapping` to individual blocks (navigation, task, validation). Block-level entries override workflow-level entries for the same key:
 
 <Note>
 The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual workflow definitions—JSON does not support comments.
@@ -389,6 +436,9 @@ The JSON examples below include comments (`//`) for clarity. Remove comments bef
 <CodeGroup>
 ```json JSON
 {
+  "error_code_mapping": {
+    "maintenance": "The website is down for maintenance or unavailable"
+  },
   "blocks": [
     {
       "block_type": "navigation",
@@ -415,23 +465,29 @@ The JSON examples below include comments (`//`) for clarity. Remove comments bef
 ```
 
 ```yaml YAML
-- block_type: navigation
-  label: login_step
-  url: "https://vendor-portal.example.com/login"
-  navigation_goal: "Log in using the stored credentials"
-  error_code_mapping:
-    login_failed: "Login credentials are incorrect or account is locked"
-    mfa_required: "Two-factor authentication is being requested"
-    captcha_blocked: "CAPTCHA is displayed and cannot be bypassed"
+error_code_mapping:
+  maintenance: "The website is down for maintenance or unavailable"
 
-- block_type: navigation
-  label: download_invoice
-  navigation_goal: "Download the invoice for {{invoice_date}}"
-  error_code_mapping:
-    invoice_not_found: "No invoice found for the specified date"
-    download_failed: "Invoice exists but download button is broken or missing"
+blocks:
+  - block_type: navigation
+    label: login_step
+    url: "https://vendor-portal.example.com/login"
+    navigation_goal: "Log in using the stored credentials"
+    error_code_mapping:
+      login_failed: "Login credentials are incorrect or account is locked"
+      mfa_required: "Two-factor authentication is being requested"
+      captcha_blocked: "CAPTCHA is displayed and cannot be bypassed"
+
+  - block_type: navigation
+    label: download_invoice
+    navigation_goal: "Download the invoice for {{invoice_date}}"
+    error_code_mapping:
+      invoice_not_found: "No invoice found for the specified date"
+      download_failed: "Invoice exists but download button is broken or missing"
 ```
 </CodeGroup>
+
+In this example, both blocks inherit the workflow-level `maintenance` code and add their own block-specific codes. If `login_step` also defined `maintenance`, its block-level value would take precedence over the workflow-level one.
 
 ### Where the error code appears
 

@@ -12732,6 +12732,15 @@
             "type": "string",
             "nullable": true,
             "title": "Finally Block Label"
+          },
+          "error_code_mapping": {
+            "type": "object",
+            "nullable": true,
+            "title": "Error Code Mapping",
+            "description": "A mapping of custom error codes to natural-language descriptions applied at the workflow level. Block-level mappings override workflow-level entries for the same key.",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         },
         "type": "object",
@@ -12910,6 +12919,15 @@
             "type": "string",
             "nullable": true,
             "title": "Finally Block Label"
+          },
+          "error_code_mapping": {
+            "type": "object",
+            "nullable": true,
+            "title": "Error Code Mapping",
+            "description": "A mapping of custom error codes to natural-language descriptions applied at the workflow level. Block-level mappings override workflow-level entries for the same key.",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         },
         "type": "object",
