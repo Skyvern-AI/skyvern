@@ -126,11 +126,11 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         {parameter.key}
                       </span>
                       {parameter.parameterType === "workflow" ? (
-                        <span className="text-sm text-slate-400">
+                        <span className="shrink-0 text-sm text-slate-400">
                           {getLabelForWorkflowParameterType(parameter.dataType)}
                         </span>
                       ) : (
-                        <span className="text-sm text-slate-400">
+                        <span className="shrink-0 text-sm text-slate-400">
                           {parameter.parameterType === "onepassword" ||
                           parameter.parameterType === "secret" ||
                           parameter.parameterType === "creditCardData"
@@ -139,7 +139,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex shrink-0 items-center gap-2">
                       <MixerVerticalIcon
                         className="cursor-pointer"
                         onClick={() => {
