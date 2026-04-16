@@ -50,10 +50,21 @@ export function validateScheduleParameters(
   const errors: Record<string, string> = {};
   for (const parameter of parameters) {
     if (!isScheduleParameter(parameter)) continue;
-    if (!isRequired(parameter)) continue;
     const value = values[parameter.key];
-    if (isMissingRequiredValue(parameter, value)) {
+    if (isRequired(parameter) && isMissingRequiredValue(parameter, value)) {
       errors[parameter.key] = "Required";
+      continue;
+    }
+    if (
+      parameter.workflow_parameter_type === "json" &&
+      typeof value === "string" &&
+      value.trim() !== ""
+    ) {
+      try {
+        JSON.parse(value);
+      } catch {
+        errors[parameter.key] = "Invalid JSON";
+      }
     }
   }
   return errors;
