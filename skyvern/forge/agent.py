@@ -121,6 +121,7 @@ from skyvern.utils.prompt_engine import (
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
 from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -422,7 +423,7 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
-    @traced()
+    @traced(name="skyvern.agent.execute_step")
     async def execute_step(
         self,
         organization: Organization,
@@ -1083,7 +1084,7 @@ class ForgeAgent:
             )
             return True
 
-    @traced()
+    @traced(name="skyvern.agent.step")
     async def agent_step(
         self,
         task: Task,
@@ -1096,6 +1097,19 @@ class ForgeAgent:
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
+        # task_id, step_id, workflow_run_id, organization_id overlap with auto-
+        # attached context attrs from @traced. Kept because the Task/Step objects
+        # are authoritative — context can lag if populated asynchronously.
+        _step_span = otel_trace.get_current_span()
+        _step_span.set_attribute("task_id", task.task_id)
+        _step_span.set_attribute("step_id", step.step_id)
+        _step_span.set_attribute("step_order", step.order)
+        _step_span.set_attribute("step_retry", step.retry_index)
+        _step_span.set_attribute("engine", str(engine))
+        if task.workflow_run_id:
+            _step_span.set_attribute("workflow_run_id", task.workflow_run_id)
+        if task.organization_id:
+            _step_span.set_attribute("organization_id", task.organization_id)
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
             extract_action_prompt=None,
@@ -1540,6 +1554,10 @@ class ForgeAgent:
                 if is_page_level_scroll:
                     wait_time = 0.0
 
+                _step_span.add_event(
+                    "action.post_wait",
+                    attributes={"wait_time_ms": int(wait_time * 1000), "action_idx": action_idx},
+                )
                 await asyncio.sleep(wait_time)
                 if not is_page_level_scroll:
                     await self.record_artifacts_after_action(task, step, browser_state, engine, action)
@@ -2480,6 +2498,7 @@ class ForgeAgent:
                 exc_info=True,
             )
 
+    @traced(name="skyvern.agent.record_artifacts_after_action")
     async def record_artifacts_after_action(
         self,
         task: Task,
@@ -2684,6 +2703,7 @@ class ForgeAgent:
             scroll=scroll,
         )
 
+    @traced(name="skyvern.agent.scrape_and_prompt")
     async def build_and_record_step_prompt(
         self,
         task: Task,
@@ -2693,6 +2713,11 @@ class ForgeAgent:
         *,
         persist_artifacts: bool = True,
     ) -> tuple[ScrapedPage, str, bool, str]:
+        _scrape_span = otel_trace.get_current_span()
+        _scrape_span.set_attribute("engine", str(engine))
+        _scrape_span.set_attribute("pre_scraped", False)
+        if task.url:
+            _scrape_span.set_attribute("page_url", strip_query_params(task.url))
         # Check if we have pre-scraped data from parallel verification optimization
         context = skyvern_context.current()
         scraped_page: ScrapedPage | None = None
@@ -2712,6 +2737,7 @@ class ForgeAgent:
                     num_elements=len(scraped_page.elements),
                     age_seconds=age_seconds,
                 )
+                _scrape_span.set_attribute("pre_scraped", True)
                 # Clear the cached data
                 context.next_step_pre_scraped_data = None
 
@@ -2834,8 +2860,12 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
 
+        _scrape_span.set_attribute("element_count", len(scraped_page.elements))
+        _scrape_span.set_attribute("prompt_name", prompt_name)
+        _scrape_span.set_attribute("use_caching", bool(use_caching))
         return scraped_page, extract_action_prompt, use_caching, prompt_name
 
+    @traced(name="skyvern.agent.persist_artifacts")
     async def _persist_scrape_artifacts(
         self,
         *,
@@ -2848,6 +2878,10 @@ class ForgeAgent:
         Persist the core scrape artifacts (HTML + element metadata) for a step.
         This is used both for regular runs and when adopting a speculative plan.
         """
+        _artifacts_span = otel_trace.get_current_span()
+        _artifacts_span.set_attribute("use_artifact_bundling", bool(context and context.use_artifact_bundling))
+        _artifacts_span.set_attribute("element_count", len(scraped_page.elements))
+        _artifacts_span.set_attribute("html_bytes", len(scraped_page.html) if scraped_page.html else 0)
 
         element_tree_format = ElementTreeFormat.HTML
         element_tree_in_prompt = self._build_element_tree_for_prompt(
@@ -3104,6 +3138,7 @@ class ForgeAgent:
                 exc_info=True,
             )
 
+    @traced(name="skyvern.agent.prompt_build")
     async def _build_extract_action_prompt(
         self,
         task: Task,
@@ -3595,6 +3630,7 @@ class ForgeAgent:
         )
         return None
 
+    @traced(name="skyvern.agent.cleanup")
     async def clean_up_task(
         self,
         task: Task,
@@ -3610,6 +3646,11 @@ class ForgeAgent:
         """
         send the task response to the webhook callback url
         """
+        _cleanup_span = otel_trace.get_current_span()
+        # task_id, workflow_run_id auto-attached by @traced from SkyvernContext.
+        _cleanup_span.set_attribute("close_browser_on_completion", bool(close_browser_on_completion))
+        _cleanup_span.set_attribute("need_call_webhook", bool(need_call_webhook))
+        _cleanup_span.set_attribute("need_final_screenshot", bool(need_final_screenshot))
         # refresh the task from the db to get the latest status
         try:
             refreshed_task = await app.DATABASE.tasks.get_task(

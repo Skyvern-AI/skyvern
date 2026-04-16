@@ -30,6 +30,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
 )
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
+from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
 
@@ -68,14 +69,23 @@ def _build_user_context(
     debug_run_info_text: str,
     user_message: str,
 ) -> str:
-    """Render untrusted context into the user message with code fencing."""
+    """Render untrusted context into the user message with code fencing.
+
+    Every argument is treated as untrusted and passed through
+    ``escape_code_fences`` before the template interpolates it into a
+    triple-backtick block. Without this, a value containing a literal
+    ``` would close the fence early and let the model see the rest as
+    system-level content (the classic code-fence breakout). The old
+    copilot path in ``workflow_copilot.py`` and ``feasibility_gate.py``
+    both apply the same guard.
+    """
     return prompt_engine.load_prompt(
         template="workflow-copilot-user",
-        workflow_yaml=workflow_yaml or "",
-        chat_history=chat_history_text,
-        global_llm_context=global_llm_context or "",
-        debug_run_info=debug_run_info_text,
-        user_message=user_message,
+        workflow_yaml=escape_code_fences(workflow_yaml or ""),
+        chat_history=escape_code_fences(chat_history_text),
+        global_llm_context=escape_code_fences(global_llm_context or ""),
+        debug_run_info=escape_code_fences(debug_run_info_text),
+        user_message=escape_code_fences(user_message),
     )
 
 

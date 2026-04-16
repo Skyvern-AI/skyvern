@@ -915,7 +915,7 @@ class WorkflowService:
 
         return None
 
-    @traced()
+    @traced(name="skyvern.workflow.execute")
     async def execute_workflow(
         self,
         workflow_run_id: str,

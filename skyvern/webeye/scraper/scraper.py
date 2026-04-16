@@ -4,6 +4,7 @@ import json
 from collections import defaultdict
 
 import structlog
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
@@ -20,9 +21,10 @@ from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
@@ -136,7 +138,7 @@ def build_element_dict(
     return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
 
 
-@traced()
+@traced(name="skyvern.agent.scrape_retry")
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
@@ -173,7 +175,6 @@ async def scrape_website(
 
     :raises Exception: When scraping fails after maximum retries.
     """
-
     try:
         num_retry += 1
         return await scrape_web_unsafe(
@@ -269,6 +270,7 @@ def _should_use_page_ready_wait() -> bool:
     return bool(context and context.enable_page_ready_wait)
 
 
+@traced(name="skyvern.agent.scrape")
 async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
@@ -357,13 +359,30 @@ async def scrape_web_unsafe(
         except Exception:
             LOG.warning("Failed to get current x, y position of the page", exc_info=True)
 
-        screenshots = await SkyvernFrame.take_split_screenshots(
-            page=page,
-            url=url,
-            draw_boxes=draw_boxes,
-            max_number=max_screenshot_number,
-            scroll=scroll,
-        )
+        _tracer = otel_trace.get_tracer("skyvern")
+        with _tracer.start_as_current_span("skyvern.agent.screenshot") as _ss_span:
+            apply_context_attrs(_ss_span)
+            # Hardcoded since this is an inline span, not a @traced method.
+            # Update if scrape_web_unsafe is renamed.
+            _ss_span.set_attribute("code.function", "scrape_web_unsafe.screenshot")
+            _ss_span.set_attribute("code.namespace", __name__)
+            _ss_span.set_attribute("max_screenshot_number", max_screenshot_number)
+            _ss_span.set_attribute("draw_boxes", draw_boxes)
+            _ss_span.set_attribute("scroll", scroll)
+            try:
+                screenshots = await SkyvernFrame.take_split_screenshots(
+                    page=page,
+                    url=url,
+                    draw_boxes=draw_boxes,
+                    max_number=max_screenshot_number,
+                    scroll=scroll,
+                )
+                _ss_span.set_attribute("screenshot_count", len(screenshots))
+                _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
+            except Exception as e:
+                _ss_span.record_exception(e)
+                _ss_span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
+                raise
 
         # scroll back to the original x, y position of the page
         if x is not None and y is not None:
@@ -393,6 +412,12 @@ async def scrape_web_unsafe(
             url=url,
             exc_info=True,
         )
+
+    _scrape_span = otel_trace.get_current_span()
+    _scrape_span.set_attribute("element_count", len(elements))
+    _scrape_span.set_attribute("html_bytes", len(html) if html else 0)
+    _scrape_span.set_attribute("text_bytes", len(text_content) if text_content else 0)
+    _scrape_span.set_attribute("page_url", strip_query_params(url))
 
     return ScrapedPage(
         elements=elements,
@@ -497,7 +522,7 @@ async def add_frame_interactable_elements(
     return elements, element_tree
 
 
-@traced()
+@traced(name="skyvern.agent.element_tree")
 async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,

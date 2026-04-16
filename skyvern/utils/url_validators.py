@@ -8,6 +8,23 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException
 
 
+def strip_query_params(url: str) -> str:
+    """Return scheme://host/path with query string, fragment, and userinfo removed.
+
+    Used for span attributes where we want page identity without leaking PII.
+    Strips: query params, fragments, and userinfo (user:password@) from netloc.
+    Returns empty string for empty or unparseable input.
+    """
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    port_str = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port_str}{parsed.path}"
+
+
 def prepend_scheme_and_validate_url(url: str) -> str:
     if not url:
         return url

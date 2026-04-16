@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, List
 
 import pyotp
 import structlog
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
@@ -391,7 +392,7 @@ class ActionHandler:
         cls._teardown_action_types[action_type] = handler
 
     @staticmethod
-    @traced()
+    @traced(name="skyvern.agent.action")
     async def handle_action(
         scraped_page: ScrapedPage,
         task: Task,
@@ -399,6 +400,12 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        # task_id, step_id auto-attached by @traced from SkyvernContext
+        _action_span = otel_trace.get_current_span()
+        _action_span.set_attribute("action_type", str(action.action_type))
+        _action_span.set_attribute("step_order", step.order)
+        if getattr(action, "element_id", None):
+            _action_span.set_attribute("element_id", action.element_id)
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
@@ -2171,7 +2178,7 @@ async def handle_terminate_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.complete_verification")
 async def handle_complete_action(
     action: actions.CompleteAction,
     page: Page,

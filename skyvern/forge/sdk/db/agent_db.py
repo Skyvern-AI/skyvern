@@ -32,6 +32,7 @@ from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
 )
+from skyvern.forge.sdk.trace import traced
 
 LOG = structlog.get_logger()
 
@@ -222,12 +223,14 @@ class AgentDB(BaseAlchemyDB):
     async def get_latest_step(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_latest_step(*args, **kwargs)
 
+    @traced(name="skyvern.db.update_step")
     async def update_step(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.update_step(*args, **kwargs)
 
     async def clear_task_failure_reason(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.clear_task_failure_reason(*args, **kwargs)
 
+    @traced(name="skyvern.db.update_task")
     async def update_task(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.update_task(*args, **kwargs)
 
@@ -397,6 +400,7 @@ class AgentDB(BaseAlchemyDB):
     async def get_task_generation_by_prompt_hash(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_params.get_task_generation_by_prompt_hash(*args, **kwargs)
 
+    @traced(name="skyvern.db.create_action")
     async def create_action(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_params.create_action(*args, **kwargs)
 
@@ -429,9 +433,11 @@ class AgentDB(BaseAlchemyDB):
 
     # -- Artifact delegates --
 
+    @traced(name="skyvern.db.create_artifact")
     async def create_artifact(self, *args: Any, **kwargs: Any) -> Any:
         return await self.artifacts.create_artifact(*args, **kwargs)
 
+    @traced(name="skyvern.db.bulk_create_artifacts")
     async def bulk_create_artifacts(self, *args: Any, **kwargs: Any) -> Any:
         return await self.artifacts.bulk_create_artifacts(*args, **kwargs)
 

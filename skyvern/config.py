@@ -110,6 +110,11 @@ class Settings(BaseSettings):
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 5.0
+    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
+    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
+    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
+    # Per-environment canary; default off until we are confident.
+    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]

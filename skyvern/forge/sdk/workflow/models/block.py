@@ -601,7 +601,7 @@ class Block(BaseModel, abc.ABC):
         """Return block-level error codes for unexpected failures. Override in subclasses."""
         return []
 
-    @traced()
+    @traced(name="skyvern.block.execute")
     async def execute_safe(
         self,
         workflow_run_id: str,
