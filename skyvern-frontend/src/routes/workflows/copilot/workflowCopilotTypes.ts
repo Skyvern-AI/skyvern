@@ -53,7 +53,10 @@ export interface WorkflowCopilotClearProposedWorkflowRequest {
 export type WorkflowCopilotStreamMessageType =
   | "processing_update"
   | "response"
-  | "error";
+  | "error"
+  | "tool_call"
+  | "tool_result"
+  | "condensing";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -72,6 +75,28 @@ export interface WorkflowCopilotStreamResponseUpdate {
 export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
+}
+
+export interface WorkflowCopilotToolCallUpdate {
+  type: "tool_call";
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  iteration: number;
+  tool_call_id: string;
+}
+
+export interface WorkflowCopilotToolResultUpdate {
+  type: "tool_result";
+  tool_name: string;
+  success: boolean;
+  summary: string;
+  iteration: number;
+  tool_call_id: string;
+}
+
+export interface WorkflowCopilotCondensingUpdate {
+  type: "condensing";
+  status: "started" | "completed";
 }
 
 export interface WorkflowYAMLConversionRequest {
