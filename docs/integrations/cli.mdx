@@ -219,6 +219,37 @@ Skills are plain markdown files. You can load them into any AI coding tool that 
 skyvern skill copy skyvern -o .codex/skills/
 ```
 
+**Hermes** — copy the skill to your active Hermes profile's skills directory. The skill needs Hermes-compatible frontmatter (`metadata.hermes.requires_tools` instead of `allowed-tools`):
+
+```bash
+# Create the skill directory
+mkdir -p ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation
+
+# Copy the skill body (you'll need to replace the frontmatter — see below)
+skyvern skill copy skyvern -o /tmp/skyvern-skill
+```
+
+Replace the frontmatter in the copied `SKILL.md` with:
+
+```yaml
+---
+name: skyvern-browser-automation
+description: "Browser automation via Skyvern — scrape pages, fill forms, extract data, run workflows."
+metadata:
+  hermes:
+    tags: [browser, automation, skyvern]
+    requires_tools: [terminal]
+---
+```
+
+Then move it into place: `cp /tmp/skyvern-skill/SKILL.md ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation/SKILL.md`
+
+Verify with `hermes skills list | grep skyvern`.
+
+<Tip>
+When both the Skyvern MCP server and the CLI skill are configured, Hermes prefers MCP tools over shelling out to the CLI — which is faster. The skill's judgment procedure (task classification, step ordering) works with either execution path.
+</Tip>
+
 **Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
 
 </Accordion>

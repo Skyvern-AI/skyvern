@@ -1,7 +1,7 @@
 ---
 title: MCP Server
 subtitle: Connect AI assistants to browser automation via Model Context Protocol
-description: Install and configure Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, VS Code, and other AI tools can run browser automations.
+description: Install and configure Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, Hermes, and other AI tools can run browser automations.
 slug: going-to-production/mcp
 keywords:
   - MCP
@@ -10,6 +10,8 @@ keywords:
   - Cursor
   - Windsurf
   - VS Code
+  - Hermes
+  - MCPorter
   - AI assistant
   - tools
   - stdio
@@ -156,6 +158,47 @@ x-api-key = "SKYVERN_API_KEY"
 ```
 
 </Tab>
+<Tab title="Hermes">
+
+Using the Skyvern CLI (recommended — writes to all Hermes profiles automatically):
+
+```bash
+pip install skyvern
+export SKYVERN_API_KEY="YOUR_SKYVERN_API_KEY"
+skyvern setup hermes
+```
+
+Or add manually to `~/.hermes/config.yaml` (and any profile configs under `~/.hermes/profiles/*/config.yaml`):
+
+```yaml
+mcp_servers:
+  skyvern:
+    url: "https://api.skyvern.com/mcp/"
+    headers:
+      x-api-key: "YOUR_SKYVERN_API_KEY"
+```
+
+Verify the connection:
+
+```bash
+hermes mcp test skyvern
+```
+
+For local stdio mode (self-hosted), use `skyvern setup hermes --local` instead.
+
+</Tab>
+<Tab title="MCPorter">
+
+MCPorter auto-discovers Skyvern from your existing MCP client configs (Cursor, Claude Code, Windsurf, etc.). If you've already set up Skyvern in any of those clients, MCPorter finds it automatically — no extra configuration needed.
+
+To check what MCPorter can discover:
+
+```bash
+pip install skyvern
+skyvern setup mcporter
+```
+
+</Tab>
 </Tabs>
 
 That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
@@ -184,6 +227,7 @@ Today it can update:
 - Cursor `~/.cursor/mcp.json`
 - Windsurf `~/.codeium/windsurf/mcp_config.json`
 - Codex `~/.codex/config.toml`
+- Hermes `~/.hermes/config.yaml` (global + per-profile configs)
 
 `skyvern mcp switch` preserves the existing transport shape. Remote configs keep using `https://.../mcp/`; local stdio configs keep `SKYVERN_BASE_URL` and `SKYVERN_API_KEY` in the launched process environment. After switching, restart your AI client.
 
@@ -310,6 +354,8 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 | **Codex** (project) | TOML | `.codex/config.toml` in trusted project |
 | **Cursor** | JSON | `~/.cursor/mcp.json` |
 | **Windsurf** | JSON | `~/.codeium/windsurf/mcp_config.json` |
+| **Hermes** (global) | YAML | `~/.hermes/config.yaml` |
+| **Hermes** (per-profile) | YAML | `~/.hermes/profiles/<name>/config.yaml` |
 
 </Accordion>
 
