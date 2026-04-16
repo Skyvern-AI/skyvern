@@ -157,7 +157,7 @@ AI-enhanced Playwright methods on a live browser page. Pass a CSS selector for s
 - [frame_main](https://skyvern.com/docs/sdk-reference/browser-automation/frame-main): Switch back to the main page frame (Python only)
 - [frame_list](https://skyvern.com/docs/sdk-reference/browser-automation/frame-list): List all frames on the page with metadata (Python only)
 
-### Browser Automation - Page Agent
+### Browser Automation - Agent
 
 Run full tasks and workflows in the context of the current browser page. All methods wait for completion.
 
