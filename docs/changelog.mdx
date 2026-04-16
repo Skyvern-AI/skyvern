@@ -13,6 +13,7 @@ keywords:
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-of-april-14%2C-2026" className="cl-sidebar-link">Week of Apr 14, 2026</a>
     <a href="#v1-0-22-—-february-26%2C-2026" className="cl-sidebar-link">v1.0.22 — Feb 26, 2026</a>
     <a href="#v1-0-21-—-february-24%2C-2026" className="cl-sidebar-link">v1.0.21 — Feb 24, 2026</a>
     <a href="#v1-0-18-—-february-19%2C-2026" className="cl-sidebar-link">v1.0.18 — Feb 19, 2026</a>
@@ -24,6 +25,31 @@ keywords:
   <div className="cl-content">
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
+
+<Update label="Week of April 14, 2026" description="Saudi Arabia proxy, workflow error mapping, smarter caching, and reliability fixes">
+
+## New features
+
+- **Saudi Arabia Proxy Location** — Added `RESIDENTIAL_SA` as a proxy geolocation option for automations targeting Saudi Arabian websites.
+
+- **Workflow-Level Error Code Mapping** — Workflows now support an `error_code_mapping` field that all blocks inherit automatically. Block-level mappings still take precedence, giving you a single place to define default error handling without repeating it on every block. ([#5506](https://github.com/Skyvern-AI/skyvern/pull/5506))
+
+## Improvements
+
+- **Smarter Extraction Cache Keys** — The extraction cache now normalizes session-volatile tokens (random UUIDs, CSRF values, nonce query params, timestamps) before hashing cache keys. Semantically identical page visits now share cached extraction results, improving cache hit rates across workflow re-runs. ([#5504](https://github.com/Skyvern-AI/skyvern/pull/5504))
+
+- **Reduced Rate-Limit Errors on Extraction Prompts** — Extraction prompts are now capped in size before being sent to the LLM. Oversized `previous_extracted_information`, `extracted_information_schema`, and element trees are truncated rather than sent whole, significantly reducing `429 RESOURCE_EXHAUSTED` errors on high-volume workflows. ([#5502](https://github.com/Skyvern-AI/skyvern/pull/5502))
+
+## Bug fixes
+
+- Fixed CSV parsing failing on files whose first header row exceeded ~1 MB, causing valid wide-format CSVs to be rejected with "Could not determine delimiter". ([#5510](https://github.com/Skyvern-AI/skyvern/pull/5510))
+- Fixed a browser automation crash on sites with cross-origin stylesheets (e.g. MUI-based apps). CSS hover styles are now parsed entirely in memory without modifying the DOM, preventing React reconciliation errors that caused the agent to loop until max steps. ([#5508](https://github.com/Skyvern-AI/skyvern/pull/5508))
+- Fixed context-window overflow failures being misdiagnosed. Steps that fail due to oversized input are now correctly counted and short-circuit to a clear `LLM_ERROR` failure reason instead of triggering a redundant LLM-based failure analysis. ([#5507](https://github.com/Skyvern-AI/skyvern/pull/5507))
+- Fixed workflow file-download blocks losing their configured `download_suffix` at task finalization, causing downloaded files to be persisted without the expected filename suffix. ([#5499](https://github.com/Skyvern-AI/skyvern/pull/5499))
+- Fixed cached scripts for non-ATS workflows incorrectly generating `fill_form()` calls, which defeated the performance benefits of caching by delegating back to AI at runtime. ([#5497](https://github.com/Skyvern-AI/skyvern/pull/5497))
+- Fixed the pagination navigator on the Workflow Past Runs and Run History pages being right-aligned instead of centered.
+
+</Update>
 
 <Update label="v1.0.22 — February 26, 2026" description="Adaptive caching, Workflow Trigger block, CLI signup, and more">
 
