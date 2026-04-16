@@ -221,6 +221,9 @@ def _update_enforcement_from_tool(
     if tool_name == "navigate_browser" and output.get("ok"):
         ctx.navigate_called = True
         ctx.observation_after_navigate = False
+        # Re-arm the per-cycle latch so the nudge can fire on the NEXT
+        # navigate-without-observe, not only the first one.
+        ctx.navigate_enforcement_done = False
 
     if tool_name in _OBSERVATION_TOOLS:
         ctx.observation_after_navigate = True

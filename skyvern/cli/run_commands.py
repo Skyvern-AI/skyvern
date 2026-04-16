@@ -5,7 +5,10 @@ import logging
 import os
 import shutil
 import subprocess
-from typing import Annotated, List, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, List, Literal, Optional
+
+if TYPE_CHECKING:
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
 import psutil
 import typer
@@ -14,6 +17,8 @@ from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm
 from starlette.middleware import Middleware
+from starlette.responses import JSONResponse as StarletteJSONResponse
+from starlette.responses import Response as StarletteResponse
 
 from skyvern.cli.commands._output import output_error
 from skyvern.cli.commands._tty import is_interactive
@@ -21,6 +26,7 @@ from skyvern.cli.console import console
 from skyvern.cli.core.client import close_skyvern
 from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware, close_auth_db
 from skyvern.cli.core.result import set_concise_responses
+from skyvern.cli.core.server_card import build_server_card
 from skyvern.cli.core.session_manager import close_current_session, set_stateless_http_mode
 from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
 from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime
@@ -292,6 +298,34 @@ def run_dev() -> None:
     console.print("\n[dim]Use 'skyvern stop all' to stop the services.[/dim]")
 
 
+class _ServerCardMiddleware:
+    """Serve /.well-known/mcp/server-card.json for HTTP MCP transports."""
+
+    def __init__(self, app: "ASGIApp", transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
+        self.app = app
+        self.transport_type = transport_type
+        card_host = "localhost" if host in ("0.0.0.0", "::") else host
+        host_part = f"[{card_host}]" if ":" in card_host else card_host
+        endpoint_url = os.environ.get("SKYVERN_MCP_PUBLIC_URL") or f"http://{host_part}:{port}{mcp_path}"
+        self.card = build_server_card(self.transport_type, endpoint_url)
+
+    async def __call__(self, scope: "Scope", receive: "Receive", send: "Send") -> None:
+        if scope["type"] == "http" and scope["path"] == "/.well-known/mcp/server-card.json":
+            cors_headers = {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, x-api-key",
+            }
+            request_method = scope.get("method", "GET")
+            if request_method == "OPTIONS":
+                response = StarletteResponse(status_code=204, headers=cors_headers)
+            else:
+                response = StarletteJSONResponse(content=self.card, headers=cors_headers)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 @run_app.command(name="mcp")
 def run_mcp(
     transport: Annotated[
@@ -334,7 +368,10 @@ def run_mcp(
             mcp.run(transport="stdio")
             return
 
-        middleware = [Middleware(MCPAPIKeyMiddleware)]
+        middleware = [
+            Middleware(_ServerCardMiddleware, transport_type=transport, host=host, port=port, mcp_path=path),
+            Middleware(MCPAPIKeyMiddleware),
+        ]
         mcp.run(
             transport=transport,
             host=host,

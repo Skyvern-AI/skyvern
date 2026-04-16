@@ -15,6 +15,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 import typer
+import yaml
 from dotenv import load_dotenv
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -172,6 +173,31 @@ def _mask_key(key: str) -> str:
     if len(key) > 2:
         return key[:2] + "****"
     return "****"
+
+
+def _load_yaml_config(path: Path) -> dict | None:
+    """Load a YAML config file. Returns empty dict if missing, ``None`` on parse failure."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            console.print(
+                f"[yellow]Warning: {path} is not a YAML mapping — skipping to preserve original file[/yellow]"
+            )
+            return None
+        return data
+    except Exception:
+        console.print(f"[yellow]Warning: could not parse {path} — skipping update to preserve original file[/yellow]")
+        return None
+
+
+def _save_yaml_config(path: Path, data: dict) -> None:
+    """Write a dict to a YAML config file, creating parent dirs as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
 
 def _mask_secrets(entry: dict) -> dict:
@@ -994,3 +1020,182 @@ def setup_windsurf(
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
     )
+
+
+@setup_app.command("hermes")
+def setup_hermes(
+    api_key: str | None = _api_key_opt,
+    dry_run: bool = _dry_run_opt,
+    yes: bool = _yes_opt,
+    local: bool = _local_opt,
+    url: str | None = _url_opt,
+) -> None:
+    """Register Skyvern MCP with Hermes (remote by default, --local for stdio)."""
+    env_key, env_base_url = _get_env_credentials()
+    resolved_key = api_key or env_key
+
+    if local:
+        # Local stdio mode: Hermes spawns `skyvern run mcp` as a child process
+        local_key, local_base_url = _get_local_env_credentials()
+        resolved_local_key = api_key or local_key or resolved_key or ""
+        resolved_base_url = local_base_url or ""
+        if not resolved_base_url:
+            console.print(
+                "[red]No base URL found for local mode. Set [bold]SKYVERN_BASE_URL[/bold] "
+                "(e.g. http://localhost:8000) in your environment, then retry.[/red]"
+            )
+            raise typer.Exit(code=1)
+        if not resolved_local_key:
+            console.print(
+                "[red]No API key found. Run [bold]skyvern login[/bold] or set "
+                "[bold]SKYVERN_API_KEY[/bold] in your environment, then retry.[/red]"
+            )
+            raise typer.Exit(code=1)
+        local_entry = _build_local_mcp_entry(resolved_local_key, resolved_base_url)
+        hermes_entry: dict = {
+            "command": local_entry.get("command", sys.executable),
+            "args": local_entry.get("args", ["-m", "skyvern", "run", "mcp"]),
+        }
+        if local_entry.get("env"):
+            hermes_entry["env"] = local_entry["env"]
+    else:
+        # Remote HTTP mode: Hermes connects to hosted MCP server
+        if not resolved_key:
+            console.print(
+                "[red]No API key found. Run [bold]skyvern login[/bold] or set "
+                "[bold]SKYVERN_API_KEY[/bold] in your environment, then retry.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        mcp_url = url or _DEFAULT_REMOTE_URL
+        parsed = urlparse(mcp_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            console.print(f"[red]Invalid URL: {mcp_url} (must be a full URL like https://api.skyvern.com/mcp/)[/red]")
+            raise typer.Exit(code=1)
+
+        hermes_entry = {
+            "url": mcp_url,
+            "headers": {"x-api-key": resolved_key},
+        }
+
+    # Discover all Hermes config locations: global + per-profile
+    hermes_home = Path.home() / ".hermes"
+    config_paths: list[Path] = [hermes_home / "config.yaml"]
+    profiles_dir = hermes_home / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir()):
+            profile_config = profile_dir / "config.yaml"
+            if profile_dir.is_dir() and profile_config.exists():
+                config_paths.append(profile_config)
+
+    if dry_run:
+        for cp in config_paths:
+            data = _load_yaml_config(cp)
+            if data is None:
+                console.print(f"[yellow]Skipping {cp} (could not parse)[/yellow]")
+                continue
+            servers = data.get("mcp_servers")
+            if servers is not None and not isinstance(servers, dict):
+                console.print(f"[yellow]Skipping {cp} (mcp_servers is not a mapping)[/yellow]")
+                continue
+            if servers is None:
+                data["mcp_servers"] = {}
+            server_key = _find_server_key(data["mcp_servers"], preferred="skyvern") or "skyvern"
+            data["mcp_servers"][server_key] = hermes_entry
+            masked_data = copy.deepcopy(data)
+            masked_data["mcp_servers"][server_key] = _mask_secrets(masked_data["mcp_servers"][server_key])
+            console.print(f"[bold]{cp}[/bold]")
+            console.print(Syntax(yaml.dump(masked_data, default_flow_style=False, sort_keys=False), "yaml"))
+        console.print(f"[yellow]Dry run -- no changes written to {len(config_paths)} config(s)[/yellow]")
+        return
+
+    if not yes:
+        paths_str = "\n".join(f"  - {cp}" for cp in config_paths)
+        console.print(f"[bold]Will add Skyvern MCP to {len(config_paths)} Hermes config(s):[/bold]\n{paths_str}")
+        if not typer.confirm("Apply changes?"):
+            raise typer.Abort()
+
+    updated: list[str] = []
+    backups: list[Path] = []
+    for cp in config_paths:
+        data = _load_yaml_config(cp)
+        if data is None:
+            console.print(f"[yellow]Skipping {cp} (could not parse)[/yellow]")
+            continue
+        servers = data.get("mcp_servers")
+        if servers is not None and not isinstance(servers, dict):
+            console.print(f"[yellow]Skipping {cp} (mcp_servers is not a mapping)[/yellow]")
+            continue
+        if servers is None:
+            data["mcp_servers"] = {}
+        server_key = _find_server_key(data["mcp_servers"], preferred="skyvern") or "skyvern"
+        if data["mcp_servers"].get(server_key) == hermes_entry:
+            continue
+        data["mcp_servers"][server_key] = hermes_entry
+        if cp.exists():
+            backup = _backup_config_path(cp)
+            shutil.copy2(cp, backup)
+            backups.append(backup)
+        _save_yaml_config(cp, data)
+        updated.append(str(cp))
+
+    if not updated:
+        console.print("[green]All Hermes configs are already up to date.[/green]")
+        return
+
+    masked_key = _mask_key(resolved_key) if resolved_key else "(none)"
+    updated_str = "\n".join(f"  {p}" for p in updated)
+    console.print(
+        Panel(
+            f"[bold green]Hermes configured![/bold green]\n\n"
+            f"Updated {len(updated)} config(s):\n{updated_str}\n\nAPI key: {masked_key}",
+            border_style="green",
+        )
+    )
+
+
+@setup_app.command("mcporter")
+def setup_mcporter() -> None:
+    """Show MCPorter integration status (MCPorter auto-discovers from existing MCP configs)."""
+    console.print(
+        Panel(
+            "[bold]MCPorter Integration[/bold]\n\n"
+            "MCPorter automatically discovers MCP servers from existing tool configs.\n"
+            "No additional configuration is needed — just ensure at least one tool is set up.",
+            border_style="blue",
+        )
+    )
+
+    config_checks: list[tuple[str, str, Path]] = [
+        ("Claude Desktop", "skyvern setup claude", _claude_desktop_config_path()),
+        ("Claude Code (global)", "skyvern setup claude-code --global", _claude_code_global_config_path()),
+        ("Claude Code (project)", "skyvern setup claude-code --project", _claude_code_project_config_path()),
+        ("Cursor", "skyvern setup cursor", _cursor_config_path()),
+        ("Windsurf", "skyvern setup windsurf", _windsurf_config_path()),
+    ]
+
+    found: list[str] = []
+    for name, _cmd, path in config_checks:
+        try:
+            if not path.exists():
+                continue
+            cfg, err = _load_mcp_config(path)
+            if err or not cfg:
+                continue
+            servers = cfg.get("mcpServers", {})
+            if _find_server_key(servers, "skyvern"):
+                console.print(f"  [green]\u2713[/green] {name} \u2014 {path}")
+                found.append(name)
+        except Exception:
+            continue
+
+    if found:
+        console.print(f"\n[green]MCPorter can discover Skyvern from {len(found)} config(s).[/green]")
+    else:
+        console.print(
+            "\n[yellow]No existing Skyvern MCP configs found.[/yellow]\n"
+            "Set up at least one tool first:\n"
+            "  skyvern setup cursor\n"
+            "  skyvern setup claude-code\n"
+            "  skyvern setup claude"
+        )
