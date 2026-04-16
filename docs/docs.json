@@ -144,6 +144,14 @@
             ]
           },
           {
+            "group": "Multi-Step Automations",
+            "pages": [
+              "multi-step-automations/overview",
+              "multi-step-automations/actions-reference",
+              "multi-step-automations/managing-browsers"
+            ]
+          },
+          {
             "group": "Handling Authentication",
             "pages": [
               "credentials/store-credentials",
@@ -152,7 +160,7 @@
             ]
           },
           {
-            "group": "Multi-Step Automations",
+            "group": "Running Workflows",
             "pages": [
               "multi-step-automations/build-a-workflow",
               "multi-step-automations/workflow-blocks-reference",

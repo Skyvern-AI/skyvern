@@ -1,0 +1,560 @@
+---
+title: Build a Browser Automation
+subtitle: Step-by-step guide to multi-step automations with code
+description: Launch a cloud browser, interact with pages using AI and Playwright, chain agent tasks, and build complete browser automations in Python or TypeScript.
+slug: multi-step-automations/overview
+keywords:
+  - launch_cloud_browser
+  - get_working_page
+  - page.act
+  - page.extract
+  - page.validate
+  - page.agent.login
+  - page.agent.run_task
+  - selector fallback
+  - login then extract
+  - multi-page
+  - Playwright
+---
+
+A single `run_task` handles one goal on one page. When your automation needs to log in, navigate across pages, extract data, and download files, you build a browser automation.
+
+This guide walks through a real example: logging into a vendor portal, extracting invoice data, and downloading a PDF. Five steps:
+
+1. **Launch a browser** and get a page
+2. **Navigate and interact** with the page using AI actions, selectors, or both
+3. **Use the agent** for complex goals like login, multi-step tasks, and file downloads
+4. **Run the script** and check results
+5. **Close the browser** to release resources
+
+---
+
+## Step 1: Launch a browser and get a page
+
+Every automation starts by launching a cloud browser and getting a page. The browser is a Chromium instance hosted by Skyvern. The page is a Playwright page with AI methods added on top.
+
+<Info>
+Install the SDK first if you haven't:
+
+<CodeGroup>
+```bash Python
+pip install skyvern
+```
+
+```bash TypeScript
+npm install @skyvern/client
+```
+</CodeGroup>
+
+All code snippets below run inside an async function. See the [complete example](#complete-example) for the full runnable script.
+</Info>
+
+<CodeGroup>
+```python Python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+The browser stays alive until you call `browser.close()` or the session times out (default: 60 minutes). All pages inside it share cookies, localStorage, and auth state.
+
+For browser launch options (timeouts, proxies, connecting to local browsers), see [Managing Browsers](/multi-step-automations/managing-browsers).
+
+---
+
+## Step 2: Navigate and interact with the page
+
+Once you have a page, you can interact with it using standard Playwright, AI actions, or both.
+
+### Navigate
+
+<CodeGroup>
+```python Python
+await page.goto("https://vendor-portal.example.com")
+```
+
+```typescript TypeScript
+await page.goto("https://vendor-portal.example.com");
+```
+</CodeGroup>
+
+### Use AI actions (no selectors needed)
+
+Four methods let you interact with the page using natural language. Skyvern screenshots the page and determines which elements to target.
+
+<CodeGroup>
+```python Python
+# Perform any action
+await page.act("Click the login button")
+
+# Extract structured data
+data = await page.extract(
+    "Extract all product names and prices",
+    schema={
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "price": {"type": "number"},
+            },
+        },
+    },
+)
+
+# Check page state (returns True/False)
+is_logged_in = await page.validate("The user is logged in")
+
+# Ask the AI a question about the page
+answer = await page.prompt("What is the total at the bottom of the table?")
+```
+
+```typescript TypeScript
+// Perform any action
+await page.act("Click the login button");
+
+// Extract structured data
+const data = await page.extract({
+  prompt: "Extract all product names and prices",
+  schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        price: { type: "number" },
+      },
+    },
+  },
+});
+
+// Check page state (returns true/false)
+const isLoggedIn = await page.validate("The user is logged in");
+
+// Ask the AI a question about the page
+const answer = await page.prompt("What is the total at the bottom of the table?");
+```
+</CodeGroup>
+
+### Use selectors with AI fallback
+
+`click`, `fill`, and `select_option` accept both a CSS selector and an AI prompt. The selector runs first. If it fails, the AI takes over.
+
+<CodeGroup>
+```python Python
+# Selector only (fast, deterministic)
+await page.click("#submit-button")
+await page.fill("#email", value="user@example.com")
+
+# AI only (no selector needed, resilient to layout changes)
+await page.click(prompt="Click the 'Submit' button")
+await page.fill(prompt="Fill 'user@example.com' in the email field")
+
+# Both - selector first, AI fallback (best for production)
+await page.click("#submit-button", prompt="Click the 'Submit' button")
+await page.fill("#email", value="user@example.com", prompt="Fill the email field")
+```
+
+```typescript TypeScript
+// Selector only (fast, deterministic)
+await page.click("#submit-button");
+await page.fill("#email", "user@example.com");
+
+// AI only (no selector needed, resilient to layout changes)
+await page.click({ prompt: "Click the 'Submit' button" });
+await page.fill({ prompt: "Fill 'user@example.com' in the email field" });
+
+// Both - selector first, AI fallback (best for production)
+await page.click("#submit-button", { prompt: "Click the 'Submit' button" });
+await page.fill("#email", "user@example.com", { prompt: "Fill the email field" });
+```
+</CodeGroup>
+
+### Mix Playwright and AI
+
+Standard Playwright methods work directly. Use selectors where you know the DOM, AI where you don't.
+
+<CodeGroup>
+```python Python
+await page.goto("https://example.com/login")
+await page.fill("#username", value="demo@example.com")  # Playwright - known selector
+await page.fill("#password", value="s3cur3-p4ss")       # Playwright - known selector
+await page.click(prompt="Click the sign-in button")      # AI - button text varies
+await page.wait_for_selector("#dashboard")                # Playwright - wait for page load
+data = await page.extract("Extract the account balance")  # AI - table layout varies
+```
+
+```typescript TypeScript
+await page.goto("https://example.com/login");
+await page.fill("#username", "demo@example.com");         // Playwright - known selector
+await page.fill("#password", "s3cur3-p4ss");              // Playwright - known selector
+await page.click({ prompt: "Click the sign-in button" }); // AI - button text varies
+await page.waitForSelector("#dashboard");                  // Playwright - wait for page load
+const data = await page.extract({ prompt: "Extract the account balance" }); // AI
+```
+</CodeGroup>
+
+---
+
+## Step 3: Use the agent for complex goals
+
+For multi-step goals ("log in with 2FA", "navigate to billing and download the invoice"), hand off to the agent. The agent runs a full AI task loop inside your page, preserving all browser state.
+
+### Login with stored credentials
+
+<CodeGroup>
+```python Python
+await page.agent.login(
+    credential_type="skyvern",
+    credential_id="cred_123"
+)
+```
+
+```typescript TypeScript
+await page.agent.login("skyvern", { credentialId: "cred_123" });
+```
+</CodeGroup>
+
+The agent handles multi-page login flows, CAPTCHAs, and 2FA automatically. Four credential providers: `skyvern` (built-in vault), `bitwarden`, `onepassword`, `azure_vault`. Store credentials via the [Credentials API](/sdk-reference/credentials/create-credential).
+
+### Run a multi-step task
+
+<CodeGroup>
+```python Python
+result = await page.agent.run_task(
+    "Go to the billing page and extract all invoice details",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "invoice_number": {"type": "string"},
+            "amount": {"type": "string"},
+        },
+    },
+)
+print(result.output)  # {"invoice_number": "INV-2025-042", "amount": "$1,250.00"}
+```
+
+```typescript TypeScript
+const result = await page.agent.runTask(
+  "Go to the billing page and extract all invoice details",
+  {
+    dataExtractionSchema: {
+      type: "object",
+      properties: {
+        invoice_number: { type: "string" },
+        amount: { type: "string" },
+      },
+    },
+  },
+);
+console.log(result.output); // {"invoice_number": "INV-2025-042", "amount": "$1,250.00"}
+```
+</CodeGroup>
+
+After the agent finishes, you take back control. The page retains all state:
+
+<CodeGroup>
+```python Python
+await page.agent.run_task("Navigate to the settings page")
+# Agent is done - use direct page actions
+settings = await page.extract("Extract all notification preferences")
+await page.click("#save-button")
+```
+
+```typescript TypeScript
+await page.agent.runTask("Navigate to the settings page");
+// Agent is done - use direct page actions
+const settings = await page.extract({ prompt: "Extract all notification preferences" });
+await page.click("#save-button");
+```
+</CodeGroup>
+
+### Download files
+
+<CodeGroup>
+```python Python
+result = await page.agent.download_files(
+    "Download the Q4 2025 financial report",
+    download_suffix=".pdf",
+    download_timeout=30,
+)
+
+for file in result.downloaded_files or []:
+    print(f"Downloaded: {file.url}")
+```
+
+```typescript TypeScript
+const result = await page.agent.downloadFiles(
+  "Download the Q4 2025 financial report",
+  { downloadSuffix: ".pdf", downloadTimeout: 30 },
+);
+
+for (const file of result.downloadedFiles ?? []) {
+  console.log(`Downloaded: ${file.url}`);
+}
+```
+</CodeGroup>
+
+### Run a workflow on the page
+
+If you have built a workflow, run it on a page you already control:
+
+<CodeGroup>
+```python Python
+await page.agent.login(credential_type="skyvern", credential_id="cred_123")
+result = await page.agent.run_workflow(
+    "wpid_monthly_report",
+    parameters={"month": "2025-03"}
+)
+```
+
+```typescript TypeScript
+await page.agent.login("skyvern", { credentialId: "cred_123" });
+const result = await page.agent.runWorkflow("wpid_monthly_report", {
+  parameters: { month: "2025-03" },
+});
+```
+</CodeGroup>
+
+**`agent.run_workflow` vs `skyvern.run_workflow`:** The top-level `run_workflow` opens its own browser. Use `agent.run_workflow` when you need to log in first or do setup before the workflow runs.
+
+---
+
+## Step 4: Run and get results
+
+### Run the script
+
+<CodeGroup>
+```bash Python
+python your_automation.py
+```
+
+```bash TypeScript
+npx tsx your_automation.ts
+```
+</CodeGroup>
+
+You'll see the browser session URL in the console output. Open it in your browser to watch the automation run in real time.
+
+### Understand the response
+
+Every agent call returns a response with the same shape:
+
+| Field | Description |
+|-------|-------------|
+| `run_id` | Unique identifier (`tsk_*` for tasks, `wr_*` for workflows) |
+| `status` | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
+| `output` | Extracted data matching your schema |
+| `failure_reason` | Error description if the run failed |
+| `recording_url` | Video recording of the entire execution |
+| `screenshot_urls` | Screenshots captured at each step |
+| `downloaded_files` | Files downloaded during the run (with URLs) |
+| `step_count` | Number of AI steps taken (affects billing) |
+
+<CodeGroup>
+```python Python
+result = await page.agent.run_task("Extract the account balance")
+
+if result.status == "completed":
+    print(result.output)
+    print(f"Recording: {result.recording_url}")
+    print(f"Steps used: {result.step_count}")
+elif result.status == "failed":
+    print(f"Failed: {result.failure_reason}")
+```
+
+```typescript TypeScript
+const result = await page.agent.runTask("Extract the account balance");
+
+if (result.status === "completed") {
+  console.log(result.output);
+  console.log(`Recording: ${result.recording_url}`);
+  console.log(`Steps used: ${result.step_count}`);
+} else if (result.status === "failed") {
+  console.log(`Failed: ${result.failure_reason}`);
+}
+```
+</CodeGroup>
+
+### View results in the Cloud UI
+
+Every run appears in the [Runs page](https://app.skyvern.com/runs). Click any run to see:
+- **Recording** - video of the browser session
+- **Actions** - step-by-step timeline with screenshots and AI reasoning
+- **Output** - extracted data as JSON
+- **Artifacts** - screenshots, HAR files, generated code
+
+### Close the browser
+
+Always close the browser when done to release cloud resources:
+
+<CodeGroup>
+```python Python
+await browser.close()
+```
+
+```typescript TypeScript
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+## Complete example
+
+Putting it all together: log into a vendor portal, extract invoices, and download a statement.
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+
+    # Navigate
+    await page.goto("https://vendor-portal.example.com")
+
+    # Login with stored credentials
+    await page.agent.login(credential_type="skyvern", credential_id="cred_abc123")
+
+    # Extract data using a mix of Playwright and AI
+    await page.click("#billing-tab")
+    invoices = await page.extract(
+        "Extract all invoice numbers, dates, and amounts",
+        schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "invoice_number": {"type": "string"},
+                    "date": {"type": "string"},
+                    "amount": {"type": "string"},
+                },
+            },
+        },
+    )
+
+    # Download a file
+    result = await page.agent.download_files(
+        "Download the latest monthly statement",
+        download_suffix=".pdf",
+    )
+
+    # Check results
+    print(f"Found {len(invoices)} invoices")
+    for inv in invoices:
+        print(f"  {inv['invoice_number']}: {inv['amount']}")
+
+    for file in result.downloaded_files or []:
+        print(f"Downloaded: {file.url}")
+
+    await browser.close()
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+async function main() {
+  const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+  const browser = await skyvern.launchCloudBrowser();
+  const page = await browser.getWorkingPage();
+
+  // Navigate
+  await page.goto("https://vendor-portal.example.com");
+
+  // Login with stored credentials
+  await page.agent.login("skyvern", { credentialId: "cred_abc123" });
+
+  // Extract data using a mix of Playwright and AI
+  await page.click("#billing-tab");
+  const invoices = await page.extract({
+    prompt: "Extract all invoice numbers, dates, and amounts",
+    schema: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          invoice_number: { type: "string" },
+          date: { type: "string" },
+          amount: { type: "string" },
+        },
+      },
+    },
+  });
+
+  // Download a file
+  const result = await page.agent.downloadFiles(
+    "Download the latest monthly statement",
+    { downloadSuffix: ".pdf" },
+  );
+
+  // Check results
+  console.log(`Found ${invoices.length} invoices`);
+  for (const inv of invoices) {
+    console.log(`  ${inv.invoice_number}: ${inv.amount}`);
+  }
+
+  for (const file of result.downloadedFiles ?? []) {
+    console.log(`Downloaded: ${file.url}`);
+  }
+
+  await browser.close();
+}
+
+main();
+```
+</CodeGroup>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Actions Reference"
+    icon="list"
+    href="/multi-step-automations/actions-reference"
+  >
+    Every page action and agent method with parameters and return types
+  </Card>
+  <Card
+    title="Managing Browsers"
+    icon="browser"
+    href="/multi-step-automations/managing-browsers"
+  >
+    Launch options, multiple tabs, proxies, connecting to local browsers
+  </Card>
+</CardGroup>
+
+<CardGroup cols={2}>
+  <Card
+    title="Store Credentials"
+    icon="key"
+    href="/sdk-reference/credentials/create-credential"
+  >
+    Set up credentials for automated login with the agent
+  </Card>
+  <Card
+    title="SDK Reference"
+    icon="code"
+    href="/sdk-reference/browser-automation/act"
+  >
+    Full method documentation for Page, Agent, and Browser
+  </Card>
+</CardGroup>

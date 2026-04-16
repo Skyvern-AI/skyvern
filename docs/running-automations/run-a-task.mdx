@@ -485,7 +485,7 @@ curl -X GET "https://api.skyvern.com/v1/runs/RUN_ID/artifacts?artifact_type=scre
     icon="sliders"
     href="/running-automations/task-parameters"
   >
-    Configure engines, proxies, extraction schemas, etc when running a task
+    Configure engines, proxies, extraction schemas, and more
   </Card>
   <Card
     title="Extract Structured Data"
@@ -493,5 +493,26 @@ curl -X GET "https://api.skyvern.com/v1/runs/RUN_ID/artifacts?artifact_type=scre
     href="/running-automations/extract-structured-data"
   >
     Define a schema to get typed JSON output from your automations
+  </Card>
+</CardGroup>
+
+### Need more than a single task?
+
+When your automation spans multiple pages, requires login before extraction, or chains several actions together, you have two options:
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser Automation (Code)"
+    icon="code"
+    href="/sdk-reference/browser-automation/launch-cloud-browser"
+  >
+    Chain Page, Agent, and Browser operations in Python or TypeScript. Full Playwright control with AI fallback.
+  </Card>
+  <Card
+    title="Workflow Builder (Visual)"
+    icon="window-maximize"
+    href="/cloud/building-workflows/build-a-workflow"
+  >
+    Build multi-step automations visually in the Cloud UI with drag-and-drop blocks. Run them from code with `run_workflow`.
   </Card>
 </CardGroup>
