@@ -6,11 +6,8 @@ import {
   WorkflowModel,
 } from "@/routes/workflows/types/workflowTypes";
 
-export type FileParserFileType = "csv" | "excel" | "pdf" | "image" | "docx";
-
 export type FileParserNodeData = NodeBaseData & {
   fileUrl: string;
-  fileType: FileParserFileType;
   jsonSchema: string;
   model: WorkflowModel | null;
 };
@@ -22,7 +19,6 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   editable: true,
   label: "",
   fileUrl: "",
-  fileType: "csv",
   continueOnFailure: false,
   jsonSchema: "null",
   model: null,

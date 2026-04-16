@@ -864,7 +864,6 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
-          fileType: block.file_type ?? "csv",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           model: block.model,
         },
@@ -2512,7 +2511,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: node.data.fileType,
+        file_type: "csv", // Backend will auto-detect based on file extension
         json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
