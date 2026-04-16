@@ -69,7 +69,19 @@ async def save_workflow_run_logs(workflow_run_id: str) -> None:
     if not settings.ENABLE_LOG_ARTIFACTS:
         return
 
-    context = skyvern_context.ensure_context()
+    # This function is called from ``update_workflow_run`` in the DB layer, which
+    # can be invoked from cleanup paths that don't carry a skyvern_context (e.g.
+    # the Temporal timeout activity). The in-memory log buffer lives on the
+    # context, so without one there's nothing to flush — degrade to a no-op
+    # instead of crashing the surrounding DB update.
+    context = skyvern_context.current()
+    if context is None:
+        LOG.debug(
+            "No skyvern context available, skipping workflow run log save",
+            workflow_run_id=workflow_run_id,
+        )
+        return
+
     log = context.log
     organization_id = context.organization_id
 
