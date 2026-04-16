@@ -111,6 +111,8 @@ export const helpTooltips = {
     ...baseHelpTooltipContent,
     fileUrl:
       "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
+    fileType:
+      "The format of the file to parse. Auto-detected from the URL extension when possible.",
   },
   wait: {
     ...baseHelpTooltipContent,

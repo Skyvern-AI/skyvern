@@ -410,7 +410,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "csv" | "excel" | "pdf" | "image" | "docx";
   json_schema: Record<string, unknown> | null;
 };
 

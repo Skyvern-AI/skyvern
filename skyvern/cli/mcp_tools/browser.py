@@ -154,7 +154,14 @@ async def skyvern_click(
             "Include visual cues, position, or surrounding text when the page has similar elements."
         ),
     ] = None,
-    selector: Annotated[str | None, Field(description="CSS selector or XPath for the element to click")] = None,
+    selector: Annotated[
+        str | None,
+        Field(
+            description="Standard CSS selector or XPath for the element to click. "
+            "jQuery pseudo-selectors like :contains(), :eq(), :first are NOT valid. "
+            "Use standard CSS: 'button.class', 'a[href*=\"pdf\"]', '#id', ':nth-of-type()'."
+        ),
+    ] = None,
     timeout: Annotated[
         int,
         Field(
