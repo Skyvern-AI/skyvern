@@ -61,9 +61,11 @@ function CodeEditor({
 }: Props) {
   const viewRef = useRef<EditorView | null>(null);
   const [internalValue, setInternalValue] = useState(value);
+  const latestValueRef = useRef(value);
 
   useEffect(() => {
     setInternalValue(value);
+    latestValueRef.current = value;
   }, [value]);
 
   const debouncedOnChange = useDebouncedCallback((newValue: string) => {
@@ -72,6 +74,7 @@ function CodeEditor({
 
   const handleChange = (newValue: string) => {
     setInternalValue(newValue);
+    latestValueRef.current = newValue;
     debouncedOnChange(newValue);
   };
 
@@ -159,7 +162,8 @@ function CodeEditor({
         if (!viewRef.current) viewRef.current = viewUpdate.view;
       }}
       onBlur={() => {
-        debouncedOnChange.flush();
+        debouncedOnChange.cancel();
+        onChange?.(latestValueRef.current);
       }}
     />
   );
