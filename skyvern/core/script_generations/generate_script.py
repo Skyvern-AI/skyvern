@@ -7,6 +7,7 @@ Generate a runnable Skyvern workflow script.
 from __future__ import annotations
 
 import hashlib
+import json
 import keyword
 import re
 from collections import deque
@@ -23,6 +24,11 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
     generate_workflow_parameters_schema,
     hydrate_input_text_actions_with_field_names,
+)
+from skyvern.core.script_generations.parameter_reference_guard import (
+    HallucinatedParameterError,
+    log_or_raise_guard_result,
+    validate_context_parameter_refs,
 )
 from skyvern.forge import app
 from skyvern.schemas.workflows import FileStorageType
@@ -52,6 +58,77 @@ class CodeGenResult:
     source_code: str
     blocks_created: int
     blocks_failed: int
+
+
+# ----- SKY-8965: valid-keys collection for the parameter-reference guard --------
+
+# `\s+` tolerates any indentation a future formatter might pick; `[^=]+?` for
+# the type annotation captures complex types like `Optional[str]` and `list[str]`
+# without silently dropping those fields from the valid-keys set.
+_SCHEMA_FIELD_RE = re.compile(r"^\s+(\w+)\s*:\s*[^=]+?=\s*Field\(", re.MULTILINE)
+
+
+def _collect_declared_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Return the set of all parameter keys from the workflow definition.
+
+    Includes workflow, output, and context parameters — any parameter type whose
+    key can legally appear as `context.parameters['key']` at runtime. Secret
+    parameter types (aws_secret, bitwarden_*, etc.) are included too since their
+    presence in the valid-keys set only reduces false-positive guard violations.
+    """
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if key:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_upstream_schema_keys(blocks: list[dict[str, Any]]) -> frozenset[str]:
+    """Return the set of keys introduced by upstream blocks' data_schema.
+
+    Extracts `properties` keys from any block's `data_schema` (extract-info
+    blocks and task blocks with a `data_extraction_goal`). Handles both dict
+    schemas and JSON-encoded string schemas (BlockYAML allows either). Recurses
+    into ForLoop children (`loop_blocks`) since extract-info nested inside a
+    loop still contributes keys referenced by the generated script.
+
+    Phase 1 treats these as globally valid (a reference to `invoice_date` is OK
+    anywhere in the script, not just blocks that come after the block that
+    declares it). Phase 2 may tighten this to per-block ordering.
+    """
+    keys: set[str] = set()
+    for block in blocks or []:
+        schema = block.get("data_schema")
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except (ValueError, TypeError):
+                schema = None
+        if isinstance(schema, dict):
+            props = schema.get("properties")
+            if isinstance(props, dict):
+                keys.update(str(k) for k in props.keys())
+        nested = block.get("loop_blocks")
+        if isinstance(nested, list):
+            keys |= _collect_upstream_schema_keys(nested)
+    return frozenset(keys)
+
+
+def _collect_synthesized_field_keys(schema_code: str) -> frozenset[str]:
+    """Extract field names from a generated `GeneratedWorkflowParameters` class.
+
+    Parses the schema code by regex for the `name: type = Field(...)` pattern.
+    Returns an empty frozenset for the empty-schema case (`pass` body).
+    """
+    if not schema_code:
+        return frozenset()
+    return frozenset(_SCHEMA_FIELD_RE.findall(schema_code))
 
 
 def _build_existing_field_assignments(
@@ -3366,7 +3443,36 @@ async def generate_workflow_script_python_code(
     ]
 
     module = cst.Module(body=module_body)
-    return CodeGenResult(source_code=module.code, blocks_created=blocks_created, blocks_failed=blocks_failed)
+    source_code = module.code
+
+    # SKY-8965 Phase 1: validate `context.parameters[X]` references against the
+    # expanded valid-keys set (declared params ∪ upstream block schema keys ∪
+    # synthesized `GeneratedWorkflowParameters` fields). Phase 1 logs violations
+    # only — we want production telemetry before raising in Phase 2. Wrapped in
+    # try/except so a guard bug can never break script generation.
+    try:
+        declared_keys = _collect_declared_param_keys(workflow)
+        upstream_keys = _collect_upstream_schema_keys(blocks)
+        synthesized_keys = _collect_synthesized_field_keys(generated_schema)
+        guard_result = validate_context_parameter_refs(
+            code=source_code,
+            declared_param_keys=declared_keys,
+            upstream_schema_keys=upstream_keys,
+            synthesized_keys=synthesized_keys,
+        )
+        log_or_raise_guard_result(
+            guard_result,
+            raise_on_violation=False,
+            workflow_permanent_id=workflow.get("workflow_permanent_id"),
+            workflow_run_id=run_id,
+        )
+    except HallucinatedParameterError:
+        # Phase 2 will raise this intentionally — don't swallow it.
+        raise
+    except Exception:
+        LOG.warning("parameter_reference_guard_failed_to_run", exc_info=True)
+
+    return CodeGenResult(source_code=source_code, blocks_created=blocks_created, blocks_failed=blocks_failed)
 
 
 async def create_or_update_script_block(
