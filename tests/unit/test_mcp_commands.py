@@ -500,6 +500,7 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     monkeypatch.setattr("skyvern.cli.mcp_commands._cursor_config_path", lambda: tmp_path / "missing-cursor.json")
     monkeypatch.setattr("skyvern.cli.mcp_commands._windsurf_config_path", lambda: tmp_path / "missing-windsurf.json")
     monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: codex_config)
+    monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-hermes.yaml")
 
     discovered, missing = _discover_switch_targets()
 
@@ -509,4 +510,4 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     assert "Codex" in discovered_by_name
     assert discovered_by_name["Codex"].config_format == "codex_toml"
     assert discovered_by_name["Codex"].entry_key == "skyvern"
-    assert {name for name, _ in missing} == {"Claude Desktop", "Cursor", "Windsurf"}
+    assert {name for name, _ in missing} == {"Claude Desktop", "Cursor", "Windsurf", "Hermes"}

@@ -130,8 +130,9 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     assert kwargs["path"] == "/mcp"
     assert kwargs["stateless_http"] is True
     middleware = kwargs["middleware"]
-    assert len(middleware) == 1
-    assert middleware[0].cls is run_commands.MCPAPIKeyMiddleware
+    assert len(middleware) == 2
+    assert middleware[0].cls is run_commands._ServerCardMiddleware
+    assert middleware[1].cls is run_commands.MCPAPIKeyMiddleware
     set_stateless.assert_has_calls([call(True), call(False)])
     cleanup_blocking.assert_called_once()
 
