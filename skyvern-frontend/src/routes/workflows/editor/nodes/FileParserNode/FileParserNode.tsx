@@ -1,8 +1,15 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
-import { type FileParserNode } from "./types";
+import { type FileParserNode, type FileParserFileType } from "./types";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { cn } from "@/util/utils";
@@ -15,6 +22,45 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { ModelSelector } from "@/components/ModelSelector";
 import { useRecordingStore } from "@/store/useRecordingStore";
+
+const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
+  { value: "csv", label: "CSV" },
+  { value: "excel", label: "Excel" },
+  { value: "pdf", label: "PDF" },
+  { value: "image", label: "Image" },
+  { value: "docx", label: "DOCX" },
+];
+
+const FILE_EXTENSION_TO_TYPE: Record<string, FileParserFileType> = {
+  csv: "csv",
+  xlsx: "excel",
+  xls: "excel",
+  pdf: "pdf",
+  png: "image",
+  jpg: "image",
+  jpeg: "image",
+  gif: "image",
+  webp: "image",
+  docx: "docx",
+};
+
+function detectFileTypeFromUrl(url: string): FileParserFileType | null {
+  try {
+    const urlObj = new URL(url);
+    const pathname = urlObj.pathname;
+    const ext = pathname.split(".").pop()?.toLowerCase();
+    if (ext && ext in FILE_EXTENSION_TO_TYPE) {
+      return FILE_EXTENSION_TO_TYPE[ext] ?? null;
+    }
+  } catch {
+    // Not a valid URL; try plain extension match
+    const ext = url.split(".").pop()?.toLowerCase().split("?")[0];
+    if (ext && ext in FILE_EXTENSION_TO_TYPE) {
+      return FILE_EXTENSION_TO_TYPE[ext] ?? null;
+    }
+  }
+  return null;
+}
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { editable, label } = data;
@@ -29,6 +75,15 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<FileParserNode["data"]>({ id, editable });
   const recordingStore = useRecordingStore();
+
+  function handleFileUrlChange(value: string) {
+    const detected = detectFileTypeFromUrl(value);
+    if (detected) {
+      update({ fileUrl: value, fileType: detected });
+    } else {
+      update({ fileUrl: value });
+    }
+  }
 
   return (
     <div
@@ -83,11 +138,37 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
             <WorkflowBlockInput
               nodeId={id}
               value={data.fileUrl}
-              onChange={(value) => {
-                update({ fileUrl: value });
-              }}
+              onChange={handleFileUrlChange}
               className="nopan text-xs"
             />
+          </div>
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">File Type</Label>
+              <HelpTooltip content={helpTooltips["fileParser"]["fileType"]} />
+            </div>
+            <Select
+              value={data.fileType}
+              onValueChange={(value) => {
+                update({ fileType: value as FileParserFileType });
+              }}
+              disabled={!editable}
+            >
+              <SelectTrigger className="nopan w-36 text-xs">
+                <SelectValue placeholder="Select type" />
+              </SelectTrigger>
+              <SelectContent>
+                {FILE_TYPE_OPTIONS.map((option) => (
+                  <SelectItem
+                    key={option.value}
+                    value={option.value}
+                    className="text-xs"
+                  >
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <WorkflowDataSchemaInputGroup
             exampleValue={dataSchemaExampleForFileExtraction}
