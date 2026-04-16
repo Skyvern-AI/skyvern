@@ -15,6 +15,7 @@ from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+from opentelemetry import trace as otel_trace
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -51,12 +52,13 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.trace import traced
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
-try:
-    from opentelemetry import trace as _otel_trace
-except ImportError:  # pragma: no cover
-    _otel_trace = None  # type: ignore[assignment]
-
 LOG = structlog.get_logger()
+
+# Canonical span name for all LLM chokepoints. Milestone 1 of the agent
+# profiling project — keep consistent so SigNoz aggregations can query across
+# router / non-router / LLMCaller paths with a single filter.
+LLM_REQUEST_SPAN_NAME = "skyvern.llm.request"
+LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
@@ -64,6 +66,57 @@ CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termina
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
+
+
+def _enrich_llm_span(
+    span: otel_trace.Span,
+    *,
+    model: str,
+    prompt_name: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    reasoning_tokens: int = 0,
+    cached_tokens: int = 0,
+    latency_ms: int,
+    llm_cost: float = 0.0,
+) -> None:
+    """Set canonical attributes + emit llm.request.completed event on an LLM span.
+
+    Only called on success paths. Error paths set `status=error` as a custom
+    string attribute; the OTEL-native ``StatusCode.ERROR`` is set separately by
+    the ``@traced`` decorator when the re-raised exception propagates through it.
+    """
+    span.set_attribute("llm_model", model)
+    span.set_attribute("prompt_tokens", prompt_tokens)
+    span.set_attribute("completion_tokens", completion_tokens)
+    span.set_attribute("reasoning_tokens", reasoning_tokens)
+    span.set_attribute("cached_tokens", cached_tokens)
+    span.set_attribute("latency_ms", latency_ms)
+    span.set_attribute("status", "ok")
+    span.set_attribute("cache_hit", bool(cached_tokens))
+    span.set_attribute("llm_cost", llm_cost)
+    # Gen AI OTEL semantic conventions — enables auto-dashboards in providers
+    # that support the spec (Logfire, SigNoz gen_ai module).
+    # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
+    span.set_attribute("gen_ai.request.model", model)
+    span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
+    span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
+    span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
+    span.set_attribute("gen_ai.usage.cached_tokens", cached_tokens)
+    span.set_attribute("gen_ai.usage.cost", llm_cost)
+    span.add_event(
+        LLM_REQUEST_COMPLETED_EVENT,
+        attributes={
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cached_tokens": cached_tokens,
+            "latency_ms": latency_ms,
+            "llm_cost": llm_cost,
+            "prompt_name": prompt_name,
+        },
+    )
 
 
 def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
@@ -501,7 +554,7 @@ class LLMAPIHandlerFactory:
         )
         main_model_group = llm_config.main_model_group
 
-        @traced(tags=[llm_key])
+        @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             prompt_name: str,
@@ -532,7 +585,12 @@ class LLMAPIHandlerFactory:
                 The response from the LLM router.
             """
             _assert_step_thought_exclusive(step, thought)
-            start_time = time.time()
+            start_time = time.perf_counter()
+            _llm_span = otel_trace.get_current_span()
+            _llm_span.set_attribute("llm_key", llm_key)
+            _llm_span.set_attribute("llm_model", main_model_group)
+            _llm_span.set_attribute("prompt_name", prompt_name)
+            _llm_span.set_attribute("handler_type", "router")
 
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
@@ -780,10 +838,14 @@ class LLMAPIHandlerFactory:
                                 primary_model=main_model_group,
                                 fallback_model=response_model,
                             )
+                # Error paths only set status=error, not token/cost attrs via
+                # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
+                    _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "Context window exceeded",
                         llm_key=llm_key,
@@ -793,7 +855,8 @@ class LLMAPIHandlerFactory:
                     )
                     raise SkyvernContextWindowExceededError(model=main_model_group, prompt_name=prompt_name) from e
                 except ValueError as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "LLM token limit exceeded",
                         llm_key=llm_key,
@@ -802,8 +865,31 @@ class LLMAPIHandlerFactory:
                         duration_seconds=duration_seconds,
                     )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
+                except CancelledError:
+                    _duration = time.perf_counter() - start_time
+                    if is_speculative_step:
+                        _llm_span.set_attribute("status", "cancelled")
+                        LOG.debug(
+                            "LLM request cancelled (speculative step)",
+                            llm_key=llm_key,
+                            model=main_model_group,
+                            prompt_name=prompt_name,
+                            duration_seconds=_duration,
+                        )
+                        raise
+                    else:
+                        _llm_span.set_attribute("status", "error")
+                        LOG.error(
+                            "LLM request got cancelled",
+                            llm_key=llm_key,
+                            model=main_model_group,
+                            prompt_name=prompt_name,
+                            duration_seconds=_duration,
+                        )
+                        raise LLMProviderError(llm_key) from None
                 except Exception as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "LLM request failed unexpectedly",
                         llm_key=llm_key,
@@ -929,7 +1015,7 @@ class LLMAPIHandlerFactory:
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
-                duration_seconds = time.time() - start_time
+                duration_seconds = time.perf_counter() - start_time
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -947,6 +1033,18 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                )
+
+                _enrich_llm_span(
+                    _llm_span,
+                    model=model_used or main_model_group,
+                    prompt_name=prompt_name,
+                    prompt_tokens=int(prompt_tokens or 0),
+                    completion_tokens=int(completion_tokens or 0),
+                    reasoning_tokens=int(reasoning_tokens or 0),
+                    cached_tokens=int(cached_tokens or 0),
+                    latency_ms=int(duration_seconds * 1000),
+                    llm_cost=float(llm_cost or 0.0),
                 )
 
                 if step and is_speculative_step:
@@ -1016,7 +1114,7 @@ class LLMAPIHandlerFactory:
 
         assert isinstance(llm_config, LLMConfig)
 
-        @traced(tags=[llm_key])
+        @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler(
             prompt: str,
             prompt_name: str,
@@ -1035,7 +1133,12 @@ class LLMAPIHandlerFactory:
             system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
             _assert_step_thought_exclusive(step, thought)
-            start_time = time.time()
+            start_time = time.perf_counter()
+            _llm_span = otel_trace.get_current_span()
+            _llm_span.set_attribute("handler_type", "default")
+            _llm_span.set_attribute("llm_key", llm_key)
+            _llm_span.set_attribute("llm_model", llm_config.model_name)
+            _llm_span.set_attribute("prompt_name", prompt_name)
             active_parameters = base_parameters or {}
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
@@ -1245,10 +1348,14 @@ class LLMAPIHandlerFactory:
                         drop_params=True,  # Drop unsupported parameters gracefully
                         **active_parameters,
                     )
+                # Error paths only set status=error, not token/cost attrs via
+                # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
+                    _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "Context window exceeded",
                         llm_key=llm_key,
@@ -1262,6 +1369,7 @@ class LLMAPIHandlerFactory:
                     # so we log at debug level. Non-speculative cancellations are unexpected errors.
                     t_llm_cancelled = time.perf_counter()
                     if is_speculative_step:
+                        _llm_span.set_attribute("status", "cancelled")
                         LOG.debug(
                             "LLM request cancelled (speculative step)",
                             llm_key=llm_key,
@@ -1271,6 +1379,7 @@ class LLMAPIHandlerFactory:
                         )
                         raise
                     else:
+                        _llm_span.set_attribute("status", "error")
                         LOG.error(
                             "LLM request got cancelled",
                             llm_key=llm_key,
@@ -1280,7 +1389,8 @@ class LLMAPIHandlerFactory:
                         )
                         raise LLMProviderError(llm_key) from None
                 except Exception as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "LLM request failed unexpectedly",
                         llm_key=llm_key,
@@ -1400,7 +1510,7 @@ class LLMAPIHandlerFactory:
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
-                duration_seconds = time.time() - start_time
+                duration_seconds = time.perf_counter() - start_time
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1418,6 +1528,22 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                )
+
+                # actual_model is the response's model normalized by _normalize_llm_model.
+                # It's only None if response.model AND model_name were both falsy (broken
+                # config). The llm_config.model_name fallback satisfies mypy and is a no-op
+                # safety net — it matches the value already fed to _normalize_llm_model.
+                _enrich_llm_span(
+                    _llm_span,
+                    model=actual_model or llm_config.model_name,
+                    prompt_name=prompt_name,
+                    prompt_tokens=int(prompt_tokens or 0),
+                    completion_tokens=int(completion_tokens or 0),
+                    reasoning_tokens=int(reasoning_tokens or 0),
+                    cached_tokens=int(cached_tokens or 0),
+                    latency_ms=int(duration_seconds * 1000),
+                    llm_cost=float(llm_cost or 0.0),
                 )
 
                 if step and is_speculative_step:
@@ -1550,6 +1676,7 @@ class LLMCaller:
     def clear_tool_results(self) -> None:
         self.current_tool_results = []
 
+    @traced(name=LLM_REQUEST_SPAN_NAME)
     async def call(
         self,
         prompt: str | None = None,
@@ -1571,6 +1698,11 @@ class LLMCaller:
     ) -> dict[str, Any] | Any:
         _assert_step_thought_exclusive(step, thought)
         start_time = time.perf_counter()
+        _llm_span = otel_trace.get_current_span()
+        _llm_span.set_attribute("llm_key", self.llm_key)
+        _llm_span.set_attribute("llm_model", self.llm_config.model_name)
+        _llm_span.set_attribute("prompt_name", prompt_name or "<unknown>")
+        _llm_span.set_attribute("handler_type", "llm_caller")
         active_parameters = self.base_parameters or {}
         if parameters is None:
             parameters = LLMAPIHandlerFactory.get_api_parameters(self.llm_config)
@@ -1700,9 +1832,13 @@ class LLMCaller:
                 if use_message_history:
                     # only update message_history when the request is successful
                     self.message_history = messages
+            # Error paths only set status=error, not token/cost attrs via
+            # _enrich_llm_span — no response object exists so there's nothing to report.
             except litellm.exceptions.APIError as e:
+                _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
+                _llm_span.set_attribute("status", "error")
                 LOG.exception(
                     "Context window exceeded",
                     llm_key=self.llm_key,
@@ -1714,6 +1850,7 @@ class LLMCaller:
                 # so we log at debug level. Non-speculative cancellations are unexpected errors.
                 t_llm_cancelled = time.perf_counter()
                 if is_speculative_step:
+                    _llm_span.set_attribute("status", "cancelled")
                     LOG.debug(
                         "LLM request cancelled (speculative step)",
                         llm_key=self.llm_key,
@@ -1722,6 +1859,7 @@ class LLMCaller:
                     )
                     raise
                 else:
+                    _llm_span.set_attribute("status", "error")
                     LOG.error(
                         "LLM request got cancelled",
                         llm_key=self.llm_key,
@@ -1730,6 +1868,7 @@ class LLMCaller:
                     )
                     raise LLMProviderError(self.llm_key) from None
             except Exception as e:
+                _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key, cause=e) from e
 
@@ -1797,23 +1936,19 @@ class LLMCaller:
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
             )
 
-            # Propagate token stats to the current OTel span so they appear
-            # in Logfire traces (gen_ai semantic conventions).
-            if _otel_trace and call_stats:
-                span = _otel_trace.get_current_span()
-                if span and span.is_recording():
-                    _token_attrs = {
-                        "gen_ai.usage.input_tokens": call_stats.input_tokens,
-                        "gen_ai.usage.output_tokens": call_stats.output_tokens,
-                        "gen_ai.usage.reasoning_tokens": call_stats.reasoning_tokens,
-                        "gen_ai.usage.cached_tokens": call_stats.cached_tokens,
-                        "gen_ai.usage.cost": call_stats.llm_cost,
-                    }
-                    for attr_key, attr_val in _token_attrs.items():
-                        if attr_val is not None:
-                            span.set_attribute(attr_key, attr_val)
-                    span.set_attribute("gen_ai.request.model", self.llm_config.model_name)
-                    span.set_attribute("llm_key", self.llm_key)
+            # See comment on the non-router _enrich_llm_span call — same reasoning
+            # for the fallback to self.llm_config.model_name.
+            _enrich_llm_span(
+                _llm_span,
+                model=actual_model or self.llm_config.model_name,
+                prompt_name=prompt_name or "<unknown>",
+                prompt_tokens=int(call_stats.input_tokens or 0),
+                completion_tokens=int(call_stats.output_tokens or 0),
+                reasoning_tokens=int(call_stats.reasoning_tokens or 0),
+                cached_tokens=int(call_stats.cached_tokens or 0),
+                latency_ms=int(duration_seconds * 1000),
+                llm_cost=float(call_stats.llm_cost or 0.0),
+            )
 
             # Raw response is used for CUA engine LLM calls.
             if raw_response:

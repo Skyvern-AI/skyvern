@@ -392,6 +392,7 @@ class SkyvernFrame:
     def get_frame(self) -> Page | Frame:
         return self.frame
 
+    @traced(name="skyvern.browser.get_content")
     async def get_content(self, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
         async with asyncio.timeout(timeout):
             return await self.frame.content()
@@ -592,6 +593,7 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
 
+    @traced(name="skyvern.browser.wait_for_animation")
     async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
         try:
             await asyncio.sleep(before_wait_sec)

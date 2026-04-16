@@ -18,6 +18,7 @@ from skyvern.exceptions import (
     FailedToStopLoadingPage,
     MissingBrowserStatePage,
 )
+from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
@@ -452,6 +453,7 @@ class RealBrowserState(BrowserState):
             mode=ScreenshotMode.LITE,
         )
 
+    @traced(name="skyvern.browser.post_action_screenshot")
     async def take_post_action_screenshot(
         self,
         scrolling_number: int,

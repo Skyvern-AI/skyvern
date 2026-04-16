@@ -4,6 +4,7 @@ from typing import Any, Dict, Match
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
+from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 
 from skyvern.constants import EXTRACT_ACTION_SCROLL_AMOUNT, SCROLL_AMOUNT_MULTIPLIER
@@ -14,6 +15,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
     extract_totp_from_navigation_inputs,
     poll_otp_value,
@@ -242,10 +244,13 @@ def parse_action(
     raise UnsupportedActionType(action_type=action_type)
 
 
+@traced(name="skyvern.agent.parse_actions")
 def parse_actions(
     task: Task, step_id: str, step_order: int, scraped_page: ScrapedPage, json_response: list[Dict[str, Any]]
 ) -> list[Action]:
     actions: list[Action] = []
+    _span = otel_trace.get_current_span()
+    _span.set_attribute("raw_action_count", len(json_response))
     context = skyvern_context.ensure_context()
     totp_code = context.totp_codes.get(task.task_id)
     totp_code_required = bool(totp_code)
