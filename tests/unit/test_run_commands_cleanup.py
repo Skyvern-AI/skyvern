@@ -19,9 +19,9 @@ async def test_cleanup_mcp_resources_closes_auth_db(monkeypatch: pytest.MonkeyPa
     close_skyvern = AsyncMock()
     close_auth_db = AsyncMock()
 
-    monkeypatch.setattr(run_commands, "close_current_session", close_current_session)
-    monkeypatch.setattr(run_commands, "close_skyvern", close_skyvern)
-    monkeypatch.setattr(run_commands, "close_auth_db", close_auth_db)
+    monkeypatch.setattr("skyvern.cli.core.session_manager.close_current_session", close_current_session)
+    monkeypatch.setattr("skyvern.cli.core.client.close_skyvern", close_skyvern)
+    monkeypatch.setattr("skyvern.cli.core.mcp_http_auth.close_auth_db", close_auth_db)
 
     await run_commands._cleanup_mcp_resources()
 
@@ -38,9 +38,9 @@ async def test_cleanup_mcp_resources_closes_auth_db_on_skyvern_close_error(monke
     async def _failing_close_skyvern() -> None:
         raise RuntimeError("close failed")
 
-    monkeypatch.setattr(run_commands, "close_current_session", close_current_session)
-    monkeypatch.setattr(run_commands, "close_skyvern", _failing_close_skyvern)
-    monkeypatch.setattr(run_commands, "close_auth_db", close_auth_db)
+    monkeypatch.setattr("skyvern.cli.core.session_manager.close_current_session", close_current_session)
+    monkeypatch.setattr("skyvern.cli.core.client.close_skyvern", _failing_close_skyvern)
+    monkeypatch.setattr("skyvern.cli.core.mcp_http_auth.close_auth_db", close_auth_db)
 
     with pytest.raises(RuntimeError, match="close failed"):
         await run_commands._cleanup_mcp_resources()
@@ -90,8 +90,8 @@ def test_run_mcp_calls_blocking_cleanup_in_finally(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup_blocking)
     monkeypatch.setattr(run_commands.atexit, "register", register)
-    monkeypatch.setattr(run_commands.mcp, "run", run)
-    monkeypatch.setattr(run_commands, "set_stateless_http_mode", set_stateless)
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run", run)
+    monkeypatch.setattr("skyvern.cli.core.session_manager.set_stateless_http_mode", set_stateless)
 
     with pytest.raises(RuntimeError, match="boom"):
         run_commands.run_mcp()
@@ -103,6 +103,8 @@ def test_run_mcp_calls_blocking_cleanup_in_finally(monkeypatch: pytest.MonkeyPat
 
 
 def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
+
     cleanup_blocking = MagicMock()
     register = MagicMock()
     run = MagicMock()
@@ -110,8 +112,8 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup_blocking)
     monkeypatch.setattr(run_commands.atexit, "register", register)
-    monkeypatch.setattr(run_commands.mcp, "run", run)
-    monkeypatch.setattr(run_commands, "set_stateless_http_mode", set_stateless)
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run", run)
+    monkeypatch.setattr("skyvern.cli.core.session_manager.set_stateless_http_mode", set_stateless)
 
     run_commands.run_mcp(
         transport="streamable-http",
@@ -132,13 +134,15 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     middleware = kwargs["middleware"]
     assert len(middleware) == 2
     assert middleware[0].cls is run_commands._ServerCardMiddleware
-    assert middleware[1].cls is run_commands.MCPAPIKeyMiddleware
+    assert middleware[1].cls is MCPAPIKeyMiddleware
     set_stateless.assert_has_calls([call(True), call(False)])
     cleanup_blocking.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_run_task_tool_registration_points_to_browser_module() -> None:
-    tool = await run_commands.mcp.get_tool("skyvern_run_task")
+    from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
+
+    tool = await mcp.get_tool("skyvern_run_task")
     assert tool is not None
     assert tool.fn.__module__ == "skyvern.cli.mcp_tools.browser"

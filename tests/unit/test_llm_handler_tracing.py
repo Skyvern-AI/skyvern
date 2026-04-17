@@ -21,16 +21,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest  # type: ignore[import-not-found]
-
-# opentelemetry-sdk is only installed in the cloud dependency group. OSS CI
-# runs `uv sync --group dev`, so this module is absent there — skip the file
-# rather than error on collection.
-pytest.importorskip("opentelemetry.sdk")
-
-from opentelemetry import trace as otel_trace  # noqa: E402
-from opentelemetry.sdk.trace import TracerProvider  # noqa: E402
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor  # noqa: E402
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter  # noqa: E402
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
