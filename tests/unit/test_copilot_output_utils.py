@@ -243,7 +243,7 @@ class TestSummarizeToolResult:
                 "url": "https://example.com",
             },
         )
-        assert "example.com" in summary
+        assert summary == "Navigated to https://example.com"
 
     def test_type_text_typed_length(self) -> None:
         summary = self._summarize(
