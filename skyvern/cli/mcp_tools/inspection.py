@@ -412,11 +412,7 @@ async def skyvern_console_messages(
         Field(description="Clear the buffer after reading. Default false."),
     ] = False,
 ) -> dict[str, Any]:
-    """Read console log messages from the browser. Captures console.log, console.error, console.warn, etc.
-
-    Messages are buffered automatically — call this anytime to see what the page has logged.
-    Use level='error' to find JavaScript errors. Use text='...' to search for specific messages.
-    """
+    """Read console log messages from the browser. Filter by level ('error') or text substring."""
     # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
     from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -492,12 +488,7 @@ async def skyvern_network_requests(
         Field(description="Clear the buffer after reading. Default false."),
     ] = False,
 ) -> dict[str, Any]:
-    """Read network requests/responses from the browser. Captures all HTTP traffic the page generates.
-
-    Each entry includes: request_id, url, method, status, content_type, resource_type, timing_ms,
-    response_size, and page_url. Use request_id with skyvern_network_request_detail to get full
-    headers and response body. Use skyvern_network_route to intercept (abort/mock) requests.
-    """
+    """Read captured network requests/responses. Use request_id with skyvern_network_request_detail for headers and body."""
     # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
     from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -567,11 +558,7 @@ async def skyvern_handle_dialog(
         Field(description="Clear the dialog history after reading. Default false."),
     ] = False,
 ) -> dict[str, Any]:
-    """Read the history of JavaScript dialogs (alert, confirm, prompt) that appeared on the page.
-
-    Dialogs are automatically dismissed by default to prevent page lockup.
-    This tool lets you see what dialogs appeared and what action was taken.
-    """
+    """Read the history of JavaScript dialogs (alert, confirm, prompt). Auto-dismissed by default."""
     # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
     # circular import if these are at module level. See session_manager.py:get_page().
     from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -619,12 +606,7 @@ async def skyvern_get_errors(
         Field(description="Clear the buffer after reading. Default false."),
     ] = False,
 ) -> dict[str, Any]:
-    """Read uncaught JavaScript errors (exceptions) from the browser page.
-
-    Captures unhandled errors thrown by page scripts (window onerror / unhandledrejection).
-    These are distinct from console.error() messages — use skyvern_console_messages(level='error') for those.
-    Use text='...' to search for specific error messages.
-    """
+    """Read uncaught JavaScript exceptions. Distinct from console.error — use skyvern_console_messages for those."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
     if is_stateless_http_mode():
@@ -675,12 +657,7 @@ async def skyvern_har_start(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Start recording network traffic in HAR format.
-
-    All HTTP requests/responses will be captured until skyvern_har_stop is called.
-    The HAR buffer is cleared on start. Only one recording can be active at a time.
-    Use skyvern_har_stop to retrieve the HAR data.
-    """
+    """Start recording network traffic in HAR format. Call skyvern_har_stop to retrieve the data."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
     if is_stateless_http_mode():
@@ -726,11 +703,7 @@ async def skyvern_har_stop(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Stop HAR recording and return the captured traffic as HAR 1.2 JSON.
-
-    Returns a complete HAR archive with all HTTP requests/responses captured since skyvern_har_start.
-    The HAR data can be imported into browser DevTools, Charles Proxy, or other HTTP analysis tools.
-    """
+    """Stop HAR recording and return captured traffic as HAR 1.2 JSON."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
     if is_stateless_http_mode():
@@ -794,11 +767,7 @@ async def skyvern_get_html(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Get the HTML content of a DOM element.
-
-    Returns innerHTML by default (children only). Set outer=true for outerHTML (includes the element tag).
-    Useful for inspecting page structure, checking rendered content, or debugging element contents.
-    """
+    """Get HTML content of a DOM element. Returns innerHTML by default; set outer=true for outerHTML."""
     from skyvern.cli.core.browser_ops import do_get_html
 
     try:
@@ -832,11 +801,7 @@ async def skyvern_get_value(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Get the current value of a form input element.
-
-    Works with <input>, <textarea>, and <select> elements.
-    Returns the current value (what the user typed or selected), not the placeholder or label.
-    """
+    """Get the current value of a form input element (<input>, <textarea>, <select>)."""
     from skyvern.cli.core.browser_ops import do_get_value
 
     try:
@@ -874,12 +839,7 @@ async def skyvern_get_styles(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Get computed CSS styles from a DOM element.
-
-    Returns the browser's computed style values (after CSS cascade + inheritance).
-    Specify properties for targeted lookup, or omit to get the first 100 computed properties.
-    Useful for verifying visual styling, checking visibility, or debugging layout issues.
-    """
+    """Get computed CSS styles from a DOM element. Specify properties for targeted lookup or omit for all."""
     from skyvern.cli.core.browser_ops import do_get_styles
 
     try:
@@ -912,12 +872,7 @@ async def skyvern_network_request_detail(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Get full details for a specific network request: filtered response headers and captured body.
-
-    First call skyvern_network_requests to get request_ids, then use this tool to inspect
-    a specific request. Bodies are only available for JSON/text/HTML/XML responses under 256KB.
-    Response headers are filtered to an allowlist — credential headers are never exposed.
-    """
+    """Get full details for a network request by request_id: response headers and captured body."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
     if is_stateless_http_mode():
@@ -974,12 +929,8 @@ async def skyvern_network_route(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Intercept network requests matching a URL pattern. Block them (abort) or return fake data (mock).
-
-    Use 'abort' to block analytics, ads, or unwanted requests. Use 'mock' to return controlled
-    test data. Patterns use glob syntax: '**/api/*' matches any URL with /api/ in the path.
-    Re-routing an existing pattern silently replaces the previous handler.
-    Call skyvern_network_unroute to remove interceptions.
+    """Intercept network requests matching a URL glob pattern. Use 'abort' to block or 'mock' to return fake data.
+    Call skyvern_network_unroute to remove.
     """
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
@@ -1031,10 +982,7 @@ async def skyvern_network_unroute(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Remove a previously set network interception rule. Requests matching the pattern will flow normally again.
-
-    Call skyvern_network_requests or check active_routes from skyvern_network_route to see current routes.
-    """
+    """Remove a network interception rule. Requests matching the pattern will flow normally again."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
     if is_stateless_http_mode():

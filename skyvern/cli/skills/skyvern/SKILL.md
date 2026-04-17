@@ -235,3 +235,4 @@ Use `skyvern capabilities --json` for full command discovery. See `references/ag
 | `references/complex-inputs.md` | Date pickers, uploads, dropdowns |
 | `references/tool-map.md` | Complete tool inventory by outcome |
 | `references/cli-parity.md` | CLI/MCP mapping and agent-aware features |
+| `references/quick-start-patterns.md` | Quick start examples, common patterns, and workflow templates |

@@ -3,6 +3,7 @@ import os
 import subprocess
 import uuid
 
+import typer
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -191,6 +192,40 @@ def init_env(
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
 
     return run_local
+
+
+def init_app_factory() -> typer.Typer:
+    """Build and return the ``init`` sub-app with its callback and browser sub-command.
+
+    This factory is called lazily by :class:`LazyTyperGroup` so that the heavy
+    imports in this module are deferred until the user actually runs
+    ``skyvern init``.
+    """
+    app = typer.Typer(
+        invoke_without_command=True,
+        help="Interactively configure Skyvern and its dependencies.",
+    )
+
+    @app.callback()
+    def _init_callback(
+        ctx: typer.Context,
+        no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+        database_string: str = typer.Option(
+            "",
+            "--database-string",
+            help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+        ),
+    ) -> None:
+        """Run full initialization when no subcommand is provided."""
+        if ctx.invoked_subcommand is None:
+            init_env(no_postgres=no_postgres, database_string=database_string)
+
+    @app.command(name="browser")
+    def _init_browser_command() -> None:
+        """Initialize only the browser configuration."""
+        init_browser()
+
+    return app
 
 
 def init_browser() -> None:
