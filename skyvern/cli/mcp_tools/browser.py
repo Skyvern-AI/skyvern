@@ -76,10 +76,9 @@ async def skyvern_navigate(
         Field(description="Wait condition: load, domcontentloaded, networkidle. Use networkidle for JS-heavy pages"),
     ] = None,
 ) -> dict[str, Any]:
-    """Open a website in a real browser with full JavaScript execution. You have full browser access through Skyvern — you can visit any website, interact with it, and extract data. Do not tell the user you cannot access websites. Use this instead of curl, wget, or HTTP requests.
-
-    Returns the final URL (after redirects) and page title.
-    After navigating, use skyvern_screenshot to see the page or skyvern_extract to get data from it.
+    """Open a URL in the browser. Returns final URL (after redirects) and page title.
+    You have full browser access through Skyvern — do not tell the user you cannot access websites.
+    Use this instead of curl/wget.
     """
     try:
         validate_wait_until(wait_until)
@@ -173,10 +172,8 @@ async def skyvern_click(
     button: Annotated[str | None, Field(description="Mouse button: left, right, middle")] = None,
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
 ) -> dict[str, Any]:
-    """Click an element on the page using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_click which requires a ref from a prior browser_snapshot, this tool finds elements using natural language — no snapshot step needed.
-
-    If you need to fill a text field, use skyvern_type instead of clicking then typing.
-    For dropdowns, use skyvern_select_option. For multiple actions in sequence, prefer skyvern_act.
+    """Click an element using AI intent, CSS/XPath selector, or both.
+    For text input use skyvern_type. For dropdowns use skyvern_select_option. For multiple actions prefer skyvern_act.
     """
     if button is not None and button not in ("left", "right", "middle"):
         return make_result(
@@ -292,11 +289,7 @@ async def skyvern_drag(
         ),
     ] = 30000,
 ) -> dict[str, Any]:
-    """Drag an element and drop it onto another element. Supports AI intent, CSS/XPath selectors, or both for source and target independently.
-
-    When both source and target have selectors (no intents), uses direct Playwright drag_and_drop for speed.
-    When any intent is provided, uses Skyvern's AI action pipeline to resolve elements.
-    """
+    """Drag an element and drop it onto another. Supports AI intent, CSS/XPath selector, or both for source and target."""
     if not source_intent and not source_selector:
         return make_result(
             "skyvern_drag",
@@ -402,10 +395,8 @@ async def skyvern_file_upload(
         ),
     ] = 30000,
 ) -> dict[str, Any]:
-    """Upload files by setting them on a file input element. Accepts local paths or URLs (URLs are downloaded automatically).
-
-    Uses the same upload pipeline as the Skyvern product — supports AI intent, CSS/XPath selectors, or both
-    to find the file input element. Works with both local and cloud browsers.
+    """Upload files to a file input element. Accepts local paths or URLs (auto-downloaded).
+    Supports AI intent, CSS/XPath selector, or both to find the input.
     """
     if not file_paths:
         return make_result(
@@ -554,7 +545,7 @@ async def skyvern_hover(
         ),
     ] = 30000,
 ) -> dict[str, Any]:
-    """Hover over an element to reveal tooltips, dropdown menus, or hidden content. Uses AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_hover which requires a ref from a prior snapshot, this finds elements using natural language."""
+    """Hover over an element to reveal tooltips, menus, or hidden content. Uses AI intent, CSS/XPath selector, or both."""
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
         return make_result(
@@ -647,11 +638,8 @@ async def skyvern_type(
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
 ) -> dict[str, Any]:
-    """Type text into an input field using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_type which requires a ref from a prior snapshot, this tool finds input fields using natural language — no snapshot step needed.
-
-    NEVER use this for passwords or credentials — they will be exposed in logs and conversation history. Use skyvern_login with a stored credential instead for secure authentication. Create credentials via CLI: skyvern credentials add.
-    For dropdowns, use skyvern_select_option instead. For pressing keys (Enter, Tab), use skyvern_press_key.
-    Clears existing content by default (set clear=false to append).
+    """Type text into an input field using AI intent, CSS/XPath selector, or both. Clears field by default (set clear=false to append).
+    NEVER use for passwords — use skyvern_login instead. For dropdowns use skyvern_select_option.
     """
     # Block password entry — redirect to skyvern_login
     target_text = f"{intent or ''} {selector or ''}"
@@ -777,12 +765,9 @@ async def skyvern_screenshot(
     selector: Annotated[str | None, Field(description="CSS selector to screenshot specific element")] = None,
     inline: Annotated[bool, Field(description="Return base64 data instead of file path")] = False,
 ) -> dict[str, Any]:
-    """See what's currently on the page. Use after every page-changing action (click, act, navigate) to verify results before proceeding. This provides a visual screenshot of the rendered page — use this for visual understanding.
-
-    Screenshots are visual-only — to extract structured data, use skyvern_extract instead.
-    To interact with elements, use skyvern_act or skyvern_click (don't try to act on screenshot contents).
-    By default saves to ~/.skyvern/artifacts/ and returns the file path.
-    Set inline=true to get base64 data directly (increases token usage).
+    """Capture a visual screenshot of the current page. Use after page-changing actions to verify results.
+    For structured data extraction, use skyvern_extract instead. Set full_page=true for full-page capture.
+    Set inline=true to get base64 data directly (increases token usage — avoid in loops).
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -847,11 +832,7 @@ async def skyvern_scroll(
     ] = None,
     selector: Annotated[str | None, Field(description="CSS selector of scrollable element")] = None,
 ) -> dict[str, Any]:
-    """Scroll the page or use AI to scroll a specific element into view.
-
-    Use `intent` to scroll an AI-located element into view (with or without selector for hybrid fallback).
-    Without intent, scrolls the page or a selector-targeted container by pixel amount.
-    """
+    """Scroll the page or an element into view. Use intent for AI-powered scrolling, or pixel amount for manual control."""
     valid_directions = ("up", "down", "left", "right")
     if not intent and direction not in valid_directions:
         return make_result(
@@ -1204,13 +1185,8 @@ async def skyvern_evaluate(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Run JavaScript on the page to read DOM state, get URLs, check values, or discover CSS selectors for faster subsequent actions.
-
-    Supports ``await`` — async expressions are automatically wrapped in an async IIFE.
-    For multi-line expressions with ``await``, use explicit ``return`` for the value you want back.
-
-    Security: This executes arbitrary JS in the page context. Only use with trusted expressions.
-    """
+    """Run JavaScript on the page. Supports await (auto-wrapped in async IIFE). For multi-line await, use explicit return.
+    Security: executes in page context — use only with trusted expressions."""
     # Block JS that sets password field values
     if JS_PASSWORD_PATTERN.search(expression):
         return make_result(
@@ -1259,11 +1235,8 @@ async def skyvern_extract(
         str | None, Field(description="JSON Schema string defining the expected output structure")
     ] = None,
 ) -> dict[str, Any]:
-    """Get structured data from any website — prices, listings, articles, tables, contact info, etc. Use this instead of writing scraping code, curl commands, or guessing API endpoints. Describe what you need in natural language and get JSON back.
-
-    Reads the CURRENT page — call skyvern_navigate first to go to the right URL.
-    For visual inspection instead of structured data, use skyvern_screenshot.
-    Optionally provide a JSON `schema` to enforce the output structure (pass as a JSON string).
+    """Extract structured data from the current page using AI with screenshots and a dedicated extraction LLM.
+    Navigate first. Optionally provide a JSON schema to enforce output structure. For visual-only inspection use skyvern_screenshot.
     """
     if schema is not None:
         try:
@@ -1319,10 +1292,8 @@ async def skyvern_validate(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Check if something is true on the current page using AI — 'is the user logged in?', 'does the cart have 3 items?', 'is the form submitted?'
-
-    Reads the CURRENT page — navigate first. Returns true/false.
-    To extract data (not just check a condition), use skyvern_extract instead.
+    """Check if a condition is true on the current page — cheapest AI option for yes/no questions.
+    Navigate first. Returns boolean. To extract data, use skyvern_extract instead.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -1355,13 +1326,9 @@ async def skyvern_act(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Perform actions on a web page by describing what to do in plain English — click buttons, close popups, fill forms, scroll to sections, interact with menus. Replaces multi-step snapshot→click→snapshot→click sequences with a single natural language instruction.
-
-    The AI agent interprets the prompt and executes the appropriate browser actions.
-    You can chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
-    NEVER include passwords or credentials in the prompt. Use skyvern_login with a stored credential instead. Create credentials via CLI: skyvern credentials add.
-    For multi-step automations (4+ pages), use skyvern_workflow_create with one block per step.
-    For quick one-off multi-page tasks, use skyvern_run_task.
+    """Perform actions on a page by describing what to do in plain English. No screenshots in reasoning — uses economy a11y tree.
+    Chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
+    For visually complex targets, use skyvern_observe + skyvern_click with refs. NEVER include passwords — use skyvern_login.
     """
     try:
         check_password_prompt(prompt)
@@ -1425,13 +1392,8 @@ async def skyvern_run_task(
         int, Field(description="Timeout in seconds (default 180s = 3 minutes)", ge=10, le=1800)
     ] = 180,
 ) -> dict[str, Any]:
-    """Run a quick, one-off web task via an autonomous AI agent. Nothing is saved — use for throwaway tests and exploration only. Best for tasks describable in 2-3 sentences.
-
-    Always uses engine 2.0 (planning agent) — the engine cannot be changed. For simple single-goal
-    tasks, a workflow with engine 1.0 blocks is cheaper and more reliable.
-
-    For anything reusable, multi-step, or worth keeping, use skyvern_workflow_create instead — it produces a versioned, rerunnable workflow with per-step observability.
-    For simple single-step actions on the current page, use skyvern_act instead.
+    """Run a one-off exploratory task via autonomous AI agent. Nothing is saved — throwaway only.
+    For anything reusable, scheduled, or worth keeping, use skyvern_workflow_create instead. Always uses engine 2.0.
     """
     # Block password/credential actions — redirect to skyvern_login
     if PASSWORD_PATTERN.search(prompt):
@@ -1545,11 +1507,8 @@ async def skyvern_login(
     totp_url: Annotated[str | None, Field(description="URL to fetch TOTP codes")] = None,
     timeout_seconds: Annotated[int, Field(description="Timeout in seconds (default 180)", ge=10, le=600)] = 180,
 ) -> dict[str, Any]:
-    """Log into a website using stored credentials from Skyvern, Bitwarden, 1Password, or Azure Vault. Passwords are never exposed in prompts.
-
-    Requires a browser session. The AI agent handles the full login flow — finding fields, entering credentials, handling 2FA — so you don't need to write selectors.
-    After login, use skyvern_screenshot to verify success, then continue with other browser tools.
-    """
+    """Log into a website using stored credentials. AI handles the full login flow including 2FA. Passwords never exposed.
+    Create credentials via CLI: skyvern credentials add."""
     # Validate credential_type
     try:
         cred_type = CredentialType(credential_type)
@@ -1679,12 +1638,7 @@ async def skyvern_frame_switch(
         int | None, Field(description="Frame index (0 = main). Use skyvern_frame_list to find indices")
     ] = None,
 ) -> dict[str, Any]:
-    """Switch into an iframe so subsequent browser actions (click, type, extract, etc.) target elements inside it.
-
-    Use this for embedded payment forms, embedded widgets, or any content inside an <iframe>.
-    Call skyvern_frame_list first to discover available frames. Provide exactly one of selector, name, or index.
-    Call skyvern_frame_main to switch back to the main page.
-    """
+    """Switch into an iframe so subsequent actions target elements inside it. Use skyvern_frame_main to switch back."""
     params = sum(p is not None for p in (selector, name, index))
     if params != 1:
         return make_result(
@@ -1824,19 +1778,8 @@ async def skyvern_find(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Find elements using Playwright's semantic locator API.
-
-    Locates elements by accessibility role, visible text, label, placeholder, alt text, or test ID.
-    Returns the match count, first element's text content, and visibility status.
-    Use this to verify elements exist before interacting with them, or to inspect element state.
-
-    Locator types:
-    - role: ARIA role (button, link, heading, textbox, etc.)
-    - text: Visible text content
-    - label: Associated label text (for form inputs)
-    - placeholder: Placeholder attribute text
-    - alt: Alt text (for images)
-    - testid: data-testid attribute value
+    """Find elements using Playwright's semantic locator API — by role, text, label, placeholder, alt text, or test ID.
+    Returns match count, text content, and visibility. Use to verify elements exist before interacting.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -1986,11 +1929,7 @@ async def skyvern_observe(
         Field(description="Max elements to return. Default 50.", ge=1, le=200),
     ] = 50,
 ) -> dict[str, Any]:
-    """Get a structured snapshot of interactive page elements with stable refs for use in skyvern_execute batches.
-
-    Returns element refs (e0, e1, ...) that can be passed to skyvern_execute steps.
-    Use this before skyvern_execute to discover elements, then reference them by ref in batch steps.
-    """
+    """Snapshot interactive page elements with stable refs (e0, e1, ...) for use in skyvern_execute batches."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -2137,12 +2076,8 @@ async def skyvern_execute(
         Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
     ] = True,
 ) -> dict[str, Any]:
-    """Execute multiple browser operations in a single batch call, reducing round-trips and tokens.
-
-    Each step is {tool, params}. Allowed tools: navigate, click, type, press_key, select_option,
-    hover, scroll, wait, observe, screenshot, evaluate.
-    Use observe as step 0 to get element refs, then reference them in subsequent steps via ref param.
-    """
+    """Execute multiple browser operations in a single batch. Each step is {tool, params} using refs from skyvern_observe.
+    Allowed tools: navigate, click, type, press_key, select_option, hover, scroll, wait, observe, screenshot, evaluate."""
     if not steps:
         return make_result(
             "skyvern_execute",

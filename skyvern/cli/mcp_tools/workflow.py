@@ -921,51 +921,12 @@ async def skyvern_workflow_create(
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
 ) -> dict[str, Any]:
-    """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
-    a new automation workflow that can be run repeatedly with different parameters.
+    """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
+    scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
 
-    By default, workflows created via MCP use Code 2.0 (code_version=2, run_with="code").
-    To disable this, explicitly set "code_version": 1 and/or "run_with": null in your definition.
-
-    Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
-    Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
-    Do NOT use the deprecated "task" block type.
-    Common block types: navigation, extraction, for_loop, conditional, code, text_prompt, action, wait, login.
-    Call skyvern_block_schema() for the full list with schemas and examples.
-
-    Example JSON definition (multi-block EIN application):
-
-        {
-          "title": "Apply for EIN",
-          "workflow_definition": {
-            "parameters": [
-              {"parameter_type": "workflow", "key": "business_name", "workflow_parameter_type": "string"},
-              {"parameter_type": "workflow", "key": "owner_name", "workflow_parameter_type": "string"},
-              {"parameter_type": "workflow", "key": "owner_ssn", "workflow_parameter_type": "string"}
-            ],
-            "blocks": [
-              {"block_type": "navigation", "label": "select_entity_type",
-               "url": "https://sa.www4.irs.gov/modiein/individual/index.jsp",
-               "title": "Select Entity Type",
-               "navigation_goal": "Select 'Sole Proprietor' as the entity type and click Continue."},
-              {"block_type": "navigation", "label": "enter_business_info",
-               "title": "Enter Business Info",
-               "navigation_goal": "Fill in the business name as '{{business_name}}' and click Continue.",
-               "parameter_keys": ["business_name"]},
-              {"block_type": "navigation", "label": "enter_owner_info",
-               "title": "Enter Owner Info",
-               "navigation_goal": "Enter the responsible party name '{{owner_name}}' and SSN '{{owner_ssn}}'. Click Continue.",
-               "parameter_keys": ["owner_name", "owner_ssn"]},
-              {"block_type": "extraction", "label": "extract_ein",
-               "title": "Extract EIN",
-               "data_extraction_goal": "Extract the assigned EIN number from the confirmation page",
-               "data_schema": {"type": "object", "properties": {"ein": {"type": "string"}}}}
-            ]
-          }
-        }
-
-    Use {{parameter_key}} to reference workflow input parameters in any block field.
-    Blocks in the same run share the same browser session automatically.
+    One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
+    Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
+    Defaults to Code 2.0 (run_with="code"). Blocks share a browser session automatically.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(
