@@ -226,6 +226,18 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
+        LOG.info(
+            "Deleting persisted browser session",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            browser_session_uri=browser_session_uri,
+        )
+        # S3 DeleteObject is idempotent: deleting a missing key is a no-op, so only real
+        # failures (AccessDenied, network, etc.) will raise here.
+        await self.async_client.delete_file(browser_session_uri, log_exception=True, raise_on_error=True)
+
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to S3."""
         temp_zip_file = create_named_temporary_file()

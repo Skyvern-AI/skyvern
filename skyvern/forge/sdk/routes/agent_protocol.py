@@ -2941,6 +2941,63 @@ async def get_workflow_versions(
     )
 
 
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/refresh",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    tags=["Workflows"],
+    summary="Refresh persisted browser session",
+    description=(
+        "Clear the persisted browser session for a workflow that uses `Save & Reuse Session`. "
+        "The next run will start from a fresh browser state. Use when a saved session is corrupted."
+    ),
+    responses={
+        204: {"description": "Successfully cleared persisted browser session"},
+        404: {"description": "Workflow not found"},
+    },
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/refresh/",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+async def refresh_workflow_browser_session(
+    workflow_permanent_id: str = Path(
+        ...,
+        description="The permanent ID of the workflow. Starts with `wpid_`.",
+        examples=["wpid_123"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    analytics.capture("skyvern-oss-agent-workflow-browser-session-refresh")
+    # Verify the workflow exists and belongs to the caller's organization.
+    await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    LOG.info(
+        "Refreshing persisted browser session for workflow",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+    try:
+        await app.STORAGE.delete_browser_session(
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+    except SkyvernHTTPException:
+        raise
+    except Exception as exc:
+        LOG.exception(
+            "Failed to refresh persisted browser session for workflow",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        raise SkyvernHTTPException(
+            message="Failed to clear the persisted browser session. Please retry the refresh operation.",
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ) from exc
+
+
 @legacy_base_router.post(
     "/suggest/{ai_suggestion_type}",
     include_in_schema=False,

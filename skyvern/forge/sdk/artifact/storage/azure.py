@@ -194,6 +194,16 @@ class AzureStorage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        browser_session_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
+        LOG.info(
+            "Deleting persisted browser session",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            browser_session_uri=browser_session_uri,
+        )
+        await self.async_client.delete_file(browser_session_uri)
+
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to Azure."""
         temp_zip_file = create_named_temporary_file()
