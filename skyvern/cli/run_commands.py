@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from typing import TYPE_CHECKING, Annotated, List, Literal, Optional
 
 if TYPE_CHECKING:
@@ -40,6 +41,11 @@ from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_e
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 _mcp_cleanup_done = False
+
+
+def _default_host() -> str:
+    """Return a safe default bind host. Windows quickstart fails to bind 0.0.0.0; use loopback instead."""
+    return "127.0.0.1" if sys.platform == "win32" else "0.0.0.0"
 
 
 async def _cleanup_mcp_resources() -> None:
@@ -115,7 +121,7 @@ def run_server() -> None:
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
     uvicorn.run(
         "skyvern.forge.api_app:create_api_app",
-        host="0.0.0.0",
+        host=_default_host(),
         port=port,
         log_level="info",
         factory=True,
@@ -263,7 +269,7 @@ def run_dev() -> None:
             "uvicorn",
             "skyvern.forge.api_app:create_api_app",
             "--host",
-            "0.0.0.0",
+            _default_host(),
             "--port",
             str(skyvern_settings.PORT),
             "--factory",
@@ -335,7 +341,9 @@ def run_mcp(
             help="MCP transport: stdio (default), sse, or streamable-http.",
         ),
     ] = "stdio",
-    host: Annotated[str, typer.Option("--host", help="Host for HTTP transports.")] = "0.0.0.0",
+    host: Annotated[
+        str, typer.Option("--host", help="Host for HTTP transports.")
+    ] = _default_host(),  # sys.platform is constant; safe at import time
     port: Annotated[int, typer.Option("--port", help="Port for HTTP transports.")] = 8000,
     path: Annotated[str, typer.Option("--path", help="HTTP endpoint path for MCP transport.")] = "/mcp",
     stateless_http: Annotated[
