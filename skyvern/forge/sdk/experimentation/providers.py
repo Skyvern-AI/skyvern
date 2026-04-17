@@ -37,11 +37,11 @@ def _serialize_feature_resolution_value(resolution_kind: ResolutionKind, resolve
     return str(resolved_value)
 
 
-def _should_emit_workflow_feature_flags(context: skyvern_context.SkyvernContext) -> bool:
-    return bool(context.workflow_run_id)
+def _should_record_feature_flags(context: skyvern_context.SkyvernContext) -> bool:
+    return bool(context.workflow_run_id or context.task_id or context.task_v2_id or context.run_id)
 
 
-def _record_workflow_feature_flags(
+def _record_feature_flag_entry(
     context: skyvern_context.SkyvernContext | None,
     *,
     feature_name: str,
@@ -49,10 +49,10 @@ def _record_workflow_feature_flags(
 ) -> None:
     if context is None:
         return
-    if not _should_emit_workflow_feature_flags(context):
+    if not _should_record_feature_flags(context):
         return
 
-    context.workflow_feature_flags_entries[feature_name] = resolved_value
+    context.feature_flag_entries[feature_name] = resolved_value
 
 
 def _build_feature_flag_resolution_log_fields(
@@ -87,10 +87,10 @@ def _build_feature_flag_resolution_log_fields(
     return log_fields
 
 
-def flush_workflow_feature_flags(context: skyvern_context.SkyvernContext | None = None) -> None:
+def flush_feature_flags(context: skyvern_context.SkyvernContext | None = None) -> None:
     resolved_context = context or skyvern_context.current()
     if resolved_context is not None:
-        resolved_context.flush_workflow_feature_flags()
+        resolved_context.flush_feature_flags()
 
 
 def record_feature_flag_resolution(
@@ -110,7 +110,7 @@ def record_feature_flag_resolution(
             resolved_value=resolved_value,
         ),
     )
-    _record_workflow_feature_flags(
+    _record_feature_flag_entry(
         context,
         feature_name=feature_name,
         resolved_value=serialized_resolved_value,
