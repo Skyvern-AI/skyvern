@@ -55,17 +55,17 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version || '3.11' }}-${{ hashFiles('**/uv.lock') }}
-      # Create/refresh the environment (installs main + dev groups + copilot extra)
+      # Create/refresh the environment (installs main + dev groups)
       - name: Sync deps with uv
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           uv lock
-          uv sync --group dev --extra copilot
+          uv sync --group dev
       # Ensure venv is current even on cache hit (cheap no-op if up to date)
       - name: Ensure environment is up to date
         if: steps.cache-venv.outputs.cache-hit == 'true'
         run: |
-          uv sync --group dev --extra copilot
+          uv sync --group dev
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
