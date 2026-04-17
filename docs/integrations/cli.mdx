@@ -161,6 +161,7 @@ skyvern setup claude-code --global    # Force global Claude Code config
 skyvern setup claude                  # Register with Claude Desktop
 skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
+skyvern setup openclaw           # Register with OpenClaw
 skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
 skyvern mcp switch --dry-run          # Preview changes without writing files
 skyvern mcp profile list              # List saved switch sources
@@ -169,7 +170,7 @@ skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.sky
 
 For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the MCP connection fully local for localhost testing.
 
-`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, and Codex configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, Codex, Hermes, and OpenClaw configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Other
 
@@ -248,6 +249,18 @@ Verify with `hermes skills list | grep skyvern`.
 
 <Tip>
 When both the Skyvern MCP server and the CLI skill are configured, Hermes prefers MCP tools over shelling out to the CLI — which is faster. The skill's judgment procedure (task classification, step ordering) works with either execution path.
+</Tip>
+
+**OpenClaw** — copy the skill into your OpenClaw workspace `skills/` directory. By default that workspace lives at `~/.openclaw/workspace/`, but if you've customized the workspace path, use that location instead.
+
+```bash
+mkdir -p ~/.openclaw/workspace/skills
+skyvern skill copy skyvern -o ~/.openclaw/workspace/skills/
+openclaw skills list | grep skyvern
+```
+
+<Tip>
+OpenClaw's MCP config provides the callable Skyvern tools; the workspace skill is optional guidance that teaches the agent when to use them.
 </Tip>
 
 **Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
