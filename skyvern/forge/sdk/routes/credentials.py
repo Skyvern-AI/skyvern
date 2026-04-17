@@ -52,6 +52,8 @@ from skyvern.forge.sdk.routes.code_samples import (
     GET_CREDENTIALS_CODE_SAMPLE_TS,
     SEND_TOTP_CODE_CODE_SAMPLE_PYTHON,
     SEND_TOTP_CODE_CODE_SAMPLE_TS,
+    UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import (
@@ -1210,6 +1212,14 @@ async def _create_browser_profile_after_workflow(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_credential",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": UPDATE_CREDENTIAL_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.post(
