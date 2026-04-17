@@ -142,7 +142,7 @@ def test_patch_entry_with_profile_updates_mcp_remote_bridge() -> None:
         ],
     }
 
-    patched = _patch_entry_with_profile(entry, profile)
+    patched = _patch_entry_with_profile(entry, profile, config_format="json5")
 
     assert patched["args"][0] == "mcp-remote"
     assert patched["args"][1] == "https://alt.skyvern.example/mcp/"
@@ -167,7 +167,7 @@ def test_patch_entry_with_profile_updates_mcp_remote_bridge_even_with_env() -> N
         },
     }
 
-    patched = _patch_entry_with_profile(entry, profile)
+    patched = _patch_entry_with_profile(entry, profile, config_format="json5")
 
     assert _entry_kind(entry) == "mcp-remote bridge"
     assert "x-api-key:new-key-1234567890" in patched["args"]
@@ -242,6 +242,147 @@ def test_apply_profile_to_target_updates_codex_entry_and_creates_backup(tmp_path
 
     backup = toml.loads(backup_path.read_text(encoding="utf-8"))
     assert backup["mcp_servers"]["skyvern"]["http_headers"]["x-api-key"] == "old-key"
+
+
+def test_patch_entry_with_profile_preserves_openclaw_transport_and_extras() -> None:
+    profile = _build_profile("Prod", "new-key-1234567890", "https://alt.skyvern.example")
+    entry = {
+        "url": "https://api.skyvern.com/mcp/",
+        "transport": "streamable-http",
+        "headers": {"x-api-key": "old-key"},
+        "connectionTimeoutMs": 120000,
+    }
+
+    patched = _patch_entry_with_profile(entry, profile, config_format="json5")
+
+    assert patched["url"] == "https://alt.skyvern.example/mcp/"
+    assert patched["transport"] == "streamable-http"
+    assert patched["headers"]["x-api-key"] == "new-key-1234567890"
+    assert patched["connectionTimeoutMs"] == 120000
+    assert "type" not in patched
+
+
+def test_patch_entry_with_profile_repairs_openclaw_remote_shape_without_transport() -> None:
+    profile = _build_profile("Prod", "new-key-1234567890", "https://alt.skyvern.example")
+    entry = {
+        "type": "http",
+        "url": "https://api.skyvern.com/mcp/",
+        "headers": {"x-api-key": "old-key"},
+        "connectionTimeoutMs": 120000,
+    }
+
+    patched = _patch_entry_with_profile(entry, profile, config_format="json5")
+
+    assert patched["url"] == "https://alt.skyvern.example/mcp/"
+    assert patched["transport"] == "streamable-http"
+    assert patched["headers"]["x-api-key"] == "new-key-1234567890"
+    assert patched["connectionTimeoutMs"] == 120000
+    assert "type" not in patched
+    assert "http_headers" not in patched
+
+
+def test_apply_profile_to_target_updates_openclaw_entry_and_creates_backup(tmp_path: Path) -> None:
+    config_path = tmp_path / "openclaw.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        "skyvern": {
+                            "url": "https://api.skyvern.com/mcp/",
+                            "transport": "streamable-http",
+                            "headers": {"x-api-key": "old-key"},
+                            "connectionTimeoutMs": 120000,
+                        }
+                    }
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    target = SwitchTarget(
+        name="OpenClaw",
+        config_path=config_path,
+        entry_key="skyvern",
+        entry={
+            "url": "https://api.skyvern.com/mcp/",
+            "transport": "streamable-http",
+            "headers": {"x-api-key": "old-key"},
+            "connectionTimeoutMs": 120000,
+        },
+        config_format="json5",
+        entry_path=["mcp", "servers"],
+    )
+    profile = _build_profile("Prod", "new-key-1234567890", "https://alt.skyvern.example")
+
+    changed, backup_path = _apply_profile_to_target(target, profile)
+
+    assert changed is True
+    assert backup_path is not None
+    assert backup_path.exists()
+
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    entry = written["mcp"]["servers"]["skyvern"]
+    assert entry["url"] == "https://alt.skyvern.example/mcp/"
+    assert entry["transport"] == "streamable-http"
+    assert entry["headers"]["x-api-key"] == "new-key-1234567890"
+    assert entry["connectionTimeoutMs"] == 120000
+
+    backup = json.loads(backup_path.read_text(encoding="utf-8"))
+    assert backup["mcp"]["servers"]["skyvern"]["headers"]["x-api-key"] == "old-key"
+
+
+def test_apply_profile_to_target_repairs_openclaw_remote_shape_without_transport(tmp_path: Path) -> None:
+    config_path = tmp_path / "openclaw.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        "skyvern": {
+                            "type": "http",
+                            "url": "https://api.skyvern.com/mcp/",
+                            "headers": {"x-api-key": "old-key"},
+                            "connectionTimeoutMs": 120000,
+                        }
+                    }
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    target = SwitchTarget(
+        name="OpenClaw",
+        config_path=config_path,
+        entry_key="skyvern",
+        entry={
+            "type": "http",
+            "url": "https://api.skyvern.com/mcp/",
+            "headers": {"x-api-key": "old-key"},
+            "connectionTimeoutMs": 120000,
+        },
+        config_format="json5",
+        entry_path=["mcp", "servers"],
+    )
+    profile = _build_profile("Prod", "new-key-1234567890", "https://alt.skyvern.example")
+
+    changed, backup_path = _apply_profile_to_target(target, profile)
+
+    assert changed is True
+    assert backup_path is not None
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    entry = written["mcp"]["servers"]["skyvern"]
+    assert entry["url"] == "https://alt.skyvern.example/mcp/"
+    assert entry["transport"] == "streamable-http"
+    assert entry["headers"]["x-api-key"] == "new-key-1234567890"
+    assert entry["connectionTimeoutMs"] == 120000
+    assert "type" not in entry
 
 
 def test_collect_profile_choices_includes_env_and_existing_config(
@@ -491,6 +632,23 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
         toml.dumps({"mcp_servers": {"skyvern": {"url": "https://api.skyvern.com/mcp/"}}}) + "\n",
         encoding="utf-8",
     )
+    openclaw_config = tmp_path / "openclaw.json"
+    openclaw_config.write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        "skyvern": {
+                            "url": "https://api.skyvern.com/mcp/",
+                            "transport": "streamable-http",
+                        }
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr("skyvern.cli.mcp_commands._claude_code_global_config_path", lambda: global_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._claude_code_project_config_path", lambda: project_config)
@@ -500,6 +658,7 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     monkeypatch.setattr("skyvern.cli.mcp_commands._cursor_config_path", lambda: tmp_path / "missing-cursor.json")
     monkeypatch.setattr("skyvern.cli.mcp_commands._windsurf_config_path", lambda: tmp_path / "missing-windsurf.json")
     monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: codex_config)
+    monkeypatch.setattr("skyvern.cli.mcp_commands._openclaw_config_path", lambda: openclaw_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-hermes.yaml")
 
     discovered, missing = _discover_switch_targets()
@@ -508,6 +667,35 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     assert "Claude Code (global)" in discovered_by_name
     assert "Claude Code (project)" in discovered_by_name
     assert "Codex" in discovered_by_name
+    assert "OpenClaw" in discovered_by_name
     assert discovered_by_name["Codex"].config_format == "codex_toml"
     assert discovered_by_name["Codex"].entry_key == "skyvern"
+    assert discovered_by_name["OpenClaw"].entry_key == "skyvern"
+    assert discovered_by_name["OpenClaw"].entry_path == ["mcp", "servers"]
     assert {name for name, _ in missing} == {"Claude Desktop", "Cursor", "Windsurf", "Hermes"}
+
+
+def test_discover_switch_targets_reports_openclaw_invalid_nested_structure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openclaw_config = tmp_path / "openclaw.json"
+    openclaw_config.write_text(json.dumps({"mcp": "bad"}) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr("skyvern.cli.mcp_commands._claude_code_global_config_path", lambda: tmp_path / "missing-a.json")
+    monkeypatch.setattr(
+        "skyvern.cli.mcp_commands._claude_code_project_config_path", lambda: tmp_path / "missing-b.json"
+    )
+    monkeypatch.setattr("skyvern.cli.mcp_commands._claude_desktop_config_path", lambda: tmp_path / "missing-c.json")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._cursor_config_path", lambda: tmp_path / "missing-d.json")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._windsurf_config_path", lambda: tmp_path / "missing-e.json")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: tmp_path / "missing-f.toml")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._openclaw_config_path", lambda: openclaw_config)
+    monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-g.yaml")
+
+    discovered, _missing = _discover_switch_targets()
+
+    openclaw_target = next(target for target in discovered if target.name == "OpenClaw")
+    assert openclaw_target.entry is None
+    assert openclaw_target.error is not None
+    assert "Invalid nested structure" in openclaw_target.error
