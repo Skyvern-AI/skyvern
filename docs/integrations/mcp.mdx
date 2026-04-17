@@ -187,6 +187,48 @@ hermes mcp test skyvern
 For local stdio mode (self-hosted), use `skyvern setup hermes --local` instead.
 
 </Tab>
+<Tab title="OpenClaw">
+
+Using the Skyvern CLI (recommended):
+
+```bash
+pip install skyvern
+export SKYVERN_API_KEY="YOUR_SKYVERN_API_KEY"
+skyvern setup openclaw
+```
+
+Or add manually to `~/.openclaw/openclaw.json` (OpenClaw accepts JSON5, but plain JSON works too):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "skyvern": {
+        "url": "https://api.skyvern.com/mcp/",
+        "transport": "streamable-http",
+        "headers": {
+          "x-api-key": "YOUR_SKYVERN_API_KEY"
+        }
+      }
+    }
+  }
+}
+```
+
+<Tip>
+OpenClaw accepts JSON5 syntax in `openclaw.json`. `skyvern setup openclaw` can read that format, but when it rewrites the file it normalizes the config back to standard JSON, so comments and JSON5-only formatting are not preserved.
+</Tip>
+
+Verify the config:
+
+```bash
+openclaw mcp list
+openclaw mcp show skyvern
+```
+
+For local stdio mode (self-hosted), use `skyvern setup openclaw --local` instead.
+
+</Tab>
 <Tab title="MCPorter">
 
 MCPorter auto-discovers Skyvern from your existing MCP client configs (Cursor, Claude Code, Windsurf, etc.). If you've already set up Skyvern in any of those clients, MCPorter finds it automatically — no extra configuration needed.
@@ -228,6 +270,7 @@ Today it can update:
 - Windsurf `~/.codeium/windsurf/mcp_config.json`
 - Codex `~/.codex/config.toml`
 - Hermes `~/.hermes/config.yaml` (global + per-profile configs)
+- OpenClaw `~/.openclaw/openclaw.json`
 
 `skyvern mcp switch` preserves the existing transport shape. Remote configs keep using `https://.../mcp/`; local stdio configs keep `SKYVERN_BASE_URL` and `SKYVERN_API_KEY` in the launched process environment. After switching, restart your AI client.
 
@@ -356,6 +399,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 | **Windsurf** | JSON | `~/.codeium/windsurf/mcp_config.json` |
 | **Hermes** (global) | YAML | `~/.hermes/config.yaml` |
 | **Hermes** (per-profile) | YAML | `~/.hermes/profiles/<name>/config.yaml` |
+| **OpenClaw** | JSON5 | `~/.openclaw/openclaw.json` |
 
 </Accordion>
 
