@@ -460,7 +460,7 @@ def test_request_only_context_does_not_emit_workflow_feature_flags(
     assert [event for _, event, _ in logger.records if event == "workflow_feature_flags"] == []
 
 
-def test_task_only_context_does_not_emit_workflow_feature_flags(
+def test_task_only_context_emits_task_feature_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     logger = CaptureLogger()
@@ -478,4 +478,89 @@ def test_task_only_context_does_not_emit_workflow_feature_flags(
     debug_fields = [fields for _, event, fields in logger.records if event == "feature_flag_resolution"][0]
     assert debug_fields["task_id"] == "tsk_only"
     assert debug_fields["organization_id"] == "org_123"
+
     assert [event for _, event, _ in logger.records if event == "workflow_feature_flags"] == []
+    task_summaries = [fields for _, event, fields in logger.records if event == "task_feature_flags"]
+    assert len(task_summaries) == 1
+    summary = task_summaries[0]
+    assert summary["task_id"] == "tsk_only"
+    assert summary["organization_id"] == "org_123"
+    assert summary["feature_resolutions"] == {"TEST_FLAG": False}
+    assert "workflow_run_id" not in summary
+    assert "workflow_permanent_id" not in summary
+
+
+def test_task_v2_only_context_emits_task_feature_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = CaptureLogger()
+    _set_logger(monkeypatch, logger)
+    skyvern_context.set(SkyvernContext(task_v2_id="tv2_only", organization_id="org_123"))
+
+    providers_module.record_feature_flag_resolution(
+        feature_name="TEST_FLAG",
+        resolution_kind="value",
+        resolved_value="variant-a",
+    )
+
+    skyvern_context.reset()
+
+    task_summaries = [fields for _, event, fields in logger.records if event == "task_feature_flags"]
+    assert len(task_summaries) == 1
+    summary = task_summaries[0]
+    assert summary["task_v2_id"] == "tv2_only"
+    assert summary["feature_resolutions"] == {"TEST_FLAG": "variant-a"}
+    assert "workflow_run_id" not in summary
+    assert [event for _, event, _ in logger.records if event == "workflow_feature_flags"] == []
+
+
+def test_workflow_with_task_emits_only_workflow_feature_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = CaptureLogger()
+    _set_logger(monkeypatch, logger)
+    skyvern_context.set(
+        SkyvernContext(
+            organization_id="org_123",
+            workflow_run_id="wr_123",
+            workflow_permanent_id="wfp_123",
+            task_id="tsk_123",
+        )
+    )
+
+    providers_module.record_feature_flag_resolution(
+        feature_name="TEST_FLAG",
+        resolution_kind="enabled",
+        resolved_value=True,
+    )
+
+    skyvern_context.reset()
+
+    workflow_summaries = [fields for _, event, fields in logger.records if event == "workflow_feature_flags"]
+    task_summaries = [fields for _, event, fields in logger.records if event == "task_feature_flags"]
+    assert len(workflow_summaries) == 1
+    assert len(task_summaries) == 0
+    assert workflow_summaries[0]["workflow_run_id"] == "wr_123"
+    assert workflow_summaries[0]["task_id"] == "tsk_123"
+    assert workflow_summaries[0]["feature_resolutions"] == {"TEST_FLAG": True}
+
+
+def test_run_id_only_context_emits_task_feature_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = CaptureLogger()
+    _set_logger(monkeypatch, logger)
+    skyvern_context.set(SkyvernContext(run_id="run_only", organization_id="org_123"))
+
+    providers_module.record_feature_flag_resolution(
+        feature_name="TEST_FLAG",
+        resolution_kind="enabled",
+        resolved_value=True,
+    )
+
+    skyvern_context.reset()
+
+    task_summaries = [fields for _, event, fields in logger.records if event == "task_feature_flags"]
+    assert len(task_summaries) == 1
+    assert task_summaries[0]["run_id"] == "run_only"
+    assert task_summaries[0]["feature_resolutions"] == {"TEST_FLAG": True}

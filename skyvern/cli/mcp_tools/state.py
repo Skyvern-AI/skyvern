@@ -47,13 +47,7 @@ async def skyvern_state_save(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...).")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
 ) -> dict[str, Any]:
-    """Save browser auth state (cookies + localStorage + sessionStorage) to a JSON file.
-
-    Use this to persist login sessions so you can restore them later with state_load,
-    avoiding repeated login flows. The state file is saved on the MCP server's local disk.
-
-    Common workflow: log in → state_save → close session → create new session → navigate → state_load.
-    """
+    """Save browser auth state (cookies + localStorage + sessionStorage) to a JSON file for later restore via state_load."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -118,14 +112,7 @@ async def skyvern_state_load(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...).")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
 ) -> dict[str, Any]:
-    """Load browser auth state (cookies + localStorage + sessionStorage) from a JSON file.
-
-    Restores a previously saved login session. Cookies are filtered to only apply those
-    matching the current page's domain (prevents cross-domain injection).
-    Navigate to the target site BEFORE calling state_load so cookie domain filtering works correctly.
-
-    Common workflow: create session → navigate to site → state_load → refresh page → you're logged in.
-    """
+    """Restore browser auth state from a JSON file. Navigate to the target site BEFORE loading so cookie domain filtering works."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:

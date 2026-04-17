@@ -1,30 +1,9 @@
-from typing import Any
-
-import click
 import typer
 from dotenv import load_dotenv
 
 from skyvern._cli_bootstrap import configure_cli_bootstrap_logging as _configure_cli_bootstrap_logging
+from skyvern.cli.lazy import LazyTyperGroup, register_lazy_command
 from skyvern.utils.env_paths import resolve_backend_env_path
-
-from ..auth_command import login as login_command
-from ..auth_command import signup as signup_command
-from ..block import block_app
-from ..credential import credential_app
-from ..credentials import credentials_app
-from ..docs import docs_app
-from ..init_command import init_browser, init_env
-from ..mcp_commands import mcp_app
-from ..quickstart import quickstart_app
-from ..run_commands import run_app
-from ..setup_commands import setup_app
-from ..skill_commands import skill_app
-from ..status import status_app
-from ..stop_commands import stop_app
-from ..tasks import tasks_app
-from ..workflow import workflow_app
-from ._output import output, output_error
-from .browser import browser_app
 
 _cli_logging_configured = False
 
@@ -40,7 +19,51 @@ def configure_cli_logging() -> None:
     _configure_cli_bootstrap_logging()
 
 
+# ---------------------------------------------------------------------------
+# Register lazy sub-commands (no module imports at definition time)
+# ---------------------------------------------------------------------------
+
+register_lazy_command(
+    "run", "skyvern.cli.run_commands", "run_app", "Run Skyvern services like the API server, UI, and MCP."
+)
+register_lazy_command("block", "skyvern.cli.block", "block_app", "Inspect and validate workflow block schemas.")
+register_lazy_command(
+    "credential", "skyvern.cli.credential", "credential_app", "MCP-parity credential commands (list/get/delete)."
+)
+register_lazy_command("workflow", "skyvern.cli.workflow", "workflow_app", "Workflow management commands.")
+register_lazy_command("tasks", "skyvern.cli.tasks", "tasks_app", "Task management commands.")
+register_lazy_command(
+    "credentials",
+    "skyvern.cli.credentials",
+    "credentials_app",
+    "Secure credential management (use this for interactive `add`).",
+)
+register_lazy_command("docs", "skyvern.cli.docs", "docs_app", "Open Skyvern documentation.")
+register_lazy_command("status", "skyvern.cli.status", "status_app", "Check if Skyvern services are running.")
+register_lazy_command("stop", "skyvern.cli.stop_commands", "stop_app", "Stop Skyvern services.")
+register_lazy_command(
+    "quickstart",
+    "skyvern.cli.quickstart",
+    "quickstart_app",
+    "One-command setup and start for Skyvern (combines init and run).",
+)
+register_lazy_command("browser", "skyvern.cli.commands.browser", "browser_app", "Browser automation commands.")
+register_lazy_command(
+    "mcp", "skyvern.cli.mcp_commands", "mcp_app", "Switch local MCP client configs and manage optional saved profiles."
+)
+register_lazy_command("skill", "skyvern.cli.skill_commands", "skill_app", "Manage bundled skill reference files.")
+register_lazy_command("setup", "skyvern.cli.setup_commands", "setup_app", "Register Skyvern MCP with AI coding tools.")
+register_lazy_command(
+    "init", "skyvern.cli.init_command", "init_app_factory", "Interactively configure Skyvern and its dependencies."
+)
+register_lazy_command("doctor", "skyvern.cli.doctor", "doctor_app", "Check Skyvern installation health.")
+
+# ---------------------------------------------------------------------------
+# Main CLI app
+# ---------------------------------------------------------------------------
+
 cli_app = typer.Typer(
+    cls=LazyTyperGroup,
     help=("""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""),
     no_args_is_help=True,
     rich_markup_mode="rich",
@@ -53,67 +76,47 @@ def cli_callback() -> None:
     configure_cli_logging()
 
 
-cli_app.add_typer(
-    run_app,
-    name="run",
-    help="Run Skyvern services like the API server, UI, and MCP.",
-)
-cli_app.add_typer(block_app, name="block", help="Inspect and validate workflow block schemas.")
-cli_app.add_typer(
-    credential_app,
-    name="credential",
-    help="MCP-parity credential commands (list/get/delete).",
-)
-cli_app.add_typer(workflow_app, name="workflow", help="Workflow management commands.")
-cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
-cli_app.add_typer(
-    credentials_app,
-    name="credentials",
-    help="Secure credential management (use this for interactive `add`).",
-)
-cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
-cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
-cli_app.add_typer(stop_app, name="stop", help="Stop Skyvern services.")
-init_app = typer.Typer(
-    invoke_without_command=True,
-    help="Interactively configure Skyvern and its dependencies.",
-)
-cli_app.add_typer(init_app, name="init")
-
-# Add quickstart command
-cli_app.add_typer(
-    quickstart_app, name="quickstart", help="One-command setup and start for Skyvern (combines init and run)."
-)
-
-cli_app.command(name="login")(login_command)
-cli_app.command(name="signup", hidden=True)(signup_command)  # backwards compat
-
-# Browser automation commands
-cli_app.add_typer(browser_app, name="browser", help="Browser automation commands.")
-cli_app.add_typer(mcp_app, name="mcp", help="Switch local MCP client configs and manage optional saved profiles.")
-cli_app.add_typer(skill_app, name="skill", help="Manage bundled skill reference files.")
-cli_app.add_typer(setup_app, name="setup", help="Register Skyvern MCP with AI coding tools.")
+# ---------------------------------------------------------------------------
+# Eagerly-defined commands (lightweight, base-deps only)
+# ---------------------------------------------------------------------------
 
 
-@init_app.callback()
-def init_callback(
-    ctx: typer.Context,
-    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-    database_string: str = typer.Option(
-        "",
-        "--database-string",
-        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+@cli_app.command(name="login")
+def login_command(
+    base_url: str = typer.Option(
+        "https://app.skyvern.com",
+        "--base-url",
+        help="Frontend URL (e.g. http://localhost:8080 for local dev)",
+    ),
+    timeout: int = typer.Option(
+        300,
+        "--timeout",
+        help="Timeout in seconds waiting for browser authentication",
     ),
 ) -> None:
-    """Run full initialization when no subcommand is provided."""
-    if ctx.invoked_subcommand is None:
-        init_env(no_postgres=no_postgres, database_string=database_string)
+    """Authenticate with Skyvern Cloud and save your API key."""
+    from skyvern.cli.auth_command import login as _login  # noqa: PLC0415
+
+    _login(base_url=base_url, timeout=timeout)
 
 
-@init_app.command(name="browser")
-def init_browser_command() -> None:
-    """Initialize only the browser configuration."""
-    init_browser()
+@cli_app.command(name="signup", hidden=True)
+def signup_command(
+    base_url: str = typer.Option(
+        "https://app.skyvern.com",
+        "--base-url",
+        help="Frontend URL (e.g. http://localhost:8080 for local dev)",
+    ),
+    timeout: int = typer.Option(
+        300,
+        "--timeout",
+        help="Timeout in seconds waiting for browser authentication",
+    ),
+) -> None:
+    """Authenticate with Skyvern Cloud (backwards-compat alias)."""
+    from skyvern.cli.auth_command import signup as _signup  # noqa: PLC0415
+
+    _signup(base_url=base_url, timeout=timeout)
 
 
 @cli_app.command("capabilities")
@@ -122,7 +125,6 @@ def capabilities(
     depth: int = typer.Option(
         1, "--depth", min=0, max=5, help="Recursion depth (0=top-level names only, 1=subcommands, 2+=full tree)."
     ),
-    # Intentionally defaults True (agent-first) — unlike other commands which default False.
     json_output: bool = typer.Option(True, "--json/--no-json", help="Output as JSON.", show_default=True),
 ) -> None:
     """Return the CLI command tree for agent discovery.
@@ -138,12 +140,16 @@ def capabilities(
       skyvern capabilities --depth 3            # full tree (~20K tokens)
       skyvern capabilities --no-json            # human-readable
     """
-    click_app = typer.main.get_command(cli_app)
+    import click as _click  # noqa: PLC0415
+
+    from skyvern.cli.commands._output import output, output_error  # noqa: PLC0415
+
+    click_app = typer.main.get_group(cli_app)
 
     if subcommand:
-        if not isinstance(click_app, click.Group):
+        if not isinstance(click_app, _click.Group):
             output_error(f"Unknown subcommand: {subcommand}", json_mode=json_output)
-        ctx = click.Context(click_app, info_name="skyvern")
+        ctx = _click.Context(click_app, info_name="skyvern")
         child_cmd = click_app.get_command(ctx, subcommand)
         if child_cmd is None or child_cmd.hidden:
             output_error(
@@ -158,24 +164,22 @@ def capabilities(
     output(tree, action="capabilities", json_mode=json_output)
 
 
-def _walk_command_tree(cmd: Any, prefix: str = "", max_depth: int = 1, _current_depth: int = 0) -> dict:
-    """Recursively walk the Click/Typer command tree and return structured metadata.
+def _walk_command_tree(cmd: object, prefix: str = "", max_depth: int = 1, _current_depth: int = 0) -> dict:
+    """Recursively walk the Click/Typer command tree and return structured metadata."""
+    import click as _click  # noqa: PLC0415
 
-    Uses progressive disclosure: max_depth controls how deep to recurse.
-    depth=0 returns names only, depth=1 includes immediate subcommands, etc.
-    """
-    name = prefix or cmd.name or "skyvern"
-    info: dict = {"name": name, "help": (cmd.help or "").strip()}
+    name = prefix or getattr(cmd, "name", None) or "skyvern"
+    info: dict = {"name": name, "help": (getattr(cmd, "help", "") or "").strip()}
 
     options = []
     arguments = []
     for param in getattr(cmd, "params", []):
-        if isinstance(param, click.Argument):
+        if isinstance(param, _click.Argument):
             arg_info: dict = {"name": param.name, "required": param.required}
             if param.type and param.type.name != "TEXT":
                 arg_info["type"] = param.type.name
             arguments.append(arg_info)
-        elif isinstance(param, click.Option) and param.name not in ("help",):
+        elif isinstance(param, _click.Option) and param.name not in ("help",):
             opt_info: dict = {
                 "name": param.name,
                 "flags": list(param.opts),
@@ -189,10 +193,10 @@ def _walk_command_tree(cmd: Any, prefix: str = "", max_depth: int = 1, _current_
     if options:
         info["options"] = options
 
-    if isinstance(cmd, click.Group):
+    if isinstance(cmd, _click.Group):
         if _current_depth < max_depth:
             children = []
-            ctx = click.Context(cmd, info_name=name)
+            ctx = _click.Context(cmd, info_name=name)
             for child_name in cmd.list_commands(ctx):
                 child_cmd = cmd.get_command(ctx, child_name)
                 if child_cmd is None or child_cmd.hidden:
@@ -206,7 +210,7 @@ def _walk_command_tree(cmd: Any, prefix: str = "", max_depth: int = 1, _current_
             if children:
                 info["subcommands"] = children
         else:
-            ctx = click.Context(cmd, info_name=name)
+            ctx = _click.Context(cmd, info_name=name)
             child_names = []
             for n in cmd.list_commands(ctx):
                 c = cmd.get_command(ctx, n)

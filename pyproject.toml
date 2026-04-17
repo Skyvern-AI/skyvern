@@ -49,6 +49,7 @@ dependencies = [
     "aiofiles>=24.1.0,<25",
     "pyotp>=2.9.0,<3",
     "asyncpg>=0.30.0,<0.32",
+    "json5>=0.13.0,<1",
     "json-repair>=0.34.0,<0.59",
     "pypdf>=6.7.5,<7",
     "pdfplumber>=0.11.0,<0.12",
@@ -92,7 +93,6 @@ cloud = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.39.1,<2",
     "kr8s>=0.20.14,<1",
     # OpenTelemetry instrumentation
-    "opentelemetry-sdk>=1.39.0,<2",
     "opentelemetry-distro>=0.60b1,<1",
     "opentelemetry-instrumentation-fastapi>=0.60b1,<1",
     "opentelemetry-instrumentation-asyncpg>=0.60b1,<1",
@@ -113,6 +113,12 @@ dev = [
     "types-requests>=2.31.0.2,<3",
     "pytest>=7.4.0,<8",
     "pytest-asyncio>=0.21.1,<0.22",
+    # Needed by tests/unit/test_llm_handler_tracing.py which exercises the LLM
+    # chokepoint's OTEL instrumentation. Cloud runtime also uses this via
+    # cloud/observability/, but that ships via the `cloud` group's transitive
+    # closure (opentelemetry-distro, instrumentation-*). Placing it here keeps
+    # the test collectable in OSS envs, which only sync the `dev` group.
+    "opentelemetry-sdk>=1.39.0,<2",
     "autoflake>=2.2.0,<3",
     "pydevd-pycharm>=233.6745.319,<234",
     "ipython>=8.17.2,<9",

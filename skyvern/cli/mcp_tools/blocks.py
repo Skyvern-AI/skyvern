@@ -316,13 +316,7 @@ async def skyvern_block_schema(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Get the schema for a workflow block type, or list all available block types.
-
-    Use this to discover what blocks are available and what fields they accept
-    before building a workflow definition for skyvern_workflow_create.
-
-    Call with no arguments to see all block types. Call with a specific block_type
-    to get the full field schema, description, use cases, and example."""
+    """Get the schema for a workflow block type, or list all available types if block_type is omitted."""
 
     action = "skyvern_block_schema"
 
@@ -405,12 +399,7 @@ async def skyvern_block_validate(
         Field(description="JSON string of a single block definition to validate"),
     ],
 ) -> dict[str, Any]:
-    """Validate a workflow block definition before using it in skyvern_workflow_create.
-
-    Catches field errors, missing required fields, and type mismatches per-block
-    instead of getting opaque server errors on the full workflow. Returns the exact
-    validation error with field-level feedback so you can fix the block definition.
-    """
+    """Validate a workflow block definition before using it in skyvern_workflow_create. Returns field-level errors."""
     action = "skyvern_block_validate"
 
     try:

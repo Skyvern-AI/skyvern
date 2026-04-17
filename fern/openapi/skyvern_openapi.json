@@ -3216,7 +3216,21 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "update_credential"
+        "x-fern-sdk-method-name": "update_credential",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nupdated = await skyvern.update_credential(\n    credential_id=\"cred_123\",\n    name=\"My Credential\",\n    credential_type=\"password\",\n    credential={\"username\": \"user@example.com\", \"password\": \"newpassword123\"},\n)\nprint(updated)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst updated = await skyvern.updateCredential(\"cred_123\", {\n    name: \"My Credential\",\n    credential_type: \"password\",\n    credential: { username: \"user@example.com\", password: \"newpassword123\" }\n});\nconsole.log(updated);\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/credentials/{credential_id}/delete": {

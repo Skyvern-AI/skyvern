@@ -24,18 +24,9 @@ from starlette.responses import Response as StarletteResponse
 from skyvern.cli.commands._output import output_error
 from skyvern.cli.commands._tty import is_interactive
 from skyvern.cli.console import console
-from skyvern.cli.core.client import close_skyvern
-from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware, close_auth_db
 from skyvern.cli.core.result import set_concise_responses
-from skyvern.cli.core.server_card import build_server_card
-from skyvern.cli.core.session_manager import close_current_session, set_stateless_http_mode
-from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
-from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime
 from skyvern.cli.utils import start_services
 from skyvern.config import settings
-from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.forge_log import setup_logger
-from skyvern.services.script_service import run_script
 from skyvern.utils import detect_os
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
@@ -49,6 +40,10 @@ def _default_host() -> str:
 
 
 async def _cleanup_mcp_resources() -> None:
+    from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
+    from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import close_current_session  # noqa: PLC0415
+
     try:
         await close_current_session()
     finally:
@@ -114,6 +109,13 @@ def kill_pids(pids: List[int]) -> None:
 @run_app.command(name="server")
 def run_server() -> None:
     """Run the Skyvern API server."""
+    try:
+        import sqlalchemy  # noqa: F401, PLC0415
+    except ImportError as exc:
+        from skyvern.cli.lazy import _handle_missing_dep  # noqa: PLC0415
+
+        _handle_missing_dep(exc)
+
     load_dotenv(resolve_backend_env_path())
     from skyvern.config import settings  # noqa: PLC0415
 
@@ -308,6 +310,8 @@ class _ServerCardMiddleware:
     """Serve /.well-known/mcp/server-card.json for HTTP MCP transports."""
 
     def __init__(self, app: "ASGIApp", transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
+        from skyvern.cli.core.server_card import build_server_card  # noqa: PLC0415
+
         self.app = app
         self.transport_type = transport_type
         card_host = "localhost" if host in ("0.0.0.0", "::") else host
@@ -362,6 +366,11 @@ def run_mcp(
     ] = False,
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
+    from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
+    from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
+    from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
+
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
     configure_mcp_telemetry_runtime(server_mode="local_cli", transport=transport)
@@ -433,7 +442,12 @@ def run_code(
     """
     # Disable LiteLLM loggers
     os.environ["LITELLM_LOG"] = "CRITICAL"
-    import litellm  # noqa: PLC0415
+    try:
+        import litellm  # noqa: PLC0415
+    except ImportError as exc:
+        from skyvern.cli.lazy import _handle_missing_dep  # noqa: PLC0415
+
+        _handle_missing_dep(exc)
 
     litellm.suppress_debug_info = True
     litellm.set_verbose = False
@@ -442,6 +456,9 @@ def run_code(
     logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
     settings.LOG_LEVEL = "CRITICAL"
+
+    from skyvern.forge.sdk.forge_log import setup_logger  # noqa: PLC0415
+
     setup_logger()
 
     # Validate script path
@@ -522,6 +539,8 @@ def run_code(
         console.print("[dim]Tip: Add parameters with -p, --params, or --params-file[/dim]")
 
     # set up skyvern context
+    from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
+    from skyvern.services.script_service import run_script  # noqa: PLC0415
 
     skyvern_context.set(skyvern_context.SkyvernContext(script_mode=True, ai_mode_override=ai))
     try:

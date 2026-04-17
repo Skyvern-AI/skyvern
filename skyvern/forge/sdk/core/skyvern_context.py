@@ -37,7 +37,7 @@ class SkyvernContext:
     max_screenshot_scrolls: int | None = None
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
-    workflow_feature_flags_entries: dict[str, bool | str | None] = field(default_factory=dict)
+    feature_flag_entries: dict[str, bool | str | None] = field(default_factory=dict)
 
     # feature flags
     enable_page_ready_wait: bool = False
@@ -123,35 +123,45 @@ class SkyvernContext:
             return False
         return True
 
-    def flush_workflow_feature_flags(self) -> None:
-        if not self.workflow_feature_flags_entries:
-            return
-        if not self.workflow_run_id:
-            LOG.debug(
-                "Discarding workflow_feature_flags entries for non-workflow context",
-                count=len(self.workflow_feature_flags_entries),
-            )
-            self.workflow_feature_flags_entries.clear()
+    def flush_feature_flags(self) -> None:
+        if not self.feature_flag_entries:
             return
 
-        feature_resolutions = dict(sorted(self.workflow_feature_flags_entries.items()))
+        has_workflow = bool(self.workflow_run_id)
+        has_task = bool(self.task_id or self.task_v2_id or self.run_id)
+
+        if not (has_workflow or has_task):
+            LOG.debug(
+                "Discarding feature flag entries for non-run context",
+                count=len(self.feature_flag_entries),
+            )
+            self.feature_flag_entries.clear()
+            return
+
+        feature_resolutions = dict(sorted(self.feature_flag_entries.items()))
         log_fields: dict[str, Any] = {
             "organization_id": str(self.organization_id or ""),
-            "workflow_run_id": str(self.workflow_run_id),
-            "workflow_permanent_id": str(self.workflow_permanent_id or ""),
             "feature_resolutions": feature_resolutions,
             "service_name": settings.OTEL_SERVICE_NAME,
         }
+        if self.workflow_run_id:
+            log_fields["workflow_run_id"] = str(self.workflow_run_id)
+        if self.workflow_permanent_id:
+            log_fields["workflow_permanent_id"] = str(self.workflow_permanent_id)
         if self.task_id:
             log_fields["task_id"] = str(self.task_id)
         if self.task_v2_id:
             log_fields["task_v2_id"] = str(self.task_v2_id)
+        if self.run_id:
+            log_fields["run_id"] = str(self.run_id)
         if self.browser_session_id:
             log_fields["browser_session_id"] = str(self.browser_session_id)
         if self.request_id:
             log_fields["request_id"] = str(self.request_id)
-        LOG.info("workflow_feature_flags", **log_fields)
-        self.workflow_feature_flags_entries.clear()
+
+        event_name = "workflow_feature_flags" if has_workflow else "task_feature_flags"
+        LOG.info(event_name, **log_fields)
+        self.feature_flag_entries.clear()
 
 
 _context: ContextVar[SkyvernContext | None] = ContextVar(
@@ -209,13 +219,13 @@ def replace(context: SkyvernContext) -> None:
     Returns:
         None
     """
-    _flush_workflow_feature_flags_if_needed(current())
+    _flush_feature_flags_if_needed(current())
     _context.set(context)
 
 
-def _flush_workflow_feature_flags_if_needed(context: SkyvernContext | None) -> None:
-    if context is not None and context.workflow_feature_flags_entries:
-        context.flush_workflow_feature_flags()
+def _flush_feature_flags_if_needed(context: SkyvernContext | None) -> None:
+    if context is not None and context.feature_flag_entries:
+        context.flush_feature_flags()
 
 
 def _restore(token: Token[SkyvernContext | None]) -> None:
@@ -228,7 +238,7 @@ def _restore(token: Token[SkyvernContext | None]) -> None:
     Returns:
         None
     """
-    _flush_workflow_feature_flags_if_needed(current())
+    _flush_feature_flags_if_needed(current())
     _context.reset(token)
 
 
@@ -257,5 +267,5 @@ def reset() -> None:
     Returns:
         None
     """
-    _flush_workflow_feature_flags_if_needed(current())
+    _flush_feature_flags_if_needed(current())
     _context.set(None)
