@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
-import toml
 import typer
 import yaml
 from rich.panel import Panel
@@ -264,6 +263,8 @@ def _server_block_key(config_format: str) -> str:
 
 
 def _load_codex_config(config_path: Path) -> tuple[dict | None, str | None]:
+    import toml  # noqa: PLC0415
+
     if not config_path.exists():
         return {}, None
 
@@ -294,6 +295,8 @@ def _load_switch_config(config_path: Path, config_format: str) -> tuple[dict | N
 
 
 def _write_codex_config(config_path: Path, config: dict, create_backup: bool = True) -> Path | None:
+    import toml  # noqa: PLC0415
+
     backup_path: Path | None = None
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if create_backup and config_path.exists():
@@ -726,6 +729,8 @@ def _patch_entry_with_profile(
 
 
 def _render_patched_entry(target: SwitchTarget, patched: dict) -> Syntax:
+    import toml  # noqa: PLC0415
+
     masked = _mask_secrets(patched)
     if target.config_format == _CONFIG_FORMAT_CODEX and target.entry_key:
         snippet = toml.dumps({_server_block_key(target.config_format): {target.entry_key: masked}})

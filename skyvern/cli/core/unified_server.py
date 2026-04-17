@@ -75,6 +75,7 @@ class UnifiedServer:
         """Start the unified server."""
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
+        # Infra-only bind; SDK quickstart uses run_commands._default_host() instead
         self._site = web.TCPSite(self._runner, "0.0.0.0", self.config.port)
         await self._site.start()
 
