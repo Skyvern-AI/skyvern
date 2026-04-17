@@ -51,6 +51,7 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+PROXY_USAGE_PREFIX = "pxu"
 SCRIPT_FILE_PREFIX = "sf"
 SCRIPT_REVISION_PREFIX = "sr"
 SCRIPT_PREFIX = "s"
@@ -208,6 +209,11 @@ def generate_thought_id() -> str:
 def generate_persistent_browser_session_id() -> str:
     int_id = generate_id()
     return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
+
+
+def generate_proxy_usage_id() -> str:
+    int_id = generate_id()
+    return f"{PROXY_USAGE_PREFIX}_{int_id}"
 
 
 def generate_browser_profile_id() -> str:
