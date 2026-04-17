@@ -49,6 +49,7 @@ dependencies = [
     "aiofiles>=24.1.0,<25",
     "pyotp>=2.9.0,<3",
     "asyncpg>=0.30.0,<0.32",
+    "json5>=0.13.0,<1",
     "json-repair>=0.34.0,<0.59",
     "pypdf>=6.7.5,<7",
     "pdfplumber>=0.11.0,<0.12",
