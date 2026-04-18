@@ -356,4 +356,4 @@ def _get_worker_hash() -> int:
 
 def _generate_worker_hash() -> int:
     worker_identity = f"{platform.node()}:{os.getpid()}"
-    return int(hashlib.md5(worker_identity.encode()).hexdigest()[-15:], 16)
+    return int(hashlib.md5(worker_identity.encode(), usedforsecurity=False).hexdigest()[-15:], 16)
