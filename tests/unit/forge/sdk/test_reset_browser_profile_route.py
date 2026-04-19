@@ -69,3 +69,16 @@ def test_reset_browser_profile_storage_failure_returns_500(monkeypatch: pytest.M
 
     assert response.status_code == 500
     assert "retry" in response.json()["detail"].lower()
+
+
+def test_legacy_refresh_alias_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, get_workflow, delete_browser_session = _build_client(monkeypatch)
+    get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
+
+    response = client.post("/v1/workflows/wpid_123/browser_session/refresh")
+
+    assert response.status_code == 204
+    delete_browser_session.assert_awaited_once_with(
+        organization_id="org_oss",
+        workflow_permanent_id="wpid_123",
+    )

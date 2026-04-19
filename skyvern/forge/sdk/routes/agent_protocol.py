@@ -2954,10 +2954,21 @@ async def get_workflow_versions(
     responses={
         204: {"description": "Successfully cleared persisted browser profile"},
         404: {"description": "Workflow not found"},
+        500: {"description": "Storage deletion failed; retry"},
     },
 )
 @base_router.post(
     "/workflows/{workflow_permanent_id}/browser_session/reset_profile/",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/refresh",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/refresh/",
     status_code=http_status.HTTP_204_NO_CONTENT,
     include_in_schema=False,
 )
