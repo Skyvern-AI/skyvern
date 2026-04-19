@@ -15,6 +15,7 @@ from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.video_utils import finalize_webm
 
 LOG = structlog.get_logger()
 
@@ -292,8 +293,9 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                with open(path, "rb") as f:
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
+                # even when browser_context.close() was killed mid-finalization.
+                browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
             else:
                 LOG.debug(
                     "Video path not found",
