@@ -2989,7 +2989,7 @@ class ForgeAgent:
             variant_parts.append("ml")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
-            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:6]
+            digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
             variant_parts.append(f"cc{digest}")
         return "-".join(variant_parts) if variant_parts else "std"
 
