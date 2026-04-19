@@ -275,7 +275,7 @@ async def test_validate_mcp_api_key_concurrent_callers_all_succeed(
     monkeypatch.setattr(mcp_http_auth, "resolve_org_from_api_key", _resolve)
     monkeypatch.setattr(mcp_http_auth, "_get_auth_db", lambda: object())
 
-    results = await asyncio.gather(*[mcp_http_auth.validate_mcp_api_key("sk_test_concurrent") for _ in range(5)])
+    results = await asyncio.gather(*[mcp_http_auth.validate_mcp_api_key("test-key-concurrent") for _ in range(5)])
     assert all(r.organization_id == "org_concurrent" for r in results)
     # First call populates cache; remaining may or may not hit DB depending on
     # scheduling, but all must succeed.
