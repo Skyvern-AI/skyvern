@@ -3770,6 +3770,10 @@ class ForgeAgent:
                 task_id=task.task_id,
             )
             return
+
+        # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
+        task.webhook_callback_url = task.webhook_callback_url.strip()
+
         last_step = await app.DATABASE.tasks.get_latest_step(task.task_id, organization_id=task.organization_id)
 
         task_response = await self.build_task_response(task=task, last_step=last_step)

@@ -2052,6 +2052,8 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
 async def send_task_v2_webhook(task_v2: TaskV2) -> None:
     if not task_v2.webhook_callback_url:
         return
+    # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
+    task_v2.webhook_callback_url = task_v2.webhook_callback_url.strip()
     organization_id = task_v2.organization_id
     if not organization_id:
         return

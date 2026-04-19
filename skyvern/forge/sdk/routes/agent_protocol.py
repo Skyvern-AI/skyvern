@@ -122,7 +122,7 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
-from skyvern.schemas.webhooks import RetryRunWebhookRequest
+from skyvern.schemas.webhooks import RetryRunWebhookRequest, RunWebhookReplayResponse
 from skyvern.schemas.workflows import (
     BlockType,
     WorkflowCreateYAMLRequest,
@@ -1591,6 +1591,7 @@ async def get_run_artifacts(
     },
     description="Retry sending the webhook for a run",
     summary="Retry run webhook",
+    response_model=RunWebhookReplayResponse,
 )
 @base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
 async def retry_run_webhook(
@@ -1598,9 +1599,9 @@ async def retry_run_webhook(
     request: RetryRunWebhookRequest | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
-) -> None:
+) -> RunWebhookReplayResponse:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
-    await run_service.retry_run_webhook(
+    return await run_service.retry_run_webhook(
         run_id,
         organization_id=current_org.organization_id,
         api_key=x_api_key,

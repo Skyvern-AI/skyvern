@@ -516,6 +516,7 @@ def _as_run_type_str(run_type: RunType | str | None) -> str:
 
 
 def _validate_target_url(url: str) -> str:
+    url = url.strip()
     try:
         validated_url = validate_url(url)
         if not validated_url:

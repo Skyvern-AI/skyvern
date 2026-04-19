@@ -6,6 +6,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.webhooks import RunWebhookReplayResponse
 from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
 
 
@@ -153,49 +154,13 @@ async def retry_run_webhook(
     organization_id: str | None = None,
     api_key: str | None = None,
     webhook_url: str | None = None,
-) -> None:
-    """Retry sending the webhook for a run."""
-
-    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run not found {run_id}",
-        )
-
-    if webhook_url:
-        if not organization_id:
-            raise OrganizationNotFound(organization_id="")
-        await webhook_service.replay_run_webhook(
-            organization_id=organization_id,
-            run_id=run_id,
-            target_url=webhook_url,
-            api_key=api_key,
-        )
-        return
-
-    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
-        task = await app.DATABASE.tasks.get_task(run_id, organization_id=organization_id)
-        if not task:
-            raise TaskNotFound(task_id=run_id)
-        latest_step = await app.DATABASE.tasks.get_latest_step(run_id, organization_id=organization_id)
-        if latest_step:
-            await app.agent.execute_task_webhook(task=task, api_key=api_key)
-    elif run.task_run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.observer.get_task_v2(run_id, organization_id=organization_id)
-        if not task_v2:
-            raise TaskNotFound(task_id=run_id)
-        await task_v2_service.send_task_v2_webhook(task_v2)
-    elif run.task_run_type == RunType.workflow_run:
-        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-            workflow_run_id=run_id,
-            organization_id=organization_id,
-        )
-        if not workflow_run:
-            raise WorkflowRunNotFound(workflow_run_id=run_id)
-        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid run type to retry webhook: {run.task_run_type}",
-        )
+) -> RunWebhookReplayResponse:
+    """Retry sending the webhook for a run, optionally to a custom URL."""
+    if not organization_id:
+        raise OrganizationNotFound(organization_id="")
+    return await webhook_service.replay_run_webhook(
+        organization_id=organization_id,
+        run_id=run_id,
+        target_url=webhook_url,
+        api_key=api_key,
+    )

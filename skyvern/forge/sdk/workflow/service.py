@@ -4677,6 +4677,9 @@ class WorkflowService:
             )
             return
 
+        # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
+        workflow_run.webhook_callback_url = workflow_run.webhook_callback_url.strip()
+
         signing_api_key = api_key
         if not signing_api_key:
             org_api_key = await app.DATABASE.organizations.get_valid_org_auth_token(
