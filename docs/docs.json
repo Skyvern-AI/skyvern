@@ -41,7 +41,6 @@
         "tab": "Home",
         "pages": [
           "index",
-          "nav/getting-started",
           "nav/cloud-ui",
           "nav/developers",
           "nav/cookbooks",
@@ -51,29 +50,24 @@
         ]
       },
       {
-        "tab": "Getting Started",
-        "groups": [
-          {
-            "group": "Getting Started",
-            "pages": [
-              "getting-started/introduction",
-              "getting-started/core-concepts",
-              "getting-started/quickstart",
-              "getting-started/ai-agents-quickstart"
-            ]
-          }
-        ]
-      },
-      {
         "tab": "Cloud UI",
         "groups": [
           {
             "group": "Getting Started",
             "pages": [
-              "cloud/getting-started/overview",
+              "cloud/getting-started/introduction",
+              "cloud/getting-started/core-concepts",
+              "cloud/getting-started/ai-agents-quickstart",
+              "cloud/getting-started/overview"
+            ]
+          },
+          {
+            "group": "Running Tasks",
+            "pages": [
               "cloud/getting-started/run-your-first-task",
               "cloud/getting-started/run-a-task",
-              "cloud/getting-started/monitor-a-run"
+              "cloud/getting-started/monitor-a-run",
+              "cloud/getting-started/run-from-code"
             ]
           },
           {
@@ -84,7 +78,8 @@
               "cloud/building-workflows/add-parameters",
               "cloud/building-workflows/configure-blocks",
               "cloud/building-workflows/run-a-workflow",
-              "cloud/building-workflows/scheduling"
+              "cloud/building-workflows/scheduling",
+              "cloud/building-workflows/run-from-code"
             ]
           },
           {
@@ -136,6 +131,25 @@
         "tab": "Developers",
         "groups": [
           {
+            "group": "Getting Started",
+            "pages": [
+              "getting-started/introduction",
+              "getting-started/core-concepts",
+              "getting-started/quickstart",
+              "getting-started/ai-agents-quickstart"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/captcha-and-bot-bypass",
+              "features/browser-sessions",
+              "features/proxy-and-geo-targeting",
+              "features/authentication-and-2fa",
+              "features/code-caching"
+            ]
+          },
+          {
             "group": "Running Automations",
             "pages": [
               "running-automations/run-a-task",
@@ -148,6 +162,8 @@
             "pages": [
               "multi-step-automations/overview",
               "multi-step-automations/actions-reference",
+              "multi-step-automations/extract-structured-data",
+              "multi-step-automations/downloading-files",
               "multi-step-automations/managing-browsers"
             ]
           },
@@ -184,7 +200,6 @@
               "going-to-production/proxy-geolocation",
               "going-to-production/error-handling",
               "going-to-production/reliability-tips",
-              "going-to-production/captcha-bot-detection",
               "integrations/mcp",
               "integrations/cli"
             ]
@@ -409,6 +424,10 @@
     }
   },
   "redirects": [
+    {
+      "source": "/going-to-production/captcha-bot-detection",
+      "destination": "/features/captcha-and-bot-bypass"
+    },
     {
       "source": "/sdk-reference/browser-automation/find",
       "destination": "/sdk-reference/browser-automation/locator"

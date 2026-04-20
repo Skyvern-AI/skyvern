@@ -725,7 +725,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 | Site still blocks requests | Bot detection beyond IP geolocation (fingerprinting, behavioral analysis) | Use `RESIDENTIAL_ISP` for static IPs, match proxy to site's region, add `wait` blocks between actions |
 | Need to debug proxy issues | Isolate whether proxy is causing failures | Set `proxy_location: "NONE"` to bypass proxy entirely |
 
-For sites with aggressive bot detection, combine residential proxies with the techniques in [Captcha & Bot Detection](/going-to-production/captcha-bot-detection).
+For sites with aggressive bot detection, combine residential proxies with the techniques in [CAPTCHA & Bot Bypass](/features/captcha-and-bot-bypass).
 
 Need a location that's not available? Get help in the [Skyvern Discord community](https://discord.gg/skyvern) to request new proxy pools.
 
@@ -737,7 +737,7 @@ Need a location that's not available? Get help in the [Skyvern Discord community
   <Card
     title="Captcha & Bot Detection"
     icon="robot"
-    href="/going-to-production/captcha-bot-detection"
+    href="/features/captcha-and-bot-bypass"
   >
     Combine proxies with anti-detection techniques
   </Card>

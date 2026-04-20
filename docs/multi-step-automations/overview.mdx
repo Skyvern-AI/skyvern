@@ -75,7 +75,7 @@ For browser launch options (timeouts, proxies, connecting to local browsers), se
 
 ## Step 2: Navigate and interact with the page
 
-Once you have a page, you can interact with it using standard Playwright, AI actions, or both.
+Once you have a page, you can interact with it using standard Playwright, AI actions, or both. For the full list of available methods and parameters, see the [Actions Reference](/multi-step-automations/actions-reference).
 
 ### Navigate
 
@@ -394,6 +394,27 @@ Every run appears in the [Runs page](https://app.skyvern.com/runs). Click any ru
 - **Actions** - step-by-step timeline with screenshots and AI reasoning
 - **Output** - extracted data as JSON
 - **Artifacts** - screenshots, HAR files, generated code
+
+### Artifacts
+
+Every run captures recordings, screenshots, AI reasoning logs, network HAR files, and downloaded files. Access them via the Cloud UI or programmatically:
+
+<CodeGroup>
+```python Python
+artifacts = await skyvern.get_run_artifacts(result.run_id)
+for artifact in artifacts:
+    print(f"{artifact.artifact_type}: {artifact.uri}")
+```
+
+```typescript TypeScript
+const artifacts = await skyvern.getRunArtifacts(result.run_id);
+for (const artifact of artifacts) {
+  console.log(`${artifact.artifact_type}: ${artifact.uri}`);
+}
+```
+</CodeGroup>
+
+For the full artifact type reference and debugging workflows, see [Using Artifacts](/debugging/using-artifacts).
 
 ### Close the browser
 

@@ -1,0 +1,80 @@
+---
+title: Browser Sessions
+subtitle: Keep a live browser open across multiple tasks and workflows
+description: Skyvern browser sessions are live browser instances that persist cookies, local storage, and page state across runs. Use them for back-to-back tasks, human-in-the-loop flows, and real-time agents.
+slug: features/browser-sessions
+icon: window-restore
+keywords:
+  - browser sessions
+  - persistent state
+  - human-in-the-loop
+  - real-time agent
+  - cookies
+  - local storage
+  - browser profile
+---
+
+A Browser Session is a live browser instance that Skyvern keeps running between runs. Cookies, local storage, open tabs, and the current page all persist. Later tasks pick up exactly where the previous one stopped.
+
+---
+
+## What you can build
+
+- **Back-to-back tasks** — log in with one task, search and extract with the next, no re-authentication in between
+- **Human-in-the-loop flows** — pause for approval between steps without losing browser state
+- **Real-time agents** — keep a browser open for hours while the agent responds to events
+- **Task + workflow chaining** — run tasks and workflows through the same live browser instance
+
+---
+
+## Configuration
+
+| Option | Range / Values |
+|--------|----------------|
+| Timeout | 5 minutes to 24 hours (default 60 min) |
+| Proxy location | Any of Skyvern's [20 supported countries](/going-to-production/proxy-geolocation) |
+| Browser type | Chrome or Edge |
+| Extensions | Built-in ad-blocker, CAPTCHA solver |
+
+Every session exposes a live VNC stream so you can watch — or take control of — the browser as it runs.
+
+---
+
+## Sessions vs. Profiles
+
+Sessions are **live** browsers that bill while open. [Browser Profiles](/optimization/browser-profiles) are **saved snapshots** of browser state you reuse across days or weeks. You can create a profile from a finished session to save its authenticated state for later reuse.
+
+---
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser sessions guide"
+    icon="window-restore"
+    href="/optimization/browser-sessions"
+  >
+    Create sessions, run tasks and workflows through them, and close cleanly
+  </Card>
+  <Card
+    title="Browser profiles"
+    icon="floppy-disk"
+    href="/optimization/browser-profiles"
+  >
+    Save state to reuse across days or weeks
+  </Card>
+  <Card
+    title="Connect your local browser"
+    icon="laptop"
+    href="/self-hosted/browser"
+  >
+    Use your own Chrome with its existing logins and extensions
+  </Card>
+  <Card
+    title="SDK reference"
+    icon="code"
+    href="/sdk-reference/browser-sessions/create-browser-session"
+  >
+    `create_browser_session`, `get_browser_session`, `close_browser_session`
+  </Card>
+</CardGroup>

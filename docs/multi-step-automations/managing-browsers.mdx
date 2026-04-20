@@ -37,7 +37,7 @@ const page = await browser.getWorkingPage();
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `timeout` | `int` | `60` | Session timeout in minutes (5-1440) |
+| `timeout` | `int` | `None` | Session timeout in minutes (5-1440). Server default: 60 minutes |
 | `proxy_location` | `ProxyLocation` | `None` | Route traffic through a geographic proxy |
 
 The browser stays alive until `timeout` expires or you call `browser.close()`.
@@ -47,14 +47,14 @@ The browser stays alive until `timeout` expires or you call `browser.close()`.
 # Launch with a 2-hour timeout and US residential proxy
 browser = await skyvern.launch_cloud_browser(
     timeout=120,
-    proxy_location="RESIDENTIAL_US"
+    proxy_location="RESIDENTIAL"
 )
 ```
 ```typescript TypeScript
 const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
 const browser = await skyvern.launchCloudBrowser({
     timeout: 120,
-    proxyLocation: "RESIDENTIAL_US",
+    proxyLocation: "RESIDENTIAL",
 });
 ```
 </CodeGroup>
@@ -188,13 +188,13 @@ Route browser traffic through residential proxies in specific countries.
 <CodeGroup>
 ```python Python
 browser = await skyvern.launch_cloud_browser(
-    proxy_location="RESIDENTIAL_US"
+    proxy_location="RESIDENTIAL"
 )
 ```
 ```typescript TypeScript
 const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
 const browser = await skyvern.launchCloudBrowser({
-    proxyLocation: "RESIDENTIAL_US",
+    proxyLocation: "RESIDENTIAL",
 });
 ```
 </CodeGroup>
@@ -203,11 +203,16 @@ Available locations:
 
 | Value | Region |
 |-------|--------|
-| `RESIDENTIAL` | Default residential proxy |
-| `RESIDENTIAL_US` | United States |
+| `RESIDENTIAL` | United States (default) |
+| `RESIDENTIAL_GB` | United Kingdom |
+| `RESIDENTIAL_DE` | Germany |
 | `RESIDENTIAL_ES` | Spain |
+| `RESIDENTIAL_FR` | France |
 | `RESIDENTIAL_IE` | Ireland |
 | `RESIDENTIAL_IN` | India |
+| `RESIDENTIAL_JP` | Japan |
+| `RESIDENTIAL_AU` | Australia |
+| `RESIDENTIAL_CA` | Canada |
 | `NONE` | No proxy (direct connection) |
 
 For self-hosted proxy configuration, see [Proxy Setup](/self-hosted/proxy).

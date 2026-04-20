@@ -40,15 +40,101 @@ print(result.output)  # {"posts": ["Post 1", "Post 2", "Post 3"]}
 | `browser_session_id` | Run in an existing browser session |
 | `webhook_url` | Callback URL for async completion |
 
-**Use Tasks for:** one-off automations, quick data extraction, prototyping before building a workflow.
+**Use Tasks for:** one-off automations, quick data extraction, prototyping.
 
-When you need reusable, multi-step automations, use **Workflows** instead.
+When a single task isn't enough, you have two options for multi-step work:
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser Automation (Code)"
+    icon="code"
+    href="#browser-automation"
+  >
+    Write multi-step automations in Python or TypeScript with full Playwright control. Best for developers who want to version, test, and deploy automation code.
+  </Card>
+  <Card
+    title="Workflows (Visual)"
+    icon="window-maximize"
+    href="#workflows"
+  >
+    Build multi-step automations visually in the Cloud UI with drag-and-drop blocks. No code required. Best for reusable templates shared across your team.
+  </Card>
+</CardGroup>
+
+---
+
+## Browser Automation
+
+**Browser Automation** is multi-step automation in code. Skyvern SDK connects to a cloud Chromium instance over CDP, layers Playwright on top, and injects AI into every page. Three layers, from innermost to outermost:
+
+### Page
+
+A **Page** wraps a Playwright page with AI. Standard calls (`goto`, `click("#id")`, `fill`) work as-is. AI actions work without selectors - Skyvern screenshots the page and decides what to interact with from your prompt.
+
+```python
+# AI actions - no selectors needed
+await page.act("Click the login button")
+data = await page.extract("Extract all product names and prices")
+is_ok = await page.validate("The cart has 3 items")
+
+# AI-enhanced Playwright - try selector first, fall back to AI
+await page.click("#checkout", prompt="Click the checkout button")
+await page.fill("#email", value="user@example.com", prompt="Fill the email field")
+```
+
+**Use Pages for:** direct page interaction. Selectors are fast and deterministic; AI prompts survive layout changes. Combine both.
+
+### Agent
+
+An **Agent** runs complete multi-step AI tasks inside a page you already have open. It reuses the current page with its cookies, login state, and navigation history. You control when to hand off to the agent and when to take back control.
+
+```python
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+
+await page.goto("https://app.example.com")
+await page.agent.login(credential_type="skyvern", credential_id="cred_123")
+
+# Page is now logged in - hand off a complex goal to the agent
+result = await page.agent.run_task(
+    "Go to billing, download the latest invoice"
+)
+
+# Or run a workflow you built in the Cloud UI
+await page.agent.run_workflow("wpid_monthly_report")
+
+await browser.close()
+```
+
+**Use Agents for:** multi-step goals within a single browser session. Login then extract. Chain multiple tasks. Mix agent calls with direct Playwright operations.
+
+### Browser
+
+A **Browser** is a cloud Chromium instance with a Playwright context. Cookies, storage, and auth state persist across every page you open inside it.
+
+```python
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+
+await page.goto("https://example.com")
+# ... do work across multiple pages ...
+
+await browser.close()
+```
+
+**Use Browsers for:** every code-based automation starts here. One browser per run. All pages share the same session state.
+
+<Note>
+**Full method reference:** [Page](/sdk-reference/browser-automation/act), [Agent](/sdk-reference/browser-automation/agent-run-task), [Browser](/sdk-reference/browser-automation/launch-cloud-browser).
+
+**Developer guide:** [Multi-Step Automations](/multi-step-automations/overview).
+</Note>
 
 ---
 
 ## Workflows
 
-A **Workflow** is a reusable template composed of blocks. Unlike tasks, workflows can be versioned, shared across your team, and executed repeatedly with different parameters.
+A **Workflow** is a reusable automation template built in the [Cloud UI workflow editor](/cloud/building-workflows/build-a-workflow). You drag and drop blocks onto a canvas, wire them together, and save. Workflows can be versioned, shared across your team, scheduled on a cron, and run repeatedly with different parameters.
 
 ```mermaid
 flowchart LR
@@ -68,6 +154,11 @@ flowchart LR
 > **Parameters:** `{{search_query}}`, `{{max_price}}`
 > Each block can reference outputs from previous blocks.
 
+<<<<<<< HEAD
+=======
+Run a workflow you built in the UI from code:
+
+>>>>>>> 14e72a60 (major change wip)
 ```python
 result = await skyvern.run_workflow(
     workflow_id="wpid_abc123",
@@ -84,28 +175,30 @@ Workflows support Jinja templating:
 - Reference parameters: `{{search_query}}`
 - Reference previous block outputs: `{{extract_block.product_name}}`
 
-**Use Workflows for:** repeatable automations, multi-step processes, team-shared templates, complex logic with loops or conditionals.
+**Use Workflows for:** no-code automation, team-shared templates, scheduled recurring jobs, visual drag-and-drop logic.
 
-See [Workflow Blocks](/multi-step-automations/workflow-blocks-reference) for the full block reference.
+<Tip>
+**Building workflows?** See the [Workflow Editor guide](/cloud/building-workflows/build-a-workflow) for step-by-step instructions.
 
----
+**Running workflows from code?** See [Running Workflows](/multi-step-automations/build-a-workflow) in the developer docs.
+</Tip>
 
-## Blocks
+### Blocks
 
-Blocks are the building units of workflows. Each block performs one specific task, and blocks execute sequentially—each can reference outputs from previous blocks.
+Blocks are the building units of workflows. Each block performs one operation in the visual editor.
 
-### Navigation & Interaction
+**Navigation & Interaction:**
 
 | Block | Purpose |
 |-------|---------|
-| **Navigation** | AI-guided navigation toward a goal—Skyvern figures out the clicks and inputs |
+| **Navigation** | AI-guided navigation toward a goal |
 | **Action** | Perform a single specific action (click, type, select, upload) |
 | **Go to URL** | Navigate directly to a specific URL |
 | **Login** | Authenticate using stored credentials |
 | **Wait** | Pause execution for a specified duration |
 | **Human Interaction** | Pause for manual intervention (CAPTCHA, approval, etc.) |
 
-### Data & Files
+**Data & Files:**
 
 | Block | Purpose |
 |-------|---------|
@@ -115,7 +208,7 @@ Blocks are the building units of workflows. Each block performs one specific tas
 | **File Parser** | Process PDFs, CSVs, and Excel files |
 | **PDF Parser** | Specialized PDF text extraction |
 
-### Logic & Control Flow
+**Logic & Control Flow:**
 
 | Block | Purpose |
 |-------|---------|
@@ -124,7 +217,7 @@ Blocks are the building units of workflows. Each block performs one specific tas
 | **Validation** | Assert conditions; halt workflow on failure |
 | **Code** | Execute custom Python/Playwright scripts |
 
-### Communication & Integration
+**Communication & Integration:**
 
 | Block | Purpose |
 |-------|---------|
@@ -132,7 +225,7 @@ Blocks are the building units of workflows. Each block performs one specific tas
 | **Text Prompt** | Text-only LLM prompt (no browser interaction) |
 | **Send Email** | Send email messages |
 
-For detailed block configuration, see [Workflow Blocks](/workflows/workflow-blocks-details).
+For detailed block configuration, see [Block Types and Configuration](/cloud/building-workflows/configure-blocks).
 
 ---
 
@@ -226,7 +319,7 @@ const result = await skyvern.agent.createWorkflowSchedule("wpid_abc123", {
 
 ## Credentials
 
-Credentials provide secure storage for authentication data. Skyvern encrypts credentials at rest and in transit, and injects them directly into the browser—**credentials are never sent to or seen by the LLM**.
+Credentials provide secure storage for authentication data. Skyvern encrypts credentials at rest and in transit, and injects them directly into the browser. Credentials are never sent to or seen by the LLM.
 
 ```mermaid
 flowchart TD
@@ -242,12 +335,12 @@ flowchart TD
 - Credit cards
 
 **Credential sources:**
-- **Skyvern** — Native encrypted storage
-- **Bitwarden** — Sync from your Bitwarden vault
-- **1Password** — Sync from your 1Password vault
-- **Azure Key Vault** — Enterprise secret management
+- **Skyvern** - Native encrypted storage
+- **Bitwarden** - Sync from your Bitwarden vault
+- **1Password** - Sync from your 1Password vault
+- **Azure Key Vault** - Enterprise secret management
 
-See [Credentials](/sdk-reference/credentials) for setup instructions.
+See [Credentials](/sdk-reference/credentials/create-credential) for setup instructions.
 
 ---
 
@@ -305,7 +398,7 @@ await skyvern.close_browser_session(
 
 ### Browser Profiles
 
-A saved snapshot of browser state. Unlike sessions, profiles persist indefinitely and can be reused across days or weeks—perfect for skipping login on repeated runs.
+A saved snapshot of browser state. Unlike sessions, profiles persist indefinitely and can be reused across days or weeks - perfect for skipping login on repeated runs.
 
 ```python
 # Create a profile from a completed run
@@ -350,7 +443,7 @@ print(result.downloaded_files)   # [{"url": "...", "checksum": "..."}]
 | **Logs** | JSON-structured logs at step, task, and workflow levels |
 | **HAR files** | HTTP Archive data for network debugging |
 
-In the Skyvern UI, go to **Runs** → click a run → view the **Actions** and **Recording** tabs.
+In the Skyvern UI, go to **Runs** > click a run > view the **Actions** and **Recording** tabs.
 
 ---
 
@@ -385,7 +478,9 @@ result = await skyvern.run_task(
 | I want to... | Use |
 |--------------|-----|
 | Run a one-off automation | [Task](#tasks) |
-| Build a reusable multi-step process | [Workflow](#workflows) |
+| Build multi-step automation in code | [Browser Automation](#browser-automation) |
+| Build multi-step automation visually | [Workflow](#workflows) |
+| Run a UI-built workflow from code | [`run_workflow`](/sdk-reference/workflows/run-workflow) |
 | Keep a browser open between tasks | [Browser Session](#browser-sessions) |
 | Skip login on repeated runs | [Browser Profile](#browser-profiles) |
 | Store secrets securely | [Credentials](#credentials) |
@@ -401,7 +496,7 @@ result = await skyvern.run_task(
     icon="window-maximize"
     href="/cloud/getting-started/overview"
   >
-    Run tasks, build workflows visually, and monitor runs — no code required.
+    Run tasks, build workflows visually, and monitor runs. No code required.
   </Card>
   <Card
     title="Build with the API"

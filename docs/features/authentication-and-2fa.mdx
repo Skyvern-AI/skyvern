@@ -1,0 +1,84 @@
+---
+title: Authentication & 2FA
+subtitle: Log in to any site, including sites with multi-factor authentication
+description: Skyvern handles logins with stored credentials, TOTP/authenticator codes, email and SMS verification, magic links, and password manager integrations with Bitwarden, 1Password, and Azure Key Vault.
+slug: features/authentication-and-2fa
+icon: key
+keywords:
+  - authentication
+  - login
+  - 2FA
+  - MFA
+  - TOTP
+  - magic link
+  - SSO
+  - Bitwarden
+  - 1Password
+  - Azure Key Vault
+---
+
+Skyvern has full authentication support built in — passwords, 2FA, magic links, and password manager integrations. Secrets live in your vault (Bitwarden, 1Password, Azure Key Vault, or your own service); Skyvern never persists them and never sends them to the LLM.
+
+---
+
+## What's supported
+
+**Credential types**
+- Passwords (with optional TOTP secret bundled in)
+- Credit cards (for checkout automations)
+- Arbitrary secrets / API keys
+
+**2FA methods**
+- **TOTP / authenticator apps** — store the secret once; Skyvern generates valid codes on every run
+- **Email or SMS codes** — push codes to Skyvern via API, or expose an endpoint Skyvern polls every 10 seconds
+- **Magic links** — push the one-time login link; Skyvern detects URLs automatically and follows them
+- **Multi-field TOTP** — Skyvern recognizes split-box layouts (one digit per input) and fills all fields with the same code
+
+**Vault integrations**
+- Bitwarden (Cloud & self-hosted / Vaultwarden)
+- 1Password (via service account token)
+- Azure Key Vault
+- Custom HTTP vault — bring your own service
+
+---
+
+## Security by design
+
+- Credentials are fetched from your vault at runtime, used once, then discarded
+- In run recordings, logs, and LLM prompts you see placeholder tokens (`BW_PASSWORD`, `BW_USERNAME`, `BW_TOTP`) — never the real values
+- The LLM never sees your secrets; credential substitution happens in Skyvern's browser layer
+
+---
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card
+    title="Store credentials"
+    icon="key"
+    href="/credentials/store-credentials"
+  >
+    Create passwords, cards, and secrets; wire up Bitwarden, 1Password, Azure, or a custom vault
+  </Card>
+  <Card
+    title="Handle 2FA"
+    icon="shield"
+    href="/credentials/handle-2fa"
+  >
+    TOTP, pushed codes, polled endpoints, and magic links
+  </Card>
+  <Card
+    title="Troubleshoot logins"
+    icon="wrench"
+    href="/credentials/troubleshooting-login"
+  >
+    Debug 2FA and login failures
+  </Card>
+  <Card
+    title="SDK reference"
+    icon="code"
+    href="/sdk-reference/browser-automation/agent-login"
+  >
+    `agent.login()`, `send_totp_code()`, and the credentials API
+  </Card>
+</CardGroup>
