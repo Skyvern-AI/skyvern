@@ -15,6 +15,7 @@ real database -- all DB / LLM / agent surfaces are patched.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -144,7 +145,7 @@ def _setup_new_copilot_mocks(
         get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
         update_workflow_copilot_chat=AsyncMock(),
         create_workflow_copilot_chat_message=AsyncMock(
-            return_value=SimpleNamespace(created_at=SimpleNamespace(isoformat=lambda: "2026-04-14T00:00:00Z"))
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
         ),
     )
     app.DATABASE.workflows = SimpleNamespace(
