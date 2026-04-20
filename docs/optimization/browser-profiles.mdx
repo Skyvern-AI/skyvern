@@ -899,6 +899,19 @@ if (shouldRefreshProfile) {
 ```
 </CodeGroup>
 
+### Clear a corrupted persisted session
+
+If a workflow's persisted browser session becomes corrupted or outdated, you can clear it so the next run starts from a fresh browser state. This is useful when a saved session causes login failures or unexpected behavior.
+
+<CodeGroup>
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/workflows/wpid_123/browser_session/refresh" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+This endpoint returns `204 No Content` on success. The next workflow run will start with a clean browser session instead of restoring the previously saved state.
+
 ---
 
 ## Next steps

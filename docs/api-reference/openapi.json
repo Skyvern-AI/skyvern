@@ -822,7 +822,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RunWebhookReplayResponse"
+                }
               }
             }
           },
@@ -2401,6 +2403,60 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/browser_session/refresh": {
+      "post": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Refresh persisted browser session",
+        "description": "Clear the persisted browser session for a workflow that uses Save & Reuse Session. The next run will start from a fresh browser state. Use when a saved session is corrupted.",
+        "operationId": "refresh_workflow_browser_session_v1_workflows__workflow_permanent_id__browser_session_refresh_post",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The permanent ID of the workflow. Starts with wpid_.",
+              "example": "wpid_123",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "The permanent ID of the workflow. Starts with wpid_."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successfully cleared persisted browser session"
+          },
+          "404": {
+            "description": "Workflow not found"
           },
           "422": {
             "description": "Validation Error",
@@ -13715,6 +13771,77 @@
           "azure_vault"
         ],
         "title": "CredentialType"
+      },
+      "RunWebhookReplayResponse": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id",
+            "description": "Identifier of the run that was replayed"
+          },
+          "run_type": {
+            "type": "string",
+            "title": "Run Type",
+            "description": "Run type associated with the payload"
+          },
+          "default_webhook_url": {
+            "type": "string",
+            "nullable": true,
+            "title": "Default Webhook Url",
+            "description": "Webhook URL stored on the original run configuration"
+          },
+          "target_webhook_url": {
+            "type": "string",
+            "nullable": true,
+            "title": "Target Webhook Url",
+            "description": "Webhook URL that the replay attempted to reach"
+          },
+          "payload": {
+            "type": "string",
+            "title": "Payload",
+            "description": "JSON payload that was delivered during the replay attempt"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Headers",
+            "description": "Signed headers that were generated for the replay attempt"
+          },
+          "status_code": {
+            "type": "integer",
+            "nullable": true,
+            "title": "Status Code",
+            "description": "HTTP status code returned by the webhook receiver, if available"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "nullable": true,
+            "title": "Latency Ms",
+            "description": "Round-trip latency in milliseconds for the replay attempt"
+          },
+          "response_body": {
+            "type": "string",
+            "nullable": true,
+            "title": "Response Body",
+            "description": "Body returned by the webhook receiver (truncated to 2KB)"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true,
+            "title": "Error",
+            "description": "Error message if the replay attempt failed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "run_type",
+          "payload",
+          "headers"
+        ],
+        "title": "RunWebhookReplayResponse"
       }
     }
   },
