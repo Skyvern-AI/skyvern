@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
+    summarize_tool_result,
     truncate_output,
 )
 
@@ -216,14 +217,68 @@ class TestSanitization:
 class TestSummarizeToolResult:
     @staticmethod
     def _summarize(tool_name: str, result: dict) -> str:
-        from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
-
         return summarize_tool_result(tool_name, result)
 
     def test_error_result(self) -> None:
         summary = self._summarize("any_tool", {"ok": False, "error": "oops"})
         assert "Failed" in summary
         assert "oops" in summary
+
+    def test_failed_run_surfaces_block_failure_reason_when_error_absent(self) -> None:
+        summary = self._summarize(
+            "run_blocks_and_collect_debug",
+            {
+                "ok": False,
+                "data": {
+                    "overall_status": "failed",
+                    "blocks": [
+                        {
+                            "label": "navigate",
+                            "status": "failed",
+                            "failure_reason": (
+                                "Failed to navigate to url https://example.invalid. "
+                                "Error message: net::ERR_NAME_NOT_RESOLVED"
+                            ),
+                        }
+                    ],
+                },
+            },
+        )
+        assert "ERR_NAME_NOT_RESOLVED" in summary
+        assert "Unknown error" not in summary
+
+    def test_failed_run_prefers_top_level_error_over_nested(self) -> None:
+        summary = self._summarize(
+            "run_blocks_and_collect_debug",
+            {
+                "ok": False,
+                "error": "top-level message",
+                "data": {"blocks": [{"failure_reason": "nested message"}]},
+            },
+        )
+        assert "top-level message" in summary
+        assert "nested message" not in summary
+
+    def test_failed_run_prefers_data_failure_reason_over_block_failure_reason(self) -> None:
+        summary = self._summarize(
+            "run_blocks_and_collect_debug",
+            {
+                "ok": False,
+                "data": {
+                    "failure_reason": "run-level",
+                    "blocks": [{"failure_reason": "block-level"}],
+                },
+            },
+        )
+        assert "run-level" in summary
+        assert "block-level" not in summary
+
+    def test_failed_run_falls_back_to_unknown_error_when_nothing_present(self) -> None:
+        summary = self._summarize(
+            "run_blocks_and_collect_debug",
+            {"ok": False, "data": {"blocks": []}},
+        )
+        assert "Unknown error" in summary
 
     def test_update_workflow(self) -> None:
         summary = self._summarize(
