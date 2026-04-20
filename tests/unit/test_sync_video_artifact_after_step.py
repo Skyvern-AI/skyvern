@@ -48,8 +48,10 @@ async def test_sync_video_uploads_each_artifact() -> None:
 
         await agent._sync_video_artifact_after_step(task, browser_state=browser_state)
 
+    # Per-step sync runs while the recording file is still open; finalize=False skips the
+    # ffmpeg remux path so long tasks do not spawn one ffmpeg subprocess per step.
     mock_app.BROWSER_MANAGER.get_video_artifacts.assert_awaited_once_with(
-        task_id=task.task_id, browser_state=browser_state
+        task_id=task.task_id, browser_state=browser_state, finalize=False
     )
     assert mock_app.ARTIFACT_MANAGER.update_artifact_data.await_count == 2
     mock_app.ARTIFACT_MANAGER.update_artifact_data.assert_any_await(
