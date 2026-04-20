@@ -548,7 +548,7 @@ console.log(result.output)
 | `prompt` | `str` | Yes | Multi-step goal description |
 | `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/multi-step-automations/extract-structured-data). |
 | `max_steps` | `int` | No | Cap AI steps. The run terminates with `timed_out` if hit. Controls cost — each step is one AI decision + action cycle. |
-| `engine` | `RunEngine` | No | AI engine. Options: `skyvern-2.0` (recommended), `skyvern-1.0` (default), `openai-cua`, `anthropic-cua`, `ui-tars` |
+| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0` in the SDK for backward compatibility. Pass `skyvern-2.0` for the latest model (also the Cloud UI default). Other options: `openai-cua`, `anthropic-cua`, `ui-tars`. |
 | `model` | `dict` / `Record<string, unknown>` | No | Override LLM model configuration |
 | `url` | `str` / `string` | No | URL to navigate to (defaults to current page URL) |
 | `webhook_url` | `str` / `string` | No | Callback URL. Skyvern POSTs the full run result on completion or failure. See [Webhooks](/going-to-production/webhooks). |

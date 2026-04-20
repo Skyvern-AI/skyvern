@@ -30,9 +30,13 @@ When Skyvern's agent completes a task or workflow, it records the actions it too
 
 ## How it works
 
-1. **First run** — use the default `Skyvern 2.0 with Code` engine. The agent executes and Skyvern records the actions as generated code.
-2. **Subsequent runs** — pass `run_with: "code"` to execute the cached code directly, no agent needed.
+1. **First run** — set `engine="skyvern-2.0"` when creating the task or workflow. The agent executes and Skyvern records the actions as generated code.
+2. **Subsequent runs** — pass `run_with="code"` to execute the cached code directly, no agent needed.
 3. **Self-healing** — if the cached code fails (layout change, new field, etc.), Skyvern re-runs with the agent and regenerates the cache.
+
+<Note>
+The SDK default engine is `skyvern-1.0`. To use code caching, explicitly set `engine="skyvern-2.0"`. In the Cloud UI, `skyvern-2.0` is the default.
+</Note>
 
 ---
 

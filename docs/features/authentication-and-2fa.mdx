@@ -44,9 +44,9 @@ Skyvern has full authentication support built in — passwords, 2FA, magic links
 
 ## Security by design
 
-- Credentials are fetched from your vault at runtime, used once, then discarded
-- In run recordings, logs, and LLM prompts you see placeholder tokens (`BW_PASSWORD`, `BW_USERNAME`, `BW_TOTP`) — never the real values
-- The LLM never sees your secrets; credential substitution happens in Skyvern's browser layer
+When a run needs a credential, Skyvern fetches it from your vault, injects it directly into the browser's form field, and discards it as soon as the field is filled. The value never enters an LLM prompt, never lands in a log line, and never gets written back to any persistent Skyvern storage.
+
+This has a visible consequence: in your run recordings, action timelines, and LLM prompts you'll see stable placeholder tokens like `BW_PASSWORD`, `BW_USERNAME`, and `BW_TOTP` wherever real credentials were used. The prefix reflects the vault source (`BW_` for Bitwarden, `OP_` for 1Password, `AZ_` for Azure Key Vault, `SK_` for Skyvern's built-in vault) so you can audit which credential fired without the secret ever leaving your vault.
 
 ---
 
