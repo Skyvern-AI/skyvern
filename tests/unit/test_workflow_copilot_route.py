@@ -23,7 +23,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.routes.workflow_copilot import workflow_copilot_chat_post
+from skyvern.forge.sdk.routes.workflow_copilot import COPILOT_V2_FLAG_KEY, workflow_copilot_chat_post
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
@@ -56,6 +56,21 @@ def _install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     return captured
 
 
+def _install_mock_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    return_value: bool | None = None,
+    side_effect: BaseException | None = None,
+) -> AsyncMock:
+    mock_provider = AsyncMock()
+    if side_effect is not None:
+        mock_provider.is_feature_enabled_cached.side_effect = side_effect
+    else:
+        mock_provider.is_feature_enabled_cached.return_value = return_value
+    monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", mock_provider)
+    return mock_provider
+
+
 @pytest.mark.asyncio
 async def test_flag_off_dispatches_to_old_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
     """Flag off -> workflow_copilot_chat_post must use the old-copilot stream handler.
@@ -64,6 +79,9 @@ async def test_flag_off_dispatches_to_old_copilot(monkeypatch: pytest.MonkeyPatc
     raise if called, then confirming the old path was used instead.
     """
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    # force_stub_app's _LazyNamespace auto-creates truthy AsyncMocks for any attribute
+    # access, so the provider needs an explicit False stub to keep this test accurate.
+    _install_mock_provider(monkeypatch, return_value=False)
 
     new_copilot_mock = AsyncMock(side_effect=AssertionError("new-copilot path must not run when flag is off"))
     monkeypatch.setattr(
@@ -223,3 +241,107 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         restore_mock.assert_awaited_once()
     else:
         restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_env_on_short_circuits_posthog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env var True must skip the PostHog check entirely and route to v2."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    mock_provider = _install_mock_provider(
+        monkeypatch,
+        side_effect=AssertionError("PostHog must not be consulted when env var is True"),
+    )
+
+    sentinel = object()
+    new_copilot_mock = AsyncMock(return_value=sentinel)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+
+    assert response is sentinel
+    new_copilot_mock.assert_awaited_once()
+    mock_provider.is_feature_enabled_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_env_off_posthog_on_uses_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env var False + PostHog True -> v2 path, with org_id as distinct_id."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    mock_provider = _install_mock_provider(monkeypatch, return_value=True)
+
+    sentinel = object()
+    new_copilot_mock = AsyncMock(return_value=sentinel)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-abc")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+
+    assert response is sentinel
+    new_copilot_mock.assert_awaited_once()
+    mock_provider.is_feature_enabled_cached.assert_awaited_once_with(
+        COPILOT_V2_FLAG_KEY,
+        distinct_id="org-abc",
+        properties={"organization_id": "org-abc"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_falls_back_to_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider errors (PostHog down, DB hiccup) must not break the endpoint."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    _install_mock_provider(monkeypatch, side_effect=RuntimeError("posthog unreachable"))
+
+    new_copilot_mock = AsyncMock(side_effect=AssertionError("v2 path must not run when provider errors"))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    captured = _install_fake_create(monkeypatch)
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+
+    assert response is captured["sentinel"]
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env var False + PostHog False -> legacy stream handler, v2 not reached."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    mock_provider = _install_mock_provider(monkeypatch, return_value=False)
+
+    new_copilot_mock = AsyncMock(side_effect=AssertionError("v2 path must not run when both gates are off"))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    captured = _install_fake_create(monkeypatch)
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+
+    assert response is captured["sentinel"]
+    new_copilot_mock.assert_not_awaited()
+    mock_provider.is_feature_enabled_cached.assert_awaited_once()
