@@ -179,14 +179,44 @@ def test_lookup_age_seconds_is_monotonic_delta(monkeypatch: pytest.MonkeyPatch) 
     assert result.age_seconds == pytest.approx(12.5)
 
 
-def test_key_changes_when_local_date_changes() -> None:
-    """Date-relative extraction goals must miss when the date changes (midnight boundary)."""
-    assert _key(local_datetime="2026-04-10T00:00:00") != _key(local_datetime="2026-04-11T00:00:00")
+def test_invalidate_key_drops_single_entry() -> None:
+    """Per-key eviction leaves sibling entries intact. Used by the retry self-heal path."""
+    key_a = _key()
+    key_b = _key(current_url="https://example.com/other")
+    extraction_cache.store("wfr_1", key_a, {"v": "a"})
+    extraction_cache.store("wfr_1", key_b, {"v": "b"})
+
+    removed = extraction_cache.invalidate_key("wfr_1", key_a)
+    assert removed is True
+    assert extraction_cache.lookup("wfr_1", key_a).hit is False
+    # Sibling entry must survive — invalidate is per-key, not per-run.
+    hit_b = extraction_cache.lookup("wfr_1", key_b)
+    assert hit_b.hit is True
+    assert hit_b.value == {"v": "b"}
 
 
-def test_key_stable_across_same_date_different_times() -> None:
-    """Same date with different timestamps should produce the same key (truncated to date)."""
-    assert _key(local_datetime="2026-04-10T08:30:00.123456") == _key(local_datetime="2026-04-10T23:59:59.999999")
+def test_invalidate_key_returns_false_for_unknown_key() -> None:
+    extraction_cache.store("wfr_1", _key(), {"v": "a"})
+    assert extraction_cache.invalidate_key("wfr_1", "nonexistent-key") is False
+
+
+def test_invalidate_key_returns_false_for_unknown_workflow_run() -> None:
+    assert extraction_cache.invalidate_key("wfr_missing", _key()) is False
+
+
+def test_invalidate_key_returns_false_for_empty_workflow_run_id() -> None:
+    """Falsy workflow_run_id is a no-op, matching the store/lookup contract."""
+    assert extraction_cache.invalidate_key(None, _key()) is False
+    assert extraction_cache.invalidate_key("", _key()) is False
+
+
+def test_compute_cache_key_rejects_legacy_local_datetime_kwarg() -> None:
+    """``local_datetime`` was dropped from the signature (SKY-8873): content
+    hash alone defines cache identity, so callers that still try to pass it
+    must fail loudly rather than silently producing a key that happens to be
+    stable-for-the-wrong-reason."""
+    with pytest.raises(TypeError):
+        extraction_cache.compute_cache_key(call_path="test", local_datetime="2026-04-10T00:00:00")  # type: ignore[call-arg]
 
 
 def test_none_and_empty_string_produce_different_keys() -> None:

@@ -114,7 +114,11 @@ def _capture_extract_information_kwargs(monkeypatch, include_extracted_text: boo
 
     task = _make_task_for_extract_information(include_extracted_text=include_extracted_text)
 
-    asyncio.run(handler.extract_information_for_navigation_goal(task=task, step=MagicMock(), scraped_page=scraped_page))
+    asyncio.run(
+        handler.extract_information_for_navigation_goal(
+            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page
+        )
+    )
 
     return captured
 
