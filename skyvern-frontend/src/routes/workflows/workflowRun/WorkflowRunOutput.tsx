@@ -1,5 +1,5 @@
 import { FileIcon } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { CodeEditor } from "../components/CodeEditor";
@@ -14,9 +14,41 @@ import { findBlockSurroundingAction } from "./workflowTimelineUtils";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { SummarizeOutput } from "@/components/SummarizeOutput";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
 import { getBlockDownloadedFileUrls } from "./blockDownloadedFiles";
+
+function SummaryDisplay({
+  summary,
+  isStale,
+}: {
+  summary: string;
+  isStale: boolean;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="space-y-1 rounded bg-slate-elevation3 p-4"
+    >
+      {isStale && (
+        <p className="text-xs text-slate-400">
+          Out of date - re-summarize for the current output.
+        </p>
+      )}
+      <p
+        className={
+          isStale
+            ? "whitespace-pre-wrap text-sm text-slate-400"
+            : "whitespace-pre-wrap text-sm"
+        }
+      >
+        {summary}
+      </p>
+    </div>
+  );
+}
 
 function WorkflowRunOutput() {
   const [searchParams] = useSearchParams();
@@ -25,13 +57,31 @@ function WorkflowRunOutput() {
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  const [blockSummaries, setBlockSummaries] = useState<
+    Record<string, { summary: string; identity: string }>
+  >({});
+  const [outputSummary, setOutputSummary] = useState<{
+    summary: string;
+    identity: string;
+  } | null>(null);
+
+  const currentWorkflowRunId = workflowRun?.workflow_run_id;
+  const prevRunIdRef = useRef(currentWorkflowRunId);
+  useEffect(() => {
+    const prev = prevRunIdRef.current;
+    prevRunIdRef.current = currentWorkflowRunId;
+    if (prev && prev !== currentWorkflowRunId) {
+      setBlockSummaries({});
+      setOutputSummary(null);
+    }
+  }, [currentWorkflowRunId]);
 
   // Local override so users on finalized runs (where there is no neutral
   // timeline selection to return to) can still view the full workflow-level
   // file list without clearing their block selection elsewhere on the page.
   const [showAllFilesOverride, setShowAllFilesOverride] = useState(false);
 
-  const activeBlock = (() => {
+  const activeBlock = useMemo(() => {
     if (!workflowRunTimeline) {
       return undefined;
     }
@@ -45,11 +95,41 @@ function WorkflowRunOutput() {
       );
     }
     return undefined;
-  })();
+  }, [workflowRunTimeline, activeItem]);
   const activeBlockId = activeBlock?.workflow_run_block_id;
   useEffect(() => {
     setShowAllFilesOverride(false);
   }, [activeBlockId]);
+
+  const outputs = workflowRun?.outputs;
+
+  const workflowOutputJsonCompact = useMemo(
+    () => (outputs ? JSON.stringify(outputs) : ""),
+    [outputs],
+  );
+
+  const workflowOutputJson = useMemo(
+    () => (outputs ? JSON.stringify(outputs, null, 2) : ""),
+    [outputs],
+  );
+
+  const activeBlockOutput = activeBlock?.output;
+  const activeBlockStatus = activeBlock?.status;
+  const activeBlockType = activeBlock?.block_type;
+  const blockOutputJsonCompact = useMemo(() => {
+    if (activeBlockOutput === undefined || activeBlockOutput === null) {
+      return "";
+    }
+    const isCompletedTaskBlock =
+      activeBlockType !== undefined &&
+      isTaskVariantBlock({ block_type: activeBlockType }) &&
+      activeBlockStatus === Status.Completed;
+    const value =
+      isCompletedTaskBlock && hasExtractedInformation(activeBlockOutput)
+        ? activeBlockOutput.extracted_information
+        : activeBlockOutput;
+    return JSON.stringify(value);
+  }, [activeBlockOutput, activeBlockStatus, activeBlockType]);
 
   if (workflowRunTimelineIsLoading) {
     return <div>Loading...</div>;
@@ -70,7 +150,6 @@ function WorkflowRunOutput() {
     (statusIsAFailureType({ status: activeBlock.status }) ||
       activeBlock.status === Status.Canceled);
 
-  const outputs = workflowRun?.outputs;
   const allFileUrls = workflowRun?.downloaded_file_urls ?? [];
 
   // Scope to the surrounding block whenever the user explicitly selected a
@@ -88,6 +167,21 @@ function WorkflowRunOutput() {
     workflowRun?.task_v2?.webhook_failure_reason ??
     workflowRun?.webhook_failure_reason;
 
+  const blockContextKey = activeBlock
+    ? `block:${activeBlock.workflow_run_id}:${activeBlock.workflow_run_block_id}`
+    : "";
+  const blockIdentity = `${blockContextKey}|${blockOutputJsonCompact}`;
+  const storedBlockSummary = activeBlock
+    ? blockSummaries[activeBlock.workflow_run_block_id]
+    : undefined;
+  const blockSummaryIsStale =
+    !!storedBlockSummary && storedBlockSummary.identity !== blockIdentity;
+
+  const runContextKey = `run:${currentWorkflowRunId ?? ""}`;
+  const runIdentity = `${runContextKey}|${workflowOutputJsonCompact}`;
+  const outputSummaryIsStale =
+    !!outputSummary && outputSummary.identity !== runIdentity;
+
   return (
     <div className="space-y-5">
       {webhookFailureReasonData ? (
@@ -103,7 +197,34 @@ function WorkflowRunOutput() {
       {activeBlock ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Block Outputs</h1>
+            <div className="flex items-center justify-between">
+              <h1 className="text-lg font-bold">Block Outputs</h1>
+              {activeBlock.output !== null && !showFailureReason && (
+                <SummarizeOutput
+                  key={blockContextKey}
+                  contextKey={blockContextKey}
+                  outputJson={blockOutputJsonCompact}
+                  workflowTitle={workflowRun?.workflow_title}
+                  blockLabel={activeBlock.label}
+                  hasSummary={!!storedBlockSummary}
+                  onSummary={(summary) =>
+                    setBlockSummaries((prev) => ({
+                      ...prev,
+                      [activeBlock.workflow_run_block_id]: {
+                        summary,
+                        identity: blockIdentity,
+                      },
+                    }))
+                  }
+                />
+              )}
+            </div>
+            {storedBlockSummary && (
+              <SummaryDisplay
+                summary={storedBlockSummary.summary}
+                isStale={blockSummaryIsStale}
+              />
+            )}
             {showFailureReason ? (
               <div className="space-y-2">
                 <h2>Failure Reason</h2>
@@ -166,10 +287,33 @@ function WorkflowRunOutput() {
       ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
-          <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
+          <div className="flex items-center justify-between">
+            <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
+            {outputs && (
+              <SummarizeOutput
+                key={runContextKey}
+                contextKey={runContextKey}
+                outputJson={workflowOutputJsonCompact}
+                workflowTitle={workflowRun?.workflow_title}
+                hasSummary={!!outputSummary}
+                onSummary={(summary) =>
+                  setOutputSummary({
+                    summary,
+                    identity: runIdentity,
+                  })
+                }
+              />
+            )}
+          </div>
+          {outputSummary && (
+            <SummaryDisplay
+              summary={outputSummary.summary}
+              isStale={outputSummaryIsStale}
+            />
+          )}
           <CodeEditor
             language="json"
-            value={outputs ? JSON.stringify(outputs, null, 2) : ""}
+            value={workflowOutputJson}
             readOnly
             minHeight="96px"
             maxHeight="200px"
