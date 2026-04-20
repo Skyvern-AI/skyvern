@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -143,10 +144,40 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
     return sanitized
 
 
+def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
+    """Yield non-empty failure_reason strings from a copilot tool result:
+    run-level ``data.failure_reason`` first, then each block's ``failure_reason``
+    in order. Callers that only need the first match should wrap with ``next``."""
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, dict):
+        return
+    run_level = data.get("failure_reason")
+    if isinstance(run_level, str) and run_level:
+        yield run_level
+    blocks = data.get("blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            reason = block.get("failure_reason")
+            if isinstance(reason, str) and reason:
+                yield reason
+
+
+def _extract_failure_message(result: dict[str, Any]) -> str:
+    """Prefer top-level ``error`` over nested failure_reason fields. Defense
+    in depth: _run_blocks_and_collect_debug now populates ``error`` on
+    failure, but other tool return shapes may still omit it."""
+    top = result.get("error")
+    if isinstance(top, str) and top:
+        return top
+    return next(iter_failure_reasons(result), "Unknown error")
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     """Create a brief human-readable summary of a tool result."""
     if not result.get("ok", False):
-        return f"Failed: {result.get('error', 'Unknown error')[:200]}"
+        return f"Failed: {_extract_failure_message(result)[:200]}"
 
     data = result.get("data") or {}
 

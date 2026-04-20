@@ -181,6 +181,16 @@ class CopilotContext(AgentContext):
     # streak is still at 2, and guarantees the stop nudge fires exactly once
     # when the streak reaches 3.
     repeated_failure_nudge_emitted_at_streak: int = 0
+    # Set by _record_run_blocks_result when the most recent failed run matches
+    # SKIP_INNER_NAV_RETRY_ERRORS (DNS / cert / SSL / invalid URL). Drives the
+    # one-shot non-retriable-nav stop nudge and the deterministic exit-path
+    # exception in run_with_enforcement. Cleared at the top of every call to
+    # _record_run_blocks_result so stale state can't leak across runs.
+    last_test_non_retriable_nav_error: str | None = None
+    # Normalized signature of the non-retriable nav error last nudged on.
+    # Lets the stop nudge re-fire if the user retries with a different bad URL
+    # (different signature) in the same session. Cleared on meaningful success.
+    non_retriable_nav_error_last_emitted_signature: str | None = None
     last_failure_category_top: str | None = None
     # Hash of the ordered (action_type, element_id) tuples from the last run's
     # action trace. When the same fingerprint repeats run-over-run with no

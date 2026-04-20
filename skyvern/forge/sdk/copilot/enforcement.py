@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from agents.run import Runner
 
+from skyvern.forge.sdk.copilot.failure_tracking import normalize_failure_reason
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -195,6 +196,14 @@ POST_PARAMETER_BINDING_WARN_NUDGE = (
     "`parameters` argument."
 )
 
+POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE = (
+    "STOP — the target URL is unreachable and further retries cannot succeed. "
+    "The navigation failed with a permanent error (DNS resolution, SSL/cert, "
+    "or invalid URL). Do NOT retry and do NOT edit the workflow. Reply to the "
+    "user now: state that the URL could not be reached, quote the exact error "
+    "message from the last failure_reason, and ask them to verify the URL."
+)
+
 POST_PARAMETER_BINDING_STOP_NUDGE = (
     "STOP — you have retried the same PARAMETER_BINDING_ERROR multiple times "
     "without reconciling the workflow configuration. Do NOT call "
@@ -248,6 +257,41 @@ def _is_progress_narration(user_response: Any) -> bool:
 
 class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
+
+
+class CopilotNonRetriableNavError(Exception):
+    """Raised from run_with_enforcement when the copilot's most recent run
+    hit a permanent navigation error (DNS / cert / SSL / invalid URL) and
+    the loop is about to exit without a successful test. Caught at the
+    agent entrypoint and translated to a deterministic user-facing failure,
+    mirroring the CopilotTotalTimeoutError handling pattern."""
+
+    def __init__(self, url: str | None, error_message: str) -> None:
+        self.url = url
+        self.error_message = error_message
+        super().__init__(f"Non-retriable navigation error: {error_message}")
+
+
+_FAILED_TO_NAVIGATE_URL_PATTERN = re.compile(r"Failed to navigate to url (\S+)\. Error message:")
+
+
+def _extract_url_from_nav_error(message: str) -> str | None:
+    """Pull the URL out of a FailedToNavigateToUrl string. None on no match."""
+    match = _FAILED_TO_NAVIGATE_URL_PATTERN.search(message)
+    return match.group(1) if match else None
+
+
+def _maybe_raise_non_retriable_nav(ctx: Any) -> None:
+    """Raise CopilotNonRetriableNavError if the most recent run was a
+    permanent navigation failure and nothing else has succeeded. Called
+    before both `return result` sites in run_with_enforcement so the loop
+    cannot hand a failed run back to the caller as if it completed."""
+    err = getattr(ctx, "last_test_non_retriable_nav_error", None)
+    if not isinstance(err, str) or not err:
+        return
+    if getattr(ctx, "last_test_ok", None) is True:
+        return
+    raise CopilotNonRetriableNavError(url=_extract_url_from_nav_error(err), error_message=err)
 
 
 _ACTION_CATEGORIES: list[list[str]] = [
@@ -362,6 +406,10 @@ def _needs_explore_without_workflow_nudge(ctx: Any) -> bool:
 
 def _needs_failed_test_nudge(ctx: Any) -> bool:
     """Return True when the last test failed and the agent hasn't iterated yet."""
+    # A permanent nav error cannot be 'fix the workflow and retry' material —
+    # the dedicated non-retriable branch in _check_enforcement owns this case.
+    if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return False
     if getattr(ctx, "last_test_ok", None) is not False:
         return False
     if not getattr(ctx, "test_after_update_done", False):
@@ -372,11 +420,18 @@ def _needs_failed_test_nudge(ctx: Any) -> bool:
 
 def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     """Return True when the last test 'completed' but data blocks had no output."""
+    # A non-retriable nav failure cannot be "suspiciously successful" — defer
+    # to the dedicated stop path rather than competing for the nudge slot.
+    if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return False
     return bool(getattr(ctx, "last_test_suspicious_success", False))
 
 
 def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
     """Return True when suspicious-success has happened enough times to escalate."""
+    # Same as above: non-retriable nav state never belongs on this branch.
+    if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return False
     if not getattr(ctx, "last_test_suspicious_success", False):
         return False
     streak = getattr(ctx, "null_data_streak_count", 0)
@@ -393,6 +448,10 @@ def _repeated_frontier_failure_nudge(ctx: Any) -> str | None:
     keeps climbing on further identical failures (incremented elsewhere by
     update_repeated_failure_state), so the stop nudge fires naturally on the
     next repeat after a warn."""
+    # Non-retriable nav errors get their own dedicated stop path; don't let a
+    # repeated-frontier nudge smuggle different retry advice past the gate.
+    if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return None
     streak = _get_int(ctx, "repeated_failure_streak_count")
     emitted = _get_int(ctx, "repeated_failure_nudge_emitted_at_streak")
     top_category = getattr(ctx, "last_failure_category_top", None)
@@ -408,7 +467,33 @@ def _repeated_frontier_failure_nudge(ctx: Any) -> str | None:
 _STOP_LEVEL_FRONTIER_NUDGES = frozenset({POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE, POST_PARAMETER_BINDING_STOP_NUDGE})
 
 
+def _non_retriable_nav_error_nudge(ctx: Any) -> tuple[str, str] | None:
+    """Emit POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE at most once per distinct
+    non-retriable nav-error signature. Returns ``(nudge, signature)`` when it
+    should fire, ``None`` otherwise. Signature normalization is shared with
+    `failure_tracking.compute_failure_signature`, so a cert error after a DNS
+    error (or vice versa) counts as a distinct signature and re-fires."""
+    raw = getattr(ctx, "last_test_non_retriable_nav_error", None)
+    if not isinstance(raw, str) or not raw:
+        return None
+    signature = normalize_failure_reason(raw)
+    last_emitted = getattr(ctx, "non_retriable_nav_error_last_emitted_signature", None)
+    if signature == last_emitted:
+        return None
+    return POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE, signature
+
+
 def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> str | None:
+    # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
+    # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
+    # resolved by observing a prior navigate or by testing an updated
+    # workflow against the same bad URL, so let it speak first.
+    non_retriable = _non_retriable_nav_error_nudge(ctx)
+    if non_retriable is not None:
+        nudge_msg, signature = non_retriable
+        ctx.non_retriable_nav_error_last_emitted_signature = signature
+        return nudge_msg
+
     if ctx.navigate_called and not ctx.observation_after_navigate and not ctx.navigate_enforcement_done:
         ctx.navigate_enforcement_done = True
         return POST_NAVIGATE_NUDGE
@@ -734,6 +819,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_REPEATED_NULL_DATA_NUDGE: "repeated_null_data",
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE: "repeated_frontier_failure_warn",
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE: "repeated_frontier_failure_stop",
+    POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE: "non_retriable_nav_error_stop",
     POST_PARAMETER_BINDING_WARN_NUDGE: "parameter_binding_warn",
     POST_PARAMETER_BINDING_STOP_NUDGE: "parameter_binding_stop",
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
@@ -940,6 +1026,7 @@ async def run_with_enforcement(
         else:
             nudge = _check_enforcement(ctx, result)
         if nudge is None:
+            _maybe_raise_non_retriable_nav(ctx)
             return result
 
         if nudge == POST_UPDATE_NUDGE:
@@ -948,6 +1035,7 @@ async def run_with_enforcement(
                     "Enforcement exhausted post-update nudges, allowing response",
                     nudge_count=ctx.post_update_nudge_count,
                 )
+                _maybe_raise_non_retriable_nav(ctx)
                 return result
             ctx.post_update_nudge_count += 1
 

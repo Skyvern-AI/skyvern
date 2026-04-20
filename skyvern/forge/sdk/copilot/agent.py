@@ -281,6 +281,7 @@ async def run_copilot_agent(
 
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
         run_with_enforcement,
     )
@@ -411,6 +412,23 @@ async def run_copilot_agent(
             except CopilotTotalTimeoutError:
                 return AgentResult(
                     user_response="I ran out of time processing your request. Here's what I have so far.",
+                    updated_workflow=ctx.last_workflow,
+                    global_llm_context=global_llm_context,
+                    workflow_yaml=ctx.last_workflow_yaml,
+                    workflow_was_persisted=ctx.workflow_persisted,
+                )
+            except CopilotNonRetriableNavError as exc:
+                LOG.warning(
+                    "Copilot run halted on non-retriable navigation error",
+                    url=exc.url,
+                    error_message=exc.error_message,
+                    organization_id=organization_id,
+                )
+                return AgentResult(
+                    user_response=(
+                        f"The target URL could not be reached. Error: {exc.error_message}. "
+                        "Please verify the URL and try again."
+                    ),
                     updated_workflow=ctx.last_workflow,
                     global_llm_context=global_llm_context,
                     workflow_yaml=ctx.last_workflow_yaml,

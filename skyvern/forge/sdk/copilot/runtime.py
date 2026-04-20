@@ -85,6 +85,8 @@ class AgentContext:
     last_failed_workflow_yaml: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    last_test_non_retriable_nav_error: str | None = None
+    non_retriable_nav_error_last_emitted_signature: str | None = None
     workflow_persisted: bool = False
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None

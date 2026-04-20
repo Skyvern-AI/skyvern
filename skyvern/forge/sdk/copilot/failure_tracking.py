@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 _FAILURE_REASON_MAX_CHARS = 200
 
 
-def _normalize_failure_reason(raw: str | None) -> str:
+def normalize_failure_reason(raw: str | None) -> str:
     if not raw:
         return ""
     collapsed = " ".join(raw.split())
@@ -61,7 +61,7 @@ def compute_failure_signature(
     run (status=completed but data-producing blocks produced no output) still
     generates a signature so repeated no-data runs can be counted as repeats.
     """
-    normalized = _normalize_failure_reason(failure_reason)
+    normalized = normalize_failure_reason(failure_reason)
     has_signal = bool(normalized) or suspicious_success
     if not has_signal:
         return None

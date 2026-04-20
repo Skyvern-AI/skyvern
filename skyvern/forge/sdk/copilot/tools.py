@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.output_utils import (
+    iter_failure_reasons,
     sanitize_tool_result_for_llm,
     truncate_output,
 )
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunStatus
+from skyvern.webeye.navigation import is_skip_inner_retry_error
 
 LOG = structlog.get_logger()
 
@@ -248,6 +250,23 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
                 "challenge, or hidden validation error that the agent is not "
                 "detecting. Do NOT retry this tool — conclude the workflow is "
                 "not automatable as-is and report back to the user."
+            )
+
+        # Within-turn fail-fast for permanent navigation errors (DNS / cert /
+        # SSL / invalid URL). The enforcement-loop stop nudge only runs
+        # BETWEEN agent turns, so without this check the LLM is free to make
+        # speculative within-turn retries (e.g. drop the `www` subdomain and
+        # try again) before the nudge fires. update_and_run_blocks internally
+        # calls _update_workflow which clears the flag, so this check must
+        # run before that — hence at the tool entrypoint, not inside the run
+        # body.
+        prior_nav_error = getattr(ctx, "last_test_non_retriable_nav_error", None)
+        if isinstance(prior_nav_error, str) and prior_nav_error:
+            return (
+                f"Prior run in this turn hit a permanent navigation error "
+                f"({prior_nav_error[:200]}). Do NOT retry — the URL is unreachable "
+                "regardless of subdomain or path variations. Reply to the user "
+                "explaining the failure and asking them to verify the URL."
             )
     return None
 
@@ -978,10 +997,15 @@ async def _run_blocks_and_collect_debug(
                 existing_set.add(label)
         ctx.verified_prefix_labels = existing_prefix
 
-    return {
-        "ok": run_ok,
-        "data": result_data,
-    }
+    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
+    if not run_ok:
+        # Promote the real failure message into a top-level ``error`` field so
+        # every downstream consumer (summarize_tool_result, SSE frames, logs,
+        # LLM context) sees it instead of defaulting to "Unknown error".
+        # Wording matches ExtractionBlock's "Unknown error (no failure reason
+        # provided)" fallback so error-message matching stays consistent.
+        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
+    return response
 
 
 async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
@@ -1383,6 +1407,12 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
             copilot_ctx.last_update_block_count = block_count
     copilot_ctx.last_test_ok = None
     copilot_ctx.last_test_failure_reason = None
+    # A fresh workflow edit invalidates the prior test's failure state —
+    # otherwise an exhausted POST_UPDATE_NUDGE on the new draft would raise
+    # CopilotNonRetriableNavError with the old run's error, telling the user
+    # to "verify the URL" for a URL they just corrected in the new draft.
+    copilot_ctx.last_test_non_retriable_nav_error = None
+    copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
     copilot_ctx.workflow_persisted = True
 
 
@@ -1443,6 +1473,15 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
     return anti_bot_match, empty_data_blocks, categories
 
 
+def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
+    """Return the first failure_reason that matches SKIP_INNER_NAV_RETRY_ERRORS
+    (DNS / cert / SSL / invalid URL), preferring run-level over block-level.
+    Same set is_skip_inner_retry_error uses at the browser layer, so the copilot
+    classifies on exactly the patterns that already short-circuit retries in
+    navigate_with_retry (skyvern/webeye/navigation.py)."""
+    return next((reason for reason in iter_failure_reasons(result) if is_skip_inner_retry_error(reason)), None)
+
+
 def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     run_ok = bool(result.get("ok", False))
     copilot_ctx.last_test_ok = run_ok
@@ -1450,6 +1489,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.last_test_anti_bot = None
     copilot_ctx.last_failure_category_top = None
+    copilot_ctx.last_test_non_retriable_nav_error = None
 
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result)
     if anti_bot_match:
@@ -1483,10 +1523,14 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
         copilot_ctx.failed_test_nudge_count = 0
         copilot_ctx.null_data_streak_count = 0
         copilot_ctx.last_failed_workflow_yaml = None
+        # Real success: clear the signature latch so a subsequent bad URL in
+        # the same session can re-fire the stop nudge.
+        copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
         update_repeated_failure_state(copilot_ctx, result)
         return
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
+    copilot_ctx.last_test_non_retriable_nav_error = _detect_non_retriable_nav_error(result)
 
     data = result.get("data")
     if isinstance(data, dict):
