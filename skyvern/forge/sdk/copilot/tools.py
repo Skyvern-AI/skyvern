@@ -826,9 +826,12 @@ async def _run_blocks_and_collect_debug(
                     final_status = run.status
                 break
 
-            if await ctx.stream.is_disconnected():
-                await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
-                return {"ok": False, "error": "Client disconnected during block execution."}
+            # Deliberately do NOT short-circuit on client disconnect here.
+            # The agent loop is allowed to run to completion after the SSE
+            # stream is gone (see SKY-8986) so its reply can be persisted;
+            # aborting an in-flight block execution would leave the
+            # workflow run in a limbo state and the agent would have no
+            # debug output to summarize in the final chat message.
 
             run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run.workflow_run_id,

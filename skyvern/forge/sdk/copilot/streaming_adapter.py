@@ -11,7 +11,6 @@ import structlog
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.request_logging import redact_sensitive_fields
-from skyvern.forge.sdk.copilot.exceptions import CopilotClientDisconnectedError
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
@@ -51,13 +50,15 @@ async def stream_to_sse(
     ``post_update_nudge_count``, ``navigate_called``, and
     ``observation_after_navigate``.
 
-    A true client disconnect -- detected by ``stream.is_disconnected()`` or a
-    failed ``stream.send()`` -- cancels the agent run and raises
-    ``CopilotClientDisconnectedError``. A plain ``asyncio.CancelledError``
-    from some other source (task-group cancel, upstream timeout, parent
-    abort) is allowed to propagate unchanged so asyncio's cancellation
-    machinery runs normally; callers that want the two to share a UX path
-    should catch both at the call site.
+    A client disconnect does NOT cancel the agent run: we continue to iterate
+    ``result.stream_events()`` so the agent completes whatever work it is
+    in the middle of and the caller can persist the reply to the DB. Events
+    sent through ``stream.send`` after disconnect are silently dropped by the
+    stream, so the queue cannot grow unbounded.
+
+    Real asyncio cancellation (server shutdown, parent task cancelled for
+    reasons unrelated to a dropped client) is re-raised unchanged so
+    asyncio's cancellation machinery still runs normally.
     """
     from agents.stream_events import RunItemStreamEvent
 
@@ -69,11 +70,13 @@ async def stream_to_sse(
 
     try:
         async for event in result.stream_events():
-            if await stream.is_disconnected():
-                result.cancel()
-                raise CopilotClientDisconnectedError()
             if not isinstance(event, RunItemStreamEvent):
                 continue
+
+            # Skip emission work (serialization, redaction) once the client
+            # is gone, but keep draining the SDK stream so the agent can
+            # finish. stream.send below would drop the payload anyway.
+            client_gone = await stream.is_disconnected()
 
             if event.name == "tool_called":
                 raw = event.item.raw_item
@@ -81,27 +84,26 @@ async def stream_to_sse(
                 tool_name = _get_raw_field(raw, "name") or "unknown"
                 call_id_to_name[call_id] = tool_name
 
-                raw_args = _get_raw_field(raw, "arguments")
-                tool_input: dict[str, Any] = {}
-                if isinstance(raw_args, str):
-                    try:
-                        tool_input = json.loads(raw_args)
-                    except (json.JSONDecodeError, TypeError):
-                        tool_input = {"raw": raw_args}
-                elif isinstance(raw_args, dict):
-                    tool_input = raw_args
+                if not client_gone:
+                    raw_args = _get_raw_field(raw, "arguments")
+                    tool_input: dict[str, Any] = {}
+                    if isinstance(raw_args, str):
+                        try:
+                            tool_input = json.loads(raw_args)
+                        except (json.JSONDecodeError, TypeError):
+                            tool_input = {"raw": raw_args}
+                    elif isinstance(raw_args, dict):
+                        tool_input = raw_args
 
-                if not await stream.send(
-                    WorkflowCopilotToolCallUpdate(
-                        type=WorkflowCopilotStreamMessageType.TOOL_CALL,
-                        tool_name=tool_name,
-                        tool_input=_sanitize_input(tool_input),
-                        iteration=iteration,
-                        tool_call_id=call_id,
+                    await stream.send(
+                        WorkflowCopilotToolCallUpdate(
+                            type=WorkflowCopilotStreamMessageType.TOOL_CALL,
+                            tool_name=tool_name,
+                            tool_input=_sanitize_input(tool_input),
+                            iteration=iteration,
+                            tool_call_id=call_id,
+                        )
                     )
-                ):
-                    result.cancel()
-                    raise CopilotClientDisconnectedError()
 
             elif event.name == "tool_output":
                 raw = event.item.raw_item
@@ -110,31 +112,27 @@ async def stream_to_sse(
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
-                summary = summarize_tool_result(tool_name, parsed)
-                success = parsed.get("ok", True)
 
-                if not await stream.send(
-                    WorkflowCopilotToolResultUpdate(
-                        type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
-                        tool_name=tool_name,
-                        success=success,
-                        summary=summary,
-                        iteration=iteration,
-                        tool_call_id=call_id,
+                if not client_gone:
+                    summary = summarize_tool_result(tool_name, parsed)
+                    success = parsed.get("ok", True)
+                    await stream.send(
+                        WorkflowCopilotToolResultUpdate(
+                            type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
+                            tool_name=tool_name,
+                            success=success,
+                            summary=summary,
+                            iteration=iteration,
+                            tool_call_id=call_id,
+                        )
                     )
-                ):
-                    result.cancel()
-                    raise CopilotClientDisconnectedError()
 
                 _update_enforcement_from_tool(ctx, tool_name, parsed)
                 iteration += 1
     except asyncio.CancelledError:
-        # Don't relabel generic cancellation as a client disconnect -- the
-        # inline is_disconnected / send-failure branches above already raise
-        # CopilotClientDisconnectedError when there is real evidence of a
-        # dropped client. Preserve cancellation semantics by re-raising so
-        # asyncio's task machinery sees the cancel and any upstream
-        # except Exception does NOT swallow it.
+        # Real cancellation (server shutdown, upstream abort). Propagate so
+        # asyncio's task machinery sees the cancel; also cancel the SDK
+        # run to free provider resources.
         result.cancel()
         raise
 

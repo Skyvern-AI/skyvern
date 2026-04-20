@@ -795,12 +795,9 @@ async def _new_copilot_chat_post(
                 )
             )
 
-            if await stream.is_disconnected():
-                LOG.info(
-                    "Workflow copilot v2 chat request is disconnected before agent loop",
-                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-                )
-                return
+            # No early exit on disconnect (SKY-8986): the agent runs to
+            # completion even after the SSE stream drops so its reply is
+            # persisted to the chat history and visible after reconnect.
 
             original_workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
                 workflow_permanent_id=chat_request.workflow_permanent_id,
@@ -838,15 +835,11 @@ async def _new_copilot_chat_post(
             updated_workflow = agent_result.updated_workflow
             updated_global_llm_context = agent_result.global_llm_context
 
-            if await stream.is_disconnected():
-                LOG.info(
-                    "Workflow copilot v2 chat request is disconnected after agent loop",
-                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-                )
-                if _should_restore_persisted_workflow(chat.auto_accept, agent_result):
-                    await _restore_workflow_definition(original_workflow, organization.organization_id)
-                return
-
+            # Persist rollback / proposed-workflow state and the chat
+            # messages regardless of whether the SSE client is still
+            # connected: the user needs to see the reply on reconnect.
+            # SKY-8986: client disconnect used to short-circuit this block
+            # and leave the chat history without the AI response.
             if chat.auto_accept is not True:
                 if _should_restore_persisted_workflow(chat.auto_accept, agent_result):
                     await _restore_workflow_definition(original_workflow, organization.organization_id)
@@ -1017,13 +1010,9 @@ async def workflow_copilot_chat_post(
                 )
             )
 
-            if await stream.is_disconnected():
-                LOG.info(
-                    "Workflow copilot chat request is disconnected before LLM call",
-                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-                )
-                return
-
+            # SKY-8986: do not short-circuit on client disconnect. The LLM
+            # call and the DB persistence below must complete so the reply
+            # is in the chat history when the user reconnects.
             user_response, updated_workflow, updated_global_llm_context = await copilot_call_llm(
                 stream,
                 organization.organization_id,
@@ -1032,13 +1021,6 @@ async def workflow_copilot_chat_post(
                 global_llm_context,
                 debug_run_info_text,
             )
-
-            if await stream.is_disconnected():
-                LOG.info(
-                    "Workflow copilot chat request is disconnected after LLM call",
-                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-                )
-                return
 
             if updated_workflow and chat.auto_accept is not True:
                 await app.DATABASE.workflow_params.update_workflow_copilot_chat(

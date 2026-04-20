@@ -281,7 +281,6 @@ async def run_copilot_agent(
 
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
-        CopilotClientDisconnectedError,
         CopilotTotalTimeoutError,
         run_with_enforcement,
     )
@@ -392,8 +391,8 @@ async def run_copilot_agent(
                     chat_request,
                     organization_id,
                 )
-            except (CopilotClientDisconnectedError, asyncio.CancelledError):
-                LOG.info("Copilot client disconnected")
+            except asyncio.CancelledError:
+                LOG.info("Copilot run cancelled")
                 return AgentResult(
                     user_response="Request cancelled.",
                     updated_workflow=ctx.last_workflow,

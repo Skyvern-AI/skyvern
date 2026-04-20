@@ -246,10 +246,6 @@ def _is_progress_narration(user_response: Any) -> bool:
     return any(pattern.search(user_response) for pattern in _PROGRESS_NARRATION_PATTERNS)
 
 
-class CopilotClientDisconnectedError(Exception):
-    """Raised when the client disconnects during agent execution."""
-
-
 class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
 
@@ -853,9 +849,10 @@ async def run_with_enforcement(
     pending_recovery_nudge: str | None = None
 
     while True:
-        if await stream.is_disconnected():
-            raise CopilotClientDisconnectedError()
-
+        # Client disconnect is no longer treated as a stop signal. The
+        # SSE stream silently drops events once the browser is gone, but
+        # the agent keeps running so the reply can be persisted to the
+        # chat history on the server side (see SKY-8986).
         elapsed = time.monotonic() - start_time
         if elapsed > TOTAL_TIMEOUT_SECONDS:
             raise CopilotTotalTimeoutError()
@@ -923,9 +920,6 @@ async def run_with_enforcement(
                         has_session=session is not None,
                     )
                     raise
-
-        if await stream.is_disconnected():
-            raise CopilotClientDisconnectedError()
 
         # Inject pending screenshots as a follow-up user message because OpenAI
         # rejects images in tool messages.
