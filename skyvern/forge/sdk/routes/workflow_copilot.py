@@ -937,13 +937,38 @@ async def _new_copilot_chat_post(
     return FastAPIEventSourceStream.create(request, stream_handler)
 
 
+COPILOT_V2_FLAG_KEY = "ENABLE_WORKFLOW_COPILOT_V2"
+
+
+async def _should_use_copilot_v2(organization: Organization, workflow_permanent_id: str) -> bool:
+    if settings.ENABLE_WORKFLOW_COPILOT_V2:
+        return True
+    try:
+        # distinct_id is the org (not a run id) because this gate is an org-sticky rollout:
+        # copilot chat may not have a stable run at dispatch time, and we want each org to
+        # see the same path across sessions. Contrast with backend.md's default of run-level
+        # ids for per-run randomized experiments.
+        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            COPILOT_V2_FLAG_KEY,
+            distinct_id=organization.organization_id,
+            properties={"organization_id": organization.organization_id},
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to evaluate copilot-v2 feature flag; falling back to legacy copilot",
+            organization_id=organization.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        return False
+
+
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
-    if settings.ENABLE_WORKFLOW_COPILOT_V2:
+    if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id):
         return await _new_copilot_chat_post(request, chat_request, organization)
 
     async def stream_handler(stream: EventSourceStream) -> None:
