@@ -530,6 +530,37 @@ class AgentFunction:
         """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
         return False
 
+    async def lookup_cross_run_extraction_cache(
+        self,
+        workflow_permanent_id: str | None,
+        cache_key: str,
+    ) -> Any | None:
+        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op.
+
+        Cloud overrides this to consult the Redis tier (SKY-8873). Returns the
+        cached extraction value on a hit or None on a miss / error / disabled
+        flag. Implementations MUST swallow backend errors and return None so
+        the extract path always falls through to a fresh LLM call rather than
+        failing loud.
+        """
+        return None
+
+    async def store_cross_run_extraction_cache(
+        self,
+        workflow_permanent_id: str | None,
+        cache_key: str,
+        value: Any,
+    ) -> None:
+        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op.
+
+        Cloud overrides this to write to the Redis tier (SKY-8873) with a
+        long TTL. Called after a fresh LLM extraction so subsequent runs of
+        the same workflow against the same page content skip the LLM call.
+        Implementations MUST swallow backend errors — write-path failures
+        must never fail the user-visible request.
+        """
+        return None
+
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
         """Return the backend-specific schedule id used by the execution engine.
 

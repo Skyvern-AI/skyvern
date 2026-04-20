@@ -981,7 +981,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 extracted_information_schema=post_ceiling_kwargs["extracted_information_schema"],
                 error_code_mapping=error_code_mapping_str,
                 llm_key=None,
-                local_datetime=local_datetime_str,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:

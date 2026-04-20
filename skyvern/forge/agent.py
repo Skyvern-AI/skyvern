@@ -5193,7 +5193,6 @@ class ForgeAgent:
                 call_path="agent",
                 data_extraction_goal=task.data_extraction_goal,
                 extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
-                local_datetime=local_datetime_str,
                 llm_key=None,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)

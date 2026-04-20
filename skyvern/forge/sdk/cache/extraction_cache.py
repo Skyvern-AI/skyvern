@@ -8,22 +8,27 @@ output schema are identical across iterations, but we still pay the full LLM
 cost each time. This cache keys on the content that actually affects the
 extraction output and skips the LLM call on a hit.
 
+This module is the v2 in-process tier. A cross-run Redis tier (SKY-8873) sits
+behind the `lookup_cross_run_extraction_cache` / `store_cross_run_extraction_cache`
+hooks on `AgentFunction` — this module stays OSS-safe and scope-neutral.
+
 Scope and lifetime:
-- Scoped by `workflow_run_id`. Cache entries for a different run are isolated,
-  and a run's entries can be cleared via `clear_workflow_run` (e.g. at run end).
-- Purely in-memory, per-process. A workflow run that spans multiple workers
-  will still pay the LLM cost the first time each worker sees the page.
+- In-process tier scoped by `workflow_run_id`. Cache entries for a different
+  run are isolated, and a run's entries can be cleared via `clear_workflow_run`
+  (e.g. at run end).
+- Purely in-memory, per-process. Cross-run / cross-worker persistence is
+  handled by the cloud-side Redis tier behind the AgentFunction hooks.
 - Two-tier eviction:
     - **Outer** (workflow runs): LRU with a cap of `_MAX_WORKFLOW_RUNS`.
       Reads and writes refresh the run's position via `move_to_end`.
     - **Inner** (entries per run): FIFO with a cap of `_MAX_ENTRIES_PER_RUN`.
       Oldest entry is popped when the limit is exceeded.
 
-Key derivation:
-- Hashes the inputs that determine the LLM's output:
-    - element tree (HTML)
-    - extracted page text
-    - current URL
+Key derivation (shared with the cross-run tier):
+- Hashes only the inputs that determine the LLM's output:
+    - element tree (HTML, canonicalized to collapse transient IDs)
+    - extracted page text (ISO-timestamp lines collapsed to date prefix)
+    - current URL (query params sorted; nonce values redacted)
     - data extraction goal
     - extracted information schema (JSON-normalized)
     - navigation payload (JSON-normalized)
@@ -33,9 +38,13 @@ Key derivation:
       first step of each task, so cache hits still land across iterations of
       a "list -> click row -> list again" loop. Including it keeps
       correctness if an intra-task second-step extraction happens.
-    - llm_key — the caller's model override. Cheap to include today (one key
-      per block type per run) and prevents stale hits if we later move this
-      cache off-process and a user changes models to retune quality.
+    - llm_key — the caller's model override. Prevents stale hits when a user
+      changes models to retune quality.
+- Date is intentionally NOT in the key. Two calls on byte-identical page
+  content are semantically the same extraction regardless of wall-clock
+  date; relying on the content hash keeps hit rate up for scheduled
+  workflows that run many days apart on stable pages. Staleness is bounded
+  by the Redis TTL and the shadow-mode FP gate (SKY-8871).
 - Two calls with identical values hash to the same key. Any meaningful change
   (new page content, different schema, etc.) produces a fresh key and a miss.
 """
@@ -61,9 +70,11 @@ _MAX_WORKFLOW_RUNS = 256
 # Sentinel hashed in place of None so that None and "" produce different keys.
 _NULL_SENTINEL = "\x00__NULL__"
 
-# Cache scope identifiers. v1 ships with "run" only; "wpid" and "global"
-# are reserved for the Redis cross-run cache (SKY-8873/SKY-8874).
+# Cache scope identifiers. "run" is the in-process per-workflow-run tier;
+# "wpid" is the Redis cross-run tier keyed on workflow_permanent_id
+# (SKY-8873). "global" is reserved for a future cross-WPID tier.
 SCOPE_RUN = "run"
+SCOPE_WPID = "wpid"
 
 # Fallback reasons emitted on cache misses. Used by log-based metrics to
 # distinguish first-call-in-run (unavoidable) from key-not-found (possible
@@ -342,7 +353,6 @@ def compute_cache_key(
     error_code_mapping: Any = None,
     previous_extracted_information: Any = None,
     llm_key: str | None = None,
-    local_datetime: str | None = None,
 ) -> str:
     """Return a stable sha256 hex digest for the inputs that affect extraction output.
 
@@ -352,13 +362,18 @@ def compute_cache_key(
     ``{{ var }}`` substitutions and no nav context, all other parts can match
     ``extract_information_for_navigation_goal``'s inputs and produce the same
     SHA otherwise.
+
+    Date is intentionally omitted: two calls on the same page content are
+    semantically the same extraction regardless of wall-clock date. The
+    in-prompt ``{{ local_datetime }}`` interpolation is not part of the
+    key — if the scraped content is identical, the cached result is valid.
+    Staleness is bounded by the Redis TTL (cross-run tier) and the shadow-
+    mode FP gate (SKY-8871) that compares cached vs fresh on a sampled rate.
     """
 
     def _s(v: str | None) -> str:
         """Map None to a sentinel so None and '' hash differently."""
         return _NULL_SENTINEL if v is None else v
-
-    date_only = local_datetime[:10] if local_datetime and len(local_datetime) >= 10 else _s(local_datetime)
 
     canonical_url = _canonical_url(current_url)
     canonical_element_tree = _canonical_element_tree(element_tree)
@@ -376,7 +391,6 @@ def compute_cache_key(
         _normalize(error_code_mapping),
         _normalize(previous_extracted_information),
         _s(llm_key),
-        date_only,
     ]
     joined = "\x1f".join(parts).encode("utf-8", errors="replace")
     return hashlib.sha256(joined).hexdigest()
@@ -492,6 +506,24 @@ def clear_workflow_run(workflow_run_id: str | None) -> None:
     if not workflow_run_id:
         return
     _CACHE.pop(workflow_run_id, None)
+
+
+def invalidate_key(workflow_run_id: str | None, cache_key: str) -> bool:
+    """Drop a single cached entry within a workflow run.
+
+    Used by the retry self-heal path (SKY-8873): when a step retries we
+    assume the previous attempt's cached value is suspect, so we evict it
+    and let the subsequent ``store`` overwrite with the fresh LLM result.
+
+    Returns True if an entry was removed, False otherwise. Safe to call on
+    unknown IDs / keys.
+    """
+    if not workflow_run_id:
+        return False
+    run_cache = _CACHE.get(workflow_run_id)
+    if run_cache is None:
+        return False
+    return run_cache.pop(cache_key, None) is not None
 
 
 def _reset_for_tests() -> None:

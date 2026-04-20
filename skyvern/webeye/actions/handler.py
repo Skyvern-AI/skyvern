@@ -4274,8 +4274,9 @@ async def extract_information_for_navigation_goal(
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 
-    # Compute local_datetime once so both the cache key and the prompt use the
-    # same value (avoids stale hits when date-relative extraction goals cross midnight).
+    # Rendered into the prompt as ``{{ local_datetime }}``. Intentionally not
+    # part of the cache key — content-hash alone defines cache identity, so
+    # two calls on byte-identical pages hit the cache regardless of wall clock.
     local_datetime_str = datetime.now(context.tz_info).isoformat()
 
     extracted_text_for_prompt = scraped_page_refreshed.extracted_text if task.include_extracted_text else None
@@ -4309,6 +4310,18 @@ async def extract_information_for_navigation_goal(
         local_datetime=local_datetime_str,
     )
 
+    # Self-heal guard: on the second retry onward (``retry_index > 1``) the
+    # previous attempts' cached result is suspect — the first retry already
+    # failed to complete, so continuing to hand the same cached value back
+    # is not going to recover. Bypass both cache tiers on retry #2+ and
+    # force a fresh LLM call; the dual-write after extraction overwrites
+    # both the in-run entry and the cross-run Redis entry.
+    # Retry #1 still uses the cache: transient failures (network blip,
+    # downstream flake) often recover without the extraction itself being
+    # the cause, and paying the LLM cost on every first retry would burn
+    # hit rate for no self-heal benefit.
+    is_retry_step = step.retry_index > 1
+
     # Best-effort cache lookup — any failure falls through to LLM. The `try`
     # is narrowed to just compute_cache_key + lookup so a downstream log
     # failure can't re-enter the except block and double-count the call as
@@ -4341,9 +4354,29 @@ async def extract_information_for_navigation_goal(
             error_code_mapping=error_code_mapping_str,
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
-            local_datetime=local_datetime_str,
         )
-        lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
+        if is_retry_step:
+            # Proactively evict the in-run entry. The cross-run tier will be
+            # overwritten by the store() after the LLM call below.
+            evicted = extraction_cache.invalidate_key(task.workflow_run_id, cache_key)
+            LOG.info(
+                "extract_information cache bypassed on retry (self-heal)",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                step_id=step.step_id,
+                retry_index=step.retry_index,
+                cache_key=cache_key,
+                cache_hit=False,
+                # Covers both tiers — the in-run entry is evicted here and the
+                # cross-run entry will be overwritten by the store() below.
+                cache_scope=extraction_cache.SCOPE_RUN,
+                cache_age_seconds=None,
+                fallback_reason="retry_bypass",
+                in_run_entry_evicted=evicted,
+                cache_path="handler",
+            )
+        else:
+            lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
     except Exception:
         LOG.warning(
             "extract_information cache lookup failed; falling through to LLM",
@@ -4450,6 +4483,105 @@ async def extract_information_for_navigation_goal(
             cache_path="handler",
         )
 
+    # Cross-run (wpid-scoped) cache lookup (SKY-8873). Consulted after an
+    # in-run miss so the tight in-process dict stays the hot path. Returns
+    # None in OSS; the cloud override hits Redis and is gated behind the
+    # EXTRACT_INFORMATION_CACHE_REDIS PostHog flag. All errors are swallowed
+    # by the backend so a Redis hiccup just falls through to the LLM call.
+    # Skipped on retry — the subsequent dual-write overwrites any stale
+    # Redis entry for this key with the fresh LLM result.
+    cross_run_value: Any | None = None
+    if cache_key is not None and not is_retry_step:
+        try:
+            cross_run_value = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(
+                task.workflow_permanent_id, cache_key
+            )
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache lookup raised",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=task.workflow_permanent_id,
+                organization_id=task.organization_id,
+                cache_key=cache_key,
+                exc_info=True,
+            )
+            cross_run_value = None
+
+    # Cross-run hit with a non-cacheable value type (e.g. a Redis payload
+    # that decoded to a bool or number). Mirror the in-run warning so the
+    # cross-run tier has the same diagnostic surface during rollout —
+    # without it, a corrupt-but-decodable entry would silently fall
+    # through to the LLM with no trail for post-hoc investigation.
+    if cache_key is not None and cross_run_value is not None and not isinstance(cross_run_value, (dict, list, str)):
+        LOG.warning(
+            "extract_information cross-run cache hit returned non-cacheable value type; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            organization_id=task.organization_id,
+            cache_key=cache_key,
+            value_type=type(cross_run_value).__name__,
+            cache_path="handler",
+        )
+        cross_run_value = None
+
+    if cache_key is not None and cross_run_value is not None and isinstance(cross_run_value, (dict, list, str)):
+        LOG.info(
+            "extract_information cache hit — skipping LLM call (cross-run)",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_hit=True,
+            cache_scope=extraction_cache.SCOPE_WPID,
+            # Age tracking in the cross-run tier is a follow-up; emit None so
+            # the field is always present but distinguishable from in-run hits.
+            cache_age_seconds=None,
+            fallback_reason=None,
+            cache_path="handler",
+        )
+        # Backfill the in-run cache so subsequent identical lookups in this
+        # run short-circuit without crossing the Redis boundary.
+        try:
+            extraction_cache.store(task.workflow_run_id, cache_key, cross_run_value)
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache backfill to in-run failed",
+                exc_info=True,
+            )
+        # Shadow sampling on cross-run hits is a follow-up — plumbing needs
+        # a cached_age for the comparison event and the current Redis backend
+        # does not track it yet.
+        return ScrapeResult(scraped_data=cross_run_value)
+
+    # Cross-run miss log — DEBUG so it doesn't flood INFO at 0% rollout
+    # (where the cloud override returns None for every call regardless of
+    # wpid or Redis state). When the flag ramps past the initial measurement
+    # checkpoint we can promote to INFO in the same commit that flips the
+    # percentage. Paired with the cross-run hit log (still INFO) this
+    # gives a computable hit rate at any rollout level.
+    # TODO(SKY-8992): promote this log from DEBUG → INFO in the same commit
+    # that flips the PostHog read flag past 0%, so the Datadog hit-rate
+    # dashboard has both sides of the ratio without a log-level backfill.
+    if cache_key is not None and not is_retry_step and cross_run_value is None:
+        LOG.debug(
+            "extract_information cache miss (cross-run)",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=extraction_cache.SCOPE_WPID,
+            cache_age_seconds=None,
+            # The wpid tier doesn't distinguish "flag disabled" from
+            # "key not found" at the handler — both surface as ``None`` —
+            # so label as ``cross_run_miss`` and let downstream metrics
+            # split by ``workflow_permanent_id`` populated vs empty.
+            fallback_reason="cross_run_miss",
+            cache_path="handler",
+        )
+
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
         llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
@@ -4479,6 +4611,23 @@ async def extract_information_for_navigation_goal(
             extraction_cache.store(task.workflow_run_id, cache_key, json_response)
         except Exception:
             LOG.warning("extract_information cache store failed; ignoring", exc_info=True)
+        # Dual-write to the cross-run (Redis) tier. Ungated so the cache is
+        # warm before the read flag rolls out. OSS returns immediately; cloud
+        # writes to Redis with a long TTL and swallows backend errors.
+        try:
+            await app.AGENT_FUNCTION.store_cross_run_extraction_cache(
+                task.workflow_permanent_id, cache_key, json_response
+            )
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache store raised; ignoring",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=task.workflow_permanent_id,
+                organization_id=task.organization_id,
+                cache_key=cache_key,
+                exc_info=True,
+            )
 
     return ScrapeResult(
         scraped_data=json_response,
