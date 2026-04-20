@@ -174,6 +174,12 @@ class SkyvernElement:
         if role and role.lower() == "combobox":
             return True
 
+        # Tag inputs where typing surfaces a suggestion list to select from
+        if class_name:
+            cl = class_name.lower()
+            if "skillset" in cl or "tagsinput" in cl:
+                return True
+
         return False
 
     async def is_custom_option(self) -> bool:
