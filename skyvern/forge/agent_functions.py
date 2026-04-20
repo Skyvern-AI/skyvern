@@ -16,6 +16,7 @@ from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -437,6 +438,31 @@ class AgentFunction:
     OSS Skyvern has no scheduling backend wired up by default, so the routes return 501.
     Cloud overrides this to True and provides the Temporal-backed implementations below.
     """
+
+    def get_mcp_oauth_issuer_url(self) -> str | None:
+        """Return the cloud OAuth issuer URL when the build provides one.
+
+        OSS builds do not ship a remote OAuth issuer, so the base implementation
+        returns None and callers should treat OAuth validation as unavailable.
+        """
+        return None
+
+    async def get_mcp_oauth_jwt_key(self) -> Any | None:
+        """Return the current signing key/JWK for MCP OAuth token validation.
+
+        Cloud builds override this to provide the identity-provider signing key.
+        OSS builds return None.
+        """
+        return None
+
+    def build_mcp_auth_db(self, database_string: str, *, debug_enabled: bool) -> Any:
+        """Return the DB instance used by MCP auth middleware.
+
+        OSS builds use the base ``AgentDB``. Cloud overrides this to provide
+        the encryption-aware ``CloudAgentDB`` implementation without importing
+        cloud modules from the OSS-synced ``skyvern/`` tree.
+        """
+        return AgentDB(database_string, debug_enabled=debug_enabled)
 
     async def validate_step_execution(
         self,
