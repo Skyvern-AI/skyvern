@@ -136,7 +136,9 @@
               "getting-started/introduction",
               "getting-started/core-concepts",
               "getting-started/quickstart",
-              "getting-started/ai-agents-quickstart"
+              "getting-started/ai-agents-quickstart",
+              "integrations/mcp",
+              "integrations/cli"
             ]
           },
           {
@@ -150,21 +152,13 @@
             ]
           },
           {
-            "group": "Running Automations",
-            "pages": [
-              "running-automations/run-a-task",
-              "running-automations/task-parameters",
-              "running-automations/extract-structured-data"
-            ]
-          },
-          {
-            "group": "Multi-Step Automations",
+            "group": "Browser Automation",
             "pages": [
               "multi-step-automations/overview",
               "multi-step-automations/actions-reference",
               "multi-step-automations/extract-structured-data",
-              "multi-step-automations/downloading-files",
-              "multi-step-automations/managing-browsers"
+              "multi-step-automations/work-with-files",
+              "multi-step-automations/handle-browsers"
             ]
           },
           {
@@ -173,16 +167,6 @@
               "credentials/store-credentials",
               "credentials/handle-2fa",
               "credentials/troubleshooting-login"
-            ]
-          },
-          {
-            "group": "Running Workflows",
-            "pages": [
-              "multi-step-automations/build-a-workflow",
-              "multi-step-automations/workflow-blocks-reference",
-              "multi-step-automations/file-operations",
-              "multi-step-automations/workflow-parameters",
-              "multi-step-automations/scheduling-workflows"
             ]
           },
           {
@@ -199,9 +183,7 @@
               "going-to-production/webhooks",
               "going-to-production/proxy-geolocation",
               "going-to-production/error-handling",
-              "going-to-production/reliability-tips",
-              "integrations/mcp",
-              "integrations/cli"
+              "going-to-production/reliability-tips"
             ]
           },
           {
@@ -514,7 +496,7 @@
     },
     {
       "source": "/running-tasks/run-tasks",
-      "destination": "/running-automations/run-a-task"
+      "destination": "/cloud/getting-started/run-from-code"
     },
     {
       "source": "/running-tasks/visualizing-results",
@@ -522,7 +504,7 @@
     },
     {
       "source": "/running-tasks/cancel-runs",
-      "destination": "/running-automations/run-a-task"
+      "destination": "/cloud/getting-started/run-from-code"
     },
     {
       "source": "/running-tasks/webhooks-faq",
@@ -538,11 +520,23 @@
     },
     {
       "source": "/running-tasks/advanced-features",
-      "destination": "/running-automations/task-parameters"
+      "destination": "/sdk-reference/tasks/run-task"
     },
     {
       "source": "/running-tasks/api-spec",
-      "destination": "/running-automations/run-a-task"
+      "destination": "/cloud/getting-started/run-from-code"
+    },
+    {
+      "source": "/running-automations/run-a-task",
+      "destination": "/cloud/getting-started/run-from-code"
+    },
+    {
+      "source": "/running-automations/task-parameters",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/running-automations/extract-structured-data",
+      "destination": "/multi-step-automations/extract-structured-data"
     },
     {
       "source": "/workflows/manage-workflows",
@@ -550,11 +544,11 @@
     },
     {
       "source": "/workflows/workflow-blocks-details",
-      "destination": "/multi-step-automations/workflow-blocks-reference"
+      "destination": "/cloud/building-workflows/configure-blocks"
     },
     {
       "source": "/workflows/workflow-parameters",
-      "destination": "/multi-step-automations/workflow-parameters"
+      "destination": "/cloud/building-workflows/add-parameters"
     },
     {
       "source": "/workflows/run-workflows",
@@ -570,23 +564,43 @@
     },
     {
       "source": "/workflows/introduction",
-      "destination": "/multi-step-automations/build-a-workflow"
+      "destination": "/cloud/building-workflows/build-a-workflow"
     },
     {
       "source": "/workflows/workflow-blocks",
-      "destination": "/multi-step-automations/workflow-blocks-reference"
+      "destination": "/cloud/building-workflows/configure-blocks"
     },
     {
       "source": "/workflows/creating-workflows",
-      "destination": "/multi-step-automations/build-a-workflow"
+      "destination": "/cloud/building-workflows/build-a-workflow"
     },
     {
       "source": "/workflows/getting-workflows",
-      "destination": "/multi-step-automations/build-a-workflow#step-7:-get-results"
+      "destination": "/cloud/building-workflows/run-a-workflow"
     },
     {
       "source": "/workflows/what-is-a-parameter",
-      "destination": "/multi-step-automations/workflow-parameters"
+      "destination": "/cloud/building-workflows/add-parameters"
+    },
+    {
+      "source": "/multi-step-automations/build-a-workflow",
+      "destination": "/multi-step-automations/overview"
+    },
+    {
+      "source": "/multi-step-automations/workflow-blocks-reference",
+      "destination": "/multi-step-automations/actions-reference"
+    },
+    {
+      "source": "/multi-step-automations/file-operations",
+      "destination": "/multi-step-automations/work-with-files"
+    },
+    {
+      "source": "/multi-step-automations/workflow-parameters",
+      "destination": "/cloud/building-workflows/add-parameters"
+    },
+    {
+      "source": "/multi-step-automations/scheduling-workflows",
+      "destination": "/cloud/building-workflows/scheduling"
     },
     {
       "source": "/credentials/introduction",

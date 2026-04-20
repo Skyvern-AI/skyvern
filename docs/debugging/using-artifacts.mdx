@@ -15,7 +15,7 @@ keywords:
   - generated code
 ---
 
-When a Skyvern run fails or produces unexpected results, artifacts are your debugging toolkit. Every run automatically captures what happened—recordings of the browser session, screenshots at each step, the AI's reasoning, and network traffic.
+When a Skyvern run fails or produces unexpected results, artifacts are your debugging toolkit. Every run automatically captures what happened: recordings of the browser session, screenshots at each step, the AI's reasoning, and network traffic.
 
 This page covers how to retrieve artifacts and what each type tells you.
 
@@ -69,7 +69,7 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts" \
 </CodeGroup>
 
 <Note>
-Signed URLs expire after 24 hours. If a URL has expired, call `get_run_artifacts` again to get fresh URLs. When running Skyvern locally, `signed_url` will be `null`—access artifacts directly from your local file system instead.
+Signed URLs expire after 24 hours. If a URL has expired, call `get_run_artifacts` again to get fresh URLs. When running Skyvern locally, `signed_url` will be `null`. Access artifacts directly from your local file system instead.
 </Note>
 
 ---
@@ -111,7 +111,7 @@ These show you what the browser looked like at various points.
 |------|------------------|-------------|
 | `recording` | Full video of the browser session (WebM) | Watch the entire run, see exactly what happened |
 | `screenshot` | Base screenshot capture | General page state capture |
-| `screenshot_final` | Screenshot when the run ended | Check the final state—did it end on the right page? |
+| `screenshot_final` | Screenshot when the run ended | Check the final state (did it end on the right page?) |
 | `screenshot_action` | Screenshot taken after each action | See the page state after each click, type, or navigation |
 | `screenshot_llm` | Screenshot sent to the LLM for decision-making | Understand what the AI "saw" when it made each decision |
 

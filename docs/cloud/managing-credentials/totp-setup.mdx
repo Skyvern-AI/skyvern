@@ -203,8 +203,8 @@ def validate_skyvern_request(request) -> bool:
 
 Some sites use one-time login links instead of numeric codes. Skyvern supports these by splitting the flow into two steps:
 
-1. **Trigger the magic link** — Run a task that initiates the login. The site emails a one-time link.
-2. **Use the link** — Monitor the inbox (e.g., via Zapier), extract the URL, then start a new task with that URL as the starting point.
+1. **Trigger the magic link**: Run a task that initiates the login. The site emails a one-time link.
+2. **Use the link**: Monitor the inbox (e.g., via Zapier), extract the URL, then start a new task with that URL as the starting point.
 
 ```python
 # Step 1: Trigger the magic link email
@@ -222,7 +222,7 @@ await client.run_task(
 )
 ```
 
-The magic link URL becomes the `url` parameter for the second task — Skyvern opens it directly, which logs the user in, and then continues with the rest of the automation.
+The magic link URL becomes the `url` parameter for the second task. Skyvern opens it directly, which logs the user in, and then continues with the rest of the automation.
 
 ---
 

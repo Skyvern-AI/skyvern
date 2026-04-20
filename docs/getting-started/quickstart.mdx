@@ -18,7 +18,7 @@ keywords:
 Run your first browser automation in 5 minutes. By the end of this guide, you'll scrape the top post from Hacker News using Skyvern's AI agent.
 
 <Note>
-Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead — no code required.
+Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead. No code required.
 </Note>
 
 ## Step 1: Get your API key
@@ -55,8 +55,8 @@ pipx installs Python packages in isolated environments while making them globall
 
 Let's scrape the title of the #1 post on Hacker News. You only need two parameters:
 
-- **`prompt`** — Natural language instructions for what the AI should do. Be specific about the data you want extracted.
-- **`url`** — The starting page. Skyvern's AI will navigate from here based on your prompt.
+- **`prompt`**: Natural language instructions for what the AI should do. Be specific about the data you want extracted.
+- **`url`**: The starting page. Skyvern's AI will navigate from here based on your prompt.
 
 The SDK uses async/await because Skyvern spins up a cloud browser and executes your task remotely, which can take 30-60 seconds.
 
@@ -119,8 +119,8 @@ The response includes a `run_id` you'll use to check status and fetch results.
 
 Since tasks run asynchronously, you have two options:
 
-1. **Polling** — Periodically check the task status (shown below)
-2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/going-to-production/webhooks))
+1. **Polling**: Periodically check the task status (shown below)
+2. **Webhooks**: Get notified when the task completes ([see webhooks guide](/going-to-production/webhooks))
 
 The code below polls every 5 seconds until the task reaches a terminal state. Once complete, `run.output` contains the extracted data as a dictionary.
 
@@ -211,14 +211,14 @@ done
 </CodeGroup>
 
 **Run states:**
-- `created` — Task initialized, not yet queued
-- `queued` — Waiting for an available browser
-- `running` — AI is navigating and executing
-- `completed` — Task finished successfully
-- `failed` — Task encountered an error
-- `terminated` — Task was manually stopped
-- `timed_out` — Task exceeded time limit
-- `canceled` — Task was cancelled before starting
+- `created`: Task initialized, not yet queued
+- `queued`: Waiting for an available browser
+- `running`: AI is navigating and executing
+- `completed`: Task finished successfully
+- `failed`: Task encountered an error
+- `terminated`: Task was manually stopped
+- `timed_out`: Task exceeded time limit
+- `canceled`: Task was cancelled before starting
 
 ## Step 5: View your results
 
@@ -266,10 +266,10 @@ Navigate to [Runs](https://app.skyvern.com/runs) and click on your run to see th
 
 ### What you'll see
 
-- **Live browser view** — Watch the AI navigate in real-time
-- **Recording** — Full video replay of the session
-- **Actions** — Step-by-step breakdown with screenshots
-- **AI Reasoning** — See why the AI made each decision
+- **Live browser view**: Watch the AI navigate in real-time
+- **Recording**: Full video replay of the session
+- **Actions**: Step-by-step breakdown with screenshots
+- **AI Reasoning**: See why the AI made each decision
 
 This is invaluable for debugging and understanding how Skyvern interprets your prompts.
 
@@ -354,7 +354,7 @@ skyvern run server
 
 ### Run a task locally
 
-The only difference from cloud is the `base_url` parameter pointing to your local server. The API is identical, so the same code works in both environments — develop locally, deploy to cloud without changes.
+The only difference from cloud is the `base_url` parameter pointing to your local server. The API is identical, so the same code works in both environments. Develop locally, deploy to cloud without changes.
 
 ```python
 import os

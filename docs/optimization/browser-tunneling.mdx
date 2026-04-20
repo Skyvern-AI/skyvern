@@ -13,7 +13,7 @@ keywords:
   - Playwright
 ---
 
-Want Skyvern Cloud to automate a site where you're already logged in? With `skyvern browser serve`, Skyvern Cloud can control a Chrome browser running on your machine — using your existing cookies, sessions, extensions, and saved passwords.
+Want Skyvern Cloud to automate a site where you're already logged in? With `skyvern browser serve`, Skyvern Cloud can control a Chrome browser running on your machine, using your existing cookies, sessions, extensions, and saved passwords.
 
 **Common use cases:**
 - Automate sites where you're already authenticated (no need to re-login)
@@ -31,7 +31,7 @@ One command starts Chrome on your machine and creates a tunnel so Skyvern Cloud 
 skyvern browser serve --tunnel
 ```
 
-That's it. The CLI launches Chrome, starts a local proxy server, and opens an ngrok tunnel. You'll see a tunnel URL in the output — pass it as `browser_address` when running tasks.
+That's it. The CLI launches Chrome, starts a local proxy server, and opens an ngrok tunnel. You'll see a tunnel URL in the output; pass it as `browser_address` when running tasks.
 
 <Note>
 The `--tunnel` flag requires [ngrok](https://ngrok.com/download) to be installed and authenticated. Run `ngrok authtoken <your-token>` once to set it up.

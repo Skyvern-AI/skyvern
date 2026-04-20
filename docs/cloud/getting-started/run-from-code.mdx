@@ -21,8 +21,8 @@ Run tasks programmatically using the Python SDK, TypeScript SDK, or REST API.
 
 A task has one required parameter and one commonly used optional parameter:
 
-- **`prompt`** (required) — Natural language instructions describing what the AI should do
-- **`url`** (optional) — The starting page for the automation
+- **`prompt`** (required): Natural language instructions describing what the AI should do
+- **`url`** (optional): The starting page for the automation
 
 When you call `run_task`, Skyvern spins up a cloud browser, navigates to the URL, and executes your prompt. A typical task takes 30-90 seconds depending on complexity.
 

@@ -16,10 +16,10 @@ Connect Skyvern to n8n's open-source automation platform. Trigger browser automa
 
 ## Available Operations
 
-- **Task → Dispatch a Task** — Run a browser automation with a prompt
-- **Task → Get a Task** — Retrieve results from a previously run task
-- **Workflow → Dispatch a Workflow Run** — Run a pre-built Skyvern workflow with parameters
-- **Workflow → Get a Workflow Run** — Retrieve results from a previously run workflow
+- **Task → Dispatch a Task**: Run a browser automation with a prompt
+- **Task → Get a Task**: Retrieve results from a previously run task
+- **Workflow → Dispatch a Workflow Run**: Run a pre-built Skyvern workflow with parameters
+- **Workflow → Get a Workflow Run**: Retrieve results from a previously run workflow
 
 ## Setup
 
@@ -60,16 +60,16 @@ Connect Skyvern to n8n's open-source automation platform. Trigger browser automa
   <img src="/images/n8n/n8n2.png" alt="Configure Dispatch a Task fields in n8n" />
 </Frame>
 
-- **User Prompt** (required) — What Skyvern should do
-- **URL** — The starting page. If omitted, Skyvern navigates based on the prompt.
-- **Webhook Callback URL** — URL to notify when the task finishes
+- **User Prompt** (required): What Skyvern should do
+- **URL**: The starting page. If omitted, Skyvern navigates based on the prompt.
+- **Webhook Callback URL**: URL to notify when the task finishes
 
 Under **Task Options**:
 
-- **Engine** — Defaults to **Skyvern 2.0**.
-  - **Skyvern 1.0** — Simple, single-step tasks
-  - **Skyvern 2.0** — Complex, multi-step goals with dynamic planning
-  - **OpenAI CUA** / **Anthropic CUA** — Third-party computer-use agents
+- **Engine**: Defaults to **Skyvern 2.0**.
+  - **Skyvern 1.0**: Simple, single-step tasks
+  - **Skyvern 2.0**: Complex, multi-step goals with dynamic planning
+  - **OpenAI CUA** / **Anthropic CUA**: Third-party computer-use agents
 
 ### Dispatch a Workflow Run
 
@@ -79,9 +79,9 @@ Under **Task Options**:
 
 First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
 
-- **Workflow Name or ID** (required) — Select from the dropdown or specify an ID with an expression
-- **Workflow Run Parameters** — Loaded dynamically from the selected workflow
-- **Webhook Callback URL** — URL to notify when the workflow finishes
+- **Workflow Name or ID** (required): Select from the dropdown or specify an ID with an expression
+- **Workflow Run Parameters**: Loaded dynamically from the selected workflow
+- **Webhook Callback URL**: URL to notify when the workflow finishes
 
 ### Get a Task
 
@@ -89,7 +89,7 @@ First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
   <img src="/images/n8n/n8n5.png" alt="Enter Task ID field in n8n" />
 </Frame>
 
-- **Task ID** (required) — The ID of the task run
+- **Task ID** (required): The ID of the task run
 
 ### Get a Workflow Run
 
@@ -97,8 +97,8 @@ First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
   <img src="/images/n8n/n8n4.png" alt="Enter Workflow Run ID field in n8n" />
 </Frame>
 
-- **Workflow Name or ID** (required) — Select the workflow from the dropdown
-- **Workflow Run ID** (required) — Starts with `wr_`
+- **Workflow Name or ID** (required): Select the workflow from the dropdown
+- **Workflow Run ID** (required): Starts with `wr_`
 
 ## Next steps
 

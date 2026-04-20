@@ -37,7 +37,7 @@ Every run transitions through these states:
 | `created` | Run initialized, not yet queued |
 | `queued` | Waiting for an available browser |
 | `running` | AI is navigating and executing |
-| `completed` | Success—check `output` for results |
+| `completed` | Success. Check `output` for results |
 | `failed` | System error (browser crash, network failure, exception) |
 | `terminated` | AI determined the goal is unachievable (login blocked, page unavailable) |
 | `timed_out` | Exceeded `max_steps` or time limit |
@@ -206,13 +206,13 @@ done
 ```
 </CodeGroup>
 
-**`failed` vs `terminated`:** A `failed` run hit infrastructure problems—retry might work. A `terminated` run means the AI recognized the goal is unachievable with current conditions. Retrying without changes (new credentials, different URL) will produce the same result.
+**`failed` vs `terminated`:** A `failed` run hit infrastructure problems, so retry might work. A `terminated` run means the AI recognized the goal is unachievable with current conditions. Retrying without changes (new credentials, different URL) will produce the same result.
 
 ---
 
 ## Step 2: Read `failure_reason`
 
-When a run fails or terminates, the `failure_reason` field contains a description of what went wrong. This is a free-text string—useful for logging but hard to branch on programmatically.
+When a run fails or terminates, the `failure_reason` field contains a description of what went wrong. This is a free-text string, useful for logging but hard to branch on programmatically.
 
 The field is available in both the polling response and webhook payload:
 
@@ -326,7 +326,7 @@ fi
 
 When the run fails, Skyvern evaluates your natural language error descriptions against the page state and returns the matching code.
 
-**How it works:** The `error_code_mapping` values are LLM-evaluated descriptions—you don't need exact string matches. For example, `"The login credentials are incorrect"` will match pages showing "Invalid password", "Wrong username", "Authentication failed", etc.
+**How it works:** The `error_code_mapping` values are LLM-evaluated descriptions, so you don't need exact string matches. For example, `"The login credentials are incorrect"` will match pages showing "Invalid password", "Wrong username", "Authentication failed", etc.
 
 ### In tasks
 
@@ -383,7 +383,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 Add `error_code_mapping` to individual blocks (navigation, task, validation):
 
 <Note>
-The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual workflow definitions—JSON does not support comments.
+The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual workflow definitions; JSON does not support comments.
 </Note>
 
 <CodeGroup>
@@ -520,7 +520,7 @@ async def run_with_error_handling(retries=1):
         return {"success": False, "reason": "login_failed", "details": "Retry limit reached"}
 
     elif error_code == "invoice_not_found":
-        # Expected condition—no invoice for this period
+        # Expected condition: no invoice for this period
         return {"success": False, "reason": "no_invoice", "date": invoice_date}
 
     elif error_code == "maintenance":
@@ -529,7 +529,7 @@ async def run_with_error_handling(retries=1):
         return {"success": False, "reason": "scheduled_retry"}
 
     else:
-        # Unknown error—log and alert
+        # Unknown error: log and alert
         log_error(run_id, run.failure_reason)
         return {"success": False, "reason": "unknown", "details": run.failure_reason}
 ```
@@ -594,7 +594,7 @@ async function runWithErrorHandling(retries = 1) {
 
 ## Validation blocks as assertions
 
-Validation blocks are assertions that check conditions at critical points—like unit test assertions. If validation fails, the workflow terminates immediately with your error code instead of continuing and failing later with a confusing error.
+Validation blocks are assertions that check conditions at critical points, like unit test assertions. If validation fails, the workflow terminates immediately with your error code instead of continuing and failing later with a confusing error.
 
 Use validation blocks after steps where you need to confirm success before proceeding:
 

@@ -25,13 +25,12 @@ This is the code-first path. If you prefer building automations visually with dr
 **Workflows vs. Browser Automation:** Workflows are built and run in the Cloud UI, no code required. Browser automations are built and run in code using Page, Agent, and Browser. Both can do multi-step work across pages. Choose based on whether your team prefers a visual editor or a code editor.
 </Info>
 
-This guide walks through a real example: logging into a vendor portal, extracting invoice data, and downloading a PDF. Five steps:
+This guide walks through a real example: logging into a vendor portal, extracting invoice data, and downloading a PDF. Four steps:
 
 1. **Launch a browser** and get a page
 2. **Navigate and interact** with the page using AI actions, selectors, or both
 3. **Use the agent** for complex goals like login, multi-step tasks, and file downloads
 4. **Run the script** and check results
-5. **Close the browser** to release resources
 
 ---
 
@@ -75,7 +74,7 @@ const page = await browser.getWorkingPage();
 
 The browser stays alive until you call `browser.close()` or the session times out (default: 60 minutes). All pages inside it share cookies, localStorage, and auth state.
 
-For browser launch options (timeouts, proxies, connecting to local browsers), see [Managing Browsers](/multi-step-automations/managing-browsers).
+For browser launch options (timeouts, proxies, connecting to local browsers), see [Managing Browsers](/multi-step-automations/handle-browsers).
 
 ---
 
@@ -339,106 +338,7 @@ const result = await page.agent.runWorkflow("wpid_monthly_report", {
 
 ## Step 4: Run and get results
 
-### Run the script
-
-<CodeGroup>
-```bash Python
-python your_automation.py
-```
-
-```bash TypeScript
-npx tsx your_automation.ts
-```
-</CodeGroup>
-
-You'll see the browser session URL in the console output. Open it in your browser to watch the automation run in real time.
-
-### Understand the response
-
-Every agent call returns a response with the same shape:
-
-| Field | Description |
-|-------|-------------|
-| `run_id` | Unique identifier (`tsk_*` for tasks, `wr_*` for workflows) |
-| `status` | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
-| `output` | Extracted data matching your schema |
-| `failure_reason` | Error description if the run failed |
-| `recording_url` | Video recording of the entire execution |
-| `screenshot_urls` | Screenshots captured at each step |
-| `downloaded_files` | Files downloaded during the run (with URLs) |
-| `step_count` | Number of AI steps taken (affects billing) |
-
-<CodeGroup>
-```python Python
-result = await page.agent.run_task("Extract the account balance")
-
-if result.status == "completed":
-    print(result.output)
-    print(f"Recording: {result.recording_url}")
-    print(f"Steps used: {result.step_count}")
-elif result.status == "failed":
-    print(f"Failed: {result.failure_reason}")
-```
-
-```typescript TypeScript
-const result = await page.agent.runTask("Extract the account balance");
-
-if (result.status === "completed") {
-  console.log(result.output);
-  console.log(`Recording: ${result.recording_url}`);
-  console.log(`Steps used: ${result.step_count}`);
-} else if (result.status === "failed") {
-  console.log(`Failed: ${result.failure_reason}`);
-}
-```
-</CodeGroup>
-
-### View results in the Cloud UI
-
-Every run appears in the [Runs page](https://app.skyvern.com/runs). Click any run to see:
-- **Recording** - video of the browser session
-- **Actions** - step-by-step timeline with screenshots and AI reasoning
-- **Output** - extracted data as JSON
-- **Artifacts** - screenshots, HAR files, generated code
-
-### Artifacts
-
-Every run captures recordings, screenshots, AI reasoning logs, network HAR files, and downloaded files. Access them via the Cloud UI or programmatically:
-
-<CodeGroup>
-```python Python
-artifacts = await skyvern.get_run_artifacts(result.run_id)
-for artifact in artifacts:
-    print(f"{artifact.artifact_type}: {artifact.uri}")
-```
-
-```typescript TypeScript
-const artifacts = await skyvern.getRunArtifacts(result.run_id);
-for (const artifact of artifacts) {
-  console.log(`${artifact.artifact_type}: ${artifact.uri}`);
-}
-```
-</CodeGroup>
-
-For the full artifact type reference and debugging workflows, see [Using Artifacts](/debugging/using-artifacts).
-
-### Close the browser
-
-Always close the browser when done to release cloud resources:
-
-<CodeGroup>
-```python Python
-await browser.close()
-```
-
-```typescript TypeScript
-await browser.close();
-```
-</CodeGroup>
-
----
-
-## Complete example
+### Complete example
 
 Putting it all together: log into a vendor portal, extract invoices, and download a statement.
 
@@ -548,6 +448,89 @@ main();
 ```
 </CodeGroup>
 
+### Run the script
+
+<CodeGroup>
+```bash Python
+python your_automation.py
+```
+
+```bash TypeScript
+npx tsx your_automation.ts
+```
+</CodeGroup>
+
+You'll see the browser session URL in the console output. Open it in your browser to watch the automation run in real time.
+
+### Understand the response
+
+Every agent call returns a response with the same shape:
+
+| Field | Description |
+|-------|-------------|
+| `run_id` | Unique identifier (`tsk_*` for tasks, `wr_*` for workflows) |
+| `status` | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
+| `output` | Extracted data matching your schema |
+| `failure_reason` | Error description if the run failed |
+| `recording_url` | Video recording of the entire execution |
+| `screenshot_urls` | Screenshots captured at each step |
+| `downloaded_files` | Files downloaded during the run (with URLs) |
+| `step_count` | Number of AI steps taken (affects billing) |
+
+<CodeGroup>
+```python Python
+result = await page.agent.run_task("Extract the account balance")
+
+if result.status == "completed":
+    print(result.output)
+    print(f"Recording: {result.recording_url}")
+    print(f"Steps used: {result.step_count}")
+elif result.status == "failed":
+    print(f"Failed: {result.failure_reason}")
+```
+
+```typescript TypeScript
+const result = await page.agent.runTask("Extract the account balance");
+
+if (result.status === "completed") {
+  console.log(result.output);
+  console.log(`Recording: ${result.recording_url}`);
+  console.log(`Steps used: ${result.step_count}`);
+} else if (result.status === "failed") {
+  console.log(`Failed: ${result.failure_reason}`);
+}
+```
+</CodeGroup>
+
+### View results in the Cloud UI
+
+Every run appears in the [Runs page](https://app.skyvern.com/runs). Click any run to see:
+- **Recording** - video of the browser session
+- **Actions** - step-by-step timeline with screenshots and AI reasoning
+- **Output** - extracted data as JSON
+- **Artifacts** - screenshots, HAR files, generated code
+
+### Artifacts
+
+Every run captures recordings, screenshots, AI reasoning logs, network HAR files, and downloaded files. Access them via the Cloud UI or programmatically:
+
+<CodeGroup>
+```python Python
+artifacts = await skyvern.get_run_artifacts(result.run_id)
+for artifact in artifacts:
+    print(f"{artifact.artifact_type}: {artifact.uri}")
+```
+
+```typescript TypeScript
+const artifacts = await skyvern.getRunArtifacts(result.run_id);
+for (const artifact of artifacts) {
+  console.log(`${artifact.artifact_type}: ${artifact.uri}`);
+}
+```
+</CodeGroup>
+
+For the full artifact type reference and debugging workflows, see [Using Artifacts](/debugging/using-artifacts).
+
 ---
 
 ## Next steps
@@ -563,7 +546,7 @@ main();
   <Card
     title="Managing Browsers"
     icon="browser"
-    href="/multi-step-automations/managing-browsers"
+    href="/multi-step-automations/handle-browsers"
   >
     Launch options, multiple tabs, proxies, connecting to local browsers
   </Card>

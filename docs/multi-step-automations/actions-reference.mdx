@@ -308,7 +308,7 @@ await page.selectOption("#country", { value: "us", prompt: "Select United States
 
 ### type
 
-Type text character-by-character. Unlike `fill`, this triggers keystroke events for each character — use for fields that react to individual key presses (search autocomplete, OTP inputs). Python only.
+Type text character-by-character. Unlike `fill`, this triggers keystroke events for each character, so use it for fields that react to individual key presses (search autocomplete, OTP inputs). Python only.
 
 ```python
 # Character-by-character input via selector
@@ -405,7 +405,7 @@ await page.upload_file("#file-input", files=["/path/to/file1.pdf", "/path/to/fil
 # AI-powered file input detection (no selector needed)
 await page.upload_file(prompt="Upload the resume to the file input")
 
-# Selector with AI fallback — try the selector first, use AI if it fails
+# Selector with AI fallback: try the selector first, use AI if it fails
 await page.upload_file(
     "#file-input",
     files="/path/to/file.pdf",
@@ -428,7 +428,7 @@ await page.upload_file(
 
 ### locator
 
-Locate an element using a CSS/XPath selector, an AI prompt, or both. When called with a `prompt`, returns an `AILocator` — a lazy Playwright `Locator` that resolves the element via AI on first use. Python only.
+Locate an element using a CSS/XPath selector, an AI prompt, or both. When called with a `prompt`, returns an `AILocator`, a lazy Playwright `Locator` that resolves the element via AI on first use. Python only.
 
 ```python
 # AI-powered: pass a natural-language prompt
@@ -438,17 +438,17 @@ await locator.click()
 # Full Playwright chaining works
 text = await page.locator(prompt="the error message").text_content()
 
-# Standard Playwright selector — no AI, identical to vanilla Playwright
+# Standard Playwright selector (no AI, identical to vanilla Playwright)
 locator = page.locator("#submit-btn")
 await locator.click()
 
-# Selector with AI fallback — try the selector first, use AI if it fails
+# Selector with AI fallback: try the selector first, use AI if it fails
 locator = page.locator("#submit-btn", prompt="the submit button")
 await locator.click()
 ```
 
 <Note>
-When called with only a `selector` (no `prompt`), `page.locator(selector)` behaves exactly like the standard Playwright `page.locator(selector)` — no AI is involved.
+When called with only a `selector` (no `prompt`), `page.locator(selector)` behaves exactly like the standard Playwright `page.locator(selector)`. No AI is involved.
 </Note>
 
 | Parameter | Type | Required | Description |
@@ -549,7 +549,7 @@ console.log(result.output)
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | Multi-step goal description |
 | `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/multi-step-automations/extract-structured-data). |
-| `max_steps` | `int` | No | Cap AI steps. The run terminates with `timed_out` if hit. Controls cost — each step is one AI decision + action cycle. |
+| `max_steps` | `int` | No | Cap AI steps. The run terminates with `timed_out` if hit. Controls cost; each step is one AI decision + action cycle. |
 | `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0` in the SDK for backward compatibility. Pass `skyvern-2.0` for the latest model (also the Cloud UI default). Other options: `openai-cua`, `anthropic-cua`, `ui-tars`. |
 | `model` | `dict` / `Record<string, unknown>` | No | Override LLM model configuration |
 | `url` | `str` / `string` | No | URL to navigate to (defaults to current page URL) |
@@ -732,7 +732,7 @@ fields = await page.extract_form_fields()
 # [{"name": "First Name", "type": "text", "index": 0, ...}, ...]
 ```
 
-**Returns:** `list[dict[str, Any]]` — each dict contains field name, type, options, and other metadata.
+**Returns:** `list[dict[str, Any]]` where each dict contains field name, type, options, and other metadata.
 
 **SDK reference:** [extract_form_fields](/sdk-reference/browser-automation/extract-form-fields)
 

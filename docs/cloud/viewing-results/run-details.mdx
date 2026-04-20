@@ -21,9 +21,9 @@ Every run has a detail page showing what the AI saw, what it decided, what it ex
 
 The top of the page shows the workflow title, a color-coded status badge, and the run ID. Three buttons on the right:
 
-- **API & Webhooks** — the exact API request that would reproduce this run, including endpoint, headers, and payload
-- **Edit** — jump to the workflow editor
-- **Rerun** — start a new run pre-filled with the same parameters (appears after the run finishes)
+- **API & Webhooks**: the exact API request that would reproduce this run, including endpoint, headers, and payload
+- **Edit**: jump to the workflow editor
+- **Rerun**: start a new run pre-filled with the same parameters (appears after the run finishes)
 
 While a run is in progress, a **Cancel** button appears instead of Rerun.
 
@@ -31,7 +31,7 @@ While a run is in progress, a **Cancel** button appears instead of Rerun.
 
 ## Extracted information
 
-On success, the **Extracted Information** section appears above the tabs — the structured data you asked for, displayed as JSON.
+On success, the **Extracted Information** section appears above the tabs, showing the structured data you asked for, displayed as JSON.
 
 <img src="/images/cloud/task-run-results.png" alt="Workflow Run Outputs showing extracted JSON data" />
 
@@ -49,25 +49,25 @@ The timeline is a chronological feed of three card types:
 
 | Card | What it shows |
 |------|--------------|
-| **Thought** | The AI's internal reasoning — what it sees, what it plans to do, and why. Tagged with "Decision." |
+| **Thought** | The AI's internal reasoning: what it sees, what it plans to do, and why. Tagged with "Decision." |
 | **Block** | When a workflow block starts or finishes (e.g., "Extraction"). Green checkmark = success. |
 | **Action** | Individual browser operations (e.g., "#1 Extract Data") with a description of what was done. |
 
 Click any timeline item to see its corresponding screenshot in the left panel. The **Actions** and **Steps** counters at the top give you a quick sense of how much work the run involved.
 
 <Tip>
-When a run produces wrong results, start with the Thought cards. Read the AI's reasoning to find where it went off track — a misidentified element, or a premature "goal met" conclusion.
+When a run produces wrong results, start with the Thought cards. Read the AI's reasoning to find where it went off track, such as a misidentified element, or a premature "goal met" conclusion.
 </Tip>
 
 ### Output
 
-All output data in one place. **Workflow Run Outputs** shows the complete JSON with line numbers and syntax highlighting. **Workflow Run Downloaded Files** lists any files the workflow downloaded — click to download directly.
+All output data in one place. **Workflow Run Outputs** shows the complete JSON with line numbers and syntax highlighting. **Workflow Run Downloaded Files** lists any files the workflow downloaded; click to download directly.
 
 ### Parameters
 
 The configuration that produced this run: workflow input parameters (key-value pairs), webhook URL, proxy location, and HTTP headers. Use this to verify a run received the right inputs or to recreate a past result.
 
-When you select a block in the Overview timeline, this tab also shows that block's configuration — prompt, URL, schema, and other settings.
+When you select a block in the Overview timeline, this tab also shows that block's configuration: prompt, URL, schema, and other settings.
 
 ### Recording
 
@@ -89,7 +89,7 @@ If the workflow uses cached code, a **Cache Key selector** lets you switch betwe
 
 Work through these in order:
 
-1. **Read the Failure Reason** at the top. It usually tells you what happened — timeout, navigation error, or missing element.
+1. **Read the Failure Reason** at the top. It usually tells you what happened: timeout, navigation error, or missing element.
 2. **Walk the Thought cards** in the Overview timeline. Find the point where the AI made an incorrect assumption about page state.
 3. **Check the Parameters tab** to confirm inputs were correct. A wrong URL or missing parameter is a common cause.
 4. **Watch the Recording** to see what actually happened. Popups, CAPTCHAs, and unexpected page layouts are often obvious on video.
@@ -100,7 +100,7 @@ Work through these in order:
 |--------|---------|
 | `created` | Initialized, waiting to be queued |
 | `queued` | Waiting for an available browser slot |
-| `running` | Actively executing — browser stream is live |
+| `running` | Actively executing; browser stream is live |
 | `completed` | Finished successfully |
 | `failed` | Stopped due to an error |
 | `terminated` | Stopped by the system (e.g., resource limits) |

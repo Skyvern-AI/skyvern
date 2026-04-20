@@ -131,7 +131,29 @@ flowchart LR
 
 Each block can reference outputs from previous blocks using Jinja templating: `{{search_query}}` for parameters, `{{extract_block.product_name}}` for upstream block outputs.
 
+<<<<<<< HEAD
 Workflows are the right choice when you want no-code automation, team-shared templates, scheduled recurring jobs, or visual drag-and-drop logic.
+=======
+Run a workflow you built in the UI from code:
+
+```python
+result = await skyvern.run_workflow(
+    workflow_id="wpid_abc123",
+    parameters={
+        "search_query": "wireless headphones",
+        "max_price": 100
+    }
+)
+
+print(result.output)
+```
+
+Workflows support Jinja templating:
+- Reference parameters: `{{search_query}}`
+- Reference previous block outputs: `{{extract_block.product_name}}`
+
+**Use Workflows for:** no-code automation, team-shared templates, scheduled recurring jobs, visual drag-and-drop logic.
+>>>>>>> 1ae51684 (removed —; removed old tasks/workflows pages)
 
 <Tip>
 **Building workflows?** See the [Workflow Editor guide](/cloud/building-workflows/build-a-workflow). **Need to trigger a workflow from code?** See [Run from Code](/cloud/building-workflows/run-from-code) in the Cloud UI docs.
