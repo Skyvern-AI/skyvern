@@ -69,6 +69,7 @@ class BrowserManager(Protocol):
         task_id: str = "",
         workflow_id: str = "",
         workflow_run_id: str = "",
+        finalize: bool = True,
     ) -> list[VideoArtifact]: ...
 
     async def get_har_data(

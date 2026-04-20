@@ -4600,7 +4600,9 @@ class WorkflowService:
             child_workflow_run_ids=child_workflow_run_ids,
         )
         if browser_state:
-            await self.persist_video_data(browser_state, workflow, workflow_run)
+            await self.persist_video_data(
+                browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
+            )
             if tasks:
                 await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
             # Skip workflow-scoped session save when using browser_profile_id to avoid conflicts
@@ -4786,13 +4788,20 @@ class WorkflowService:
             ) from e
 
     async def persist_video_data(
-        self, browser_state: BrowserState, workflow: Workflow, workflow_run: WorkflowRun
+        self,
+        browser_state: BrowserState,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        close_browser_on_completion: bool = True,
     ) -> None:
-        # Create recording artifact after closing the browser, so we can get an accurate recording
+        # Only remux via ffmpeg when the browser was actually closed — otherwise
+        # the recording file is still open (persistent sessions, shared browser,
+        # remote address) and the remux would fail on the partial container.
         video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
+            finalize=close_browser_on_completion,
         )
         LOG.debug("Persisting video data", number_of_video_artifacts=len(video_artifacts))
         for video_artifact in video_artifacts:

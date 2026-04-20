@@ -2482,7 +2482,7 @@ class ForgeAgent:
             return
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
+                task_id=task.task_id, browser_state=browser_state, finalize=False
             )
             for video_artifact in video_artifacts:
                 await app.ARTIFACT_MANAGER.update_artifact_data(
@@ -2641,10 +2641,12 @@ class ForgeAgent:
                 task=task,
                 browser_session_id=browser_session_id,
             )
-        # Initialize video artifact for the task here, afterwards it'll only get updated
+        # Initialize video artifact for the task here, afterwards it'll only get updated.
+        # The recording file is still open here, so skip the ffmpeg remux — matches the
+        # per-step sync path; the finalized upload happens in cleanup_and_persist_task.
         if browser_state and browser_state.browser_artifacts:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
+                task_id=task.task_id, browser_state=browser_state, finalize=False
             )
             for idx, video_artifact in enumerate(video_artifacts):
                 if video_artifact.video_artifact_id:
@@ -3980,9 +3982,11 @@ class ForgeAgent:
             task.organization_id,
         )
         if browser_state:
-            # Update recording artifact after closing the browser, so we can get an accurate recording
+            # Only remux via ffmpeg when the browser was actually closed — otherwise
+            # the recording file is still open (persistent/remote sessions) and the
+            # remux would fail on the partial container anyway.
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
+                task_id=task.task_id, browser_state=browser_state, finalize=close_browser_on_completion
             )
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:

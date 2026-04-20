@@ -567,8 +567,10 @@ async def _create_video_artifact(
     if not browser_state:
         return None
     if browser_state.browser_artifacts:
+        # Recording file is still open during block execution — skip the ffmpeg remux;
+        # the finalized upload happens after browser_context.close() in cleanup.
         video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-            task_id=task.task_id, browser_state=browser_state
+            task_id=task.task_id, browser_state=browser_state, finalize=False
         )
         for idx, video_artifact in enumerate(video_artifacts):
             if video_artifact.video_artifact_id:
