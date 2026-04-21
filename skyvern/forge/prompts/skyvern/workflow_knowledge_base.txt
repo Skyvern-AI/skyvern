@@ -532,13 +532,13 @@ blocks:
 
 ** FILE PARSER BLOCK (file_url_parser) **
 
-Purpose: Parse PDFs, CSVs, and Excel files. This is the "File Parser Block" in the UI.
+Purpose: Parse PDFs, CSVs, Excel files, images, and DOCX files. This is the "File Parser Block" in the UI.
 
 Structure:
 block_type: file_url_parser
 label: <unique_label>
 file_url: <https_url_or_file_url>             # Required: URL to the file
-file_type: <pdf|csv|excel>                     # Required: File type
+file_type: <auto_detect|csv|excel|pdf|image|docx>  # Optional: defaults to auto_detect (infer from URL/content)
 json_schema: <json_schema>                     # Optional: Structure of parsed output
 
 Use Cases:

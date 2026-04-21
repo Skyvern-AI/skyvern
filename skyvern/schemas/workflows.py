@@ -442,6 +442,7 @@ class BlockResult:
 
 
 class FileType(StrEnum):
+    AUTO_DETECT = "auto_detect"
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
@@ -831,7 +832,7 @@ class FileParserBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
 
     file_url: str
-    file_type: FileType
+    file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
 
 

@@ -4555,17 +4555,14 @@ async def extract_information_for_navigation_goal(
         # does not track it yet.
         return ScrapeResult(scraped_data=cross_run_value)
 
-    # Cross-run miss log — DEBUG so it doesn't flood INFO at 0% rollout
-    # (where the cloud override returns None for every call regardless of
-    # wpid or Redis state). When the flag ramps past the initial measurement
-    # checkpoint we can promote to INFO in the same commit that flips the
-    # percentage. Paired with the cross-run hit log (still INFO) this
-    # gives a computable hit rate at any rollout level.
-    # TODO(SKY-8992): promote this log from DEBUG → INFO in the same commit
-    # that flips the PostHog read flag past 0%, so the Datadog hit-rate
-    # dashboard has both sides of the ratio without a log-level backfill.
+    # Cross-run miss log — INFO so the wpid-tier hit rate is computable
+    # from logs alone once the read flag starts ramping. Earlier drafts kept
+    # this at DEBUG specifically to avoid flooding INFO during the
+    # post-merge 0%-read window; promoted to INFO in SKY-8992 before the
+    # first read-flag flip so Datadog has both sides of the ratio without a
+    # log-level backfill.
     if cache_key is not None and not is_retry_step and cross_run_value is None:
-        LOG.debug(
+        LOG.info(
             "extract_information cache miss (cross-run)",
             task_id=task.task_id,
             workflow_run_id=task.workflow_run_id,

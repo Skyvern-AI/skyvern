@@ -3747,7 +3747,7 @@ class FileParserBlock(Block):
     _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
 
     file_url: str
-    file_type: FileType
+    file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
 
     def get_failure_error_codes(self) -> list[str]:
@@ -4180,7 +4180,8 @@ class FileParserBlock(Block):
             # Download the file.
             file_path = await download_file(self.file_url, organization_id=organization_id)
 
-            # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
+            # Resolve AUTO_DETECT (and legacy CSV-as-default) via URL/magic-byte detection;
+            # IMAGE/EXCEL/PDF/DOCX are honored as user overrides.
             if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
                 self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
