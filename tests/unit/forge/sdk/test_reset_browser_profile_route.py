@@ -1,4 +1,4 @@
-"""Tests for POST /workflows/{wpid}/browser_session/refresh."""
+"""Tests for POST /workflows/{wpid}/browser_session/reset_profile."""
 
 from __future__ import annotations
 
@@ -36,11 +36,11 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMoc
     return TestClient(fastapi_app), get_workflow, delete_browser_session
 
 
-def test_refresh_browser_session_clears_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reset_browser_profile_clears_storage(monkeypatch: pytest.MonkeyPatch) -> None:
     client, get_workflow, delete_browser_session = _build_client(monkeypatch)
     get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
 
-    response = client.post("/v1/workflows/wpid_123/browser_session/refresh")
+    response = client.post("/v1/workflows/wpid_123/browser_session/reset_profile")
 
     assert response.status_code == 204
     get_workflow.assert_awaited_once_with(workflow_permanent_id="wpid_123", organization_id="org_oss")
@@ -50,22 +50,43 @@ def test_refresh_browser_session_clears_storage(monkeypatch: pytest.MonkeyPatch)
     )
 
 
-def test_refresh_browser_session_workflow_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reset_browser_profile_workflow_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     client, get_workflow, delete_browser_session = _build_client(monkeypatch)
     get_workflow.side_effect = WorkflowNotFound(workflow_permanent_id="wpid_missing")
 
-    response = client.post("/v1/workflows/wpid_missing/browser_session/refresh")
+    response = client.post("/v1/workflows/wpid_missing/browser_session/reset_profile")
 
     assert response.status_code == 404
     delete_browser_session.assert_not_awaited()
 
 
-def test_refresh_browser_session_storage_failure_returns_500(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reset_browser_profile_storage_failure_returns_500(monkeypatch: pytest.MonkeyPatch) -> None:
     client, get_workflow, delete_browser_session = _build_client(monkeypatch)
     get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
     delete_browser_session.side_effect = RuntimeError("s3 AccessDenied")
 
-    response = client.post("/v1/workflows/wpid_123/browser_session/refresh")
+    response = client.post("/v1/workflows/wpid_123/browser_session/reset_profile")
 
     assert response.status_code == 500
     assert "retry" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/workflows/wpid_123/browser_session/refresh",
+        "/v1/workflows/wpid_123/browser_session/refresh/",
+        "/v1/workflows/wpid_123/browser_session/reset_profile/",
+    ],
+)
+def test_alias_paths_still_work(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    client, get_workflow, delete_browser_session = _build_client(monkeypatch)
+    get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
+
+    response = client.post(path)
+
+    assert response.status_code == 204
+    delete_browser_session.assert_awaited_once_with(
+        organization_id="org_oss",
+        workflow_permanent_id="wpid_123",
+    )
