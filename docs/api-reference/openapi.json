@@ -2414,6 +2414,608 @@
           }
         }
       }
+    },
+    "/v1/schedules": {
+      "get": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "List all schedules for the organization",
+        "operationId": "schedules_list_all",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 1,
+              "title": "Page"
+            },
+            "description": "Page number (1-indexed)"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 10,
+              "minimum": 1,
+              "maximum": 100,
+              "title": "Page Size"
+            },
+            "description": "Number of results per page (1-100)"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "paused"
+              ],
+              "nullable": true,
+              "title": "Status"
+            },
+            "description": "Filter by status: 'active' or 'paused'"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "title": "Search"
+            },
+            "description": "Search by workflow title or schedule name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationScheduleListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/schedules": {
+      "post": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Create a schedule for a workflow",
+        "operationId": "schedules_create",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowScheduleUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid cron expression or timezone"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "409": {
+            "description": "Maximum schedules per workflow reached"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          },
+          "502": {
+            "description": "Failed to sync schedule with scheduling service"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "List schedules for a workflow",
+        "operationId": "schedules_list",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}": {
+      "get": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Get a workflow schedule by id",
+        "operationId": "schedules_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Schedule or workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Update a workflow schedule",
+        "operationId": "schedules_update",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowScheduleUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid cron expression or timezone"
+          },
+          "404": {
+            "description": "Schedule or workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          },
+          "502": {
+            "description": "Failed to sync schedule with scheduling service"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Delete a workflow schedule",
+        "operationId": "schedules_delete",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteScheduleResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Schedule or workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          },
+          "502": {
+            "description": "Failed to sync schedule with scheduling service"
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable": {
+      "post": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Enable a workflow schedule",
+        "operationId": "schedules_enable",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Schedule or workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          },
+          "502": {
+            "description": "Failed to sync schedule with scheduling service"
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable": {
+      "post": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Disable a workflow schedule",
+        "operationId": "schedules_disable",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Schedule or workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Workflow schedules are disabled in this build"
+          },
+          "502": {
+            "description": "Failed to sync schedule with scheduling service"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -6752,6 +7354,12 @@
             "type": "boolean",
             "title": "Complete If Empty",
             "default": false
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "nullable": true,
+            "title": "Max Concurrency",
+            "description": "Maximum number of loop iterations to execute in parallel. When set, iterations run concurrently up to this limit instead of sequentially. When null or omitted, iterations run sequentially."
           }
         },
         "type": "object",
@@ -6890,6 +7498,12 @@
             "type": "boolean",
             "title": "Complete If Empty",
             "default": false
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "nullable": true,
+            "title": "Max Concurrency",
+            "description": "Maximum number of loop iterations to execute in parallel. When set, iterations run concurrently up to this limit instead of sequentially. When null or omitted, iterations run sequentially."
           }
         },
         "type": "object",
@@ -13715,6 +14329,301 @@
           "azure_vault"
         ],
         "title": "CredentialType"
+      },
+      "WorkflowSchedule": {
+        "properties": {
+          "workflow_schedule_id": {
+            "type": "string",
+            "title": "Workflow Schedule Id",
+            "description": "Unique identifier for this schedule (prefixed wfs_)"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id",
+            "description": "The workflow this schedule triggers"
+          },
+          "cron_expression": {
+            "type": "string",
+            "title": "Cron Expression",
+            "description": "5-field cron expression defining the recurrence"
+          },
+          "timezone": {
+            "type": "string",
+            "title": "Timezone",
+            "description": "IANA timezone identifier for the cron expression"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "description": "Whether the schedule is active (true) or paused (false)"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "nullable": true,
+            "title": "Parameters",
+            "description": "Workflow parameters passed to each run"
+          },
+          "temporal_schedule_id": {
+            "type": "string",
+            "nullable": true,
+            "title": "Temporal Schedule Id",
+            "description": "Internal identifier used by the scheduling engine"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "title": "Name",
+            "description": "Human-readable name for the schedule"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "title": "Description",
+            "description": "Description of what this schedule does"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_schedule_id",
+          "organization_id",
+          "workflow_permanent_id",
+          "cron_expression",
+          "timezone",
+          "enabled",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "WorkflowSchedule"
+      },
+      "OrganizationScheduleItem": {
+        "properties": {
+          "workflow_schedule_id": {
+            "type": "string",
+            "title": "Workflow Schedule Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "workflow_title": {
+            "type": "string",
+            "title": "Workflow Title",
+            "description": "Title of the associated workflow"
+          },
+          "cron_expression": {
+            "type": "string",
+            "title": "Cron Expression"
+          },
+          "timezone": {
+            "type": "string",
+            "title": "Timezone"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "nullable": true,
+            "title": "Parameters"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "title": "Name"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "title": "Description"
+          },
+          "next_run": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "title": "Next Run",
+            "description": "Next scheduled execution time in UTC"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_schedule_id",
+          "organization_id",
+          "workflow_permanent_id",
+          "workflow_title",
+          "cron_expression",
+          "timezone",
+          "enabled",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OrganizationScheduleItem"
+      },
+      "OrganizationScheduleListResponse": {
+        "properties": {
+          "schedules": {
+            "items": {
+              "$ref": "#/components/schemas/OrganizationScheduleItem"
+            },
+            "type": "array",
+            "title": "Schedules"
+          },
+          "total_count": {
+            "type": "integer",
+            "title": "Total Count",
+            "description": "Total number of schedules matching the query"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page",
+            "description": "Current page number"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size",
+            "description": "Number of results per page"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schedules",
+          "total_count",
+          "page",
+          "page_size"
+        ],
+        "title": "OrganizationScheduleListResponse"
+      },
+      "WorkflowScheduleListResponse": {
+        "properties": {
+          "schedules": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSchedule"
+            },
+            "type": "array",
+            "title": "Schedules"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schedules"
+        ],
+        "title": "WorkflowScheduleListResponse"
+      },
+      "WorkflowScheduleResponse": {
+        "properties": {
+          "schedule": {
+            "$ref": "#/components/schemas/WorkflowSchedule"
+          },
+          "next_runs": {
+            "items": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "type": "array",
+            "title": "Next Runs",
+            "default": [],
+            "description": "Upcoming execution times in UTC based on the cron expression and timezone"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schedule"
+        ],
+        "title": "WorkflowScheduleResponse"
+      },
+      "WorkflowScheduleUpsertRequest": {
+        "properties": {
+          "cron_expression": {
+            "type": "string",
+            "title": "Cron Expression",
+            "description": "5-field cron expression (minimum 5-minute interval)"
+          },
+          "timezone": {
+            "type": "string",
+            "title": "Timezone",
+            "description": "IANA timezone identifier (e.g., America/New_York)"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "default": true,
+            "description": "Whether the schedule is active. Defaults to true"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "nullable": true,
+            "title": "Parameters",
+            "description": "Workflow parameters to pass on each run"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "title": "Name",
+            "description": "Human-readable name for the schedule"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "title": "Description",
+            "description": "Description of what this schedule does"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cron_expression",
+          "timezone"
+        ],
+        "title": "WorkflowScheduleUpsertRequest"
+      },
+      "DeleteScheduleResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "title": "DeleteScheduleResponse"
       }
     }
   },

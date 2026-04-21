@@ -217,6 +217,15 @@ curl -X GET "https://api.skyvern.com/api/v1/schedules" \
 ```
 </CodeGroup>
 
+### Query parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | integer | `1` | Page number (1-indexed) |
+| `page_size` | integer | `10` | Number of results per page (1–100) |
+| `status` | string | — | Filter by status: `"active"` or `"paused"` |
+| `search` | string | — | Search by workflow title or schedule name |
+
 ### Example response
 
 ```json
