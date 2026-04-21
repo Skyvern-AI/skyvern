@@ -12,6 +12,7 @@ import structlog
 from agents.run import Runner
 
 from skyvern.forge.sdk.copilot.failure_tracking import normalize_failure_reason
+from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -1047,4 +1048,12 @@ async def run_with_enforcement(
             current_input = (
                 [nudge_msg] if session is not None else _prune_input_list(result.to_input_list()) + [nudge_msg]
             )
+        # Signal the narrator that the agent is re-entering the loop after an
+        # enforcement correction. stream_to_sse creates the state on the first
+        # pass; on later passes we poke the transition latch directly so the
+        # next narration (produced after the next tool round-trip) can describe
+        # the course-correction.
+        narrator_state = getattr(ctx, "narrator_state", None)
+        if narrator_state is not None:
+            narrator_state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
         iteration += 1
