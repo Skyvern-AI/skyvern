@@ -67,6 +67,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     CONDENSING = "condensing"
+    NARRATION = "narration"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -118,6 +119,20 @@ class WorkflowCopilotCondensingUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.CONDENSING, description="Message type"
     )
     status: str = Field(..., description="Condensing status: 'started' or 'completed'")
+
+
+class WorkflowCopilotNarrationUpdate(BaseModel):
+    # Ephemeral, user-facing one-sentence status line emitted periodically while
+    # the agent runs. Distinct from PROCESSING_UPDATE (terse status text) so the
+    # frontend can style narration as a separate "thinking" channel. Not
+    # persisted to chat history -- reload shows only user and final-assistant
+    # rows.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.NARRATION, description="Message type"
+    )
+    narration: str = Field(..., description="One-sentence user-facing progress narration")
+    iteration: int = Field(..., description="Agent loop iteration number this narration describes")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowYAMLConversionRequest(BaseModel):

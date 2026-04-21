@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.narration import NarratorState
 
 
 class UrlVisit(BaseModel):
@@ -205,3 +208,9 @@ class CopilotContext(AgentContext):
     last_action_sequence_fingerprint: str | None = None
     pending_action_sequence_fingerprint: str | None = None
     repeated_action_fingerprint_streak_count: int = 0
+
+    # Populated lazily by ``stream_to_sse`` and reused across enforcement
+    # iterations so cadence/last-emitted-at survive ``run_with_enforcement``
+    # retries. Declared here (rather than attached dynamically) so future
+    # refactors can't strip it silently.
+    narrator_state: NarratorState | None = None
