@@ -17,7 +17,6 @@ import {
   WorkflowCopilotToolCallUpdate,
   WorkflowCopilotToolResultUpdate,
   WorkflowCopilotCondensingUpdate,
-  WorkflowCopilotNarrationUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
@@ -36,8 +35,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
-  | WorkflowCopilotCondensingUpdate
-  | WorkflowCopilotNarrationUpdate;
+  | WorkflowCopilotCondensingUpdate;
 
 interface ToolActivity {
   tool_name: string;
@@ -79,7 +77,7 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
   return (
     <div className="flex items-start gap-3">
       <div
-        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white ${
+        className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold text-white ${
           message.sender === "ai" ? "bg-blue-600" : "bg-purple-600"
         }`}
       >
@@ -169,7 +167,6 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [processingStatus, setProcessingStatus] = useState<string>("");
-  const [latestNarration, setLatestNarration] = useState<string>("");
   const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
@@ -456,6 +453,7 @@ export function WorkflowCopilotChat({
     }
     setIsLoading(false);
     setProcessingStatus("");
+    setToolActivity([]);
     streamingAbortController.current?.abort();
   };
 
@@ -484,7 +482,6 @@ export function WorkflowCopilotChat({
     setInputValue("");
     setIsLoading(true);
     setProcessingStatus("Starting...");
-    setLatestNarration("");
     setToolActivity([]);
 
     const abortController = new AbortController();
@@ -630,10 +627,6 @@ export function WorkflowCopilotChat({
               handleProcessingUpdate(payload);
               return false;
             case "tool_call":
-              setProcessingStatus(
-                TOOL_DISPLAY_NAMES[payload.tool_name] ??
-                  payload.tool_name + "...",
-              );
               setToolActivity((prev) => [
                 ...prev,
                 {
@@ -642,6 +635,10 @@ export function WorkflowCopilotChat({
                   status: "running",
                 },
               ]);
+              setProcessingStatus(
+                TOOL_DISPLAY_NAMES[payload.tool_name] ??
+                  payload.tool_name + "...",
+              );
               return false;
             case "tool_result":
               setToolActivity((prev) =>
@@ -659,11 +656,6 @@ export function WorkflowCopilotChat({
             case "condensing":
               if (payload.status === "started") {
                 setProcessingStatus("Condensing context...");
-              }
-              return false;
-            case "narration":
-              if (payload.narration) {
-                setLatestNarration(payload.narration);
               }
               return false;
             case "response":
@@ -696,8 +688,6 @@ export function WorkflowCopilotChat({
       pendingMessageId.current = null;
       setIsLoading(false);
       setProcessingStatus("");
-      setLatestNarration("");
-      setToolActivity([]);
     }
   };
 
@@ -963,25 +953,23 @@ export function WorkflowCopilotChat({
           })}
           {isLoading && (
             <div className="flex items-start gap-3">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
+              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
                 AI
               </div>
               <div className="flex-1 rounded-lg bg-slate-800 p-3">
-                <div className="flex items-center gap-2 text-sm text-slate-300">
+                <div className="flex items-center gap-2 text-sm text-slate-400">
                   <ReloadIcon className="h-4 w-4 animate-spin" />
-                  <span>
-                    {latestNarration || processingStatus || "Processing..."}
-                  </span>
+                  <span>{processingStatus || "Processing..."}</span>
                 </div>
                 {toolActivity.length > 0 && (
                   <div className="mt-2 space-y-1">
                     {toolActivity.map((activity, index) => (
                       <div
                         key={index}
-                        className="flex items-start gap-1.5 text-xs text-slate-500"
+                        className="flex items-center gap-1.5 text-xs text-slate-500"
                       >
                         <span
-                          className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${
+                          className={`inline-block h-1.5 w-1.5 rounded-full ${
                             activity.status === "running"
                               ? "animate-pulse bg-blue-400"
                               : activity.status === "success"
@@ -989,7 +977,7 @@ export function WorkflowCopilotChat({
                                 : "bg-red-400"
                           }`}
                         />
-                        <span className="line-clamp-2 min-w-0 flex-1">
+                        <span>
                           {TOOL_DISPLAY_NAMES[activity.tool_name] ??
                             activity.tool_name}
                           {activity.summary ? ` — ${activity.summary}` : ""}
