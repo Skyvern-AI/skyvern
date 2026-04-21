@@ -109,18 +109,66 @@ def _normalize_failure_reason(failure_reason: str | None) -> str:
     return normalized or "The workflow test run failed."
 
 
+_FAILURE_FOLLOW_UP = {
+    "NAVIGATION_FAILURE": " Can you confirm the URL is correct?",
+    "PROXY_ERROR": " Want me to retry with a different proxy location?",
+    "PAGE_LOAD_TIMEOUT": " Can you confirm the URL and try again in a moment?",
+    "ANTI_BOT_DETECTION": " Want me to retry with a different proxy location?",
+    "AUTH_FAILURE": " The site rejected the login — is the stored password still valid?",
+    "CREDENTIAL_ERROR": " I couldn't find a credential to use — can you link one in Settings?",
+}
+
+
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
-    if ctx.last_update_block_count is None or ctx.last_test_ok is not False:
-        return user_response
+    # Reshape replies when we cannot ship a proposal this turn so the user
+    # sees why nothing is being offered rather than an un-grounded claim.
+    if ctx.last_test_ok is False and ctx.last_update_block_count is not None:
+        if ctx.last_update_block_count <= 0:
+            draft_phrase = "a draft workflow"
+        else:
+            block_word = "block" if ctx.last_update_block_count == 1 else "blocks"
+            draft_phrase = f"a draft workflow with {ctx.last_update_block_count} {block_word}"
 
-    if ctx.last_update_block_count <= 0:
-        draft_phrase = "a draft workflow"
-    else:
-        block_word = "block" if ctx.last_update_block_count == 1 else "blocks"
-        draft_phrase = f"a draft workflow with {ctx.last_update_block_count} {block_word}"
+        failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
+        follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
+        return f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}.{follow_up}"
 
-    failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
-    return f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}"
+    if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
+        # Agent edited the YAML but didn't verify it this turn; don't promise
+        # a re-run we can't durably execute (the restore helper rolls the
+        # mid-turn DB write back and there's no durable draft to re-test).
+        return (
+            "I drafted an update but wasn't able to verify it this turn. "
+            "Could you share more context about what you'd like me to do?"
+        )
+
+    return user_response
+
+
+def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
+    """Only surface a workflow proposal when it passed a test this turn.
+
+    SKY-9143: the Accept/Reject UI must never reflect a workflow we haven't
+    proven works. Every agent exit path that builds an AgentResult directly
+    (cancel, max-turns, timeout, non-retriable nav error, catch-all Exception)
+    funnels through this so the strict invariant holds regardless of which
+    branch the run took.
+    """
+    if ctx.last_workflow is not None and ctx.last_test_ok is True:
+        return ctx.last_workflow, ctx.last_workflow_yaml
+    return None, None
+
+
+def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_context: str | None) -> AgentResult:
+    """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    return AgentResult(
+        user_response=user_response,
+        updated_workflow=verified_workflow,
+        global_llm_context=global_llm_context,
+        workflow_yaml=verified_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+    )
 
 
 def _translate_to_agent_result(
@@ -161,11 +209,17 @@ def _translate_to_agent_result(
                     f"Please ask me to fix it.)"
                 )
 
-    user_response = _rewrite_failed_test_response(str(user_response), ctx)
+    # Inline REPLACE_WORKFLOW bypasses _update_workflow so ctx.last_workflow
+    # is still whatever the tool layer last saw. Writing the REPLACE_WORKFLOW
+    # result onto ctx ensures _verified_workflow_or_none sees the right
+    # candidate — though it still gates on last_test_ok, so an untested
+    # REPLACE is rejected too.
+    if action_data.get("type") == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow:
+        ctx.last_workflow = last_workflow
+        ctx.last_workflow_yaml = last_workflow_yaml
 
-    if ctx.last_test_ok is False:
-        last_workflow = None
-        last_workflow_yaml = None
+    user_response = _rewrite_failed_test_response(str(user_response), ctx)
+    last_workflow, last_workflow_yaml = _verified_workflow_or_none(ctx)
 
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in ("REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"):
@@ -394,28 +448,18 @@ async def run_copilot_agent(
                 )
             except asyncio.CancelledError:
                 LOG.info("Copilot run cancelled")
-                return AgentResult(
-                    user_response="Request cancelled.",
-                    updated_workflow=ctx.last_workflow,
-                    global_llm_context=global_llm_context,
-                    workflow_yaml=ctx.last_workflow_yaml,
-                    workflow_was_persisted=ctx.workflow_persisted,
-                )
+                return _build_exit_result(ctx, "Request cancelled.", global_llm_context)
             except MaxTurnsExceeded:
-                return AgentResult(
-                    user_response="I've reached the maximum number of steps. Here's what I have so far.",
-                    updated_workflow=ctx.last_workflow,
-                    global_llm_context=global_llm_context,
-                    workflow_yaml=ctx.last_workflow_yaml,
-                    workflow_was_persisted=ctx.workflow_persisted,
+                return _build_exit_result(
+                    ctx,
+                    "I've reached the maximum number of steps. Here's what I have so far.",
+                    global_llm_context,
                 )
             except CopilotTotalTimeoutError:
-                return AgentResult(
-                    user_response="I ran out of time processing your request. Here's what I have so far.",
-                    updated_workflow=ctx.last_workflow,
-                    global_llm_context=global_llm_context,
-                    workflow_yaml=ctx.last_workflow_yaml,
-                    workflow_was_persisted=ctx.workflow_persisted,
+                return _build_exit_result(
+                    ctx,
+                    "I ran out of time processing your request. Here's what I have so far.",
+                    global_llm_context,
                 )
             except CopilotNonRetriableNavError as exc:
                 LOG.warning(
@@ -424,25 +468,21 @@ async def run_copilot_agent(
                     error_message=exc.error_message,
                     organization_id=organization_id,
                 )
+                # Non-retriable nav errors prove the current workflow doesn't
+                # work; zero the proposal even if other tools succeeded.
                 return AgentResult(
                     user_response=(
                         f"The target URL could not be reached. Error: {exc.error_message}. "
                         "Please verify the URL and try again."
                     ),
-                    updated_workflow=ctx.last_workflow,
+                    updated_workflow=None,
                     global_llm_context=global_llm_context,
-                    workflow_yaml=ctx.last_workflow_yaml,
+                    workflow_yaml=None,
                     workflow_was_persisted=ctx.workflow_persisted,
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return AgentResult(
-            user_response="An unexpected error occurred. Please try again.",
-            updated_workflow=ctx.last_workflow,
-            global_llm_context=global_llm_context,
-            workflow_yaml=ctx.last_workflow_yaml,
-            workflow_was_persisted=ctx.workflow_persisted,
-        )
+        return _build_exit_result(ctx, "An unexpected error occurred. Please try again.", global_llm_context)
     finally:
         _copilot_model_name.reset(model_token)
         session.close()

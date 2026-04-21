@@ -83,8 +83,19 @@ class BlockRunInfo:
 
 
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """Return True when a persisted draft should be rolled back."""
-    return auto_accept is not True and bool(getattr(agent_result, "workflow_was_persisted", False))
+    """Return True when a persisted draft should be rolled back.
+
+    SKY-9143: when the agent decided not to ship a proposal this turn
+    (``updated_workflow is None``) but ``_update_workflow`` already committed
+    a YAML to ``workflow_definition``, we must restore the original even under
+    ``auto_accept=True`` — otherwise an unverified edit becomes the live
+    workflow silently.
+    """
+    if not bool(getattr(agent_result, "workflow_was_persisted", False)):
+        return False
+    if getattr(agent_result, "updated_workflow", None) is None:
+        return True
+    return auto_accept is not True
 
 
 async def _restore_workflow_definition(original_workflow: Workflow | None, organization_id: str) -> None:
@@ -840,9 +851,17 @@ async def _new_copilot_chat_post(
             # connected: the user needs to see the reply on reconnect.
             # SKY-8986: client disconnect used to short-circuit this block
             # and leave the chat history without the AI response.
+            #
+            # SKY-9143: restore runs outside the auto_accept wrapper so
+            # auto-accept turns that ended without a viable proposal still
+            # roll back a mid-turn _update_workflow write. The Accept/Reject
+            # panel state below stays gated on auto_accept — the frontend
+            # applies proposals via applyWorkflowUpdate when auto-accept is
+            # on.
+            if _should_restore_persisted_workflow(chat.auto_accept, agent_result):
+                await _restore_workflow_definition(original_workflow, organization.organization_id)
+
             if chat.auto_accept is not True:
-                if _should_restore_persisted_workflow(chat.auto_accept, agent_result):
-                    await _restore_workflow_definition(original_workflow, organization.organization_id)
                 if updated_workflow:
                     proposed_data = updated_workflow.model_dump(mode="json")
                     if agent_result.workflow_yaml:
