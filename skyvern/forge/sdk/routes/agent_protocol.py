@@ -39,7 +39,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -395,6 +395,7 @@ async def run_workflow(
         ai_fallback=workflow_run_request.ai_fallback,
     )
 
+    trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -407,6 +408,7 @@ async def run_workflow(
             request_id=request_id,
             request=request,
             background_tasks=background_tasks,
+            trigger_type=trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2378,6 +2380,7 @@ async def run_workflow_legacy(
     )
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
+    legacy_trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -2390,6 +2393,7 @@ async def run_workflow_legacy(
             request_id=request_id,
             request=request,
             background_tasks=background_tasks,
+            trigger_type=legacy_trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
