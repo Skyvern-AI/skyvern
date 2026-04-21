@@ -508,9 +508,22 @@ curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_486305187432193504/retry_we
 ```
 </CodeGroup>
 
-<Warning>
-`retry_run_webhook` is fire-and-forget—it returns immediately without waiting for delivery confirmation. To verify success, monitor your webhook endpoint directly or check the run's `failure_reason` field after a short delay.
-</Warning>
+`retry_run_webhook` returns a response object with delivery details so you can confirm success immediately:
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | string | Identifier of the run that was replayed |
+| `run_type` | string | Run type associated with the payload |
+| `default_webhook_url` | string \| null | Webhook URL stored on the original run configuration |
+| `target_webhook_url` | string \| null | Webhook URL that the replay attempted to reach |
+| `payload` | string | JSON payload that was delivered during the replay attempt |
+| `headers` | object | Signed headers generated for the replay attempt |
+| `status_code` | integer \| null | HTTP status code returned by the webhook receiver |
+| `latency_ms` | integer \| null | Round-trip latency in milliseconds |
+| `response_body` | string \| null | Body returned by the webhook receiver (truncated to 2 KB) |
+| `error` | string \| null | Error message if the replay attempt failed |
+
+Check the `status_code` and `error` fields to verify whether delivery succeeded.
 
 <Tip>
 **Implement idempotency.** If you call `retry_run_webhook`, you may receive the same payload twice (once from the original attempt that your server processed but returned an error, and once from the retry). Use the `run_id` as an idempotency key—check if you've already processed this run before taking action.
