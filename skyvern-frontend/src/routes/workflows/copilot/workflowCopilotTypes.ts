@@ -56,7 +56,8 @@ export type WorkflowCopilotStreamMessageType =
   | "error"
   | "tool_call"
   | "tool_result"
-  | "condensing";
+  | "condensing"
+  | "narration";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -97,6 +98,13 @@ export interface WorkflowCopilotToolResultUpdate {
 export interface WorkflowCopilotCondensingUpdate {
   type: "condensing";
   status: "started" | "completed";
+}
+
+export interface WorkflowCopilotNarrationUpdate {
+  type: "narration";
+  narration: string;
+  iteration: number;
+  timestamp: string;
 }
 
 export interface WorkflowYAMLConversionRequest {
