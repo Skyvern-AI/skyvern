@@ -9685,7 +9685,8 @@
             "title": "File Url"
           },
           "file_type": {
-            "$ref": "#/components/schemas/FileType"
+            "$ref": "#/components/schemas/FileType",
+            "default": "auto_detect"
           },
           "json_schema": {
             "anyOf": [
@@ -9704,8 +9705,7 @@
         "required": [
           "label",
           "output_parameter",
-          "file_url",
-          "file_type"
+          "file_url"
         ],
         "title": "FileParserBlock"
       },
@@ -9761,7 +9761,8 @@
             "title": "File Url"
           },
           "file_type": {
-            "$ref": "#/components/schemas/FileType"
+            "$ref": "#/components/schemas/FileType",
+            "default": "auto_detect"
           },
           "json_schema": {
             "anyOf": [
@@ -9779,8 +9780,7 @@
         "type": "object",
         "required": [
           "label",
-          "file_url",
-          "file_type"
+          "file_url"
         ],
         "title": "FileParserBlockYAML"
       },
@@ -9795,6 +9795,7 @@
       "FileType": {
         "type": "string",
         "enum": [
+          "auto_detect",
           "csv",
           "excel",
           "pdf",
