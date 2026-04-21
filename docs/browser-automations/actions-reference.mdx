@@ -2,7 +2,7 @@
 title: Actions Reference
 subtitle: Every page action and agent method
 description: Reference for all page actions (act, extract, validate, prompt, click, fill, select_option) and agent methods (login, run_task, download_files, run_workflow) with parameters and return types.
-slug: multi-step-automations/actions-reference
+slug: browser-automations/actions-reference
 keywords:
   - act
   - extract
@@ -49,10 +49,10 @@ If you're building automations visually instead, see [Block Types and Configurat
 
 | Method | Purpose | Returns |
 |--------|---------|---------|
-| [`agent.login`](#agentlogin) | Authenticate with stored credentials | `WorkflowRunResponse` |
-| [`agent.run_task`](#agentrun_task) | Run a multi-step AI task on the current page | `TaskRunResponse` |
-| [`agent.download_files`](#agentdownload_files) | Navigate and download files | `WorkflowRunResponse` |
-| [`agent.run_workflow`](#agentrun_workflow) | Run a Cloud UI workflow on the current page | `WorkflowRunResponse` |
+| [`agent.login`](#agentlogin) | Authenticate with stored credentials | [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse) |
+| [`agent.run_task`](#agentrun_task) | Run a multi-step AI task on the current page | [`TaskRunResponse`](/sdk-reference/tasks/run-task#returns-taskrunresponse) |
+| [`agent.download_files`](#agentdownload_files) | Navigate and download files | [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse) |
+| [`agent.run_workflow`](#agentrun_workflow) | Run a Cloud UI workflow on the current page | [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse) |
 
 ### Form automation (Python only)
 
@@ -206,7 +206,7 @@ const result = await page.prompt(
 | `schema` | `dict` | No | JSON Schema for structured response |
 | `model` | `dict` | No | Override LLM model config |
 
-**Returns:** `dict`, `list`, `str`, or `None`
+**Returns:** `dict`, `list`, `str`, or `None`. Without a `schema`, returns a `dict` of the form `{"llm_response": "..."}` (TypeScript: `{ llmResponse: "..." }`). With a `schema`, returns data shaped to your schema.
 
 **SDK reference:** [prompt](/sdk-reference/browser-automation/prompt)
 
@@ -476,6 +476,8 @@ When `prompt` is provided, the returned `AILocator` supports all standard Playwr
 
 ## Agent methods
 
+All agent methods return either a [`TaskRunResponse`](/sdk-reference/tasks/run-task#returns-taskrunresponse) (for `agent.run_task`) or a [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse) (for `agent.login`, `agent.download_files`, `agent.run_workflow`). Follow the links for the full field list.
+
 ### agent.login
 
 Authenticate with stored credentials. Handles multi-page login flows, CAPTCHAs, and 2FA.
@@ -503,7 +505,7 @@ await page.agent.login("skyvern", {
 | `prompt` | `str` | No | Additional login instructions |
 | `timeout` | `float` | No | Max wait time in seconds (default: 1800) |
 
-**Returns:** `WorkflowRunResponse`
+**Returns:** [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse)
 
 **SDK reference:** [agent.login](/sdk-reference/browser-automation/agent-login)
 
@@ -548,7 +550,7 @@ console.log(result.output)
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | Multi-step goal description |
-| `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/multi-step-automations/extract-structured-data). |
+| `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/browser-automations/extract-structured-data). |
 | `max_steps` | `int` | No | Cap AI steps. The run terminates with `timed_out` if hit. Controls cost; each step is one AI decision + action cycle. |
 | `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0` in the SDK for backward compatibility. Pass `skyvern-2.0` for the latest model (also the Cloud UI default). Other options: `openai-cua`, `anthropic-cua`, `ui-tars`. |
 | `model` | `dict` / `Record<string, unknown>` | No | Override LLM model configuration |
@@ -561,7 +563,7 @@ console.log(result.output)
 | `user_agent` | `str` / `string` | No | Custom User-Agent header for the browser |
 | `timeout` | `float` | No | Max wait in seconds (default: 1800) |
 
-**Returns:** `TaskRunResponse`
+**Returns:** [`TaskRunResponse`](/sdk-reference/tasks/run-task#returns-taskrunresponse)
 
 **SDK reference:** [agent.run_task](/sdk-reference/browser-automation/agent-run-task)
 
@@ -594,11 +596,12 @@ const result = await page.agent.downloadFiles(
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | What to download |
-| `download_suffix` | `str` | No | Expected file extension |
-| `download_timeout` | `float` | No | Download wait time in seconds |
+| `download_suffix` | `str` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). Not a validator; mismatched extensions don't fail the run. |
+| `download_timeout` | `float` | No | Soft hint (seconds) for how long to wait for a download. The overall `timeout` is what actually fails the run. |
 | `max_steps_per_run` | `int` | No | Cap AI steps |
+| `timeout` | `float` | No | Max wait in seconds (default: 1800) |
 
-**Returns:** `WorkflowRunResponse`
+**Returns:** [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse)
 
 **SDK reference:** [agent.download_files](/sdk-reference/browser-automation/agent-download-files)
 
@@ -635,7 +638,7 @@ const result = await page.agent.runWorkflow(
 | `totp_identifier` | `str` / `string` | No | Identifier for push-based TOTP |
 | `timeout` | `float` | No | Max wait in seconds (default: 1800) |
 
-**Returns:** `WorkflowRunResponse`
+**Returns:** [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse)
 
 **SDK reference:** [agent.run_workflow](/sdk-reference/browser-automation/agent-run-workflow)
 

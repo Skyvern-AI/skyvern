@@ -2,7 +2,7 @@
 title: Work with Files
 subtitle: Download files from websites during browser automations
 description: Use agent.download_files to navigate websites, find download links, and retrieve files. Access downloaded files via presigned URLs.
-slug: multi-step-automations/work-with-files
+slug: browser-automations/work-with-files
 keywords:
   - download_files
   - downloaded_files
@@ -74,8 +74,8 @@ await browser.close();
 |-----------|------|----------|-------------|
 | `prompt` | `str` / `string` | Yes | Describe what to download. The agent navigates the page to find and click the download link. |
 | `url` | `str` / `string` | No | URL to navigate to before downloading. Defaults to the current page URL. |
-| `download_suffix` | `str` / `string` | No | Expected file extension (e.g., `".pdf"`, `".csv"`). The agent waits for a file matching this extension. |
-| `download_timeout` | `float` / `number` | No | Seconds to wait for the download to start. If the file doesn't begin downloading within this time, the run fails. |
+| `download_suffix` | `str` / `string` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). **Not a validator**; mismatched extensions don't fail the run. Omit this to get a system-generated filename like `download-<timestamp>-<random>.pdf`. |
+| `download_timeout` | `float` / `number` | No | Soft hint (seconds) for how long to wait for a download to start. Not a hard cap; the overall `timeout` below governs failure. |
 | `max_steps_per_run` | `int` / `number` | No | Cap AI steps for the download navigation. |
 | `timeout` | `float` / `number` | No | Total timeout in seconds (default: 1800). |
 
@@ -87,15 +87,20 @@ await browser.close();
 
 ### Response fields
 
+Most-used fields:
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `run_id` | `str` | Run identifier (prefix: `wr_`) |
 | `status` | `str` | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
 | `downloaded_files` | `list[FileInfo]` | Files captured during the run |
-| `output` | `dict \| None` | Any extracted data |
+| `output` | `dict \| None` | Any extracted data (may be `None` even on `completed`) |
+| `app_url` | `str` | Link to view this run in the Cloud UI |
 | `recording_url` | `str \| None` | Video recording of the download session |
 | `failure_reason` | `str \| None` | Error description if the download failed |
 | `step_count` | `int` | Number of AI steps taken |
+
+See the [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse) reference for the full field list.
 
 ### FileInfo fields
 
@@ -104,8 +109,9 @@ Each file in `downloaded_files` has:
 | Field | Type | Description |
 |-------|------|-------------|
 | `url` | `str` | Presigned URL to download the file. Valid for a limited time. |
-| `filename` | `str \| None` | Original filename |
+| `filename` | `str \| None` | Saved filename. Reflects `download_suffix` if you set one, otherwise system-generated. |
 | `checksum` | `str \| None` | SHA-256 checksum for integrity verification |
+| `modified_at` | `datetime \| None` | Last-modified timestamp if the source provides one |
 
 ---
 
@@ -142,9 +148,9 @@ for (const file of result.downloadedFiles ?? []) {
 
 ## Tips
 
-**Use `download_suffix`** to tell the agent what file type to wait for. Without it, the agent may return before the download completes.
+**Set `download_suffix`** to get a predictable filename (e.g., `"invoice-q4"` → `invoice-q4.pdf`). Without it, files are saved with a system-generated name like `download-<timestamp>-<random>.pdf`. It does **not** validate or filter by extension.
 
-**Set `download_timeout`** for large files. The default may not be enough for files over 100MB.
+**Raise the overall `timeout`** for large files. `download_timeout` is a soft hint; `timeout` is what actually fails the run.
 
 **Verify with checksums.** The `checksum` field contains a SHA-256 hash. Compare it against expected values to verify file integrity.
 
@@ -164,7 +170,7 @@ If you build workflows in the Cloud UI, file operations use dedicated blocks ins
 | **Upload to S3** | Upload workflow files to S3 |
 | **File Upload** | Upload to your own S3 or Azure Blob Storage |
 
-Files downloaded during a workflow accumulate in a temporary directory and can be passed between blocks using workflow parameters. See [Workflow Blocks Reference](/multi-step-automations/workflow-blocks-reference) for block configuration details.
+Files downloaded during a workflow accumulate in a temporary directory and can be passed between blocks using workflow parameters. See [Workflow Blocks Reference](/cloud/building-workflows/configure-blocks) for block configuration details.
 
 ---
 

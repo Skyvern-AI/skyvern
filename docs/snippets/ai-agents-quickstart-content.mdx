@@ -90,9 +90,9 @@ Go to [app.skyvern.com/settings](https://app.skyvern.com/settings) and get your 
 Paste your API key below, then copy the prompt into your AI coding assistant. 
 
 It will:
-1. install the Skyvern Python/Typescript SDK
+1. Install the Skyvern Python/TypeScript SDK
 2. Ask what you want to automate (say "Go to Hacker News and get the top comment of the #1 post" for example)
-3. Write the code to a file, and run it.
+3. Runs a browser automation that launches a cloud browser, runs AI actions on pages, and prints the result
 
 <Tabs>
 <Tab title="Python">
@@ -114,40 +114,54 @@ Now ask me what I want to automate in the browser. Suggest this as a default:
 "Go to Hacker News and get the top comment of the #1 post"
 
 After I respond, create a skyvern-tasks/ folder and save a Python file there
-using this template, replacing <TASK> and <URL> with what I asked for:
+using this template, replacing <URL>, <TASK>, and the schema fields with what
+I asked for. Use the Page/Agent/Browser pattern: launch a cloud browser, get a
+page, then run AI actions on it.
 
     import os
     import asyncio
     from skyvern import Skyvern
 
     async def main():
-        client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+        skyvern = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
 
-        result = await client.run_task(
-            prompt="<TASK>",
-            url="<URL>",
-        )
+        # 1. Launch a cloud browser and get a page
+        browser = await skyvern.launch_cloud_browser()
+        page = await browser.get_working_page()
 
-        print(f"Task started: {result.run_id}")
-        print(f"View live: {result.app_url}")
+        try:
+            await page.goto("<URL>")
 
-        while True:
-            run = await client.get_run(result.run_id)
-            print(f"Status: {run.status}")
+            # 2. For a multi-step goal (navigate + extract), use the agent
+            result = await page.agent.run_task(
+                "<TASK>",
+                data_extraction_schema={
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                    },
+                },
+            )
 
-            if run.status in ("completed", "failed", "terminated", "timed_out", "canceled"):
-                break
-
-            await asyncio.sleep(5)
-
-        print(f"Final status: {run.status}")
-        print(f"Output: {run.output}")
-        if run.recording_url:
-            print(f"Recording: {run.recording_url}")
+            print(f"Status: {result.status}")
+            print(f"View run: {result.app_url}")
+            print(f"Steps used: {result.step_count}")
+            if result.output is not None:
+                print(f"Output: {result.output}")
+            elif result.failure_reason:
+                print(f"Failed: {result.failure_reason}")
+        finally:
+            # 3. Always close the browser to release cloud resources
+            await browser.close()
 
     asyncio.run(main())
 
-Run the file and show me the output.`}</ApiKeyPrompt>
+Run the file and show me the output.
+
+Notes:
+- For one-shot extraction on a single page, use page.extract() directly instead of agent.run_task().
+- For anything requiring login, use page.agent.login() before the task.
+- Always wrap browser usage in try/finally with browser.close().`}</ApiKeyPrompt>
 
 </Tab>
 <Tab title="TypeScript">
@@ -165,46 +179,54 @@ Now ask me what I want to automate in the browser. Suggest this as a default:
 "Go to Hacker News and get the top comment of the #1 post"
 
 After I respond, create a skyvern-tasks/ folder and save a TypeScript file there
-using this template, replacing <TASK> and <URL> with what I asked for:
+using this template, replacing <URL>, <TASK>, and the schema fields with what
+I asked for. Use the Page/Agent/Browser pattern: launch a cloud browser, get a
+page, then run AI actions on it.
 
-    import { SkyvernClient } from "@skyvern/client";
+    import { Skyvern } from "@skyvern/client";
 
     async function main() {
-      const client = new SkyvernClient({
-        apiKey: process.env.SKYVERN_API_KEY,
-      });
+      const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY });
 
-      const result = await client.runTask({
-        body: {
-          prompt: "<TASK>",
-          url: "<URL>",
-        },
-      });
+      // 1. Launch a cloud browser and get a page
+      const browser = await skyvern.launchCloudBrowser();
+      const page = await browser.getWorkingPage();
 
-      console.log(\`Task started: \${result.run_id}\`);
-      console.log(\`View live: \${result.app_url}\`);
+      try {
+        await page.goto("<URL>");
 
-      const terminalStatuses = ["completed", "failed", "terminated", "timed_out", "canceled"];
-      let run;
-      while (true) {
-        run = await client.getRun(result.run_id);
-        console.log(\`Status: \${run.status}\`);
+        // 2. For a multi-step goal (navigate + extract), use the agent
+        const result = await page.agent.runTask("<TASK>", {
+          dataExtractionSchema: {
+            type: "object",
+            properties: {
+              answer: { type: "string" },
+            },
+          },
+        });
 
-        if (terminalStatuses.includes(run.status)) break;
-
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-      }
-
-      console.log(\`Final status: \${run.status}\`);
-      console.log(\`Output: \${JSON.stringify(run.output, null, 2)}\`);
-      if (run.recording_url) {
-        console.log(\`Recording: \${run.recording_url}\`);
+        console.log(\`Status: \${result.status}\`);
+        console.log(\`View run: \${result.appUrl}\`);
+        console.log(\`Steps used: \${result.stepCount}\`);
+        if (result.output != null) {
+          console.log("Output:", result.output);
+        } else if (result.failureReason) {
+          console.log(\`Failed: \${result.failureReason}\`);
+        }
+      } finally {
+        // 3. Always close the browser to release cloud resources
+        await browser.close();
       }
     }
 
     main();
 
-Run the file and show me the output.`}</ApiKeyPrompt>
+Run the file and show me the output.
+
+Notes:
+- For one-shot extraction on a single page, use page.extract() directly instead of agent.runTask().
+- For anything requiring login, use page.agent.login() before the task.
+- Always wrap browser usage in try/finally with browser.close().`}</ApiKeyPrompt>
 
 </Tab>
 </Tabs>
@@ -280,16 +302,23 @@ x-api-key = "YOUR_SKYVERN_API_KEY"
 
 <CardGroup cols={3}>
   <Card
-    title="Build a Workflow"
-    icon="diagram-project"
-    href="/multi-step-automations/build-a-workflow"
+    title="Build a Browser Automation"
+    icon="browser"
+    href="/browser-automations/overview"
   >
-    Chain multiple steps into a single automation with loops, conditionals, and data passing
+    The full Page/Agent/Browser walkthrough: AI actions, Playwright selectors, and agent tasks
+  </Card>
+  <Card
+    title="Actions Reference"
+    icon="list"
+    href="/browser-automations/actions-reference"
+  >
+    Every page action and agent method with parameters and return types
   </Card>
   <Card
     title="Extract Structured Data"
     icon="database"
-    href="/running-automations/extract-structured-data"
+    href="/browser-automations/extract-structured-data"
   >
     Define a JSON schema to get typed output from your automations
   </Card>
@@ -306,13 +335,6 @@ x-api-key = "YOUR_SKYVERN_API_KEY"
     href="/integrations/mcp"
   >
     All 33 tools, config options, local mode, and troubleshooting
-  </Card>
-  <Card
-    title="CLI & Skills"
-    icon="terminal"
-    href="/integrations/cli"
-  >
-    Browser commands, workflow management, and the skill system
   </Card>
   <Card
     title="Use Webhooks"

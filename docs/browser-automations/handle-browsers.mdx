@@ -2,7 +2,7 @@
 title: Handle Browsers
 subtitle: Launch, connect, configure, and manage browser sessions
 description: Launch cloud browsers, connect via CDP, configure proxies and timeouts, open multiple tabs, and manage browser lifecycle for Skyvern automations.
-slug: multi-step-automations/handle-browsers
+slug: browser-automations/handle-browsers
 keywords:
   - launch_cloud_browser
   - use_cloud_browser
@@ -43,6 +43,13 @@ const page = await browser.getWorkingPage();
 | `proxy_location` | `ProxyLocation` | `None` | Route traffic through a geographic proxy |
 
 The browser stays alive until `timeout` expires or you call `browser.close()`.
+
+After a successful launch the handle exposes:
+
+- `browser.browser_session_id`: the `pbs_*` session id, useful for locking tasks to this session or for logging
+- `browser.pages`: the list of open Playwright pages in this browser context
+
+If `timeout < 5`, Skyvern rejects the request with `UnprocessableEntityError` (422). An invalid `proxy_location` enum is rejected the same way.
 
 <CodeGroup>
 ```python Python
@@ -87,6 +94,8 @@ const browser = await skyvern.connectToCloudBrowserSession("pbs_abc123");
 </CodeGroup>
 
 `use_cloud_browser` checks for an available session first. If one exists, it connects to it. If not, it creates a new one with the options you provide.
+
+Passing an unknown session id to `connect_to_cloud_browser_session` raises `NotFoundError` (HTTP 404).
 
 ---
 
@@ -141,7 +150,7 @@ const page = await browser.getWorkingPage();
 ```
 </CodeGroup>
 
-Returns the most recent page. If no pages are open, creates a new one.
+Returns the most recent page. If no pages are open, creates a new one. Each call returns a fresh `SkyvernBrowserPage` wrapper. Don't rely on identity (`is` / `===`) comparisons between the return value and earlier page references.
 
 ### Open a new tab
 

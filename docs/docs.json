@@ -154,11 +154,11 @@
           {
             "group": "Browser Automation",
             "pages": [
-              "multi-step-automations/overview",
-              "multi-step-automations/actions-reference",
-              "multi-step-automations/extract-structured-data",
-              "multi-step-automations/work-with-files",
-              "multi-step-automations/handle-browsers"
+              "browser-automations/overview",
+              "browser-automations/actions-reference",
+              "browser-automations/extract-structured-data",
+              "browser-automations/work-with-files",
+              "browser-automations/handle-browsers"
             ]
           },
           {
@@ -536,7 +536,7 @@
     },
     {
       "source": "/running-automations/extract-structured-data",
-      "destination": "/multi-step-automations/extract-structured-data"
+      "destination": "/browser-automations/extract-structured-data"
     },
     {
       "source": "/workflows/manage-workflows",
@@ -583,16 +583,36 @@
       "destination": "/cloud/building-workflows/add-parameters"
     },
     {
+      "source": "/multi-step-automations/overview",
+      "destination": "/browser-automations/overview"
+    },
+    {
+      "source": "/multi-step-automations/actions-reference",
+      "destination": "/browser-automations/actions-reference"
+    },
+    {
+      "source": "/multi-step-automations/extract-structured-data",
+      "destination": "/browser-automations/extract-structured-data"
+    },
+    {
+      "source": "/multi-step-automations/work-with-files",
+      "destination": "/browser-automations/work-with-files"
+    },
+    {
+      "source": "/multi-step-automations/handle-browsers",
+      "destination": "/browser-automations/handle-browsers"
+    },
+    {
       "source": "/multi-step-automations/build-a-workflow",
-      "destination": "/multi-step-automations/overview"
+      "destination": "/browser-automations/overview"
     },
     {
       "source": "/multi-step-automations/workflow-blocks-reference",
-      "destination": "/multi-step-automations/actions-reference"
+      "destination": "/browser-automations/actions-reference"
     },
     {
       "source": "/multi-step-automations/file-operations",
-      "destination": "/multi-step-automations/work-with-files"
+      "destination": "/browser-automations/work-with-files"
     },
     {
       "source": "/multi-step-automations/workflow-parameters",

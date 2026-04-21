@@ -2,7 +2,7 @@
 title: Build a Browser Automation
 subtitle: Step-by-step guide to multi-step automations with code
 description: Launch a cloud browser, interact with pages using AI and Playwright, chain agent tasks, and build complete browser automations in Python or TypeScript.
-slug: multi-step-automations/overview
+slug: browser-automations/overview
 keywords:
   - launch_cloud_browser
   - get_working_page
@@ -74,13 +74,13 @@ const page = await browser.getWorkingPage();
 
 The browser stays alive until you call `browser.close()` or the session times out (default: 60 minutes). All pages inside it share cookies, localStorage, and auth state.
 
-For browser launch options (timeouts, proxies, connecting to local browsers), see [Managing Browsers](/multi-step-automations/handle-browsers).
+For browser launch options (timeouts, proxies, connecting to local browsers), see [Managing Browsers](/browser-automations/handle-browsers).
 
 ---
 
 ## Step 2: Navigate and interact with the page
 
-Once you have a page, you can interact with it using standard Playwright, AI actions, or both. For the full list of available methods and parameters, see the [Actions Reference](/multi-step-automations/actions-reference).
+Once you have a page, you can interact with it using standard Playwright, AI actions, or both. For the full list of available methods and parameters, see the [Actions Reference](/browser-automations/actions-reference).
 
 ### Navigate
 
@@ -100,10 +100,10 @@ Four methods let you interact with the page using natural language. Skyvern scre
 
 <CodeGroup>
 ```python Python
-# Perform any action
+# Perform any action. Returns None.
 await page.act("Click the login button")
 
-# Extract structured data
+# Extract structured data. Returns dict (or list if schema root is array).
 data = await page.extract(
     "Extract all product names and prices",
     schema={
@@ -118,18 +118,19 @@ data = await page.extract(
     },
 )
 
-# Check page state (returns True/False)
+# Check page state. Returns bool.
 is_logged_in = await page.validate("The user is logged in")
 
-# Ask the AI a question about the page
-answer = await page.prompt("What is the total at the bottom of the table?")
+# Ask the AI a question. Returns {"llm_response": str}.
+result = await page.prompt("What is the total at the bottom of the table?")
+answer = result["llm_response"]
 ```
 
 ```typescript TypeScript
-// Perform any action
+// Perform any action. Returns void.
 await page.act("Click the login button");
 
-// Extract structured data
+// Extract structured data. Returns object (or array if schema root is array).
 const data = await page.extract({
   prompt: "Extract all product names and prices",
   schema: {
@@ -144,11 +145,12 @@ const data = await page.extract({
   },
 });
 
-// Check page state (returns true/false)
+// Check page state. Returns boolean.
 const isLoggedIn = await page.validate("The user is logged in");
 
-// Ask the AI a question about the page
-const answer = await page.prompt("What is the total at the bottom of the table?");
+// Ask the AI a question. Returns { llmResponse: string }.
+const result = await page.prompt("What is the total at the bottom of the table?");
+const answer = result.llmResponse;
 ```
 </CodeGroup>
 
@@ -193,9 +195,9 @@ Standard Playwright methods work directly. Use selectors where you know the DOM,
 <CodeGroup>
 ```python Python
 await page.goto("https://example.com/login")
-await page.fill("#username", value="demo@example.com")  # Playwright - known selector
-await page.fill("#password", value="s3cur3-p4ss")       # Playwright - known selector
-await page.click(prompt="Click the sign-in button")      # AI - button text varies
+await page.fill("#username", value="demo@example.com")    # Playwright - known selector
+await page.fill("#password", value="s3cur3-p4ss")         # Playwright - known selector
+await page.click(prompt="Click the sign-in button")       # AI - button text varies
 await page.wait_for_selector("#dashboard")                # Playwright - wait for page load
 data = await page.extract("Extract the account balance")  # AI - table layout varies
 ```
@@ -247,7 +249,8 @@ result = await page.agent.run_task(
         },
     },
 )
-print(result.output)  # {"invoice_number": "INV-2025-042", "amount": "$1,250.00"}
+print(result.output)
+# {"invoice_number": "INV-2025-042", "amount": "$1,250.00"}
 ```
 
 ```typescript TypeScript
@@ -263,7 +266,8 @@ const result = await page.agent.runTask(
     },
   },
 );
-console.log(result.output); // {"invoice_number": "INV-2025-042", "amount": "$1,250.00"}
+console.log(result.output);
+// {"invoice_number": "INV-2025-042", "amount": "$1,250.00"}
 ```
 </CodeGroup>
 
@@ -336,9 +340,7 @@ const result = await page.agent.runWorkflow("wpid_monthly_report", {
 
 ---
 
-## Step 4: Run and get results
-
-### Complete example
+## Complete example
 
 Putting it all together: log into a vendor portal, extract invoices, and download a statement.
 
@@ -448,7 +450,11 @@ main();
 ```
 </CodeGroup>
 
-### Run the script
+---
+
+## Step 4: Run and get results
+
+Run the script:
 
 <CodeGroup>
 ```bash Python
@@ -462,45 +468,38 @@ npx tsx your_automation.ts
 
 You'll see the browser session URL in the console output. Open it in your browser to watch the automation run in real time.
 
-### Understand the response
+### Example output
 
-Every agent call returns a response with the same shape:
+Here's what the Complete Example prints, grouped by the call that produced each block:
 
-| Field | Description |
-|-------|-------------|
-| `run_id` | Unique identifier (`tsk_*` for tasks, `wr_*` for workflows) |
-| `status` | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
-| `output` | Extracted data matching your schema |
-| `failure_reason` | Error description if the run failed |
-| `recording_url` | Video recording of the entire execution |
-| `screenshot_urls` | Screenshots captured at each step |
-| `downloaded_files` | Files downloaded during the run (with URLs) |
-| `step_count` | Number of AI steps taken (affects billing) |
+```text wrap
+# skyvern.launch_cloud_browser()
+[Skyvern] Launched new cloud browser session  url=https://app.skyvern.com/browser-session/pbs_519895987620976102
 
-<CodeGroup>
-```python Python
-result = await page.agent.run_task("Extract the account balance")
+# page.agent.login(...)
+[Skyvern] AI login workflow finished  run_id=wr_519896041203554782  status=completed
 
-if result.status == "completed":
-    print(result.output)
-    print(f"Recording: {result.recording_url}")
-    print(f"Steps used: {result.step_count}")
-elif result.status == "failed":
-    print(f"Failed: {result.failure_reason}")
+# page.extract(...)
+[Skyvern] AI extract  prompt=Extract all invoice numbers, dates, and amounts
+
+# page.agent.download_files(...)
+[Skyvern] Starting AI file download workflow  navigation_goal=Download the latest monthly statement
+[Skyvern] AI file download workflow is running, this may take a while  run_id=wr_519896107880060430
+[Skyvern] AI file download workflow finished  run_id=wr_519896107880060430  status=completed
+
+# print(f"Found {len(invoices)} invoices")  +  for inv in invoices: print(...)
+Found 3 invoices
+  INV-2025-042: $2,340.00
+  INV-2025-043: $1,850.00
+  INV-2025-044: $3,100.00
+
+# for file in result.downloaded_files: print(f"Downloaded: {file.url}")
+Downloaded: https://skyvern-uploads.s3.amazonaws.com/downloads/production/o_510.../wr_519.../statement.pdf?AWS...
 ```
 
-```typescript TypeScript
-const result = await page.agent.runTask("Extract the account balance");
+The `[Skyvern] ...` lines come from the SDK's built-in logger and stream in real time as each call runs. Your own `print` output appears after the awaited call returns.
 
-if (result.status === "completed") {
-  console.log(result.output);
-  console.log(`Recording: ${result.recording_url}`);
-  console.log(`Steps used: ${result.step_count}`);
-} else if (result.status === "failed") {
-  console.log(`Failed: ${result.failure_reason}`);
-}
-```
-</CodeGroup>
+For the full response shape, see [`TaskRunResponse`](/sdk-reference/tasks/run-task#returns-taskrunresponse) and [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse).
 
 ### View results in the Cloud UI
 
@@ -539,14 +538,14 @@ For the full artifact type reference and debugging workflows, see [Using Artifac
   <Card
     title="Actions Reference"
     icon="list"
-    href="/multi-step-automations/actions-reference"
+    href="/browser-automations/actions-reference"
   >
     Every page action and agent method with parameters and return types
   </Card>
   <Card
     title="Managing Browsers"
     icon="browser"
-    href="/multi-step-automations/handle-browsers"
+    href="/browser-automations/handle-browsers"
   >
     Launch options, multiple tabs, proxies, connecting to local browsers
   </Card>
