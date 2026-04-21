@@ -92,7 +92,7 @@ Paste your API key below, then copy the prompt into your AI coding assistant.
 It will:
 1. Install the Skyvern Python/TypeScript SDK
 2. Ask what you want to automate (say "Go to Hacker News and get the top comment of the #1 post" for example)
-3. Runs a browser automation that launches a cloud browser, runs AI actions on pages, and prints the result
+3. Write a browser automation that launches a cloud browser, runs AI actions on pages, and prints the result
 
 <Tabs>
 <Tab title="Python">
@@ -161,7 +161,12 @@ Run the file and show me the output.
 Notes:
 - For one-shot extraction on a single page, use page.extract() directly instead of agent.run_task().
 - For anything requiring login, use page.agent.login() before the task.
-- Always wrap browser usage in try/finally with browser.close().`}</ApiKeyPrompt>
+- Always wrap browser usage in try/finally with browser.close().
+
+Reference docs you can fetch as needed:
+- https://skyvern.com/docs/llms.txt (full page index, LLM-friendly)
+- https://skyvern.com/docs/sdk-reference/complete-reference.md (every SDK method, parameter, and type; unified Python + TypeScript)
+- https://skyvern.com/docs/api-reference/openapi.json (OpenAPI spec for the REST API)`}</ApiKeyPrompt>
 
 </Tab>
 <Tab title="TypeScript">
@@ -226,7 +231,12 @@ Run the file and show me the output.
 Notes:
 - For one-shot extraction on a single page, use page.extract() directly instead of agent.runTask().
 - For anything requiring login, use page.agent.login() before the task.
-- Always wrap browser usage in try/finally with browser.close().`}</ApiKeyPrompt>
+- Always wrap browser usage in try/finally with browser.close().
+
+Reference docs you can fetch as needed:
+- https://skyvern.com/docs/llms.txt (full page index, LLM-friendly)
+- https://skyvern.com/docs/sdk-reference/complete-reference.md (every SDK method, parameter, and type; unified Python + TypeScript)
+- https://skyvern.com/docs/api-reference/openapi.json (OpenAPI spec for the REST API)`}</ApiKeyPrompt>
 
 </Tab>
 </Tabs>
@@ -300,47 +310,33 @@ x-api-key = "YOUR_SKYVERN_API_KEY"
 
 ### Keep building
 
-<CardGroup cols={3}>
+<CardGroup cols={2}>
   <Card
     title="Build a Browser Automation"
     icon="browser"
     href="/browser-automations/overview"
   >
-    The full Page/Agent/Browser walkthrough: AI actions, Playwright selectors, and agent tasks
+    The full Page/Agent/Browser walkthrough
   </Card>
   <Card
-    title="Actions Reference"
-    icon="list"
-    href="/browser-automations/actions-reference"
+    title="SDK Reference"
+    icon="code"
+    href="/sdk-reference/complete-reference"
   >
-    Every page action and agent method with parameters and return types
-  </Card>
-  <Card
-    title="Extract Structured Data"
-    icon="database"
-    href="/browser-automations/extract-structured-data"
-  >
-    Define a JSON schema to get typed output from your automations
-  </Card>
-  <Card
-    title="Handle Logins"
-    icon="key"
-    href="/sdk-reference/credentials/create-credential"
-  >
-    Store credentials securely for sites that require authentication
+    Every SDK method, parameter, and type (Python + TypeScript)
   </Card>
   <Card
     title="Full MCP Reference"
     icon="server"
     href="/integrations/mcp"
   >
-    All 33 tools, config options, local mode, and troubleshooting
+    All tools, config options, local mode, and troubleshooting
   </Card>
   <Card
-    title="Use Webhooks"
-    icon="webhook"
-    href="/going-to-production/webhooks"
+    title="llms.txt"
+    icon="file-lines"
+    href="https://skyvern.com/docs/llms.txt"
   >
-    Get notified when tasks complete instead of polling
+    Machine-readable doc index for AI coding agents
   </Card>
 </CardGroup>

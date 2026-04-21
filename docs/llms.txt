@@ -6,7 +6,7 @@
 
 - [What is Skyvern?](https://skyvern.com/docs/getting-started/introduction.md): Overview of Skyvern's AI-powered browser automation platform; how it uses LLMs and computer vision to navigate any website without custom scripts
 - [Core Concepts](https://skyvern.com/docs/getting-started/core-concepts.md): Key building blocks; tasks, workflows, blocks, parameters, browser sessions, browser profiles, credentials, runs, and artifacts
-- [API Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): Run your first browser automation task with the Skyvern REST API using Python, TypeScript, or cURL in under 5 minutes
+- [Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): Run your first browser automation task with the Skyvern REST API using Python, TypeScript, or cURL in under 5 minutes
 - [AI Agents Quickstart](https://skyvern.com/docs/getting-started/ai-agents-quickstart.md): Set up Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, or any AI coding assistant can run browser automations
 
 ## Creating & Running Tasks

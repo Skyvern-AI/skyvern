@@ -1,22 +1,23 @@
 ---
-title: API Quickstart
+title: Quickstart
 subtitle: Run your first browser automation in 5 minutes
-description: Launch a cloud browser, navigate to a page, and extract data using Skyvern's Page/Agent/Browser SDK. Works in Python, TypeScript, or cURL in under 5 minutes.
+description: Launch a cloud browser, go to a webpage, and extract structured data with Python, TypeScript, or cURL in under 5 minutes.
 slug: getting-started/quickstart
 keywords:
   - quickstart
-  - 5 minutes
-  - Hacker News
   - launch_cloud_browser
   - get_working_page
   - page.extract
   - page.agent.run_task
   - cURL
+  - Python
+  - Typescript
   - pip install
   - npm install
+  - installation
 ---
 
-Run your first browser automation in 5 minutes. By the end of this guide, you'll launch a cloud browser, navigate to Hacker News, and extract the top post title using Skyvern's Page/Agent/Browser SDK.
+Run your first browser automation in 5 minutes. By the end of this guide, you'll launch a cloud browser, navigate to Hacker News, and extract the top post title using Skyvern SDK's Page, Agent and Browser methods.
 
 <Note>
 Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead. No code required.
@@ -27,8 +28,6 @@ Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) i
 <img src="/images/get-api-key.png" alt="Get Skyvern API key" />
 
 Sign up at [app.skyvern.com](https://app.skyvern.com) and go to [Settings](https://app.skyvern.com/settings) to copy your API key.
-
-When you call `launch_cloud_browser()`, Skyvern spins up a Chromium instance in the cloud. Your code drives that browser via a Playwright `Page` that also has AI methods (`act`, `extract`, `validate`, `prompt`) layered on top. You can watch the browser live at any time.
 
 ## Step 2: Install the SDK
 
@@ -54,7 +53,7 @@ pipx installs Python packages in isolated environments while making them globall
 
 ## Step 3: Launch a browser and extract data
 
-The pattern is always the same: launch a browser, get a page, use AI methods on the page, close the browser.
+When you call `launch_cloud_browser()`, Skyvern spins up a Chromium instance in the cloud. Your code drives that browser via a Playwright `Page` that also has AI methods (`act`, `extract`, `validate`, `prompt`) layered on top. You can watch the browser live at any time.
 
 <CodeGroup>
 ```python Python

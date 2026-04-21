@@ -1,6 +1,6 @@
 ---
 name: skyvern
-description: Automate any website with AI-powered browser automation. Use when the user needs to interact with a website: filling forms, extracting data, downloading files, logging in, or running multi-step workflows. Skyvern navigates sites it has never seen before using LLMs and computer vision. Integrates via Python SDK, TypeScript SDK, REST API, MCP server, or CLI.
+description: Automate any website with AI-powered browser automation. Use when the user needs to interact with a website like filling forms, extracting data, downloading files, logging in, or running multi-step workflows. Skyvern navigates sites it has never seen before using LLMs and computer vision. Integrates via Python SDK, TypeScript SDK, REST API, MCP server, or CLI.
 license: AGPL-3.0
 compatibility: Requires a Skyvern Cloud API key (https://app.skyvern.com) or a self-hosted Skyvern instance. Python SDK requires Python 3.11+. TypeScript SDK requires Node.js 18+. MCP server works with Claude Code, Claude Desktop, Cursor, Windsurf, and VS Code.
 metadata:
@@ -172,7 +172,7 @@ skyvern workflow run --id wf_xxx        # Run a workflow
 
 ## Key references
 
-- [API Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): First task in 5 minutes
+- [Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): First task in 5 minutes
 - [SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference): All methods and types (Python + TypeScript)
 - [MCP Server Setup](https://skyvern.com/docs/going-to-production/mcp.md): Connect AI assistants
 - [Workflow Blocks Reference](https://skyvern.com/docs/cloud/building-workflows/configure-blocks.md): All block types
