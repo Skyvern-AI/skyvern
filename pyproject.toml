@@ -222,6 +222,9 @@ exclude = [
     "alembic/env.py",
     "cloud/extensions",
     "skyvern-frontend",
+    "skyvern/client",
+    "notebooks",
+    "internal",
 ]
 line-length = 120
 target-version = "py311"
