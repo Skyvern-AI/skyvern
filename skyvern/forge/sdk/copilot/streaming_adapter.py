@@ -11,6 +11,16 @@ import structlog
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.request_logging import redact_sensitive_fields
+from skyvern.forge.sdk.copilot.narration import (
+    NarratorState,
+    TransitionKind,
+    cancel_in_flight,
+    detect_transitions,
+    extract_tool_details,
+    handler_available,
+    schedule_narration,
+    snapshot_ctx,
+)
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
@@ -68,6 +78,17 @@ async def stream_to_sse(
     # carry the same iteration value; it advances after the matching result.
     iteration = 0
 
+    # Narrator state persists across enforcement iterations via ctx so
+    # cadence (last_emitted_at, min-gap) survives run_with_enforcement retries.
+    # Resolve handler availability once so per-event narrator bookkeeping
+    # (snapshot, detect, extract) is skipped when no narrator LLM is configured.
+    narrator_enabled = handler_available()
+    narrator_state: NarratorState = getattr(ctx, "narrator_state", None) or NarratorState()
+    ctx.narrator_state = narrator_state
+    user_message = getattr(ctx, "user_message", "") or ""
+    if user_message and not narrator_state.user_goal:
+        narrator_state.user_goal = user_message
+
     try:
         async for event in result.stream_events():
             if not isinstance(event, RunItemStreamEvent):
@@ -105,17 +126,29 @@ async def stream_to_sse(
                         )
                     )
 
+                # First narration lands here (~seconds after submit) rather
+                # than waiting for tool_output of a long tool.
+                if narrator_enabled:
+                    narrator_state.pending_tool_name = tool_name
+                    narrator_state.record_transition(TransitionKind.TOOL_STARTED)
+                    schedule_narration(narrator_state, stream, iteration)
+
             elif event.name == "tool_output":
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = call_id_to_name.get(call_id, "unknown")
+                # Clear pending_tool_name so post-tool transitions describe
+                # what the agent just finished, not what it's still doing.
+                narrator_state.pending_tool_name = None
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
+                # Compute summary/success unconditionally: the narrator path
+                # below also needs them, and the work is cheap (no I/O).
+                summary = summarize_tool_result(tool_name, parsed)
+                success = parsed.get("ok", True)
 
                 if not client_gone:
-                    summary = summarize_tool_result(tool_name, parsed)
-                    success = parsed.get("ok", True)
                     await stream.send(
                         WorkflowCopilotToolResultUpdate(
                             type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
@@ -127,7 +160,26 @@ async def stream_to_sse(
                         )
                     )
 
-                _update_enforcement_from_tool(ctx, tool_name, parsed)
+                if narrator_enabled:
+                    ctx_before = snapshot_ctx(ctx)
+                    _update_enforcement_from_tool(ctx, tool_name, parsed)
+                    ctx_after = snapshot_ctx(ctx)
+
+                    prior_tool_name = (
+                        narrator_state.pending_activity[-1].tool_name if narrator_state.pending_activity else None
+                    )
+                    narrator_state.record_tool(
+                        tool_name=tool_name,
+                        summary=summary,
+                        success=success,
+                        iteration=iteration,
+                        details=extract_tool_details(tool_name, parsed),
+                    )
+                    for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
+                        narrator_state.record_transition(transition)
+                    schedule_narration(narrator_state, stream, iteration)
+                else:
+                    _update_enforcement_from_tool(ctx, tool_name, parsed)
                 iteration += 1
     except asyncio.CancelledError:
         # Real cancellation (server shutdown, upstream abort). Propagate so
@@ -135,6 +187,10 @@ async def stream_to_sse(
         # run to free provider resources.
         result.cancel()
         raise
+    finally:
+        # Cancel any in-flight narration before the stream tears down so
+        # tasks don't try to send on a disconnected channel.
+        await cancel_in_flight(narrator_state)
 
 
 def _get_raw_field(raw: Any, key: str) -> Any:

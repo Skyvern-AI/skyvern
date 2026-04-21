@@ -209,11 +209,13 @@ def parse_action(
         base_action_dict["skyvern_element_hash"] = None
         base_action_dict["skyvern_element_data"] = None
         # Support both "key" (single key from prompt) and "keys" (list, from code/legacy)
-        # Limited to navigation/submission keys to prevent misuse on regular form fields
+        # Navigation/submission keys are always allowed. Single digits and letters are allowed
+        # as a fallback for typing into hidden/overlay input components (e.g., 2FA digit boxes).
         allowed_keys = {"Enter", "Tab", "Escape", "ArrowDown", "ArrowUp"}
         key = action.get("key")
         if key:
-            if key not in allowed_keys:
+            is_single_char = len(key) == 1 and (key.isdigit() or key.isalpha())
+            if key not in allowed_keys and not is_single_char:
                 LOG.warning("KEYPRESS action has unsupported key, skipping action", key=key)
                 return NullAction(**base_action_dict)
             keys = [key]
