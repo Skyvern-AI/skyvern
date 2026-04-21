@@ -150,6 +150,92 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
     result.cancel.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_stream_to_sse_emits_narration_on_workflow_updated_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a completed update_workflow tool round-trip flips
+    ctx.update_workflow_called, which should register as a workflow_updated
+    transition on the narrator state and produce a NARRATION SSE payload in
+    addition to the existing TOOL_CALL / TOOL_RESULT frames.
+    """
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot import narration
+    from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
+        return "Revising the workflow draft."
+
+    monkeypatch.setattr(narration, "_get_narrator_handler", lambda: _handler)
+
+    # Tool input / output raw_items matching the shapes streaming_adapter reads.
+    call_raw = {"call_id": "c-upd", "name": "update_workflow", "arguments": "{}"}
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = call_raw
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    # Shape the output so _update_enforcement_from_tool sets
+    # update_workflow_called=True (needs ok=True + non-empty block_count).
+    output_payload = [{"type": "text", "text": '{"ok": true, "data": {"block_count": 2}}'}]
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c-upd", "name": "update_workflow"}
+    out_item.output = output_payload
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    # In production the SDK yields tool events slowly (LLM latency between
+    # them), giving the background narration task ample time to finish before
+    # stream_to_sse's finally cancels anything still in flight. Simulate that
+    # by inserting explicit event-loop yields between synthetic events and
+    # after the last one, so the narration task can run to completion under
+    # the test's microsecond-fast loop.
+    async def _slow_stream_events() -> Any:
+        yield tool_call_event
+        await asyncio.sleep(0)
+        yield tool_output_event
+        # Let the scheduled narration task complete before the async generator
+        # exits and stream_to_sse's finally cancels any still-running task.
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    result = MagicMock()
+    result.stream_events = _slow_stream_events
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    ctx = CopilotContext(
+        organization_id="org_test",
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid_test",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=None,  # type: ignore[arg-type]
+        api_key=None,
+        user_message="",
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    narration_payloads = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
+    assert len(narration_payloads) == 1
+    assert narration_payloads[0].narration == "Revising the workflow draft."
+    # The tool round-trip also emitted TOOL_CALL + TOOL_RESULT.
+    tool_types = [getattr(p, "type", None) for p in sent]
+    assert WorkflowCopilotStreamMessageType.TOOL_CALL in tool_types
+    assert WorkflowCopilotStreamMessageType.TOOL_RESULT in tool_types
+
+
 class TestParseToolOutput:
     @staticmethod
     def _parse(output: Any) -> dict[str, Any]:
