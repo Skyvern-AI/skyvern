@@ -32,6 +32,15 @@ API_KEY_HEADER = "x-api-key"
 AUTHORIZATION_HEADER = "authorization"
 BEARER_PREFIX = "Bearer "
 HEALTH_PATHS = {"/health", "/healthz"}
+# Keep in sync with skyvern-frontend/cloud/mcp-auth-constants.ts::SKYVERN_AUTH_TEMPLATE_NAME.
+# Names the JWT template the frontend uses to mint bearer tokens for
+# /oauth/callback and the CLI signup flow. A divergence silently breaks auth.
+# Canonical declaration only — nothing in this Python module currently reads
+# the template name (JWT validation here inspects `iss`/`aud`/`sub` claims,
+# not the template identifier). The constant exists so future Python callers
+# (tests, token-minting helpers) have a single source of truth paired with
+# the TypeScript side.
+SKYVERN_AUTH_TEMPLATE_NAME = "skyvern-auth-template"
 _MCP_ALLOWED_TOKEN_TYPES = (OrganizationAuthTokenType.api,)
 _auth_db: AgentDB | None = None
 _auth_db_lock = RLock()
