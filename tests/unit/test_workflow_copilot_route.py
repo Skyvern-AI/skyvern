@@ -179,17 +179,26 @@ def _setup_new_copilot_mocks(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("auto_accept", "workflow_was_persisted", "expect_restore"),
+    ("auto_accept", "workflow_was_persisted", "has_valid_proposal", "expect_restore"),
     [
-        (True, True, False),  # auto_accept True => no restore
-        (False, False, False),  # nothing persisted => nothing to restore
-        (False, True, True),  # mid-stream disconnect with a persisted draft => restore
+        # auto_accept + valid proposal => keep the DB write (frontend applied it)
+        (True, True, True, False),
+        # auto_accept + no proposal (SKY-9143) => restore the unverified mid-turn write
+        (True, True, False, True),
+        # Nothing was persisted => nothing to restore regardless of other flags
+        (False, False, False, False),
+        # Normal mid-stream disconnect with a persisted draft and no proposal => restore
+        (False, True, False, True),
+        # Normal mid-stream disconnect with a persisted draft and a valid proposal =>
+        # still restore, user accepts via the panel to re-apply
+        (False, True, True, True),
     ],
 )
 async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_auto_accept(
     monkeypatch: pytest.MonkeyPatch,
     auto_accept: bool,
     workflow_was_persisted: bool,
+    has_valid_proposal: bool,
     expect_restore: bool,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
@@ -209,9 +218,12 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         description="Original description",
         workflow_definition=None,
     )
+    proposal = MagicMock(spec=["model_dump"]) if has_valid_proposal else None
+    if proposal is not None:
+        proposal.model_dump.return_value = {"workflow_id": "wf-canonical"}
     agent_result = SimpleNamespace(
         user_response="done",
-        updated_workflow=None,
+        updated_workflow=proposal,
         global_llm_context=None,
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
