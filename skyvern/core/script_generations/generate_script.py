@@ -2498,6 +2498,24 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     return for_loop
 
 
+_FOR_LOOP_CACHED_CODE_RE = re.compile(r"^async for\b.*\bin\s+skyvern\.loop\s*\(")
+
+
+def _is_for_loop_cached_code(code: str) -> bool:
+    """Return True if *code* is a bare `async for ... in skyvern.loop(...):` block.
+
+    for_loop block_code is only valid inside the async run_workflow body — appending it
+    at module level (as the preserve-cached-blocks loop otherwise does) produces
+    'async for outside async function' SyntaxError (SKY-9180).
+    """
+    for line in code.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _FOR_LOOP_CACHED_CODE_RE.match(stripped) is not None
+    return False
+
+
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
     if not args:
         return
@@ -3409,6 +3427,15 @@ async def generate_workflow_script_python_code(
             else:
                 blocks_failed += 1
 
+        # SKY-9180: for_loop cached code is a bare `async for` statement, which is a
+        # SyntaxError at module level. The DB row stays (so the script_block cache
+        # entry is retained), but the code is only valid when inlined inside the
+        # async run_workflow body via _build_block_statement — which only happens
+        # for for_loops in the current run's `blocks`. Skip appending to main.py
+        # for for_loop cached code from unexecuted branches to avoid the error.
+        if _is_for_loop_cached_code(cached_source.code):
+            continue
+
         append_block_code(cached_source.code)
         preserved_count += 1
 
@@ -3418,8 +3445,11 @@ async def generate_workflow_script_python_code(
             preserved_count=preserved_count,
             preserved_labels=[
                 label
-                for label in cached_blocks
-                if label not in processed_labels and cached_blocks[label].code and cached_blocks[label].run_signature
+                for label, source in cached_blocks.items()
+                if label not in processed_labels
+                and source.code
+                and source.run_signature
+                and not _is_for_loop_cached_code(source.code)
             ],
         )
 
