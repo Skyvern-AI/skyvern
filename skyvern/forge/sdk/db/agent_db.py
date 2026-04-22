@@ -199,6 +199,9 @@ class AgentDB(BaseAlchemyDB):
     async def get_total_unique_step_order_count_by_task_ids(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_total_unique_step_order_count_by_task_ids(*args, **kwargs)
 
+    async def get_workflow_run_progress_timestamps(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.tasks.get_workflow_run_progress_timestamps(*args, **kwargs)
+
     async def get_task_step_models(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_task_step_models(*args, **kwargs)
 
