@@ -14,6 +14,10 @@ from skyvern.cli.mcp_tools import session as mcp_session
 
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> None:
+    # Must leave _current_session as None in the pytest main context; any populated
+    # SessionState written here would be inherited by every later async test task
+    # via contextvars.copy_context() and would short-circuit the _global_session
+    # fallback in get_current_session().
     client_mod._skyvern_instance.set(None)
     client_mod._api_key_override.set(None)
     client_mod._global_skyvern_instance = None
@@ -22,7 +26,6 @@ def _reset_singletons() -> None:
     session_manager._current_session.set(None)
     session_manager._global_session = None
     session_manager.set_stateless_http_mode(False)
-    mcp_session.set_current_session(mcp_session.SessionState())
 
 
 def test_get_skyvern_reuses_global_instance_across_contexts(monkeypatch: pytest.MonkeyPatch) -> None:

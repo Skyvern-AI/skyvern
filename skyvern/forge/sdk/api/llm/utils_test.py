@@ -73,10 +73,15 @@ class TestParseApiResponse:
         assert result == {"message": 'This is a "quoted" word'}
 
     def test_parse_api_response_completely_invalid_json(self) -> None:
-        """Test handling completely invalid JSON that can't be fixed"""
+        """Test handling completely invalid JSON that can't be fixed.
+
+        json-repair >=0.35 returns ['incomplete'] for this input instead of
+        {}, so parsing now falls through to _fix_cutoff_json, which returns
+        the {"actions": []} sentinel when no valid action is found.
+        """
         response = self._create_mock_response("not json at all { incomplete")
         result = parse_api_response(response)
-        assert result == {}
+        assert result == {"actions": []}
 
     def test_parse_api_response_nested_array_json(self) -> None:
         """Test parsing JSON with nested arrays"""

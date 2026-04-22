@@ -19,12 +19,14 @@ from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.client.types import WorkflowCreateYamlRequest
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
-from ._validation import validate_folder_id
+from ._validation import validate_folder_id, validate_run_id, validate_workflow_id
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -45,7 +47,7 @@ def _serialize_workflow(wf: Any) -> dict[str, Any]:
 
     Uses Any to avoid tight coupling with Fern-generated client types.
     """
-    return {
+    data: dict[str, Any] = {
         "workflow_permanent_id": wf.workflow_permanent_id,
         "workflow_id": wf.workflow_id,
         "title": wf.title,
@@ -57,6 +59,11 @@ def _serialize_workflow(wf: Any) -> dict[str, Any]:
         "created_at": wf.created_at.isoformat() if wf.created_at else None,
         "modified_at": wf.modified_at.isoformat() if wf.modified_at else None,
     }
+    for caching_field in ("run_with", "code_version", "adaptive_caching"):
+        val = getattr(wf, caching_field, None)
+        if val is not None:
+            data[caching_field] = val
+    return data
 
 
 def _serialize_workflow_full(wf: Any) -> dict[str, Any]:
@@ -87,6 +94,7 @@ def _serialize_run(run: Any) -> dict[str, Any]:
         "app_url",
         "browser_session_id",
         "run_with",
+        "ai_fallback",
     ):
         val = getattr(run, field, None)
         if val is not None:
@@ -102,6 +110,10 @@ def _serialize_run(run: Any) -> dict[str, Any]:
         val = getattr(run, ts_field, None)
         if val is not None:
             data[ts_field] = val.isoformat()
+
+    script_run = getattr(run, "script_run", None)
+    if script_run is not None:
+        data["script_run"] = script_run.model_dump(mode="json") if hasattr(script_run, "model_dump") else script_run
 
     return data
 
@@ -288,6 +300,12 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
     if run_with:
         summary["run_with"] = run_with
 
+    script_run = _get_value(run, "script_run")
+    if script_run is not None:
+        sr = _jsonable(script_run)
+        if isinstance(sr, dict) and sr.get("ai_fallback_triggered") is not None:
+            summary["ai_fallback_triggered"] = sr["ai_fallback_triggered"]
+
     workflow_title = _get_value(run, "workflow_title")
     if workflow_title:
         summary["workflow_title"] = workflow_title
@@ -326,6 +344,8 @@ def _serialize_run_full(run: Any) -> dict[str, Any]:
         "browser_profile_id",
         "run_with",
         "total_steps",
+        "script_run",
+        "ai_fallback",
     ):
         value = _get_value(run, field)
         if value is not None:
@@ -366,56 +386,6 @@ async def _get_workflow_run_status(
             detail = response.text
         raise RuntimeError(f"HTTP {response.status_code}: {detail}")
     return response.json()
-
-
-def _validate_workflow_id(workflow_id: str, action: str) -> dict[str, Any] | None:
-    """Validate workflow_id format. Returns a make_result error dict or None if valid."""
-    if "/" in workflow_id or "\\" in workflow_id:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "workflow_id must not contain path separators",
-                "Provide a valid workflow permanent ID (starts with wpid_)",
-            ),
-        )
-    if not workflow_id.startswith("wpid_"):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid workflow_id format: {workflow_id!r}",
-                "Workflow IDs start with wpid_. Use skyvern_workflow_list to find valid IDs.",
-            ),
-        )
-    return None
-
-
-def _validate_run_id(run_id: str, action: str) -> dict[str, Any] | None:
-    """Validate run_id format. Returns a make_result error dict or None if valid."""
-    if "/" in run_id or "\\" in run_id:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "run_id must not contain path separators",
-                "Provide a valid run ID (starts with wr_ or tsk_v2_)",
-            ),
-        )
-    if not run_id.startswith("wr_") and not run_id.startswith("tsk_v2_"):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid run_id format: {run_id!r}",
-                "Run IDs start with wr_ (workflow runs) or tsk_v2_ (task runs). Check skyvern_workflow_run output.",
-            ),
-        )
-    return None
 
 
 async def _get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, Any]:
@@ -475,7 +445,7 @@ def _validate_definition_structure(json_def: WorkflowCreateYamlRequest | None, a
 
 
 _CODE_V2_DEFAULTS: dict[str, Any] = {
-    "adaptive_caching": True,
+    "code_version": 2,
     "run_with": "code",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
@@ -557,7 +527,7 @@ def _load_definition_dict(definition: str, fmt: str) -> tuple[dict[str, Any] | N
 
     if fmt == "yaml":
         try:
-            return _as_dict(yaml.safe_load(definition), "yaml")
+            return _as_dict(safe_load_no_dates(definition), "yaml")
         except yaml.YAMLError:
             return None, None
 
@@ -565,7 +535,7 @@ def _load_definition_dict(definition: str, fmt: str) -> tuple[dict[str, Any] | N
         return _as_dict(json.loads(definition), "json")
     except (json.JSONDecodeError, TypeError):
         try:
-            return _as_dict(yaml.safe_load(definition), "yaml")
+            return _as_dict(safe_load_no_dates(definition), "yaml")
         except yaml.YAMLError:
             return None, None
 
@@ -603,7 +573,7 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
 
 
 def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults into a JSON definition string when not explicitly set.
+    """Inject Code 2.0 defaults (code_version=2, run_with=code) when not explicitly set.
 
     Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
     """
@@ -633,6 +603,192 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
 
     existing_workflow = await _get_workflow_by_id(workflow_id)
     raw["proxy_location"] = existing_workflow.get("proxy_location") or _DEFAULT_MCP_PROXY_LOCATION
+    return _dump_definition_dict(raw, parsed_format)
+
+
+# Parameter types that are auto-managed (credentials and secrets set via the UI) and should
+# always be preserved from the existing workflow during MCP updates, regardless of what the
+# caller sends. These should NEVER be modifiable via MCP — only via the UI credential picker.
+# Derived from the enum to stay in sync when new secret types are added.
+_AUTO_MANAGED_PARAMETER_TYPES = frozenset(pt.value for pt in ParameterType if pt.is_secret_or_credential())
+_PROTECTED_WORKFLOW_PARAMETER_TYPES = frozenset(pt.value for pt in WorkflowParameterType if pt.is_credential_type())
+# Login-capable credential types — subset of protected params that carry username/password data.
+# Derived from the enum to stay in sync when new login-capable types are added.
+_LOGIN_CREDENTIAL_PARAMETER_TYPES = frozenset(pt.value for pt in ParameterType if pt.is_login_credential())
+
+# Runtime-only fields returned by GET /api/v1/workflows/{id} that must be stripped before
+# re-injecting parameters into a YAML/JSON definition.  Uses a suffix-based deny-list so
+# new parameter types with the standard *_parameter_id / workflow_id / timestamp pattern
+# are handled automatically.
+_RUNTIME_FIELD_SUFFIXES = ("_parameter_id", "_at")
+# workflow_id is the only runtime field not caught by the suffix rules above.
+_RUNTIME_EXACT_FIELDS = frozenset({"workflow_id"})
+
+
+def _strip_runtime_fields(param: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *param* with runtime-only fields removed."""
+    return {
+        k: v
+        for k, v in param.items()
+        if k not in _RUNTIME_EXACT_FIELDS and not any(k.endswith(s) for s in _RUNTIME_FIELD_SUFFIXES)
+    }
+
+
+def _is_protected_update_parameter(param: Any) -> bool:
+    """Return True when *param* should be preserved from the existing workflow.
+
+    This includes:
+    - Secret/credential parameter types managed directly by the UI.
+    - Workflow input parameters whose type is `credential_id`, where the
+      selected credential lives in `default_value`.
+    """
+    if not isinstance(param, dict):
+        return False
+
+    key = param.get("key")
+    parameter_type = param.get("parameter_type")
+    if not key or not parameter_type:
+        return False
+    if parameter_type in _AUTO_MANAGED_PARAMETER_TYPES:
+        return True
+    return (
+        parameter_type == ParameterType.WORKFLOW.value
+        and param.get("workflow_parameter_type") in _PROTECTED_WORKFLOW_PARAMETER_TYPES
+    )
+
+
+def _is_login_credential_reference(param: dict[str, Any]) -> bool:
+    """Return True when *param* represents a credential reference usable by login blocks."""
+
+    parameter_type = param.get("parameter_type")
+    if not parameter_type:
+        return False
+    if parameter_type in _LOGIN_CREDENTIAL_PARAMETER_TYPES:
+        return True
+    return (
+        parameter_type == ParameterType.WORKFLOW.value
+        and param.get("workflow_parameter_type") in _PROTECTED_WORKFLOW_PARAMETER_TYPES
+    )
+
+
+def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return all block dicts from a block list, recursing into for_loop nested blocks."""
+    result: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        result.append(block)
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            result.extend(_iter_blocks_flat(loop_blocks))
+    return result
+
+
+async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> str:
+    """Preserve protected credential/secret parameters during MCP workflow updates.
+
+    Credential references should NEVER be modifiable via MCP — the existing workflow's
+    values always win. This function:
+      1. Always replaces protected parameters with the existing workflow's versions
+         (even if the caller includes them — they may have stale/wrong data).
+      2. Injects credential parameter_keys into blocks using type-based matching
+         (login blocks always get ALL credential keys) with label-based fallback
+         for non-login blocks.
+    """
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    wf_def = raw.get("workflow_definition")
+    if not isinstance(wf_def, dict):
+        return definition
+
+    update_params: list[dict[str, Any]] = wf_def.get("parameters", [])
+
+    existing_workflow = await _get_workflow_by_id(workflow_id)
+    existing_wf_def = existing_workflow.get("workflow_definition")
+    if not isinstance(existing_wf_def, dict):
+        return definition
+
+    existing_params: list[dict[str, Any]] = existing_wf_def.get("parameters", [])
+
+    modified = False
+
+    # --- Step 1: Always replace protected parameters with existing values ---
+    # Credential/secret parameters — including workflow inputs of type credential_id —
+    # should NEVER be modifiable via MCP. The existing workflow's values always win,
+    # even if the caller includes them with different data. This means callers cannot
+    # swap credential references or remove credential params via MCP; those operations
+    # must go through the UI credential picker.
+    protected_keys: set[str] = set()
+    for param in existing_params:
+        if _is_protected_update_parameter(param):
+            protected_keys.add(param["key"])
+
+    if protected_keys:
+        # Remove any protected params the caller may have included (may have stale data)
+        update_params = [p for p in update_params if not (isinstance(p, dict) and p.get("key") in protected_keys)]
+        # Inject all protected params from the existing workflow, stripping runtime-only
+        # fields that come from the GET API response (e.g. *_parameter_id, workflow_id,
+        # created_at, modified_at, deleted_at) to keep the definition YAML-clean.
+        for param in existing_params:
+            if _is_protected_update_parameter(param):
+                update_params.append(_strip_runtime_fields(param))
+        modified = True
+        wf_def["parameters"] = update_params
+
+    # --- Step 2: Inject credential parameter keys into blocks ---
+    # Login blocks get credential-type keys via type-based matching (resilient to label
+    # renames by Claude). Non-login blocks fall back to label-based matching — so if Claude
+    # renames a non-login block that references aws_secret/bitwarden/etc., the key reference
+    # is lost. This asymmetry is accepted because login blocks are the critical path for
+    # credential injection; non-login secret refs are rare and still work when labels match.
+    all_cred_keys: set[str] = set()
+    login_cred_keys: set[str] = set()
+    for param in existing_params:
+        if _is_protected_update_parameter(param):
+            all_cred_keys.add(param["key"])
+            if _is_login_credential_reference(param):
+                login_cred_keys.add(param["key"])
+
+    if all_cred_keys:
+        existing_blocks: list[dict[str, Any]] = existing_wf_def.get("blocks", [])
+        update_blocks: list[dict[str, Any]] = wf_def.get("blocks", [])
+
+        # Build label-based map for fallback (non-login blocks)
+        existing_block_cred_keys: dict[str, list[str]] = {}
+        for block in _iter_blocks_flat(existing_blocks):
+            label = block.get("label")
+            if not label:
+                continue
+            existing_pkeys = block.get("parameter_keys") or []
+            cred_keys = [k for k in existing_pkeys if k in all_cred_keys]
+            if cred_keys:
+                existing_block_cred_keys[label] = cred_keys
+
+        for block in _iter_blocks_flat(update_blocks):
+            block_type = block.get("block_type")
+            label = block.get("label")
+
+            keys_to_inject: list[str] = []
+            if block_type == "login":
+                keys_to_inject = sorted(login_cred_keys)
+            elif label and label in existing_block_cred_keys:
+                keys_to_inject = sorted(existing_block_cred_keys[label])
+
+            if keys_to_inject:
+                block_pkeys: list[str] = list(block.get("parameter_keys") or [])
+                current_keys = set(block_pkeys)
+                for cred_key in keys_to_inject:
+                    if cred_key not in current_keys:
+                        block_pkeys.append(cred_key)
+                        modified = True
+                block["parameter_keys"] = block_pkeys
+
+    if not modified:
+        return definition
+
     return _dump_definition_dict(raw, parsed_format)
 
 
@@ -721,7 +877,7 @@ async def skyvern_workflow_get(
 ) -> dict[str, Any]:
     """Get the full definition of a specific workflow. Use when you need to inspect a workflow's
     blocks, parameters, and configuration before running or updating it."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_get"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_get"):
         return err
 
     with Timer() as timer:
@@ -765,51 +921,12 @@ async def skyvern_workflow_create(
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
 ) -> dict[str, Any]:
-    """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
-    a new automation workflow that can be run repeatedly with different parameters.
+    """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
+    scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
 
-    By default, workflows created via MCP use Code 2.0 (adaptive caching with run_with="code").
-    To disable this, explicitly set "adaptive_caching": false and/or "run_with": null in your definition.
-
-    Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
-    Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
-    Do NOT use the deprecated "task" block type.
-    Common block types: navigation, extraction, for_loop, conditional, code, text_prompt, action, wait, login.
-    Call skyvern_block_schema() for the full list with schemas and examples.
-
-    Example JSON definition (multi-block EIN application):
-
-        {
-          "title": "Apply for EIN",
-          "workflow_definition": {
-            "parameters": [
-              {"parameter_type": "workflow", "key": "business_name", "workflow_parameter_type": "string"},
-              {"parameter_type": "workflow", "key": "owner_name", "workflow_parameter_type": "string"},
-              {"parameter_type": "workflow", "key": "owner_ssn", "workflow_parameter_type": "string"}
-            ],
-            "blocks": [
-              {"block_type": "navigation", "label": "select_entity_type",
-               "url": "https://sa.www4.irs.gov/modiein/individual/index.jsp",
-               "title": "Select Entity Type",
-               "navigation_goal": "Select 'Sole Proprietor' as the entity type and click Continue."},
-              {"block_type": "navigation", "label": "enter_business_info",
-               "title": "Enter Business Info",
-               "navigation_goal": "Fill in the business name as '{{business_name}}' and click Continue.",
-               "parameter_keys": ["business_name"]},
-              {"block_type": "navigation", "label": "enter_owner_info",
-               "title": "Enter Owner Info",
-               "navigation_goal": "Enter the responsible party name '{{owner_name}}' and SSN '{{owner_ssn}}'. Click Continue.",
-               "parameter_keys": ["owner_name", "owner_ssn"]},
-              {"block_type": "extraction", "label": "extract_ein",
-               "title": "Extract EIN",
-               "data_extraction_goal": "Extract the assigned EIN number from the confirmation page",
-               "data_schema": {"type": "object", "properties": {"ein": {"type": "string"}}}}
-            ]
-          }
-        }
-
-    Use {{parameter_key}} to reference workflow input parameters in any block field.
-    Blocks in the same run share the same browser session automatically.
+    One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
+    Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
+    Defaults to Code 2.0 (run_with="code"). Blocks share a browser session automatically.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(
@@ -878,7 +995,7 @@ async def skyvern_workflow_update(
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_update"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
         return err
 
     if format not in ("json", "yaml", "auto"):
@@ -894,6 +1011,7 @@ async def skyvern_workflow_update(
 
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
+        definition = await _inject_workflow_update_parameters(definition, format, workflow_id)
     except NotFoundError:
         return make_result(
             "skyvern_workflow_update",
@@ -957,7 +1075,7 @@ async def skyvern_workflow_delete(
 ) -> dict[str, Any]:
     """Delete a workflow permanently. Use when you need to remove a workflow that is no longer needed.
     Requires force=true to prevent accidental deletion."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_delete"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_delete"):
         return err
 
     if not force:
@@ -1017,7 +1135,7 @@ async def skyvern_workflow_update_folder(
     ] = None,
 ) -> dict[str, Any]:
     """Assign a workflow to a folder, or remove it from its current folder."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_update_folder"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_update_folder"):
         return err
     if folder_id is not None and (err := validate_folder_id(folder_id, "skyvern_workflow_update_folder")):
         return err
@@ -1085,14 +1203,17 @@ async def skyvern_workflow_run(
         int, Field(description="Max wait time in seconds when wait=true (default 300)", ge=10, le=3600)
     ] = 300,
     run_with: Annotated[
-        str | None, Field(description="Execution mode override (e.g., 'code' for cached script execution)")
+        str | None,
+        Field(
+            description="Execution mode override (e.g., 'code' for cached script execution). Null inherits from workflow setting."
+        ),
     ] = None,
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
     Returns immediately by default (async) — set wait=true to block until completion.
     Default timeout is 300s (5 minutes). For longer workflows, increase timeout_seconds
     or use wait=false and poll with skyvern_workflow_status."""
-    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_run"):
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_run"):
         return err
 
     parsed_params: dict[str, Any] | None = None
@@ -1188,7 +1309,7 @@ async def skyvern_workflow_status(
 ) -> dict[str, Any]:
     """Check the status and progress of a workflow or task run. Use when you need to monitor
     a running workflow, check if it completed, or retrieve its output."""
-    if err := _validate_run_id(run_id, "skyvern_workflow_status"):
+    if err := validate_run_id(run_id, "skyvern_workflow_status"):
         return err
     if verbosity not in {"summary", "full"}:
         return make_result(
@@ -1247,7 +1368,7 @@ async def skyvern_workflow_cancel(
 ) -> dict[str, Any]:
     """Cancel a running workflow or task. Use when you need to stop a workflow that is taking
     too long, is stuck, or is no longer needed."""
-    if err := _validate_run_id(run_id, "skyvern_workflow_cancel"):
+    if err := validate_run_id(run_id, "skyvern_workflow_cancel"):
         return err
 
     skyvern = get_skyvern()

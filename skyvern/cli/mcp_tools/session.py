@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -27,6 +28,15 @@ def _session_api_key_hash() -> str | None:
     return hash_api_key_for_cache(api_key)
 
 
+def _should_default_to_cdp() -> tuple[bool, str | None]:
+    """Check if BROWSER_TYPE is cdp-connect and return the configured debugging URL."""
+    browser_type = os.environ.get("BROWSER_TYPE", "")
+    if browser_type == "cdp-connect":
+        cdp_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL", "http://127.0.0.1:9222")
+        return True, cdp_url
+    return False, None
+
+
 async def skyvern_browser_session_create(
     timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
     proxy_location: Annotated[str | None, Field(description="Proxy location: RESIDENTIAL, US, etc.")] = None,
@@ -38,6 +48,34 @@ async def skyvern_browser_session_create(
     Use local=true for a local Chromium instance.
     The session persists across tool calls until explicitly closed.
     """
+    # When BROWSER_TYPE=cdp-connect, auto-connect to the user's local browser via CDP.
+    # resolve_browser() stores the browser in session state via set_current_session()
+    # internally, so we don't need to call it again here.
+    use_cdp, cdp_url = _should_default_to_cdp()
+    if use_cdp and not local and cdp_url:
+        with Timer() as timer:
+            try:
+                _browser, ctx = await resolve_browser(cdp_url=cdp_url)
+                timer.mark("sdk")
+            except Exception as e:
+                return make_result(
+                    "skyvern_browser_session_create",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.SDK_ERROR,
+                        str(e),
+                        f"Failed to connect to local browser at {cdp_url}. "
+                        "Make sure Chrome is running with remote debugging enabled.",
+                    ),
+                )
+        return make_result(
+            "skyvern_browser_session_create",
+            browser_context=ctx,
+            data={"local": True, "cdp_url": cdp_url},
+            timing_ms=timer.timing_ms,
+        )
+
     with Timer() as timer:
         try:
             if is_stateless_http_mode() and local:

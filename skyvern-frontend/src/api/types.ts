@@ -63,6 +63,7 @@ export const ProxyLocation = {
   ResidentialNL: "RESIDENTIAL_NL",
   ResidentialPH: "RESIDENTIAL_PH",
   ResidentialKR: "RESIDENTIAL_KR",
+  ResidentialSA: "RESIDENTIAL_SA",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -146,6 +147,12 @@ export type Task = {
   application: string | null;
 };
 
+export type FailureCategory = {
+  category: string;
+  confidence_float: number;
+  reasoning: string;
+};
+
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -156,6 +163,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
@@ -252,6 +260,33 @@ export interface CreateAzureClientSecretCredentialRequest {
 
 export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
+}
+
+export interface BitwardenCredential {
+  email: string;
+  master_password: string;
+}
+
+export interface BitwardenCredentialSafe {
+  email: string;
+}
+
+export interface BitwardenOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  credential: BitwardenCredentialSafe;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateBitwardenCredentialRequest {
+  credential: BitwardenCredential;
+}
+
+export interface BitwardenCredentialResponse {
+  token: BitwardenOrganizationAuthToken;
 }
 
 export interface CustomCredentialServiceConfig {
@@ -414,6 +449,31 @@ export type WorkflowRunApiResponse = {
   workflow_title: string | null;
 };
 
+export const TaskRunType = {
+  TaskV1: "task_v1",
+  TaskV2: "task_v2",
+  WorkflowRun: "workflow_run",
+  OpenaiCua: "openai_cua",
+  AnthropicCua: "anthropic_cua",
+  UiTars: "ui_tars",
+} as const;
+
+export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
+
+export type TaskRunListItem = {
+  task_run_id: string;
+  task_run_type: TaskRunType;
+  run_id: string;
+  title: string | null;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  workflow_permanent_id: string | null;
+  script_run: boolean;
+  searchable_text: string | null;
+};
+
 export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
   workflow_run_id: string;
@@ -430,6 +490,7 @@ export type WorkflowRunStatusApiResponse = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -460,6 +521,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -555,6 +617,7 @@ export type CredentialApiResponse = {
   browser_profile_id?: string | null;
   tested_url?: string | null;
   user_context?: string | null;
+  save_browser_session_intent?: boolean | null;
 };
 
 export function isPasswordCredential(
@@ -588,6 +651,7 @@ export type CreateCredentialRequest = {
   name: string;
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
+  vault_type?: "custom";
 };
 
 export type PasswordCredential = {

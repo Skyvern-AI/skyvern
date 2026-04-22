@@ -8,7 +8,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
   ai_fallback: true,
-  adaptive_caching: true,
+  code_version: 2,
   run_with: "code",
   workflow_definition: {
     version: 2,

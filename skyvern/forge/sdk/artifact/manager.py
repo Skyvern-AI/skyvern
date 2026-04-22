@@ -23,6 +23,12 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
 
+_SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
+    ArtifactType.SCREENSHOT_LLM: "screenshot_llm",
+    ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
+    ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
+}
+
 
 @dataclass
 class ArtifactBatchData:
@@ -183,7 +189,7 @@ class ArtifactManager:
         if not workflow_run_block_id and context:
             workflow_run_block_id = context.parent_workflow_run_block_id
 
-        artifact = await app.DATABASE.create_artifact(
+        artifact = await app.DATABASE.artifacts.create_artifact(
             artifact_id,
             artifact_type,
             uri,
@@ -515,7 +521,7 @@ class ArtifactManager:
         artifact_models = [artifact_data.artifact_model for artifact_data in request.artifacts]
 
         # Bulk insert artifacts
-        artifacts = await app.DATABASE.bulk_create_artifacts(artifact_models)
+        artifacts = await app.DATABASE.artifacts.bulk_create_artifacts(artifact_models)
 
         # Fire and forget upload tasks
         for artifact, artifact_data in zip(artifacts, request.artifacts):
@@ -817,7 +823,7 @@ class ArtifactManager:
     ) -> None:
         if not artifact_id or not organization_id:
             return None
-        artifact = await app.DATABASE.get_artifact_by_id(artifact_id, organization_id)
+        artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
             return
         # Fire and forget
@@ -930,6 +936,7 @@ class ArtifactManager:
                 step=step,
                 workflow_run_id=workflow_run_id or (context.workflow_run_id if context else None),
                 workflow_run_block_id=workflow_run_block_id
+                or (context.workflow_run_block_id if context else None)
                 or (context.parent_workflow_run_block_id if context else None),
                 run_id=run_id or (context.run_id if context else None),
             )
@@ -1052,7 +1059,7 @@ class ArtifactManager:
         (e.g. action.screenshot_artifact_id) before the archive is flushed.
         """
         acc = self._get_or_create_step_archive(step, workflow_run_id, workflow_run_block_id, run_id)
-        prefix = "screenshot_llm" if artifact_type == ArtifactType.SCREENSHOT_LLM else "screenshot_action"
+        prefix = _SCREENSHOT_PREFIX_MAP.get(artifact_type, "screenshot_action")
         artifact_ids: list[str] = []
         for screenshot_bytes in screenshots:
             idx = sum(1 for k in acc.entries if k.startswith(f"{prefix}_"))
@@ -1171,12 +1178,12 @@ class ArtifactManager:
             )
             for artifact_type, filename, artifact_id in accumulator.member_types
         ]
-        await app.DATABASE.bulk_create_artifacts([parent_model, *member_models])
+        await app.DATABASE.artifacts.bulk_create_artifacts([parent_model, *member_models])
 
         # Apply deferred action.screenshot_artifact_id updates now that artifact rows exist.
         for organization_id, action_id, artifact_id in accumulator.pending_action_screenshot_updates:
             try:
-                await app.DATABASE.update_action_screenshot_artifact_id(
+                await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
                     organization_id=organization_id,
                     action_id=action_id,
                     screenshot_artifact_id=artifact_id,
@@ -1260,7 +1267,7 @@ class ArtifactManager:
             )
             for filename, (artifact_type, _) in entries.items()
         ]
-        await app.DATABASE.bulk_create_artifacts([parent_model, *member_models])
+        await app.DATABASE.artifacts.bulk_create_artifacts([parent_model, *member_models])
 
     async def wait_for_upload_aiotasks(self, primary_keys: list[str]) -> None:
         try:

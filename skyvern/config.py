@@ -1,12 +1,42 @@
 import logging
 import platform
+from pathlib import Path
 from typing import Any
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
 from skyvern.utils.env_paths import resolve_backend_env_path
+
+
+def _default_database_string() -> str:
+    """Return the default DATABASE_STRING.
+
+    Uses a SQLite file at ~/.skyvern/data.db so that ``skyvern run server``
+    works out of the box without Docker or Postgres.  Users who set
+    DATABASE_STRING in .env or the environment get Postgres automatically
+    (pydantic-settings reads env before the default_factory runs).
+
+    This is a pure string computation — no filesystem side effects.
+    The parent directory is created by _ensure_sqlite_dir() at engine
+    build time (agent_db.py) or server bootstrap time (api_app.py).
+    """
+    db_path = Path.home() / ".skyvern" / "data.db"
+    return f"sqlite+aiosqlite:///{db_path}"
+
+
+def _ensure_sqlite_dir(database_string: str) -> None:
+    """Create the parent directory for a file-backed SQLite database URL.
+
+    No-op for in-memory SQLite (`:memory:`) or non-SQLite URLs.
+    """
+    if not database_string.startswith("sqlite") or ":memory:" in database_string:
+        return
+    db_file = database_string.split("///", 1)[-1]
+    Path(db_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
 
 # NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
 # the process has changed dir to the desired project root by this time.
@@ -30,7 +60,7 @@ class Settings(BaseSettings):
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
 
     # Script reviewer settings
-    FAILURE_REVIEW_DAILY_CAP: int = 3  # Max failure-triggered script reviews per wpid per day
+    SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -64,11 +94,7 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = (
-        "postgresql+asyncpg://skyvern@localhost/skyvern"
-        if platform.system() == "Windows"
-        else "postgresql+psycopg://skyvern@localhost/skyvern"
-    )
+    DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
@@ -78,10 +104,17 @@ class Settings(BaseSettings):
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
+    BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
+    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 5.0
+    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
+    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
+    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
+    # Per-environment canary; default off until we are confident.
+    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -141,6 +174,11 @@ class Settings(BaseSettings):
     # browser settings
     BROWSER_LOCALE: str | None = None  # "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
+    # Directory containing pre-built default browser profiles ({dir}/chrome/ and {dir}/chromium/).
+    # When set, used as the default profile source for new browser sessions.
+    # Cloud workers download S3 profiles here at startup; self-hosted users can point this at a
+    # local profile directory. Leave empty to use the in-repo template.
+    DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
@@ -414,6 +452,7 @@ class Settings(BaseSettings):
 
     SVG_MAX_LENGTH: int = 100000
     SVG_MAX_PARSING_ELEMENT_CNT: int = 3000
+    ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = True
@@ -627,6 +666,9 @@ class Settings(BaseSettings):
             "for compatibility with the Proactor event loop policy."
         )
         object.__setattr__(self, "DATABASE_STRING", updated_string)
+
+    def is_sqlite(self) -> bool:
+        return self.DATABASE_STRING.startswith("sqlite")
 
     def is_cloud_environment(self) -> bool:
         """

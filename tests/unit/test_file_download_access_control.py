@@ -25,11 +25,20 @@ def _downloads_s3_uri(organization_id: str) -> str:
     )
 
 
+def _artifact_s3_uri(organization_id: str) -> str:
+    return (
+        f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/"
+        f"v1/{settings.ENV}/{organization_id}/workflow_runs/wr_123/wrb_456/artifact.pdf"
+    )
+
+
 @pytest.fixture(autouse=True)
 def storage(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     def assert_managed_file_access(uri: str, organization_id: str) -> None:
         if organization_id == ATTACKER_ORG_ID and (
-            uri == _legacy_s3_uri(ATTACKER_ORG_ID) or uri == _downloads_s3_uri(ATTACKER_ORG_ID)
+            uri == _legacy_s3_uri(ATTACKER_ORG_ID)
+            or uri == _downloads_s3_uri(ATTACKER_ORG_ID)
+            or uri == _artifact_s3_uri(ATTACKER_ORG_ID)
         ):
             return
         raise PermissionError(f"No permission to access storage URI: {uri}")
@@ -84,6 +93,35 @@ async def test_download_file_allows_same_org_downloaded_artifact(storage: Simple
             assert f.read() == b"tenant-secret-bytes"
     finally:
         os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_download_file_allows_same_org_artifact_uri(storage: SimpleNamespace) -> None:
+    path = await files.download_file(_artifact_s3_uri(ATTACKER_ORG_ID), organization_id=ATTACKER_ORG_ID)
+
+    storage.assert_managed_file_access.assert_called_once_with(_artifact_s3_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
+    storage.download_managed_file.assert_awaited_once_with(_artifact_s3_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
+    try:
+        with open(path, "rb") as f:
+            assert f.read() == b"tenant-secret-bytes"
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_download_file_rejects_cross_org_artifact_uri(storage: SimpleNamespace) -> None:
+    with pytest.raises(PermissionError, match="No permission to access storage URI"):
+        await files.download_file(_artifact_s3_uri(VICTIM_ORG_ID), organization_id=ATTACKER_ORG_ID)
+
+    storage.download_managed_file.assert_not_called()
+
+
+def test_validate_download_url_allows_same_org_artifact_uri() -> None:
+    assert files.validate_download_url(_artifact_s3_uri(ATTACKER_ORG_ID), organization_id=ATTACKER_ORG_ID) is True
+
+
+def test_validate_download_url_rejects_cross_org_artifact_uri() -> None:
+    assert files.validate_download_url(_artifact_s3_uri(VICTIM_ORG_ID), organization_id=ATTACKER_ORG_ID) is False
 
 
 def test_validate_download_url_rejects_s3_uri_without_org_id() -> None:

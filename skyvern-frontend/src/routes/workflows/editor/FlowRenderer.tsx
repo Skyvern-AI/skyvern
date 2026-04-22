@@ -95,8 +95,8 @@ import {
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
   upgradeWorkflowDefinitionToVersionTwo,
+  getWorkflowErrors,
 } from "./workflowEditorUtils";
-import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
@@ -464,6 +464,29 @@ function FlowRenderer({
       window.removeEventListener(
         "loop-header-resized",
         handleLoopHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
+  // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
+  useEffect(() => {
+    const handleConditionalHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "conditional-header-resized",
+      handleConditionalHeaderResized,
+    );
+    return () => {
+      window.removeEventListener(
+        "conditional-header-resized",
+        handleConditionalHeaderResized,
       );
     };
   }, [reactFlowInstance, debouncedLayoutForDimensions]);
@@ -1030,7 +1053,13 @@ function FlowRenderer({
                 return (
                   change.type === "add" ||
                   change.type === "remove" ||
-                  change.type === "replace"
+                  change.type === "replace" ||
+                  // User drag-drop. `dragging === false` fires once at the
+                  // end of a drag gesture. Programmatic position updates
+                  // (mount-time layout, setNodes from node components)
+                  // leave `dragging` undefined, so this filter doesn't
+                  // falsely trip for them.
+                  (change.type === "position" && change.dragging === false)
                 );
               })
             ) {

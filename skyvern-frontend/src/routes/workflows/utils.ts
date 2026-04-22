@@ -1,5 +1,5 @@
 import { useLocation } from "react-router-dom";
-import type { WorkflowParameter } from "./types/workflowTypes";
+import type { Parameter, WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
@@ -84,6 +84,38 @@ export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
 
   return blockLabels;
 };
+
+/**
+ * Returns run parameter entries ordered by the workflow definition's parameter array.
+ * Falls back to Object.entries() if no definition is available.
+ */
+export function getOrderedRunParameters(
+  definitionParameters: Array<Parameter> | undefined,
+  runParameters: Record<string, unknown>,
+): Array<[string, unknown]> {
+  if (!definitionParameters) {
+    return Object.entries(runParameters);
+  }
+
+  const orderedKeys = definitionParameters
+    .filter((p) => p.parameter_type === "workflow")
+    .map((p) => p.key);
+
+  const seenKeys = new Set(orderedKeys);
+
+  const ordered: Array<[string, unknown]> = orderedKeys
+    .filter((key) => key in runParameters)
+    .map((key) => [key, runParameters[key]]);
+
+  // Append any run parameters not in the definition (backward compat)
+  for (const [key, value] of Object.entries(runParameters)) {
+    if (!seenKeys.has(key)) {
+      ordered.push([key, value]);
+    }
+  }
+
+  return ordered;
+}
 
 export const getCode = (
   orderedBlockLabels: string[],

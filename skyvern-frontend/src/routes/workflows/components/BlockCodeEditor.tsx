@@ -1,7 +1,6 @@
 import { ExitIcon } from "@radix-ui/react-icons";
 import { useSearchParams } from "react-router-dom";
-import { Handle } from "@xyflow/react";
-import { Position } from "@xyflow/react";
+import { Handle, Position } from "@xyflow/react";
 
 import { KeyIcon } from "@/components/icons/KeyIcon";
 import { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";

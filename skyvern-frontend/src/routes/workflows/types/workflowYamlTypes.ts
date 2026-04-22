@@ -1,6 +1,5 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
-import { WorkflowBlockType } from "./workflowTypes";
-import { WorkflowModel } from "./workflowTypes";
+import { WorkflowBlockType, WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
@@ -19,6 +18,7 @@ export type WorkflowCreateYAMLRequest = {
   cache_key?: string | null;
   ai_fallback?: boolean;
   adaptive_caching?: boolean;
+  code_version?: number | null;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;
@@ -352,7 +352,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
   json_schema?: Record<string, unknown> | null;
 };
 

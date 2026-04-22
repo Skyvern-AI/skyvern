@@ -32,16 +32,16 @@ import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ModelSelector } from "@/components/ModelSelector";
-import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
+import {
+  WorkflowModel,
+  scriptableWorkflowBlockTypes,
+  type WorkflowBlockType,
+} from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
-import {
-  scriptableWorkflowBlockTypes,
-  type WorkflowBlockType,
-} from "@/routes/workflows/types/workflowTypes";
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
@@ -307,12 +307,6 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                                   Skyvern Agent
                                 </SelectItem>
                                 <SelectItem value="code">Code</SelectItem>
-                                <SelectItem value="code_v2">
-                                  <span>Code 2.0</span>{" "}
-                                  <span className="text-xs italic text-yellow-400">
-                                    new
-                                  </span>
-                                </SelectItem>
                               </SelectContent>
                             </Select>
                           </div>
@@ -411,7 +405,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             data.extraHttpHeaders &&
                             typeof data.extraHttpHeaders === "object"
                               ? JSON.stringify(data.extraHttpHeaders)
-                              : data.extraHttpHeaders ?? null
+                              : (data.extraHttpHeaders ?? null)
                           }
                           onChange={(val) => {
                             const v =

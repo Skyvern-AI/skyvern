@@ -3,7 +3,7 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { helpTooltips } from "../../helpContent";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
-import { useContext, useMemo } from "react";
+import { useCallback, useContext, useMemo } from "react";
 import CloudContext from "@/store/CloudContext";
 import { parameterIsSkyvernCredential } from "../../types";
 
@@ -11,12 +11,15 @@ type Props = {
   availableOutputParameters: Array<string>;
   parameters: Array<string>;
   onParametersChange: (parameters: Array<string>) => void;
+  /** Called when a credential parameter with a totp_identifier is added */
+  onCredentialTotpIdentifier?: (totpIdentifier: string) => void;
 };
 
 function ParametersMultiSelect({
   availableOutputParameters,
   parameters,
   onParametersChange,
+  onCredentialTotpIdentifier,
 }: Props) {
   const isCloud = useContext(CloudContext);
   const { parameters: workflowParameters } = useWorkflowParametersStore();
@@ -57,6 +60,47 @@ function ParametersMultiSelect({
     });
   }, [keys, workflowParameters, isSuccess, credentialIdsInVault]);
 
+  const handleValueChange = useCallback(
+    (newParameters: Array<string>) => {
+      onParametersChange(newParameters);
+
+      // Check if a credential parameter was newly added
+      if (onCredentialTotpIdentifier) {
+        const addedKeys = newParameters.filter(
+          (key) => !parameters.includes(key),
+        );
+        for (const key of addedKeys) {
+          const param = workflowParameters.find((p) => p.key === key);
+          if (
+            param &&
+            param.parameterType === "credential" &&
+            parameterIsSkyvernCredential(param)
+          ) {
+            const credential = credentials.find(
+              (c) => c.credential_id === param.credentialId,
+            );
+            if (
+              credential &&
+              credential.credential_type === "password" &&
+              "totp_identifier" in credential.credential &&
+              credential.credential.totp_identifier
+            ) {
+              onCredentialTotpIdentifier(credential.credential.totp_identifier);
+              break;
+            }
+          }
+        }
+      }
+    },
+    [
+      onParametersChange,
+      onCredentialTotpIdentifier,
+      parameters,
+      workflowParameters,
+      credentials,
+    ],
+  );
+
   return (
     <div className="space-y-2">
       <header className="flex gap-2">
@@ -65,7 +109,7 @@ function ParametersMultiSelect({
       </header>
       <MultiSelect
         value={parameters}
-        onValueChange={onParametersChange}
+        onValueChange={handleValueChange}
         options={options}
         maxCount={50}
       />

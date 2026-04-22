@@ -526,8 +526,9 @@ def _make_app_mocks() -> tuple[MagicMock, MagicMock]:
     mock_storage.store_artifact = AsyncMock()
 
     mock_database = MagicMock()
-    mock_database.bulk_create_artifacts = AsyncMock()
-    mock_database.update_action_screenshot_artifact_id = AsyncMock()
+    mock_database.artifacts = MagicMock()
+    mock_database.artifacts.bulk_create_artifacts = AsyncMock()
+    mock_database.artifacts.update_action_screenshot_artifact_id = AsyncMock()
     return mock_storage, mock_database
 
 
@@ -557,9 +558,9 @@ class TestFlushStepArchive:
             await manager.flush_step_archive(step.step_id)
 
         mock_storage.store_artifact.assert_awaited_once()
-        mock_database.bulk_create_artifacts.assert_awaited_once()
+        mock_database.artifacts.bulk_create_artifacts.assert_awaited_once()
         # The artifact list should include the parent + 6 member rows (scrape produces 6 entries)
-        call_args = mock_database.bulk_create_artifacts.call_args[0][0]
+        call_args = mock_database.artifacts.bulk_create_artifacts.call_args[0][0]
         assert len(call_args) == 7  # 1 parent + 6 members
 
     @pytest.mark.asyncio
@@ -612,7 +613,7 @@ class TestFlushStepArchive:
 
         # store_artifact and bulk_create_artifacts should only be called once
         assert mock_storage.store_artifact.await_count == 1
-        assert mock_database.bulk_create_artifacts.await_count == 1
+        assert mock_database.artifacts.bulk_create_artifacts.await_count == 1
 
     @pytest.mark.asyncio
     async def test_flush_nonexistent_step_id_is_noop(self) -> None:
@@ -626,7 +627,7 @@ class TestFlushStepArchive:
             await manager.flush_step_archive("nonexistent_step_id")
 
         mock_storage.store_artifact.assert_not_awaited()
-        mock_database.bulk_create_artifacts.assert_not_awaited()
+        mock_database.artifacts.bulk_create_artifacts.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_flush_applies_pending_screenshot_updates(self) -> None:
@@ -652,7 +653,7 @@ class TestFlushStepArchive:
             mock_app.DATABASE = mock_database
             await manager.flush_step_archive(step.step_id)
 
-        mock_database.update_action_screenshot_artifact_id.assert_awaited_once_with(
+        mock_database.artifacts.update_action_screenshot_artifact_id.assert_awaited_once_with(
             organization_id="org_1",
             action_id="action_1",
             screenshot_artifact_id="art_1",
@@ -682,10 +683,10 @@ class TestFlushStepArchive:
             await manager.flush_step_archive(step.step_id)
             # Reset call counts to detect any additional calls from wait_for_upload_aiotasks
             mock_storage.store_artifact.reset_mock()
-            mock_database.bulk_create_artifacts.reset_mock()
+            mock_database.artifacts.bulk_create_artifacts.reset_mock()
             # Simulate the end-of-task flush fallback
             await manager.wait_for_upload_aiotasks([step.task_id])
 
         # The fallback should find nothing to flush — no extra uploads
         mock_storage.store_artifact.assert_not_awaited()
-        mock_database.bulk_create_artifacts.assert_not_awaited()
+        mock_database.artifacts.bulk_create_artifacts.assert_not_awaited()

@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, List
 
 import pyotp
 import structlog
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
@@ -60,6 +61,7 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
+    calculate_sha256_for_file,
     check_downloading_files_and_wait_for_download_to_complete,
     get_download_dir,
     list_files_in_directory,
@@ -67,21 +69,25 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
     load_prompt_with_elements,
+    load_prompt_with_elements_tracked,
 )
+from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -387,7 +393,7 @@ class ActionHandler:
         cls._teardown_action_types[action_type] = handler
 
     @staticmethod
-    @traced()
+    @traced(name="skyvern.agent.action", role="wrapper")
     async def handle_action(
         scraped_page: ScrapedPage,
         task: Task,
@@ -395,20 +401,33 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        # task_id, step_id auto-attached by @traced from SkyvernContext
+        _action_span = otel_trace.get_current_span()
+        _action_span.set_attribute("action_type", str(action.action_type))
+        _action_span.set_attribute("step_order", step.order)
+        if getattr(action, "element_id", None):
+            _action_span.set_attribute("element_id", action.element_id)
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
             isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
         )
+        # triggers_download splits the bimodal distribution: non-download actions
+        # finish in ~1s while download actions can burn up to BROWSER_DOWNLOAD_MAX_WAIT_TIME
+        # (120s) polling for the file. Explains the 36s p95 on this wrapper.
+        _action_span.set_attribute("triggers_download", trigger_download_action)
+        _tracer = otel_trace.get_tracer("skyvern")
         if not trigger_download_action:
-            results = await ActionHandler._handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
-            persisted_action = await app.DATABASE.create_action(action=action)
+            with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                apply_context_attrs(_hi_span)
+                results = await ActionHandler._handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
+            persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
 
@@ -419,6 +438,7 @@ class ActionHandler:
             )
         )
         initial_page_count = 0
+        page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
@@ -437,45 +457,57 @@ class ActionHandler:
 
         download_triggered = False
         try:
-            results = await ActionHandler._handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
+            with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                apply_context_attrs(_hi_span)
+                results = await ActionHandler._handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
             if not results:
                 return results
-            try:
-                LOG.info(
-                    "Checking if there is any new files after click",
-                    download_dir=download_dir,
-                )
-                async with asyncio.timeout(task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME):
-                    while True:
-                        list_files_after = list_files_in_directory(download_dir)
-                        if task.browser_session_id:
-                            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                                organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                            )
-                            list_files_after = list_files_after + files_in_browser_session
+            _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
+            with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
+                apply_context_attrs(_dl_wait_span)
+                _dl_wait_span.set_attribute("timeout_seconds", _download_timeout)
+                _poll_iterations = 0
+                try:
+                    LOG.info(
+                        "Checking if there is any new files after click",
+                        download_dir=download_dir,
+                    )
+                    async with asyncio.timeout(_download_timeout):
+                        while True:
+                            _poll_iterations += 1
+                            list_files_after = list_files_in_directory(download_dir)
+                            if task.browser_session_id:
+                                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                                    organization_id=task.organization_id,
+                                    browser_session_id=task.browser_session_id,
+                                )
+                                list_files_after = list_files_after + files_in_browser_session
 
-                        if len(list_files_after) > len(list_files_before):
-                            LOG.info(
-                                "Found new files in download directory after action",
-                                num_downloaded_files_after=len(list_files_after),
-                                download_dir=download_dir,
-                                workflow_run_id=task.workflow_run_id,
-                            )
-                            download_triggered = True
-                            break
-                        await asyncio.sleep(1)
+                            if len(list_files_after) > len(list_files_before):
+                                LOG.info(
+                                    "Found new files in download directory after action",
+                                    num_downloaded_files_after=len(list_files_after),
+                                    download_dir=download_dir,
+                                    workflow_run_id=task.workflow_run_id,
+                                )
+                                download_triggered = True
+                                break
+                            await asyncio.sleep(1)
 
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "No file to download after action",
-                    workflow_run_id=task.workflow_run_id,
-                )
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "No file to download after action",
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                finally:
+                    _dl_wait_span.set_attribute("download_triggered", download_triggered)
+                    _dl_wait_span.set_attribute("poll_iterations", _poll_iterations)
 
             if not download_triggered:
                 results[-1].download_triggered = False
@@ -491,9 +523,31 @@ class ActionHandler:
                 timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
             )
 
-            # Calculate newly downloaded file names
+            # Calculate newly downloaded file names and deduplicate local files by checksum.
+            # A single click can trigger multiple identical downloads (e.g., when an <a> click
+            # event bubbles to a parent <tr onclick> that opens the same URL).
+            # Only local files are deduplicated — remote URIs (s3://, azure://) from browser
+            # sessions are passed through as-is since we cannot hash or remove them locally.
             new_file_paths = set(list_files_after) - set(list_files_before)
-            downloaded_file_names = [os.path.basename(fp) for fp in new_file_paths]
+            seen_checksums: dict[str, str] = {}
+            deduplicated_paths: list[str] = []
+            for fp in sorted(new_file_paths):
+                if not os.path.isfile(fp):
+                    deduplicated_paths.append(fp)
+                    continue
+                checksum = calculate_sha256_for_file(fp)
+                if checksum in seen_checksums:
+                    LOG.info(
+                        "Removing duplicate downloaded file from single action",
+                        file=os.path.basename(fp),
+                        duplicate_of=os.path.basename(seen_checksums[checksum]),
+                        checksum=checksum,
+                    )
+                    os.remove(fp)
+                else:
+                    seen_checksums[checksum] = fp
+                    deduplicated_paths.append(fp)
+            downloaded_file_names = [os.path.basename(fp) for fp in deduplicated_paths]
             if downloaded_file_names:
                 results[-1].downloaded_files = downloaded_file_names
                 action.downloaded_files = downloaded_file_names
@@ -524,7 +578,26 @@ class ActionHandler:
                     # close the extra page
                     await pages_after_download[-1].close()
 
-            persisted_action = await app.DATABASE.create_action(action=action)
+                # After a print/download action the working page sometimes navigates to
+                # about:blank (e.g. when the browser follows a download URL that yields no
+                # renderable content). Detect this and navigate back to the original URL so
+                # subsequent steps are not stuck on a blank page.
+                blank_page_urls = {"about:blank", ":"}
+                if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
+                    LOG.warning(
+                        "Working page navigated to blank after download action, navigating back to original URL",
+                        original_url=page_url_before_download,
+                    )
+                    try:
+                        await browser_state.navigate_to_url(page=page, url=page_url_before_download)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to navigate back to original URL after blank page from download",
+                            original_url=page_url_before_download,
+                            exc_info=True,
+                        )
+
+            persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
     @staticmethod
@@ -670,7 +743,7 @@ def check_for_invalid_web_action(
     return []
 
 
-@traced()
+@traced(name="skyvern.agent.action.solve_captcha")
 async def handle_solve_captcha_action(
     action: actions.SolveCaptchaAction,
     page: Page,
@@ -686,7 +759,7 @@ async def handle_solve_captcha_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
     page: Page,
@@ -730,6 +803,7 @@ async def handle_click_action(
                 if await skyvern_element.navigate_to_a_href(page=page):
                     return [ActionSuccess()]
 
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
         elif action.repeat == 2:
@@ -755,19 +829,18 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    # Skip scroll_into_view when a page-level SCROLL just completed on THIS element.
-    # The scroll positioned the page at the bottom to enable T&C buttons;
-    # scroll_into_view() would use programmatic window.scroll() to center the
-    # element, moving the page away from the bottom and re-disabling the button.
+    # Skip scroll_into_view when a SCROLL action just completed on THIS element.
+    # The scroll may have positioned the page or a container at the bottom to enable
+    # T&C buttons; element.scrollIntoView() would undo that positioning.
     # Uses element ID matching (not a boolean) so unrelated clicks aren't affected.
     skip_scroll_into_view = await page.evaluate(
-        "(id) => { const v = window.__skyvernPageScrolledElementId;"
-        " window.__skyvernPageScrolledElementId = null; return v === id; }",
+        "(id) => { const v = window.__skyvernScrolledElementId;"
+        " window.__skyvernScrolledElementId = null; return v === id; }",
         action.element_id,
     )
     if skip_scroll_into_view:
         LOG.info(
-            "Skipping scroll_into_view after page-level scroll to preserve scroll position",
+            "Skipping scroll_into_view after deliberate scroll action to preserve scroll position",
             element_id=skyvern_element.get_id(),
         )
     else:
@@ -849,7 +922,7 @@ async def handle_click_action(
     return results
 
 
-@traced()
+@traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
     action_history: list[ActionResult],
@@ -975,7 +1048,7 @@ async def handle_sequential_click_for_dropdown(
     )
 
 
-@traced()
+@traced(name="skyvern.agent.action.click_to_download")
 async def handle_click_to_download_file_action(
     action: actions.ClickAction,
     page: Page,
@@ -1114,7 +1187,7 @@ async def _handle_multi_field_totp_sequence(
     return None  # Success
 
 
-@traced()
+@traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
     page: Page,
@@ -1124,7 +1197,7 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     if not action.element_id:
         # This is a CUA type action
-        await page.keyboard.type(action.text)
+        await EventStrategyFactory.type_text(page, None, action.text)
         return [ActionSuccess()]
 
     dom = DomUtil(scraped_page, page)
@@ -1565,7 +1638,7 @@ async def handle_input_text_action(
             await skyvern_element.press_key("Tab")
 
 
-@traced()
+@traced(name="skyvern.agent.action.upload_file")
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
     page: Page,
@@ -1651,7 +1724,7 @@ async def handle_upload_file_action(
 
 # This function is deprecated in 'extract-actions' prompt. Downloads are handled by the click action handler now.
 # Currently, it's only used for the download action triggered by the code.
-@traced()
+@traced(name="skyvern.agent.action.download_file")
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,
@@ -1711,7 +1784,7 @@ async def handle_download_file_action(
         return [ActionFailure(e)]
 
 
-@traced()
+@traced(name="skyvern.agent.action.null")
 async def handle_null_action(
     action: actions.NullAction,
     page: Page,
@@ -1722,7 +1795,7 @@ async def handle_null_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.select_option")
 async def handle_select_option_action(
     action: actions.SelectOptionAction,
     page: Page,
@@ -1997,7 +2070,8 @@ async def handle_select_option_action(
         await skyvern_element.scroll_into_view()
 
         try:
-            await skyvern_element.get_locator().click(timeout=timeout)
+            await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
+            await EventStrategyFactory.click(page, skyvern_element.get_locator(), timeout=timeout)
         except Exception:
             LOG.info(
                 "fail to open dropdown by clicking, try to press arrow down to open",
@@ -2042,7 +2116,7 @@ async def handle_select_option_action(
         await incremental_scraped.stop_listen_dom_increment()
 
 
-@traced()
+@traced(name="skyvern.agent.action.checkbox")
 async def handle_checkbox_action(
     action: actions.CheckboxAction,
     page: Page,
@@ -2071,7 +2145,7 @@ async def handle_checkbox_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.wait")
 async def handle_wait_action(
     action: actions.WaitAction,
     page: Page,
@@ -2083,7 +2157,7 @@ async def handle_wait_action(
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
-@traced()
+@traced(name="skyvern.agent.action.hover")
 async def handle_hover_action(
     action: actions.HoverAction,
     page: Page,
@@ -2106,6 +2180,7 @@ async def handle_hover_action(
     try:
         await skyvern_element.hover_to_reveal()
         await skyvern_element.get_locator().scroll_into_view_if_needed()
+        await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
         await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
 
         if action.hold_seconds and action.hold_seconds > 0:
@@ -2121,7 +2196,7 @@ async def handle_hover_action(
         return [ActionFailure(FailToHover(skyvern_element.get_id(), msg=str(exc)))]
 
 
-@traced()
+@traced(name="skyvern.agent.action.terminate")
 async def handle_terminate_action(
     action: actions.TerminateAction,
     page: Page,
@@ -2145,7 +2220,7 @@ async def handle_terminate_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.complete_verification")
 async def handle_complete_action(
     action: actions.CompleteAction,
     page: Page,
@@ -2153,58 +2228,68 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if not action.verified and task.navigation_goal:
-        LOG.info(
-            "CompleteAction hasn't been verified, going to verify the user goal",
+    # verification_path separates the three distinct runtime paths that
+    # roll up to this span — explains the 175x p95/p50 ratio.
+    _span = otel_trace.get_current_span()
+    if action.verified or not task.navigation_goal:
+        _span.set_attribute("verification_path", "already_verified")
+        return [ActionSuccess()]
+
+    LOG.info(
+        "CompleteAction hasn't been verified, going to verify the user goal",
+        workflow_run_id=task.workflow_run_id,
+    )
+    try:
+        verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
+    except Exception as e:
+        _span.set_attribute("verification_path", "needs_llm_error")
+        LOG.exception(
+            "Failed to verify the complete action",
             workflow_run_id=task.workflow_run_id,
         )
-        try:
-            verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
-        except Exception as e:
-            LOG.exception(
-                "Failed to verify the complete action",
-                workflow_run_id=task.workflow_run_id,
-            )
-            return [ActionFailure(exception=e)]
+        return [ActionFailure(exception=e)]
 
-        # Check if we should terminate instead of complete
-        # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
-        if verification_result.is_terminate:
-            LOG.warning(
-                "CompleteAction verification determined task should terminate instead (termination-aware experiment)",
-                workflow_run_id=task.workflow_run_id,
-                thoughts=verification_result.thoughts,
-                status=verification_result.status if verification_result.status else "legacy",
-            )
-            # Create a TerminateAction and execute it
-            terminate_action = actions.TerminateAction(
-                reasoning=verification_result.thoughts,
-                organization_id=action.organization_id,
-                workflow_run_id=action.workflow_run_id,
-                task_id=action.task_id,
-                step_id=action.step_id,
-                step_order=action.step_order,
-                action_order=action.action_order,
-            )
-            results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
-            action.action_type = ActionType.TERMINATE
-            action.reasoning = terminate_action.reasoning
-            action.errors = terminate_action.errors
-            return results
-
-        if not verification_result.is_complete:
-            return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
-
-        LOG.info(
-            "CompleteAction has been verified successfully",
+    # Check if we should terminate instead of complete
+    # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
+    if verification_result.is_terminate:
+        _span.set_attribute("verification_path", "terminate_requested")
+        LOG.warning(
+            "CompleteAction verification determined task should terminate instead (termination-aware experiment)",
             workflow_run_id=task.workflow_run_id,
+            thoughts=verification_result.thoughts,
+            status=verification_result.status if verification_result.status else "legacy",
         )
-        action.verified = True
+        # Create a TerminateAction and execute it
+        terminate_action = actions.TerminateAction(
+            reasoning=verification_result.thoughts,
+            organization_id=action.organization_id,
+            workflow_run_id=action.workflow_run_id,
+            task_id=action.task_id,
+            step_id=action.step_id,
+            step_order=action.step_order,
+            action_order=action.action_order,
+        )
+        results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
+        action.action_type = ActionType.TERMINATE
+        action.reasoning = terminate_action.reasoning
+        action.errors = terminate_action.errors
+        return results
+
+    if not verification_result.is_complete:
+        _span.set_attribute("verification_path", "needs_llm_rejected")
+        return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
+
+    _span.set_attribute("verification_path", "needs_llm_verified")
+    LOG.info(
+        "CompleteAction has been verified successfully",
+        workflow_run_id=task.workflow_run_id,
+    )
+    action.verified = True
 
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.extract")
 async def handle_extract_action(
     action: actions.ExtractAction,
     page: Page,
@@ -2226,7 +2311,7 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
-@traced()
+@traced(name="skyvern.agent.action.scroll")
 async def handle_scroll_action(
     action: actions.ScrollAction,
     page: Page,
@@ -2274,7 +2359,7 @@ async def handle_scroll_action(
             viewport = page.viewport_size
             center_x = viewport["width"] // 2 if viewport else 640
             center_y = viewport["height"] // 2 if viewport else 360
-            await page.mouse.move(center_x, center_y)
+            await EventStrategyFactory.move_cursor(page, center_x, center_y)
             wheel_delta = 500 if scroll_direction == "down" else -500
             # Dynamically compute iterations based on remaining scrollable distance
             # so we reach the bottom even on very long T&C pages.
@@ -2293,38 +2378,54 @@ async def handle_scroll_action(
                 iterations=iterations,
                 wheel_delta=wheel_delta,
             )
+            # Scroll per-iteration with page-reaction pauses between each chunk
+            # (e.g. lazy-load, infinite scroll, dynamically enabled buttons).
+            # Use raw page.mouse.wheel() here — the chunking + 100ms pauses already
+            # provide a natural pattern, and applying the custom event strategy
+            # per-iteration would add excessive latency per chunk.
             for _ in range(iterations):
                 await page.mouse.wheel(0, wheel_delta)
                 await page.wait_for_timeout(100)
             # Wait for page JS to process scroll events (e.g. enabling buttons)
             await page.wait_for_timeout(500)
 
-            # Record which element was just page-level scrolled. The click handler
+            # Record which element was just deliberately scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which
-            # would use programmatic window.scroll() to center it — undoing the
+            # would use element.scrollIntoView() to center it — undoing the
             # scroll position that enables buttons on T&C pages. Using the element
             # ID (not a boolean) ensures unrelated clicks aren't affected.
             await page.evaluate(
-                "(id) => { window.__skyvernPageScrolledElementId = id; }",
+                "(id) => { window.__skyvernScrolledElementId = id; }",
                 action.element_id,
             )
             return [ActionSuccess(data={"page_level_scroll": True})]
-        elif not scroll_result:
+        elif scroll_result:
+            # Sub-container was scrolled successfully. Record the element ID so
+            # the click handler skips scroll_into_view() for this element — same
+            # protection as page-level scrolls. Without this, element.scrollIntoView()
+            # would re-center the container and undo the deliberate scroll (e.g.,
+            # scrolling a T&C modal to the bottom to enable an accept button).
+            await page.evaluate(
+                "(id) => { window.__skyvernScrolledElementId = id; }",
+                action.element_id,
+            )
+            return [ActionSuccess(data={"container_scroll": True})]
+        else:
             LOG.warning(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
             )
-            await page.mouse.wheel(action.scroll_x, action.scroll_y)
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
-        await page.mouse.move(action.x, action.y)
-        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     else:
-        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.keypress")
 async def handle_keypress_action(
     action: actions.KeypressAction,
     page: Page,
@@ -2336,7 +2437,7 @@ async def handle_keypress_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.move")
 async def handle_move_action(
     action: actions.MoveAction,
     page: Page,
@@ -2344,11 +2445,11 @@ async def handle_move_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.x, action.y)
+    await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.drag")
 async def handle_drag_action(
     action: actions.DragAction,
     page: Page,
@@ -2360,7 +2461,7 @@ async def handle_drag_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.verification_code")
 async def handle_verification_code_action(
     action: actions.VerificationCodeAction,
     page: Page,
@@ -2377,7 +2478,7 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.left_mouse")
 async def handle_left_mouse_action(
     action: actions.LeftMouseAction,
     page: Page,
@@ -2389,7 +2490,7 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.goto_url")
 async def handle_goto_url_action(
     action: actions.GotoUrlAction,
     page: Page,
@@ -2401,7 +2502,7 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.close_page")
 async def handle_close_page_action(
     action: actions.ClosePageAction,
     page: Page,
@@ -2509,7 +2610,8 @@ async def chain_click(
     """
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
-            await locator.click(timeout=timeout)
+            await EventStrategyFactory.move_to_element(page, locator)
+            await EventStrategyFactory.click(page, locator, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
 
@@ -2525,7 +2627,7 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_element := await skyvern_element.find_label_for(dom=dom):
-                    await bound_element.get_locator().click(timeout=timeout)
+                    await EventStrategyFactory.click(page, bound_element.get_locator(), timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2543,7 +2645,7 @@ async def chain_click(
                 if bound_element := await skyvern_element.find_element_in_label_children(
                     dom=dom, element_type=InteractiveElement.INPUT
                 ):
-                    await bound_element.get_locator().click(timeout=timeout)
+                    await EventStrategyFactory.click(page, bound_element.get_locator(), timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2561,6 +2663,8 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
+                    # Intentional positional click bypassing EventStrategyFactory — position
+                    # anchoring at (0,0) avoids mis-targeting nested elements inside labels
                     await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
@@ -2578,6 +2682,8 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
+                    # Intentional positional click bypassing EventStrategyFactory — position
+                    # anchoring at (0,0) avoids mis-targeting nested elements inside labels
                     await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
@@ -2597,22 +2703,27 @@ async def chain_click(
             dom=DomUtil(scraped_page=scraped_page, page=page)
         )
         if blocking_element is None:
-            if not blocked:
+            if blocked:
                 LOG.info(
-                    "Chain click: exit since the element is not blocking by any element",
+                    "Chain click: element is blocked by a non-interactable element, try to click by the coordinates",
                     action=action,
                     element=str(skyvern_element),
                     locator=locator,
                 )
-                return action_results
+            else:
+                # Element is visible and elementFromPoint returns the target itself,
+                # but Playwright's click still failed (e.g. element transiently
+                # unstable due to React re-render or CSS animation).  Fall through
+                # to coordinate click which bypasses Playwright's actionability
+                # checks while still dispatching a real mouse event.
+                LOG.info(
+                    "Chain click: element is visible and not blocked, but Playwright click failed — trying coordinate click",
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
 
             try:
-                LOG.info(
-                    "Chain click: element is blocked by an non-interactable element, try to click by the coordinates",
-                    action=action,
-                    element=str(skyvern_element),
-                    locator=locator,
-                )
                 await skyvern_element.coordinate_click(page=page)
                 action_results.append(ActionSuccess())
                 return action_results
@@ -2622,7 +2733,7 @@ async def chain_click(
                 )
 
             LOG.info(
-                "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
+                "Chain click: coordinate click failed, going to use javascript click instead of playwright click",
                 action=action,
                 element=str(skyvern_element),
                 locator=locator,
@@ -2652,7 +2763,7 @@ async def chain_click(
                     locator=locator,
                 )
 
-                await blocking_element.get_locator().click(timeout=timeout)
+                await EventStrategyFactory.click(page, blocking_element.get_locator(), timeout=timeout)
                 action_results.append(ActionSuccess())
                 return action_results
         except Exception as e:
@@ -2677,7 +2788,7 @@ async def chain_click(
             return [ActionFailure(WrongElementToUploadFile(action.element_id))]
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.auto_completion")
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -2763,7 +2874,9 @@ async def choose_auto_completion_dropdown(
                             input_value=text,
                         )
                         try:
-                            await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                            await EventStrategyFactory.click(
+                                page, fast_path_locator, timeout=settings.BROWSER_ACTION_TIMEOUT_MS
+                            )
                             clear_input = False
                             result.action_result = ActionSuccess()
                             return result
@@ -2850,7 +2963,17 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
-        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        # Use SkyvernElement.click() so we get the full fallback chain
+        # (Playwright click → coordinate click → JavaScript click).  Plain
+        # locator.click() can fail when the item or one of its ancestors has
+        # pointer-events:none, which is common in React/Vue dropdown lists.
+        selected_element = SkyvernElement(
+            locator=locator,
+            frame=current_frame,
+            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+        )
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
         clear_input = False
         return result
 
@@ -3031,6 +3154,25 @@ async def input_or_auto_complete_input(
             current_value = new_current_value
 
     else:
+        if not input_or_select_context.is_search_bar:
+            LOG.info(
+                "Auto completion attempts exhausted, trying discover-all-options fallback",
+                element_id=skyvern_element.get_id(),
+                original_text=text,
+            )
+            fallback_result = await discover_and_select_from_full_dropdown(
+                context=input_or_select_context,
+                page=page,
+                scraped_page=scraped_page,
+                dom=dom,
+                original_text=text,
+                skyvern_element=skyvern_element,
+                step=step,
+                task=task,
+            )
+            if fallback_result is not None:
+                return fallback_result
+
         LOG.warning(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             context=input_or_select_context,
@@ -3038,7 +3180,194 @@ async def input_or_auto_complete_input(
         return None
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.discover_and_select")
+async def discover_and_select_from_full_dropdown(
+    context: InputOrSelectContext,
+    page: Page,
+    scraped_page: ScrapedPage,
+    dom: DomUtil,
+    original_text: str,
+    skyvern_element: SkyvernElement,
+    step: Step,
+    task: Task,
+    relevance_threshold: float = 0.6,
+) -> ActionResult | None:
+    """Fallback for auto-completion: clear input, click/ArrowDown to reveal all options,
+    then ask LLM to pick the best semantic match from actual dropdown values."""
+    if not await skyvern_element.is_visible():
+        return None
+
+    current_frame = skyvern_element.get_frame()
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+
+    try:
+        await skyvern_element.scroll_into_view()
+        await skyvern_element.input_clear()
+
+        # Try click first to open the dropdown (most combobox components respond to click)
+        try:
+            await EventStrategyFactory.click(
+                page, skyvern_element.get_locator(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS
+            )
+        except Exception:
+            LOG.info(
+                "Click failed in discover fallback, continuing to ArrowDown",
+                element_id=skyvern_element.get_id(),
+            )
+
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+
+        cleanup_func = clean_and_remove_element_tree_factory(
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+        )
+        incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
+
+        # If click didn't produce options, try ArrowDown as fallback
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options after click, trying ArrowDown",
+                element_id=skyvern_element.get_id(),
+            )
+            try:
+                await skyvern_element.press_key("ArrowDown")
+            except TimeoutError:
+                LOG.info(
+                    "Timeout pressing ArrowDown in discover fallback, continuing",
+                    element_id=skyvern_element.get_id(),
+                )
+
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+            incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
+
+        # If incremental detection failed (e.g. options in a different shadow root),
+        # try a full page re-scrape diff as last resort
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options from incremental detection, trying re-scrape diff",
+                element_id=skyvern_element.get_id(),
+            )
+            scraped_page_after = await scraped_page.generate_scraped_page_without_screenshots()
+            new_element_ids_from_rescrape = list(
+                set(scraped_page_after.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+            )
+            if new_element_ids_from_rescrape:
+                # Feed re-scrape results back into incremental_element so the unified
+                # auto-completion-choose-option path below handles them (best-effort,
+                # with relevance_threshold). This avoids select_from_emerging_elements
+                # which uses the more aggressive custom-select prompt.
+                rescrape_elements = [
+                    scraped_page_after.id_to_element_dict[eid]
+                    for eid in new_element_ids_from_rescrape
+                    if eid in scraped_page_after.id_to_element_dict
+                ]
+                if rescrape_elements:
+                    LOG.info(
+                        "Discover fallback: re-scrape diff found new elements",
+                        new_element_count=len(rescrape_elements),
+                    )
+                    incremental_element = rescrape_elements
+                    incremental_scraped.id_to_element_dict.update(scraped_page_after.id_to_element_dict)
+
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options found after all attempts",
+                element_id=skyvern_element.get_id(),
+            )
+            return None
+
+        cleaned_elements = remove_duplicated_HTML_element(incremental_element)
+        html = incremental_scraped.build_html_tree(cleaned_elements)
+        new_element_ids = [e.get("id", "") for e in cleaned_elements if e.get("id")]
+
+        field_information = context.field if not context.intention else context.intention
+        prompt = prompt_engine.load_prompt(
+            "auto-completion-choose-option",
+            is_search=context.is_search_bar,
+            field_information=field_information,
+            filled_value=original_text,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
+            elements=html,
+            new_elements_ids=new_element_ids,
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        )
+
+        LOG.info(
+            "Discover fallback: asking LLM to pick from actual options",
+            element_id=skyvern_element.get_id(),
+            original_text=original_text,
+        )
+        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+            prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
+        )
+
+        element_id = json_response.get("id", "")
+        relevance_float = json_response.get("relevance_float", 0)
+
+        if not element_id or relevance_float < relevance_threshold:
+            LOG.info(
+                "Discover fallback: no suitable option found",
+                element_id=element_id,
+                relevance_float=relevance_float,
+                threshold=relevance_threshold,
+            )
+            return None
+
+        discovered_value = json_response.get("value", "")
+        LOG.info(
+            "Discover fallback: found suitable option, typing discovered value to trigger auto-completion",
+            element_id=element_id,
+            relevance_float=relevance_float,
+            discovered_value=discovered_value,
+        )
+
+        if not discovered_value:
+            # FIXME: when element_id is valid and the dropdown is still open (incremental path),
+            # we could try clicking the element directly instead of requiring the value text.
+            # Currently this only affects the re-scrape path where the dropdown is closed.
+            return None
+
+        # Instead of clicking the option directly (dropdown may have closed during re-scrape),
+        # input the discovered value into the combobox. Since it's an exact match, the combobox's
+        # filter will show it as the only option. Then find and click it directly via Playwright.
+        await skyvern_element.input_clear()
+        await skyvern_element.press_fill(discovered_value)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+
+        # Select the first matching option via keyboard: ArrowDown highlights it, Enter confirms.
+        # This avoids needing to locate the option element in shadow DOM.
+        try:
+            await skyvern_element.press_key("ArrowDown")
+            await skyvern_element.press_key("Enter")
+            LOG.info(
+                "Discover fallback: selected option via keyboard",
+                discovered_value=discovered_value,
+            )
+            return ActionSuccess()
+        except Exception:
+            LOG.info(
+                "Discover fallback: keyboard selection failed",
+                exc_info=True,
+                discovered_value=discovered_value,
+            )
+            return None
+
+    except Exception:
+        LOG.warning(
+            "Discover fallback failed",
+            exc_info=True,
+            original_text=original_text,
+        )
+        return None
+    finally:
+        await incremental_scraped.stop_listen_dom_increment()
+
+
+@traced(name="skyvern.agent.dropdown.select_sequential")
 async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
     input_or_select_context: InputOrSelectContext,
@@ -3218,7 +3547,7 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
     options: CustomSelectPromptOptions,
@@ -3311,7 +3640,7 @@ async def select_from_emerging_elements(
     return ActionSuccess()
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.select")
 async def select_from_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -3497,7 +3826,8 @@ async def select_from_dropdown(
             "Find an alternative option with the same value. Try to select the option.",
             value=value,
         )
-        await locator.click(timeout=timeout)
+        await EventStrategyFactory.move_to_element(page, locator)
+        await EventStrategyFactory.click(page, locator, timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
     except Exception as e:
@@ -3505,7 +3835,7 @@ async def select_from_dropdown(
         return single_select_result
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.select_by_value")
 async def select_from_dropdown_by_value(
     value: str,
     page: Page,
@@ -3526,7 +3856,7 @@ async def select_from_dropdown_by_value(
 
     element_locator = await incremental_scraped.select_one_element_by_value(value=value)
     if element_locator is not None:
-        await element_locator.click(timeout=timeout)
+        await EventStrategyFactory.click(page, element_locator, timeout=timeout)
         return ActionSuccess()
 
     if dropdown_menu_element is None:
@@ -3562,7 +3892,7 @@ async def select_from_dropdown_by_value(
 
         element_locator = await incre_scraped.select_one_element_by_value(value=value)
         if element_locator is not None:
-            await element_locator.click(timeout=timeout)
+            await EventStrategyFactory.click(page, element_locator, timeout=timeout)
             nonlocal selected
             selected = True
             return False
@@ -3732,7 +4062,7 @@ async def try_to_find_potential_scrollable_element(
     return skyvern_element
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.scroll_load_options")
 async def scroll_down_to_load_all_options(
     scrollable_element: SkyvernElement,
     page: Page,
@@ -3851,9 +4181,7 @@ async def normal_select(
     value: str | None = json_response.get("value")
 
     try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
+        await EventStrategyFactory.click(locator.page, locator, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
     except Exception as e:
         LOG.info(
             "Failed to click before select action",
@@ -3986,29 +4314,328 @@ async def extract_information_for_navigation_goal(
     Scrapes a webpage and returns the scraped response, including:
     1. JSON representation of what the user is seeing
     2. The scraped page
+
+    Extraction-result cache
+    --------------------------------
+    Many workflows re-extract the same page on every iteration of a loop
+    (e.g. navigate back to a documents list, extract, click one row, repeat).
+    When the page content, data-extraction goal, and output schema are
+    identical to a previous call within the same workflow run, reuse the
+    prior LLM result instead of paying for another extract-information call.
     """
     scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
-    extract_information_prompt = load_prompt_with_elements(
+
+    # Compute llm key up-front so the cache key includes it.
+    llm_key_override = task.llm_key
+    if await service_utils.is_cua_task(task=task):
+        # CUA tasks should use the default data extraction llm key
+        llm_key_override = None
+
+    # Rendered into the prompt as ``{{ local_datetime }}``. Intentionally not
+    # part of the cache key — content-hash alone defines cache identity, so
+    # two calls on byte-identical pages hit the cache regardless of wall clock.
+    local_datetime_str = datetime.now(context.tz_info).isoformat()
+
+    extracted_text_for_prompt = scraped_page_refreshed.extracted_text if task.include_extracted_text else None
+
+    previous_info_capped = truncate_previous_extracted_information(task.extracted_information)
+    capped_schema = truncate_extraction_schema(task.extracted_information_schema)
+    # Normalize error_code_mapping to the exact string the prompt will render
+    # (None when falsy). Hashing this value below — instead of the raw dict —
+    # means None and {} collapse to one key since both drop the prompt block.
+    error_code_mapping_str = json.dumps(task.error_code_mapping) if task.error_code_mapping else None
+
+    # Render the prompt FIRST so the cache key hashes the exact string that
+    # will be sent to the LLM (captures economy-tree swaps and 2/3 truncation
+    # inside load_prompt_with_elements). Use the _tracked variant so the cache
+    # key below can hash the post-ceiling values — when the prompt exceeds the
+    # hard ceiling, `enforce_prompt_ceiling` drops fields to None, and two
+    # requests that render to the same final LLM prompt must share a key.
+    extract_information_prompt, post_ceiling_kwargs = load_prompt_with_elements_tracked(
         element_tree_builder=scraped_page_refreshed,
         prompt_engine=prompt_engine,
         template_name="extract-information",
         html_need_skyvern_attrs=False,
         navigation_goal=task.navigation_goal,
         navigation_payload=task.navigation_payload,
-        previous_extracted_information=task.extracted_information,
+        previous_extracted_information=previous_info_capped,
         data_extraction_goal=task.data_extraction_goal,
-        extracted_information_schema=task.extracted_information_schema,
+        extracted_information_schema=capped_schema,
         current_url=scraped_page_refreshed.url,
-        extracted_text=scraped_page_refreshed.extracted_text,
-        error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-        local_datetime=datetime.now(context.tz_info).isoformat(),
+        extracted_text=extracted_text_for_prompt,
+        error_code_mapping_str=error_code_mapping_str,
+        local_datetime=local_datetime_str,
     )
 
-    llm_key_override = task.llm_key
-    if await service_utils.is_cua_task(task=task):
-        # CUA tasks should use the default data extraction llm key
-        llm_key_override = None
+    # Self-heal guard: on the second retry onward (``retry_index > 1``) the
+    # previous attempts' cached result is suspect — the first retry already
+    # failed to complete, so continuing to hand the same cached value back
+    # is not going to recover. Bypass both cache tiers on retry #2+ and
+    # force a fresh LLM call; the dual-write after extraction overwrites
+    # both the in-run entry and the cross-run Redis entry.
+    # Retry #1 still uses the cache: transient failures (network blip,
+    # downstream flake) often recover without the extraction itself being
+    # the cause, and paying the LLM cost on every first retry would burn
+    # hit rate for no self-heal benefit.
+    is_retry_step = step.retry_index > 1
+
+    # Best-effort cache lookup — any failure falls through to LLM. The `try`
+    # is narrowed to just compute_cache_key + lookup so a downstream log
+    # failure can't re-enter the except block and double-count the call as
+    # both a hit/miss and a `lookup_error` in the Datadog miss-reason metric.
+    cache_key: str | None = None
+    lookup_result: extraction_cache.LookupResult | None = None
+    try:
+        # Use the variant of the element tree that load_prompt_with_elements
+        # actually rendered (could be economy or 2/3-truncated under token
+        # pressure). Falls back to a fresh HTML build when the prior build
+        # used fmt=JSON (field is None in that case). The fallback call
+        # mutates `last_used_element_tree{_html}` on scraped_page_refreshed;
+        # this is intentional — nothing downstream reads those fields after
+        # the cache key is computed.
+        # Hash the post-ceiling values for fields that enforce_prompt_ceiling
+        # may drop (previous_extracted_information / extracted_information_schema /
+        # extracted_text). When those fields are dropped, two requests that
+        # differ only in the dropped values render identical final prompts and
+        # must share a cache key. `extracted_text` also respects
+        # include_extracted_text (None when disabled).
+        cache_key = extraction_cache.compute_cache_key(
+            call_path="handler",
+            element_tree=scraped_page_refreshed.last_used_element_tree_html
+            or scraped_page_refreshed.build_element_tree(html_need_skyvern_attrs=False),
+            extracted_text=post_ceiling_kwargs["extracted_text"],
+            current_url=scraped_page_refreshed.url,
+            data_extraction_goal=task.data_extraction_goal,
+            extracted_information_schema=post_ceiling_kwargs["extracted_information_schema"],
+            navigation_payload=task.navigation_payload,
+            error_code_mapping=error_code_mapping_str,
+            previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
+            llm_key=llm_key_override,
+        )
+        if is_retry_step:
+            # Proactively evict the in-run entry. The cross-run tier will be
+            # overwritten by the store() after the LLM call below.
+            evicted = extraction_cache.invalidate_key(task.workflow_run_id, cache_key)
+            LOG.info(
+                "extract_information cache bypassed on retry (self-heal)",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                step_id=step.step_id,
+                retry_index=step.retry_index,
+                cache_key=cache_key,
+                cache_hit=False,
+                # Covers both tiers — the in-run entry is evicted here and the
+                # cross-run entry will be overwritten by the store() below.
+                cache_scope=extraction_cache.SCOPE_RUN,
+                cache_age_seconds=None,
+                fallback_reason="retry_bypass",
+                in_run_entry_evicted=evicted,
+                cache_path="handler",
+            )
+        else:
+            lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
+    except Exception:
+        LOG.warning(
+            "extract_information cache lookup failed; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=extraction_cache.SCOPE_RUN,
+            cache_age_seconds=None,
+            fallback_reason=extraction_cache.FALLBACK_LOOKUP_ERROR,
+            cache_path="handler",
+            exc_info=True,
+        )
+        # Preserve cache_key so the downstream store() can still warm the cache
+        # for subsequent identical calls even when lookup() fails transiently.
+
+    if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, (dict, list, str)):
+        LOG.info(
+            "extract_information cache hit — skipping LLM call",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            cache_hit=True,
+            cache_scope=lookup_result.scope,
+            cache_age_seconds=lookup_result.age_seconds,
+            fallback_reason=None,
+            cache_path="handler",
+        )
+        # Fire-and-forget shadow sampling on sampled hits. Flag lookup happens
+        # inside the background task so the cache-hit return is not blocked
+        # by the flag provider (e.g. PostHog latency on the first hit per run).
+        if cache_key is not None and task.workflow_run_id is not None:
+            shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+            )
+            shadow_schema = task.extracted_information_schema
+            # Snapshot screenshots at schedule time — scraped_page is mutable
+            # and may be refreshed before the background task runs.
+            shadow_screenshots = list(scraped_page.screenshots)
+
+            async def _shadow_gate() -> bool:
+                # Captures `task` by reference — safe because the cloud override
+                # only reads immutable identifiers (workflow_run_id, organization_id,
+                # workflow_permanent_id, task_id) set at construction.
+                return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+            async def _shadow_llm_call() -> Any:
+                fresh = await shadow_llm_api_handler(
+                    prompt=extract_information_prompt,
+                    # step=None suppresses both update_step (token/cost accounting)
+                    # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
+                    # are an observability side-channel — the user-visible request
+                    # was served from cache, so they must not inflate step usage,
+                    # billing, or artifact counts.
+                    step=None,
+                    screenshots=shadow_screenshots,
+                    # Use the same prompt_name as the miss path so prompt-level
+                    # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
+                    # cached (tuned) vs fresh (untuned) would diverge for config
+                    # reasons unrelated to cache correctness.
+                    prompt_name="extract-information",
+                    force_dict=False,
+                )
+                # Apply the same post-processing the miss path applies so the
+                # comparison is apples-to-apples against the cached value.
+                if shadow_schema:
+                    fresh = validate_and_fill_extraction_result(
+                        extraction_result=fresh,
+                        schema=shadow_schema,
+                    )
+                return fresh
+
+            extraction_shadow.schedule_shadow_check(
+                gate=_shadow_gate,
+                cache_key=cache_key,
+                workflow_run_id=task.workflow_run_id,
+                cached_value=lookup_result.value,
+                # -1.0 sentinel marks "age unknown" so it's distinguishable in
+                # Datadog from "just-cached (0.0)".
+                cached_age_seconds=lookup_result.age_seconds if lookup_result.age_seconds is not None else -1.0,
+                llm_call=_shadow_llm_call,
+                schema=shadow_schema,
+            )
+        return ScrapeResult(scraped_data=lookup_result.value)
+    if lookup_result is not None and lookup_result.hit:
+        LOG.warning(
+            "extract_information cache hit returned non-cacheable value type; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            value_type=type(lookup_result.value).__name__,
+            cache_path="handler",
+        )
+    elif lookup_result is not None:
+        LOG.info(
+            "extract_information cache miss",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=lookup_result.scope,
+            cache_age_seconds=None,
+            fallback_reason=lookup_result.fallback_reason,
+            cache_path="handler",
+        )
+
+    # Cross-run (wpid-scoped) cache lookup (SKY-8873). Consulted after an
+    # in-run miss so the tight in-process dict stays the hot path. Returns
+    # None in OSS; the cloud override hits Redis and is gated behind the
+    # EXTRACT_INFORMATION_CACHE_REDIS PostHog flag. All errors are swallowed
+    # by the backend so a Redis hiccup just falls through to the LLM call.
+    # Skipped on retry — the subsequent dual-write overwrites any stale
+    # Redis entry for this key with the fresh LLM result.
+    cross_run_value: Any | None = None
+    if cache_key is not None and not is_retry_step:
+        try:
+            cross_run_value = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(
+                task.workflow_permanent_id, cache_key
+            )
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache lookup raised",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=task.workflow_permanent_id,
+                organization_id=task.organization_id,
+                cache_key=cache_key,
+                exc_info=True,
+            )
+            cross_run_value = None
+
+    # Cross-run hit with a non-cacheable value type (e.g. a Redis payload
+    # that decoded to a bool or number). Mirror the in-run warning so the
+    # cross-run tier has the same diagnostic surface during rollout —
+    # without it, a corrupt-but-decodable entry would silently fall
+    # through to the LLM with no trail for post-hoc investigation.
+    if cache_key is not None and cross_run_value is not None and not isinstance(cross_run_value, (dict, list, str)):
+        LOG.warning(
+            "extract_information cross-run cache hit returned non-cacheable value type; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            organization_id=task.organization_id,
+            cache_key=cache_key,
+            value_type=type(cross_run_value).__name__,
+            cache_path="handler",
+        )
+        cross_run_value = None
+
+    if cache_key is not None and cross_run_value is not None and isinstance(cross_run_value, (dict, list, str)):
+        LOG.info(
+            "extract_information cache hit — skipping LLM call (cross-run)",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_hit=True,
+            cache_scope=extraction_cache.SCOPE_WPID,
+            # Age tracking in the cross-run tier is a follow-up; emit None so
+            # the field is always present but distinguishable from in-run hits.
+            cache_age_seconds=None,
+            fallback_reason=None,
+            cache_path="handler",
+        )
+        # Backfill the in-run cache so subsequent identical lookups in this
+        # run short-circuit without crossing the Redis boundary.
+        try:
+            extraction_cache.store(task.workflow_run_id, cache_key, cross_run_value)
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache backfill to in-run failed",
+                exc_info=True,
+            )
+        # Shadow sampling on cross-run hits is a follow-up — plumbing needs
+        # a cached_age for the comparison event and the current Redis backend
+        # does not track it yet.
+        return ScrapeResult(scraped_data=cross_run_value)
+
+    # Cross-run miss log — INFO so the wpid-tier hit rate is computable
+    # from logs alone once the read flag starts ramping. Earlier drafts kept
+    # this at DEBUG specifically to avoid flooding INFO during the
+    # post-merge 0%-read window; promoted to INFO in SKY-8992 before the
+    # first read-flag flip so Datadog has both sides of the ratio without a
+    # log-level backfill.
+    if cache_key is not None and not is_retry_step and cross_run_value is None:
+        LOG.info(
+            "extract_information cache miss (cross-run)",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=extraction_cache.SCOPE_WPID,
+            cache_age_seconds=None,
+            # The wpid tier doesn't distinguish "flag disabled" from
+            # "key not found" at the handler — both surface as ``None`` —
+            # so label as ``cross_run_miss`` and let downstream metrics
+            # split by ``workflow_permanent_id`` populated vs empty.
+            fallback_reason="cross_run_miss",
+            cache_path="handler",
+        )
 
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -4028,6 +4655,58 @@ async def extract_information_for_navigation_goal(
             extraction_result=json_response,
             schema=task.extracted_information_schema,
         )
+
+    # Cache the post-validation result so cache hits return the same shape as
+    # a fresh LLM call (schema-validated with missing fields filled). Accept
+    # dict / list / str — the `extract-information` prompt uses
+    # `force_dict=False`, so root `type: array` or scalar schemas are valid
+    # return shapes (matches ``ScrapeResult.scraped_data``).
+    # TEMPORARY INSTRUMENTATION (SKY-8992): the dual-write block below appears
+    # to never populate Redis in production despite the code being deployed
+    # and the cloud override verified. Log the gate inputs every call so we
+    # can see which guard is closing the block. Revert after root-cause is
+    # identified.
+    LOG.info(
+        "extract_information cache store gate",
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        workflow_permanent_id=task.workflow_permanent_id,
+        cache_key_present=cache_key is not None,
+        json_response_type=type(json_response).__name__,
+        json_response_is_cacheable=isinstance(json_response, (dict, list, str)),
+        cache_path="handler",
+    )
+    if cache_key is not None and isinstance(json_response, (dict, list, str)):
+        # TEMPORARY INSTRUMENTATION (SKY-8992): confirm the dual-write block is entered.
+        LOG.info(
+            "extract_information cache store block entered",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_path="handler",
+        )
+        try:
+            extraction_cache.store(task.workflow_run_id, cache_key, json_response)
+        except Exception:
+            LOG.warning("extract_information cache store failed; ignoring", exc_info=True)
+        # Dual-write to the cross-run (Redis) tier. Ungated so the cache is
+        # warm before the read flag rolls out. OSS returns immediately; cloud
+        # writes to Redis with a long TTL and swallows backend errors.
+        try:
+            await app.AGENT_FUNCTION.store_cross_run_extraction_cache(
+                task.workflow_permanent_id, cache_key, json_response
+            )
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache store raised; ignoring",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=task.workflow_permanent_id,
+                organization_id=task.organization_id,
+                cache_key=cache_key,
+                exc_info=True,
+            )
 
     return ScrapeResult(
         scraped_data=json_response,
@@ -4060,7 +4739,7 @@ async def click_listbox_option(
                 try:
                     skyvern_element = await dom.get_skyvern_element_by_id(child["id"])
                     locator = skyvern_element.locator
-                    await locator.click(timeout=1000)
+                    await EventStrategyFactory.click(page, locator, timeout=1000)
 
                     return True
                 except Exception:

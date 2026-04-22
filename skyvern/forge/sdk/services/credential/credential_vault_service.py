@@ -47,7 +47,7 @@ class CredentialVaultService(ABC):
         vault_type: CredentialVaultType,
     ) -> Credential:
         if data.credential_type == CredentialType.PASSWORD:
-            return await app.DATABASE.create_credential(
+            return await app.DATABASE.credentials.create_credential(
                 organization_id=organization_id,
                 name=data.name,
                 vault_type=vault_type,
@@ -60,7 +60,7 @@ class CredentialVaultService(ABC):
                 card_brand=None,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
-            return await app.DATABASE.create_credential(
+            return await app.DATABASE.credentials.create_credential(
                 organization_id=organization_id,
                 name=data.name,
                 vault_type=vault_type,
@@ -73,7 +73,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=None,
             )
         elif data.credential_type == CredentialType.SECRET:
-            return await app.DATABASE.create_credential(
+            return await app.DATABASE.credentials.create_credential(
                 organization_id=organization_id,
                 name=data.name,
                 vault_type=vault_type,
@@ -96,7 +96,7 @@ class CredentialVaultService(ABC):
         item_id: str,
     ) -> Credential:
         if data.credential_type == CredentialType.PASSWORD:
-            return await app.DATABASE.update_credential_vault_data(
+            return await app.DATABASE.credentials.update_credential_vault_data(
                 credential_id=credential.credential_id,
                 organization_id=credential.organization_id,
                 item_id=item_id,
@@ -109,7 +109,7 @@ class CredentialVaultService(ABC):
                 card_brand=None,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
-            return await app.DATABASE.update_credential_vault_data(
+            return await app.DATABASE.credentials.update_credential_vault_data(
                 credential_id=credential.credential_id,
                 organization_id=credential.organization_id,
                 item_id=item_id,
@@ -122,7 +122,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=None,
             )
         elif data.credential_type == CredentialType.SECRET:
-            return await app.DATABASE.update_credential_vault_data(
+            return await app.DATABASE.credentials.update_credential_vault_data(
                 credential_id=credential.credential_id,
                 organization_id=credential.organization_id,
                 item_id=item_id,

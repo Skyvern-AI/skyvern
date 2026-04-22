@@ -1,7 +1,9 @@
 import asyncio
+import os
 import subprocess
 import uuid
 
+import typer
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -148,8 +150,16 @@ def init_env(
         update_or_add_env_var("SKYVERN_API_KEY", api_key)
     console.print(f"✅ [green]{resolve_backend_env_path()} file has been initialized.[/green]")
 
+    # Retrieve browser config for MCP setup (set during local init)
+    _mcp_browser_type = os.environ.get("BROWSER_TYPE") if run_local else None
+    _mcp_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if run_local else None
+
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
-        setup_mcp(local=run_local)
+        setup_mcp(
+            local=run_local,
+            browser_type=_mcp_browser_type,
+            browser_remote_debugging_url=_mcp_browser_url,
+        )
 
         if not run_local:
             console.print(
@@ -182,6 +192,40 @@ def init_env(
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
 
     return run_local
+
+
+def init_app_factory() -> typer.Typer:
+    """Build and return the ``init`` sub-app with its callback and browser sub-command.
+
+    This factory is called lazily by :class:`LazyTyperGroup` so that the heavy
+    imports in this module are deferred until the user actually runs
+    ``skyvern init``.
+    """
+    app = typer.Typer(
+        invoke_without_command=True,
+        help="Interactively configure Skyvern and its dependencies.",
+    )
+
+    @app.callback()
+    def _init_callback(
+        ctx: typer.Context,
+        no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+        database_string: str = typer.Option(
+            "",
+            "--database-string",
+            help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+        ),
+    ) -> None:
+        """Run full initialization when no subcommand is provided."""
+        if ctx.invoked_subcommand is None:
+            init_env(no_postgres=no_postgres, database_string=database_string)
+
+    @app.command(name="browser")
+    def _init_browser_command() -> None:
+        """Initialize only the browser configuration."""
+        init_browser()
+
+    return app
 
 
 def init_browser() -> None:

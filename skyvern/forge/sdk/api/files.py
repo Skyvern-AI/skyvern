@@ -272,6 +272,46 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
         zip_ref.extractall(output_dir)
 
 
+_REMOTE_URL_PREFIXES = ("http://", "https://", "s3://", "azure://", "www.")
+
+
+def is_remote_url(path: str) -> bool:
+    """Return True if the path is a remote URL (HTTP, S3, Azure) rather than a local filesystem path."""
+    return path.startswith(_REMOTE_URL_PREFIXES)
+
+
+def validate_local_file_path(candidate_path: str, run_id: str | None) -> str:
+    """Validate that a local file path is within the workflow's download directory.
+
+    Uses os.path.realpath() to resolve symlinks and '..' traversal before checking
+    containment. Raises PermissionError if the path resolves outside the allowed directory.
+
+    Returns the resolved canonical path on success.
+    """
+    if run_id is None:
+        raise PermissionError("File access denied: no workflow run ID provided")
+
+    if not candidate_path:
+        LOG.warning("Empty path provided for file access validation", run_id=run_id)
+        raise PermissionError(f"File access denied: path must not be empty for run {run_id}")
+
+    allowed_dir = os.path.realpath(os.path.join(settings.DOWNLOAD_PATH, str(run_id)))
+    resolved = os.path.realpath(candidate_path)
+
+    # The resolved path must be the allowed dir itself or a child of it
+    if resolved != allowed_dir and not resolved.startswith(allowed_dir + os.sep):
+        LOG.warning(
+            "Path traversal attempt blocked",
+            candidate_path=candidate_path,
+            resolved_path=resolved,
+            allowed_dir=allowed_dir,
+            run_id=run_id,
+        )
+        raise PermissionError(f"File access denied: path is outside the allowed download directory for run {run_id}")
+
+    return resolved
+
+
 def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
     return Path(get_download_dir(run_id=run_id))
 

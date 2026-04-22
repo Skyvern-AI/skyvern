@@ -5,13 +5,13 @@ import {
   Position,
   useNodes,
   useReactFlow,
+  type Node,
 } from "@xyflow/react";
 import {
   PlusIcon,
   ChevronDownIcon,
   DotsVerticalIcon,
 } from "@radix-ui/react-icons";
-import type { Node } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -31,19 +31,19 @@ import {
   getLoopNodeWidth,
   updateNodeAndDescendantsVisibility,
 } from "../../workflowEditorUtils";
-import type { ConditionalNode } from "./types";
 import {
+  type ConditionalNode,
   ConditionalNodeData,
   createBranchCondition,
   defaultBranchCriteria,
 } from "./types";
 import type { BranchCondition } from "../../../types/workflowTypes";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const nodes = useNodes<AppNode>();
-  const { setNodes, setEdges } = useReactFlow();
+  const { setNodes, setEdges, updateNodeData } = useReactFlow();
   const node = nodes.find((n) => n.id === id);
   const { beginInternalUpdate, endInternalUpdate } =
     useWorkflowHasChangesStore();
@@ -100,6 +100,26 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const conditionalNodeWidth = useMemo(() => {
     return node ? getLoopNodeWidth(node, nodes) : 450;
   }, [node, nodes]);
+
+  const headerRef = useRef<HTMLDivElement>(null);
+  const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver(() => {
+      const height = Math.round(el.offsetHeight);
+      if (lastHeaderHeight.current !== height) {
+        lastHeaderHeight.current = height;
+        updateNodeData(id, { _headerHeight: height });
+        window.dispatchEvent(new Event("conditional-header-resized"));
+      }
+    });
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [id, updateNodeData]);
 
   const orderedBranches = useMemo(() => {
     const defaultBranch = data.branches.find((branch) => branch.is_default);
@@ -388,7 +408,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     // If the deleted branch was active, switch to the first branch
     const newActiveBranchId =
       data.activeBranchId === branchId
-        ? updatedBranches[0]?.id ?? null
+        ? (updatedBranches[0]?.id ?? null)
         : data.activeBranchId;
 
     update({
@@ -528,6 +548,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
       >
         <div className="flex w-full justify-center">
           <div
+            ref={headerRef}
             className={cn(
               "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
               data.comparisonColor,
@@ -763,18 +784,19 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                       />
                     )}
                   </div>
-                  <WorkflowBlockInput
+                  <WorkflowBlockInputTextarea
                     nodeId={id}
                     value={
                       activeBranch.is_default
                         ? "Executed when no other condition matches"
-                        : activeBranch.criteria?.expression ?? ""
+                        : (activeBranch.criteria?.expression ?? "")
                     }
                     disabled={!data.editable || activeBranch.is_default}
                     onChange={(value) => {
                       handleExpressionChange(value);
                     }}
                     placeholder="Enter condition to evaluate (Jinja, natural language, or both)"
+                    className="nopan text-xs"
                   />
                 </div>
               )}

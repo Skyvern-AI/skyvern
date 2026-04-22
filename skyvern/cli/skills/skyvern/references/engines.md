@@ -1,17 +1,20 @@
-# Engine Choice for Quick Automation
+# Choosing Between `run_task` and Workflows
 
-Use one-off tools by default for short tasks.
+Default to workflows for real automation work. Reach for `skyvern_run_task` only when you are
+doing a throwaway trial and do not want to keep the result.
+
+## Prefer `skyvern_workflow_create`
+
+- The task spans multiple pages.
+- The user says `set this up`, `automate`, `workflow`, `reusable`, `repeat`, or `schedule`.
+- You want block-level observability, reruns, parameters, or cached scripts.
+- You expect to debug or hand the automation to someone else later.
 
 ## Prefer `skyvern_run_task`
 
-- You need a throwaway automation now.
-- The task can complete in a small number of steps.
-- Reusability is not required.
+- You need a one-off exploratory trial right now.
+- The result is disposable and not worth saving.
+- You are checking feasibility before deciding whether to build a workflow.
 
-## Prefer a workflow instead
-
-- The task will be rerun with different parameters.
-- You need branching, loops, or explicit block-level observability.
-- You need reproducible runs for operations teams.
-
-Rule of thumb: if you need to run the same automation twice with different inputs, move to `building-workflows`.
+Rule of thumb: if the task crosses page boundaries or sounds like real automation instead of a trial,
+build a workflow first.

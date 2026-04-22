@@ -13,9 +13,9 @@ from .setup_commands import setup_claude, setup_claude_code, setup_cursor, setup
 
 
 async def get_or_create_local_organization() -> Organization:
-    organization = await app.DATABASE.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
+    organization = await app.DATABASE.organizations.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
     if not organization:
-        organization = await app.DATABASE.create_organization(
+        organization = await app.DATABASE.organizations.create_organization(
             organization_name=SKYVERN_LOCAL_ORG,
             domain=SKYVERN_LOCAL_DOMAIN,
             max_steps_per_run=10,
@@ -25,7 +25,7 @@ async def get_or_create_local_organization() -> Organization:
             organization.organization_id,
             expires_delta=API_KEY_LIFETIME,
         )
-        await app.DATABASE.create_org_auth_token(
+        await app.DATABASE.organizations.create_org_auth_token(
             organization_id=organization.organization_id,
             token=api_key,
             token_type=OrganizationAuthTokenType.api,
@@ -35,14 +35,19 @@ async def get_or_create_local_organization() -> Organization:
 
 async def setup_local_organization() -> str:
     organization = await get_or_create_local_organization()
-    org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+    org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
         organization_id=organization.organization_id,
         token_type=OrganizationAuthTokenType.api.value,
     )
     return org_auth_token.token if org_auth_token else ""
 
 
-def setup_mcp(*, local: bool = False) -> None:
+def setup_mcp(
+    *,
+    local: bool = False,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
+) -> None:
     console.print(Panel("[bold green]MCP Server Setup[/bold green]", border_style="green"))
     if local:
         console.print(
@@ -63,6 +68,8 @@ def setup_mcp(*, local: bool = False) -> None:
             project=False,
             global_config=False,
             skip_skills=False,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
         )
 
     if Confirm.ask("Would you like to set up MCP integration for Claude Desktop?", default=True):
@@ -73,6 +80,8 @@ def setup_mcp(*, local: bool = False) -> None:
             local=local,
             use_python_path=True,
             url=None,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
         )
 
     if Confirm.ask("Would you like to set up MCP integration for Cursor?", default=True):
@@ -83,6 +92,8 @@ def setup_mcp(*, local: bool = False) -> None:
             local=local,
             use_python_path=True,
             url=None,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
         )
 
     if Confirm.ask("Would you like to set up MCP integration for Windsurf?", default=True):
@@ -93,6 +104,8 @@ def setup_mcp(*, local: bool = False) -> None:
             local=local,
             use_python_path=True,
             url=None,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
         )
 
     console.print("\n🎉 [bold green]MCP server configuration completed.[/bold green]")

@@ -8,15 +8,15 @@ import { usePostHog } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import type {
-  BlockYAML,
-  ParameterYAML,
+import {
+  type BlockYAML,
+  type ParameterYAML,
+  WorkflowCreateYAMLRequest,
 } from "@/routes/workflows/types/workflowYamlTypes";
 import type {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
-import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 type SaveData = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
@@ -152,13 +152,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        run_with:
-          saveData.settings.runWith === "code_v2"
-            ? "code"
-            : saveData.settings.runWith,
+        run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
-        adaptive_caching: saveData.settings.runWith === "code_v2",
+        code_version:
+          saveData.settings.runWith === "code"
+            ? (saveData.settings.codeVersion ?? 2)
+            : undefined,
         workflow_definition: {
           version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,
@@ -255,7 +255,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             const loc = err.loc
               ?.filter((part) => part !== "body" && part !== "__root__")
               .join(" -> ");
-            return loc ? `${loc}: ${err.msg}` : err.msg ?? "Unknown error";
+            return loc ? `${loc}: ${err.msg}` : (err.msg ?? "Unknown error");
           })
           .join("; ");
       } else {

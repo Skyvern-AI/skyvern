@@ -18,7 +18,7 @@ async def get_action_history(
     """
 
     # Get action results from the last history_window steps
-    steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+    steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
     # the last step is always the newly created one and it should be excluded from the history window
     window_steps = steps[-1 - history_window : -1]
     if current_step:

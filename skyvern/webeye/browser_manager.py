@@ -40,6 +40,7 @@ class BrowserManager(Protocol):
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
         organization_id: str | None = None,
+        child_workflow_run_ids: list[str] | None = None,
     ) -> BrowserState | None: ...
 
     async def get_or_create_for_script(
@@ -47,6 +48,8 @@ class BrowserManager(Protocol):
         script_id: str | None = None,
         browser_session_id: str | None = None,
     ) -> BrowserState: ...
+
+    def evict_page(self, page_id: str) -> None: ...
 
     def get_for_task(self, task_id: str, workflow_run_id: str | None = None) -> BrowserState | None: ...
 
@@ -66,6 +69,7 @@ class BrowserManager(Protocol):
         task_id: str = "",
         workflow_id: str = "",
         workflow_run_id: str = "",
+        finalize: bool = True,
     ) -> list[VideoArtifact]: ...
 
     async def get_har_data(

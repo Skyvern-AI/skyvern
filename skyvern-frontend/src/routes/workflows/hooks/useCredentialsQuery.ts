@@ -12,19 +12,23 @@ type UseQueryOptions = Omit<
 type Props = UseQueryOptions & {
   page?: number;
   page_size?: number;
+  vault_type?: string;
 };
 
 function useCredentialsQuery(props: Props = {}) {
-  const { page = 1, page_size = 25, ...queryOptions } = props;
+  const { page = 1, page_size = 25, vault_type, ...queryOptions } = props;
   const credentialGetter = useCredentialGetter();
 
   return useQuery<Array<CredentialApiResponse>>({
-    queryKey: ["credentials", page, page_size],
+    queryKey: ["credentials", page, page_size, vault_type],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.set("page", String(page));
       params.set("page_size", String(page_size));
+      if (vault_type) {
+        params.set("vault_type", vault_type);
+      }
       return client.get("/credentials", { params }).then((res) => res.data);
     },
     refetchOnMount: "always",

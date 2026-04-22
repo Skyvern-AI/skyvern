@@ -26,7 +26,7 @@ override-dependencies = [
     "authlib>=1.6.9",
     "pyasn1>=0.6.3",
     "PyJWT>=2.12.0",
-    "fastmcp>=2.14.2",
+    "fastmcp>=3.2.0",
     "mcp>=1.23.0",
     "pypdf>=6.8.0",
     "pillow>=12.1.1",
@@ -35,7 +35,7 @@ override-dependencies = [
     "starlette>=0.49.1",
     "google-cloud-aiplatform>=1.133.0",
     # Cascading overrides needed to unblock the above security constraints:
-    # fastmcp>=2.14.2 requires websockets>=15 (skyvern pins <13)
+    # fastmcp>=3.2.0 requires websockets>=15 (skyvern pins <13)
     "websockets>=15.0.1",
     # litellm/skyvern requires openai>=2 but llama-index needs <2;
     # keep openai in v1 range for llama-index compatibility

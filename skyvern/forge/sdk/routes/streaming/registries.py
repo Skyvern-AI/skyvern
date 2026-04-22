@@ -4,7 +4,7 @@ Contains registries for coordinating active WS connections (aka "channels", see
 
 NOTE: in AWS we had to turn on what amounts to sticky sessions for frontend apps,
 so that an individual frontend app instance is guaranteed to always connect to
-the same backend api instance. This is beccause the two registries here are
+the same backend api instance. This is because the two registries here are
 tied together via a `client_id` string.
 
 The tale-of-the-tape is this:
@@ -12,6 +12,11 @@ The tale-of-the-tape is this:
     - one dedicated to streaming VNC's RFB protocol
     - the other dedicated to messaging (JSON)
   - both of these channels are stateful and need to coordinate with one another
+
+Additionally, this module manages:
+  - CDP input channels for interactive browser control
+  - Stream reference counts that defer browser state cleanup while active
+    CDP streams hold references to a workflow run's browser
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import typing as t
 import structlog
 
 if t.TYPE_CHECKING:
+    from skyvern.forge.sdk.routes.streaming.cdp_input import CdpInputChannel
     from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
     from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
 
@@ -90,3 +96,55 @@ def del_message_channel(client_id: str, *, expected: MessageChannel | None = Non
         return
 
     del message_channels[client_id]
+
+
+# Stream reference counts per workflow_run_id.
+_stream_refcounts: dict[str, int] = {}
+_deferred_close_params: dict[str, bool] = {}
+
+
+def stream_ref_inc(workflow_run_id: str) -> None:
+    _stream_refcounts[workflow_run_id] = _stream_refcounts.get(workflow_run_id, 0) + 1
+
+
+async def stream_ref_dec(workflow_run_id: str) -> None:
+    count = _stream_refcounts.get(workflow_run_id, 0) - 1
+    if count <= 0:
+        _stream_refcounts.pop(workflow_run_id, None)
+        close_on_completion = _deferred_close_params.pop(workflow_run_id, None)
+        if close_on_completion is not None:
+            from skyvern.forge import app
+
+            browser_state = app.BROWSER_MANAGER.pages.get(workflow_run_id)
+            if browser_state is not None:
+                try:
+                    await browser_state.close(close_browser_on_completion=close_on_completion)
+                except Exception:
+                    LOG.warning(
+                        "stream_ref_dec: error closing deferred browser state",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+            app.BROWSER_MANAGER.evict_page(workflow_run_id)
+    else:
+        _stream_refcounts[workflow_run_id] = count
+
+
+def stream_ref_active(workflow_run_id: str) -> bool:
+    return _stream_refcounts.get(workflow_run_id, 0) > 0
+
+
+def set_deferred_close_params(workflow_run_id: str, close_browser_on_completion: bool) -> None:
+    _deferred_close_params[workflow_run_id] = close_browser_on_completion
+
+
+# a registry for CDP input channels, keyed by `client_id`
+cdp_input_channels: dict[str, CdpInputChannel] = {}
+
+
+def add_cdp_input_channel(channel: CdpInputChannel) -> None:
+    cdp_input_channels[channel.client_id] = channel
+
+
+def del_cdp_input_channel(client_id: str) -> None:
+    cdp_input_channels.pop(client_id, None)

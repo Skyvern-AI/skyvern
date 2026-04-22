@@ -112,7 +112,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
   ai_fallback: true,
-  adaptive_caching: true,
+  code_version: 2,
   run_with: "code",
   workflow_definition: {
     version: 2,
@@ -602,7 +602,7 @@ function Workflows() {
                       key: param.key,
                       value:
                         param.parameter_type === "workflow"
-                          ? param.default_value ?? ""
+                          ? (param.default_value ?? "")
                           : "",
                       description: param.description ?? null,
                     }));

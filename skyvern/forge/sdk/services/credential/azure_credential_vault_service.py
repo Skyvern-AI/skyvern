@@ -99,7 +99,7 @@ class AzureCredentialVaultService(CredentialVaultService):
         self,
         credential: Credential,
     ) -> None:
-        await app.DATABASE.delete_credential(credential.credential_id, credential.organization_id)
+        await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
         # Deleting takes several seconds, so we empty the value and delete async so customers do not have to wait
         await self._client.create_or_update_secret(
             vault_name=self._vault_name,

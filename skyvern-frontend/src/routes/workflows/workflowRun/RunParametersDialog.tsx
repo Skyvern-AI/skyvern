@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { Parameter } from "../types/workflowTypes";
+import { getOrderedRunParameters } from "../utils";
 
 type Props = {
   open: boolean;
@@ -50,11 +51,14 @@ export function RunParametersDialog({
     ]),
   );
 
-  const items = Object.entries(run?.parameters ?? {}).map(([key, value]) => {
+  const items = getOrderedRunParameters(
+    workflow?.workflow_definition.parameters,
+    run?.parameters ?? {},
+  ).map(([key, value]) => {
     const def = defByKey.get(key);
     const description =
-      def && "description" in def ? def.description ?? undefined : undefined;
-    const type = def ? def.parameter_type ?? undefined : undefined;
+      def && "description" in def ? (def.description ?? undefined) : undefined;
+    const type = def ? (def.parameter_type ?? undefined) : undefined;
     const displayValue =
       value === null || value === undefined
         ? ""

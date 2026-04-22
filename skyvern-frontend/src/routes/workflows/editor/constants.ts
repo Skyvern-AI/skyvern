@@ -15,6 +15,37 @@ export const SMTP_PASSWORD_AWS_KEY = "SKYVERN_SMTP_PASSWORD_SES";
 
 export const EMAIL_BLOCK_SENDER = "hello@skyvern.com";
 
+// Reserved parameters that are always available
+// See: skyvern/forge/sdk/workflow/models/parameter.py RESERVED_PARAMETER_KEYS
+export const GLOBAL_RESERVED_PARAMETERS = [
+  { key: "current_date", description: "Current UTC date (YYYY-MM-DD format)" },
+  {
+    key: "workflow_run_outputs",
+    description: "JSON of all block outputs collected so far",
+  },
+  {
+    key: "workflow_run_summary",
+    description: "Merged summary of all block outputs",
+  },
+  { key: "workflow_run_id", description: "Unique ID of the current run" },
+  { key: "workflow_id", description: "The workflow's ID" },
+  {
+    key: "workflow_permanent_id",
+    description: "The workflow's permanent ID",
+  },
+  { key: "workflow_title", description: "The workflow's title" },
+] as const;
+
+// Reserved parameters only available inside loop blocks
+export const LOOP_RESERVED_PARAMETERS = [
+  { key: "current_value", description: "The current item being iterated" },
+  { key: "current_item", description: "Alias for current_value" },
+  {
+    key: "current_index",
+    description: "Zero-based index of the current iteration",
+  },
+] as const;
+
 export const BITWARDEN_CLIENT_ID_AWS_SECRET_KEY = "SKYVERN_BITWARDEN_CLIENT_ID";
 export const BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY =
   "SKYVERN_BITWARDEN_CLIENT_SECRET";

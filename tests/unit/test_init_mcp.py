@@ -29,6 +29,8 @@ def test_setup_mcp_local_claude_code_uses_local_stdio(monkeypatch) -> None:
             "project": False,
             "global_config": False,
             "skip_skills": False,
+            "browser_type": None,
+            "browser_remote_debugging_url": None,
         }
     ]
 
@@ -37,7 +39,7 @@ def test_init_callback_passes_plain_database_string(monkeypatch) -> None:
     calls: list[tuple[bool, str]] = []
 
     monkeypatch.setattr(
-        "skyvern.cli.commands.init_env",
+        "skyvern.cli.init_command.init_env",
         lambda no_postgres=False, database_string="": calls.append((no_postgres, database_string)),
     )
 

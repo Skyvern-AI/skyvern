@@ -6,15 +6,18 @@ import copy
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 from urllib.parse import urlparse
 
+import json5
 import typer
+import yaml
 from dotenv import load_dotenv
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -41,6 +44,10 @@ _DEFAULT_REMOTE_URL = "https://api.skyvern.com/mcp/"
 _DEFAULT_CLAUDE_DESKTOP_BUNDLE_URL = (
     "https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb"
 )
+_JSON5_COMMENT_RE = re.compile(r"(?<!:)//|/\*")
+_JSON5_TRAILING_COMMA_RE = re.compile(r",\s*[}\]]")
+_JSON5_UNQUOTED_KEY_RE = re.compile(r"(^|[{,]\s*)([A-Za-z_$][\w$-]*)\s*:", re.MULTILINE)
+_JSON5_SINGLE_QUOTED_STRING_RE = re.compile(r"(^|[:[{,]\s*)'(?:[^'\\]|\\.)*'", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +122,8 @@ def _build_local_mcp_entry(
     base_url: str,
     use_python_path: bool = False,
     command: str | None = None,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> dict:
     """Build a stdio MCP entry for local self-hosted mode.
 
@@ -126,6 +135,10 @@ def _build_local_mcp_entry(
         env_block["SKYVERN_BASE_URL"] = base_url
     if api_key:
         env_block["SKYVERN_API_KEY"] = api_key
+    if browser_type:
+        env_block["BROWSER_TYPE"] = browser_type
+    if browser_remote_debugging_url:
+        env_block["BROWSER_REMOTE_DEBUGGING_URL"] = browser_remote_debugging_url
 
     _ = use_python_path
 
@@ -142,6 +155,58 @@ def _build_local_mcp_entry(
         "args": ["-m", "skyvern", "run", "mcp"],
         "env": env_block,
     }
+
+
+def _build_openclaw_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
+    """Build an OpenClaw remote MCP entry."""
+    entry: dict = {
+        "url": url,
+        "transport": "streamable-http",
+    }
+    if api_key:
+        entry["headers"] = {"x-api-key": api_key}
+    return entry
+
+
+def _normalize_openclaw_remote_entry(entry: dict, *, api_key: str, url: str) -> dict:
+    """Normalize an OpenClaw remote entry to `{url, transport, headers}` shape.
+
+    This repairs legacy/generic HTTP shapes that may have been copied from
+    other MCP clients by migrating non-auth `http_headers` into `headers`,
+    removing generic fields like `type`, and enforcing a transport field.
+    """
+    normalized = copy.deepcopy(entry)
+    headers = dict(normalized.get("headers") or {})
+    legacy_headers = normalized.pop("http_headers", None)
+    if isinstance(legacy_headers, dict):
+        for key, value in legacy_headers.items():
+            if key != "x-api-key":
+                headers.setdefault(key, value)
+    headers["x-api-key"] = api_key
+    normalized["headers"] = headers
+    normalized.pop("type", None)
+    normalized["transport"] = str(normalized.get("transport") or "streamable-http")
+    normalized["url"] = url
+    return normalized
+
+
+def _walk_nested_path(config: dict, path: list[str], *, create: bool = False) -> tuple[dict | None, str | None]:
+    """Walk a nested mapping path and optionally create missing nodes."""
+    node = config
+    walked: list[str] = []
+    full_path = ".".join(path)
+    for key in path:
+        walked.append(key)
+        child = node.get(key)
+        if child is None:
+            if not create:
+                return {}, None
+            child = {}
+            node[key] = child
+        if not isinstance(child, dict):
+            return None, f"Invalid nested structure: {'.'.join(walked)} in {full_path} must be a mapping."
+        node = child
+    return node, None
 
 
 def _has_api_key(entry: dict | None) -> bool:
@@ -166,6 +231,31 @@ def _mask_key(key: str) -> str:
     if len(key) > 2:
         return key[:2] + "****"
     return "****"
+
+
+def _load_yaml_config(path: Path) -> dict | None:
+    """Load a YAML config file. Returns empty dict if missing, ``None`` on parse failure."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            console.print(
+                f"[yellow]Warning: {path} is not a YAML mapping — skipping to preserve original file[/yellow]"
+            )
+            return None
+        return data
+    except Exception:
+        console.print(f"[yellow]Warning: could not parse {path} — skipping update to preserve original file[/yellow]")
+        return None
+
+
+def _save_yaml_config(path: Path, data: dict) -> None:
+    """Write a dict to a YAML config file, creating parent dirs as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
 
 def _mask_secrets(entry: dict) -> dict:
@@ -220,6 +310,27 @@ def _load_mcp_config(config_path: Path) -> tuple[dict | None, str | None]:
     return existing, None
 
 
+def _load_openclaw_config(config_path: Path) -> tuple[dict | None, str | None]:
+    """Load an OpenClaw config file, accepting OpenClaw's JSON5-on-read format.
+
+    OpenClaw accepts JSON5 syntax in `openclaw.json`. Skyvern normalizes writes
+    back to standard JSON, so comments and JSON5-only formatting are not
+    preserved when this file is rewritten.
+    """
+    if not config_path.exists():
+        return {}, None
+
+    try:
+        existing = json5.loads(config_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return None, f"Cannot parse {config_path}. Fix the JSON5/JSON and re-run."
+
+    if not isinstance(existing, dict):
+        return None, f"{config_path} must contain a top-level JSON object."
+
+    return existing, None
+
+
 def _read_mcp_config(config_path: Path) -> dict:
     """Load an MCP config or exit with a user-friendly message."""
     existing, error = _load_mcp_config(config_path)
@@ -229,10 +340,10 @@ def _read_mcp_config(config_path: Path) -> dict:
     return existing or {}
 
 
-def _find_server_key(servers: dict[str, object], preferred: str = "skyvern") -> str | None:
+def _find_server_key(servers: dict[object, object], preferred: str = "skyvern") -> str | None:
     """Find an existing server key case-insensitively."""
     for key in servers:
-        if key.lower() == preferred.lower():
+        if isinstance(key, str) and key.lower() == preferred.lower():
             return key
     return None
 
@@ -254,26 +365,13 @@ def _write_mcp_config(config_path: Path, config: dict, create_backup: bool = Tru
     return backup_path
 
 
-def _upsert_mcp_config(
-    config_path: Path,
-    tool_name: str,
-    skyvern_entry: dict,
-    server_key: str = "skyvern",
-    dry_run: bool = False,
-    yes: bool = False,
-) -> None:
-    """Read config, diff, prompt, and write. Idempotent."""
-    existing = _read_mcp_config(config_path)
-    servers = existing.setdefault("mcpServers", {})
-    resolved_server_key = _find_server_key(servers, preferred=server_key) or server_key
-    current = servers.get(resolved_server_key)
-
-    if current == skyvern_entry:
+def _preview_upsert_change(current: dict | None, new_entry: dict, tool_name: str) -> bool:
+    """Preview a config upsert and return whether a write should proceed."""
+    if current == new_entry:
         console.print(f"[green]Already configured for {tool_name} (no changes)[/green]")
-        return
+        return False
 
-    # Block any attempt to overwrite an existing API key with an empty one
-    if _has_api_key(current) and not _has_api_key(skyvern_entry):
+    if _has_api_key(current) and not _has_api_key(new_entry):
         console.print(
             "[red bold]Error:[/red bold] Existing config has an API key but the new "
             "config does not. Pass --api-key or set SKYVERN_API_KEY in your environment.",
@@ -288,7 +386,87 @@ def _upsert_mcp_config(
         console.print(f"[bold]Adding Skyvern MCP config for {tool_name}:[/bold]")
 
     console.print("\n[bold]New:[/bold]")
-    console.print(Syntax(json.dumps(_mask_secrets(skyvern_entry), indent=2), "json"))
+    console.print(Syntax(json.dumps(_mask_secrets(new_entry), indent=2), "json"))
+    return True
+
+
+def _warn_openclaw_json_normalization(config_path: Path, *, dry_run: bool) -> None:
+    """Warn before rewriting an existing OpenClaw config as standard JSON."""
+    if not config_path.exists():
+        return
+    try:
+        raw_text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if not _looks_like_json5_source(raw_text):
+        return
+
+    prefix = "Dry run note:" if dry_run else "Note:"
+    console.print(
+        "[yellow]"
+        f"{prefix} OpenClaw accepts JSON5 in {config_path.name}, but Skyvern rewrites the file as standard JSON. "
+        "Comments and JSON5-only formatting, if present, will not be preserved."
+        "[/yellow]"
+    )
+
+
+def _looks_like_json5_source(raw_text: str) -> bool:
+    stripped_text = _strip_double_quoted_strings(raw_text)
+    return bool(
+        _JSON5_COMMENT_RE.search(stripped_text)
+        or _JSON5_TRAILING_COMMA_RE.search(stripped_text)
+        or _JSON5_UNQUOTED_KEY_RE.search(stripped_text)
+        or _JSON5_SINGLE_QUOTED_STRING_RE.search(stripped_text)
+    )
+
+
+def _strip_double_quoted_strings(raw_text: str) -> str:
+    stripped: list[str] = []
+    in_string = False
+    escaped = False
+
+    for char in raw_text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            stripped.append(" ")
+            continue
+
+        if char == '"':
+            in_string = True
+            stripped.append(" ")
+            continue
+
+        stripped.append(char)
+
+    return "".join(stripped)
+
+
+def _write_openclaw_config(config_path: Path, config: dict) -> Path | None:
+    _warn_openclaw_json_normalization(config_path, dry_run=False)
+    return _write_mcp_config(config_path, config, create_backup=True)
+
+
+def _upsert_mcp_config(
+    config_path: Path,
+    tool_name: str,
+    skyvern_entry: dict,
+    server_key: str = "skyvern",
+    dry_run: bool = False,
+    yes: bool = False,
+) -> None:
+    """Read config, diff, prompt, and write. Idempotent."""
+    existing = _read_mcp_config(config_path)
+    servers = existing.setdefault("mcpServers", {})
+    resolved_server_key = _find_server_key(servers, preferred=server_key) or server_key
+    current = servers.get(resolved_server_key)
+
+    if not _preview_upsert_change(current, skyvern_entry, tool_name):
+        return
 
     if dry_run:
         console.print(f"\n[yellow]Dry run -- no changes written to {config_path}[/yellow]")
@@ -313,9 +491,17 @@ def _build_entry(
     use_python_path: bool,
     url: str | None,
     use_mcp_remote_bridge: bool = False,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> dict:
     if local:
-        return _build_local_mcp_entry(api_key, base_url, use_python_path=use_python_path)
+        return _build_local_mcp_entry(
+            api_key,
+            base_url,
+            use_python_path=use_python_path,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
+        )
     remote_url = url or _DEFAULT_REMOTE_URL
     parsed = urlparse(remote_url)
     if parsed.scheme not in ("http", "https"):
@@ -371,6 +557,8 @@ def _get_known_tools() -> list[DetectedTool]:
 
     Note: Codex is not included in the guided setup flow yet.
     Its config is TOML rather than the JSON shape used by the current setup commands.
+    OpenClaw is also excluded intentionally because it uses a nested JSON5 config
+    shape rather than the flat JSON config handled by the generic guided setup path.
     """
     return [
         DetectedTool(
@@ -527,6 +715,16 @@ def _codex_config_path() -> Path:
     return Path.home() / ".codex" / "config.toml"
 
 
+def _openclaw_config_path() -> Path:
+    config_override = os.environ.get("OPENCLAW_CONFIG_PATH")
+    if config_override:
+        return Path(config_override).expanduser()
+    # Unlike Cursor/Windsurf, OpenClaw may run directly inside WSL. Resolve the
+    # config from the current runtime's home directory so `skyvern setup
+    # openclaw` targets the same file `openclaw` reads in that environment.
+    return Path.home() / ".openclaw" / "openclaw.json"
+
+
 _PROJECT_MARKERS = (
     ".git",
     ".mcp.json",
@@ -602,6 +800,8 @@ def _run_setup(
     url: str | None,
     *,
     use_mcp_remote_bridge: bool = False,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     if tool_name == "Claude Desktop" and not local and use_mcp_remote_bridge and not _has_node_runtime():
         console.print(f"[yellow]{_claude_desktop_bundle_message()}[/yellow]")
@@ -615,6 +815,8 @@ def _run_setup(
         use_python_path=use_python_path,
         url=url,
         use_mcp_remote_bridge=use_mcp_remote_bridge,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
     )
     _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
 
@@ -768,6 +970,9 @@ def setup_guided(
                     f"[yellow]Skipping Claude Desktop JSON setup.[/yellow] {_claude_desktop_bundle_message()}"
                 )
                 continue
+            # Pass browser config from env for local mode
+            env_browser_type = os.environ.get("BROWSER_TYPE") if local else None
+            env_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if local else None
             entry = _build_entry(
                 resolved_key,
                 env_url,
@@ -775,6 +980,8 @@ def setup_guided(
                 use_python_path=use_python_path,
                 url=url,
                 use_mcp_remote_bridge=use_bridge,
+                browser_type=env_browser_type,
+                browser_remote_debugging_url=env_browser_url,
             )
             _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
             if tool.name == "Claude Code":
@@ -839,6 +1046,8 @@ def setup_claude(
     local: bool = _local_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Claude Desktop (remote mode requires Node.js; bundle is recommended otherwise)."""
     _run_setup(
@@ -851,6 +1060,8 @@ def setup_claude(
         use_python_path,
         url,
         use_mcp_remote_bridge=not local,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
     )
 
 
@@ -864,7 +1075,9 @@ def setup_claude_desktop_alias(
     url: str | None = _url_opt,
 ) -> None:
     """Backward-compatible alias for `skyvern setup claude`."""
-    setup_claude(api_key, dry_run, yes, local, use_python_path, url)
+    setup_claude(
+        api_key, dry_run, yes, local, use_python_path, url, browser_type=None, browser_remote_debugging_url=None
+    )
 
 
 @setup_app.command("claude-code")
@@ -884,13 +1097,26 @@ def setup_claude_code(
         help="Write Claude Code MCP config to ~/.claude.json even if the current directory is a project",
     ),
     skip_skills: bool = typer.Option(False, "--skip-skills", help="Don't install Claude Code skills (e.g. /qa)"),
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Claude Code and install skills (remote by default)."""
     config_path, install_skills = _claude_code_config_target(project=project, global_config=global_config)
     if not project and not global_config:
         target_label = ".mcp.json in the current project" if install_skills else "~/.claude.json"
         console.print(f"[dim]Claude Code target: {target_label}[/dim]")
-    _run_setup("Claude Code", config_path, api_key, dry_run, yes, local, use_python_path, url)
+    _run_setup(
+        "Claude Code",
+        config_path,
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
 
     if not skip_skills:
         if install_skills:
@@ -910,9 +1136,22 @@ def setup_cursor(
     local: bool = _local_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Cursor (remote by default)."""
-    _run_setup("Cursor", _cursor_config_path(), api_key, dry_run, yes, local, use_python_path, url)
+    _run_setup(
+        "Cursor",
+        _cursor_config_path(),
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
 
 
 @setup_app.command("windsurf")
@@ -923,6 +1162,274 @@ def setup_windsurf(
     local: bool = _local_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with Windsurf (remote by default)."""
-    _run_setup("Windsurf", _windsurf_config_path(), api_key, dry_run, yes, local, use_python_path, url)
+    _run_setup(
+        "Windsurf",
+        _windsurf_config_path(),
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
+
+
+def _merge_openclaw_remote_entry(current: dict | None, desired: dict) -> dict:
+    """Preserve OpenClaw-specific remote keys like timeouts when reconfiguring an existing entry."""
+    # If the existing entry is stdio-shaped, remote setup intentionally replaces
+    # it with the desired OpenClaw remote shape.
+    if not isinstance(current, dict) or "command" in current or "args" in current:
+        return desired
+    return _normalize_openclaw_remote_entry(
+        current,
+        api_key=str(desired.get("headers", {}).get("x-api-key", "")),
+        url=str(desired["url"]),
+    )
+
+
+@setup_app.command("openclaw")
+def setup_openclaw(
+    api_key: str | None = _api_key_opt,
+    dry_run: bool = _dry_run_opt,
+    yes: bool = _yes_opt,
+    local: bool = _local_opt,
+    use_python_path: bool = _python_path_opt,
+    url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
+) -> None:
+    """Register Skyvern MCP with OpenClaw (remote by default, --local for stdio)."""
+    resolved_key, env_url = _resolve_setup_credentials(api_key_flag=api_key, yes=yes, local=local)
+    entry = _build_entry(
+        resolved_key,
+        env_url,
+        local=local,
+        use_python_path=use_python_path,
+        url=url,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
+    if not local:
+        entry = _build_openclaw_mcp_entry(resolved_key, entry["url"])
+
+    config_path = _openclaw_config_path()
+    existing, error = _load_openclaw_config(config_path)
+    if error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=1)
+
+    config = existing or {}
+    servers_result, error = _walk_nested_path(config, ["mcp", "servers"], create=True)
+    if error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=1)
+    servers = cast(dict, servers_result)
+
+    server_key = _find_server_key(servers, preferred="skyvern") or "skyvern"
+    current = servers.get(server_key)
+    if current is not None and not isinstance(current, dict):
+        console.print(f"[red]Invalid existing OpenClaw MCP entry for '{server_key}'; expected a JSON object.[/red]")
+        raise typer.Exit(code=1)
+
+    next_entry = _merge_openclaw_remote_entry(current, entry) if not local else entry
+    if not _preview_upsert_change(current, next_entry, "OpenClaw"):
+        return
+
+    if dry_run:
+        _warn_openclaw_json_normalization(config_path, dry_run=True)
+        console.print(f"\n[yellow]Dry run -- no changes written to {config_path}[/yellow]")
+        return
+
+    if not yes and not typer.confirm("\nApply changes?"):
+        raise typer.Abort()
+
+    servers[server_key] = next_entry
+    backup_path = _write_openclaw_config(config_path, config)
+    console.print(f"[green]Configured OpenClaw at {config_path}[/green]")
+    if backup_path is not None:
+        console.print(f"[dim]Backup saved to {backup_path}[/dim]")
+
+
+@setup_app.command("hermes")
+def setup_hermes(
+    api_key: str | None = _api_key_opt,
+    dry_run: bool = _dry_run_opt,
+    yes: bool = _yes_opt,
+    local: bool = _local_opt,
+    url: str | None = _url_opt,
+) -> None:
+    """Register Skyvern MCP with Hermes (remote by default, --local for stdio)."""
+    env_key, env_base_url = _get_env_credentials()
+    resolved_key = api_key or env_key
+
+    if local:
+        # Local stdio mode: Hermes spawns `skyvern run mcp` as a child process
+        local_key, local_base_url = _get_local_env_credentials()
+        resolved_local_key = api_key or local_key or resolved_key or ""
+        resolved_base_url = local_base_url or ""
+        if not resolved_base_url:
+            console.print(
+                "[red]No base URL found for local mode. Set [bold]SKYVERN_BASE_URL[/bold] "
+                "(e.g. http://localhost:8000) in your environment, then retry.[/red]"
+            )
+            raise typer.Exit(code=1)
+        if not resolved_local_key:
+            console.print(
+                "[red]No API key found. Run [bold]skyvern login[/bold] or set "
+                "[bold]SKYVERN_API_KEY[/bold] in your environment, then retry.[/red]"
+            )
+            raise typer.Exit(code=1)
+        local_entry = _build_local_mcp_entry(resolved_local_key, resolved_base_url)
+        hermes_entry: dict = {
+            "command": local_entry.get("command", sys.executable),
+            "args": local_entry.get("args", ["-m", "skyvern", "run", "mcp"]),
+        }
+        if local_entry.get("env"):
+            hermes_entry["env"] = local_entry["env"]
+    else:
+        # Remote HTTP mode: Hermes connects to hosted MCP server
+        if not resolved_key:
+            console.print(
+                "[red]No API key found. Run [bold]skyvern login[/bold] or set "
+                "[bold]SKYVERN_API_KEY[/bold] in your environment, then retry.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        mcp_url = url or _DEFAULT_REMOTE_URL
+        parsed = urlparse(mcp_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            console.print(f"[red]Invalid URL: {mcp_url} (must be a full URL like https://api.skyvern.com/mcp/)[/red]")
+            raise typer.Exit(code=1)
+
+        hermes_entry = {
+            "url": mcp_url,
+            "headers": {"x-api-key": resolved_key},
+        }
+
+    # Discover all Hermes config locations: global + per-profile
+    hermes_home = Path.home() / ".hermes"
+    config_paths: list[Path] = [hermes_home / "config.yaml"]
+    profiles_dir = hermes_home / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir()):
+            profile_config = profile_dir / "config.yaml"
+            if profile_dir.is_dir() and profile_config.exists():
+                config_paths.append(profile_config)
+
+    if dry_run:
+        for cp in config_paths:
+            data = _load_yaml_config(cp)
+            if data is None:
+                console.print(f"[yellow]Skipping {cp} (could not parse)[/yellow]")
+                continue
+            servers = data.get("mcp_servers")
+            if servers is not None and not isinstance(servers, dict):
+                console.print(f"[yellow]Skipping {cp} (mcp_servers is not a mapping)[/yellow]")
+                continue
+            if servers is None:
+                data["mcp_servers"] = {}
+            server_key = _find_server_key(data["mcp_servers"], preferred="skyvern") or "skyvern"
+            data["mcp_servers"][server_key] = hermes_entry
+            masked_data = copy.deepcopy(data)
+            masked_data["mcp_servers"][server_key] = _mask_secrets(masked_data["mcp_servers"][server_key])
+            console.print(f"[bold]{cp}[/bold]")
+            console.print(Syntax(yaml.dump(masked_data, default_flow_style=False, sort_keys=False), "yaml"))
+        console.print(f"[yellow]Dry run -- no changes written to {len(config_paths)} config(s)[/yellow]")
+        return
+
+    if not yes:
+        paths_str = "\n".join(f"  - {cp}" for cp in config_paths)
+        console.print(f"[bold]Will add Skyvern MCP to {len(config_paths)} Hermes config(s):[/bold]\n{paths_str}")
+        if not typer.confirm("Apply changes?"):
+            raise typer.Abort()
+
+    updated: list[str] = []
+    backups: list[Path] = []
+    for cp in config_paths:
+        data = _load_yaml_config(cp)
+        if data is None:
+            console.print(f"[yellow]Skipping {cp} (could not parse)[/yellow]")
+            continue
+        servers = data.get("mcp_servers")
+        if servers is not None and not isinstance(servers, dict):
+            console.print(f"[yellow]Skipping {cp} (mcp_servers is not a mapping)[/yellow]")
+            continue
+        if servers is None:
+            data["mcp_servers"] = {}
+        server_key = _find_server_key(data["mcp_servers"], preferred="skyvern") or "skyvern"
+        if data["mcp_servers"].get(server_key) == hermes_entry:
+            continue
+        data["mcp_servers"][server_key] = hermes_entry
+        if cp.exists():
+            backup = _backup_config_path(cp)
+            shutil.copy2(cp, backup)
+            backups.append(backup)
+        _save_yaml_config(cp, data)
+        updated.append(str(cp))
+
+    if not updated:
+        console.print("[green]All Hermes configs are already up to date.[/green]")
+        return
+
+    masked_key = _mask_key(resolved_key) if resolved_key else "(none)"
+    updated_str = "\n".join(f"  {p}" for p in updated)
+    console.print(
+        Panel(
+            f"[bold green]Hermes configured![/bold green]\n\n"
+            f"Updated {len(updated)} config(s):\n{updated_str}\n\nAPI key: {masked_key}",
+            border_style="green",
+        )
+    )
+
+
+@setup_app.command("mcporter")
+def setup_mcporter() -> None:
+    """Show MCPorter integration status (MCPorter auto-discovers from existing MCP configs)."""
+    console.print(
+        Panel(
+            "[bold]MCPorter Integration[/bold]\n\n"
+            "MCPorter automatically discovers MCP servers from existing tool configs.\n"
+            "No additional configuration is needed — just ensure at least one tool is set up.",
+            border_style="blue",
+        )
+    )
+
+    config_checks: list[tuple[str, str, Path]] = [
+        ("Claude Desktop", "skyvern setup claude", _claude_desktop_config_path()),
+        ("Claude Code (global)", "skyvern setup claude-code --global", _claude_code_global_config_path()),
+        ("Claude Code (project)", "skyvern setup claude-code --project", _claude_code_project_config_path()),
+        ("Cursor", "skyvern setup cursor", _cursor_config_path()),
+        ("Windsurf", "skyvern setup windsurf", _windsurf_config_path()),
+    ]
+
+    found: list[str] = []
+    for name, _cmd, path in config_checks:
+        try:
+            if not path.exists():
+                continue
+            cfg, err = _load_mcp_config(path)
+            if err or not cfg:
+                continue
+            servers = cfg.get("mcpServers", {})
+            if _find_server_key(servers, "skyvern"):
+                console.print(f"  [green]\u2713[/green] {name} \u2014 {path}")
+                found.append(name)
+        except Exception:
+            continue
+
+    if found:
+        console.print(f"\n[green]MCPorter can discover Skyvern from {len(found)} config(s).[/green]")
+    else:
+        console.print(
+            "\n[yellow]No existing Skyvern MCP configs found.[/yellow]\n"
+            "Set up at least one tool first:\n"
+            "  skyvern setup cursor\n"
+            "  skyvern setup claude-code\n"
+            "  skyvern setup claude"
+        )

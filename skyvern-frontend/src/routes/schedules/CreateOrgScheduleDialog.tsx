@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,7 +14,10 @@ import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import type {
+  WorkflowApiResponse,
+  Parameter,
+} from "@/routes/workflows/types/workflowTypes";
 import {
   CRON_PRESETS,
   cronToHumanReadable,
@@ -25,6 +28,10 @@ import {
   isValidCron,
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import { cn } from "@/util/utils";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
+import { buildScheduleParametersPayload } from "@/routes/workflows/components/scheduleParameters";
+import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
 import { useCreateOrgScheduleMutation } from "./useCreateOrgScheduleMutation";
 
 type Props = {
@@ -48,6 +55,8 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
   const [scheduleName, setScheduleName] = useState("");
   const [scheduleDescription, setScheduleDescription] = useState("");
 
+  const allTimezones = useMemo(() => getTimezones(), []);
+
   const { data: workflows = [] } = useQuery<Array<WorkflowApiResponse>>({
     queryKey: ["workflows", "scheduleDialogPicker", workflowSearch],
     queryFn: async () => {
@@ -64,13 +73,65 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
     enabled: open,
   });
 
-  const allTimezones = useMemo(() => getTimezones(), []);
+  const { data: selectedWorkflowDetail } = useWorkflowQuery({
+    workflowPermanentId: selectedWorkflow?.workflow_permanent_id,
+  });
+
+  // The workflow detail (and therefore the parameter definitions) is loaded
+  // iff the resolved workflow id matches the selection. While the request is
+  // still in flight or stale, the form must not allow submission — otherwise
+  // we'd POST without `parameters` for a workflow that has required inputs
+  // and the backend would 400 with "Missing schedule parameters".
+  const workflowDetailLoaded =
+    selectedWorkflow !== null &&
+    selectedWorkflowDetail?.workflow_permanent_id ===
+      selectedWorkflow.workflow_permanent_id;
+
+  const workflowParameters = useMemo<ReadonlyArray<Parameter>>(() => {
+    if (
+      !selectedWorkflowDetail ||
+      selectedWorkflowDetail.workflow_permanent_id !==
+        selectedWorkflow?.workflow_permanent_id
+    ) {
+      return [];
+    }
+
+    return selectedWorkflowDetail.workflow_definition.parameters;
+  }, [selectedWorkflow, selectedWorkflowDetail]);
+  const {
+    values: parameters,
+    errors: parameterErrors,
+    handleChange: handleParameterChange,
+    validate: validateParameters,
+    reset: resetParameters,
+    clear: clearParameters,
+  } = useScheduleParameterState(workflowParameters);
+
+  // Re-seed parameter state when (a) the user switches workflows or
+  // (b) the parameter definitions for the currently-selected workflow
+  // arrive from a still-in-flight react-query fetch. We track the
+  // (workflowId, paramsLength) tuple in a ref so refetches that produce
+  // an identical parameter set don't clobber user-typed values.
+  const selectedWorkflowId = selectedWorkflow?.workflow_permanent_id ?? null;
+  const lastSeededRef = useRef<{ id: string | null; count: number }>({
+    id: null,
+    count: 0,
+  });
+  useEffect(() => {
+    const last = lastSeededRef.current;
+    const next = { id: selectedWorkflowId, count: workflowParameters.length };
+    if (last.id !== next.id || last.count !== next.count) {
+      lastSeededRef.current = next;
+      resetParameters();
+    }
+  }, [selectedWorkflowId, workflowParameters, resetParameters]);
+
   const filteredTimezones = useMemo(() => {
     if (timezoneFilter === null) return allTimezones;
     if (!timezoneFilter) return allTimezones;
     const lower = timezoneFilter.toLowerCase();
     return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
-  }, [allTimezones, timezoneFilter]);
+  }, [timezoneFilter, allTimezones]);
 
   const valid = isValidCron(cronExpression);
   const humanReadable = valid ? cronToHumanReadable(cronExpression) : null;
@@ -85,10 +146,17 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
     setTimezoneFilter(null);
     setScheduleName("");
     setScheduleDescription("");
+    clearParameters();
   }
 
   function handleSubmit() {
-    if (!valid || !selectedWorkflow) return;
+    if (!selectedWorkflow || !workflowDetailLoaded) return;
+    const parametersValid = validateParameters();
+    if (!valid || !parametersValid) return;
+    const payload = buildScheduleParametersPayload(
+      parameters,
+      workflowParameters,
+    );
     createMutation.mutate(
       {
         workflowPermanentId: selectedWorkflow.workflow_permanent_id,
@@ -97,6 +165,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
           timezone,
           ...(scheduleName && { name: scheduleName }),
           ...(scheduleDescription && { description: scheduleDescription }),
+          ...(payload && { parameters: payload }),
         },
       },
       {
@@ -194,6 +263,14 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
               onChange={(e) => setScheduleDescription(e.target.value)}
             />
           </div>
+
+          <ScheduleParametersSection
+            parameters={workflowParameters}
+            values={parameters}
+            onChange={handleParameterChange}
+            errors={parameterErrors}
+            disabled={createMutation.isPending}
+          />
 
           {/* Cron Presets */}
           <div className="space-y-2">
@@ -305,7 +382,9 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
             Cancel
           </Button>
           <Button
-            disabled={!valid || !selectedWorkflow || createMutation.isPending}
+            disabled={
+              !valid || !workflowDetailLoaded || createMutation.isPending
+            }
             onClick={handleSubmit}
           >
             {createMutation.isPending ? "Creating..." : "Create Schedule"}

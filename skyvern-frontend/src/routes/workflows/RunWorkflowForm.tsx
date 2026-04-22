@@ -47,7 +47,6 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -190,7 +189,7 @@ type RunWorkflowRequestBody = {
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   browser_address?: string | null;
-  run_with?: "agent" | "code" | "code_v2";
+  run_with?: "agent" | "code";
   ai_fallback?: boolean;
 };
 
@@ -265,17 +264,15 @@ function transformToWorkflowRunRequest(
   return transformed;
 }
 
-const VALID_RUN_WITH = new Set(["agent", "code", "code_v2"]);
+const VALID_RUN_WITH = new Set(["agent", "code"]);
 
 function deriveRunWith(
   workflow?: WorkflowApiResponse,
   override?: string | null,
-): "agent" | "code" | "code_v2" {
+): "agent" | "code" {
   if (override && VALID_RUN_WITH.has(override))
-    return override as "agent" | "code" | "code_v2";
-  if (workflow?.run_with === "code_v2") return "code_v2";
-  if (workflow?.adaptive_caching && workflow?.run_with === "code")
-    return "code_v2";
+    return override as "agent" | "code";
+  if (workflow?.run_with === "agent") return "agent";
   if (workflow?.run_with === "code") return "code";
   return "agent";
 }
@@ -287,7 +284,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: "agent" | "code" | "code_v2";
+  runWith: "agent" | "code";
   aiFallback: boolean | null;
 };
 
@@ -310,6 +307,14 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
 
+  const blockingParameterTypes = new Set([
+    "boolean",
+    "integer",
+    "float",
+    "file_url",
+    "json",
+  ]);
+
   const form = useForm<RunWorkflowFormType>({
     mode: "onTouched",
     reValidateMode: "onChange",
@@ -327,6 +332,13 @@ function RunWorkflowForm({
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
+
+  const formErrors = form.formState.errors;
+  const hasBlockingParameterError = workflowParameters.some(
+    (param) =>
+      blockingParameterTypes.has(param.workflow_parameter_type) &&
+      formErrors[param.key],
+  );
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -393,15 +405,6 @@ function RunWorkflowForm({
     workflowPermanentId,
     status: "published",
   });
-
-  const { data: blockScriptsV2 } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue: cacheKeyValue ? `${cacheKeyValue}:v2` : "v2",
-    workflowPermanentId,
-    status: "published",
-  });
-
-  const hasCodeV2 = Object.keys(blockScriptsV2 ?? {}).length > 0;
 
   const [hasCode, setHasCode] = useState(false);
 
@@ -509,11 +512,7 @@ function RunWorkflowForm({
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
     const hasBlockingErrors = workflowParameters.some(
       (param) =>
-        (param.workflow_parameter_type === "boolean" ||
-          param.workflow_parameter_type === "integer" ||
-          param.workflow_parameter_type === "float" ||
-          param.workflow_parameter_type === "file_url" ||
-          param.workflow_parameter_type === "json") &&
+        blockingParameterTypes.has(param.workflow_parameter_type) &&
         errors[param.key],
     );
 
@@ -563,35 +562,18 @@ function RunWorkflowForm({
 
                 return {
                   method: "POST",
-                  url: `${runsApiBaseUrl}/run/workflows`,
+                  url: `${env.runsApiBaseUrl}/run/workflows`,
                   body: transformedBody,
                   headers,
                 } satisfies ApiCommandOptions;
               }}
             />
-            {hasCodeV2 && (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={
-                  runWorkflowMutation.isPending || hasLoginBlockValidationError
-                }
-                onClick={() => {
-                  form.setValue("runWith", "code_v2");
-                  form.handleSubmit(onSubmit, handleInvalid)();
-                }}
-              >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                Run with Code 2.0
-                <span className="ml-2 rounded bg-amber-500/20 px-1.5 py-0.5 text-xs font-semibold text-amber-400">
-                  Beta
-                </span>
-              </Button>
-            )}
             <Button
               type="submit"
               disabled={
-                runWorkflowMutation.isPending || hasLoginBlockValidationError
+                runWorkflowMutation.isPending ||
+                hasLoginBlockValidationError ||
+                hasBlockingParameterError
               }
             >
               {runWorkflowMutation.isPending && (
@@ -910,12 +892,6 @@ function RunWorkflowForm({
                     generated).
                   </span>
                 ),
-                code_v2: (
-                  <span>
-                    Run this workflow with Code 2.0 (adaptive caching with
-                    self-healing scripts).
-                  </span>
-                ),
               };
               return (
                 <FormItem>
@@ -942,7 +918,6 @@ function RunWorkflowForm({
                           <SelectContent>
                             <SelectItem value="agent">Skyvern Agent</SelectItem>
                             <SelectItem value="code">Code</SelectItem>
-                            <SelectItem value="code_v2">Code 2.0</SelectItem>
                           </SelectContent>
                         </Select>
                       </FormControl>

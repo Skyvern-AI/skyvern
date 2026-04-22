@@ -27,8 +27,10 @@ Clickable elements from `{{ current_url }}`:
 ```
 
 Current URL: {{ current_url }}
+{%- if extracted_text %}
 
 Text extracted from the webpage: {{ extracted_text }}
+{%- endif %}
 
 User Navigation Payload: {{ navigation_payload }}
 

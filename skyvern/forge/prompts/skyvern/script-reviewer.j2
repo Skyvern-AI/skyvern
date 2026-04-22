@@ -5,10 +5,19 @@ You are a script reviewer for a browser automation system. Your job is to update
 2. Use 4-space indentation consistently. Never mix tabs and spaces.
 3. Return ONLY valid Python. No explanations, no comments about what you changed.
 4. Every `page.classify()` MUST have an `else` branch that calls `await page.element_fallback(navigation_goal="...")`.
-5. Add `text_patterns` derived from the page text in the episode data below.
+5. Add `text_patterns` derived from the page text in the episode data below. **NEVER include PII in text_patterns** — no email addresses, no personal names, no account numbers, no customer-specific identifiers. Use generic page structure indicators instead (form labels, button text, section headings, navigation links). Wrong: `"Welcome John Smith, user@example.com, Billing & Payments"`. Right: `"Welcome, Billing & Payments, Sign in, Logout"`.
 6. Keep classify option descriptions short (< 10 words) and mutually exclusive.
+6b. **Classify branch hygiene**:
+    - **Don't add** a branch whose actions (fills, clicks, selectors) duplicate an existing branch — unless it has **distinct `text_patterns`** that improve page detection.
+    - Branches with empty or `"N/A"` text_patterns that duplicate another branch's actions are redundant. The page is the same variant — investigate root cause (timing, page load) instead.
+    - **Consolidate**: if you see multiple existing branches with identical actions and empty/`"N/A"` text_patterns, merge them into one and remove the duplicates.
 7. **SEMANTIC SELECTORS**: Use `ai='fallback'` with label-based selectors — NEVER copy xpaths from other branches. Build selectors using `:has-text()` (case-insensitive substring match). Examples: `selector='label:has-text("Full name") input'`, `selector='button:has-text("Submit")'`. If no semantic selector is possible (complex widgets), use `ai='fallback'` with only a `prompt=`.
-8. **ACCUMULATE SELECTORS**: NEVER remove a working selector. When the same field has different labels across variants (e.g. "Website" vs "URL"), use comma-separated CSS selectors: `selector='label:has-text("Website") input, label:has-text("URL") input'`. The first match wins.
+8. **SELECTOR MANAGEMENT**:
+    a. **Accumulate across variants**: When different page variants use different labels for the same field, use comma-separated CSS selectors: `selector='label:has-text("Website") input, label:has-text("URL") input'`. The first match wins.
+    b. **Replace failed selectors**: When an episode reports a `failed_selector` (the selector that was tried and did NOT match), REMOVE that specific selector from the list and replace it with a working alternative derived from the episode's `agent_actions` data (look for `css_suggestion`, `all_attributes`, `element_id`, `element_tag`). Do NOT keep selectors that are known to fail — they add timeout delays on every run.
+    c. **Broaden element types**: If a `button:has-text("X")` selector fails, the element may not be a `<button>`. Broaden to include other clickable elements: `button:has-text("X"), input[type="submit"], a:has-text("X"), [role="button"]:has-text("X")`.
+    d. When the episode has NO `agent_actions` data (only an error message like "AI click failed"), derive the selector from the **Page Text at failure** section — look for the button/link text mentioned in the error and build a broader selector.
+    e. **Same selector succeeds in agent but fails in script**: If the agent actions show the SAME selector succeeding that the script failed on, consider what might be different. Look at the agent actions BEFORE the successful one — did the agent perform additional steps first (dismissing a popup, waiting for a page transition, filling a prerequisite field)? If so, add those steps to the script before the failing action. If no additional steps are apparent, it may be a timing/page-load issue — try adding `await page.wait(seconds=3)` before the action to give the page time to render.
 9. **PARAMETER NAMES — CRITICAL**:
     a. The **Workflow Parameter Keys** section below lists EVERY valid parameter name. `context.parameters['key']` is ONLY allowed when `key` appears in that list.
     b. **NEVER INVENT parameter names.** If a form field does not have a matching parameter key, do NOT create a `context.parameters['made_up_name']` reference. This will crash at runtime with a KeyError.
@@ -28,13 +37,54 @@ You are a script reviewer for a browser automation system. Your job is to update
        ```
 10. **URL PATTERNS**: When different variants come from different URL hosts or paths, add `url_patterns` to the `page.classify()` call for FREE Tier-0 disambiguation. Use regex on the URL path: `url_patterns={"variant_a": "example\\.com/form-a"}`. URL patterns are checked BEFORE text patterns and cost nothing.
 11. **FOR-LOOP BLOCKS**: When code runs inside a for-loop (e.g. by iterating over extracted items), every `page.click()`, `page.goto()`, or `page.download_file()` call MUST use per-iteration data to target the specific item. Never use a static selector or generic prompt that would resolve to the same element on every iteration.
-    - **File download blocks**: Use `context.download_selector()` which builds a CSS selector (e.g. `a[href*="filename.pdf"]`) from URL-like fields in the current loop value. Combine with `context.prompt` for AI fallback: `await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")`. If `download_selector()` returns `None` (no URL in loop value), fall back to a text-based selector using `context.loop_value`.
+    - **File download and navigation blocks**: Use `context.loop_item_selector()` which builds a CSS selector from the current loop value — URL path matching (e.g. `a[href*="water-act-2014"]`) or text matching (e.g. `a:has-text("Document Title")`). Combine with `context.prompt` for AI fallback: `await page.click(selector=context.loop_item_selector(), prompt=context.prompt, ai="fallback")`. Returns `None` when no viable selector can be built, which makes `page.click` fall back to AI automatically.
     - **Other blocks**: Use `context.loop_value` (dict) to build selectors. Prefer `page.goto(context.loop_value["url"])` for direct URLs, or include the item's title/identifier in the selector: `selector=f'a:has-text("{context.loop_value["title"]}")'`.
+12. **NEVER HARDCODE PER-RUN VALUES IN SELECTORS OR PROMPTS**. If a selector or prompt contains a value that varies per run (a person's name, an ID, an address, a company name), it MUST be dynamic — never a literal string. This applies even when the page shows an abbreviated form (e.g., "J. Smith") that doesn't exactly match the parameter ("John H. Smith").
+    - **How to detect**: Check the **Current Run Parameter Values** and **Past Episode Parameters** sections below. If different episodes show different values for the same parameter (e.g., `full_name: "John Smith"` in one run, `full_name: "Jane Doe"` in another), any selector referencing that name is per-run and must be dynamic.
+    - **Wrong** (hardcodes a name that changes every run):
+      ```python
+      await page.click(selector='a[aria-label="John Smith select for details"]', ai='fallback', prompt='Click provider')
+      ```
+    - **Correct — option A** (dynamic selector via f-string, with AI fallback for fuzzy matching):
+      ```python
+      await page.click(selector=f'a:has-text("{context.parameters["full_name"]}")', ai='fallback', prompt=f"Click on the entry for {context.parameters['full_name']}")
+      ```
+    - **Correct — option B** (AI-only, best when the page abbreviates or reformats the name):
+      ```python
+      await page.click(ai='proactive', prompt=f"Click on the provider entry that matches {context.parameters['full_name']}")
+      ```
+    - Use **option A** when the page shows the exact parameter value (fast, no LLM call if selector hits). Use **option B** when the page reformats/abbreviates names — the AI handles fuzzy matching that a static selector cannot.
 
 ## Block Navigation Goal
 ```
 {{ navigation_goal }}
 ```
+{% if terminate_criterion %}
+
+## Block Termination Criterion
+When this condition is met, call `await page.terminate(errors=["<error_code>: <reason>"])`:
+```
+{{ terminate_criterion }}
+```
+You MUST check for this condition using `page.classify()` or `page.extract()` and terminate inside an `if`/`elif` branch when it is satisfied. Do NOT rely on the AI fallback to handle termination — the script should detect it directly.
+{% endif %}
+{% if complete_criterion %}
+
+## Block Completion Criterion
+The block should call `await page.complete()` when this condition is met:
+```
+{{ complete_criterion }}
+```
+{% endif %}
+{% if error_code_mapping %}
+
+## Error Code Mapping
+These are the specific error codes defined for this block. When terminating, use the matching error code:
+{% for code, description in error_code_mapping.items() %}
+- **{{ code }}**: {{ description }}
+{% endfor %}
+Use these codes in `page.terminate(errors=["<ERROR_CODE>: <details>"])` when the corresponding condition is detected.
+{% endif %}
 {% if parameter_keys %}
 
 ## Workflow Parameter Keys
@@ -43,6 +93,14 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 - `{{ key }}`
 {% endfor %}
 For fields not covered by these parameters: use Python code if the value is deterministic (see "Deterministic Logic"), or `ai='proactive'` if it requires subjective judgment (see Rule 9c).
+{% endif %}
+{% if run_parameter_values %}
+
+## Current Run Parameter Values
+These are the ACTUAL values for this run. If any of these appear (even partially) in a selector or hardcoded string, that value is per-run and MUST be made dynamic (see Rule 12).
+{% for key, value in run_parameter_values.items() %}
+- `{{ key }}` = `{{ value[:80] }}{% if value|length > 80 %}…{% endif %}`
+{% endfor %}
 {% endif %}
 
 ## Existing Cached Code
@@ -74,15 +132,42 @@ The cached code failed and the AI agent took over. Here is what happened:
 {% endif %}
 - **Agent Actions After Fallback** (use these to write the NEW branch actions):
 {% if episode.agent_actions is mapping and episode.agent_actions.actions is defined %}
+{% set ns = namespace(prev_url='') %}
 {% for a in episode.agent_actions.actions %}
   {{ loop.index }}. {{ a.action_type }}: {{ a.intention or a.reasoning or "N/A" }} ({{ a.status }})
+{%- if a.page_url and loop.first %} [url: {{ a.page_url }}]{% endif %}
+{%- if a.page_url and not loop.first and a.page_url != ns.prev_url and a.seconds_since_previous and a.seconds_since_previous > 3 %} [after step {{ loop.index - 1 }}, page navigated to {{ a.page_url }} — {{ a.seconds_since_previous }}s since last action]
+{%- elif a.page_url and not loop.first and a.page_url != ns.prev_url %} [after step {{ loop.index - 1 }}, page navigated to {{ a.page_url }}]
+{%- elif a.seconds_since_previous and a.seconds_since_previous > 3 %} [{{ a.seconds_since_previous }}s since last action]{% endif %}
 {%- if a.field %} [field: {{ a.field }}]{% endif %}
 {%- if a.element_tag %} [tag: {{ a.element_tag }}]{% endif %}
 {%- if a.element_text %} [text: "{{ a.element_text }}"]{% endif %}
-{%- if a.css_suggestion %} **[USE THIS SELECTOR: `{{ a.css_suggestion }}`]**{% endif %}
+{%- if a.selector_options and a.selector_options | length > 1 %}
+    Selector options (prefer the most robust — avoid IDs that look auto-generated):
+{%- for sel, desc in a.selector_options %}
+      {{ loop.index }}. `{{ sel }}` — {{ desc }}
+{%- endfor %}
+{%- elif a.css_suggestion %} **[USE THIS SELECTOR: `{{ a.css_suggestion }}`]**{% endif %}
 {%- if a.all_attributes %} [attrs: {{ a.all_attributes | tojson }}]{% endif %}
 {%- if not a.all_attributes and a.element_attributes %} [attrs: {{ a.element_attributes | tojson }}]{% endif %}
+{%- if a.page_url %}{% set ns.prev_url = a.page_url %}{% endif %}
 {% endfor %}
+{% elif episode.agent_actions is mapping and episode.agent_actions.failed_selector is defined %}
+  **Element-level fallback** — the selector `{{ episode.agent_actions.failed_selector }}` failed.
+  - Intention: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
+  - AI clicked:
+{%- if episode.agent_actions.element_tag %} [tag: {{ episode.agent_actions.element_tag }}]{% endif %}
+{%- if episode.agent_actions.element_text %} [text: "{{ episode.agent_actions.element_text }}"]{% endif %}
+{%- if episode.agent_actions.selector_options and episode.agent_actions.selector_options | length > 1 %}
+  Selector options (prefer the most robust — avoid IDs that look auto-generated):
+{%- for sel, desc in episode.agent_actions.selector_options %}
+    {{ loop.index }}. `{{ sel }}` — {{ desc }}
+{%- endfor %}
+{%- elif episode.agent_actions.css_suggestion %} [css: `{{ episode.agent_actions.css_suggestion }}`]{% endif %}
+{%- if episode.agent_actions.all_attributes %} [attrs: {{ episode.agent_actions.all_attributes | tojson }}]{% endif %}
+{%- if episode.agent_actions.reasoning %}
+  - AI reasoning: {{ episode.agent_actions.reasoning }}{% endif %}
+  Read the AI reasoning carefully — it explains what actually happened and why. Fix the script so this interaction succeeds without AI fallback.
 {% elif episode.agent_actions is mapping and episode.agent_actions.navigation_goal is defined %}
   Surgical fallback: "{{ episode.agent_actions.navigation_goal }}" — {{ episode.agent_actions.steps_taken }} steps, completed={{ episode.agent_actions.completed }}
 {% elif episode.agent_actions %}
@@ -110,9 +195,11 @@ The following failures occurred in PREVIOUS runs and were already reviewed. Lear
 - **Error**: {{ h.error_message or "N/A" }}
 - **Reviewer fix applied**: {{ h.reviewer_output or "No fix recorded" }}
 - **Did the AI fallback succeed?**: {{ "Yes" if h.fallback_succeeded else ("No" if h.fallback_succeeded is sameas false else "Unknown") }}
+{% if h.run_parameters %}- **Run parameters**: {% for k, v in h.run_parameters.items() %}`{{ k }}={{ v[:60] }}{% if v|length > 60 %}…{% endif %}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
 {% endfor %}
 
-**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach instead of repeating the same pattern.
+**Key takeaway:** If the same error appears above multiple times, the previous fixes did NOT solve it. Try a fundamentally different approach instead of repeating the same pattern. **If different past episodes show different values for the same parameter** (e.g., different names, different IDs), the block handles per-run data — any selector or hardcoded string referencing those values must be dynamic (see Rule 12).
 {% endif %}
 
 {% if user_instructions %}
@@ -124,7 +211,31 @@ The user has provided the following instructions for fixing this script. Priorit
 {% endif %}
 
 ## Slow Page Load / Page Not Ready
-When the error or page text suggests the page wasn't ready for interaction, the script acted too soon. Signs include: blank page messages, "still on X page", loading spinners/overlays, progress indicators, or the page text showing a transitional state rather than the expected content. Fix this by adding `await page.wait(timeout_ms=5000)` **before the first action that failed**. If the existing code already has a `page.wait()` before that action and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
+When the error or page text suggests the page wasn't ready for interaction, the script acted too soon. Signs include: blank page messages, "still on X page", loading spinners/overlays, progress indicators, or the page text showing a transitional state rather than the expected content.
+
+**Where to place `page.wait()`** depends on WHY the page wasn't ready:
+
+1. **After `page.goto()` / navigation** — If the error is "blank page", "page not loaded", or the page text is empty/minimal after navigating to a URL, the page hasn't finished rendering. Add `await page.wait(timeout_ms=5000)` **after** the `page.goto()` call, before the next interaction:
+   ```python
+   await page.goto('https://example.com/login')
+   await page.wait(timeout_ms=5000)  # wait for JS-heavy page to render
+   await page.fill(selector='#username', value=..., ai='fallback', prompt='...')
+   ```
+
+2. **Before an interaction** — If the page has loaded but a specific element isn't ready yet (loading spinner, overlay, lazy-loaded section), add `await page.wait(timeout_ms=5000)` **before** the action that failed:
+   ```python
+   await page.wait(timeout_ms=5000)  # wait for element to appear
+   await page.click(selector='button:has-text("Submit")', ai='fallback', prompt='...')
+   ```
+
+If the existing code already has a `page.wait()` and it still failed, increase the timeout (e.g., 5000→8000→10000→15000).
+
+3. **Before `fill_form()` when 0 fields are found** — If the error message says "fill_form found 0 form fields", the page hasn't finished rendering its form inputs. Add `await page.wait(timeout_ms=5000)` **before** the `fill_form()` call:
+   ```python
+   await page.goto(url)
+   await page.wait(timeout_ms=5000)  # wait for form fields to render
+   await page.fill_form(context.parameters, prompt='...')
+   ```
 
 ## What to do
 
@@ -401,7 +512,7 @@ async def block_fn(page, context):
 These properties are available on the `context` object when code runs inside a for-loop:
 - `context.loop_value` — Current loop iteration value (dict). Contains the extracted data for this iteration (e.g. `{"title": "...", "download_url": "...", "unique_id": "..."}`).
 - `context.prompt` — Per-iteration navigation goal/prompt (str or None). Set automatically from the block's navigation_goal with the current loop value substituted.
-- `context.download_selector()` — Builds a CSS selector targeting a download link from `context.loop_value`. Scans the dict values for URL-like strings, extracts the filename, and returns e.g. `'a[href*="filename.pdf"]'`. Returns `None` if no URL is found — in that case, build a selector manually from `context.loop_value`.
+- `context.loop_item_selector()` — Builds a CSS selector to click the current loop item's link. Tries URL path matching first (e.g. `'a[href*="water-act-2014"]'` from path segments), then text matching (e.g. `'a:has-text("Document Title")'`). Returns `None` if no viable selector — `page.click` will fall back to AI. Works for both navigation and download blocks.
 
 ### DO NOT USE (these do NOT exist and will crash at runtime)
 - ~~`page.completed`~~ — Does NOT exist. Use `await page.complete()` to finish.

@@ -1,6 +1,5 @@
 import Dagre from "@dagrejs/dagre";
-import type { Node } from "@xyflow/react";
-import { Edge } from "@xyflow/react";
+import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
@@ -74,6 +73,7 @@ import {
   conditionalNodeDefaultData,
   createDefaultBranchConditions,
   ConditionalNode,
+  isConditionalNode,
 } from "./nodes/ConditionalNode/types";
 import {
   isLoopNode,
@@ -113,9 +113,12 @@ import {
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
-import { loginNodeDefaultData } from "./nodes/LoginNode/types";
+import { isLoginNode, loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
-import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
+import {
+  fileDownloadNodeDefaultData,
+  isFileDownloadNode,
+} from "./nodes/FileDownloadNode/types";
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   isPdfParserNode,
@@ -132,6 +135,7 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
@@ -384,7 +388,7 @@ function layout(
       ...childNodes.map((child) =>
         child.type === "loop"
           ? getLoopNodeWidth(child, nodes)
-          : child.measured?.width ?? 0,
+          : (child.measured?.width ?? 0),
       ),
     );
     const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
@@ -400,7 +404,20 @@ function layout(
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
+    // Use measured header height when available, fall back to 225 for initial render.
+    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
+    const conditionalHeaderHeight = isConditionalNode(node)
+      ? node.data._headerHeight
+      : undefined;
+    const conditionalBaseMargin = conditionalHeaderHeight
+      ? conditionalHeaderHeight + 28
+      : 225;
+    // Only add extra margin for the status row when using the fallback height,
+    // since the measured height already includes the status row content.
+    const marginy =
+      isTargetted && !conditionalHeaderHeight
+        ? conditionalBaseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
+        : conditionalBaseMargin;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
@@ -668,9 +685,9 @@ function convertToNode(
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
           // When engine is SkyvernV2, use navigation_goal as the prompt
-          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          prompt: isV2Engine ? (block.navigation_goal ?? "") : "",
           maxSteps: isV2Engine
-            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            ? (block.max_steps_per_run ?? MAX_STEPS_DEFAULT)
             : MAX_STEPS_DEFAULT,
         },
       };
@@ -819,7 +836,7 @@ function convertToNode(
       const loopVariableReference =
         block.loop_variable_reference !== null
           ? block.loop_variable_reference
-          : block.loop_over?.key ?? "";
+          : (block.loop_over?.key ?? "");
       return {
         ...identifiers,
         ...common,
@@ -847,6 +864,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           model: block.model,
         },
@@ -1520,6 +1538,7 @@ function getElements(
       extraHttpHeaders: settings.extraHttpHeaders,
       editable,
       runWith: settings.runWith,
+      codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
       label: "__start_block__",
@@ -1639,6 +1658,27 @@ function getElements(
 
   // Create top-level edges based on next_block_label (not array order!)
   // We'll filter out conditional branch blocks below by checking conditionalNodeId
+  //
+  // Detect cycles by walking the next_block_label chain (not array order, since the
+  // two can differ). React Flow crashes when rendering cyclic edge graphs.
+  const cycleBackEdgeLabels = new Set<string>();
+  {
+    const visited = new Set<string>();
+    let current = blocks[0]?.label ?? null;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const block = blocksByLabel.get(current);
+      if (!block) break;
+      const next = block.next_block_label ?? null;
+      if (next && visited.has(next)) {
+        // This block's next_block_label closes a cycle — mark it
+        cycleBackEdgeLabels.add(current);
+        break;
+      }
+      current = next;
+    }
+  }
+
   blocks.forEach((block) => {
     const sourceNode = labelToNode.get(block.label);
     if (!sourceNode || !isWorkflowBlockNode(sourceNode)) {
@@ -1653,6 +1693,10 @@ function getElements(
     // Find target block using next_block_label
     const nextLabel = block.next_block_label;
     if (nextLabel) {
+      // Skip edges that close a cycle in the next_block_label chain
+      if (cycleBackEdgeLabels.has(block.label)) {
+        return;
+      }
       const targetNode = labelToNode.get(nextLabel);
       if (targetNode) {
         edges.push(edgeWithAddButton(sourceNode.id, targetNode.id));
@@ -1676,11 +1720,13 @@ function getElements(
   if (blocks.length === 0) {
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
-    // Find the last top-level block (one with next_block_label === null and not in a branch)
-    // There might be multiple blocks with next_block_label === null (e.g., last block in nested branches)
-    // We need the one that's NOT inside any conditional
+    // Find the last top-level block: one with next_block_label === null OR
+    // one whose back-edge was skipped (cycle broken), and not in a branch
     const lastBlock = blocks.find((block) => {
-      if (block.next_block_label !== null) {
+      if (
+        block.next_block_label !== null &&
+        !cycleBackEdgeLabels.has(block.label)
+      ) {
         return false;
       }
       const node = labelToNode.get(block.label);
@@ -1771,9 +1817,9 @@ function getElements(
     const branchHidden =
       Boolean(
         conditionalNodeId &&
-          conditionalBranchId &&
-          activeBranchId &&
-          conditionalBranchId !== activeBranchId,
+        conditionalBranchId &&
+        activeBranchId &&
+        conditionalBranchId !== activeBranchId,
       ) ?? false;
 
     const nodeHidden =
@@ -2466,7 +2512,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv", // Backend will auto-detect based on file extension
+        file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
@@ -2765,7 +2811,8 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
-    runWith: "code_v2",
+    runWith: "code",
+    codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
     runSequentially: false,
@@ -2792,6 +2839,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
           ? JSON.stringify(data.extraHttpHeaders)
           : data.extraHttpHeaders,
       runWith: data.runWith,
+      codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
       runSequentially: data.runSequentially,
@@ -4018,8 +4066,9 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
-    run_with: workflow.run_with,
+    run_with: workflow.run_with ?? "agent",
     adaptive_caching: workflow.adaptive_caching ?? undefined,
+    code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
@@ -4046,11 +4095,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (node.data.navigationGoal.length === 0) {
       errors.push(`${node.data.label}: Action Instruction is required.`);
     }
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   // check loop node parameters
@@ -4067,11 +4114,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   // check task node json fields
   const taskNodes = nodes.filter(isTaskNode);
   taskNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     // Validate Task data schema JSON when enabled (value different from "null")
     if (node.data.dataSchema && node.data.dataSchema !== "null") {
       const result = TSON.parse(node.data.dataSchema);
@@ -4086,11 +4131,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const validationNodes = nodes.filter(isValidationNode);
   validationNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     if (
       node.data.completeCriterion.length === 0 &&
       node.data.terminateCriterion.length === 0
@@ -4120,6 +4163,23 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         errors.push(`${node.data.label}: Prompt is required.`);
       }
     }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const loginNodes = nodes.filter(isLoginNode);
+  loginNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const fileDownloadNodes = nodes.filter(isFileDownloadNode);
+  fileDownloadNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   const conditionalNodes = nodes.filter((node) => node.type === "conditional");

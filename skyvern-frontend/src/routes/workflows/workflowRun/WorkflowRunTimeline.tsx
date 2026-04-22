@@ -81,7 +81,7 @@ function WorkflowRunTimeline({
   const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   return (
-    <div className="min-w-0 space-y-4 rounded bg-slate-elevation1 p-4">
+    <div className="min-w-0 space-y-4 overflow-hidden rounded bg-slate-elevation1 p-4">
       <div className="grid grid-cols-2 gap-2">
         <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
           Actions: {numberOfActions}
@@ -91,7 +91,7 @@ function WorkflowRunTimeline({
         </div>
       </div>
       <ScrollArea>
-        <ScrollAreaViewport className="h-[37rem] max-h-[37rem]">
+        <ScrollAreaViewport className="h-[37rem] max-h-[37rem] [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="space-y-4 p-1">
             {workflowRunIsNotFinalized && (
               <div

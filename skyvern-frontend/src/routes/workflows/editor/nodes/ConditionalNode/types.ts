@@ -12,6 +12,7 @@ export type ConditionalNodeData = NodeBaseData & {
   branches: Array<BranchCondition>;
   activeBranchId: string | null;
   mergeLabel: string | null;
+  _headerHeight?: number; // internal: measured header card height for layout
 };
 
 export type ConditionalNode = Node<ConditionalNodeData, "conditional">;
@@ -28,7 +29,7 @@ export function createBranchCondition(
   return {
     id: overrides.id ?? nanoid(),
     criteria:
-      overrides.is_default ?? false
+      (overrides.is_default ?? false)
         ? null
         : overrides.criteria
           ? {

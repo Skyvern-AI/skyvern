@@ -226,6 +226,18 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
+        LOG.info(
+            "Deleting persisted browser session",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            browser_session_uri=browser_session_uri,
+        )
+        # S3 DeleteObject is idempotent: deleting a missing key is a no-op, so only real
+        # failures (AccessDenied, network, etc.) will raise here.
+        await self.async_client.delete_file(browser_session_uri, log_exception=True, raise_on_error=True)
+
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to S3."""
         temp_zip_file = create_named_temporary_file()
@@ -575,14 +587,22 @@ class S3Storage(BaseStorage):
         except Exception as e:
             raise PermissionError(f"No permission to access storage URI: {uri}") from e
 
-        allowed_prefixes = (
-            f"{settings.ENV}/{organization_id}/",
-            f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
-        )
-        if parsed_uri.bucket != settings.AWS_S3_BUCKET_UPLOADS or not any(
-            parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes
-        ):
-            raise PermissionError(f"No permission to access storage URI: {uri}")
+        # Uploads bucket: keys use {env}/{org}/ or downloads/{env}/{org}/
+        if parsed_uri.bucket == settings.AWS_S3_BUCKET_UPLOADS:
+            allowed_prefixes = (
+                f"{settings.ENV}/{organization_id}/",
+                f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
+            )
+            if any(parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes):
+                return
+
+        # Artifacts bucket: keys use v1/{env}/{org}/
+        if parsed_uri.bucket == settings.AWS_S3_BUCKET_ARTIFACTS:
+            artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
+            if parsed_uri.key.startswith(artifact_prefix):
+                return
+
+        raise PermissionError(f"No permission to access storage URI: {uri}")
 
     async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
         """Download a managed org-scoped file from S3."""

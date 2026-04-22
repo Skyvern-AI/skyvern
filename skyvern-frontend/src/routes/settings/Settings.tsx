@@ -17,6 +17,7 @@ import {
 import { getRuntimeApiKey } from "@/util/env";
 import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
+import { BitwardenCredentialForm } from "@/components/BitwardenCredentialForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
 import { useVersionQuery } from "@/hooks/useVersionQuery";
@@ -90,6 +91,18 @@ function Settings() {
         </CardHeader>
         <CardContent className="p-8">
           <OnePasswordTokenForm />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Bitwarden Integration</CardTitle>
+          <CardDescription>
+            Configure your Bitwarden account credentials to use your own vault
+            for credential management.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-8">
+          <BitwardenCredentialForm />
         </CardContent>
       </Card>
       <Card>

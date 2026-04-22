@@ -7,14 +7,26 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
 
+# key/salt path: md5 output is fed into PBKDF2HMAC-SHA256 (100k iterations) inside
+# _derive_key(); md5 is only a string->16-byte normalizer, so usedforsecurity=False is
+# honest. Changing the hash would invalidate every stored ciphertext, so the
+# normalizer itself is locked-in until a re-key migration.
+#
+# iv path (default_iv / self.iv below): md5 output becomes the AES-CBC IV directly,
+# so md5 *is* being used in a security-sensitive position there. But the real issue
+# is architectural — the IV is deterministic (same input string -> same IV every
+# time), which breaks AES-CBC semantic security. Swapping md5 for SHA-256 wouldn't
+# fix that. Fix requires random per-encryption IVs stored alongside ciphertext,
+# which is a breaking migration tracked separately. Those two md5() calls are left
+# without usedforsecurity=False on purpose so the alert keeps surfacing as debt.
 default_iv = hashlib.md5(b"deterministic_iv_0123456789").digest()
-default_salt = hashlib.md5(b"deterministic_salt_0123456789").digest()
+default_salt = hashlib.md5(b"deterministic_salt_0123456789", usedforsecurity=False).digest()
 
 
 class AES(BaseEncryptor):
     def __init__(self, *, secret_key: str, salt: str | None = None, iv: str | None = None) -> None:
-        self.secret_key = hashlib.md5(secret_key.encode("utf-8")).digest()
-        self.salt = hashlib.md5(salt.encode("utf-8")).digest() if salt else default_salt
+        self.secret_key = hashlib.md5(secret_key.encode("utf-8"), usedforsecurity=False).digest()
+        self.salt = hashlib.md5(salt.encode("utf-8"), usedforsecurity=False).digest() if salt else default_salt
         self.iv = hashlib.md5(iv.encode("utf-8")).digest() if iv else default_iv
 
     def method(self) -> EncryptMethod:

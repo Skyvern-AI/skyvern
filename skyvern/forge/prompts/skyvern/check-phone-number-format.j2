@@ -3,6 +3,7 @@ You need to help checking two goals:
 2. If the current value is a phone number, check whether the format of the phone number matches the required format based on the user's goals, user details, and HTML elements.
 
 There are several checkpoints to verify the format of the phone number:
+- Whether there are form validation errors near the phone input field (e.g., <mat-error>, inline error text). If present, the error message takes priority over the formatting signals below.
 - Whether the country code is already present near the phone number field (as a dropdown, input, or displayed text). If so, do NOT include the country code in the recommended number.
 - Whether the phone number should add hyphen.
 - Whether the phone number should add country code. Only add if there is NO separate country code element on the page.

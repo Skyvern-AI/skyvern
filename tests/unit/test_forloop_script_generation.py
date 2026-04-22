@@ -336,7 +336,7 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
-        mock_app.DATABASE.get_workflow_run_blocks = AsyncMock(
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
             return_value=[
                 mock_forloop_run_block,
                 mock_child_run_block,
@@ -345,8 +345,8 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
         # B1 optimization: Mock batch methods instead of individual queries
         mock_task.task_id = "task_extraction_789"
         mock_action.task_id = "task_extraction_789"
-        mock_app.DATABASE.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
-        mock_app.DATABASE.get_tasks_actions = AsyncMock(return_value=[mock_action])
+        mock_app.DATABASE.tasks.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
+        mock_app.DATABASE.tasks.get_tasks_actions = AsyncMock(return_value=[mock_action])
 
         # Call the transformation
         result = await transform_workflow_run_to_code_gen_input(
@@ -528,13 +528,13 @@ class TestForLoopScriptCompilation:
             # The generated code must compile without SyntaxError
             # This was the actual bug: 'async for' at module level
             try:
-                ast.parse(result)
+                ast.parse(result.source_code)
             except SyntaxError as e:
-                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result}")
+                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
 
             # Verify the for-loop is present inside run_workflow (not at module level)
-            assert "async for current_value in skyvern.loop" in result
-            assert "def run_workflow" in result
+            assert "async for current_value in skyvern.loop" in result.source_code
+            assert "def run_workflow" in result.source_code
 
 
 class TestForLoopInnerBlockCachedFunctions:
@@ -614,13 +614,13 @@ class TestForLoopInnerBlockCachedFunctions:
 
             # The generated code must compile without errors
             try:
-                ast.parse(result)
+                ast.parse(result.source_code)
             except SyntaxError as e:
-                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result}")
+                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
 
             # Verify the inner block's @skyvern.cached function is present
-            assert "@skyvern.cached" in result
-            assert "extract_data" in result
+            assert "@skyvern.cached" in result.source_code
+            assert "extract_data" in result.source_code
 
             # Verify create_or_update_script_block was called for both the for_loop
             # and the inner extraction block
@@ -687,12 +687,12 @@ class TestForLoopInnerBlockCachedFunctions:
 
             # Should compile fine
             try:
-                ast.parse(result)
+                ast.parse(result.source_code)
             except SyntaxError as e:
-                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result}")
+                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
 
             # No @skyvern.cached should be present since inner block had no actions
-            assert "@skyvern.cached" not in result
+            assert "@skyvern.cached" not in result.source_code
 
             # create_or_update_script_block should be called for the for_loop only,
             # NOT for the inner block
@@ -753,12 +753,12 @@ class TestForLoopInnerBlockCachedFunctions:
             )
 
             try:
-                ast.parse(result)
+                ast.parse(result.source_code)
             except SyntaxError as e:
-                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result}")
+                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
 
             # No @skyvern.cached should be generated for non-task blocks
-            assert "@skyvern.cached" not in result
+            assert "@skyvern.cached" not in result.source_code
 
     @pytest.mark.asyncio
     async def test_inner_block_labels_in_processed_labels(self) -> None:
@@ -838,15 +838,15 @@ class TestForLoopInnerBlockCachedFunctions:
 
             # Should compile fine
             try:
-                ast.parse(result)
+                ast.parse(result.source_code)
             except SyntaxError as e:
-                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result}")
+                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
 
             # The inner block should appear only once in the generated code (not duplicated
             # by the "preserve unexecuted branch" section)
-            occurrences = result.count("@skyvern.cached")
+            occurrences = result.source_code.count("@skyvern.cached")
             # There should be exactly 1 cached function (the inner block), not 2
             assert occurrences == 1, (
                 f"Expected 1 @skyvern.cached occurrence but found {occurrences}. "
-                f"Inner block may have been duplicated.\n\nGenerated code:\n{result}"
+                f"Inner block may have been duplicated.\n\nGenerated code:\n{result.source_code}"
             )

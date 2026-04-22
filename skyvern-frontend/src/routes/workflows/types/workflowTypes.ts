@@ -410,7 +410,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
   json_schema: Record<string, unknown> | null;
 };
 
@@ -600,10 +600,11 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  run_with: string | null; // 'agent', 'code', or 'code_v2'
+  run_with: string; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
   adaptive_caching: boolean | null;
+  code_version: number | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
@@ -617,7 +618,8 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: string | null; // 'agent', 'code', or 'code_v2'
+  runWith: string; // 'agent' or 'code'
+  codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
   runSequentially: boolean;

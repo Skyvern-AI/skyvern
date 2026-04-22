@@ -1,5 +1,5 @@
 import copy
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
+BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
 
 jinja_sandbox_env = SandboxedEnvironment()
 
@@ -395,7 +396,9 @@ class WorkflowRunContext:
         parameter: Parameter,
         organization: Organization,
     ) -> None:
-        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        db_credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=organization.organization_id
+        )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
@@ -518,7 +521,7 @@ class WorkflowRunContext:
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization.organization_id,
             OrganizationAuthTokenType.onepassword_service_account.value,
         )
@@ -605,13 +608,13 @@ class WorkflowRunContext:
         if item.notes:
             self._add_secret_parameter_value(parameter, "notes", item.notes)
 
-    async def register_bitwarden_login_credential_parameter_value(
+    async def _get_global_bitwarden_credentials(
         self,
-        parameter: BitwardenLoginCredentialParameter,
-        organization: Organization,
-    ) -> None:
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+    ) -> BitwardenCredentials:
         try:
-            # Get the Bitwarden login credentials from AWS secrets
             client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
                 parameter.bitwarden_client_id_aws_secret_key
             )
@@ -625,13 +628,111 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id and not settings.BITWARDEN_EMAIL:
+        return client_id, client_secret, master_password, None
+
+    async def _get_bitwarden_credential_candidates(
+        self,
+        organization: Organization,
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+    ) -> list[BitwardenCredentials]:
+        org_bw_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+            organization_id=organization.organization_id,
+            token_type=OrganizationAuthTokenType.bitwarden_credential.value,
+        )
+
+        if not org_bw_token:
+            return [await self._get_global_bitwarden_credentials(parameter)]
+
+        candidates: list[BitwardenCredentials] = [
+            (
+                None,
+                None,
+                org_bw_token.credential.master_password,
+                org_bw_token.credential.email,
+            )
+        ]
+
+        try:
+            global_credentials = await self._get_global_bitwarden_credentials(parameter)
+        except Exception:
+            LOG.info(
+                "Global Bitwarden fallback credentials are unavailable",
+                organization_id=organization.organization_id,
+            )
+            global_credentials = None
+
+        if global_credentials and global_credentials not in candidates:
+            candidates.append(global_credentials)
+
+        return candidates
+
+    @staticmethod
+    def _validate_bitwarden_credentials(
+        client_id: str | None,
+        client_secret: str | None,
+        master_password: str | None,
+        email: str | None,
+    ) -> None:
+        if not client_id and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
+        if not client_secret and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
 
+    @staticmethod
+    def _should_retry_bitwarden_with_global_credentials(error: BitwardenBaseError) -> bool:
+        error_message = str(error).lower()
+        return (
+            "timeouterror" in error_message
+            or "timed out" in error_message
+            or "new device verification" in error_message
+        )
+
+    async def _run_bitwarden_operation_with_fallback(
+        self,
+        organization: Organization,
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+        operation: Callable[[str | None, str | None, str, str | None], Awaitable[Any]],
+    ) -> tuple[Any, BitwardenCredentials]:
+        candidates = await self._get_bitwarden_credential_candidates(organization, parameter)
+        last_error: BitwardenBaseError | None = None
+
+        for index, credentials in enumerate(candidates):
+            client_id, client_secret, master_password, email = credentials
+            self._validate_bitwarden_credentials(client_id, client_secret, master_password, email)
+            assert master_password
+
+            try:
+                result = await operation(client_id, client_secret, master_password, email)
+                return result, credentials
+            except BitwardenBaseError as error:
+                last_error = error
+                has_fallback = index + 1 < len(candidates)
+                if email and has_fallback and self._should_retry_bitwarden_with_global_credentials(error):
+                    LOG.warning(
+                        "Org-level Bitwarden email auth failed, retrying with global Bitwarden credentials",
+                        organization_id=organization.organization_id,
+                        workflow_id=parameter.workflow_id,
+                        parameter_key=parameter.key,
+                        error=str(error),
+                    )
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError("No Bitwarden credential candidates available")
+
+    async def register_bitwarden_login_credential_parameter_value(
+        self,
+        parameter: BitwardenLoginCredentialParameter,
+        organization: Organization,
+    ) -> None:
         url = self._resolve_parameter_value(parameter.url_parameter_key)
         if not url and not parameter.bitwarden_item_id:
             LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
@@ -640,8 +741,13 @@ class WorkflowRunContext:
         collection_id = self._resolve_parameter_value(parameter.bitwarden_collection_id)
         item_id = self._resolve_parameter_value(parameter.bitwarden_item_id)
 
-        try:
-            secret_credentials = await BitwardenService.get_secret_value_from_url(
+        async def fetch_secret_credentials(
+            client_id: str | None,
+            client_secret: str | None,
+            master_password: str,
+            email: str | None,
+        ) -> dict[str, str]:
+            return await BitwardenService.get_secret_value_from_url(
                 client_id,
                 client_secret,
                 master_password,
@@ -650,7 +756,16 @@ class WorkflowRunContext:
                 url,
                 collection_id=collection_id,
                 item_id=item_id,
+                email=email,
             )
+
+        try:
+            secret_credentials, credentials = await self._run_bitwarden_operation_with_fallback(
+                organization,
+                parameter,
+                fetch_secret_credentials,
+            )
+            client_id, client_secret, master_password, email = credentials
             if secret_credentials:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
@@ -740,28 +855,6 @@ class WorkflowRunContext:
         parameter: BitwardenSensitiveInformationParameter,
         organization: Organization,
     ) -> None:
-        try:
-            # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
-                parameter.bitwarden_client_id_aws_secret_key
-            )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
-                parameter.bitwarden_client_secret_aws_secret_key
-            )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
-                parameter.bitwarden_master_password_aws_secret_key
-            )
-        except Exception as e:
-            LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
-            raise e
-
-        if not client_id and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client secret not found")
-        if not master_password:
-            raise ValueError("Bitwarden master password not found")
-
         bitwarden_identity_key = parameter.bitwarden_identity_key
         if self.has_parameter(parameter.bitwarden_identity_key) and self.has_value(parameter.bitwarden_identity_key):
             bitwarden_identity_key = self.values[parameter.bitwarden_identity_key]
@@ -770,8 +863,13 @@ class WorkflowRunContext:
         if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(parameter.bitwarden_collection_id):
             collection_id = self.values[parameter.bitwarden_collection_id]
 
-        try:
-            sensitive_values = await BitwardenService.get_sensitive_information_from_identity(
+        async def fetch_sensitive_values(
+            client_id: str | None,
+            client_secret: str | None,
+            master_password: str,
+            email: str | None,
+        ) -> dict[str, str]:
+            return await BitwardenService.get_sensitive_information_from_identity(
                 client_id,
                 client_secret,
                 master_password,
@@ -780,7 +878,16 @@ class WorkflowRunContext:
                 collection_id,
                 bitwarden_identity_key,
                 parameter.bitwarden_identity_fields,
+                email=email,
             )
+
+        try:
+            sensitive_values, credentials = await self._run_bitwarden_operation_with_fallback(
+                organization,
+                parameter,
+                fetch_sensitive_values,
+            )
+            client_id, client_secret, master_password, email = credentials
             if sensitive_values:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
@@ -809,28 +916,6 @@ class WorkflowRunContext:
         parameter: BitwardenCreditCardDataParameter,
         organization: Organization,
     ) -> None:
-        try:
-            # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
-                parameter.bitwarden_client_id_aws_secret_key
-            )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
-                parameter.bitwarden_client_secret_aws_secret_key
-            )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
-                parameter.bitwarden_master_password_aws_secret_key
-            )
-        except Exception as e:
-            LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
-            raise e
-
-        if not client_id and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client secret not found")
-        if not master_password:
-            raise ValueError("Bitwarden master password not found")
-
         if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
             item_id = self.values[parameter.bitwarden_item_id]
         else:
@@ -841,8 +926,13 @@ class WorkflowRunContext:
         else:
             collection_id = parameter.bitwarden_collection_id
 
-        try:
-            credit_card_data = await BitwardenService.get_credit_card_data(
+        async def fetch_credit_card_data(
+            client_id: str | None,
+            client_secret: str | None,
+            master_password: str,
+            email: str | None,
+        ) -> dict[str, str]:
+            return await BitwardenService.get_credit_card_data(
                 client_id,
                 client_secret,
                 master_password,
@@ -850,7 +940,16 @@ class WorkflowRunContext:
                 organization.bw_collection_ids,
                 collection_id,
                 item_id,
+                email=email,
             )
+
+        try:
+            credit_card_data, credentials = await self._run_bitwarden_operation_with_fallback(
+                organization,
+                parameter,
+                fetch_credit_card_data,
+            )
+            client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
                 raise ValueError("Credit card data not found in Bitwarden")
 
@@ -963,7 +1062,10 @@ class WorkflowRunContext:
             current_value = self.values[block_label]
             # only able to merge the value when the current value and the pending value are both dicts
             if isinstance(current_value, dict) and isinstance(block_reference_value, dict):
-                block_reference_value.update(current_value)
+                # Merge old into new so that new values (e.g. from the latest loop
+                # iteration) take precedence over stale ones.
+                merged = {**current_value, **block_reference_value}
+                block_reference_value = merged
             else:
                 LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
@@ -1106,7 +1208,7 @@ class WorkflowRunContext:
 
     @staticmethod
     async def _get_azure_vault_client_for_organization(organization: Organization) -> AsyncAzureVaultClient:
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential.value
         )
         if org_auth_token:

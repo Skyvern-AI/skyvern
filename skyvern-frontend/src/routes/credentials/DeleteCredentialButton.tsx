@@ -1,12 +1,14 @@
-import { DialogClose } from "@/components/ui/dialog";
 import {
+  Dialog,
+  DialogClose,
+  DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTrigger } from "@/components/ui/dialog";
 import {
   Tooltip,
   TooltipContent,

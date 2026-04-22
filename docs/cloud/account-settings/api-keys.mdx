@@ -1,7 +1,15 @@
 ---
 title: API Key
 subtitle: Authenticate programmatic access to Skyvern
+description: Find, copy, and use your Skyvern API key from the Cloud UI Settings page to authenticate REST API and SDK requests.
 slug: cloud/account-settings/api-keys
+keywords:
+  - API key
+  - x-api-key
+  - authentication
+  - settings
+  - copy
+  - regenerate
 ---
 
 Every API call to Skyvern requires an API key. The key identifies your organization and determines billing.
@@ -21,7 +29,7 @@ Treat your API key like a password. Anyone with this key can create runs, read r
 Every Skyvern API request requires the `x-api-key` header:
 
 ```bash
-curl -X POST "https://api.skyvern.com/v1/runs" \
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
   -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "url": "https://example.com", "prompt": "Extract the pricing table" }'

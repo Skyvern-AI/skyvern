@@ -1350,71 +1350,6 @@
         "x-fern-sdk-method-name": "update_workflow_folder"
       }
     },
-    "/v1/artifacts/{artifact_id}": {
-      "get": {
-        "tags": [
-          "Artifacts"
-        ],
-        "summary": "Get an artifact",
-        "description": "Get an artifact",
-        "operationId": "get_artifact_v1_artifacts__artifact_id__get",
-        "parameters": [
-          {
-            "name": "artifact_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Artifact Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved artifact",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Artifact"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Artifact not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_artifact"
-      }
-    },
     "/v1/artifacts/{artifact_id}/content": {
       "get": {
         "tags": [
@@ -1738,6 +1673,128 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/runs": {
+      "get": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Runs V2",
+        "operationId": "get_runs_v2_v1_runs_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 10,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunStatus"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 3
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive substring search (min 3 chars for trigram index).",
+              "examples": [
+                "login_url",
+                "wr_abc123"
+              ],
+              "title": "Search Key"
+            },
+            "description": "Case-insensitive substring search (min 3 chars for trigram index)."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TaskRunListItem"
+                  },
+                  "title": "Response Get Runs V2 V1 Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_runs_v2"
       }
     },
     "/v1/workflows/runs": {
@@ -2989,6 +3046,24 @@
             "description": "Number of items per page"
           },
           {
+            "name": "vault_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CredentialVaultType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "title": "Vault Type"
+            },
+            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -3141,7 +3216,21 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "update_credential"
+        "x-fern-sdk-method-name": "update_credential",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nupdated = await skyvern.update_credential(\n    credential_id=\"cred_123\",\n    name=\"My Credential\",\n    credential_type=\"password\",\n    credential={\"username\": \"user@example.com\", \"password\": \"newpassword123\"},\n)\nprint(updated)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst updated = await skyvern.updateCredential(\"cred_123\", {\n    name: \"My Credential\",\n    credential_type: \"password\",\n    credential: { username: \"user@example.com\", password: \"newpassword123\" }\n});\nconsole.log(updated);\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/credentials/{credential_id}/delete": {
@@ -3833,13 +3922,76 @@
         }
       }
     },
-    "/api/v1/schedules": {
+    "/v1/sdk/run_action": {
+      "post": {
+        "tags": [
+          "SDK"
+        ],
+        "summary": "Run an SDK action",
+        "description": "Execute a single SDK action with the specified parameters",
+        "operationId": "run_sdk_action_v1_sdk_run_action_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunSdkActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSdkActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "run_sdk_action"
+      }
+    },
+    "/v1/schedules": {
       "get": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "List Organization Schedules",
-        "operationId": "list_organization_schedules_api_v1_schedules_get",
+        "summary": "List all schedules for the organization",
+        "operationId": "schedules_list_all",
         "parameters": [
           {
             "name": "page",
@@ -3947,13 +4099,13 @@
         }
       }
     },
-    "/api/v1/workflows/{workflow_permanent_id}/schedules": {
+    "/v1/workflows/{workflow_permanent_id}/schedules": {
       "post": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "Create Workflow Schedule",
-        "operationId": "create_workflow_schedule_api_v1_workflows__workflow_permanent_id__schedules_post",
+        "summary": "Create a schedule for a workflow",
+        "operationId": "schedules_create",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4018,10 +4170,10 @@
       },
       "get": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "List Workflow Schedules",
-        "operationId": "list_workflow_schedules_api_v1_workflows__workflow_permanent_id__schedules_get",
+        "summary": "List schedules for a workflow",
+        "operationId": "schedules_list",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4075,13 +4227,13 @@
         }
       }
     },
-    "/api/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}": {
+    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}": {
       "get": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "Get Workflow Schedule",
-        "operationId": "get_workflow_schedule_api_v1_workflows__workflow_permanent_id__schedules__workflow_schedule_id__get",
+        "summary": "Get a workflow schedule by id",
+        "operationId": "schedules_get",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4145,10 +4297,10 @@
       },
       "put": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "Update Workflow Schedule",
-        "operationId": "update_workflow_schedule_api_v1_workflows__workflow_permanent_id__schedules__workflow_schedule_id__put",
+        "summary": "Update a workflow schedule",
+        "operationId": "schedules_update",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4222,10 +4374,10 @@
       },
       "delete": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "Delete Workflow Schedule Route",
-        "operationId": "delete_workflow_schedule_route_api_v1_workflows__workflow_permanent_id__schedules__workflow_schedule_id__delete",
+        "summary": "Delete a workflow schedule",
+        "operationId": "schedules_delete",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4270,11 +4422,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "boolean"
-                  },
-                  "title": "Response Delete Workflow Schedule Route Api V1 Workflows  Workflow Permanent Id  Schedules  Workflow Schedule Id  Delete"
+                  "$ref": "#/components/schemas/DeleteScheduleResponse"
                 }
               }
             }
@@ -4292,13 +4440,13 @@
         }
       }
     },
-    "/api/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable": {
+    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable": {
       "post": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "Enable Workflow Schedule",
-        "operationId": "enable_workflow_schedule_api_v1_workflows__workflow_permanent_id__schedules__workflow_schedule_id__enable_post",
+        "summary": "Enable a workflow schedule",
+        "operationId": "schedules_enable",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4361,13 +4509,13 @@
         }
       }
     },
-    "/api/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable": {
+    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable": {
       "post": {
         "tags": [
-          "agent"
+          "Schedules"
         ],
-        "summary": "Disable Workflow Schedule",
-        "operationId": "disable_workflow_schedule_api_v1_workflows__workflow_permanent_id__schedules__workflow_schedule_id__disable_post",
+        "summary": "Disable a workflow schedule",
+        "operationId": "schedules_disable",
         "parameters": [
           {
             "name": "workflow_permanent_id",
@@ -4536,6 +4684,41 @@
           "aws_key"
         ],
         "title": "AWSSecretParameterYAML"
+      },
+      "ActAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_act",
+            "title": "Type",
+            "default": "ai_act"
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "Natural language prompt for the action",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "type": "object",
+        "title": "ActAction",
+        "description": "AI act action parameters."
       },
       "Action": {
         "properties": {
@@ -6407,7 +6590,7 @@
         "properties": {
           "file": {
             "type": "string",
-            "format": "binary",
+            "contentMediaType": "application/octet-stream",
             "title": "File"
           }
         },
@@ -6874,6 +7057,60 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "ClickAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_click",
+            "title": "Type",
+            "default": "ai_click"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the click",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "ClickAction",
+        "description": "Click action parameters."
       },
       "ClickContext": {
         "properties": {
@@ -7521,6 +7758,22 @@
                 "username": "user@example.com"
               }
             ]
+          },
+          "vault_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CredentialVaultType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
+            "examples": [
+              "custom",
+              "azure_vault",
+              "bitwarden"
+            ]
           }
         },
         "type": "object",
@@ -7792,6 +8045,17 @@
               "Amazon Login"
             ]
           },
+          "vault_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CredentialVaultType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')"
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -7827,6 +8091,18 @@
             ],
             "title": "User Context",
             "description": "User-provided context describing the login sequence (e.g., 'click SSO button first')"
+          },
+          "save_browser_session_intent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Save Browser Session Intent",
+            "description": "Whether the user intends to save a browser session, regardless of test outcome"
           }
         },
         "type": "object",
@@ -7848,6 +8124,15 @@
         ],
         "title": "CredentialType",
         "description": "Type of credential stored in the system."
+      },
+      "CredentialVaultType": {
+        "type": "string",
+        "enum": [
+          "bitwarden",
+          "azure_vault",
+          "custom"
+        ],
+        "title": "CredentialVaultType"
       },
       "CreditCardCredentialResponse": {
         "properties": {
@@ -7875,6 +8160,19 @@
         ],
         "title": "CreditCardCredentialResponse",
         "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name."
+      },
+      "DeleteScheduleResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "title": "DeleteScheduleResponse"
       },
       "DeployScriptRequest": {
         "properties": {
@@ -8215,6 +8513,88 @@
           "captcha-solver"
         ],
         "title": "Extensions"
+      },
+      "ExtractAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "extract",
+            "title": "Type",
+            "default": "extract"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Extraction prompt",
+            "default": ""
+          },
+          "extract_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extract Schema",
+            "description": "Schema for extraction"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping",
+            "description": "Error code mapping for extraction"
+          },
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention",
+            "description": "The intention or goal of the extraction"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "type": "object",
+        "title": "ExtractAction",
+        "description": "Extract data action parameters."
       },
       "ExtractionBlock": {
         "properties": {
@@ -9305,7 +9685,8 @@
             "title": "File Url"
           },
           "file_type": {
-            "$ref": "#/components/schemas/FileType"
+            "$ref": "#/components/schemas/FileType",
+            "default": "auto_detect"
           },
           "json_schema": {
             "anyOf": [
@@ -9324,8 +9705,7 @@
         "required": [
           "label",
           "output_parameter",
-          "file_url",
-          "file_type"
+          "file_url"
         ],
         "title": "FileParserBlock"
       },
@@ -9381,7 +9761,8 @@
             "title": "File Url"
           },
           "file_type": {
-            "$ref": "#/components/schemas/FileType"
+            "$ref": "#/components/schemas/FileType",
+            "default": "auto_detect"
           },
           "json_schema": {
             "anyOf": [
@@ -9399,8 +9780,7 @@
         "type": "object",
         "required": [
           "label",
-          "file_url",
-          "file_type"
+          "file_url"
         ],
         "title": "FileParserBlockYAML"
       },
@@ -9415,6 +9795,7 @@
       "FileType": {
         "type": "string",
         "enum": [
+          "auto_detect",
           "csv",
           "excel",
           "pdf",
@@ -11250,6 +11631,97 @@
         "type": "object",
         "title": "InputOrSelectContext"
       },
+      "InputTextAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_input_text",
+            "title": "Type",
+            "default": "ai_input_text"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Value to input",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the input",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "TOTP identifier for input_text actions"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL for input_text actions"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "InputTextAction",
+        "description": "Input text action parameters."
+      },
       "JinjaBranchCriteria": {
         "properties": {
           "criteria_type": {
@@ -11280,6 +11752,25 @@
         ],
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
+      },
+      "LocateElementAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "locate_element",
+            "title": "Type",
+            "default": "locate_element"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Natural language prompt to locate an element",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "LocateElementAction",
+        "description": "Locate element action parameters."
       },
       "LoginBlock": {
         "properties": {
@@ -12875,7 +13366,8 @@
           "created_at",
           "modified_at"
         ],
-        "title": "OrganizationScheduleItem"
+        "title": "OrganizationScheduleItem",
+        "description": "Compact schedule projection for the org-wide list endpoint.\n\nIntentionally omits `backend_schedule_id` — the list view is for browsing\nschedules in the dashboard, not for managing the underlying execution-backend\nbinding. Callers that need the backend id should fetch the individual\nschedule via the per-workflow get endpoint."
       },
       "OrganizationScheduleListResponse": {
         "properties": {
@@ -13204,7 +13696,7 @@
           "username"
         ],
         "title": "PasswordCredentialResponse",
-        "description": "Response model for password credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include password, TOTP secret, or TOTP identifier."
+        "description": "Response model for password credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include password or TOTP secret."
       },
       "PersistentBrowserType": {
         "type": "string",
@@ -13465,6 +13957,53 @@
         ],
         "title": "PrintPageBlockYAML"
       },
+      "PromptAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Type",
+            "default": "prompt"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "The prompt to send to the LLM"
+          },
+          "response_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Schema",
+            "description": "Optional JSON schema to structure the response"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "PromptAction",
+        "description": "Prompt action parameters."
+      },
       "PromptBranchCriteria": {
         "properties": {
           "criteria_type": {
@@ -13557,6 +14096,130 @@
           "ui-tars"
         ],
         "title": "RunEngine"
+      },
+      "RunSdkActionRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url",
+            "description": "The URL where the action should be executed"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "The browser session ID"
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The browser address"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id",
+            "description": "Optional workflow run ID to continue an existing workflow run"
+          },
+          "action": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClickAction"
+              },
+              {
+                "$ref": "#/components/schemas/InputTextAction"
+              },
+              {
+                "$ref": "#/components/schemas/SelectOptionAction"
+              },
+              {
+                "$ref": "#/components/schemas/UploadFileAction"
+              },
+              {
+                "$ref": "#/components/schemas/ActAction"
+              },
+              {
+                "$ref": "#/components/schemas/ExtractAction"
+              },
+              {
+                "$ref": "#/components/schemas/LocateElementAction"
+              },
+              {
+                "$ref": "#/components/schemas/ValidateAction"
+              },
+              {
+                "$ref": "#/components/schemas/PromptAction"
+              }
+            ],
+            "title": "Action",
+            "description": "The action to execute with its specific parameters",
+            "discriminator": {
+              "propertyName": "type",
+              "mapping": {
+                "ai_act": "#/components/schemas/ActAction",
+                "ai_click": "#/components/schemas/ClickAction",
+                "ai_input_text": "#/components/schemas/InputTextAction",
+                "ai_select_option": "#/components/schemas/SelectOptionAction",
+                "ai_upload_file": "#/components/schemas/UploadFileAction",
+                "extract": "#/components/schemas/ExtractAction",
+                "locate_element": "#/components/schemas/LocateElementAction",
+                "prompt": "#/components/schemas/PromptAction",
+                "validate": "#/components/schemas/ValidateAction"
+              }
+            }
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "action"
+        ],
+        "title": "RunSdkActionRequest",
+        "description": "Request to run a single SDK action."
+      },
+      "RunSdkActionResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id",
+            "description": "The workflow run ID used for this action"
+          },
+          "result": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result",
+            "description": "The result from the action (e.g., selector, value, extracted data)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id"
+        ],
+        "title": "RunSdkActionResponse",
+        "description": "Response from running an SDK action."
       },
       "RunStatus": {
         "type": "string",
@@ -13783,6 +14446,73 @@
         },
         "type": "object",
         "title": "SelectOption"
+      },
+      "SelectOptionAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_select_option",
+            "title": "Type",
+            "default": "ai_select_option"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Value to select",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the selection",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "SelectOptionAction",
+        "description": "Select option action parameters."
       },
       "SendEmailBlock": {
         "properties": {
@@ -14822,6 +15552,92 @@
         ],
         "title": "TaskBlockYAML"
       },
+      "TaskRunListItem": {
+        "properties": {
+          "task_run_id": {
+            "type": "string",
+            "title": "Task Run Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "task_run_type": {
+            "type": "string",
+            "title": "Task Run Type"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "script_run": {
+            "type": "boolean",
+            "title": "Script Run",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_run_id",
+          "run_id",
+          "task_run_type",
+          "status",
+          "created_at"
+        ],
+        "title": "TaskRunListItem",
+        "description": "Lightweight run-history item backed by the task_runs table."
+      },
       "TaskRunRequest": {
         "properties": {
           "prompt": {
@@ -14851,8 +15667,8 @@
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "\nThe engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
-            "default": "skyvern-2.0"
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
+            "default": "skyvern-1.0"
           },
           "title": {
             "anyOf": [
@@ -15095,7 +15911,7 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether to run the task with agent or code.",
+            "description": "Whether to run the task with agent or code. Null means use the default.",
             "examples": [
               "agent",
               "code"
@@ -16129,6 +16945,73 @@
         "title": "UpdateWorkflowFolderRequest",
         "description": "Request model for updating a workflow's folder assignment"
       },
+      "UploadFileAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_upload_file",
+            "title": "Type",
+            "default": "ai_upload_file"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Url",
+            "description": "File URL for upload",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the upload",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "UploadFileAction",
+        "description": "Upload file action parameters."
+      },
       "UploadFileResponse": {
         "properties": {
           "s3_uri": {
@@ -16663,6 +17546,40 @@
           "confidence_float"
         ],
         "title": "UserDefinedError"
+      },
+      "ValidateAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "validate",
+            "title": "Type",
+            "default": "validate"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Validation criteria or condition to check"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "ValidateAction",
+        "description": "Validate action parameters."
       },
       "ValidationBlock": {
         "properties": {
@@ -17439,15 +18356,9 @@
             "title": "Extra Http Headers"
           },
           "run_with": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run With"
+            "type": "string",
+            "title": "Run With",
+            "default": "agent"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -17469,6 +18380,17 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "code_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Version"
           },
           "generate_script_on_terminal": {
             "type": "boolean",
@@ -17679,15 +18601,9 @@
             "default": "published"
           },
           "run_with": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run With"
+            "type": "string",
+            "title": "Run With",
+            "default": "agent"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -17710,6 +18626,19 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "code_version": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2,
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Version"
           },
           "generate_script_on_terminal": {
             "type": "boolean",
@@ -18471,6 +19400,21 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "failure_category": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Category"
           },
           "parent_workflow_run_id": {
             "anyOf": [
@@ -19303,11 +20247,10 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether to run the workflow with agent, code, or code_v2 (adaptive caching).",
+            "description": "Whether to run the workflow with agent or code. Null inherits from the workflow setting.",
             "examples": [
               "agent",
-              "code",
-              "code_v2"
+              "code"
             ]
           }
         },
@@ -19578,20 +20521,13 @@
             "description": "Type of run - always workflow_run for workflow runs"
           },
           "run_with": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
             "title": "Run With",
-            "description": "Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching)",
+            "description": "Whether the workflow run was executed with agent or code",
+            "default": "agent",
             "examples": [
               "agent",
-              "code",
-              "code_v2"
+              "code"
             ]
           },
           "ai_fallback": {
@@ -19708,9 +20644,11 @@
         "enum": [
           "manual",
           "api",
-          "scheduled"
+          "scheduled",
+          "webhook"
         ],
-        "title": "WorkflowRunTriggerType"
+        "title": "WorkflowRunTriggerType",
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
       },
       "WorkflowSchedule": {
         "properties": {

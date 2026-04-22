@@ -22,6 +22,8 @@ type Props = {
     cardBrand: string;
     cardHolderName: string;
   }) => void;
+  /** Slot rendered right after Name, before the separator */
+  beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
@@ -54,6 +56,7 @@ function formatCardExpirationDate(cardExpirationDate: string) {
 function CreditCardCredentialContent({
   values,
   onChange,
+  beforeCredentialFields,
   editMode,
   editingGroups,
   onEnableEditName,
@@ -90,6 +93,7 @@ function CreditCardCredentialContent({
           )}
         </div>
       </div>
+      {beforeCredentialFields}
       <Separator />
       <div className="space-y-2">
         <Label>Cardholder Name</Label>

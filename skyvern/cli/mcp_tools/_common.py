@@ -5,8 +5,45 @@ MCP tools import from here; the canonical implementations live in core/.
 
 from __future__ import annotations
 
+from typing import Any
+
 from skyvern.cli.core.artifacts import get_artifact_dir, save_artifact
 from skyvern.cli.core.result import Artifact, BrowserContext, ErrorCode, Timer, make_error, make_result
+from skyvern.client.errors import NotFoundError
+
+
+async def raw_http_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    """GET request to Skyvern API for endpoints without SDK methods.
+
+    Raises NotFoundError on 404, RuntimeError on other HTTP errors.
+    """
+    from ._session import get_skyvern
+
+    skyvern = get_skyvern()
+    # Temporary workaround: these MCP routes do not have public Fern SDK methods yet,
+    # so we reach through the generated client's private wrapper. Revisit if the SDK
+    # is regenerated or adds first-class methods for these endpoints.
+    response = await skyvern._client_wrapper.httpx_client.request(
+        path,
+        method="GET",
+        params=params or {},
+    )
+    if response.status_code == 404:
+        raise NotFoundError(body={"detail": f"Not found: {path}"})
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text
+        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+    if response.status_code == 204:
+        return {}
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text}
+
 
 __all__ = [
     "Artifact",
@@ -16,5 +53,6 @@ __all__ = [
     "get_artifact_dir",
     "make_error",
     "make_result",
+    "raw_http_get",
     "save_artifact",
 ]

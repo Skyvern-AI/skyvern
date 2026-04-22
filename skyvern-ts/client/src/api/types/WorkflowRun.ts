@@ -18,6 +18,7 @@ export interface WorkflowRun {
     totp_verification_url?: string;
     totp_identifier?: string;
     failure_reason?: string;
+    failure_category?: Record<string, unknown>[];
     parent_workflow_run_id?: string;
     workflow_title?: string;
     max_screenshot_scrolls?: number;
@@ -29,6 +30,8 @@ export interface WorkflowRun {
     sequential_key?: string;
     ai_fallback?: boolean;
     code_gen?: boolean;
+    trigger_type?: Skyvern.WorkflowRunTriggerType;
+    workflow_schedule_id?: string;
     queued_at?: string;
     started_at?: string;
     finished_at?: string;

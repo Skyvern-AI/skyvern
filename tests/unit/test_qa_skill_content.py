@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from skyvern.cli.mcp_tools.prompts import QA_TEST_CONTENT, qa_test
+from tests.unit.skill_test_helpers import first_nonempty_line_after_h1
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLED_QA_SKILL = ROOT / "skyvern" / "cli" / "skills" / "qa" / "SKILL.md"
@@ -18,19 +19,6 @@ _needs_cloud_repo = pytest.mark.skipif(
 )
 
 
-def _first_nonempty_line_after_h1(text: str) -> str:
-    after_h1 = False
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if raw_line.startswith("# "):
-            after_h1 = True
-            continue
-        if not after_h1 or not line:
-            continue
-        return line
-    return ""
-
-
 @_needs_cloud_repo
 def test_bundled_and_claude_qa_skill_match_exactly() -> None:
     assert BUNDLED_QA_SKILL.read_text(encoding="utf-8") == CLAUDE_QA_SKILL.read_text(encoding="utf-8")
@@ -38,7 +26,7 @@ def test_bundled_and_claude_qa_skill_match_exactly() -> None:
 
 def test_qa_skill_has_summary_line_before_note_comment() -> None:
     skill_text = BUNDLED_QA_SKILL.read_text(encoding="utf-8")
-    first_line_after_h1 = _first_nonempty_line_after_h1(skill_text)
+    first_line_after_h1 = first_nonempty_line_after_h1(skill_text)
     assert first_line_after_h1
     assert not first_line_after_h1.startswith("<!--")
 

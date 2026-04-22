@@ -35,15 +35,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Skyvern is a browser automation platform that uses LLMs and computer vision to interact with websites. The architecture consists of:
 
 ### Core Components
-- **Agent System** (`skyvern/agent/`): Multi-agent system for web navigation and task execution
+- **Agent System** (`skyvern/forge/agent.py`): LLM-powered agent loop for web navigation and task execution
+- **Public Library** (`skyvern/library/`): User-facing `from skyvern import Skyvern` interface and SDK-style page/browser/locator wrappers
 - **Browser Engine** (`skyvern/webeye/`): Playwright-based browser automation with computer vision
 - **Workflow Engine** (`skyvern/services/`): Orchestrates complex multi-step workflows
 - **API Layer** (`skyvern/forge/`): FastAPI-based REST API and WebSocket support
 
 ### Key Directories
-- `skyvern/agent/`: LLM-powered agents for web interaction
+- `skyvern/forge/agent.py` + `skyvern/forge/agent_functions.py`: LLM-powered agent loop for web interaction
+- `skyvern/library/`: Public `Skyvern` class and library-facing SDK wrappers
 - `skyvern/webeye/`: Browser automation, DOM scraping, action execution
 - `skyvern/forge/`: FastAPI server, API endpoints, request handling
+- `skyvern/forge/sdk/`: Internal SDK — DB, routes, schemas, workflow, copilot, executor, cache
 - `skyvern/services/`: Business logic for tasks, workflows, and browser sessions
 - `skyvern/cli/`: Command-line interface
 - `skyvern/client/`: Generated Python client SDK

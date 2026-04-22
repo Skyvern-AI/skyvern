@@ -33,8 +33,6 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "AZURE_GPT4O_MINI_API_VERSION": "",
             "ENABLE_GEMINI": "false",
             "GEMINI_API_KEY": "",
-            "ENABLE_NOVITA": "false",
-            "NOVITA_API_KEY": "",
             "LLM_KEY": "",
             "SECONDARY_LLM_KEY": "",
             "BROWSER_TYPE": "chromium-headful",
@@ -78,6 +76,7 @@ def setup_llm_providers() -> None:
             enabled_providers.append("openai")
             model_options.extend(
                 [
+                    "OPENAI_GPT5_4",
                     "OPENAI_GPT5",
                     "OPENAI_GPT5_2",
                     "OPENAI_GPT4_1",
@@ -102,10 +101,9 @@ def setup_llm_providers() -> None:
             enabled_providers.append("anthropic")
             model_options.extend(
                 [
+                    "ANTHROPIC_CLAUDE4.6_OPUS",
                     "ANTHROPIC_CLAUDE4.5_OPUS",
                     "ANTHROPIC_CLAUDE4.5_SONNET",
-                    "ANTHROPIC_CLAUDE4_OPUS",
-                    "ANTHROPIC_CLAUDE4_SONNET",
                     "ANTHROPIC_CLAUDE4.5_HAIKU",
                 ]
             )
@@ -147,82 +145,30 @@ def setup_llm_providers() -> None:
     else:
         update_or_add_env_var("ENABLE_GEMINI", "false")
 
-    console.print("\n[bold blue]--- Novita Configuration ---[/bold blue]")
-    console.print("To enable Novita, you must have a Novita API key.")
-    enable_novita = Confirm.ask("Do you want to enable Novita?")
-    if enable_novita:
-        novita_api_key = Prompt.ask("Enter your Novita API key", password=True)
-        if not novita_api_key:
-            console.print("[red]Error: Novita API key is required. Novita will not be enabled.[/red]")
+    console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
+    console.print("Use any locally-running model via Ollama (e.g. llama3, mistral, qwen).")
+    console.print("[dim]Requires Ollama running locally: https://ollama.com[/dim]")
+    enable_ollama = Confirm.ask("Do you want to enable a local Ollama model?")
+    if enable_ollama:
+        ollama_server_url = Prompt.ask(
+            "Enter Ollama server URL",
+            default="http://localhost:11434",
+        )
+        ollama_model = Prompt.ask(
+            "Enter model name (e.g. llama3.3, mistral, qwen2.5)",
+        )
+        if not ollama_model:
+            console.print("[red]Error: Model name is required. Ollama will not be enabled.[/red]")
         else:
-            update_or_add_env_var("NOVITA_API_KEY", novita_api_key)
-            update_or_add_env_var("ENABLE_NOVITA", "true")
-            enabled_providers.append("novita")
-            model_options.extend(
-                [
-                    "NOVITA_LLAMA_3_2_11B_VISION",
-                    "NOVITA_LLAMA_3_1_8B",
-                    "NOVITA_LLAMA_3_1_70B",
-                    "NOVITA_LLAMA_3_1_405B",
-                    "NOVITA_LLAMA_3_8B",
-                    "NOVITA_LLAMA_3_70B",
-                ]
-            )
+            ollama_vision = Confirm.ask("Does this model support vision?", default=False)
+            update_or_add_env_var("OLLAMA_SERVER_URL", ollama_server_url)
+            update_or_add_env_var("OLLAMA_MODEL", ollama_model)
+            update_or_add_env_var("OLLAMA_SUPPORTS_VISION", str(ollama_vision).lower())
+            update_or_add_env_var("ENABLE_OLLAMA", "true")
+            enabled_providers.append("ollama")
+            model_options.append("OLLAMA")
     else:
-        update_or_add_env_var("ENABLE_NOVITA", "false")
-
-    console.print("\n[bold blue]--- VolcEngine Configuration ---[/bold blue]")
-    console.print("To enable VolcEngine, you must have a ByteDance Doubao API key.")
-    enable_volcengine = Confirm.ask("Do you want to enable VolcEngine?")
-    if enable_volcengine:
-        volcengine_api_key = Prompt.ask("Enter your VolcEngine(ByteDance Doubao) API key", password=True)
-        if not volcengine_api_key:
-            console.print("[red]Error: VolcEngine key is required. VolcEngine will not be enabled.[/red]")
-        else:
-            update_or_add_env_var("VOLCENGINE_API_KEY", volcengine_api_key)
-            update_or_add_env_var("ENABLE_VOLCENGINE", "true")
-            enabled_providers.append("volcengine")
-            model_options.extend(
-                [
-                    "VOLCENGINE_DOUBAO_SEED_1_6",
-                    "VOLCENGINE_DOUBAO_SEED_1_6_FLASH",
-                    "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO",
-                ]
-            )
-    else:
-        update_or_add_env_var("ENABLE_VOLCENGINE", "false")
-
-    console.print("\n[bold blue]--- OpenAI-Compatible Provider Configuration ---[/bold blue]")
-    console.print("To enable an OpenAI-compatible provider, you must have a model name, API key, and API base URL.")
-    enable_openai_compatible = Confirm.ask("Do you want to enable an OpenAI-compatible provider?")
-    if enable_openai_compatible:
-        openai_compatible_model_name = Prompt.ask("Enter the model name (e.g., 'yi-34b', 'mistral-large')")
-        openai_compatible_api_key = Prompt.ask("Enter your API key", password=True)
-        openai_compatible_api_base = Prompt.ask("Enter the API base URL (e.g., 'https://api.together.xyz/v1')")
-        openai_compatible_vision = Confirm.ask("Does this model support vision?")
-
-        if not all([openai_compatible_model_name, openai_compatible_api_key, openai_compatible_api_base]):
-            console.print(
-                "[red]Error: All required fields must be populated. OpenAI-compatible provider will not be enabled.[/red]"
-            )
-        else:
-            update_or_add_env_var("OPENAI_COMPATIBLE_MODEL_NAME", openai_compatible_model_name)
-            update_or_add_env_var("OPENAI_COMPATIBLE_API_KEY", openai_compatible_api_key)
-            update_or_add_env_var("OPENAI_COMPATIBLE_API_BASE", openai_compatible_api_base)
-            if openai_compatible_vision:
-                update_or_add_env_var("OPENAI_COMPATIBLE_SUPPORTS_VISION", "true")
-            else:
-                update_or_add_env_var("OPENAI_COMPATIBLE_SUPPORTS_VISION", "false")
-
-            openai_compatible_api_version = Prompt.ask("Enter API version (optional, press enter to skip)", default="")
-            if openai_compatible_api_version:
-                update_or_add_env_var("OPENAI_COMPATIBLE_API_VERSION", openai_compatible_api_version)
-
-            update_or_add_env_var("ENABLE_OPENAI_COMPATIBLE", "true")
-            enabled_providers.append("openai_compatible")
-            model_options.append("OPENAI_COMPATIBLE")
-    else:
-        update_or_add_env_var("ENABLE_OPENAI_COMPATIBLE", "false")
+        update_or_add_env_var("ENABLE_OLLAMA", "false")
 
     if not model_options:
         capture_setup_event(

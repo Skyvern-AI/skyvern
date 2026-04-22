@@ -9,7 +9,9 @@ jobs:
     if: ${{ github.event_name == 'push' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Install Fern
         run: npm install -g fern-api
       - name: Publish Docs

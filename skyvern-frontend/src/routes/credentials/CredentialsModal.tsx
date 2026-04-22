@@ -8,8 +8,8 @@ import {
 import {
   useCredentialModalState,
   CredentialModalTypes,
+  type CredentialModalType,
 } from "./useCredentialModalState";
-import type { CredentialModalType } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -33,6 +33,7 @@ import {
   CheckCircledIcon,
   CrossCircledIcon,
   ExclamationTriangleIcon,
+  ExternalLinkIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -42,7 +43,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
-import { ExternalLinkIcon } from "@radix-ui/react-icons";
+import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -132,6 +133,10 @@ function CredentialsModal({
     type: urlType,
     setIsOpen: setUrlIsOpen,
   } = useCredentialModalState();
+  const { parsedConfig: customCredentialServiceConfig } =
+    useCustomCredentialServiceConfig();
+  const hasCustomCredentialService = !!customCredentialServiceConfig;
+  const [vaultType, setVaultType] = useState<"default" | "custom">("default");
 
   const isEditMode = !!editingCredential;
 
@@ -195,10 +200,17 @@ function CredentialsModal({
   // reset by the time onSuccess runs, so we snapshot them here.
   const saveIntentRef = useRef<{
     shouldTestAfterSave: boolean;
+    saveBrowserSessionIntent: boolean;
     testUrl: string;
     userContext: string;
     name: string;
-  }>({ shouldTestAfterSave: false, testUrl: "", userContext: "", name: "" });
+  }>({
+    shouldTestAfterSave: false,
+    saveBrowserSessionIntent: false,
+    testUrl: "",
+    userContext: "",
+    name: "",
+  });
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -251,7 +263,10 @@ function CredentialsModal({
       if (editingCredential.tested_url) {
         setTestUrl(editingCredential.tested_url);
       }
-      if (editingCredential.browser_profile_id) {
+      if (
+        editingCredential.save_browser_session_intent ||
+        !!editingCredential.browser_profile_id
+      ) {
         setTestAndSave(true);
       }
       if (editingCredential.user_context) {
@@ -306,6 +321,7 @@ function CredentialsModal({
   }, [isOpen, credentials, isEditMode, editingCredential]);
 
   function reset() {
+    setVaultType("default");
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
     setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
@@ -324,6 +340,7 @@ function CredentialsModal({
     setUserContext("");
     saveIntentRef.current = {
       shouldTestAfterSave: false,
+      saveBrowserSessionIntent: false,
       testUrl: "",
       userContext: "",
       name: "",
@@ -532,18 +549,20 @@ function CredentialsModal({
     onSuccess: async (data) => {
       const {
         shouldTestAfterSave,
+        saveBrowserSessionIntent,
         testUrl: capturedTestUrl,
         userContext: capturedUserContext,
       } = saveIntentRef.current;
 
-      // Save metadata (tested_url, user_context) on the credential via PATCH
-      if (capturedTestUrl || capturedUserContext) {
+      // Save metadata (tested_url, user_context, save_browser_session_intent) on the credential via PATCH
+      if (capturedTestUrl || capturedUserContext || saveBrowserSessionIntent) {
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           await client.patch(`/credentials/${data.credential_id}`, {
             name: data.name,
             ...(capturedTestUrl && { tested_url: capturedTestUrl }),
             user_context: capturedUserContext?.trim() || null,
+            save_browser_session_intent: saveBrowserSessionIntent,
           });
         } catch {
           // Best-effort — credential was created, URL is just metadata
@@ -606,12 +625,13 @@ function CredentialsModal({
     onSuccess: async () => {
       const {
         shouldTestAfterSave,
+        saveBrowserSessionIntent,
         testUrl: capturedTestUrl,
         userContext: capturedUserContext,
         name: capturedName,
       } = saveIntentRef.current;
 
-      // Persist metadata (tested_url, user_context) via PATCH
+      // Persist metadata (tested_url, user_context, save_browser_session_intent) via PATCH
       if (editingCredential?.credential_id) {
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
@@ -621,6 +641,7 @@ function CredentialsModal({
               name: capturedName || editingCredential.name,
               ...(capturedTestUrl && { tested_url: capturedTestUrl }),
               user_context: capturedUserContext?.trim() || null,
+              save_browser_session_intent: saveBrowserSessionIntent,
             },
           );
         } catch {
@@ -680,19 +701,24 @@ function CredentialsModal({
       name,
       tested_url,
       user_context,
+      save_browser_session_intent,
     }: {
       id: string;
       name: string;
       tested_url?: string;
       user_context?: string | null;
+      save_browser_session_intent?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const body: Record<string, string | null> = { name };
+      const body: Record<string, string | boolean | null> = { name };
       if (tested_url) {
         body.tested_url = tested_url;
       }
       if (user_context !== undefined) {
         body.user_context = user_context;
+      }
+      if (save_browser_session_intent !== undefined) {
+        body.save_browser_session_intent = save_browser_session_intent;
       }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
@@ -795,6 +821,7 @@ function CredentialsModal({
           name,
           tested_url: url || undefined,
           user_context: ctx || null,
+          save_browser_session_intent: true,
         });
         return;
       }
@@ -813,6 +840,7 @@ function CredentialsModal({
           testStatus !== "completed" &&
           testUrl.trim() !== "" &&
           hasEditModeChanges,
+        saveBrowserSessionIntent: testAndSave,
         testUrl: testUrl.trim(),
         userContext: userContext.trim(),
         name,
@@ -828,6 +856,7 @@ function CredentialsModal({
           totp_type: passwordCredentialValues.totp_type,
           totp_identifier: totpIdentifier === "" ? null : totpIdentifier,
         },
+        ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
       const cardNumber = creditCardCredentialValues.cardNumber.trim();
@@ -884,6 +913,7 @@ function CredentialsModal({
           card_brand: cardBrand,
           card_holder_name: cardHolderName,
         },
+        ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     } else if (type === CredentialModalTypes.SECRET) {
       const secretValue = secretCredentialValues.secretValue.trim();
@@ -905,6 +935,7 @@ function CredentialsModal({
           secret_value: secretValue,
           secret_label: secretLabel === "" ? null : secretLabel,
         },
+        ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     }
   };
@@ -931,6 +962,27 @@ function CredentialsModal({
     return () => clearTimeout(timeout);
   }, [isTestInProgress, testMessageIndex]);
 
+  const customVaultCheckbox =
+    hasCustomCredentialService && !isEditMode ? (
+      <div className="flex items-center gap-3">
+        <Checkbox
+          id="use-custom-vault"
+          checked={vaultType === "custom"}
+          onCheckedChange={(checked) =>
+            setVaultType(checked === true ? "custom" : "default")
+          }
+          disabled={isTestInProgress}
+        />
+        <Label
+          htmlFor="use-custom-vault"
+          className="cursor-pointer text-sm font-medium"
+        >
+          Store in Custom Credential Service
+        </Label>
+        <HelpTooltip content="Store this credential in your external credential service instead of the default Skyvern vault." />
+      </div>
+    ) : undefined;
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -945,6 +997,7 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          beforeCredentialFields={customVaultCheckbox}
           afterUrl={
             <div className="space-y-3">
               <div className="flex items-center gap-3">
@@ -1054,6 +1107,7 @@ function CredentialsModal({
         <CreditCardCredentialContent
           values={creditCardCredentialValues}
           onChange={setCreditCardCredentialValues}
+          beforeCredentialFields={customVaultCheckbox}
           editMode={isEditMode}
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
@@ -1065,6 +1119,7 @@ function CredentialsModal({
       <SecretCredentialContent
         values={secretCredentialValues}
         onChange={setSecretCredentialValues}
+        beforeCredentialFields={customVaultCheckbox}
         editMode={isEditMode}
         editingGroups={editingGroups}
         onEnableEditName={handleEnableEditName}

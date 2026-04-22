@@ -82,11 +82,47 @@ export function useCustomCredentialServiceConfig() {
     },
   });
 
+  const testConnectionMutation = useMutation({
+    mutationFn: async (data: CreateCustomCredentialServiceConfigRequest) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return await client
+        .post("/credentials/custom_credential/test_connection", data)
+        .then((response) => response.data as { success: boolean });
+    },
+    onSuccess: () => {
+      toast({
+        title: "Success",
+        description: "Connection successful",
+        variant: "success",
+      });
+    },
+    onError: (error: unknown) => {
+      const resp = (error as { response?: { data?: { detail?: unknown } } })
+        ?.response;
+      const detail = resp?.data?.detail;
+      let message: string;
+      if (typeof detail === "string") {
+        message = detail;
+      } else if (Array.isArray(detail)) {
+        message = detail.map((d) => d.msg ?? JSON.stringify(d)).join("; ");
+      } else {
+        message = (error as Error)?.message || "Connection test failed";
+      }
+      toast({
+        title: "Error",
+        description: message,
+        variant: "destructive",
+      });
+    },
+  });
+
   return {
     customCredentialServiceAuthToken,
     parsedConfig,
     isLoading,
     createOrUpdateConfig: createOrUpdateConfigMutation.mutate,
     isUpdating: createOrUpdateConfigMutation.isPending,
+    testConnection: testConnectionMutation.mutate,
+    isTesting: testConnectionMutation.isPending,
   };
 }

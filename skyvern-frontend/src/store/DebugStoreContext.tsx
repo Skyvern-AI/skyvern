@@ -13,6 +13,7 @@ export type DebugStoreContextType = {
   isDebugMode: boolean;
 };
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const DebugStoreContext = createContext<
   DebugStoreContextType | undefined
 >(undefined);

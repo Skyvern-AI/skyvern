@@ -22,7 +22,7 @@ Reply in JSON format with the following keys:
         "id": str, // The id of the element to take action on. The id has to be one from the elements list. For target-less actions (SOLVE_CAPTCHA, WAIT, COMPLETE, TERMINATE, KEYPRESS), set this to null.
         "captcha_type": str, // The type of captcha for SOLVE_CAPTCHA action only. null if not SOLVE_CAPTCHA action. It's a string enum: "TEXT_CAPTCHA", "RECAPTCHA", "HCAPTCHA", "MTCAPTCHA", "FUNCAPTCHA", "CLOUDFLARE", "OTHER".
         "text": str, // Text for INPUT_TEXT action only
-        "key": str, // The keyboard key to press for KEYPRESS action only. Allowed values: "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp". null if not KEYPRESS action.
+        "key": str, // The keyboard key to press for KEYPRESS action only. Allowed values: "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp". For "0"-"9" and "a"-"z", use KEYPRESS only when no suitable element is available for INPUT_TEXT. null if not KEYPRESS action.
         "direction": str, // The direction to scroll for SCROLL action only. Allowed values: "up", "down". null if not SCROLL action.
         "file_url": str, // The url of the file to upload if applicable. This field must be present for UPLOAD_FILE but can also be present for CLICK only if the click is to upload the file. It should be null otherwise.
         "download": bool, // Can only be true for CLICK or SELECT_OPTION actions. If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.

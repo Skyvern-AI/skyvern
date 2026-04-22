@@ -1,7 +1,19 @@
 ---
 title: Error Handling
 subtitle: Handle API errors, timeouts, and configure retries
+description: Handle typed API errors, timeouts, and configure automatic retries in the Skyvern TypeScript SDK using SkyvernError, status-specific exceptions, and the built-in retry mechanism.
 slug: ts-sdk-reference/error-handling
+keywords:
+  - BadRequestError
+  - ForbiddenError
+  - NotFoundError
+  - SkyvernTimeoutError
+  - timeout
+  - retry
+  - AbortSignal
+  - polling
+  - run status
+  - failure
 ---
 
 The SDK raises typed exceptions for API errors. All errors extend `SkyvernError` and include the HTTP status code, response body, and raw response.

@@ -2,6 +2,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -35,6 +36,10 @@ type Props = {
   onUrlAutoFill?: (url: string) => void;
   /** Current URL value of the login block — skip auto-fill if already set */
   currentUrl?: string;
+  /** Called when a credential with a totp_identifier is selected to auto-fill the 2FA identifier */
+  onTotpIdentifierAutoFill?: (totpIdentifier: string) => void;
+  /** Current totp_identifier value — skip auto-fill if already set */
+  currentTotpIdentifier?: string;
 };
 
 // Function to generate a unique credential parameter key
@@ -61,6 +66,8 @@ function LoginBlockCredentialSelector({
   onChange,
   onUrlAutoFill,
   currentUrl,
+  onTotpIdentifierAutoFill,
+  currentTotpIdentifier,
 }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
@@ -130,6 +137,11 @@ function LoginBlockCredentialSelector({
     type: "credential" as const,
     hasBrowserProfile: !!credential.browser_profile_id,
     browserProfileUrl: credential.tested_url ?? null,
+    totpIdentifier:
+      credential.credential_type === "password" &&
+      "totp_identifier" in credential.credential
+        ? (credential.credential.totp_identifier ?? null)
+        : null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
@@ -159,7 +171,9 @@ function LoginBlockCredentialSelector({
     <>
       <Select
         key={value ?? "no-credential"}
-        value={isCredentialMissing ? undefined : selectedCredentialId ?? value}
+        value={
+          isCredentialMissing ? undefined : (selectedCredentialId ?? value)
+        }
         onValueChange={(newValue) => {
           if (newValue === "new") {
             setIsOpen(true);
@@ -249,6 +263,16 @@ function LoginBlockCredentialSelector({
           ) {
             onUrlAutoFill?.(selectedCredential.browserProfileUrl);
           }
+
+          // Auto-fill the 2FA identifier from the credential's totp_identifier
+          // when the field is empty.
+          if (
+            selectedCredential &&
+            !currentTotpIdentifier?.trim() &&
+            selectedCredential.totpIdentifier
+          ) {
+            onTotpIdentifierAutoFill?.(selectedCredential.totpIdentifier);
+          }
         }}
       >
         <SelectTrigger
@@ -268,6 +292,13 @@ function LoginBlockCredentialSelector({
           )}
         </SelectTrigger>
         <SelectContent>
+          <SelectItem value="new">
+            <div className="flex items-center gap-2">
+              <PlusIcon className="size-4" />
+              <span>Add new credential</span>
+            </div>
+          </SelectItem>
+          {options.length > 0 && <SelectSeparator />}
           {options.map((option) => (
             <SelectItem key={option.value} value={option.value}>
               <div className="flex items-center gap-2">
@@ -287,12 +318,6 @@ function LoginBlockCredentialSelector({
               </div>
             </SelectItem>
           ))}
-          <SelectItem value="new">
-            <div className="flex items-center gap-2">
-              <PlusIcon className="size-4" />
-              <span>Add new credential</span>
-            </div>
-          </SelectItem>
         </SelectContent>
       </Select>
       <CredentialsModal
