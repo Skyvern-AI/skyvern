@@ -5,7 +5,6 @@ import os
 import pathlib
 import platform
 import random
-import re
 import shutil
 import socket
 import subprocess
@@ -30,7 +29,7 @@ from skyvern.exceptions import UnknownBrowserType, UnknownErrorWhileCreatingBrow
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
+from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy, is_valid_proxy_url
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 
@@ -306,12 +305,34 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        if settings.ENABLE_PROXY:
+        # Custom proxy URL handling: when a user provides a raw proxy URL string,
+        # it takes precedence over the ENABLE_PROXY / hosted proxy pool settings.
+        # This is intentional — custom proxy users explicitly opt out of the hosted pool.
+        # Note: we don't reuse _get_proxy_server_creds() here because Playwright's proxy API
+        # requires "server" to be scheme://host:port only (no credentials), while
+        # _get_proxy_server_creds returns the full URL as "server".
+        custom_proxy_config = None
+        if proxy_location and isinstance(proxy_location, str):
+            if is_valid_proxy_url(proxy_location):
+                parsed = urlparse(proxy_location)
+                custom_proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else ""),
+                }
+                if parsed.username:
+                    custom_proxy_config["username"] = parsed.username
+                if parsed.password:
+                    custom_proxy_config["password"] = parsed.password
+            else:
+                LOG.warning("Invalid custom proxy URL, ignoring", proxy_location=proxy_location)
+
+        if custom_proxy_config:
+            args["proxy"] = custom_proxy_config
+        elif settings.ENABLE_PROXY:
             proxy_config = setup_proxy()
             if proxy_config:
                 args["proxy"] = proxy_config
 
-        if proxy_location:
+        if proxy_location and not custom_proxy_config and isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
         return args
@@ -352,7 +373,7 @@ class BrowserContextFactory:
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
-            if proxy_location is not None:
+            if proxy_location is not None and isinstance(proxy_location, ProxyLocation):
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
@@ -382,7 +403,7 @@ def setup_proxy() -> dict | None:
 
     valid_proxies = []
     for proxy in proxy_servers:
-        if _is_valid_proxy_url(proxy):
+        if is_valid_proxy_url(proxy):
             valid_proxies.append(proxy)
         else:
             LOG.warning(f"Invalid proxy URL format: {proxy}")
@@ -405,17 +426,6 @@ def setup_proxy() -> dict | None:
     except Exception as e:
         LOG.warning(f"Error setting up proxy: {e}. Continuing without proxy...")
         return None
-
-
-def _is_valid_proxy_url(url: str) -> bool:
-    PROXY_PATTERN = re.compile(r"^(http|https|socks5):\/\/([^:@]+(:[^@]*)?@)?[^\s:\/]+(:\d+)?$")
-    try:
-        parsed = urlparse(url)
-        if not parsed.scheme or not parsed.netloc:
-            return False
-        return bool(PROXY_PATTERN.match(url))
-    except Exception:
-        return False
 
 
 def _get_proxy_server_creds(proxy: str) -> dict:
