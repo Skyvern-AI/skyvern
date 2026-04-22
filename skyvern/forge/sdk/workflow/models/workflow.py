@@ -157,6 +157,17 @@ class WorkflowRunStatus(StrEnum):
             WorkflowRunStatus.completed,
         ]
 
+    def is_final_excluding_canceled(self) -> bool:
+        """Like :meth:`is_final` but excludes ``canceled``.
+
+        For callers that can't distinguish a legitimate user/block cancel from
+        a synthetic ``canceled`` written as a last-resort fallback — e.g. the
+        copilot tool reading the row AFTER ``mark_workflow_run_as_canceled_if_not_final``
+        has run. Callers that want to trust a legitimate ``canceled`` must read
+        the row BEFORE invoking any cancel helper.
+        """
+        return self.is_final() and self is not WorkflowRunStatus.canceled
+
 
 class WorkflowRun(BaseModel):
     workflow_run_id: str
@@ -244,6 +255,7 @@ class WorkflowRunResponseBase(BaseModel):
     workflow_run_id: str
     status: WorkflowRunStatus
     failure_reason: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None

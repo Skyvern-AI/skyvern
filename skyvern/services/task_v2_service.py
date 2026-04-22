@@ -455,7 +455,7 @@ async def initialize_task_v2_metadata(
     return task_v2
 
 
-@traced()
+@traced(name="skyvern.task_v2.run")
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,

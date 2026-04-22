@@ -58,6 +58,10 @@ from skyvern.forge.sdk.workflow.models.block import (
     WaitBlock,
     WorkflowTriggerBlock,
 )
+from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
+    GoogleSheetsReadBlock,
+    GoogleSheetsWriteBlock,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     RESERVED_PARAMETER_KEYS,
@@ -746,6 +750,31 @@ def block_yaml_to_block(
             browser_session_id=block_yaml.browser_session_id,
             use_parent_browser_session=block_yaml.use_parent_browser_session,
             parameters=workflow_trigger_block_parameters,
+        )
+    elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_READ:
+        google_sheets_read_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return GoogleSheetsReadBlock(
+            **base_kwargs,
+            spreadsheet_url=block_yaml.spreadsheet_url,
+            sheet_name=block_yaml.sheet_name,
+            range=block_yaml.range,
+            credential_id=block_yaml.credential_id,
+            has_header_row=block_yaml.has_header_row,
+            parameters=google_sheets_read_parameters,
+        )
+    elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:
+        google_sheets_write_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return GoogleSheetsWriteBlock(
+            **base_kwargs,
+            spreadsheet_url=block_yaml.spreadsheet_url,
+            sheet_name=block_yaml.sheet_name,
+            range=block_yaml.range,
+            credential_id=block_yaml.credential_id,
+            write_mode=block_yaml.write_mode,
+            values=block_yaml.values,
+            column_mapping=block_yaml.column_mapping,
+            create_sheet_if_missing=block_yaml.create_sheet_if_missing,
+            parameters=google_sheets_write_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

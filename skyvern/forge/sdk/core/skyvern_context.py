@@ -37,6 +37,7 @@ class SkyvernContext:
     max_screenshot_scrolls: int | None = None
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
+    is_remote_browser: bool = False
     feature_flag_entries: dict[str, bool | str | None] = field(default_factory=dict)
 
     # feature flags

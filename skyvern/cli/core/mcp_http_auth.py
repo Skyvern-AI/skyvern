@@ -77,15 +77,24 @@ class _OAuthResolution:
 
 
 def _canonical_mcp_url(base_url: str | None = None) -> str:
+    """Return the canonical MCP resource URI with no trailing slash.
+
+    MCP clients canonicalize the resource URI without a trailing slash for
+    RFC 8707 audience / RFC 9728 protected-resource comparison. Advertising
+    ``.../mcp/`` caused Claude's MCP SDK to reject discovery with
+    ``Protected resource .../mcp/ does not match expected .../mcp``. The
+    audience / resource-claim validators below normalize both sides before
+    comparing so tokens issued against either form still validate.
+    """
     candidate = (base_url or settings.SKYVERN_BASE_URL or _DEFAULT_REMOTE_BASE_URL).strip()
     if not candidate:
         candidate = _DEFAULT_REMOTE_BASE_URL
     parts = urlsplit(candidate)
     path = (parts.path or "").rstrip("/")
     if path.endswith("/mcp"):
-        canonical_path = f"{path}/"
+        canonical_path = path
     else:
-        canonical_path = f"{path}/mcp/" if path else "/mcp/"
+        canonical_path = f"{path}/mcp" if path else "/mcp"
     return urlunsplit((parts.scheme, parts.netloc, canonical_path, "", ""))
 
 
@@ -151,25 +160,49 @@ def _validate_token_issuer(payload: dict[str, object], expected_issuer: str) -> 
         raise HTTPException(status_code=401, detail="Token issuer is not valid for this MCP resource")
 
 
+def _normalize_resource(resource: str) -> str:
+    """Strip a trailing slash so audience / resource comparisons are slash-agnostic.
+
+    Centralized here so ``_validate_token_audience``,
+    ``_validate_token_resource_claims``, and any future validator apply the
+    same normalization rule to both sides of the comparison.
+    """
+    return resource.rstrip("/")
+
+
 def _validate_token_audience(payload: dict[str, object], expected_resource: str) -> None:
     audience = payload.get("aud")
     if isinstance(audience, str):
         audiences = [audience]
     elif isinstance(audience, list):
+        # RFC 7519 permits `aud` as string-or-array-of-strings; silently drop
+        # any non-string items in the array rather than rejecting. This is
+        # intentionally more permissive than `_validate_token_resource_claims`
+        # (where the single `resource` claim must be a string outright):
+        # a malformed array element here shouldn't poison an otherwise valid
+        # audience list.
         audiences = [item for item in audience if isinstance(item, str)]
     else:
         audiences = []
 
-    if expected_resource not in audiences:
+    # Slash-agnostic compare: tokens whose `aud` was minted against either
+    # `.../mcp` or `.../mcp/` validate against either expected form.
+    expected_norm = _normalize_resource(expected_resource)
+    if not any(_normalize_resource(a) == expected_norm for a in audiences):
         raise HTTPException(status_code=401, detail="Token audience is not valid for this MCP resource")
 
 
 def _validate_token_resource_claims(payload: dict[str, object], expected_resource: str) -> None:
+    expected_norm = _normalize_resource(expected_resource)
     for key in _RESOURCE_CLAIM_KEYS:
         claim_value = payload.get(key)
         if claim_value is None:
             continue
-        if claim_value != expected_resource:
+        # A non-string `resource` claim is a malformed token, not a value
+        # mismatch — use a distinct error so the cause is obvious in logs.
+        if not isinstance(claim_value, str):
+            raise HTTPException(status_code=401, detail="Token resource claim must be a string")
+        if _normalize_resource(claim_value) != expected_norm:
             raise HTTPException(status_code=401, detail="Token resource is not valid for this MCP resource")
 
 

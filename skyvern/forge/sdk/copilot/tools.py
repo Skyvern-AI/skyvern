@@ -41,7 +41,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 
 LOG = structlog.get_logger()
@@ -55,7 +55,7 @@ _FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
     }
 )
 _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
-RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS = 180
+RUN_BLOCKS_DEBUG_TIMEOUT_SECONDS = 300
 
 # Detached cleanup tasks held here so the garbage collector does not drop them
 # while they still have work to do, and so the "task exception was never
@@ -112,6 +112,81 @@ def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
     exc = task.exception() if task.done() and not task.cancelled() else None
     if exc is not None:
         LOG.warning("Detached cancel fallback failed", exc_info=exc)
+
+
+async def _safe_read_workflow_run(
+    workflow_run_id: str,
+    organization_id: str,
+    *,
+    context: str,
+) -> WorkflowRun | None:
+    """Read a workflow_runs row, logging-and-returning-None on failure.
+
+    The ``context`` string distinguishes call sites in logs (e.g.
+    ``"pre-cancel"`` vs ``"post-drain"``) so a failure is attributable to
+    the specific phase of the timeout branch it fired from.
+    """
+    try:
+        return await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Workflow run re-read failed",
+            workflow_run_id=workflow_run_id,
+            context=context,
+            exc_info=True,
+        )
+        return None
+
+
+def _trusted_post_drain_status(run: WorkflowRun | None) -> str | None:
+    """Return the run's status if it is one we can trust after the cancel
+    helper has run; otherwise ``None``.
+
+    ``canceled`` is deliberately rejected because at post-drain read time we
+    can't tell a legitimate ``canceled`` (written by
+    ``_finalize_workflow_run_status`` when a block/user canceled the run)
+    apart from a synthetic ``canceled`` (written by the cancel helper's
+    fallback). Callers that need to distinguish those cases must read the row
+    BEFORE the cancel helper runs.
+    """
+    if run is None:
+        return None
+    if WorkflowRunStatus(run.status).is_final_excluding_canceled():
+        return run.status
+    return None
+
+
+def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
+    """Clear ``pending_reconciliation_run_id`` iff ``result`` proves the
+    pending run has reached a trustworthy-final status.
+
+    Called from ``get_run_results_tool`` after ``_get_run_results`` returns.
+    Requires (a) a pending run_id on the ctx, (b) a matching resolved run_id
+    in ``result.data`` (so a ``workflow_run_id=None`` call that resolves to
+    a different run does NOT clear), and (c) the resolved ``overall_status``
+    passes ``is_final_excluding_canceled`` (so an ambiguous ``canceled``
+    does NOT clear).
+    """
+    pending_run_id = getattr(copilot_ctx, "pending_reconciliation_run_id", None)
+    if not isinstance(pending_run_id, str) or not pending_run_id:
+        return
+    if not isinstance(result, dict):
+        return
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return
+    resolved_run_id = data.get("workflow_run_id")
+    resolved_status = data.get("overall_status")
+    if (
+        isinstance(resolved_run_id, str)
+        and resolved_run_id == pending_run_id
+        and isinstance(resolved_status, str)
+        and WorkflowRunStatus(resolved_status).is_final_excluding_canceled()
+    ):
+        copilot_ctx.pending_reconciliation_run_id = None
 
 
 # Streak threshold at which the copilot hard-aborts a tool call because the
@@ -240,6 +315,23 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
     # to block-running tools so planning/metadata tools (update_workflow,
     # list_credentials, get_run_results) stay unaffected.
     if tool_name in _BLOCK_RUNNING_TOOLS:
+        # Reconciliation guard: a previous block-running tool call timed out
+        # without reconciling the run's outcome (post-drain status was
+        # ``canceled``, non-final, or unreadable). Block further block-running
+        # calls until ``get_run_results`` clears the flag. Prevents the LLM
+        # from auto-retrying a mutation block whose side effects may have
+        # landed.
+        pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
+        if isinstance(pending_run_id, str) and pending_run_id:
+            return (
+                f"The previous block-running tool call timed out and run "
+                f"{pending_run_id} was not reconciled to a trustworthy terminal "
+                f'status. Call `get_run_results(workflow_run_id="{pending_run_id}")` '
+                f"first, report the result to the user, then await user input "
+                f"before running more blocks. This guard prevents duplicate "
+                f"side effects on live sites."
+            )
+
         streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
         streak = streak_raw if isinstance(streak_raw, int) else 0
         if streak >= REPEATED_ACTION_STREAK_ABORT_AT:
@@ -861,26 +953,78 @@ async def _run_blocks_and_collect_debug(
                 break
 
         if final_status is None:
-            await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
-            timeout_msg = (
-                f"Block execution timed out after {max_poll}s. "
-                f"Run ID: {workflow_run.workflow_run_id}. "
-                f"The task was likely stuck repeating failing actions. "
-                f"Consider: simplifying the navigation_goal, using a more specific URL, "
-                f"adding a dismiss-popup step, or concluding the site is not automatable."
+            # Read the row BEFORE the cancel helper runs. The poll interval is
+            # 2 s, so a legitimate self-finalize (``canceled`` from a user/block
+            # cancel, or any other terminal) can land in the narrow gap between
+            # the last poll and entering this branch. Trusting the pre-cancel
+            # status preserves that signal without ambiguity — nothing we do
+            # could have written it. Any post-cancel re-read has to exclude
+            # ``canceled`` because the helper itself writes synthetic
+            # ``canceled`` (see ``WorkflowRunStatus.is_final_excluding_canceled``).
+            pre_cancel_run = await _safe_read_workflow_run(
+                workflow_run.workflow_run_id, ctx.organization_id, context="pre-cancel"
             )
-            if ctx.browser_session_id:
-                try:
-                    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                        session_id=ctx.browser_session_id,
-                        organization_id=ctx.organization_id,
+
+            if pre_cancel_run is not None and WorkflowRunStatus(pre_cancel_run.status).is_final():
+                final_status = pre_cancel_run.status
+                run = pre_cancel_run
+            else:
+                await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+
+                # The cancel helper waits for ``execute_workflow``'s shielded
+                # ``_finalize_workflow_run_status`` to run, which writes the real
+                # terminal status when the run completed during the drain window.
+                # Re-read once before declaring timeout so a run that finished
+                # in those last few seconds is not mis-reported as a failure the
+                # LLM will retry against a live site.
+                run = await _safe_read_workflow_run(
+                    workflow_run.workflow_run_id, ctx.organization_id, context="post-drain"
+                )
+                trusted = _trusted_post_drain_status(run)
+                if trusted is not None:
+                    final_status = trusted
+                else:
+                    # Three distinct cases produce a ``None`` from
+                    # ``_trusted_post_drain_status`` — DB read failed, row
+                    # non-final, or ``canceled`` (legitimate vs synthetic
+                    # indistinguishable at this read). Body differs so logs
+                    # are attributable; the LLM-facing instruction is
+                    # identical: outcome is uncertain, reconcile via
+                    # ``get_run_results`` before re-invoking block-running
+                    # tools. The reconciliation guard below enforces that.
+                    if run is None:
+                        timeout_body = (
+                            f"Block execution exceeded the {max_poll}s tool budget and the workflow "
+                            f"run row could not be re-read after cancellation (see 'Workflow run "
+                            f"re-read failed' log)."
+                        )
+                    elif run.status == WorkflowRunStatus.canceled.value:
+                        timeout_body = (
+                            f"Block execution was cancelled after exceeding the {max_poll}s tool "
+                            f"budget. Side effects of any actions already taken may have landed."
+                        )
+                    else:
+                        timeout_body = (
+                            f"Block execution exceeded the {max_poll}s tool budget and the workflow "
+                            f"run did not reach a terminal status within the cancellation grace "
+                            f"window (last observed status: {run.status})."
+                        )
+                    timeout_msg = (
+                        f"{timeout_body} Run ID: {workflow_run.workflow_run_id}. "
+                        f"Outcome is uncertain. Do NOT re-invoke block-running tools in this "
+                        f"session without first calling `get_run_results` with this "
+                        f"workflow_run_id and reporting the result to the user."
                     )
-                    if browser_state:
-                        page = await browser_state.get_or_create_page()
-                        timeout_msg += f" Browser was on: {page.url}"
-                except Exception:
-                    pass
-            return {"ok": False, "error": timeout_msg}
+                    current_url, _ = await _fallback_page_info(ctx)
+                    if current_url:
+                        timeout_msg += f" Browser was on: {current_url}"
+                    # Turn-scoped reconciliation guard. Clearing requires an
+                    # explicit ``get_run_results`` read that resolves to this
+                    # run_id with a status that passes
+                    # ``WorkflowRunStatus.is_final_excluding_canceled`` (see
+                    # clearing logic in ``get_run_results_tool``).
+                    ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
+                    return {"ok": False, "error": timeout_msg}
     except asyncio.CancelledError:
         # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
         # the cleanup so the parent cancellation can't interrupt it mid-await.
@@ -1691,6 +1835,8 @@ async def get_run_results_tool(
     if workflow_run_id:
         params["workflow_run_id"] = workflow_run_id
     result = await _get_run_results(params, copilot_ctx)
+    _maybe_clear_reconciliation_flag(copilot_ctx, result)
+
     sanitized = sanitize_tool_result_for_llm("get_run_results", result)
     return json.dumps(sanitized)
 
