@@ -14,7 +14,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-10T02:43:47.326099Z"
+exclude-newer = "2026-04-14T19:31:07.927062Z"
 exclude-newer-span = "P7D"
 
 [manifest]
@@ -5606,6 +5606,8 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "filetype" },
+    { name = "google-auth" },
+    { name = "google-auth-oauthlib" },
     { name = "google-cloud-aiplatform" },
     { name = "greenlet", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "greenlet", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -5731,6 +5733,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.121.0,<0.136" },
     { name = "fastmcp", specifier = ">=3.2.0,<4" },
     { name = "filetype", specifier = ">=1.2.0,<2" },
+    { name = "google-auth", specifier = ">=2.49.2,<3" },
+    { name = "google-auth-oauthlib", specifier = ">=1.3.1,<2" },
     { name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" },
     { name = "greenlet", marker = "python_full_version == '3.11.*'", specifier = "==3.0.3" },
     { name = "greenlet", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">3.0.3" },
