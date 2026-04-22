@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.copilot.output_utils import (
+    parse_final_response,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
     truncate_output,
@@ -323,3 +324,43 @@ class TestSummarizeToolResult:
     def test_unknown_tool_returns_ok(self) -> None:
         summary = self._summarize("unknown_tool", {"ok": True})
         assert summary == "OK"
+
+
+class TestParseFinalResponse:
+    """parse_final_response is the last mile between model output and the frontend.
+
+    A parse failure falls back to `{"type": "REPLY", "user_response": text}`,
+    which means the raw JSON object is rendered in the chat bubble. Real model
+    outputs sometimes embed literal newlines inside string values (strict
+    `json.loads` rejects those) — seen in SKY-9189 test-2 where the full
+    refusal envelope landed in the user bubble instead of just user_response.
+    """
+
+    def test_parses_clean_json_envelope(self) -> None:
+        envelope = '{"type": "ASK_QUESTION", "user_response": "hi"}'
+        parsed = parse_final_response(envelope)
+        assert parsed == {"type": "ASK_QUESTION", "user_response": "hi"}
+
+    def test_strips_json_code_fence(self) -> None:
+        envelope = '```json\n{"type": "REPLY", "user_response": "ok"}\n```'
+        assert parse_final_response(envelope)["type"] == "REPLY"
+
+    def test_tolerates_literal_newline_inside_string_value(self) -> None:
+        # Real model output shape: a multi-line user_response split across
+        # actual newlines instead of \n escapes. strict=True rejects this,
+        # strict=False accepts it. Without the fallback, the whole JSON blob
+        # gets shown to the user.
+        envelope = '{"type": "ASK_QUESTION", "user_response": "line one\nline two"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "line one\nline two"
+
+    def test_unparseable_text_falls_back_to_reply(self) -> None:
+        # Genuinely broken output still degrades gracefully.
+        parsed = parse_final_response("not json at all")
+        assert parsed == {"type": "REPLY", "user_response": "not json at all"}
+
+    def test_non_dict_json_falls_back_to_reply(self) -> None:
+        # A JSON array at top level is valid JSON but not a valid envelope.
+        parsed = parse_final_response("[1, 2, 3]")
+        assert parsed == {"type": "REPLY", "user_response": "[1, 2, 3]"}

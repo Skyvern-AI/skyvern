@@ -314,3 +314,42 @@ class TestTranslateToAgentResultGating:
         assert "test failed" in agent_result.user_response.lower()
         assert "All done" not in agent_result.user_response
         assert agent_result.updated_workflow is None
+
+
+class TestCredentialRefusalReachesAgent:
+    """Prove the SKY-9189 refusal rule is actually delivered to the agent.
+
+    `run_copilot_agent` constructs the openai-agents SDK `Agent(...)` with
+    `instructions=_build_system_prompt(...)` and `tools=list(NATIVE_TOOLS)`.
+    A behavior test would require patching the agent loop and is fragile; a
+    construction test (rule text flows through the exact helpers the route
+    uses) is deterministic and catches both prompt and tool-surface drift.
+    """
+
+    def test_build_system_prompt_carries_refusal_clause(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
+
+        assert "CREDENTIAL HANDLING - CRITICAL" in prompt
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in prompt
+        assert "MUST NOT build, update, or run a workflow" in prompt
+        assert "redacted from the outbound client stream" not in prompt
+
+    def test_native_tools_carry_refusal_reference(self) -> None:
+        import re
+
+        from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
+
+        targets = {"run_blocks_and_collect_debug", "update_and_run_blocks"}
+        matched = {tool.name for tool in NATIVE_TOOLS if tool.name in targets}
+        assert matched == targets, f"missing tools in NATIVE_TOOLS: {targets - matched}"
+
+        cross_ref = re.compile(r"CREDENTIAL\s+HANDLING refusal rule")
+        for tool in NATIVE_TOOLS:
+            if tool.name not in targets:
+                continue
+            desc = tool.description
+            assert "redacted from" not in desc, f"{tool.name} still claims redaction"
+            assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"
+            assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
