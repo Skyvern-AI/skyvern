@@ -1,8 +1,11 @@
 """Tests for cancellation / webhook-tolerance helpers on WorkflowService.
 
 - ``mark_workflow_run_as_canceled_if_not_final`` delegates to the conditional
-  DB update and is a no-op when the DB reports no row was affected (the row
-  was already in a terminal state).
+  DB update and is a no-op when the DB reports no row was affected - either
+  because the row was already in a terminal state or because no row with that
+  id exists.
+- ``mark_workflow_run_as_canceled`` rejects transitions to ``canceled`` when
+  the run has already reached a terminal state (SKY-9188).
 - ``execute_workflow_webhook`` returns cleanly when the workflow row has been
   soft-deleted mid-run — it must not raise ``WorkflowNotFound`` from the
   cleanup path.
@@ -14,11 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.exceptions import WorkflowNotFound
+from skyvern.exceptions import WorkflowNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
@@ -45,6 +49,135 @@ async def test_mark_canceled_if_not_final_returns_conditional_result(
     )
 
 
+def _make_updated_row() -> MagicMock:
+    row = MagicMock()
+    row.status = WorkflowRunStatus.canceled
+    row.created_at = datetime.now(UTC) - timedelta(seconds=30)
+    row.started_at = datetime.now(UTC) - timedelta(seconds=20)
+    row.workflow_id = "wf_abc"
+    row.organization_id = "org_abc"
+    row.run_with = None
+    row.ai_fallback = False
+    row.trigger_type = None
+    row.workflow_schedule_id = None
+    return row
+
+
+@pytest.mark.asyncio
+async def test_mark_canceled_if_not_final_logs_duration_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal-transition parity with ``_update_workflow_run_status``: a
+    successful conditional cancel must emit the ``Workflow run duration metrics``
+    log with the same structured fields, so the metric stays comparable across
+    statuses.
+    """
+    from skyvern.forge.sdk.workflow import service as service_module
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    updated_row = _make_updated_row()
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=updated_row),
+    )
+    monkeypatch.setattr(
+        WorkflowService,
+        "_sync_task_run_from_workflow_run",
+        AsyncMock(return_value=None),
+    )
+
+    info_calls: list[tuple[str, dict]] = []
+
+    def fake_info(event: str, **kwargs: object) -> None:
+        info_calls.append((event, dict(kwargs)))
+
+    monkeypatch.setattr(service_module.LOG, "info", fake_info)
+
+    svc = WorkflowService()
+    result = await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_live")
+
+    assert result is updated_row
+    metrics_events = [kwargs for event, kwargs in info_calls if event == "Workflow run duration metrics"]
+    assert len(metrics_events) == 1
+    metrics = metrics_events[0]
+    assert metrics["workflow_run_id"] == "wr_live"
+    assert metrics["workflow_id"] == "wf_abc"
+    assert metrics["organization_id"] == "org_abc"
+    assert metrics["workflow_run_status"] == WorkflowRunStatus.canceled
+    assert metrics["queued_seconds"] == pytest.approx(10.0, abs=1.0)
+    assert metrics["duration_seconds"] == pytest.approx(20.0, abs=1.0)
+
+
+@pytest.mark.asyncio
+async def test_mark_canceled_if_not_final_syncs_task_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal-transition parity: a successful conditional cancel must spawn
+    the ``_sync_task_run_from_workflow_run`` write-through so downstream
+    consumers reading ``task_runs`` see the cancel event.
+    """
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    updated_row = _make_updated_row()
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=updated_row),
+    )
+    sync_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(WorkflowService, "_sync_task_run_from_workflow_run", sync_mock)
+
+    svc = WorkflowService()
+    await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_sync")
+
+    # Let the fire-and-forget background task drain.
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    sync_mock.assert_awaited_once()
+    call_args = sync_mock.await_args
+    assert call_args is not None
+    assert call_args.args[0] is updated_row
+    assert call_args.args[1] == "wr_sync"
+    assert call_args.args[2] == WorkflowRunStatus.canceled
+
+
+@pytest.mark.asyncio
+async def test_mark_canceled_if_not_final_skips_side_effects_on_terminal_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the conditional update returns ``None`` (row already terminal),
+    neither the duration-metrics log nor the task_runs sync may fire — the
+    terminal status's own ``_update_workflow_run_status`` call already emitted
+    them.
+    """
+    from skyvern.forge.sdk.workflow import service as service_module
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=None),
+    )
+    sync_mock = AsyncMock(side_effect=AssertionError("_sync_task_run_from_workflow_run must not run on no-op"))
+    monkeypatch.setattr(WorkflowService, "_sync_task_run_from_workflow_run", sync_mock)
+
+    info_calls: list[str] = []
+
+    def fake_info(event: str, **kwargs: object) -> None:
+        info_calls.append(event)
+
+    monkeypatch.setattr(service_module.LOG, "info", fake_info)
+
+    svc = WorkflowService()
+    result = await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_already_done")
+
+    assert result is None
+    assert "Workflow run duration metrics" not in info_calls
+    sync_mock.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_mark_canceled_if_not_final_is_noop_on_terminal_row(
     monkeypatch: pytest.MonkeyPatch,
@@ -61,6 +194,102 @@ async def test_mark_canceled_if_not_final_is_noop_on_terminal_row(
 
     assert result is None
     delegate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        WorkflowRunStatus.completed,
+        WorkflowRunStatus.failed,
+        WorkflowRunStatus.terminated,
+        WorkflowRunStatus.timed_out,
+        WorkflowRunStatus.canceled,
+    ],
+)
+async def test_mark_canceled_rejects_transition_on_terminal_row(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: WorkflowRunStatus,
+) -> None:
+    """SKY-9188: ``mark_workflow_run_as_canceled`` must not overwrite a
+    finalized status. The underlying conditional update returns ``None`` for
+    terminal rows; the service helper must propagate the existing row back to
+    callers without writing ``canceled``.
+    """
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    existing_row = MagicMock()
+    existing_row.status = terminal_status
+
+    conditional_update = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", conditional_update)
+    get_workflow_run = AsyncMock(return_value=existing_row)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", get_workflow_run)
+    # A guard that accidentally falls through to the unconditional write would
+    # call ``update_workflow_run`` — fail loudly if that happens.
+    unconditional_update = AsyncMock(side_effect=AssertionError("unconditional update_workflow_run must not be called"))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", unconditional_update)
+
+    svc = WorkflowService()
+    result = await svc.mark_workflow_run_as_canceled(workflow_run_id="wr_final")
+
+    assert result is existing_row
+    assert result.status == terminal_status
+    conditional_update.assert_awaited_once_with(
+        workflow_run_id="wr_final",
+        status=WorkflowRunStatus.canceled,
+    )
+    unconditional_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mark_canceled_writes_when_row_is_non_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SKY-9188: a non-terminal run still transitions to ``canceled`` through
+    the conditional update path.
+    """
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    canceled_row = MagicMock()
+    canceled_row.status = WorkflowRunStatus.canceled
+
+    conditional_update = AsyncMock(return_value=canceled_row)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", conditional_update)
+    get_workflow_run = AsyncMock(side_effect=AssertionError("get_workflow_run must not be called on the happy path"))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", get_workflow_run)
+
+    svc = WorkflowService()
+    result = await svc.mark_workflow_run_as_canceled(workflow_run_id="wr_running")
+
+    assert result is canceled_row
+    conditional_update.assert_awaited_once_with(
+        workflow_run_id="wr_running",
+        status=WorkflowRunStatus.canceled,
+    )
+    get_workflow_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mark_canceled_raises_when_row_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the conditional update rejects (returns ``None``) AND the row no
+    longer exists, there is no sensible ``WorkflowRun`` to return — raise
+    ``WorkflowRunNotFound`` rather than silently pretending the cancel
+    succeeded.
+    """
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    conditional_update = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", conditional_update)
+    get_workflow_run = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", get_workflow_run)
+
+    svc = WorkflowService()
+
+    with pytest.raises(WorkflowRunNotFound):
+        await svc.mark_workflow_run_as_canceled(workflow_run_id="wr_missing")
 
 
 @pytest.mark.asyncio

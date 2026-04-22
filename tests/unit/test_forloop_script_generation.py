@@ -526,15 +526,94 @@ class TestForLoopScriptCompilation:
             )
 
             # The generated code must compile without SyntaxError
-            # This was the actual bug: 'async for' at module level
+            # This was the actual bug: 'async for' at module level.
+            # Use compile(), not ast.parse — ast.parse allows module-level `async for`,
+            # but Python's execution layer rejects it (same check runs at runtime).
             try:
-                ast.parse(result.source_code)
+                compile(result.source_code, "<generated_script>", "exec")
             except SyntaxError as e:
                 pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
 
             # Verify the for-loop is present inside run_workflow (not at module level)
             assert "async for current_value in skyvern.loop" in result.source_code
             assert "def run_workflow" in result.source_code
+
+    @pytest.mark.asyncio
+    async def test_cached_forloop_from_unexecuted_branch_not_appended_at_module_level(self) -> None:
+        """Regression for SKY-9180: cached for_loop code preserved from a prior run must
+        not be appended at module level.
+
+        Scenario: current run executes only a task block; the prior run cached a for_loop
+        whose label doesn't appear in the current run's blocks (e.g. an unexecuted branch).
+        The preserve-cached-blocks loop previously appended the for_loop's bare `async for`
+        code at module level, producing 'async for outside async function' SyntaxError.
+        """
+        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
+        from skyvern.services.workflow_script_service import ScriptBlockSource
+
+        blocks = [
+            {
+                "block_type": "task",
+                "label": "task_one",
+                "task_id": "tsk_1",
+                "title": "Task One",
+            },
+        ]
+        cached_blocks = {
+            "iteratecq": ScriptBlockSource(
+                label="iteratecq",
+                code=(
+                    "async for current_value in skyvern.loop("
+                    "values = '{{providerdetails.ProviderDetails}}', label = 'iteratecq'):\n"
+                    "    pass\n"
+                ),
+                run_signature="async for current_value in skyvern.loop(values = '', label = 'iteratecq')",
+                workflow_run_id="wr_prev",
+                workflow_run_block_id="wrb_prev",
+                input_fields=None,
+                requires_agent=False,
+            ),
+        }
+        workflow = {
+            "workflow_id": "wf_test",
+            "title": "Test",
+            "workflow_definition": {"parameters": []},
+        }
+
+        with (
+            patch(
+                "skyvern.core.script_generations.generate_script.generate_workflow_parameters_schema",
+                new_callable=AsyncMock,
+                return_value=("", {}),
+            ),
+            patch(
+                "skyvern.core.script_generations.generate_script.create_or_update_script_block",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            result = await generate_workflow_script_python_code(
+                file_name="test.py",
+                workflow_run_request={"workflow_id": "wpid_test"},
+                workflow=workflow,
+                blocks=blocks,
+                actions_by_task={"tsk_1": []},
+                script_id="script_123",
+                script_revision_id="rev_123",
+                organization_id="org_123",
+                cached_blocks=cached_blocks,
+            )
+
+        try:
+            compile(result.source_code, "<generated_script>", "exec")
+        except SyntaxError as e:
+            pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result.source_code}")
+
+        # The cached for_loop belongs to an unexecuted branch — current `blocks`
+        # only contains task_one — so the loop must NOT be inlined in main.py.
+        # Guards against a future change that compiles (e.g. wrapping the loop
+        # in an async helper) but still ships stale/unreachable loop code.
+        assert "async for current_value in skyvern.loop" not in result.source_code
 
 
 class TestForLoopInnerBlockCachedFunctions:
