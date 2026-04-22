@@ -147,28 +147,26 @@ def pick_field_name_for_action(
     referenced_keys = extract_jinja_root_names(goal_template)
 
     # Rule 1: jinja reference to a declared or schema key.
+    # Only fires when exactly ONE valid key is referenced in the goal — otherwise
+    # we can't disambiguate which INPUT_TEXT action targets which key and would
+    # collapse multiple fields onto the same name (CORR-1 from debate review).
     intersection = referenced_keys & valid_keys
-    if intersection:
-        # When the goal references multiple keys we can't disambiguate here
-        # (we don't know which INPUT_TEXT action targets which field). Prefer
-        # a declared parameter over a schema key, then alphabetical for
-        # determinism.
-        # TODO(SKY-8965 Phase 2): before wiring this picker into the hot path,
-        # disambiguate multi-key goals by falling through to Rule 3 (or a new
-        # action-intention → key matcher) when `len(intersection) > 1`.
-        # Otherwise every INPUT_TEXT action in a multi-field form gets the same
-        # alphabetically-first name and the synthesized schema collapses fields.
-        declared_matches = intersection & declared_param_keys
-        preferred = sorted(declared_matches) if declared_matches else sorted(intersection)
-        return FieldPick(field_name=preferred[0], rule="jinja_ref")
+    if len(intersection) == 1:
+        (match,) = intersection
+        return FieldPick(field_name=match, rule="jinja_ref")
 
     # Rule 2: value matches an upstream schema key name or is clearly keyed
-    # by intention to one. Conservative check: if the intention text mentions
-    # a valid schema key (substring match, case-insensitive), bind to it.
+    # by intention to one. Sorted by descending key length so that `invoice_id`
+    # is tried before `id` — prevents short keys from shadowing longer,
+    # more-specific keys via substring match (andrewneilson review feedback).
+    # Keys that aren't valid Python identifiers are sanitized before returning
+    # (JSON Schema allows hyphens, reserved words, etc. that would produce
+    # invalid Pydantic class bodies).
     intention = (action.get("intention") or "").lower()
-    for key in sorted(upstream_schema_keys):
+    for key in sorted(upstream_schema_keys, key=len, reverse=True):
         if key.lower() in intention:
-            return FieldPick(field_name=key, rule="upstream_schema")
+            safe_key = sanitize_intention_to_field_name(key, fallback=key)
+            return FieldPick(field_name=safe_key, rule="upstream_schema")
 
     # Rule 3: deterministic fallback derived from intention.
     name = sanitize_intention_to_field_name(intention)

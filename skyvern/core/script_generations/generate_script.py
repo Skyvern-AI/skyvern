@@ -120,6 +120,28 @@ def _collect_upstream_schema_keys(blocks: list[dict[str, Any]]) -> frozenset[str
     return frozenset(keys)
 
 
+def _collect_goal_templates(blocks: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each task_id to its unrendered navigation_goal template.
+
+    The deterministic picker uses these templates to detect jinja references
+    like ``{{ search_term }}`` and bind actions to declared parameters.
+
+    Recurses into ``loop_blocks`` so tasks nested inside ForLoops also get
+    Rule-1 context (CORR-3 from debate review).
+    """
+    result: dict[str, str] = {}
+    for block in blocks or []:
+        task_id = block.get("task_id")
+        if task_id:
+            goal = block.get("navigation_goal") or block.get("data_extraction_goal") or ""
+            if goal:
+                result[task_id] = goal
+        nested = block.get("loop_blocks")
+        if isinstance(nested, list):
+            result.update(_collect_goal_templates(nested))
+    return result
+
+
 def _collect_synthesized_field_keys(schema_code: str) -> frozenset[str]:
     """Extract field names from a generated `GeneratedWorkflowParameters` class.
 
@@ -152,15 +174,26 @@ def _build_existing_field_assignments(
     Returns:
         Dictionary mapping action index (1-based) to the existing field name that must be preserved
     """
-    # Build mapping of block label -> task_id
+    # Build mapping of block label -> task_id, recursing into loop_blocks so
+    # cached child blocks inside ForLoops are also covered. Without this,
+    # Phase 1-era LLM names in cached ForLoop children would not get
+    # re-registered and the Phase 2 guard would false-positive on regen
+    # (andrewneilson review feedback).
     block_label_to_task_id: dict[str, str] = {}
-    for idx, block in enumerate(blocks):
-        if block.get("block_type") not in SCRIPT_TASK_BLOCKS:
-            continue
-        label = block.get("label") or block.get("title") or block.get("task_id") or f"task_{idx}"
-        task_id = block.get("task_id")
-        if task_id:
-            block_label_to_task_id[label] = task_id
+
+    def _collect_block_label_to_task_id(blks: list[dict[str, Any]], counter: int = 0) -> None:
+        for block in blks:
+            if block.get("block_type") in SCRIPT_TASK_BLOCKS:
+                label = block.get("label") or block.get("title") or block.get("task_id") or f"task_{counter}"
+                task_id = block.get("task_id")
+                if task_id:
+                    block_label_to_task_id[label] = task_id
+            nested = block.get("loop_blocks")
+            if isinstance(nested, list):
+                _collect_block_label_to_task_id(nested, counter + 1)
+            counter += 1
+
+    _collect_block_label_to_task_id(blocks)
 
     # Build mapping of task_id -> list of existing field names (for unchanged blocks)
     task_id_to_existing_fields: dict[str, list[str]] = {}
@@ -2877,8 +2910,18 @@ async def generate_workflow_script_python_code(
         cached_blocks=cached_blocks,
         updated_block_labels=updated_block_labels,
     )
+    # SKY-8965 Phase 2: pass declared-param and upstream-schema keys so the
+    # deterministic picker can match actions to known fields instead of the
+    # LLM inventing names.
+    declared_keys = _collect_declared_param_keys(workflow)
+    upstream_keys = _collect_upstream_schema_keys(blocks)
+    goal_template_by_task = _collect_goal_templates(blocks)
     generated_schema, field_mappings = await generate_workflow_parameters_schema(
-        actions_by_task, existing_field_assignments
+        actions_by_task,
+        existing_field_assignments,
+        declared_param_keys=declared_keys,
+        upstream_schema_keys=upstream_keys,
+        goal_template_by_task=goal_template_by_task,
     )
     actions_by_task = hydrate_input_text_actions_with_field_names(actions_by_task, field_mappings)
 
@@ -3445,14 +3488,13 @@ async def generate_workflow_script_python_code(
     module = cst.Module(body=module_body)
     source_code = module.code
 
-    # SKY-8965 Phase 1: validate `context.parameters[X]` references against the
+    # SKY-8965 Phase 2: validate `context.parameters[X]` references against the
     # expanded valid-keys set (declared params ∪ upstream block schema keys ∪
-    # synthesized `GeneratedWorkflowParameters` fields). Phase 1 logs violations
-    # only — we want production telemetry before raising in Phase 2. Wrapped in
-    # try/except so a guard bug can never break script generation.
+    # synthesized `GeneratedWorkflowParameters` fields). Phase 2 raises on
+    # violation, preventing phantom-parameter scripts from being cached.
+    # Phase 1 (now in prod) logged warnings; 13 violations in 7 days confirmed
+    # the bug is real and low-frequency (~0.05%), safe to enforce.
     try:
-        declared_keys = _collect_declared_param_keys(workflow)
-        upstream_keys = _collect_upstream_schema_keys(blocks)
         synthesized_keys = _collect_synthesized_field_keys(generated_schema)
         guard_result = validate_context_parameter_refs(
             code=source_code,
@@ -3462,12 +3504,23 @@ async def generate_workflow_script_python_code(
         )
         log_or_raise_guard_result(
             guard_result,
-            raise_on_violation=False,
+            raise_on_violation=True,
             workflow_permanent_id=workflow.get("workflow_permanent_id"),
             workflow_run_id=run_id,
         )
-    except HallucinatedParameterError:
-        # Phase 2 will raise this intentionally — don't swallow it.
+    except HallucinatedParameterError as hpe:
+        # Dedicated structured log so this is distinguishable from a codegen
+        # crash in Datadog. The broad except-Exception in the caller
+        # (workflow_script_service) would otherwise swallow the distinction
+        # (andrewneilson review feedback).
+        LOG.warning(
+            "parameter_reference_guard_rejected_script",
+            workflow_permanent_id=workflow.get("workflow_permanent_id"),
+            workflow_run_id=run_id,
+            undeclared_refs=sorted(r.key for r in hpe.result.undeclared_refs),
+            valid_keys=sorted(hpe.result.valid_keys),
+            sky_ticket="SKY-8965",
+        )
         raise
     except Exception:
         LOG.warning("parameter_reference_guard_failed_to_run", exc_info=True)

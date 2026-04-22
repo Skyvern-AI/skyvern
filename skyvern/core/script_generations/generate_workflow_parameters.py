@@ -1,62 +1,113 @@
 """
-Module for generating GeneratedWorkflowParameters schema from workflow run input_text actions.
+Module for generating GeneratedWorkflowParameters schema from workflow run
+input_text actions.
+
+SKY-8965 Phase 2: the LLM call (`_generate_field_names_with_llm`) has been
+replaced by a deterministic 3-rule picker. See
+`deterministic_field_naming.py` for the picker and
+`parameter_reference_guard.py` for the post-generation validation guard.
 """
 
 from typing import Any, Dict, List, Tuple
 
 import structlog
-from pydantic import BaseModel
 
-from skyvern.forge import app
+from skyvern.core.script_generations.deterministic_field_naming import (
+    pick_field_names_for_actions,
+)
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.webeye.actions.actions import ActionType
 
 LOG = structlog.get_logger(__name__)
 
-# Initialize prompt engine
-prompt_engine = PromptEngine("skyvern")
 CUSTOM_FIELD_ACTIONS = [ActionType.INPUT_TEXT, ActionType.UPLOAD_FILE, ActionType.SELECT_OPTION]
 
 
-class GeneratedFieldMapping(BaseModel):
-    """Mapping of action indices to field names."""
-
-    field_mappings: Dict[str, str]
-    schema_fields: Dict[str, Dict[str, str]]
-
-
+# async retained for caller-signature compat; no I/O inside after Phase 2
+# removed the LLM call.
 async def generate_workflow_parameters_schema(
     actions_by_task: Dict[str, List[Dict[str, Any]]],
     existing_field_assignments: Dict[int, str] | None = None,
+    *,
+    declared_param_keys: frozenset[str] = frozenset(),
+    upstream_schema_keys: frozenset[str] = frozenset(),
+    goal_template_by_task: Dict[str, str] | None = None,
 ) -> Tuple[str, Dict[str, str]]:
     """
     Generate a GeneratedWorkflowParameters Pydantic schema based on input_text actions.
 
-    Args:
-        actions_by_task: Dictionary mapping task IDs to lists of action dictionaries
-        existing_field_assignments: Optional dictionary mapping action index (1-based) to
-            existing field names that must be preserved. Used when regenerating schemas
-            to maintain compatibility with cached block code.
+    SKY-8965 Phase 2: field names are picked deterministically (no LLM call).
+    The three-rule picker in ``deterministic_field_naming.py`` decides each
+    name based on: (1) jinja refs in the goal, (2) upstream schema keys,
+    (3) sanitized action intention.
+
+    New keyword-only args (optional for backwards compat — callers that don't
+    pass them get empty frozensets, which makes the picker fall through to
+    Rule 3 for every action):
+        declared_param_keys: Workflow-declared parameter keys.
+        upstream_schema_keys: Keys from upstream blocks' extraction schemas.
+        goal_template_by_task: Unrendered navigation_goal per task_id.
 
     Returns:
         Tuple of (schema_code, field_mappings) where:
         - schema_code: Python code for the GeneratedWorkflowParameters class
-        - field_mappings: Dictionary mapping action indices to field names for hydration
+        - field_mappings: Dictionary mapping ``"{task_id}:{action_id}"`` to field
+          names, used by ``hydrate_input_text_actions_with_field_names``
     """
-    existing_field_assignments = existing_field_assignments or {}
+    goal_template_by_task = goal_template_by_task or {}
 
-    # Extract all input_text actions
-    custom_field_actions = []
-    action_index_map = {}
-    action_counter = 1
+    # --- mark incomplete actions (SKY-7653 race-condition mitigation) ----
+    _mark_incomplete_actions(actions_by_task)
 
+    # --- deterministic pick (replaces the LLM call) ---------------------
+    picks = pick_field_names_for_actions(
+        actions_by_task=actions_by_task,
+        goal_template_by_task=goal_template_by_task,
+        declared_param_keys=declared_param_keys,
+        upstream_schema_keys=upstream_schema_keys,
+        existing_field_assignments=existing_field_assignments,
+    )
+
+    if not picks:
+        LOG.info("No custom-field actions found — empty schema")
+        return _generate_empty_schema(), {}
+
+    # Build schema and field mappings from the picks
+    schema_fields: Dict[str, Dict[str, str]] = {}
+    action_field_mappings: Dict[str, str] = {}
+
+    for action_key, pick in picks.items():
+        action_field_mappings[action_key] = pick.field_name
+        if pick.field_name not in schema_fields:
+            schema_fields[pick.field_name] = {
+                "type": "str",
+                "description": pick.description or f"Value for {pick.field_name}",
+            }
+
+    LOG.info(
+        "deterministic_field_naming_complete",
+        total_picks=len(picks),
+        rules_used=sorted({pick.rule for pick in picks.values()}),
+        field_names=sorted(schema_fields.keys()),
+    )
+
+    schema_code = _generate_pydantic_schema(schema_fields)
+    return schema_code, action_field_mappings
+
+
+def _mark_incomplete_actions(actions_by_task: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Flag the skyvern context if any custom-field actions lack data (SKY-7653).
+
+    This preserves the race-condition mitigation from the original LLM path:
+    when script generation runs before action data is fully saved to the DB,
+    the ``script_gen_had_incomplete_actions`` flag triggers a finalize
+    regeneration.
+    """
     for task_id, actions in actions_by_task.items():
         for action in actions:
             action_type = action.get("action_type", "")
             if action_type not in CUSTOM_FIELD_ACTIONS:
                 continue
-
             value = ""
             if action_type == ActionType.INPUT_TEXT:
                 value = action.get("text", "")
@@ -64,93 +115,11 @@ async def generate_workflow_parameters_schema(
                 value = action.get("file_url", "")
             elif action_type == ActionType.SELECT_OPTION:
                 value = action.get("option", "")
-
-            # Skip actions without data - addresses race condition where script generation
-            # runs before action data is fully saved to database (SKY-7653)
             if not value:
-                LOG.debug(
-                    "Skipping action without data during field mapping generation",
-                    action_type=action_type,
-                    action_id=action.get("action_id", ""),
-                    task_id=task_id,
-                )
-                # Mark that we had incomplete actions - triggers finalize regeneration
                 ctx = skyvern_context.current()
                 if ctx:
                     ctx.script_gen_had_incomplete_actions = True
-                continue
-
-            # Check if this action has an existing field name that must be preserved
-            existing_field_name = existing_field_assignments.get(action_counter)
-
-            custom_field_actions.append(
-                {
-                    "action_type": action_type,
-                    "value": value,
-                    "intention": action.get("intention", ""),
-                    "task_id": task_id,
-                    "action_id": action.get("action_id", ""),
-                    "existing_field_name": existing_field_name,
-                }
-            )
-            action_index_map[f"action_index_{action_counter}"] = {
-                "task_id": task_id,
-                "action_id": action.get("action_id", ""),
-            }
-            action_counter += 1
-
-    if not custom_field_actions:
-        LOG.warning("No field_name_actions found in workflow run")
-        return _generate_empty_schema(), {}
-
-    # Generate field names using LLM
-    try:
-        field_mapping = await _generate_field_names_with_llm(custom_field_actions)
-
-        # Generate the Pydantic schema code
-        schema_code = _generate_pydantic_schema(field_mapping.schema_fields)
-
-        # Create field mappings for action hydration
-        action_field_mappings = {}
-        for action_idx, field_name in field_mapping.field_mappings.items():
-            if action_idx in action_index_map:
-                action_info = action_index_map[action_idx]
-                key = f"{action_info['task_id']}:{action_info['action_id']}"
-                action_field_mappings[key] = field_name
-
-        return schema_code, action_field_mappings
-
-    except Exception as e:
-        LOG.error("Failed to generate workflow parameters schema", error=str(e), exc_info=True)
-        return _generate_empty_schema(), {}
-
-
-async def _generate_field_names_with_llm(
-    custom_field_actions: List[Dict[str, Any]],
-) -> GeneratedFieldMapping:
-    """
-    Use LLM to generate field names from input actions.
-
-    Args:
-        custom_field_actions: List of action dictionaries with action details.
-            Each action may include an "existing_field_name" key if the field
-            name must be preserved from a cached block.
-
-    Returns:
-        GeneratedFieldMapping with field mappings and schema definitions
-    """
-    # Check if any actions have existing field names that must be preserved
-    has_existing_fields = any(action.get("existing_field_name") for action in custom_field_actions)
-
-    prompt = prompt_engine.load_prompt(
-        template="generate-workflow-parameters",
-        custom_field_actions=custom_field_actions,
-        has_existing_fields=has_existing_fields,
-    )
-
-    response = await app.SCRIPT_GENERATION_LLM_API_HANDLER(prompt=prompt, prompt_name="generate-workflow-parameters")
-
-    return GeneratedFieldMapping.model_validate(response)
+                return  # one flag is enough
 
 
 def _generate_pydantic_schema(schema_fields: Dict[str, Dict[str, str]]) -> str:
