@@ -13,6 +13,7 @@ keywords:
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-of-april-21%2C-2026" className="cl-sidebar-link">Week of Apr 21, 2026</a>
     <a href="#week-of-april-14%2C-2026" className="cl-sidebar-link">Week of Apr 14, 2026</a>
     <a href="#v1-0-22-—-february-26%2C-2026" className="cl-sidebar-link">v1.0.22 — Feb 26, 2026</a>
     <a href="#v1-0-21-—-february-24%2C-2026" className="cl-sidebar-link">v1.0.21 — Feb 24, 2026</a>
@@ -26,7 +27,24 @@ keywords:
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
-<Update label="Week of April 14, 2026" description="Saudi Arabia proxy, workflow error mapping, smarter caching, and reliability fixes">
+<Update label="Week of April 21, 2026" description="Copilot reliability, run recordings, 2FA improvements, and more">
+
+## Improvements
+
+- **Copilot Live Status Narration** — The workflow editor copilot now displays a short live status line while it works, so you can see what the agent is doing instead of waiting in silence. ([#5567](https://github.com/Skyvern-AI/skyvern/pull/5567))
+
+- **Renamed Browser Profile Reset Action** — The API endpoint for clearing a persisted browser session has been renamed from `/browser_session/refresh` to `/browser_session/reset_profile` for clarity. The old path remains available as a deprecated alias. ([#5572](https://github.com/Skyvern-AI/skyvern/pull/5572))
+
+- **Fewer Screenshots for API Runs** — Screenshot capture frequency has been reduced for API-triggered runs, lowering storage overhead on long-running automations without affecting interactive sessions. ([#5565](https://github.com/Skyvern-AI/skyvern/pull/5565))
+
+## Bug fixes
+
+- Fixed the workflow copilot incorrectly proposing a workflow it had just failed to build. The copilot now only surfaces an Accept/Reject panel when the last test actually passed. ([#5574](https://github.com/Skyvern-AI/skyvern/pull/5574))
+- Fixed 2FA entry failing on pages with custom overlay input components where the real input field is hidden. The agent now types digit keys directly when no interactable input exists. ([#5568](https://github.com/Skyvern-AI/skyvern/pull/5568))
+
+</Update>
+
+<Update label="Week of April 14, 2026" description="Saudi Arabia proxy, workflow error mapping, smarter caching, MCP OAuth, AI output summaries, and reliability fixes">
 
 ## New features
 
@@ -34,11 +52,25 @@ keywords:
 
 - **Workflow-Level Error Code Mapping** — Workflows now support an `error_code_mapping` field that all blocks inherit automatically. Block-level mappings still take precedence, giving you a single place to define default error handling without repeating it on every block. ([#5506](https://github.com/Skyvern-AI/skyvern/pull/5506))
 
+- **AI Summarize for Workflow Run Outputs** — A magic-wand "Summarize with AI" button now appears next to block and workflow run output sections, generating a plain-language summary of raw JSON output on demand. ([#5556](https://github.com/Skyvern-AI/skyvern/pull/5556))
+
+- **Reset Browser Profile API** — A new `POST /workflows/{workflow_permanent_id}/browser_session/reset_profile` endpoint clears a corrupted persisted browser session so the next run starts from a fresh browser state. ([#5544](https://github.com/Skyvern-AI/skyvern/pull/5544))
+
+- **MCP OAuth for Remote Clients** — MCP clients (e.g. Claude Code, Codex) can now complete browser-based OAuth to authenticate with Skyvern without getting stuck in redirect chains. ([#5558](https://github.com/Skyvern-AI/skyvern/pull/5558))
+
+- **OpenClaw MCP Setup** — `skyvern setup openclaw` and `skyvern mcp switch` now support OpenClaw as an MCP client target for both remote and local stdio configurations. ([#5536](https://github.com/Skyvern-AI/skyvern/pull/5536))
+
 ## Improvements
 
 - **Smarter Extraction Cache Keys** — The extraction cache now normalizes session-volatile tokens (random UUIDs, CSRF values, nonce query params, timestamps) before hashing cache keys. Semantically identical page visits now share cached extraction results, improving cache hit rates across workflow re-runs. ([#5504](https://github.com/Skyvern-AI/skyvern/pull/5504))
 
 - **Reduced Rate-Limit Errors on Extraction Prompts** — Extraction prompts are now capped in size before being sent to the LLM. Oversized `previous_extracted_information`, `extracted_information_schema`, and element trees are truncated rather than sent whole, significantly reducing `429 RESOURCE_EXHAUSTED` errors on high-volume workflows. ([#5502](https://github.com/Skyvern-AI/skyvern/pull/5502))
+
+- **Cross-Run Extraction Cache** — Extraction results are now cached in Redis across workflow runs, scoped to the workflow. Recurring scheduled workflows skip redundant LLM calls when the page content hasn't changed. ([#5562](https://github.com/Skyvern-AI/skyvern/pull/5562))
+
+- **Copilot Survives Tab Switches and Reconnects** — The workflow copilot agent now runs to completion even if the browser tab is closed or the connection drops mid-request, and the AI reply is persisted so it appears when you reconnect. ([#5560](https://github.com/Skyvern-AI/skyvern/pull/5560))
+
+- **Copilot Fails Fast on Unresolvable URLs** — The workflow copilot now immediately surfaces the real error (e.g. DNS resolution failure) and stops retrying when a URL cannot be reached, rather than reporting success. ([#5563](https://github.com/Skyvern-AI/skyvern/pull/5563))
 
 ## Bug fixes
 
@@ -48,7 +80,11 @@ keywords:
 - Fixed workflow file-download blocks losing their configured `download_suffix` at task finalization, causing downloaded files to be persisted without the expected filename suffix. ([#5499](https://github.com/Skyvern-AI/skyvern/pull/5499))
 - Fixed cached scripts for non-ATS workflows incorrectly generating `fill_form()` calls, which defeated the performance benefits of caching by delegating back to AI at runtime. ([#5497](https://github.com/Skyvern-AI/skyvern/pull/5497))
 - Fixed the pagination navigator on the Workflow Past Runs and Run History pages being right-aligned instead of centered.
-
+- Fixed run recordings missing an end timestamp and broken scrubbing. Recordings are now finalized with a stream-copy remux so players correctly show duration and support seeking. ([#5551](https://github.com/Skyvern-AI/skyvern/pull/5551))
+- Fixed tag input fields (e.g. skill set fields on job application forms) not selecting values from the dropdown. These fields are now correctly treated as auto-completion inputs. ([#5557](https://github.com/Skyvern-AI/skyvern/pull/5557))
+- Fixed per-step video sync spawning a redundant ffmpeg process on every step, causing CPU spikes and log noise. ([#5559](https://github.com/Skyvern-AI/skyvern/pull/5559))
+- Fixed workflow parameter edit and delete buttons being hidden when a parameter name was too long.
+- Fixed webhook delivery failing silently when a stored webhook URL had a leading or trailing space. ([#5550](https://github.com/Skyvern-AI/skyvern/pull/5550))
 </Update>
 
 <Update label="v1.0.22 — February 26, 2026" description="Adaptive caching, Workflow Trigger block, CLI signup, and more">
