@@ -228,7 +228,7 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.browser_session_id = browser_session_id
                 if browser_address:
                     workflow_run.browser_address = browser_address
-                if extra_http_headers:
+                if extra_http_headers is not None:
                     workflow_run.extra_http_headers = extra_http_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
