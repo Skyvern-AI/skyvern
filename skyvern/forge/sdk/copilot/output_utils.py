@@ -38,7 +38,14 @@ def extract_final_text(result: RunResultStreaming) -> str:
 
 
 def parse_final_response(text: str) -> dict[str, Any]:
-    """Parse the agent's final JSON envelope, stripping markdown code fences."""
+    """Parse the agent's final JSON envelope, stripping markdown code fences.
+
+    Tolerant of literal control characters (newlines/tabs/CR) inside string
+    values. Some model outputs wrap long `user_response` prose across real
+    newlines instead of `\\n` escapes; strict `json.loads` rejects those, and
+    without this fallback the frontend renders the full raw JSON object as
+    the user-visible reply (see SKY-9189 test-2 regression).
+    """
     cleaned = text.strip()
     for prefix in ("```json", "```"):
         if cleaned.startswith(prefix):
@@ -48,12 +55,13 @@ def parse_final_response(text: str) -> dict[str, Any]:
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
 
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
+    for strict in (True, False):
+        try:
+            parsed = json.loads(cleaned, strict=strict)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
 
     return {"type": "REPLY", "user_response": text}
 
