@@ -305,10 +305,13 @@ async def test_validate_mcp_api_key_retries_transient_failure_without_negative_c
 
 
 def test_profile_to_mcp_url_normalizes_base_variants() -> None:
-    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com") == "https://api.skyvern.com/mcp/"
-    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com/") == "https://api.skyvern.com/mcp/"
-    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com/mcp") == "https://api.skyvern.com/mcp/"
-    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com/mcp/") == "https://api.skyvern.com/mcp/"
+    # Canonical form has no trailing slash so the advertised MCP resource URI
+    # matches what clients send during RFC 8707 audience / RFC 9728
+    # protected-resource comparison.
+    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com") == "https://api.skyvern.com/mcp"
+    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com/") == "https://api.skyvern.com/mcp"
+    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com/mcp") == "https://api.skyvern.com/mcp"
+    assert mcp_http_auth._canonical_mcp_url("https://api.skyvern.com/mcp/") == "https://api.skyvern.com/mcp"
 
 
 def test_resource_metadata_url_normalizes_base_variants() -> None:
@@ -335,6 +338,87 @@ def test_validate_token_audience_accepts_matching_url() -> None:
         {"aud": ["https://api.skyvern.com/mcp/"]},
         "https://api.skyvern.com/mcp/",
     )
+
+
+def test_validate_token_audience_tolerates_trailing_slash_mismatch() -> None:
+    # Token audience minted against the slashed form must still validate when
+    # the canonical (slashless) expected_resource is used, and vice versa.
+    mcp_http_auth._validate_token_audience(
+        {"aud": ["https://api.skyvern.com/mcp/"]},
+        "https://api.skyvern.com/mcp",
+    )
+    mcp_http_auth._validate_token_audience(
+        {"aud": ["https://api.skyvern.com/mcp"]},
+        "https://api.skyvern.com/mcp/",
+    )
+
+
+def test_validate_token_resource_claim_tolerates_trailing_slash_mismatch() -> None:
+    # Same normalization applies to the RFC 8707 `resource` claim.
+    mcp_http_auth._validate_token_resource_claims(
+        {"resource": "https://api.skyvern.com/mcp/"},
+        "https://api.skyvern.com/mcp",
+    )
+    mcp_http_auth._validate_token_resource_claims(
+        {"resource": "https://api.skyvern.com/mcp"},
+        "https://api.skyvern.com/mcp/",
+    )
+
+
+def test_validate_token_audience_rejects_missing_aud() -> None:
+    # Payload without any `aud` key at all must reject — the `any(...)` check
+    # on an empty audience list cannot match the expected resource.
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience({}, "https://api.skyvern.com/mcp")
+
+
+def test_validate_token_audience_rejects_none_aud() -> None:
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience({"aud": None}, "https://api.skyvern.com/mcp")
+
+
+def test_validate_token_audience_rejects_empty_list_aud() -> None:
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience({"aud": []}, "https://api.skyvern.com/mcp")
+
+
+def test_validate_token_audience_filters_non_string_list_items() -> None:
+    # Non-string items inside the `aud` array are silently dropped (per the
+    # asymmetry documented in _validate_token_audience); with only garbage in
+    # the list, there is nothing to match against the expected resource.
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience({"aud": [42, None, {}]}, "https://api.skyvern.com/mcp")
+
+
+def test_validate_token_audience_rejects_different_path_despite_normalization() -> None:
+    # Guards against a future refactor broadening rstrip normalization into a
+    # prefix / startswith check. `/mcp-other/` is not a slash-variant of
+    # `/mcp` and must be rejected.
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience(
+            {"aud": ["https://api.skyvern.com/mcp-other/"]},
+            "https://api.skyvern.com/mcp",
+        )
+
+
+def test_validate_token_resource_claim_rejects_different_path_despite_normalization() -> None:
+    # Same boundary guard for the `resource` claim.
+    with pytest.raises(HTTPException, match="Token resource is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_resource_claims(
+            {"resource": "https://api.skyvern.com/mcp-other/"},
+            "https://api.skyvern.com/mcp",
+        )
+
+
+def test_validate_token_resource_claim_rejects_non_string_claim() -> None:
+    # Explicit type guard: a non-string `resource` claim is a malformed token,
+    # not a slash-variant of the expected value, and gets its own error detail
+    # so the cause is obvious in logs.
+    with pytest.raises(HTTPException, match="Token resource claim must be a string"):
+        mcp_http_auth._validate_token_resource_claims(
+            {"resource": 42},
+            "https://api.skyvern.com/mcp",
+        )
 
 
 def test_looks_like_jwt_rejects_dotted_opaque_token() -> None:
