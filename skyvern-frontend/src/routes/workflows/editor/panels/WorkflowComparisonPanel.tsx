@@ -57,6 +57,8 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   file_upload: "fileUpload",
   goto_url: "url",
   http_request: "http_request",
+  google_sheets_read: "googleSheetsRead",
+  google_sheets_write: "googleSheetsWrite",
 };
 
 function getBlockIdentifier(block: WorkflowBlock): string {

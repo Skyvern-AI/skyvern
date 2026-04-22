@@ -71,6 +71,34 @@ export const helpTooltips = {
     prompt:
       "Write a prompt you would like passed into the LLM and specify the output format, if applicable.",
   },
+  google_sheets_read: {
+    ...baseHelpTooltipContent,
+    spreadsheetUrl:
+      "Paste a Google Sheets URL, or click the table icon to pick from your connected account. Jinja templates work too.",
+    sheetName:
+      "Pick a tab via the layers icon once a spreadsheet is selected, or type the name directly.",
+    range: "A1 notation range to read (optional, defaults to all data)",
+    credentialId: "The credential ID for Google OAuth authentication",
+    hasHeaderRow:
+      "If enabled, the first row is used as column headers for the output objects",
+  },
+  google_sheets_write: {
+    ...baseHelpTooltipContent,
+    spreadsheetUrl:
+      "The full URL of the Google Sheet to write to. Use the picker to browse your connected account.",
+    credentialId:
+      "The Google account used to authenticate with the spreadsheet.",
+    sheetName:
+      "The sheet tab to write to. Use the picker to list tabs or create a new one.",
+    writeMode:
+      "Append adds new rows below existing data. Update Range overwrites the exact cells in the range you specify.",
+    range:
+      "Only used for Update Range. A1 notation (e.g. A2:D5) or a named range. The data shape must match the range dimensions.",
+    values:
+      "Jinja2 template that resolves to a JSON array. Arrays of lists write left-to-right; arrays of objects require column mappings below.",
+    columnMapping:
+      "Map each source field to a sheet column. Use the column letter (A, B, C) or the header name if your sheet has a header row.",
+  },
   login: baseHelpTooltipContent,
   loop: {
     ...baseHelpTooltipContent,

@@ -47,6 +47,8 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  GoogleSheetsReadBlockYAML,
+  GoogleSheetsWriteBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -140,6 +142,16 @@ import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
+import {
+  googleSheetsReadNodeDefaultData,
+  isGoogleSheetsReadNode,
+} from "./nodes/GoogleSheetsReadNode/types";
+import { validateGoogleSheetsReadNode } from "./nodes/GoogleSheetsReadNode/validate";
+import {
+  googleSheetsWriteNodeDefaultData,
+  isGoogleSheetsWriteNode,
+} from "./nodes/GoogleSheetsWriteNode/types";
+import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -989,6 +1001,43 @@ function convertToNode(
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
           useParentBrowserSession: block.use_parent_browser_session ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "google_sheets_read": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "google_sheets_write": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          writeMode: block.write_mode ?? "append",
+          values: block.values ?? "",
+          columnMapping: block.column_mapping
+            ? JSON.stringify(block.column_mapping, null, 2)
+            : "",
+          createSheetIfMissing: block.create_sheet_if_missing ?? false,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -2096,6 +2145,28 @@ function createNode(
         },
       };
     }
+    case "googleSheetsRead": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...googleSheetsReadNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "googleSheetsWrite": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...googleSheetsWriteNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2598,6 +2669,41 @@ function getWorkflowBlock(
         wait_for_completion: node.data.waitForCompletion,
         browser_session_id: node.data.browserSessionId || null,
         use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsRead": {
+      return {
+        ...base,
+        block_type: "google_sheets_read",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsWrite": {
+      let parsedColumnMapping: Record<string, string> | null = null;
+      if (node.data.columnMapping) {
+        try {
+          parsedColumnMapping = JSON.parse(node.data.columnMapping);
+        } catch {
+          // ignore invalid JSON
+        }
+      }
+      return {
+        ...base,
+        block_type: "google_sheets_write",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        write_mode: node.data.writeMode,
+        values: node.data.values,
+        column_mapping: parsedColumnMapping,
+        create_sheet_if_missing: node.data.createSheetIfMissing,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4039,6 +4145,35 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "google_sheets_read": {
+        const blockYaml: GoogleSheetsReadBlockYAML = {
+          ...base,
+          block_type: "google_sheets_read",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          has_header_row: block.has_header_row,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "google_sheets_write": {
+        const blockYaml: GoogleSheetsWriteBlockYAML = {
+          ...base,
+          block_type: "google_sheets_write",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          write_mode: block.write_mode,
+          values: block.values,
+          column_mapping: block.column_mapping,
+          create_sheet_if_missing: block.create_sheet_if_missing,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -4286,6 +4421,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(`${node.data.label}: Payload - ${payloadResult.message}`);
     }
   });
+
+  nodes
+    .filter(isGoogleSheetsReadNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+
+  nodes
+    .filter(isGoogleSheetsWriteNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
 
   return errors;
 }

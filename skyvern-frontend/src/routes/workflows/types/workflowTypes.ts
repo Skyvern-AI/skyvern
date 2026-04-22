@@ -213,7 +213,9 @@ export type WorkflowBlock =
   | URLBlock
   | HttpRequestBlock
   | PrintPageBlock
-  | WorkflowTriggerBlock;
+  | WorkflowTriggerBlock
+  | GoogleSheetsReadBlock
+  | GoogleSheetsWriteBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -240,6 +242,8 @@ export const WorkflowBlockTypes = {
   HttpRequest: "http_request",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
+  GoogleSheetsRead: "google_sheets_read",
+  GoogleSheetsWrite: "google_sheets_write",
 } as const;
 
 // all of them
@@ -568,6 +572,29 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   wait_for_completion: boolean;
   browser_session_id: string | null;
   use_parent_browser_session: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type GoogleSheetsReadBlock = WorkflowBlockBase & {
+  block_type: "google_sheets_read";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  has_header_row: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
+  block_type: "google_sheets_write";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  write_mode: "append" | "update";
+  values: string;
+  column_mapping: Record<string, string> | null;
+  create_sheet_if_missing?: boolean;
   parameters: Array<WorkflowParameter>;
 };
 

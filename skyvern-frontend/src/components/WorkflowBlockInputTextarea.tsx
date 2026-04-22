@@ -21,12 +21,23 @@ type Props = Omit<
   "onChange"
 > & {
   aiImprove?: AiImprove;
+  extraAction?: React.ReactNode;
+  hideActions?: boolean;
   onChange: (value: string) => void;
   nodeId: string;
 };
 
 function WorkflowBlockInputTextarea(props: Props) {
-  const { aiImprove, nodeId, onChange, disabled, ...textAreaProps } = props;
+  const {
+    aiImprove,
+    extraAction,
+    hideActions,
+    nodeId,
+    onChange,
+    disabled,
+    ...textAreaProps
+  } = props;
+  const showActions = !disabled && !hideActions;
   const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
@@ -100,6 +111,14 @@ function WorkflowBlockInputTextarea(props: Props) {
     }, 0);
   };
 
+  const ACTION_ZONE_PADDING = { 1: "pr-9", 2: "pr-12", 3: "pr-16" } as const;
+  const actionSlots = 1 + (aiImprove ? 1 : 0) + (extraAction ? 1 : 0);
+  // Fall back to the widest padding if a future caller adds a 4th action;
+  // dropping right-padding entirely would let icons overlap input text.
+  const actionZonePadding =
+    ACTION_ZONE_PADDING[actionSlots as keyof typeof ACTION_ZONE_PADDING] ??
+    "pr-16";
+
   return (
     <div className="relative">
       <AutoResizingTextarea
@@ -127,10 +146,7 @@ function WorkflowBlockInputTextarea(props: Props) {
           }
         }}
         onSelect={handleTextareaSelect}
-        className={cn(
-          !disabled && (aiImprove ? "pr-12" : "pr-9"),
-          props.className,
-        )}
+        className={cn(showActions && actionZonePadding, props.className)}
       />
       <ParameterGhostText
         ghostText={autocomplete.ghostText}
@@ -147,7 +163,7 @@ function WorkflowBlockInputTextarea(props: Props) {
         onDismiss={autocomplete.dismiss}
       />
 
-      {!disabled && (
+      {showActions && (
         <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
           <div className="flex items-center justify-center gap-1">
             {aiImprove && (
@@ -160,6 +176,7 @@ function WorkflowBlockInputTextarea(props: Props) {
                 useCase={aiImprove.useCase}
               />
             )}
+            {extraAction}
             <div className="cursor-pointer">
               <Popover>
                 <PopoverTrigger asChild>

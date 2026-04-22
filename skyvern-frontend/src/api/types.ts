@@ -262,6 +262,86 @@ export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
 }
 
+export interface GoogleOAuthCredential {
+  id: string;
+  organization_id: string;
+  credential_name: string;
+  scopes: string | null;
+  valid: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface GoogleOAuthCredentialResponse {
+  credential: GoogleOAuthCredential;
+  app_origin?: string | null;
+}
+
+export interface GoogleOAuthCredentialListResponse {
+  credentials: GoogleOAuthCredential[];
+}
+
+export interface CreateGoogleOAuthAuthorizeRequest {
+  redirect_uri: string;
+  credential_name?: string;
+  app_origin?: string;
+}
+
+export interface GoogleOAuthAuthorizeResponse {
+  authorize_url: string;
+  state: string;
+}
+
+export interface CreateGoogleOAuthCallbackRequest {
+  code: string;
+  state: string;
+}
+
+export interface GoogleSpreadsheetSummary {
+  id: string;
+  name: string;
+  modified_time: string | null;
+  web_view_link: string | null;
+}
+
+export interface PagedGoogleSpreadsheets {
+  spreadsheets: GoogleSpreadsheetSummary[];
+  next_page_token: string | null;
+}
+
+export interface GoogleSheetTab {
+  sheet_id: number;
+  title: string;
+  index: number;
+}
+
+export interface ListGoogleSheetTabsResponse {
+  tabs: GoogleSheetTab[];
+}
+
+export interface SheetHeader {
+  letter: string;
+  name: string;
+}
+
+export interface GetSheetHeadersResponse {
+  headers: SheetHeader[];
+}
+
+export interface CreateGoogleSpreadsheetResponse {
+  spreadsheet: GoogleSpreadsheetSummary;
+  first_sheet_name: string | null;
+}
+
+export interface CreateGoogleSheetTabResponse {
+  tab: GoogleSheetTab;
+}
+
+export interface GoogleSheetsReconnectRequiredError {
+  code: "reconnect_required";
+  missing_scope: string | null;
+}
+
 export interface BitwardenCredential {
   email: string;
   master_password: string;

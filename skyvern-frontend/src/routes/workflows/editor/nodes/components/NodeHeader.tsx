@@ -3,6 +3,7 @@ import { ReloadIcon, PlayIcon, StopIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useReactFlow } from "@xyflow/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
@@ -53,6 +54,16 @@ import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
+import type { AppNode } from "..";
+import { getWorkflowErrors } from "../../workflowEditorUtils";
+
+class ValidationFailureError extends Error {
+  readonly isValidationFailure = true;
+  constructor() {
+    super("workflow validation failed");
+    this.name = "ValidationFailureError";
+  }
+}
 
 function isWorkflowParameter(param: Parameter): param is WorkflowParameter {
   return (
@@ -214,6 +225,7 @@ function NodeHeader({
     workflowPermanentId,
   });
   const saveWorkflow = useWorkflowSave();
+  const reactFlow = useReactFlow<AppNode>();
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
@@ -313,6 +325,33 @@ function NodeHeader({
       parameterOverrides?: Record<string, unknown>;
     }) => {
       closeWorkflowPanel();
+
+      // Compute errors against the full graph so per-block validators that
+      // reference siblings/edges (loops, conditionals, validation block
+      // ordering) behave correctly, then keep only the ones tagged with this
+      // block's label so unrelated unfinished nodes don't block running this
+      // one. Filter relies on the implicit contract that every validator
+      // formats errors as `${label}: ${message}` - if that ever drifts,
+      // errors for this block would silently slip past this gate.
+      const allErrors = getWorkflowErrors(reactFlow.getNodes());
+      const labelPrefix = `${blockLabel}:`;
+      const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      if (blockErrors.length > 0) {
+        toast({
+          variant: "destructive",
+          title: "Can not run block because of errors:",
+          description: (
+            <div className="space-y-2">
+              {blockErrors.map((error) => (
+                <p key={error}>{error}</p>
+              ))}
+            </div>
+          ),
+        });
+        // Throw a typed error so React Query routes to onError (not
+        // onSuccess) without firing the generic "Failed to start" toast.
+        throw new ValidationFailureError();
+      }
 
       await saveWorkflow.mutateAsync();
 
@@ -439,7 +478,12 @@ function NodeHeader({
         `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
       );
     },
-    onError: (error: AxiosError) => {
+    onError: (error: AxiosError | ValidationFailureError) => {
+      // The block-validation gate threw a typed error and already showed
+      // its own toast; don't stack the generic "Failed to start" on top.
+      if (error instanceof ValidationFailureError) {
+        return;
+      }
       const detail = (error.response?.data as { detail?: string })?.detail;
       log.error("Run block: error", {
         workflowPermanentId,

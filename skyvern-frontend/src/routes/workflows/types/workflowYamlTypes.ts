@@ -144,7 +144,9 @@ export type BlockYAML =
   | URLBlockYAML
   | HttpRequestBlockYAML
   | PrintPageBlockYAML
-  | WorkflowTriggerBlockYAML;
+  | WorkflowTriggerBlockYAML
+  | GoogleSheetsReadBlockYAML
+  | GoogleSheetsWriteBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -426,5 +428,28 @@ export type WorkflowTriggerBlockYAML = BlockYAMLBase & {
   wait_for_completion: boolean;
   browser_session_id?: string | null;
   use_parent_browser_session?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type GoogleSheetsReadBlockYAML = BlockYAMLBase & {
+  block_type: "google_sheets_read";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  has_header_row: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
+  block_type: "google_sheets_write";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  write_mode: "append" | "update";
+  values: string;
+  column_mapping: Record<string, string> | null;
+  create_sheet_if_missing?: boolean;
   parameter_keys?: Array<string> | null;
 };
