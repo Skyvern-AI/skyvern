@@ -100,16 +100,18 @@ def test_rule_1_jinja_reference_to_declared_param() -> None:
     assert pick.rule == "jinja_ref"
 
 
-def test_rule_1_prefers_declared_param_over_schema_key_on_tie() -> None:
-    """When both sets match, declared-param beats schema-key."""
+def test_rule_1_falls_through_on_multi_key_goal() -> None:
+    """When the goal references multiple valid keys, Rule 1 can't disambiguate
+    which INPUT_TEXT action targets which key. Fall through to Rule 3 to avoid
+    collapsing all actions onto the same name (CORR-1 from debate review)."""
     pick = pick_field_name_for_action(
         action=_input_action("x", intention="pick one"),
         goal_template="use {{ name_declared }} and {{ name_schema }}",
         declared_param_keys=frozenset({"name_declared"}),
         upstream_schema_keys=frozenset({"name_schema"}),
     )
-    assert pick.field_name == "name_declared"
-    assert pick.rule == "jinja_ref"
+    # Multi-key → Rule 3 fallback, not Rule 1
+    assert pick.rule == "intention_derived"
 
 
 def test_rule_1_ignores_jinja_refs_not_in_valid_keys() -> None:

@@ -12,10 +12,8 @@ from typing import Any
 
 import pytest
 
-from skyvern.core.script_generations import generate_workflow_parameters as gwp
 from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
-    GeneratedFieldMapping,
     generate_workflow_parameters_schema,
     hydrate_input_text_actions_with_field_names,
 )
@@ -200,16 +198,6 @@ class TestCodeGenerationWithoutFieldName:
 class TestFieldMappingGeneration:
     """Test the field mapping generation logic."""
 
-    def test_field_mapping_structure(self) -> None:
-        """Test that GeneratedFieldMapping has the expected structure."""
-        mapping = GeneratedFieldMapping(
-            field_mappings={"action_index_1": "facility_name"},
-            schema_fields={"facility_name": {"type": "str", "description": "The facility name"}},
-        )
-
-        assert mapping.field_mappings["action_index_1"] == "facility_name"
-        assert mapping.schema_fields["facility_name"]["type"] == "str"
-
     def test_action_index_to_field_mapping_key_format(self) -> None:
         """Test that field mapping keys use the correct format: task_id:action_id."""
         task_id = "task-123"
@@ -243,21 +231,9 @@ async def test_generate_workflow_parameters_schema_empty_actions(monkeypatch: py
 @pytest.mark.asyncio
 async def test_generate_workflow_parameters_schema_with_actions(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Integration test: Verify that when actions are present, LLM is called.
-
-    This confirms that when script generation runs AFTER actions are saved,
-    it properly generates field mappings.
+    Integration test: Verify that when actions are present, the deterministic
+    picker generates field mappings (SKY-8965 Phase 2: no LLM call).
     """
-
-    # Mock the LLM call to return a mapping
-    async def mock_generate_field_names_with_llm(custom_field_actions):
-        return GeneratedFieldMapping(
-            field_mappings={"action_index_1": "facility_name"},
-            schema_fields={"facility_name": {"type": "str", "description": "The facility name"}},
-        )
-
-    monkeypatch.setattr(gwp, "_generate_field_names_with_llm", mock_generate_field_names_with_llm)
-
     task_id = "task-123"
     action_id = "action-456"
     actions_by_task = {
@@ -268,13 +244,13 @@ async def test_generate_workflow_parameters_schema_with_actions(monkeypatch: pyt
 
     schema_code, action_field_mappings = await generate_workflow_parameters_schema(actions_by_task)
 
-    # Should have generated schema with field
-    assert "facility_name" in schema_code
+    # Should have generated schema with a field derived from the intention
     assert "GeneratedWorkflowParameters" in schema_code
+    assert "enter_facility_name" in schema_code
 
     # Should have mapping for our action
     assert f"{task_id}:{action_id}" in action_field_mappings
-    assert action_field_mappings[f"{task_id}:{action_id}"] == "facility_name"
+    assert action_field_mappings[f"{task_id}:{action_id}"] == "enter_facility_name"
 
 
 class TestRaceConditionTimingScenario:
@@ -662,19 +638,6 @@ async def test_generate_workflow_parameters_schema_skips_empty_actions_and_sets_
     context = SkyvernContext()
     skyvern_context.set(context)
 
-    # Mock the LLM call - should only be called if there are valid actions
-    llm_called = False
-
-    async def mock_generate_field_names_with_llm(custom_field_actions):
-        nonlocal llm_called
-        llm_called = True
-        return GeneratedFieldMapping(
-            field_mappings={"action_index_1": "facility_name"},
-            schema_fields={"facility_name": {"type": "str", "description": "The facility name"}},
-        )
-
-    monkeypatch.setattr(gwp, "_generate_field_names_with_llm", mock_generate_field_names_with_llm)
-
     task_id = "task-123"
 
     # Actions with empty values - simulates race condition
@@ -693,9 +656,7 @@ async def test_generate_workflow_parameters_schema_skips_empty_actions_and_sets_
     try:
         schema_code, action_field_mappings = await generate_workflow_parameters_schema(actions_by_task)
 
-        # LLM should NOT be called because action was skipped
-        assert not llm_called
-
+        # Deterministic picker skips empty-value actions (same as old LLM path)
         # Should return empty schema
         assert "pass" in schema_code
         assert action_field_mappings == {}
@@ -720,15 +681,6 @@ async def test_generate_workflow_parameters_schema_with_complete_actions_no_flag
     context = SkyvernContext()
     skyvern_context.set(context)
 
-    # Mock the LLM call
-    async def mock_generate_field_names_with_llm(custom_field_actions):
-        return GeneratedFieldMapping(
-            field_mappings={"action_index_1": "facility_name"},
-            schema_fields={"facility_name": {"type": "str", "description": "The facility name"}},
-        )
-
-    monkeypatch.setattr(gwp, "_generate_field_names_with_llm", mock_generate_field_names_with_llm)
-
     task_id = "task-123"
 
     # Actions with complete values - no race condition
@@ -747,8 +699,8 @@ async def test_generate_workflow_parameters_schema_with_complete_actions_no_flag
     try:
         schema_code, action_field_mappings = await generate_workflow_parameters_schema(actions_by_task)
 
-        # Should have generated schema
-        assert "facility_name" in schema_code
+        # Should have generated schema with deterministic field name
+        assert "enter_facility_name" in schema_code
 
         # Context flag should NOT be set - no regeneration needed
         assert context.script_gen_had_incomplete_actions is False
