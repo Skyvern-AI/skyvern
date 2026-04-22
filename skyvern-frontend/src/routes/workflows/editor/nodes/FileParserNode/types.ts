@@ -6,7 +6,13 @@ import {
   WorkflowModel,
 } from "@/routes/workflows/types/workflowTypes";
 
-export type FileParserFileType = "csv" | "excel" | "pdf" | "image" | "docx";
+export type FileParserFileType =
+  | "auto_detect"
+  | "csv"
+  | "excel"
+  | "pdf"
+  | "image"
+  | "docx";
 
 export type FileParserNodeData = NodeBaseData & {
   fileUrl: string;
@@ -22,7 +28,7 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   editable: true,
   label: "",
   fileUrl: "",
-  fileType: "csv",
+  fileType: "auto_detect",
   continueOnFailure: false,
   jsonSchema: "null",
   model: null,

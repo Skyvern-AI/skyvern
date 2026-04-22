@@ -7,6 +7,7 @@ import {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { Status404 } from "@/components/Status404";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
@@ -177,7 +178,10 @@ function TaskDetails() {
     task?.status === Status.TimedOut;
   const failureReason = showFailureReason ? (
     <div className="space-y-1">
-      <Label className="text-lg">Failure Reason</Label>
+      <div className="flex items-center gap-2">
+        <Label className="text-lg">Failure Reason</Label>
+        <FailureCategoryBadge failureCategory={task.failure_category ?? null} />
+      </div>
       <CodeEditor
         language="json"
         value={JSON.stringify(task.failure_reason, null, 2)}
