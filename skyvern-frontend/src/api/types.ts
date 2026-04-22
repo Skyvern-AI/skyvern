@@ -147,6 +147,12 @@ export type Task = {
   application: string | null;
 };
 
+export type FailureCategory = {
+  category: string;
+  confidence_float: number;
+  reasoning: string;
+};
+
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -157,6 +163,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
@@ -483,6 +490,7 @@ export type WorkflowRunStatusApiResponse = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -513,6 +521,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;

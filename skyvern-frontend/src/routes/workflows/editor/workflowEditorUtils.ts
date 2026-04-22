@@ -864,7 +864,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
-          fileType: block.file_type ?? "csv",
+          fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           model: block.model,
         },

@@ -1,4 +1,4 @@
-import fetchToCurl from "fetch-to-curl";
+import { fetchToCurl } from "fetch-to-curl";
 
 export interface ApiCommandOptions {
   method: string;

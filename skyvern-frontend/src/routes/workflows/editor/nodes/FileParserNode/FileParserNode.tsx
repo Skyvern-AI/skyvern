@@ -24,6 +24,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { useRecordingStore } from "@/store/useRecordingStore";
 
 const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
+  { value: "auto_detect", label: "Auto detect" },
   { value: "csv", label: "CSV" },
   { value: "excel", label: "Excel" },
   { value: "pdf", label: "PDF" },
@@ -78,7 +79,9 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
 
   function handleFileUrlChange(value: string) {
     const detected = detectFileTypeFromUrl(value);
-    if (detected) {
+    const currentType = data.fileType;
+    const canInfer = detected && (!currentType || currentType === detected);
+    if (canInfer) {
       update({ fileUrl: value, fileType: detected });
     } else {
       update({ fileUrl: value });
