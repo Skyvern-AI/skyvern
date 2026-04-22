@@ -94,7 +94,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -423,7 +423,12 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
-    @traced(name="skyvern.agent.execute_step")
+    # Span name intentionally differs from the method: this is the outer wrapper
+    # that handles cancellation checks, status updates, retries, and cleanup around
+    # the inner step body. "step_orchestration" reads better on the trace dashboard
+    # than "execute_step", which was easy to confuse with the inner span below.
+    # code.function still carries the qualname for grep.
+    @traced(name="skyvern.agent.step_orchestration", role="wrapper")
     async def execute_step(
         self,
         organization: Organization,
@@ -1084,7 +1089,12 @@ class ForgeAgent:
             )
             return True
 
-    @traced(name="skyvern.agent.step")
+    # Span name intentionally differs from the method: this is the inner body
+    # that actually runs a step (scrape, LLM call, action execution). It sits
+    # under the "step_orchestration" span above. "step_body" vs the old
+    # "skyvern.agent.step" makes the parent/child relationship obvious at a glance
+    # on the dashboard. code.function still carries the qualname for grep.
+    @traced(name="skyvern.agent.step_body", role="wrapper")
     async def agent_step(
         self,
         task: Task,
@@ -2546,26 +2556,34 @@ class ForgeAgent:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
                 _ctx = skyvern_context.current()
-                if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
-                    ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                        step=step,
-                        screenshots=[screenshot],
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    )
-                    if ids:
-                        screenshot_artifact_id = ids[0]
-                else:
-                    screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=screenshot,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        step=step,
-                    )
-                    if screenshot_request:
-                        artifacts.append(screenshot_request)
-                        for artifact_data in screenshot_request.artifacts:
-                            if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
-                                screenshot_artifact_id = artifact_data.artifact_model.artifact_id
-                                break
+                # Derive bundled from the actual branch condition, not just the context flag —
+                # step=None and speculative steps force the non-bundled path.
+                _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.agent.artifact.screenshot_action") as _ss_art_span:
+                    apply_context_attrs(_ss_art_span)
+                    _ss_art_span.set_attribute("screenshot_bytes", len(screenshot))
+                    _ss_art_span.set_attribute("bundled", _bundled)
+                    if _bundled:
+                        ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                            step=step,
+                            screenshots=[screenshot],
+                            artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        )
+                        if ids:
+                            screenshot_artifact_id = ids[0]
+                    else:
+                        screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=screenshot,
+                            artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                            step=step,
+                        )
+                        if screenshot_request:
+                            artifacts.append(screenshot_request)
+                            for artifact_data in screenshot_request.artifacts:
+                                if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
+                                    screenshot_artifact_id = artifact_data.artifact_model.artifact_id
+                                    break
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2576,24 +2594,38 @@ class ForgeAgent:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
             _ctx = skyvern_context.current()
-            if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
-                app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html.encode("utf-8"))
-            else:
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=html.encode(),
-                        artifact_type=ArtifactType.HTML_ACTION,
-                        step=step,
+            # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
+            # second pass through html.encode() in the chosen branch.
+            html_bytes = html.encode("utf-8")
+            _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.agent.artifact.html_action") as _html_art_span:
+                apply_context_attrs(_html_art_span)
+                _html_art_span.set_attribute("html_bytes", len(html_bytes))
+                _html_art_span.set_attribute("bundled", _bundled)
+                if _bundled:
+                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html_bytes)
+                else:
+                    artifacts.append(
+                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=html_bytes,
+                            artifact_type=ArtifactType.HTML_ACTION,
+                            step=step,
+                        )
                     )
-                )
         except Exception:
             LOG.exception("Failed to record html after action")
 
         if artifacts:
-            try:
-                await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-            except Exception:
-                LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.agent.artifact.bulk_create") as _bulk_span:
+                apply_context_attrs(_bulk_span)
+                # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                _bulk_span.set_attribute("artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None))
+                try:
+                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                except Exception:
+                    LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
 
         if screenshot_artifact_id and action.action_id and action.organization_id:
             action.screenshot_artifact_id = screenshot_artifact_id
@@ -2608,19 +2640,22 @@ class ForgeAgent:
                     artifact_id=screenshot_artifact_id,
                 )
             else:
-                try:
-                    await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
-                        organization_id=action.organization_id,
-                        action_id=action.action_id,
-                        screenshot_artifact_id=screenshot_artifact_id,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to update action with screenshot artifact id",
-                        action_id=action.action_id,
-                        screenshot_artifact_id=screenshot_artifact_id,
-                        exc_info=True,
-                    )
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.agent.artifact.update_action_screenshot_fk") as _fk_span:
+                    apply_context_attrs(_fk_span)
+                    try:
+                        await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
+                            organization_id=action.organization_id,
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to update action with screenshot artifact id",
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                            exc_info=True,
+                        )
 
     async def initialize_execution_state(
         self,
@@ -2705,7 +2740,7 @@ class ForgeAgent:
             scroll=scroll,
         )
 
-    @traced(name="skyvern.agent.scrape_and_prompt")
+    @traced(name="skyvern.agent.scrape_and_prompt", role="wrapper")
     async def build_and_record_step_prompt(
         self,
         task: Task,
@@ -3339,6 +3374,14 @@ class ForgeAgent:
 
         # Map template to prompt_name for logging/caching guards
         prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+
+        # Tag the span so we can explain the 26x p95/p50 variance — prompt size
+        # is almost always the reason prompt_build gets slow.
+        _prompt_build_span = otel_trace.get_current_span()
+        _prompt_build_span.set_attribute("prompt_name", prompt_name)
+        _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
+        _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+
         return full_prompt, use_caching, prompt_name
 
     async def _get_prompt_caching_settings(self, context: SkyvernContext) -> dict[str, bool]:
@@ -3700,37 +3743,42 @@ class ForgeAgent:
                     LOG.exception("Failed to take screenshot before sending task response")
 
         if task.organization_id:
-            try:
-                # Keep both finalize and save inside a single timeout budget so a hung
-                # finalize call cannot block persistence forever; accept the trade-off
-                # that a very slow finalize on many files could crowd out save.
-                async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                    if download_suffix and list_files_before is not None:
-                        await self._finalize_downloaded_files_for_task(
-                            task,
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
+                apply_context_attrs(_cl_save_span)
+                try:
+                    # Keep both finalize and save inside a single timeout budget so a hung
+                    # finalize call cannot block persistence forever; accept the trade-off
+                    # that a very slow finalize on many files could crowd out save.
+                    async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                        if download_suffix and list_files_before is not None:
+                            await self._finalize_downloaded_files_for_task(
+                                task,
+                                organization_id=task.organization_id,
+                                download_suffix=download_suffix,
+                                list_files_before=list_files_before,
+                                randomize_if_missing=False,
+                            )
+                        context = skyvern_context.current()
+                        await app.STORAGE.save_downloaded_files(
                             organization_id=task.organization_id,
-                            download_suffix=download_suffix,
-                            list_files_before=list_files_before,
-                            randomize_if_missing=False,
+                            run_id=context.run_id
+                            if context and context.run_id
+                            else task.workflow_run_id or task.task_id,
                         )
-                    context = skyvern_context.current()
-                    await app.STORAGE.save_downloaded_files(
-                        organization_id=task.organization_id,
-                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout to save downloaded files",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
                     )
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "Timeout to save downloaded files",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to save downloaded files",
-                    exc_info=True,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
+                except Exception:
+                    LOG.warning(
+                        "Failed to save downloaded files",
+                        exc_info=True,
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
 
         # if it's a task block from workflow run,
         # we don't need to close the browser, save browser artifacts, or call webhook
@@ -3744,15 +3792,22 @@ class ForgeAgent:
 
         await self.async_operation_pool.remove_task(task.task_id)
 
-        await self.cleanup_browser_and_create_artifacts(
-            close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
-        )
+        _tracer = otel_trace.get_tracer("skyvern")
+        with _tracer.start_as_current_span("skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
+            apply_context_attrs(_cl_br_span)
+            await self.cleanup_browser_and_create_artifacts(
+                close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
+            )
 
         # Wait for all tasks to complete before generating the links for the artifacts
-        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
+        with _tracer.start_as_current_span("skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
+            apply_context_attrs(_cl_wait_span)
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            await self.execute_task_webhook(task=task, api_key=api_key)
+            with _tracer.start_as_current_span("skyvern.agent.cleanup.webhook") as _cl_wh_span:
+                apply_context_attrs(_cl_wh_span)
+                await self.execute_task_webhook(task=task, api_key=api_key)
 
     async def execute_task_webhook(
         self,

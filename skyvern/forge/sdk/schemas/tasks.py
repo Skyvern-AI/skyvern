@@ -357,6 +357,7 @@ class Task(TaskBase):
             finished_at=self.finished_at,
             extracted_information=self.extracted_information,
             failure_reason=failure_reason or self.failure_reason,
+            failure_category=self.failure_category,
             webhook_failure_reason=self.webhook_failure_reason,
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
@@ -387,6 +388,7 @@ class TaskResponse(BaseModel):
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     failure_reason: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
     webhook_failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None

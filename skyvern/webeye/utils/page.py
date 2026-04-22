@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Any
 
 import structlog
+from opentelemetry import trace as otel_trace
 from PIL import Image
 from playwright._impl._errors import Error as PlaywrightError
 from playwright._impl._errors import TimeoutError
@@ -15,7 +16,7 @@ from playwright.async_api import ElementHandle, Frame, Page
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 
 LOG = structlog.get_logger()
 
@@ -282,7 +283,7 @@ class SkyvernFrame:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
 
     @staticmethod
-    @traced()
+    @traced(name="skyvern.browser.scrolling_screenshot")
     async def take_scrolling_screenshot(
         page: Page,
         file_path: str | None = None,
@@ -356,7 +357,7 @@ class SkyvernFrame:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
-    @traced()
+    @traced(name="skyvern.browser.split_screenshots")
     async def take_split_screenshots(
         page: Page,
         url: str | None = None,
@@ -552,7 +553,7 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, expression=js_script)
 
-    @traced()
+    @traced(name="skyvern.browser.element_tree_from_body")
     async def build_tree_from_body(
         self,
         frame_name: str | None,
@@ -569,7 +570,7 @@ class SkyvernFrame:
             arg=[frame_name, frame_index, must_included_tags],
         )
 
-    @traced()
+    @traced(name="skyvern.browser.incremental_element_tree")
     async def get_incremental_element_tree(
         self,
         wait_until_finished: bool = True,
@@ -580,7 +581,7 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
 
-    @traced()
+    @traced(name="skyvern.browser.element_tree_from_element")
     async def build_tree_from_element(
         self,
         starter: ElementHandle,
@@ -595,11 +596,20 @@ class SkyvernFrame:
 
     @traced(name="skyvern.browser.wait_for_animation")
     async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
+        # Separates the fast finished-quickly path from the timeout/error paths
+        # that burn the full timeout budget — explains the 124x p95/p50 ratio.
+        _span = otel_trace.get_current_span()
         try:
             await asyncio.sleep(before_wait_sec)
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
+            _span.set_attribute("animation_result", "finished")
+        except (TimeoutError, asyncio.TimeoutError):
+            _span.set_attribute("animation_result", "timeout")
+            LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
+            return
         except Exception:
+            _span.set_attribute("animation_result", "error")
             LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
             return
 
@@ -615,6 +625,7 @@ class SkyvernFrame:
                     return
                 await asyncio.sleep(0.1)
 
+    @traced(name="skyvern.browser.page_ready", role="wrapper")
     async def wait_for_page_ready(
         self,
         network_idle_timeout_ms: float = 3000,
@@ -635,70 +646,84 @@ class SkyvernFrame:
         before attempting to interact with elements.
         """
         total_start_time = time.time()
+        _tracer = otel_trace.get_tracer("skyvern")
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
         loading_indicator_duration_ms = 0.0
         step_start_time = time.time()
         loading_indicator_result = "success"
-        try:
-            await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
-        except (TimeoutError, asyncio.TimeoutError):
-            loading_indicator_result = "timeout"
-            LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
-        except Exception:
-            loading_indicator_result = "error"
-            LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
-        finally:
-            loading_indicator_duration_ms = (time.time() - step_start_time) * 1000
-            LOG.info(
-                "page_readiness_check",
-                step="loading_indicators",
-                result=loading_indicator_result,
-                duration_ms=loading_indicator_duration_ms,
-                timeout_ms=loading_indicator_timeout_ms,
-            )
+        with _tracer.start_as_current_span("skyvern.browser.page_ready.loading_indicators") as _li_span:
+            apply_context_attrs(_li_span)
+            _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
+            try:
+                await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
+            except (TimeoutError, asyncio.TimeoutError):
+                loading_indicator_result = "timeout"
+                LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+            except Exception:
+                loading_indicator_result = "error"
+                LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
+            finally:
+                loading_indicator_duration_ms = (time.time() - step_start_time) * 1000
+                _li_span.set_attribute("result", loading_indicator_result)
+                LOG.info(
+                    "page_readiness_check",
+                    step="loading_indicators",
+                    result=loading_indicator_result,
+                    duration_ms=loading_indicator_duration_ms,
+                    timeout_ms=loading_indicator_timeout_ms,
+                )
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
         network_idle_duration_ms = 0.0
         step_start_time = time.time()
         network_idle_result = "success"
-        try:
-            await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
-        except (TimeoutError, asyncio.TimeoutError):
-            network_idle_result = "timeout"
-            LOG.warning("Network idle timeout - page may have constant activity, proceeding")
-        finally:
-            network_idle_duration_ms = (time.time() - step_start_time) * 1000
-            LOG.info(
-                "page_readiness_check",
-                step="network_idle",
-                result=network_idle_result,
-                duration_ms=network_idle_duration_ms,
-                timeout_ms=network_idle_timeout_ms,
-            )
+        with _tracer.start_as_current_span("skyvern.browser.page_ready.network_idle") as _ni_span:
+            apply_context_attrs(_ni_span)
+            _ni_span.set_attribute("timeout_ms", network_idle_timeout_ms)
+            try:
+                await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
+            except (TimeoutError, asyncio.TimeoutError):
+                network_idle_result = "timeout"
+                LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+            finally:
+                network_idle_duration_ms = (time.time() - step_start_time) * 1000
+                _ni_span.set_attribute("result", network_idle_result)
+                LOG.info(
+                    "page_readiness_check",
+                    step="network_idle",
+                    result=network_idle_result,
+                    duration_ms=network_idle_duration_ms,
+                    timeout_ms=network_idle_timeout_ms,
+                )
 
         # 3. Wait for DOM to stabilize
         dom_stability_duration_ms = 0.0
         step_start_time = time.time()
         dom_stability_result = "success"
-        try:
-            await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
-        except (TimeoutError, asyncio.TimeoutError):
-            dom_stability_result = "timeout"
-            LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
-        except Exception:
-            dom_stability_result = "error"
-            LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
-        finally:
-            dom_stability_duration_ms = (time.time() - step_start_time) * 1000
-            LOG.info(
-                "page_readiness_check",
-                step="dom_stability",
-                result=dom_stability_result,
-                duration_ms=dom_stability_duration_ms,
-                timeout_ms=dom_stability_timeout_ms,
-                stable_ms=dom_stable_ms,
-            )
+        with _tracer.start_as_current_span("skyvern.browser.page_ready.dom_stability") as _ds_span:
+            apply_context_attrs(_ds_span)
+            _ds_span.set_attribute("timeout_ms", dom_stability_timeout_ms)
+            _ds_span.set_attribute("stable_ms", dom_stable_ms)
+            try:
+                await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
+            except (TimeoutError, asyncio.TimeoutError):
+                dom_stability_result = "timeout"
+                LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
+            except Exception:
+                dom_stability_result = "error"
+                LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
+            finally:
+                dom_stability_duration_ms = (time.time() - step_start_time) * 1000
+                _ds_span.set_attribute("result", dom_stability_result)
+                LOG.info(
+                    "page_readiness_check",
+                    step="dom_stability",
+                    result=dom_stability_result,
+                    duration_ms=dom_stability_duration_ms,
+                    timeout_ms=dom_stability_timeout_ms,
+                    stable_ms=dom_stable_ms,
+                )
 
         # Log total page readiness check duration
         total_duration_ms = (time.time() - total_start_time) * 1000

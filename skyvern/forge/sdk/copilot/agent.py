@@ -187,10 +187,14 @@ def _translate_to_agent_result(
     action_data = parse_final_response(text)
     user_response = action_data.get("user_response") or "Done."
 
+    resp_type = action_data.get("type", "REPLY")
+    if resp_type not in ("REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"):
+        resp_type = "REPLY"
+
     last_workflow = ctx.last_workflow
     last_workflow_yaml = ctx.last_workflow_yaml
 
-    if action_data.get("type") == "REPLACE_WORKFLOW":
+    if resp_type == "REPLACE_WORKFLOW":
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
@@ -201,6 +205,7 @@ def _translate_to_agent_result(
                     organization_id=organization_id,
                     workflow_yaml=workflow_yaml,
                 )
+                last_workflow_yaml = workflow_yaml
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
                 LOG.warning("Failed to process final workflow YAML", error=str(e))
                 user_response = (
@@ -209,21 +214,23 @@ def _translate_to_agent_result(
                     f"Please ask me to fix it.)"
                 )
 
-    # Inline REPLACE_WORKFLOW bypasses _update_workflow so ctx.last_workflow
-    # is still whatever the tool layer last saw. Writing the REPLACE_WORKFLOW
-    # result onto ctx ensures _verified_workflow_or_none sees the right
-    # candidate — though it still gates on last_test_ok, so an untested
-    # REPLACE is rejected too.
-    if action_data.get("type") == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow:
+    # Inline REPLACE_WORKFLOW bypasses _update_workflow, so ctx.last_workflow
+    # is whatever the tool layer last saw. Write the REPLACE candidate onto
+    # ctx and invalidate any prior passing test: the REPLACE yaml itself was
+    # never run, so a leftover ``last_test_ok is True`` from an earlier tested
+    # (but different) yaml must not promote this untested one.
+    if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow:
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
+        ctx.last_test_ok = None
 
-    user_response = _rewrite_failed_test_response(str(user_response), ctx)
+    # ASK_QUESTION replies carry a specific clarifying question — often the
+    # "stop and ask" unblocker the system prompt now requires when the agent
+    # cannot test. The generic rewrite would replace it with a vague
+    # "Could you share more context", so skip it for ASK_QUESTION.
+    if resp_type != "ASK_QUESTION":
+        user_response = _rewrite_failed_test_response(str(user_response), ctx)
     last_workflow, last_workflow_yaml = _verified_workflow_or_none(ctx)
-
-    resp_type = action_data.get("type", "REPLY")
-    if resp_type not in ("REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"):
-        resp_type = "REPLY"
 
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)

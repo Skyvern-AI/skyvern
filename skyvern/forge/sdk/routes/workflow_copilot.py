@@ -858,7 +858,8 @@ async def _new_copilot_chat_post(
             # panel state below stays gated on auto_accept — the frontend
             # applies proposals via applyWorkflowUpdate when auto-accept is
             # on.
-            if _should_restore_persisted_workflow(chat.auto_accept, agent_result):
+            restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+            if restored:
                 await _restore_workflow_definition(original_workflow, organization.organization_id)
 
             if chat.auto_accept is not True:
@@ -871,11 +872,16 @@ async def _new_copilot_chat_post(
                         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                         proposed_workflow=proposed_data,
                     )
-                elif getattr(agent_result, "clear_proposed_workflow", False):
-                    # Feasibility-gate fast-path returned ASK_QUESTION. Null
-                    # any previously-persisted proposed_workflow so a page
-                    # reload does not resurrect a stale draft alongside the
-                    # new clarification question.
+                elif (
+                    restored or getattr(agent_result, "clear_proposed_workflow", False)
+                ) and chat.proposed_workflow is not None:
+                    # Null any previously-persisted proposed_workflow so a
+                    # page reload does not resurrect a stale Accept/Reject
+                    # card next to an assistant message that just explained
+                    # why no verified proposal is available. Covers:
+                    # * feasibility-gate fast-path clarifications, and
+                    # * SKY-9143 strict-gate turns where a mid-turn draft was
+                    #   rolled back (``restored=True``).
                     await app.DATABASE.workflow_params.update_workflow_copilot_chat(
                         organization_id=chat.organization_id,
                         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,

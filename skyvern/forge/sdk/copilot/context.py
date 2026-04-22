@@ -160,6 +160,15 @@ class CopilotContext(AgentContext):
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     last_failed_workflow_yaml: str | None = None
+    # Set when a block-running tool timed out and the run's true outcome
+    # could not be reconciled (post-drain row was ``canceled``, non-final, or
+    # unreadable). Blocks further block-running tool calls until the LLM
+    # calls ``get_run_results(workflow_run_id=<same>)`` AND that read returns
+    # a status in ``_TRUSTED_POST_DRAIN_STATUSES``. Turn-scoped by
+    # construction — ``CopilotContext`` is re-created per agent turn — so
+    # this guards auto-retry WITHIN a turn but not cross-turn "user says
+    # retry" requests.
+    pending_reconciliation_run_id: str | None = None
     # Consecutive test runs whose data-producing blocks completed with no
     # meaningful output (missing, empty, or all-null fields). Resets when a
     # run produces real data. Used to escalate when the agent is stuck

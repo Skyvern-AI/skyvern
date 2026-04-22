@@ -49,7 +49,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
@@ -590,7 +590,9 @@ class LLMAPIHandlerFactory:
             _llm_span.set_attribute("llm_key", llm_key)
             _llm_span.set_attribute("llm_model", main_model_group)
             _llm_span.set_attribute("prompt_name", prompt_name)
-            _llm_span.set_attribute("handler_type", "router")
+            # handler_type distinguishes the three LLM entry points that share
+            # the skyvern.llm.request span name. Dashboards filter on this attr.
+            _llm_span.set_attribute("handler_type", "router_with_fallback")
 
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
@@ -647,24 +649,32 @@ class LLMAPIHandlerFactory:
                         )
 
                 llm_prompt_value = prompt
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_prompt = llm_prompt_value.encode("utf-8")
-                        if screenshots and step:
-                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                                step=step,
-                                screenshots=screenshots,
-                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                # Pre-request artifact persistence cluster. Covers prompt + screenshot
+                # staging before the LLM call. The hot cost is inside the non-bundled
+                # branch (prepare_llm_artifact → S3 upload).
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                    apply_context_attrs(_pre_span)
+                    _pre_span.set_attribute("bundled", bool(_should_bundle))
+                    _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_prompt = llm_prompt_value.encode("utf-8")
+                            if screenshots and step:
+                                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                    step=step,
+                                    screenshots=screenshots,
+                                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                                )
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=llm_prompt_value.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_PROMPT,
+                                    screenshots=screenshots,
+                                    **artifact_targets,
+                                )
                             )
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=llm_prompt_value.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_PROMPT,
-                                screenshots=screenshots,
-                                **artifact_targets,
-                            )
-                        )
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
@@ -845,7 +855,7 @@ class LLMAPIHandlerFactory:
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.perf_counter() - start_time
-                    _llm_span.set_attribute("status", "error")
+                    _llm_span.set_attribute("status", "context_exceeded")
                     LOG.exception(
                         "Context window exceeded",
                         llm_key=llm_key,
@@ -887,6 +897,17 @@ class LLMAPIHandlerFactory:
                             duration_seconds=_duration,
                         )
                         raise LLMProviderError(llm_key) from None
+                except litellm.exceptions.RateLimitError as e:
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "rate_limited")
+                    LOG.warning(
+                        "LLM request rate limited",
+                        llm_key=llm_key,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderError(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
@@ -1066,24 +1087,35 @@ class LLMAPIHandlerFactory:
 
                 return parsed_response
             finally:
-                try:
-                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-                except Exception:
-                    LOG.error("Failed to persist artifacts", exc_info=True)
-                if _should_bundle and should_persist_llm_artifacts and step:
-                    _ctx = skyvern_context.current()
-                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
-                        step=step,
-                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
-                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
-                        run_id=_ctx.run_id if _ctx else None,
-                        hashed_href_map=_bundle_hashed_href_map,
-                        prompt=_bundle_prompt,
-                        request=_bundle_request,
-                        response=_bundle_response,
-                        parsed_response=_bundle_parsed,
-                        rendered_response=_bundle_rendered,
+                # Post-response artifact persistence cluster. bulk_create_artifacts
+                # does the S3 uploads + DB rows for every LLM artifact queued during
+                # this request; the bundled-path archive accumulate is fast in-memory.
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                    apply_context_attrs(_post_span)
+                    _post_span.set_attribute("bundled", bool(_should_bundle))
+                    # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                    _post_span.set_attribute(
+                        "artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None)
                     )
+                    try:
+                        await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                    except Exception:
+                        LOG.error("Failed to persist artifacts", exc_info=True)
+                    if _should_bundle and should_persist_llm_artifacts and step:
+                        _ctx = skyvern_context.current()
+                        app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                            step=step,
+                            workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                            workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                            run_id=_ctx.run_id if _ctx else None,
+                            hashed_href_map=_bundle_hashed_href_map,
+                            prompt=_bundle_prompt,
+                            request=_bundle_request,
+                            response=_bundle_response,
+                            parsed_response=_bundle_parsed,
+                            rendered_response=_bundle_rendered,
+                        )
 
         llm_api_handler_with_router_and_fallback.llm_key = llm_key  # type: ignore[attr-defined]
         LLMAPIHandlerFactory._router_handler_cache[llm_key] = llm_api_handler_with_router_and_fallback
@@ -1135,7 +1167,9 @@ class LLMAPIHandlerFactory:
             _assert_step_thought_exclusive(step, thought)
             start_time = time.perf_counter()
             _llm_span = otel_trace.get_current_span()
-            _llm_span.set_attribute("handler_type", "default")
+            # handler_type distinguishes the three LLM entry points that share
+            # the skyvern.llm.request span name. Dashboards filter on this attr.
+            _llm_span.set_attribute("handler_type", "single_handler")
             _llm_span.set_attribute("llm_key", llm_key)
             _llm_span.set_attribute("llm_model", llm_config.model_name)
             _llm_span.set_attribute("prompt_name", prompt_name)
@@ -1202,24 +1236,32 @@ class LLMAPIHandlerFactory:
                         )
 
                 llm_prompt_value = prompt
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_prompt = llm_prompt_value.encode("utf-8")
-                        if screenshots and step:
-                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                                step=step,
-                                screenshots=screenshots,
-                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                # Pre-request artifact persistence cluster. Covers prompt + screenshot
+                # staging before the LLM call. The hot cost is inside the non-bundled
+                # branch (prepare_llm_artifact → S3 upload).
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                    apply_context_attrs(_pre_span)
+                    _pre_span.set_attribute("bundled", bool(_should_bundle))
+                    _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_prompt = llm_prompt_value.encode("utf-8")
+                            if screenshots and step:
+                                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                    step=step,
+                                    screenshots=screenshots,
+                                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                                )
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=llm_prompt_value.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_PROMPT,
+                                    screenshots=screenshots,
+                                    **artifact_targets,
+                                )
                             )
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=llm_prompt_value.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_PROMPT,
-                                screenshots=screenshots,
-                                **artifact_targets,
-                            )
-                        )
 
                 if not llm_config.supports_vision:
                     screenshots = None
@@ -1355,7 +1397,7 @@ class LLMAPIHandlerFactory:
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.perf_counter() - start_time
-                    _llm_span.set_attribute("status", "error")
+                    _llm_span.set_attribute("status", "context_exceeded")
                     LOG.exception(
                         "Context window exceeded",
                         llm_key=llm_key,
@@ -1388,6 +1430,17 @@ class LLMAPIHandlerFactory:
                             duration=t_llm_cancelled - t_llm_request,
                         )
                         raise LLMProviderError(llm_key) from None
+                except litellm.exceptions.RateLimitError as e:
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "rate_limited")
+                    LOG.warning(
+                        "LLM request rate limited",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderError(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
@@ -1565,24 +1618,35 @@ class LLMAPIHandlerFactory:
 
                 return parsed_response
             finally:
-                try:
-                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-                except Exception:
-                    LOG.error("Failed to persist artifacts", exc_info=True)
-                if _should_bundle and should_persist_llm_artifacts and step:
-                    _ctx = skyvern_context.current()
-                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
-                        step=step,
-                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
-                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
-                        run_id=_ctx.run_id if _ctx else None,
-                        hashed_href_map=_bundle_hashed_href_map,
-                        prompt=_bundle_prompt,
-                        request=_bundle_request,
-                        response=_bundle_response,
-                        parsed_response=_bundle_parsed,
-                        rendered_response=_bundle_rendered,
+                # Post-response artifact persistence cluster. bulk_create_artifacts
+                # does the S3 uploads + DB rows for every LLM artifact queued during
+                # this request; the bundled-path archive accumulate is fast in-memory.
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                    apply_context_attrs(_post_span)
+                    _post_span.set_attribute("bundled", bool(_should_bundle))
+                    # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                    _post_span.set_attribute(
+                        "artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None)
                     )
+                    try:
+                        await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                    except Exception:
+                        LOG.error("Failed to persist artifacts", exc_info=True)
+                    if _should_bundle and should_persist_llm_artifacts and step:
+                        _ctx = skyvern_context.current()
+                        app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                            step=step,
+                            workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                            workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                            run_id=_ctx.run_id if _ctx else None,
+                            hashed_href_map=_bundle_hashed_href_map,
+                            prompt=_bundle_prompt,
+                            request=_bundle_request,
+                            response=_bundle_response,
+                            parsed_response=_bundle_parsed,
+                            rendered_response=_bundle_rendered,
+                        )
 
         llm_api_handler.llm_key = llm_key  # type: ignore[attr-defined]
         return llm_api_handler
@@ -1702,7 +1766,9 @@ class LLMCaller:
         _llm_span.set_attribute("llm_key", self.llm_key)
         _llm_span.set_attribute("llm_model", self.llm_config.model_name)
         _llm_span.set_attribute("prompt_name", prompt_name or "<unknown>")
-        _llm_span.set_attribute("handler_type", "llm_caller")
+        # handler_type distinguishes the three LLM entry points that share
+        # the skyvern.llm.request span name. Dashboards filter on this attr.
+        _llm_span.set_attribute("handler_type", "direct_call")
         active_parameters = self.base_parameters or {}
         if parameters is None:
             parameters = LLMAPIHandlerFactory.get_api_parameters(self.llm_config)
@@ -1759,27 +1825,43 @@ class LLMCaller:
                             tool["display_height_px"] = target_dimension["height"]
                         if "display_width_px" in tool:
                             tool["display_width_px"] = target_dimension["width"]
-                screenshots = resize_screenshots(screenshots, target_dimension)
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.screenshot_resize") as _resize_span:
+                    apply_context_attrs(_resize_span)
+                    _resize_span.set_attribute("input_count", len(screenshots))
+                    _resize_span.set_attribute("input_bytes", sum(len(s) for s in screenshots))
+                    _resize_span.set_attribute("target_width", target_dimension["width"])
+                    _resize_span.set_attribute("target_height", target_dimension["height"])
+                    screenshots = resize_screenshots(screenshots, target_dimension)
+                    _resize_span.set_attribute("output_bytes", sum(len(s) for s in screenshots))
 
             llm_prompt_value = prompt or ""
-            if prompt and should_persist_llm_artifacts:
-                if _should_bundle:
-                    _bundle_prompt = prompt.encode("utf-8")
-                    if screenshots and step:
-                        app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                            step=step,
-                            screenshots=screenshots,
-                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            # Pre-request artifact persistence cluster. Covers prompt + screenshot
+            # staging before the LLM call. The hot cost is inside the non-bundled
+            # branch (prepare_llm_artifact → S3 upload).
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                apply_context_attrs(_pre_span)
+                _pre_span.set_attribute("bundled", bool(_should_bundle))
+                _pre_span.set_attribute("persist", bool(prompt and should_persist_llm_artifacts))
+                if prompt and should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_prompt = prompt.encode("utf-8")
+                        if screenshots and step:
+                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                step=step,
+                                screenshots=screenshots,
+                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            )
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=prompt.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_PROMPT,
+                                screenshots=screenshots,
+                                **artifact_targets,
+                            )
                         )
-                else:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=prompt.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_PROMPT,
-                            screenshots=screenshots,
-                            **artifact_targets,
-                        )
-                    )
 
             if not self.llm_config.supports_vision:
                 screenshots = None
@@ -1838,7 +1920,7 @@ class LLMCaller:
                 _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
-                _llm_span.set_attribute("status", "error")
+                _llm_span.set_attribute("status", "context_exceeded")
                 LOG.exception(
                     "Context window exceeded",
                     llm_key=self.llm_key,
@@ -1867,6 +1949,10 @@ class LLMCaller:
                         duration=t_llm_cancelled - t_llm_request,
                     )
                     raise LLMProviderError(self.llm_key) from None
+            except litellm.exceptions.RateLimitError as e:
+                _llm_span.set_attribute("status", "rate_limited")
+                LOG.warning("LLM request rate limited", llm_key=self.llm_key)
+                raise LLMProviderError(self.llm_key, cause=e) from e
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
@@ -2005,31 +2091,40 @@ class LLMCaller:
 
             return parsed_response
         finally:
-            try:
-                await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-            except Exception:
-                LOG.error("Failed to persist artifacts", exc_info=True)
-            if _should_bundle and should_persist_llm_artifacts and step:
-                _ctx = skyvern_context.current()
-                app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
-                    step=step,
-                    workflow_run_id=_ctx.workflow_run_id if _ctx else None,
-                    workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
-                    run_id=_ctx.run_id if _ctx else None,
-                    hashed_href_map=_bundle_hashed_href_map,
-                    prompt=_bundle_prompt,
-                    request=_bundle_request,
-                    response=_bundle_response,
-                    parsed_response=_bundle_parsed,
-                    rendered_response=_bundle_rendered,
-                )
+            # Post-response artifact persistence cluster. bulk_create_artifacts does
+            # the S3 uploads + DB rows for every LLM artifact queued during this
+            # request; the bundled-path archive accumulate is fast in-memory.
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                apply_context_attrs(_post_span)
+                _post_span.set_attribute("bundled", bool(_should_bundle))
+                # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                _post_span.set_attribute("artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None))
+                try:
+                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                except Exception:
+                    LOG.error("Failed to persist artifacts", exc_info=True)
+                if _should_bundle and should_persist_llm_artifacts and step:
+                    _ctx = skyvern_context.current()
+                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                        step=step,
+                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                        run_id=_ctx.run_id if _ctx else None,
+                        hashed_href_map=_bundle_hashed_href_map,
+                        prompt=_bundle_prompt,
+                        request=_bundle_request,
+                        response=_bundle_response,
+                        parsed_response=_bundle_parsed,
+                        rendered_response=_bundle_rendered,
+                    )
 
     def get_screenshot_resize_target_dimension(self, window_dimension: Resolution | None) -> Resolution:
         if window_dimension and window_dimension != self.browser_window_dimension:
             return get_resize_target_dimension(window_dimension)
         return self.screenshot_resize_target_dimension
 
-    @traced()
+    @traced(name="skyvern.llm.dispatch")
     async def _dispatch_llm_call(
         self,
         messages: list[dict[str, Any]],

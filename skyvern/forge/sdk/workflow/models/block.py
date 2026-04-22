@@ -31,6 +31,7 @@ from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
+from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
 
@@ -47,6 +48,7 @@ from skyvern.exceptions import (
     DownloadFileMaxSizeExceeded,
     MissingBrowserState,
     MissingBrowserStatePage,
+    MissingStarterUrl,
     PDFParsingError,
     TaskNotFound,
     UnexpectedTaskStatus,
@@ -100,6 +102,10 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
     DOWNLOADED_FILE_SIGS_KEY,
     filter_downloaded_files_for_current_iteration,
     to_downloaded_file_signature,
+)
+from skyvern.forge.sdk.workflow.models._jinja import (
+    _JSON_TYPE_MARKER,
+    _json_type_filter,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -218,24 +224,6 @@ else:
 
 # Date format used for the built-in {{current_date}} reserved parameter.
 CURRENT_DATE_FORMAT = "%Y-%m-%d"
-
-# Sentinel marker for native JSON type injection via | json filter.
-_JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
-
-
-def _json_type_filter(value: Any) -> str:
-    """Jinja filter that marks a value for native JSON type injection.
-
-    Usage in templates: {{ some_bool | json }}
-
-    The filter serializes the value to JSON and wraps it with sentinel markers.
-    When _render_templates_in_json() detects these markers, it unwraps and
-    parses the JSON to get the native typed value (bool, int, list, etc.).
-
-    Uses default=str to handle non-JSON-serializable types (datetime, Enum, etc.)
-    """
-    return f"{_JSON_TYPE_MARKER}{json.dumps(value, default=str)}{_JSON_TYPE_MARKER}"
-
 
 jinja_sandbox_env.filters["json"] = _json_type_filter
 
@@ -414,6 +402,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_context: WorkflowRunContext,
         *,
         force_include_secrets: bool = False,
+        env: SandboxedEnvironment | None = None,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -431,7 +420,7 @@ class Block(BaseModel, abc.ABC):
             BlockType.HTTP_REQUEST,
         ]
 
-        template = jinja_sandbox_env.from_string(potential_template)
+        template = (env or jinja_sandbox_env).from_string(potential_template)
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
@@ -601,7 +590,7 @@ class Block(BaseModel, abc.ABC):
         """Return block-level error codes for unexpected failures. Override in subclasses."""
         return []
 
-    @traced(name="skyvern.block.execute")
+    @traced(name="skyvern.block.execute", role="wrapper")
     async def execute_safe(
         self,
         workflow_run_id: str,
@@ -612,6 +601,10 @@ class Block(BaseModel, abc.ABC):
         current_index: int | None = None,
         **kwargs: dict,
     ) -> BlockResult:
+        # block_type slices the 303s p95 by block kind — task/for_loop/code/extraction
+        # have wildly different latency profiles. Set early so it's present even if
+        # execute_safe raises before any child work.
+        otel_trace.get_current_span().set_attribute("block_type", self.block_type.value)
         workflow_run_block_id = None
         engine: RunEngine | None = None
         try:
@@ -1076,6 +1069,24 @@ class BaseTaskBlock(Block):
                         organization_id=workflow_run.organization_id,
                     )
                     raise e
+
+                # Validate starter URL before downstream scraping on a blank page
+                if not (self.url and self.url.strip()) and working_page.url in ("about:blank", "", ":"):
+                    missing_url_exc = MissingStarterUrl(block_label=self.label)
+                    LOG.warning(
+                        "First browser block has no starter URL",
+                        task_id=task.task_id,
+                        workflow_run_id=workflow_run_id,
+                        block_label=self.label,
+                    )
+                    await self._handle_task_failure_with_error_detection(
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        failure_reason=str(missing_url_exc),
+                        organization_id=workflow_run.organization_id,
+                    )
+                    raise missing_url_exc
 
                 try:
                     # add screenshot artifact for the first task
@@ -7174,6 +7185,12 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     return all_blocks
 
 
+# Late import: google_sheets_blocks imports Block from this module, so top-level import would cycle.
+from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E402
+    GoogleSheetsReadBlock,
+    GoogleSheetsWriteBlock,
+)
+
 BlockSubclasses = Union[
     ConditionalBlock,
     ForLoopBlock,
@@ -7199,6 +7216,8 @@ BlockSubclasses = Union[
     HttpRequestBlock,
     PrintPageBlock,
     WorkflowTriggerBlock,
+    GoogleSheetsReadBlock,
+    GoogleSheetsWriteBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

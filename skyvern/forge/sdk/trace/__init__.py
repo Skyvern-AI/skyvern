@@ -1,8 +1,10 @@
 import asyncio
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from opentelemetry import trace
+
+SpanRole = Literal["wrapper"]
 
 # Context fields to auto-attach to every span. Deliberately minimal — each
 # attribute is paid for in storage and index cardinality, so only IDs we
@@ -56,7 +58,11 @@ def apply_context_attrs(span: Any) -> None:
             span.set_attribute(attr, str(value))
 
 
-def traced(name: str | None = None, tags: list[str] | None = None) -> Callable:
+def traced(
+    name: str | None = None,
+    tags: list[str] | None = None,
+    role: SpanRole | None = None,
+) -> Callable:
     """Decorator that creates an OTEL span. No-op without SDK installed.
 
     Every span is tagged with:
@@ -73,6 +79,11 @@ def traced(name: str | None = None, tags: list[str] | None = None) -> Callable:
     Args:
         name: Span name. If not provided, uses func.__qualname__.
         tags: Tags to add as a span attribute.
+        role: Optional span role. Set to "wrapper" on spans whose duration is
+            dominated by the work of their children (e.g. `agent.step`,
+            `workflow.execute`). Dashboards filter these out with
+            `skyvern.span.role != 'wrapper'` so leaf-time composition (pie,
+            stacked bar) isn't double-counted via nesting.
     """
 
     def decorator(func: Callable) -> Callable:
@@ -87,6 +98,8 @@ def traced(name: str | None = None, tags: list[str] | None = None) -> Callable:
                 with trace.get_tracer("skyvern").start_as_current_span(span_name) as span:
                     span.set_attribute("code.function", code_function)
                     span.set_attribute("code.namespace", code_namespace)
+                    if role is not None:
+                        span.set_attribute("skyvern.span.role", role)
                     apply_context_attrs(span)
                     if tags:
                         span.set_attribute("tags", tags)
@@ -105,6 +118,8 @@ def traced(name: str | None = None, tags: list[str] | None = None) -> Callable:
                 with trace.get_tracer("skyvern").start_as_current_span(span_name) as span:
                     span.set_attribute("code.function", code_function)
                     span.set_attribute("code.namespace", code_namespace)
+                    if role is not None:
+                        span.set_attribute("skyvern.span.role", role)
                     apply_context_attrs(span)
                     if tags:
                         span.set_attribute("tags", tags)

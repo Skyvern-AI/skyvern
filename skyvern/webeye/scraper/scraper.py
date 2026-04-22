@@ -138,7 +138,6 @@ def build_element_dict(
     return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
 
 
-@traced(name="skyvern.agent.scrape_retry")
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
@@ -360,7 +359,7 @@ async def scrape_web_unsafe(
             LOG.warning("Failed to get current x, y position of the page", exc_info=True)
 
         _tracer = otel_trace.get_tracer("skyvern")
-        with _tracer.start_as_current_span("skyvern.agent.screenshot") as _ss_span:
+        with _tracer.start_as_current_span("skyvern.browser.scrape_screenshot") as _ss_span:
             apply_context_attrs(_ss_span)
             # Hardcoded since this is an inline span, not a @traced method.
             # Update if scrape_web_unsafe is renamed.
@@ -542,6 +541,9 @@ async def get_interactable_element_tree(
     context = skyvern_context.ensure_context()
     frames = await get_all_children_frames(page)
     frames = await filter_frames(frames, scrape_exclude)
+    # Iframe-heavy pages dominate the 1.8s p95 here; frame_count lets us
+    # slice element_tree latency by page complexity.
+    otel_trace.get_current_span().set_attribute("frame_count", len(frames))
 
     for frame in frames:
         frame_index = context.frame_index_map.get(frame, None)
@@ -580,7 +582,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return True
         return False
 
-    @traced()
+    @traced(name="skyvern.agent.incremental_element_tree")
     async def get_incremental_element_tree(
         self,
         cleanup_element_tree: CleanupElementTreeFunc,

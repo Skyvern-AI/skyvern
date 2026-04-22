@@ -123,6 +123,15 @@ class EventStrategyFactory:
         """Update cursor position without generating movement."""
         EventStrategyFactory.get_cursor_strategy().sync_position(page, x, y)
 
+    @staticmethod
+    async def click(page: Page, locator: Locator, timeout: float | None = None) -> None:
+        """Click an element using the active cursor strategy."""
+        start = time.perf_counter()
+        try:
+            await EventStrategyFactory.get_cursor_strategy().click(page, locator, timeout)
+        finally:
+            EventStrategyFactory.__metrics.record("click", time.perf_counter() - start)
+
     # -- input convenience methods ----------------------------------------------
 
     @staticmethod

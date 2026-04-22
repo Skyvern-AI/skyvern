@@ -28,6 +28,8 @@ from skyvern.schemas.workflows import (
     FileParserBlockYAML,
     FileUploadBlockYAML,
     ForLoopBlockYAML,
+    GoogleSheetsReadBlockYAML,
+    GoogleSheetsWriteBlockYAML,
     HttpRequestBlockYAML,
     HumanInteractionBlockYAML,
     LoginBlockYAML,
@@ -78,6 +80,8 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.HUMAN_INTERACTION.value: HumanInteractionBlockYAML,
     BlockType.PRINT_PAGE.value: PrintPageBlockYAML,
     BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
+    BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
+    BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
 }
 
 # ---------------------------------------------------------------------------
@@ -107,6 +111,8 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
     "workflow_trigger": "Trigger another workflow by permanent ID, with optional payload and wait-for-completion",
+    "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
+    "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
 }
 
 # ---------------------------------------------------------------------------
@@ -210,6 +216,25 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "workflow_permanent_id": "wpid_xxx",
         "payload": {"url": "{{ some_parameter }}"},
         "wait_for_completion": True,
+    },
+    "google_sheets_read": {
+        "block_type": "google_sheets_read",
+        "label": "read_sheet_data",
+        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit",
+        "sheet_name": "Sheet1",
+        "range": "A1:D100",
+        "credential_id": "{{ google_credential_id }}",
+        "has_header_row": True,
+    },
+    "google_sheets_write": {
+        "block_type": "google_sheets_write",
+        "label": "write_sheet_data",
+        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit",
+        "sheet_name": "Sheet1",
+        "range": "A1",
+        "credential_id": "{{ google_credential_id }}",
+        "write_mode": "append",
+        "values": "{{ output_data | tojson }}",
     },
 }
 

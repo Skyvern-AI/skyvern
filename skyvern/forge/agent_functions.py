@@ -606,6 +606,96 @@ class AgentFunction:
         Cloud override provides actual solving; OSS base is a no-op."""
         return False
 
+    async def get_google_sheets_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+    ) -> str | None:
+        """Get a Google Sheets access token for the given credential.
+
+        Returns None in OSS. Cloud override uses the OAuth service to
+        decrypt the stored refresh token and exchange it for an access token.
+        """
+        return None
+
+    async def get_google_workspace_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+        required_scopes: list[str] | None = None,
+    ) -> object | None:
+        """OSS no-op; cloud override returns a refreshed google.oauth2.credentials.Credentials or None."""
+        return None
+
+    async def ensure_sheet_tab(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        title: str,
+    ) -> int | None:
+        """Ensure a sheet tab with the given title exists in the spreadsheet.
+
+        Returns the sheet_id of the newly created tab, or None if the caller
+        should fall back to its own lookup (e.g. a concurrent creator won the
+        race). OSS base is a no-op that returns None; cloud override calls the
+        Sheets v4 batchUpdate addSheet endpoint.
+        """
+        return None
+
+    async def google_sheets_values_get(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        ranges: str,
+        fields: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read ranges from a spreadsheet via spreadsheets.get. OSS no-op."""
+        return None
+
+    async def google_sheets_values_append(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        range_: str,
+        values: list[list[Any]],
+    ) -> dict[str, Any] | None:
+        """Append rows via spreadsheets.values.append. OSS no-op."""
+        return None
+
+    async def google_sheets_values_update(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        range_: str,
+        values: list[list[Any]],
+    ) -> dict[str, Any] | None:
+        """Update rows via spreadsheets.values.update. OSS no-op."""
+        return None
+
+    async def google_sheets_batch_update(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Apply a batchUpdate to a spreadsheet. OSS no-op."""
+        return None
+
+    async def google_sheets_get_sheet_id(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_title: str,
+    ) -> int | None:
+        """Resolve a tab title to its numeric sheetId. OSS no-op."""
+        return None
+
     async def generate_async_operations(
         self,
         organization: Organization,
@@ -621,7 +711,7 @@ class AgentFunction:
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
 
-        @traced()
+        @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.

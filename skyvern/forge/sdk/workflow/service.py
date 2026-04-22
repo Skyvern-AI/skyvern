@@ -915,7 +915,7 @@ class WorkflowService:
 
         return None
 
-    @traced(name="skyvern.workflow.execute")
+    @traced(name="skyvern.workflow.execute", role="wrapper")
     async def execute_workflow(
         self,
         workflow_run_id: str,
@@ -924,6 +924,7 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
+        need_call_webhook: bool = True,
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
@@ -1014,6 +1015,7 @@ class WorkflowService:
                 api_key=api_key,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                need_call_webhook=need_call_webhook,
             )
             return workflow_run
 
@@ -1069,6 +1071,7 @@ class WorkflowService:
                     api_key=api_key,
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=close_browser_on_completion,
+                    need_call_webhook=need_call_webhook,
                 )
                 return workflow_run
             # Start background task to periodically renew the browser session
@@ -1256,6 +1259,7 @@ class WorkflowService:
                 api_key=api_key,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                need_call_webhook=need_call_webhook,
             )
 
         return workflow_run
@@ -4526,6 +4530,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
             failure_reason=workflow_run.failure_reason,
+            failure_category=workflow_run.failure_category,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
             webhook_failure_reason=workflow_run.webhook_failure_reason,

@@ -433,6 +433,16 @@ class ScrapingFailedBlankPage(ScrapingFailed):
         super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")
 
 
+class MissingStarterUrl(SkyvernException):
+    def __init__(self, block_label: str | None = None) -> None:
+        self.block_label = block_label
+        location = f"block '{block_label}'" if block_label else "the first browser block"
+        super().__init__(
+            f"{location} has no starting URL set. The first browser block must have a URL to navigate to. "
+            "Set a URL on the block, or reference a workflow parameter (e.g. '{{ starting_url }}')."
+        )
+
+
 class WorkflowRunContextNotInitialized(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRunContext not initialized for workflow run {workflow_run_id}")
