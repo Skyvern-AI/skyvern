@@ -4326,6 +4326,10 @@ async def extract_information_for_navigation_goal(
     scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
 
+    # task.workflow_permanent_id is None on most fetch paths (tasks table has
+    # no such column); fall back to context. SKY-8992.
+    wpid_for_cache = task.workflow_permanent_id or context.workflow_permanent_id
+
     # Compute llm key up-front so the cache key includes it.
     llm_key_override = task.llm_key
     if await service_utils.is_cua_task(task=task):
@@ -4551,9 +4555,7 @@ async def extract_information_for_navigation_goal(
     cross_run_value: Any | None = None
     if cache_key is not None and not is_retry_step:
         try:
-            cross_run_value = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(
-                task.workflow_permanent_id, cache_key
-            )
+            cross_run_value = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(wpid_for_cache, cache_key)
         except Exception:
             LOG.warning(
                 "extract_information cross-run cache lookup raised",
@@ -4694,9 +4696,7 @@ async def extract_information_for_navigation_goal(
         # warm before the read flag rolls out. OSS returns immediately; cloud
         # writes to Redis with a long TTL and swallows backend errors.
         try:
-            await app.AGENT_FUNCTION.store_cross_run_extraction_cache(
-                task.workflow_permanent_id, cache_key, json_response
-            )
+            await app.AGENT_FUNCTION.store_cross_run_extraction_cache(wpid_for_cache, cache_key, json_response)
         except Exception:
             LOG.warning(
                 "extract_information cross-run cache store raised; ignoring",
