@@ -688,7 +688,7 @@ Downloaded files are stored in `SKYVERN_DOWNLOAD_DIRECTORY`—use this path in `
 
 ## File Parser
 
-Download and parse a file from a URL. Supports CSV, Excel, and PDF files.
+Download and parse a file from a URL. Supports CSV, Excel, PDF, image, and DOCX files. By default, the file type is auto-detected from the URL and file contents.
 
 <CodeGroup>
 ```json JSON
@@ -711,7 +711,7 @@ Download and parse a file from a URL. Supports CSV, Excel, and PDF files.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `file_url` | string | — | **Required.** URL of the file to parse. |
-| `file_type` | string | — | **Required.** One of: `csv`, `excel`, `pdf`. |
+| `file_type` | string | `auto_detect` | One of: `auto_detect`, `csv`, `excel`, `pdf`, `image`, `docx`. When set to `auto_detect`, Skyvern infers the format from the URL and file contents. |
 | `json_schema` | object | — | Schema for structured extraction. |
 
 ---
