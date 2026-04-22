@@ -1483,7 +1483,11 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             description=(
                 "Type text into an input element. Use a CSS selector, an AI intent "
                 "description, or both to target the field. "
-                "Optionally clear the field first. Use this for form filling."
+                "Optionally clear the field first. Use this for form filling. "
+                "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
+                "codes, private keys, or other raw credentials/secrets received in "
+                "chat — stop and follow the CREDENTIAL HANDLING refusal rule in the "
+                "system prompt instead."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "delay"}),
             required_overrides=["text"],
@@ -1718,6 +1722,11 @@ async def list_credentials_tool(
 ) -> str:
     """List stored credentials (metadata only — never passwords or secrets).
     Use this to find credential IDs for login blocks.
+
+    Paginated. `page_size` caps at 50. The response includes `has_more`;
+    before concluding no credential exists, keep incrementing `page` until
+    `has_more` is `false` — otherwise you risk telling the user to create
+    a credential they have already stored on a later page.
     """
     copilot_ctx = ctx.context
     loop_error = _tool_loop_error(copilot_ctx, "list_credentials")
@@ -1771,15 +1780,14 @@ async def run_blocks_tool(
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
-    supplied concrete values in their message (names, emails, IDs), pass them
-    on the first call rather than letting the workflow fall back to
+    supplied concrete non-secret values in their message (names, emails, IDs),
+    pass them on the first call rather than letting the workflow fall back to
     placeholders. For sensitive values (password, secret, token, api_key,
-    credential, totp, otp, one_time_code, private_key, auth), prefer calling
-    list_credentials first; if a stored credential matches, reference its
-    credential_id via a credential parameter. If no matching credential
-    exists and the user supplied an inline value, you may pass it via
-    `parameters` — values under those sensitive key names are redacted from
-    the outbound client stream and the tool-execution trace.
+    credential, totp, otp, one_time_code, private_key, auth) — call
+    `list_credentials` and use a credential parameter whose default_value is
+    the stored `credential_id`. If no stored credential matches, do NOT pass
+    the inline value via `parameters`; stop and follow the CREDENTIAL
+    HANDLING refusal rule in the system prompt.
     """
     copilot_ctx = ctx.context
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug")
@@ -1858,15 +1866,14 @@ async def update_and_run_blocks_tool(
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
-    supplied concrete values in their message (names, emails, IDs), pass them
-    on the first call rather than letting the workflow fall back to
+    supplied concrete non-secret values in their message (names, emails, IDs),
+    pass them on the first call rather than letting the workflow fall back to
     placeholders. For sensitive values (password, secret, token, api_key,
-    credential, totp, otp, one_time_code, private_key, auth), prefer calling
-    list_credentials first; if a stored credential matches, reference its
-    credential_id via a credential parameter. If no matching credential
-    exists and the user supplied an inline value, you may pass it via
-    `parameters` — values under those sensitive key names are redacted from
-    the outbound client stream and the tool-execution trace.
+    credential, totp, otp, one_time_code, private_key, auth) — call
+    `list_credentials` and use a credential parameter whose default_value is
+    the stored `credential_id`. If no stored credential matches, do NOT pass
+    the inline value via `parameters`; stop and follow the CREDENTIAL
+    HANDLING refusal rule in the system prompt.
     """
     copilot_ctx = ctx.context
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks")
