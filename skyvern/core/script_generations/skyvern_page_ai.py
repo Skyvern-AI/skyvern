@@ -114,7 +114,7 @@ class SkyvernPageAi(Protocol):
     async def ai_element_fallback(
         self,
         navigation_goal: str,
-        max_steps: int = 10,
+        max_steps: int = 5,
     ) -> None:
         """Activate the AI agent from the CURRENT page position to achieve a navigation goal.
 

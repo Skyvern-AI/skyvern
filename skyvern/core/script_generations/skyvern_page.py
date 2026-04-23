@@ -3213,7 +3213,7 @@ class SkyvernPage(Page):
     async def element_fallback(
         self,
         navigation_goal: str,
-        max_steps: int = 10,
+        max_steps: int = 5,
     ) -> None:
         """Activate the AI agent from the CURRENT page position to achieve a goal.
 
@@ -3223,7 +3223,7 @@ class SkyvernPage(Page):
 
         Args:
             navigation_goal: The goal for the AI agent to achieve from the current page.
-            max_steps: Maximum number of agent steps before giving up. Defaults to 10.
+            max_steps: Maximum number of agent steps before giving up. Defaults to 5.
 
         Raises:
             Exception: If the element fallback fails or exceeds max_steps.
