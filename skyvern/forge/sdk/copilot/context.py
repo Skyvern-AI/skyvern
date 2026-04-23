@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+
+ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
@@ -108,13 +110,18 @@ class AgentResult:
     user_response: str
     updated_workflow: Workflow | None
     global_llm_context: str | None
-    response_type: str = "REPLY"
+    response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
     workflow_was_persisted: bool = False
     # Feasibility-gate fast-path sets this True so the route can null any
     # previously-persisted proposed_workflow. Regular in-loop ASK_QUESTION
     # responses leave it False, preserving in-progress drafts.
     clear_proposed_workflow: bool = False
+    # Actual API token usage accumulated across the agent run. None when no
+    # provider reported usage on the stream — distinguishes "no data" from
+    # "0 tokens" so eval cost grading can flag missing telemetry instead of
+    # silently passing as cheap.
+    total_tokens: int | None = None
 
 
 @dataclass
@@ -149,6 +156,14 @@ class CopilotContext(AgentContext):
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+
+    # Token usage summed from raw_responses after each streamed run. None
+    # until the first response that carries a usage object — some providers
+    # (notably non-OpenAI streaming routes) omit usage entirely, and we want
+    # eval cost grading to see "no data" rather than "0 tokens".
+    total_tokens_used: int | None = None
+    input_tokens_used: int | None = None
+    output_tokens_used: int | None = None
 
     # Workflow state
     last_workflow: Workflow | None = None

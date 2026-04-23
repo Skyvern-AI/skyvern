@@ -168,6 +168,7 @@ def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_conte
         global_llm_context=global_llm_context,
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
+        total_tokens=ctx.total_tokens_used,
     )
 
 
@@ -251,6 +252,7 @@ def _translate_to_agent_result(
         response_type=resp_type,
         workflow_yaml=last_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
+        total_tokens=ctx.total_tokens_used,
     )
 
 
@@ -486,6 +488,7 @@ async def run_copilot_agent(
                     global_llm_context=global_llm_context,
                     workflow_yaml=None,
                     workflow_was_persisted=ctx.workflow_persisted,
+                    total_tokens=ctx.total_tokens_used,
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
