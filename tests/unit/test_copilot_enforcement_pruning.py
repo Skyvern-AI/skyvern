@@ -25,7 +25,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _prune_input_list,
     _summarize_tool_output,
 )
-from skyvern.forge.sdk.copilot.tools import _is_meaningful_extracted_data
+from skyvern.forge.sdk.copilot.tools import (
+    _analyze_run_blocks,
+    _is_meaningful_extracted_data,
+    _record_run_blocks_result,
+)
 
 
 class _Ctx:
@@ -105,6 +109,169 @@ def test_meaningful_data_empty_string() -> None:
 
 def test_meaningful_data_string() -> None:
     assert _is_meaningful_extracted_data("$260.48") is True
+
+
+# ---------------------------------------------------------------------------
+# _analyze_run_blocks — envelope-unwrap for EXTRACTION blocks
+#
+# ExtractionBlock stores TaskOutput.from_task() on block.output. Envelope
+# fields (task_id, status, *_screenshot_artifact_ids) are always populated on
+# a completed run and would short-circuit _is_meaningful_extracted_data to
+# True even when the real payload fields (extracted_information,
+# downloaded_files, downloaded_file_urls) are empty. The meaningful-data
+# check must judge against the payload slice, not the envelope.
+# ---------------------------------------------------------------------------
+
+
+_EMPTY_EXTRACTION_ENVELOPE: dict[str, Any] = {
+    "task_id": "tsk_00000000000000000001",
+    "status": "completed",
+    "extracted_information": [],
+    "failure_reason": None,
+    "errors": [],
+    "failure_category": None,
+    "downloaded_files": [],
+    "downloaded_file_urls": None,
+    "task_screenshots": None,
+    "workflow_screenshots": None,
+    "task_screenshot_artifact_ids": ["a_00000000000000000001", "a_00000000000000000002"],
+    "workflow_screenshot_artifact_ids": ["a_00000000000000000001", "a_00000000000000000003"],
+}
+
+
+def _run_result(blocks: list[dict[str, Any]], ok: bool = True) -> dict[str, Any]:
+    return {"ok": ok, "data": {"blocks": blocks}}
+
+
+def _envelope(**overrides: Any) -> dict[str, Any]:
+    """Return a fresh copy of the empty-extraction envelope with field overrides."""
+    return {**_EMPTY_EXTRACTION_ENVELOPE, **overrides}
+
+
+def _extraction_block(extracted_data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "label": "extract_flights",
+        "block_type": "EXTRACTION",
+        "status": "completed",
+        "extracted_data": extracted_data,
+    }
+
+
+def _text_prompt_block(extracted_data: Any) -> dict[str, Any]:
+    return {
+        "label": "summarize",
+        "block_type": "TEXT_PROMPT",
+        "status": "completed",
+        "extracted_data": extracted_data,
+    }
+
+
+# Case id -> (envelope overrides, expected empty_data_blocks)
+#
+# empty_payload_trace_repro: extracted_information=[], downloaded_files=[],
+#   downloaded_file_urls=None, envelope metadata populated. Envelope-as-a-whole
+#   is truthy; real payload is empty; gate must flip. (SKY-9143 repro.)
+# download_only_files / download_only_urls: legitimate extraction success where the
+#   block produced files but no structured payload — must NOT flip the gate.
+_EXTRACTION_ENVELOPE_CASES: list[tuple[str, dict[str, Any], bool]] = [
+    ("empty_payload_trace_repro", {}, True),
+    ("real_extraction", {"extracted_information": [{"price": "260.48"}]}, False),
+    (
+        "download_only_files",
+        {"downloaded_files": [{"url": "https://example.com/a.pdf", "checksum": "abc123"}]},
+        False,
+    ),
+    (
+        "download_only_urls",
+        {"extracted_information": None, "downloaded_file_urls": ["https://example.com/a.pdf"]},
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_empty",
+    [(ovr, exp) for _, ovr, exp in _EXTRACTION_ENVELOPE_CASES],
+    ids=[case_id for case_id, _, _ in _EXTRACTION_ENVELOPE_CASES],
+)
+def test_analyze_extraction_envelope(overrides: dict[str, Any], expected_empty: bool) -> None:
+    _, empty, _ = _analyze_run_blocks(_run_result([_extraction_block(_envelope(**overrides))]))
+    assert empty is expected_empty
+
+
+def test_analyze_text_prompt_default_schema_is_not_empty() -> None:
+    # TEXT_PROMPT blocks return the raw LLM response dict (no Task envelope).
+    # Default schema is {"llm_response": "<text>"}.
+    _, empty, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"llm_response": "the sentiment is positive"})]))
+    assert empty is False
+
+
+def test_analyze_text_prompt_user_schema_named_extracted_information_is_not_sliced() -> None:
+    # Guard against a too-broad unwrap: a user's json_schema may name a
+    # top-level field "extracted_information". The helper must not mistake
+    # that for an EXTRACTION envelope and discard sibling fields.
+    block = _text_prompt_block({"extracted_information": "ignored because this is TEXT_PROMPT", "summary": "x"})
+    _, empty, _ = _analyze_run_blocks(_run_result([block]))
+    assert empty is False
+
+
+def test_analyze_text_prompt_all_null_is_empty() -> None:
+    # Symmetric to {"price": None} — a text-prompt response with all-null
+    # fields counts as no meaningful output.
+    _, empty, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"summary": None})]))
+    assert empty is True
+
+
+# ---------------------------------------------------------------------------
+# _record_run_blocks_result — end-to-end flip of last_test_ok on empty envelope
+# ---------------------------------------------------------------------------
+
+
+def _fresh_ctx_for_record() -> Any:
+    """SimpleNamespace shaped for _record_run_blocks_result + update_repeated_failure_state.
+
+    Uses getattr-with-default-compatible defaults so the function under test
+    populates the interesting fields without tripping AttributeError on the
+    downstream update_repeated_failure_state call.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        last_test_ok=True,
+        last_test_failure_reason=None,
+        last_test_suspicious_success=False,
+        last_test_anti_bot=None,
+        last_failure_category_top=None,
+        last_test_non_retriable_nav_error=None,
+        null_data_streak_count=0,
+        failed_test_nudge_count=0,
+        last_failed_workflow_yaml=None,
+        non_retriable_nav_error_last_emitted_signature=None,
+        workflow_yaml=None,
+        last_workflow=None,
+        last_frontier_start_label=None,
+        last_executed_block_labels=[],
+        last_failure_signature=None,
+        last_frontier_fingerprint=None,
+        repeated_failure_streak_count=0,
+        repeated_failure_nudge_emitted_at_streak=0,
+        pending_action_sequence_fingerprint=None,
+        last_action_sequence_fingerprint=None,
+        repeated_action_fingerprint_streak_count=0,
+    )
+
+
+def test_record_run_blocks_result_flips_last_test_ok_on_empty_extraction_envelope() -> None:
+    # End-to-end: a run reporting ok=true but whose sole EXTRACTION block
+    # produced the empty envelope must push last_test_ok from True to None,
+    # so _verified_workflow_or_none blocks the proposal. This is the user-
+    # visible SKY-9143 regression.
+    ctx = _fresh_ctx_for_record()
+    result = _run_result([_extraction_block(_envelope())])
+    _record_run_blocks_result(ctx, result)
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_failure_reason is not None
 
 
 # ---------------------------------------------------------------------------

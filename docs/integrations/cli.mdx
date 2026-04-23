@@ -14,7 +14,7 @@ keywords:
   - one-liner
 ---
 
-The `skyvern` CLI gives you direct access to browser automation, workflow management, credential storage, and more — all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
+The `skyvern` CLI gives you direct access to browser automation, workflow management, credential storage, and more, all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
 
 ## Install
 
@@ -197,7 +197,7 @@ The CLI and MCP server share the same underlying logic. The CLI is for humans an
 
 ## Skills
 
-Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools — they are documentation that an AI agent can load to learn the CLI and API.
+Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools; they are documentation that an AI agent can load to learn the CLI and API.
 
 ```bash
 skyvern skill list                  # List available skills
@@ -212,21 +212,21 @@ skyvern skill copy skyvern -o .     # Copy a single skill
 
 Skills are plain markdown files. You can load them into any AI coding tool that supports custom instructions:
 
-**Claude Code** — the recommended local path is `skyvern quickstart` or `skyvern init`, then choose Claude Code during MCP setup. That writes `.mcp.json` and installs bundled skills like `/qa`. You can also run `skyvern setup claude-code` later if you are configuring MCP separately.
+**Claude Code**: the recommended local path is `skyvern quickstart` or `skyvern init`, then choose Claude Code during MCP setup. That writes `.mcp.json` and installs bundled skills like `/qa`. You can also run `skyvern setup claude-code` later if you are configuring MCP separately.
 
-**Codex** — copy the skill into your project's `.codex/skills/` directory:
+**Codex**: copy the skill into your project's `.codex/skills/` directory:
 
 ```bash
 skyvern skill copy skyvern -o .codex/skills/
 ```
 
-**Hermes** — copy the skill to your active Hermes profile's skills directory. The skill needs Hermes-compatible frontmatter (`metadata.hermes.requires_tools` instead of `allowed-tools`):
+**Hermes**: copy the skill to your active Hermes profile's skills directory. The skill needs Hermes-compatible frontmatter (`metadata.hermes.requires_tools` instead of `allowed-tools`):
 
 ```bash
 # Create the skill directory
 mkdir -p ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation
 
-# Copy the skill body (you'll need to replace the frontmatter — see below)
+# Copy the skill body (you'll need to replace the frontmatter; see below)
 skyvern skill copy skyvern -o /tmp/skyvern-skill
 ```
 
@@ -235,7 +235,7 @@ Replace the frontmatter in the copied `SKILL.md` with:
 ```yaml
 ---
 name: skyvern-browser-automation
-description: "Browser automation via Skyvern — scrape pages, fill forms, extract data, run workflows."
+description: "Browser automation via Skyvern: scrape pages, fill forms, extract data, run workflows."
 metadata:
   hermes:
     tags: [browser, automation, skyvern]
@@ -248,10 +248,10 @@ Then move it into place: `cp /tmp/skyvern-skill/SKILL.md ~/.hermes/profiles/<you
 Verify with `hermes skills list | grep skyvern`.
 
 <Tip>
-When both the Skyvern MCP server and the CLI skill are configured, Hermes prefers MCP tools over shelling out to the CLI — which is faster. The skill's judgment procedure (task classification, step ordering) works with either execution path.
+When both the Skyvern MCP server and the CLI skill are configured, Hermes prefers MCP tools over shelling out to the CLI, which is faster. The skill's judgment procedure (task classification, step ordering) works with either execution path.
 </Tip>
 
-**OpenClaw** — copy the skill into your OpenClaw workspace `skills/` directory. By default that workspace lives at `~/.openclaw/workspace/`, but if you've customized the workspace path, use that location instead.
+**OpenClaw**: copy the skill into your OpenClaw workspace `skills/` directory. By default that workspace lives at `~/.openclaw/workspace/`, but if you've customized the workspace path, use that location instead.
 
 ```bash
 mkdir -p ~/.openclaw/workspace/skills
@@ -263,7 +263,7 @@ openclaw skills list | grep skyvern
 OpenClaw's MCP config provides the callable Skyvern tools; the workspace skill is optional guidance that teaches the agent when to use them.
 </Tip>
 
-**Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
+**Any tool**: point your tool at the file path returned by `skyvern skill path skyvern`.
 
 </Accordion>
 

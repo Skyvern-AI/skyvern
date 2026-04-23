@@ -33,7 +33,7 @@ A workflow that:
 
 ## Prerequisites
 
-- **Skyvern Cloud API key** — Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings) → API Keys
+- **Skyvern Cloud API key**: Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings) → API Keys
 
 Install the SDK:
 
@@ -167,7 +167,7 @@ This makes sure your passwords are never stored in the shareable workflow defini
     </Steps>
   </Tab>
   <Tab title="API / SDK">
-    A **workflow definition** is a JSON or YAML file that describes your entire workflow — its metadata, parameters, and blocks. Create a file called `job-application-workflow.yaml` (or `.json`) with the following template:
+    A **workflow definition** is a JSON or YAML file that describes your entire workflow: its metadata, parameters, and blocks. Create a file called `job-application-workflow.yaml` (or `.json`) with the following template:
 
     <CodeGroup>
     ```json JSON
@@ -259,11 +259,11 @@ Parameters are the inputs your workflow accepts. Defining them upfront lets you 
 
 The workflow chains together several blocks to automate the full job application process:
 
-1. **PDF Parser block** — Extracts structured data from your resume
-2. **Login block** — Authenticates to the job portal using stored credentials
-3. **Navigation block** — Searches for relevant jobs based on your resume
-4. **Extraction block** — Extracts a list of job postings from search results
-5. **For loop** (Go to URL + Extraction + Action + Extraction + Text Prompt + Navigation) — Iterates over each job to extract details, generates tailored answers using an LLM, and submits the application.
+1. **PDF Parser block**: Extracts structured data from your resume
+2. **Login block**: Authenticates to the job portal using stored credentials
+3. **Navigation block**: Searches for relevant jobs based on your resume
+4. **Extraction block**: Extracts a list of job postings from search results
+5. **For loop** (Go to URL + Extraction + Action + Extraction + Text Prompt + Navigation): Iterates over each job to extract details, generates tailored answers using an LLM, and submits the application.
 
 In the Cloud UI, click the **+** button after the Start node to add blocks sequentially. For SDK users, add each block to the `blocks` array in your workflow definition file.
 
@@ -503,12 +503,12 @@ The output is accessible as `jobs_list_extraction_output.jobs` in subsequent blo
 
 Iterate over each job posting and complete the application. This loop contains multiple blocks that work together:
 
-1. **goto_url** — Navigate to the job page
-2. **extraction** — Extract detailed job information
-3. **action** — Click the Apply button
-4. **extraction** — Extract application form questions
-5. **text_prompt** — Generate tailored answers using AI
-6. **navigation** — Fill out and submit the application
+1. **goto_url**: Navigate to the job page
+2. **extraction**: Extract detailed job information
+3. **action**: Click the Apply button
+4. **extraction**: Extract application form questions
+5. **text_prompt**: Generate tailored answers using AI
+6. **navigation**: Fill out and submit the application
 
 <Tabs>
   <Tab title="Cloud UI">
@@ -695,13 +695,13 @@ Iterate over each job posting and complete the application. This loop contains m
       <Step title="Block 2: Login">
         Add a **Login** block. Set **URL** to the `job_portal_url` parameter. Select the `credentials` parameter. Set the goal: "Log in using the provided credentials. Handle any cookie consent popups. COMPLETE when on the account dashboard or orders page."
       </Step>
-      <Step title="Block 3: Navigation — search for jobs">
+      <Step title="Block 3: Navigation (search for jobs)">
         Add a **Navigation** block. Leave **URL** empty. Set the goal: "Search for a relevant job based on the parsed resume."
       </Step>
-      <Step title="Block 4: Extraction — job listings">
+      <Step title="Block 4: Extraction (job listings)">
         Add an **Extraction** block. Set the goal: "Extract all visible job profiles: job page url, title, employer, location, and type." Paste the jobs JSON schema into **Data Schema**.
       </Step>
-      <Step title="Block 5: For Loop — apply to each job">
+      <Step title="Block 5: For Loop (apply to each job)">
         Add a **For Loop** block. Set **Loop Variable** to `jobs_list_extraction_output.jobs`. Enable **Continue on Failure** and **Next Loop on Failure**. Inside the loop, add six blocks in order: **Go to URL** (job page), **Extraction** (job details), **Action** (click Apply), **Extraction** (form questions), **Text Prompt** (generate answers), **Navigation** (fill and submit the form).
       </Step>
     </Steps>
@@ -1146,13 +1146,13 @@ Create the workflow from your definition file and execute it.
 ## Resources
 
 <CardGroup cols={2}>
-  <Card title="Workflow Blocks Reference" icon="cube" href="/multi-step-automations/workflow-blocks-reference">
+  <Card title="Workflow Blocks Reference" icon="cube" href="/cloud/building-workflows/configure-blocks">
     Complete parameter reference for all block types
   </Card>
-  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials">
+  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials/create-credential">
     Securely store and use login credentials
   </Card>
-  <Card title="File Operations" icon="file" href="/multi-step-automations/file-operations">
+  <Card title="File Operations" icon="file" href="/cloud/building-workflows/configure-blocks">
     Upload and parse files in workflows
   </Card>
   <Card title="Error Handling" icon="triangle-exclamation" href="/going-to-production/error-handling">

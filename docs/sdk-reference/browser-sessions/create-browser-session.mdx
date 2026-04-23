@@ -1,0 +1,144 @@
+---
+title: "create_browser_session"
+slug: sdk-reference/browser-sessions/create-browser-session
+---
+
+A browser session is a persistent browser instance that stays alive between API calls. Use sessions to chain multiple tasks in the same browser without losing cookies, local storage, or login state.
+
+For conceptual background, see [Browser Sessions](/optimization/browser-sessions).
+
+<Note>
+Python uses `snake_case` (e.g., `create_browser_session`); TypeScript uses `camelCase` (e.g., `createBrowserSession`). Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+</Note>
+
+Spin up a new cloud browser session.
+
+<CodeGroup>
+```python Python
+session = await client.create_browser_session(timeout=60)
+print(session.browser_session_id)  # pbs_abc123
+```
+
+```typescript TypeScript
+const session = await skyvern.createBrowserSession({ timeout: 60 });
+console.log(session.browser_session_id); // pbs_abc123
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `timeout` | `int` | No | `60` | Session timeout in minutes (5–1440). Timer starts after the session is ready. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
+| `extensions` | `list[Extensions]` | No | `None` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
+| `browser_type` | `PersistentBrowserType` | No | `None` | Browser type. Options: `"chrome"`, `"msedge"`. |
+| `browser_profile_id` | `str` | No | `None` | Load a browser profile (cookies, localStorage) into this session. ID starts with `bpf_`. |
+| `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
+
+### Returns `BrowserSessionResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_session_id` | `str` | Unique ID. Starts with `pbs_`. |
+| `status` | `str \| None` | Current session status. |
+| `browser_address` | `str \| None` | CDP address for connecting to the browser. |
+| `app_url` | `str \| None` | Link to the live browser view in the Cloud UI. |
+| `timeout` | `int \| None` | Configured timeout in minutes. |
+| `started_at` | `datetime \| None` | When the session became ready. |
+| `created_at` | `datetime` | When the session was requested. |
+
+### Example: Chain multiple tasks in one session
+
+<CodeGroup>
+```python Python
+session = await client.create_browser_session()
+
+# Step 1: Log in
+await client.run_task(
+    prompt="Log in with username demo@example.com",
+    url="https://app.example.com/login",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+
+# Step 2: Extract data (same browser, already logged in)
+result = await client.run_task(
+    prompt="Go to the invoices page and extract all invoice numbers",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+print(result.output)
+
+# Clean up
+await client.close_browser_session(session.browser_session_id)
+```
+
+```typescript TypeScript
+const session = await skyvern.createBrowserSession({});
+
+// Step 1: Log in
+await skyvern.runTask({
+  body: {
+    prompt: "Log in with username demo@example.com",
+    url: "https://app.example.com/login",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+
+// Step 2: Extract data (same browser, already logged in)
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Go to the invoices page and extract all invoice numbers",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+
+// Clean up
+await skyvern.closeBrowserSession(session.browser_session_id);
+```
+</CodeGroup>
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

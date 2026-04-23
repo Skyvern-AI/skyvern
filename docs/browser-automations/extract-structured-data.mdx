@@ -1,0 +1,717 @@
+---
+title: Extract Structured Data
+subtitle: Get consistent, typed output from your automations
+description: Define JSON Schema extraction schemas for Skyvern tasks to get consistent, typed output. Build schemas for single objects or arrays of items with the interactive schema builder.
+slug: browser-automations/extract-structured-data
+keywords:
+  - JSON Schema
+  - extraction schema
+  - typed output
+  - schema builder
+  - array
+  - object
+  - string
+  - number
+  - boolean
+---
+
+import { FIELD_TYPES, SchemaBuilder } from "/snippets/schema-builder.mdx";
+
+When building browser automations in code, you can extract structured data from any page using `page.extract` with a JSON schema, or by passing a `data_extraction_schema` to `page.agent.run_task`. By default, Skyvern returns extracted data in whatever format makes sense for the action. Pass a schema to enforce a specific shape using [JSON Schema](https://json-schema.org/).
+
+If you're using the Cloud UI workflow editor instead, extraction works through the Extract block. See [Block Types and Configuration](/cloud/building-workflows/configure-blocks) for setup.
+
+---
+
+## Define a schema
+
+Pass a JSON Schema object to `page.extract` via the `schema` parameter, or to `run_task` via `data_extraction_schema`:
+
+<Tabs>
+  <Tab title="page.extract (browser automation)">
+    <CodeGroup>
+    ```python Python
+    data = await page.extract(
+        "Get the title of the top post",
+        schema={
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The title of the top post"
+                }
+            }
+        },
+    )
+    ```
+
+    ```typescript TypeScript
+    const data = await page.extract({
+      prompt: "Get the title of the top post",
+      schema: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "The title of the top post",
+          },
+        },
+      },
+    });
+    ```
+    </CodeGroup>
+  </Tab>
+  <Tab title="run_task">
+    <CodeGroup>
+    ```python Python
+    result = await client.run_task(
+        prompt="Get the title of the top post",
+        url="https://news.ycombinator.com",
+        data_extraction_schema={
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The title of the top post"
+                }
+            }
+        }
+    )
+    ```
+
+    ```typescript TypeScript
+    const result = await client.runTask({
+      body: {
+        prompt: "Get the title of the top post",
+        url: "https://news.ycombinator.com",
+        data_extraction_schema: {
+          type: "object",
+          properties: {
+            title: {
+              type: "string",
+              description: "The title of the top post",
+            },
+          },
+        },
+      },
+    });
+    ```
+
+    ```bash cURL
+    curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+      -H "x-api-key: $SKYVERN_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "prompt": "Get the title of the top post",
+        "url": "https://news.ycombinator.com",
+        "data_extraction_schema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "The title of the top post"
+            }
+          }
+        }
+      }'
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+The `description` field in each property helps Skyvern understand what data to extract. Be specific.
+
+<Warning>
+`description` fields drive extraction quality. Vague descriptions like "the data" produce vague results. Be specific: "The product price in USD, without currency symbol."
+</Warning>
+
+---
+
+## Schema format
+
+Skyvern uses standard JSON Schema. Common types:
+
+| Type | JSON Schema | Example value |
+|------|-------------|---------------|
+| String | `{"type": "string"}` | `"Hello world"` |
+| Number | `{"type": "number"}` | `19.99` |
+| Integer | `{"type": "integer"}` | `42` |
+| Boolean | `{"type": "boolean"}` | `true` |
+| Array | `{"type": "array", "items": {...}}` | `[1, 2, 3]` |
+| Object | `{"type": "object", "properties": {...}}` | `{"key": "value"}` |
+
+<Note>
+A schema doesn't guarantee all fields are populated. If the data isn't on the page, fields return `null`. Design your code to handle missing values.
+</Note>
+
+---
+
+## Build your schema
+
+Use the interactive builder to generate a schema, then copy it into your code.
+
+<SchemaBuilder />
+
+---
+
+## Examples
+
+### Single value
+
+Extract one piece of information, such as the current price of Bitcoin:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the current Bitcoin price in USD",
+    url="https://coinmarketcap.com/currencies/bitcoin/",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "price": {
+                "type": "number",
+                "description": "Current Bitcoin price in USD"
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the current Bitcoin price in USD",
+    url: "https://coinmarketcap.com/currencies/bitcoin/",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        price: {
+          type: "number",
+          description: "Current Bitcoin price in USD",
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the current Bitcoin price in USD",
+    "url": "https://coinmarketcap.com/currencies/bitcoin/",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "price": {
+          "type": "number",
+          "description": "Current Bitcoin price in USD"
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+**Output (when completed):**
+
+```json
+{
+  "price": 104521.37
+}
+```
+
+---
+
+### List of items
+
+Extract multiple items with the same structure, such as the top posts from a news site:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the top 5 posts",
+    url="https://news.ycombinator.com",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "posts": {
+                "type": "array",
+                "description": "Top 5 posts from the front page",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Post title"
+                        },
+                        "points": {
+                            "type": "integer",
+                            "description": "Number of points"
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Link to the post"
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the top 5 posts",
+    url: "https://news.ycombinator.com",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        posts: {
+          type: "array",
+          description: "Top 5 posts from the front page",
+          items: {
+            type: "object",
+            properties: {
+              title: {
+                type: "string",
+                description: "Post title",
+              },
+              points: {
+                type: "integer",
+                description: "Number of points",
+              },
+              url: {
+                type: "string",
+                description: "Link to the post",
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the top 5 posts",
+    "url": "https://news.ycombinator.com",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "posts": {
+          "type": "array",
+          "description": "Top 5 posts from the front page",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Post title"
+              },
+              "points": {
+                "type": "integer",
+                "description": "Number of points"
+              },
+              "url": {
+                "type": "string",
+                "description": "Link to the post"
+              }
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+**Output (when completed):**
+
+```json
+{
+  "posts": [
+    {
+      "title": "Running Claude Code dangerously (safely)",
+      "points": 342,
+      "url": "https://blog.emilburzo.com/2026/01/running-claude-code-dangerously-safely/"
+    },
+    {
+      "title": "Linux kernel framework for PCIe device emulation",
+      "points": 287,
+      "url": "https://github.com/cakehonolulu/pciem"
+    },
+    {
+      "title": "I'm addicted to being useful",
+      "points": 256,
+      "url": "https://www.seangoedecke.com/addicted-to-being-useful/"
+    },
+    {
+      "title": "Level S4 solar radiation event",
+      "points": 198,
+      "url": "https://www.swpc.noaa.gov/news/g4-severe-geomagnetic-storm"
+    },
+    {
+      "title": "WebAssembly Text Format parser performance",
+      "points": 176,
+      "url": "https://blog.gplane.win/posts/improve-wat-parser-perf.html"
+    }
+  ]
+}
+```
+
+<Tip>
+Arrays without limits extract everything visible on the page. Specify limits in your prompt (e.g., "top 5 posts") or the array description to control output size.
+</Tip>
+
+---
+
+### Nested objects
+
+Extract hierarchical data, such as a product with its pricing and availability:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get product details including pricing and availability",
+    url="https://www.amazon.com/dp/B0EXAMPLE",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "product": {
+                "type": "object",
+                "description": "Product information",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Product name"
+                    },
+                    "pricing": {
+                        "type": "object",
+                        "description": "Pricing details",
+                        "properties": {
+                            "current_price": {
+                                "type": "number",
+                                "description": "Current price in USD"
+                            },
+                            "original_price": {
+                                "type": "number",
+                                "description": "Original price before discount"
+                            },
+                            "discount_percent": {
+                                "type": "integer",
+                                "description": "Discount percentage"
+                            }
+                        }
+                    },
+                    "availability": {
+                        "type": "object",
+                        "description": "Stock information",
+                        "properties": {
+                            "in_stock": {
+                                "type": "boolean",
+                                "description": "Whether the item is in stock"
+                            },
+                            "delivery_estimate": {
+                                "type": "string",
+                                "description": "Estimated delivery date"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get product details including pricing and availability",
+    url: "https://www.amazon.com/dp/B0EXAMPLE",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        product: {
+          type: "object",
+          description: "Product information",
+          properties: {
+            name: {
+              type: "string",
+              description: "Product name",
+            },
+            pricing: {
+              type: "object",
+              description: "Pricing details",
+              properties: {
+                current_price: {
+                  type: "number",
+                  description: "Current price in USD",
+                },
+                original_price: {
+                  type: "number",
+                  description: "Original price before discount",
+                },
+                discount_percent: {
+                  type: "integer",
+                  description: "Discount percentage",
+                },
+              },
+            },
+            availability: {
+              type: "object",
+              description: "Stock information",
+              properties: {
+                in_stock: {
+                  type: "boolean",
+                  description: "Whether the item is in stock",
+                },
+                delivery_estimate: {
+                  type: "string",
+                  description: "Estimated delivery date",
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get product details including pricing and availability",
+    "url": "https://www.amazon.com/dp/B0EXAMPLE",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "product": {
+          "type": "object",
+          "description": "Product information",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Product name"
+            },
+            "pricing": {
+              "type": "object",
+              "description": "Pricing details",
+              "properties": {
+                "current_price": {
+                  "type": "number",
+                  "description": "Current price in USD"
+                },
+                "original_price": {
+                  "type": "number",
+                  "description": "Original price before discount"
+                },
+                "discount_percent": {
+                  "type": "integer",
+                  "description": "Discount percentage"
+                }
+              }
+            },
+            "availability": {
+              "type": "object",
+              "description": "Stock information",
+              "properties": {
+                "in_stock": {
+                  "type": "boolean",
+                  "description": "Whether the item is in stock"
+                },
+                "delivery_estimate": {
+                  "type": "string",
+                  "description": "Estimated delivery date"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+**Output (when completed):**
+
+```json
+{
+  "product": {
+    "name": "Wireless Bluetooth Headphones",
+    "pricing": {
+      "current_price": 79.99,
+      "original_price": 129.99,
+      "discount_percent": 38
+    },
+    "availability": {
+      "in_stock": true,
+      "delivery_estimate": "Tomorrow, Jan 21"
+    }
+  }
+}
+```
+
+---
+
+## Accessing extracted data
+
+How you access extracted data depends on which method you used.
+
+### page.extract (browser automation)
+
+`page.extract` returns the extracted data directly as the return value:
+
+<CodeGroup>
+```python Python
+data = await page.extract(
+    "Get the top post",
+    schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Post title"},
+            "points": {"type": "integer", "description": "Points"}
+        }
+    },
+)
+
+# data is the extracted result directly
+print(f"Title: {data['title']}")
+print(f"Points: {data['points']}")
+```
+
+```typescript TypeScript
+const data = await page.extract({
+  prompt: "Get the top post",
+  schema: {
+    type: "object",
+    properties: {
+      title: { type: "string", description: "Post title" },
+      points: { type: "integer", description: "Points" },
+    },
+  },
+});
+
+// data is the extracted result directly
+console.log(`Title: ${data.title}`);
+console.log(`Points: ${data.points}`);
+```
+</CodeGroup>
+
+### run_task (async task)
+
+The extracted data appears in the `output` field of the completed run. Poll until the task reaches a terminal state, then access the output.
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the top post",
+    url="https://news.ycombinator.com",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Post title"},
+            "points": {"type": "integer", "description": "Points"}
+        }
+    }
+)
+
+run_id = result.run_id
+
+while True:
+    run = await client.get_run(run_id)
+
+    if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+# Access the extracted data
+print(f"Output: {run.output}")
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the top post",
+    url: "https://news.ycombinator.com",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Post title" },
+        points: { type: "integer", description: "Points" },
+      },
+    },
+  },
+});
+
+const runId = result.run_id;
+
+while (true) {
+  const run = await client.getRun(runId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+    console.log(`Output: ${JSON.stringify(run.output)}`);
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+```
+
+```bash cURL
+RUN_ID="your_run_id_here"
+
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo "$RESPONSE" | jq -r '.status')
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
+    echo "$RESPONSE" | jq '.output'
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+If using webhooks, the same `output` field appears in the webhook payload.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Actions Reference"
+    icon="sliders"
+    href="/browser-automations/actions-reference"
+  >
+    All available page actions and agent methods
+  </Card>
+  <Card
+    title="Build a Browser Automation"
+    icon="play"
+    href="/browser-automations/overview"
+  >
+    Launch a browser, navigate pages, and extract data
+  </Card>
+</CardGroup>

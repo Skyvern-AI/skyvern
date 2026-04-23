@@ -1,0 +1,180 @@
+---
+title: Work with Files
+subtitle: Download files from websites during browser automations
+description: Use agent.download_files to navigate websites, find download links, and retrieve files. Access downloaded files via presigned URLs.
+slug: browser-automations/work-with-files
+keywords:
+  - download_files
+  - downloaded_files
+  - presigned URL
+  - PDF
+  - invoice
+  - download_suffix
+  - download_timeout
+  - FileInfo
+---
+
+In a browser automation, `agent.download_files` navigates a page, finds the download link, and captures the file. Downloaded files are stored in Skyvern's cloud storage and returned as presigned URLs in the response.
+
+If you're building workflows in the Cloud UI instead, use the File Download block. See [Block Types and Configuration](/cloud/building-workflows/configure-blocks).
+
+---
+
+## Download a file
+
+<CodeGroup>
+```python Python
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+
+await page.goto("https://portal.example.com")
+await page.agent.login(credential_type="skyvern", credential_id="cred_123")
+
+result = await page.agent.download_files(
+    "Download the Q4 2025 financial report",
+    download_suffix=".pdf",
+    download_timeout=30,
+)
+
+for file in result.downloaded_files or []:
+    print(f"File: {file.filename}")
+    print(f"URL: {file.url}")
+    print(f"Checksum: {file.checksum}")
+
+await browser.close()
+```
+
+```typescript TypeScript
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+await page.goto("https://portal.example.com");
+await page.agent.login("skyvern", { credentialId: "cred_123" });
+
+const result = await page.agent.downloadFiles(
+  "Download the Q4 2025 financial report",
+  { downloadSuffix: ".pdf", downloadTimeout: 30 },
+);
+
+for (const file of result.downloadedFiles ?? []) {
+  console.log(`File: ${file.filename}`);
+  console.log(`URL: ${file.url}`);
+  console.log(`Checksum: ${file.checksum}`);
+}
+
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+## Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `str` / `string` | Yes | Describe what to download. The agent navigates the page to find and click the download link. |
+| `url` | `str` / `string` | No | URL to navigate to before downloading. Defaults to the current page URL. |
+| `download_suffix` | `str` / `string` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). **Not a validator**; mismatched extensions don't fail the run. Omit this to get a system-generated filename like `download-<timestamp>-<random>.pdf`. |
+| `download_timeout` | `float` / `number` | No | Soft hint (seconds) for how long to wait for a download to start. Not a hard cap; the overall `timeout` below governs failure. |
+| `max_steps_per_run` | `int` / `number` | No | Cap AI steps for the download navigation. |
+| `timeout` | `float` / `number` | No | Total timeout in seconds (default: 1800). |
+
+---
+
+## Response
+
+`agent.download_files` returns a `WorkflowRunResponse`. The downloaded files are in the `downloaded_files` field.
+
+### Response fields
+
+Most-used fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `str` | Run identifier (prefix: `wr_`) |
+| `status` | `str` | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
+| `downloaded_files` | `list[FileInfo]` | Files captured during the run |
+| `output` | `dict \| None` | Any extracted data (may be `None` even on `completed`) |
+| `app_url` | `str` | Link to view this run in the Cloud UI |
+| `recording_url` | `str \| None` | Video recording of the download session |
+| `failure_reason` | `str \| None` | Error description if the download failed |
+| `step_count` | `int` | Number of AI steps taken |
+
+See the [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse) reference for the full field list.
+
+### FileInfo fields
+
+Each file in `downloaded_files` has:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `url` | `str` | Presigned URL to download the file. Valid for a limited time. |
+| `filename` | `str \| None` | Saved filename. Reflects `download_suffix` if you set one, otherwise system-generated. |
+| `checksum` | `str \| None` | SHA-256 checksum for integrity verification |
+| `modified_at` | `datetime \| None` | Last-modified timestamp if the source provides one |
+
+---
+
+## Where files are stored
+
+Files are stored in Skyvern's managed cloud storage (S3). You access them through the presigned URLs returned in `downloaded_files`. Files are not saved to your local machine automatically.
+
+To save a file locally:
+
+<CodeGroup>
+```python Python
+import requests
+
+for file in result.downloaded_files or []:
+    response = requests.get(file.url)
+    with open(file.filename or "download.pdf", "wb") as f:
+        f.write(response.content)
+    print(f"Saved {file.filename}")
+```
+
+```typescript TypeScript
+import fs from "fs";
+
+for (const file of result.downloadedFiles ?? []) {
+  const response = await fetch(file.url);
+  const buffer = await response.arrayBuffer();
+  fs.writeFileSync(file.filename ?? "download.pdf", Buffer.from(buffer));
+  console.log(`Saved ${file.filename}`);
+}
+```
+</CodeGroup>
+
+---
+
+## Tips
+
+**Set `download_suffix`** to get a predictable filename (e.g., `"invoice-q4"` → `invoice-q4.pdf`). Without it, files are saved with a system-generated name like `download-<timestamp>-<random>.pdf`. It does **not** validate or filter by extension.
+
+**Raise the overall `timeout`** for large files. `download_timeout` is a soft hint; `timeout` is what actually fails the run.
+
+**Verify with checksums.** The `checksum` field contains a SHA-256 hash. Compare it against expected values to verify file integrity.
+
+**Login first.** Most download portals require authentication. Call `agent.login` before `agent.download_files` - the agent reuses the authenticated session.
+
+---
+
+## File operations in workflows
+
+If you build workflows in the Cloud UI, file operations use dedicated blocks instead of `agent.download_files`:
+
+| Block | Purpose |
+|-------|---------|
+| **File Download** | Download files during workflow execution |
+| **File Parser** | Parse PDFs, CSVs, and Excel files |
+| **Download to S3** | Save files from URLs to Skyvern's S3 |
+| **Upload to S3** | Upload workflow files to S3 |
+| **File Upload** | Upload to your own S3 or Azure Blob Storage |
+
+Files downloaded during a workflow accumulate in a temporary directory and can be passed between blocks using workflow parameters. See [Workflow Blocks Reference](/cloud/building-workflows/configure-blocks) for block configuration details.
+
+---
+
+## Full reference
+
+- [agent.download_files](/sdk-reference/browser-automation/agent-download-files) - SDK reference with all parameter options
+- [Using Artifacts](/debugging/using-artifacts) - access recordings, screenshots, and downloaded files from any run

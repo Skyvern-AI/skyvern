@@ -1,0 +1,29 @@
+---
+title: use_cloud_browser
+slug: sdk-reference/browser-automation/use-cloud-browser
+---
+
+Get or create a cloud browser session. Reuses the most recent available session if one exists, otherwise creates a new one.
+
+<CodeGroup>
+```python Python
+browser = await skyvern.use_cloud_browser()
+page = await browser.get_working_page()
+```
+
+```typescript TypeScript
+const browser = await skyvern.useCloudBrowser();
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+## Parameters
+
+Same parameters as `launch_cloud_browser` / `launchCloudBrowser`. Options are only used when creating a new session.
+
+| Parameter (Python) | Parameter (TS) | Type | Required | Default | Description |
+|-------------------|----------------|------|----------|---------|-------------|
+| `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (5--1440). |
+| `proxy_location` | `proxyLocation` | `ProxyLocation` | No | `None` / `undefined` | Geographic proxy location for browser traffic. |
+
+## Returns `SkyvernBrowser`

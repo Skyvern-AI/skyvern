@@ -15,11 +15,11 @@ Connect Skyvern to Workato's enterprise automation platform. Trigger browser aut
 
 ## Available Actions
 
-- **Create and Run Task** — Run an automation using **Skyvern 1.0** (simple, single-step goals)
-- **Create and Run Task V2** — Run an automation using **Skyvern 2.0** (complex, multi-step goals)
-- **Run a Workflow** — Run a pre-built Skyvern workflow with parameters
-- **Get Task / Get Task V2** — Retrieve results from a previously run task
-- **Get Workflow** — Retrieve results from a previously run workflow
+- **Create and Run Task**: Run an automation using **Skyvern 1.0** (simple, single-step goals)
+- **Create and Run Task V2**: Run an automation using **Skyvern 2.0** (complex, multi-step goals)
+- **Run a Workflow**: Run a pre-built Skyvern workflow with parameters
+- **Get Task / Get Task V2**: Retrieve results from a previously run task
+- **Get Workflow**: Retrieve results from a previously run workflow
 
 ## Setup
 
@@ -71,16 +71,16 @@ Connect Skyvern to Workato's enterprise automation platform. Trigger browser aut
 
 ### Create and Run a Task
 
-- **URL** (required) — The starting page for the automation
-- **Navigation Goal** — What Skyvern should do on the page. Omit if only extracting data.
-- **Data Extraction Goal** — What data to pull from the page
-- **Navigation Payload** — JSON input data for forms. Lets you reuse the same task with different data.
-- **Extracted Information Schema** — JSON schema defining the shape of extracted data
-- **Webhook Callback URL** — URL to notify when the task finishes
-- **Max Steps** — Cap the number of steps to control costs
+- **URL** (required): The starting page for the automation
+- **Navigation Goal**: What Skyvern should do on the page. Omit if only extracting data.
+- **Data Extraction Goal**: What data to pull from the page
+- **Navigation Payload**: JSON input data for forms. Lets you reuse the same task with different data.
+- **Extracted Information Schema**: JSON schema defining the shape of extracted data
+- **Webhook Callback URL**: URL to notify when the task finishes
+- **Max Steps**: Cap the number of steps to control costs
 
 <Note>
-The navigation goal describes what to do *after* loading the URL. Don't include "go to website X" — use the URL field instead.
+The navigation goal describes what to do *after* loading the URL. Don't include "go to website X"; use the URL field instead.
 </Note>
 
 <Frame>
@@ -91,8 +91,8 @@ The navigation goal describes what to do *after* loading the URL. Don't include 
 
 First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
 
-- **Workflow** (required) — Select the workflow to run
-- **Parameters** — Fill in any parameters defined in your workflow
+- **Workflow** (required): Select the workflow to run
+- **Parameters**: Fill in any parameters defined in your workflow
 
 <Frame>
   <img src="/images/workato/s5img1.png" alt="Select workflow in Workato" />
@@ -102,8 +102,8 @@ First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
 
 Retrieve the details of a completed run.
 
-- **Task ID** (required) — Starts with `tsk_`
-- **Workflow Run ID** (required) — Starts with `wr_`
+- **Task ID** (required): Starts with `tsk_`
+- **Workflow Run ID** (required): Starts with `wr_`
 
 ## Next steps
 

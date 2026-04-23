@@ -38,11 +38,11 @@ When a run fails or produces unexpected results, this guide helps you identify t
 </Steps>
 
 **Key artifacts to check:**
-- `screenshot_final` — Final page state
-- `recording` — Video of what happened
-- `llm_response_parsed` — What the AI decided to do
-- `visible_elements_tree` — What elements were detected
-- `har` — Network requests if something failed to load
+- `screenshot_final`: Final page state
+- `recording`: Video of what happened
+- `llm_response_parsed`: What the AI decided to do
+- `visible_elements_tree`: What elements were detected
+- `har`: Network requests if something failed to load
 
 ---
 
@@ -91,7 +91,7 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
 | `failed` | System error | Browser crash, network failure |
 | `terminated` | AI gave up | Login blocked, CAPTCHA, page unavailable |
 | `timed_out` | Exceeded `max_steps` | Task too complex, or AI got stuck |
-| `canceled` | Manually stopped | — |
+| `canceled` | Manually stopped | N/A |
 
 ---
 
@@ -216,7 +216,7 @@ See [Using Artifacts](/debugging/using-artifacts) for the full list of artifact 
 **Symptom:** Getting `504 Gateway Timeout` errors when creating browser sessions.
 
 **Fix:**
-- Retry after a few seconds — usually transient
+- Retry after a few seconds; usually transient
 - For self-hosted: check infrastructure resources
 - If persistent, contact support with your run IDs
 </Accordion>
@@ -288,9 +288,9 @@ See [Using Artifacts](/debugging/using-artifacts) for the full list of artifact 
 **Symptom:** `failure_reason` mentions CAPTCHA.
 
 **Fix options:**
-1. **Browser profile** — Use an authenticated session that skips login
-2. **Human interaction block** — Pause for manual CAPTCHA solving
-3. **Different proxy** — Use `RESIDENTIAL_ISP` for static IPs sites trust more
+1. **Browser profile**: Use an authenticated session that skips login
+2. **Human interaction block**: Pause for manual CAPTCHA solving
+3. **Different proxy**: Use `RESIDENTIAL_ISP` for static IPs sites trust more
 </Accordion>
 
 ### Data & Output Issues
@@ -338,7 +338,7 @@ See [Using Artifacts](/debugging/using-artifacts) for the full list of artifact 
 **Fix:**
 - Add termination: "STOP if you've attempted this action 3 times without success"
 - Add completion markers: "COMPLETE when you see 'Success' message"
-- Review loop conditions — ensure exit criteria are achievable
+- Review loop conditions to ensure exit criteria are achievable
 </Accordion>
 
 ---

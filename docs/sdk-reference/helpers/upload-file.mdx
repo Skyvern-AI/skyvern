@@ -1,0 +1,80 @@
+---
+title: "upload_file"
+slug: sdk-reference/helpers/upload-file
+---
+
+Upload a file to Skyvern's storage. Returns a presigned URL and S3 URI you can reference in tasks and workflows.
+
+<CodeGroup>
+```python Python
+with open("data.csv", "rb") as f:
+    upload = await client.upload_file(file=f)
+    print(upload.s3uri)          # s3://skyvern-uploads/...
+    print(upload.presigned_url)  # https://...signed download URL
+```
+
+```typescript TypeScript
+import fs from "fs";
+
+const upload = await skyvern.uploadFile({
+  file: fs.createReadStream("data.csv"),
+});
+console.log(upload.s3_uri);        // s3://skyvern-uploads/...
+console.log(upload.presigned_url); // https://...signed download URL
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file` | `File` (Python) / `File \| ReadStream \| Blob` (TS) | Yes | The file to upload. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `UploadFileResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `s3uri` (Python) / `s3_uri` (TS) | `str` | S3 URI for the uploaded file. |
+| `presigned_url` | `str` | Pre-signed download URL. |
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

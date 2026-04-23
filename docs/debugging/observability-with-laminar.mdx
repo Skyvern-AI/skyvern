@@ -16,11 +16,11 @@ keywords:
 
 [Laminar](https://www.lmnr.ai/) is an observability platform for AI applications. When integrated with Skyvern, it captures traces of your automation runs in Laminar's dashboard. What you see depends on how you're running Skyvern:
 
-- **Skyvern Cloud (via SDK)** — Laminar wraps the `run_task` / `run_workflow` call, so you get a trace span around the API request and response: latency, status, errors, and the returned output.
-- **Self-hosted** — Skyvern's server can export full traces to Laminar, including every LLM call (prompts, responses, token usage), browser actions, and workflow step execution. See [self-hosted tracing setup](#self-hosted-tracing-setup) below.
+- **Skyvern Cloud (via SDK)**: Laminar wraps the `run_task` / `run_workflow` call, so you get a trace span around the API request and response: latency, status, errors, and the returned output.
+- **Self-hosted**: Skyvern's server can export full traces to Laminar, including every LLM call (prompts, responses, token usage), browser actions, and workflow step execution. See [self-hosted tracing setup](#self-hosted-tracing-setup) below.
 
 <Tip>
-Laminar traces complement [artifacts](/debugging/using-artifacts). Use artifacts for per-run debugging (screenshots, recordings, logs) and Laminar for tracking patterns across runs — failure rates, response times, and which tasks are slowest.
+Laminar traces complement [artifacts](/debugging/using-artifacts). Use artifacts for per-run debugging (screenshots, recordings, logs) and Laminar for tracking patterns across runs (failure rates, response times, and which tasks are slowest).
 </Tip>
 
 <Note>
@@ -44,8 +44,8 @@ npm install @skyvern/client @lmnr-ai/lmnr
 </CodeGroup>
 
 You will also need:
-- A **Skyvern API key** — get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/)
-- A **Laminar API key** — sign up at [lmnr.ai](https://www.lmnr.ai/) and create a project
+- A **Skyvern API key**: get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/)
+- A **Laminar API key**: sign up at [lmnr.ai](https://www.lmnr.ai/) and create a project
 
 ---
 
@@ -73,7 +73,7 @@ LMNR_PROJECT_API_KEY=your-laminar-api-key
 
 ## Run a traced task
 
-This example scrapes the top 3 posts from Hacker News with Laminar tracing enabled. Call `Laminar.initialize()` before any Skyvern calls — it reads `LMNR_PROJECT_API_KEY` from your environment automatically.
+This example scrapes the top 3 posts from Hacker News with Laminar tracing enabled. Call `Laminar.initialize()` before any Skyvern calls; it reads `LMNR_PROJECT_API_KEY` from your environment automatically.
 
 <CodeGroup>
 ```python Python
@@ -143,14 +143,14 @@ Expected output:
 }
 ```
 
-The task runs, the output is returned, and the full trace — every HTTP call, timing, and payload — appears in your Laminar dashboard.
+The task runs, the output is returned, and the full trace (every HTTP call, timing, and payload) appears in your Laminar dashboard.
 
 <Note>
-**Python only:** You will see a `ForgeApp is not initialized` error in stderr on startup. This is harmless — `lmnr[all]` tries to instrument Skyvern's server-side internals, which aren't present when using the client SDK. Your traces still work correctly.
+**Python only:** You will see a `ForgeApp is not initialized` error in stderr on startup. This is harmless; `lmnr[all]` tries to instrument Skyvern's server-side internals, which aren't present when using the client SDK. Your traces still work correctly.
 </Note>
 
 <Warning>
-**Python only:** `LaminarLiteLLMCallback` is deprecated and unnecessary. Laminar instruments LiteLLM directly — no callback setup is needed.
+**Python only:** `LaminarLiteLLMCallback` is deprecated and unnecessary. Laminar instruments LiteLLM directly, so no callback setup is needed.
 </Warning>
 
 ---
@@ -165,11 +165,11 @@ When calling `run_task` or `run_workflow` through the SDK, Laminar traces the cl
 
 | Trace data | What it shows |
 |------------|---------------|
-| API request/response | The full round-trip to Skyvern's API — status, latency, payload size |
+| API request/response | The full round-trip to Skyvern's API (status, latency, payload size) |
 | Task output | The extracted data or completion result |
 | Errors | HTTP errors, timeouts, and task failures |
 
-This is useful for monitoring how your application interacts with Skyvern — tracking which tasks fail, how long they take, and what outputs you're getting back.
+This is useful for monitoring how your application interacts with Skyvern: tracking which tasks fail, how long they take, and what outputs you're getting back.
 
 ### Self-hosted
 
@@ -182,7 +182,7 @@ When running Skyvern on your own infrastructure, you get deep server-side traces
 | Workflow steps | Sequential block execution and data passed between blocks |
 | Image tracing | Screenshots sent to the LLM for analysis |
 | Performance metrics | Latency and cost per LLM call |
-| Errors | Exceptions at any layer — LLM, browser, workflow engine |
+| Errors | Exceptions at any layer: LLM, browser, workflow engine |
 
 ---
 
@@ -205,7 +205,7 @@ LMNR_GRPC_PORT=8011
 LMNR_HTTP_PORT=8010
 ```
 
-No code changes needed — once the env vars are set, traces appear in your Laminar project automatically.
+No code changes needed. Once the env vars are set, traces appear in your Laminar project automatically.
 
 ---
 

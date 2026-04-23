@@ -1,0 +1,75 @@
+---
+title: get_workflow_runs
+slug: sdk-reference/workflows/get-workflow-runs
+---
+
+List workflow runs across all workflows for the current organization. Results are paginated and can be filtered by status, search key, and error code.
+
+<CodeGroup>
+```python Python
+runs = await client.get_workflow_runs(page=1, page_size=10)
+for run in runs:
+    print(run.workflow_run_id, run.status)
+```
+
+```typescript TypeScript
+const runs = await skyvern.getWorkflowRuns({ page: 1, page_size: 10 });
+for (const run of runs) {
+  console.log(run.workflow_run_id, run.status);
+}
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page` | `int` | No | Page number (1-indexed). |
+| `page_size` | `int` | No | Results per page. |
+| `status` | `WorkflowRunStatus \| list[WorkflowRunStatus]` | No | Filter by run status. |
+| `search_key` | `str` | No | Case-insensitive substring search (min 3 chars). Matches against run ID, parameter keys, parameter values, and descriptions. |
+| `error_code` | `str` | No | Filter by error code. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `list[WorkflowRun]`
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

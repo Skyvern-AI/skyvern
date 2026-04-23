@@ -1,0 +1,39 @@
+---
+title: click
+slug: sdk-reference/browser-automation/click
+---
+
+Click an element using a CSS selector, an AI prompt, or both. When both are given, the selector is tried first; if it fails, AI takes over.
+
+<CodeGroup>
+```python Python
+# Standard Playwright click
+await page.click("#submit-button")
+
+# AI-powered click (no selector needed)
+await page.click(prompt="Click the 'Submit' button")
+
+# Selector with AI fallback
+await page.click("#submit-button", prompt="Click the 'Submit' button")
+```
+
+```typescript TypeScript
+// Standard Playwright click
+await page.click("#submit-button");
+
+// AI-powered click (no selector needed)
+await page.click({ prompt: "Click the 'Submit' button" });
+
+// Selector with AI fallback
+await page.click("#submit-button", { prompt: "Click the 'Submit' button" });
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` / `string` | No | CSS selector for the target element. |
+| `prompt` | `str` / `string` | No | Natural language description of the element to click. |
+| `ai` | `str` / `string` | No | Controls AI behavior. `"fallback"` (default) tries the selector first, then AI. `None` / `null` disables AI. |
+| `**kwargs` | | No | Standard Playwright click options (e.g., `timeout`, `force`, `position`). |
+
+Returns `str | None` / `string | null` -- the resolved selector used, or `None` if AI handled the click without a selector.

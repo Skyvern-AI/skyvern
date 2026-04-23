@@ -1,24 +1,26 @@
 ---
-title: API Quickstart
+title: Quickstart
 subtitle: Run your first browser automation in 5 minutes
-description: Run your first browser automation task with the Skyvern API. Scrape Hacker News using Python, TypeScript, or cURL in under 5 minutes.
+description: Launch a cloud browser, go to a webpage, and extract structured data with Python, TypeScript, or cURL in under 5 minutes.
 slug: getting-started/quickstart
 keywords:
   - quickstart
-  - 5 minutes
-  - Hacker News
-  - run_task
-  - get_run
-  - polling
+  - launch_cloud_browser
+  - get_working_page
+  - page.extract
+  - page.agent.run_task
   - cURL
+  - Python
+  - Typescript
   - pip install
   - npm install
+  - installation
 ---
 
-Run your first browser automation in 5 minutes. By the end of this guide, you'll scrape the top post from Hacker News using Skyvern's AI agent.
+Run your first browser automation in 5 minutes. By the end of this guide, you'll launch a cloud browser, navigate to Hacker News, and extract the top post title using Skyvern SDK's Page, Agent and Browser methods.
 
 <Note>
-Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead — no code required.
+Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead. No code required.
 </Note>
 
 ## Step 1: Get your API key
@@ -26,8 +28,6 @@ Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) i
 <img src="/images/get-api-key.png" alt="Get Skyvern API key" />
 
 Sign up at [app.skyvern.com](https://app.skyvern.com) and go to [Settings](https://app.skyvern.com/settings) to copy your API key.
-
-When you make API calls, Skyvern spins up a cloud browser, executes your task with AI, and returns the results. You can watch the browser live at any time.
 
 ## Step 2: Install the SDK
 
@@ -51,14 +51,9 @@ pipx install skyvern
 pipx installs Python packages in isolated environments while making them globally available.
 </Accordion>
 
-## Step 3: Run your first task
+## Step 3: Launch a browser and extract data
 
-Let's scrape the title of the #1 post on Hacker News. You only need two parameters:
-
-- **`prompt`** — Natural language instructions for what the AI should do. Be specific about the data you want extracted.
-- **`url`** — The starting page. Skyvern's AI will navigate from here based on your prompt.
-
-The SDK uses async/await because Skyvern spins up a cloud browser and executes your task remotely, which can take 30-60 seconds.
+When you call `launch_cloud_browser()`, Skyvern spins up a Chromium instance in the cloud. Your code drives that browser via a Playwright `Page` that also has AI methods (`act`, `extract`, `validate`, `prompt`) layered on top. You can watch the browser live at any time.
 
 <CodeGroup>
 ```python Python
@@ -67,42 +62,59 @@ import asyncio
 from skyvern import Skyvern
 
 async def main():
-    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+    skyvern = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
 
-    result = await client.run_task(
-        prompt="Go to news.ycombinator.com and get the title of the #1 post",
-        url="https://news.ycombinator.com",
-    )
+    # 1. Launch a cloud browser and get a page
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    print(f"Watch live: https://app.skyvern.com/browser-session/{browser.browser_session_id}")
 
-    print(f"Run ID: {result.run_id}")
-    print(f"Status: {result.status}")
+    try:
+        # 2. Navigate
+        await page.goto("https://news.ycombinator.com")
+
+        # 3. Extract data with an AI prompt
+        result = await page.extract("Get the title of the #1 post")
+        print(f"Extracted: {result}")
+    finally:
+        # 4. Always close the browser to free cloud resources
+        await browser.close()
 
 asyncio.run(main())
 ```
 
 ```typescript TypeScript
-import { SkyvernClient } from "@skyvern/client";
+import { Skyvern } from "@skyvern/client";
 
 async function main() {
-  const client = new SkyvernClient({
-    apiKey: process.env.SKYVERN_API_KEY,
-  });
+  const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY });
 
-  const result = await client.runTask({
-    body: {
-      prompt: "Go to news.ycombinator.com and get the title of the #1 post",
-      url: "https://news.ycombinator.com",
-    },
-  });
+  // 1. Launch a cloud browser and get a page
+  const browser = await skyvern.launchCloudBrowser();
+  const page = await browser.getWorkingPage();
+  console.log(`Watch live: https://app.skyvern.com/browser-session/${browser.browserSessionId}`);
 
-  console.log(`Run ID: ${result.run_id}`);
-  console.log(`Status: ${result.status}`);
+  try {
+    // 2. Navigate
+    await page.goto("https://news.ycombinator.com");
+
+    // 3. Extract data with an AI prompt
+    const result = await page.extract("Get the title of the #1 post");
+    console.log("Extracted:", result);
+  } finally {
+    // 4. Always close the browser to free cloud resources
+    await browser.close();
+  }
 }
 
 main();
 ```
 
 ```bash cURL
+# The SDK's browser/page pattern is a client-side abstraction over several
+# REST calls. For a single curl example, use the task API, which handles
+# browser + navigation + extraction as one request:
+
 curl -X POST "https://api.skyvern.com/v1/run/tasks" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
@@ -113,85 +125,28 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-The response includes a `run_id` you'll use to check status and fetch results.
+<Info>
+**Why `page.extract` is enough here.** For a one-shot read on a single page, `page.extract(prompt, schema=...)` returns the extracted data directly (a `dict` in Python, `object` in TS). For multi-step goals like *"log in, navigate to billing, download the invoice"*, use `page.agent.run_task(prompt)` instead; it runs a full AI task loop on the page and returns a [`TaskRunResponse`](/sdk-reference/tasks/run-task#returns-taskrunresponse). See [Build a Browser Automation](/browser-automations/overview) for the full walkthrough.
+</Info>
 
-## Step 4: Check the status
+## Step 4: Understand the output
 
-Since tasks run asynchronously, you have two options:
+`page.extract` returns the extracted data as a dict. For the Hacker News example you'll see something like:
 
-1. **Polling** — Periodically check the task status (shown below)
-2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/going-to-production/webhooks))
-
-The code below polls every 5 seconds until the task reaches a terminal state. Once complete, `run.output` contains the extracted data as a dictionary.
-
-<CodeGroup>
-```python Python
-import os
-import asyncio
-from skyvern import Skyvern
-
-async def main():
-    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
-
-    result = await client.run_task(
-        prompt="Go to news.ycombinator.com and get the title of the #1 post",
-        url="https://news.ycombinator.com",
-    )
-
-    run_id = result.run_id
-    print(f"Task started: {run_id}")
-
-    while True:
-        run = await client.get_run(run_id)
-        print(f"Status: {run.status}")
-
-        if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
-            break
-
-        await asyncio.sleep(5)
-
-    print(f"Final status: {run.status}")
-    print(f"Output: {run.output}")
-
-asyncio.run(main())
+```text
+Watch live: https://app.skyvern.com/browser-session/pbs_519891155782767800
+Extracted: {'top_post_title': 'Linux kernel framework for PCIe device emulation, in userspace'}
 ```
 
-```typescript TypeScript
-import { SkyvernClient } from "@skyvern/client";
+- **`Watch live: ...`** is printed before any AI calls. Open it in another tab to watch the browser navigate and extract in real time.
+- **`Extracted: {...}`** appears after `page.extract` returns. The key names come from the AI (unless you pass a `schema`, in which case they match your schema). For typed, predictable output, see [Extract Structured Data](/browser-automations/extract-structured-data).
 
-async function main() {
-  const client = new SkyvernClient({
-    apiKey: process.env.SKYVERN_API_KEY,
-  });
+### If you used the cURL path
 
-  const result = await client.runTask({
-    body: {
-      prompt: "Go to news.ycombinator.com and get the title of the #1 post",
-      url: "https://news.ycombinator.com",
-    },
-  });
+The task API is asynchronous. The POST returns a `run_id`; poll for the final result:
 
-  const runId = result.run_id;
-  console.log(`Task started: ${runId}`);
-
-  while (true) {
-    const run = await client.getRun(runId);
-    console.log(`Status: ${run.status}`);
-
-    if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
-      console.log(`Output: ${JSON.stringify(run.output)}`);
-      break;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
-}
-
-main();
-```
-
-```bash cURL
-RUN_ID="your_run_id_here"
+```bash
+RUN_ID="tsk_..."  # from the POST response above
 
 while true; do
   RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
@@ -204,72 +159,29 @@ while true; do
     echo "$RESPONSE" | jq '.output'
     break
   fi
-
   sleep 5
 done
 ```
-</CodeGroup>
 
 **Run states:**
-- `created` — Task initialized, not yet queued
-- `queued` — Waiting for an available browser
-- `running` — AI is navigating and executing
-- `completed` — Task finished successfully
-- `failed` — Task encountered an error
-- `terminated` — Task was manually stopped
-- `timed_out` — Task exceeded time limit
-- `canceled` — Task was cancelled before starting
+- `created`, `queued`: Waiting for an available browser
+- `running`: AI is navigating and executing
+- `completed`: Task finished successfully
+- `failed` / `terminated` / `timed_out` / `canceled`: Non-success terminal states
 
-## Step 5: View your results
+## Step 5: Watch the recording
 
-When the task completes, you'll get a response like this:
+Every run is recorded. Two ways to access it:
 
-```json
-{
-  "run_id": "tsk_v2_486305187432193504",
-  "status": "completed",
-  "output": {
-    "top_post_title": "Linux kernel framework for PCIe device emulation, in userspace"
-  },
-  "downloaded_files": [],
-  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../recording.webm?...",
-  "screenshot_urls": ["https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../screenshot_final.png?..."],
-  "app_url": "https://app.skyvern.com/runs/wr_486305187432193510",
-  "step_count": 2,
-  "run_type": "task_v2"
-}
-```
+### Live
 
-The `output` contains whatever data the AI extracted based on your prompt. The `app_url` links to the Cloud UI where you can view the full run details.
+While the script runs, the `Watch live: ...` URL printed in Step 3 streams the browser in real time.
 
-## Step 6: Watch the recording
+### After the run
 
-Every task is recorded. There are two ways to access recordings:
-
-### From the API response
-
-The `recording_url` field is included in every completed run response:
-
-```json
-{
-  "run_id": "tsk_v2_486305187432193504",
-  "status": "completed",
-  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/o_485917350850524254/tsk_.../recording.webm?AWSAccessKeyId=...&Signature=...&Expires=..."
-}
-```
-
-### From the Cloud UI
-
-Navigate to [Runs](https://app.skyvern.com/runs) and click on your run to see the Recording tab.
+Open [Runs](https://app.skyvern.com/runs) and click on your run to see the Recording tab, step-by-step actions with screenshots, and AI reasoning for each decision.
 
 <img src="/images/view-recording.png" alt="Recording tab in Skyvern Cloud" />
-
-### What you'll see
-
-- **Live browser view** — Watch the AI navigate in real-time
-- **Recording** — Full video replay of the session
-- **Actions** — Step-by-step breakdown with screenshots
-- **AI Reasoning** — See why the AI made each decision
 
 This is invaluable for debugging and understanding how Skyvern interprets your prompts.
 
@@ -352,9 +264,9 @@ skyvern run server
   <img src="/images/skyvern-run-server.gif" alt="Skyvern local server logs" />
 </p>
 
-### Run a task locally
+### Run locally
 
-The only difference from cloud is the `base_url` parameter pointing to your local server. The API is identical, so the same code works in both environments — develop locally, deploy to cloud without changes.
+The only difference from cloud is the `base_url` parameter pointing to your local server. The Page/Agent/Browser API is identical, so the same code works in both environments. Develop locally, deploy to cloud without changes.
 
 ```python
 import os
@@ -362,17 +274,20 @@ import asyncio
 from skyvern import Skyvern
 
 async def main():
-    client = Skyvern(
+    skyvern = Skyvern(
         base_url="http://localhost:8000",
-        api_key=os.getenv("SKYVERN_API_KEY")
+        api_key=os.getenv("SKYVERN_API_KEY"),
     )
 
-    result = await client.run_task(
-        prompt="Go to news.ycombinator.com and get the title of the #1 post",
-        url="https://news.ycombinator.com",
-    )
+    browser = await skyvern.launch_local_browser()
+    page = await browser.get_working_page()
 
-    print(f"Run ID: {result.run_id}")
+    try:
+        await page.goto("https://news.ycombinator.com")
+        result = await page.extract("Get the title of the #1 post")
+        print(f"Extracted: {result}")
+    finally:
+        await browser.close()
 
 asyncio.run(main())
 ```
@@ -391,23 +306,37 @@ If you also selected Claude Code during setup, start your local frontend dev ser
 
 <CardGroup cols={2}>
   <Card
+    title="Build a Browser Automation"
+    icon="browser"
+    href="/browser-automations/overview"
+  >
+    The full Page/Agent/Browser walkthrough: AI actions, Playwright selectors, and agent tasks
+  </Card>
+  <Card
+    title="Actions Reference"
+    icon="list"
+    href="/browser-automations/actions-reference"
+  >
+    Every page action and agent method with parameters and return types
+  </Card>
+  <Card
     title="Extract Structured Data"
     icon="database"
-    href="/running-automations/extract-structured-data"
+    href="/browser-automations/extract-structured-data"
   >
     Define a schema to get typed JSON output from your automations
   </Card>
   <Card
     title="Handle Logins"
     icon="key"
-    href="/sdk-reference/credentials"
+    href="/sdk-reference/credentials/create-credential"
   >
     Store credentials securely for sites that require authentication
   </Card>
   <Card
     title="Build Workflows"
     icon="diagram-project"
-    href="/multi-step-automations/build-a-workflow"
+    href="/cloud/building-workflows/build-a-workflow"
   >
     Chain multiple steps together for complex automations
   </Card>

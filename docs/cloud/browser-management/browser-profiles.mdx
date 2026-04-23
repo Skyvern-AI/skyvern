@@ -12,7 +12,7 @@ keywords:
   - reuse
 ---
 
-A **browser profile** is a saved snapshot of browser state — cookies, localStorage, and session files. Load a profile into a new [browser session](/cloud/browser-management/browser-sessions) and the browser starts with that saved state restored, skipping login flows you've already completed.
+A **browser profile** is a saved snapshot of browser state: cookies, localStorage, and session files. Load a profile into a new [browser session](/cloud/browser-management/browser-sessions) and the browser starts with that saved state restored, skipping login flows you've already completed.
 
 Profiles are ideal when you:
 
@@ -28,7 +28,7 @@ Looking to manage profiles from code? See the [API & SDK guide](/optimization/br
 
 ## How profiles are created
 
-Browser profiles are created automatically when you test a password credential with the **Save browser session** option enabled. There is no standalone "create profile" button — the profile is a byproduct of a successful login test.
+Browser profiles are created automatically when you test a password credential with the **Save browser session** option enabled. There is no standalone "create profile" button; the profile is a byproduct of a successful login test.
 
 ### Creating a profile from a credential
 
@@ -45,7 +45,7 @@ Browser profiles are created automatically when you test a password credential w
     Below the password fields, enable the **Save browser session** option. Enter the **login URL** for the site (e.g., `https://app.example.com/login`). You can also add optional context to help the AI navigate the login flow.
   </Step>
   <Step title="Test the credential">
-    Click **Test**. Skyvern opens a browser, navigates to the login URL, signs in with the credential, and — if the login succeeds — saves the browser state as a profile. The profile is linked to this credential automatically.
+    Click **Test**. Skyvern opens a browser, navigates to the login URL, signs in with the credential, and, if the login succeeds, saves the browser state as a profile. The profile is linked to this credential automatically.
   </Step>
   <Step title="Confirm the profile was saved">
     When the test completes, the credential row shows a **saved-profile** badge with the site hostname. This means the browser profile is ready to use.

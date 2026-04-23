@@ -1,0 +1,71 @@
+---
+title: "list_browser_profiles"
+slug: sdk-reference/browser-profiles/list-browser-profiles
+---
+
+List all browser profiles.
+
+<CodeGroup>
+```python Python
+profiles = await client.list_browser_profiles()
+for p in profiles:
+    print(f"{p.name} ({p.browser_profile_id})")
+```
+
+```typescript TypeScript
+const profiles = await skyvern.listBrowserProfiles({});
+for (const p of profiles) {
+  console.log(`${p.name} (${p.browser_profile_id})`);
+}
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include_deleted` | `bool` | No | `None` | Include soft-deleted profiles in the results. |
+| `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
+
+### Returns `list[BrowserProfile]`
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

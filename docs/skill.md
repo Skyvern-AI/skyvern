@@ -1,6 +1,6 @@
 ---
 name: skyvern
-description: Automate any website with AI-powered browser automation. Use when the user needs to interact with a website — filling forms, extracting data, downloading files, logging in, or running multi-step workflows. Skyvern navigates sites it has never seen before using LLMs and computer vision. Integrates via Python SDK, TypeScript SDK, REST API, MCP server, or CLI.
+description: Automate any website with AI-powered browser automation. Use when the user needs to interact with a website like filling forms, extracting data, downloading files, logging in, or running multi-step workflows. Skyvern navigates sites it has never seen before using LLMs and computer vision. Integrates via Python SDK, TypeScript SDK, REST API, MCP server, or CLI.
 license: AGPL-3.0
 compatibility: Requires a Skyvern Cloud API key (https://app.skyvern.com) or a self-hosted Skyvern instance. Python SDK requires Python 3.11+. TypeScript SDK requires Node.js 18+. MCP server works with Claude Code, Claude Desktop, Cursor, Windsurf, and VS Code.
 metadata:
@@ -10,9 +10,11 @@ metadata:
   github: https://github.com/Skyvern-AI/skyvern
 ---
 
-# Skyvern — AI Browser Automation
+# Skyvern: AI Browser Automation
 
-Skyvern automates browser-based workflows using LLMs and computer vision. It navigates websites it has never seen before — filling forms, extracting data, and completing multi-step tasks — via a simple API.
+Skyvern automates browser-based workflows using LLMs and computer vision. It navigates websites it has never seen before, filling forms, extracting data, and completing multi-step tasks via a simple API.
+
+**SDK reference (all methods, parameters, types in one page):** https://skyvern.com/docs/sdk-reference/complete-reference
 
 ## When to use Skyvern
 
@@ -108,7 +110,7 @@ run = await client.run_workflow(workflow_id=workflow.workflow_id)
 
 ### Manage browser sessions
 
-Persist a live browser across multiple tasks — maintain login state, cookies, and page context.
+Persist a live browser across multiple tasks to maintain login state, cookies, and page context.
 
 ```python
 session = await client.create_session()
@@ -170,10 +172,9 @@ skyvern workflow run --id wf_xxx        # Run a workflow
 
 ## Key references
 
-- [API Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): First task in 5 minutes
-- [Python SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference.md): All methods and types
-- [TypeScript SDK Reference](https://skyvern.com/docs/ts-sdk-reference/complete-reference.md): All methods and types
+- [Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): First task in 5 minutes
+- [SDK Reference](https://skyvern.com/docs/sdk-reference/complete-reference.md): All methods and types (Python + TypeScript)
 - [MCP Server Setup](https://skyvern.com/docs/going-to-production/mcp.md): Connect AI assistants
-- [Workflow Blocks Reference](https://skyvern.com/docs/multi-step-automations/workflow-blocks-reference.md): All block types
+- [Workflow Blocks Reference](https://skyvern.com/docs/cloud/building-workflows/configure-blocks.md): All block types
 - [Task Parameters](https://skyvern.com/docs/running-automations/task-parameters.md): All task options
 - [Full documentation index](https://skyvern.com/docs/llms.txt): Complete page directory
