@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, List
 
 import pyotp
 import structlog
+from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
@@ -1638,6 +1639,46 @@ async def handle_input_text_action(
             await skyvern_element.press_key("Tab")
 
 
+_URL_RECOVERY_EDIT_DISTANCE_FRACTION = 0.1
+_URL_RECOVERY_MAX_EDIT_DISTANCE = 10
+
+
+def _origin_key(parsed: urllib.parse.ParseResult) -> tuple[str, str | None, int | None, str]:
+    return (parsed.scheme.lower(), parsed.hostname, parsed.port, parsed.path)
+
+
+def _find_similar_url_in_text(candidate_url: str, text: str) -> str | None:
+    # Bounded-edit-distance substring search via fuzzysearch (Bitap /
+    # Levenshtein-automaton kernel). Recovers a verbatim user-supplied URL when
+    # the LLM flips a few characters inside a long pre-signed token. The
+    # origin-key gate prevents any cross-origin swap.
+    if not candidate_url or not text:
+        return None
+    normalized = candidate_url.strip()
+    try:
+        candidate = urllib.parse.urlparse(normalized)
+    except ValueError:
+        return None
+    if not candidate.scheme or not candidate.hostname:
+        return None
+
+    max_dist = min(max(1, int(len(normalized) * _URL_RECOVERY_EDIT_DISTANCE_FRACTION)), _URL_RECOVERY_MAX_EDIT_DISTANCE)
+    # Case-insensitive match so scheme/hostname casing doesn't consume the edit-distance budget.
+    matches = find_near_matches(normalized.lower(), text.lower(), max_l_dist=max_dist)
+    if not matches:
+        return None
+
+    best = min(matches, key=lambda m: m.dist)
+    matched = text[best.start : best.end]
+    try:
+        parsed = urllib.parse.urlparse(matched)
+    except ValueError:
+        return None
+    if _origin_key(parsed) != _origin_key(candidate):
+        return None
+    return matched
+
+
 @traced(name="skyvern.agent.action.upload_file")
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
@@ -1661,12 +1702,24 @@ async def handle_upload_file_action(
         and decoded_url not in str(task.navigation_payload)
         and decoded_url not in str(task.navigation_goal)
     ):
-        LOG.warning(
-            "LLM might be imagining the file url, which is not in navigation payload",
-            action=action,
-            file_url=action.file_url,
+        user_sources = f"{task.navigation_goal or ''}\n{task.navigation_payload or ''}"
+        recovered_url = _find_similar_url_in_text(file_url, user_sources) or _find_similar_url_in_text(
+            decoded_url, user_sources
         )
-        return [ActionFailure(ImaginaryFileUrl(action.file_url))]
+        if recovered_url:
+            LOG.warning(
+                "LLM-returned file_url appears to be a corrupted copy of a user-provided URL; using the verbatim URL",
+                action=action,
+            )
+            file_url = recovered_url
+            decoded_url = urllib.parse.unquote(file_url)
+        else:
+            LOG.warning(
+                "LLM might be imagining the file url, which is not in navigation payload",
+                action=action,
+                file_url=action.file_url,
+            )
+            return [ActionFailure(ImaginaryFileUrl(action.file_url))]
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)

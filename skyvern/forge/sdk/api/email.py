@@ -1,3 +1,4 @@
+import asyncio
 import smtplib
 from email.message import EmailMessage
 
@@ -8,25 +9,58 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
+# Per-op socket timeout so the executor thread cannot linger past an outer asyncio cancel.
+_SMTP_SOCKET_TIMEOUT_SECONDS = 10
+
+
+def _send_blocking(
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    message: EmailMessage,
+) -> None:
+    smtp_host = smtplib.SMTP(host, port, timeout=_SMTP_SOCKET_TIMEOUT_SECONDS)
+    try:
+        smtp_host.starttls()
+        smtp_host.login(username, password)
+        smtp_host.send_message(message)
+    finally:
+        try:
+            smtp_host.quit()
+        except smtplib.SMTPException:
+            # Connection may already be torn down; fall back to close() and move on.
+            smtp_host.close()
+
 
 async def _send(*, message: EmailMessage) -> bool:
     settings = SettingsManager.get_settings()
     try:
-        smtp_host = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
-
-        LOG.info("email: Connected to SMTP server")
-
-        smtp_host.starttls()
-        smtp_host.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
-
-        LOG.info("email: Logged in to SMTP server")
-
-        smtp_host.send_message(message)
-
+        # smtplib is blocking; offload so the event loop stays free during TLS+AUTH+DATA.
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: _send_blocking(
+                host=settings.SMTP_HOST,
+                port=settings.SMTP_PORT,
+                username=settings.SMTP_USERNAME,
+                password=settings.SMTP_PASSWORD,
+                message=message,
+            ),
+        )
         LOG.info("email: Email sent")
     except Exception as e:
-        LOG.error("email: Failed to send email", error=str(e), host=settings.SMTP_HOST, port=settings.SMTP_PORT)
-        raise e
+        # Log error_type only. SMTP rejection messages often embed the recipient
+        # address (e.g. "550 5.1.1 Recipient rejected: <addr>"), which would leak
+        # PII into log aggregators. The exception class plus host/port is enough
+        # to triage; callers that need detail can add context around the raise.
+        LOG.error(
+            "email: Failed to send email",
+            error_type=type(e).__name__,
+            host=settings.SMTP_HOST,
+            port=settings.SMTP_PORT,
+        )
+        raise
 
     return True
 
@@ -35,10 +69,9 @@ def validate_recipients(recipients: list[str]) -> None:
     for recipient in recipients:
         try:
             validate_email(recipient)
-        except EmailNotValidError:
-            raise Exception(
-                f"invalid email address: {recipient}",
-            )
+        except EmailNotValidError as ex:
+            # Do not echo the address; callers log downstream and we avoid PII leakage.
+            raise ValueError("invalid email address") from ex
 
 
 async def build_message(
