@@ -29,6 +29,15 @@ def test_mcp_instructions_guide_text_prompt_defaults() -> None:
 
 
 @pytest.mark.asyncio
+async def test_expected_prompts_registered() -> None:
+    prompts = await mcp.list_prompts()
+    prompt_names = {prompt.name for prompt in prompts}
+    # Deliberately additive-only: this guards that core prompts remain
+    # registered without breaking when new prompts are introduced later.
+    assert {"build_workflow", "debug_automation", "extract_data", "qa_test"} <= prompt_names
+
+
+@pytest.mark.asyncio
 async def test_text_prompt_block_schema_example_omits_raw_llm_key() -> None:
     result = await skyvern_block_schema(block_type="text_prompt")
 
