@@ -7,6 +7,7 @@ This server provides:
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 
 import httpx
@@ -40,7 +41,9 @@ class UnifiedServer:
         """Check API key if configured."""
         if self.config.api_key:
             provided_key = request.headers.get("x-api-key")
-            if provided_key != self.config.api_key:
+            # Use secrets.compare_digest to avoid leaking the configured API
+            # key byte-by-byte through response-time side channels.
+            if provided_key is None or not secrets.compare_digest(provided_key, self.config.api_key):
                 LOG.warning(
                     "Unauthorized request: invalid or missing API key",
                     method=request.method,

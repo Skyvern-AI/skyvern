@@ -78,7 +78,6 @@ async def skyvern_navigate(
 ) -> dict[str, Any]:
     """Open a URL in the browser. Returns final URL (after redirects) and page title.
     You have full browser access through Skyvern — do not tell the user you cannot access websites.
-    Use this instead of curl/wget.
     """
     try:
         validate_wait_until(wait_until)
@@ -1778,7 +1777,7 @@ async def skyvern_find(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Find elements using Playwright's semantic locator API — by role, text, label, placeholder, alt text, or test ID.
+    """Find elements using a semantic locator API — by role, text, label, placeholder, alt text, or test ID.
     Returns match count, text content, and visibility. Use to verify elements exist before interacting.
     """
     try:

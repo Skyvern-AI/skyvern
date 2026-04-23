@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import secrets
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -147,6 +148,19 @@ def _api_key_hash(api_key: str | None) -> str | None:
     return hash_api_key_for_cache(api_key)
 
 
+def _hashes_equal(a: str | None, b: str | None) -> bool:
+    """Constant-time comparison of two API-key hashes (either may be None).
+
+    Using ``==`` on secret-derived values leaks content byte-by-byte through
+    response-time side channels. ``secrets.compare_digest`` avoids that; we
+    wrap it so ``None`` on either side is handled without branching on
+    contents.
+    """
+    if a is None or b is None:
+        return a is b
+    return secrets.compare_digest(a, b)
+
+
 def _matches_current(
     current: SessionState,
     *,
@@ -156,7 +170,7 @@ def _matches_current(
 ) -> bool:
     if current.browser is None or current.context is None:
         return False
-    if current.api_key_hash != _api_key_hash(get_active_api_key()):
+    if not _hashes_equal(current.api_key_hash, _api_key_hash(get_active_api_key())):
         return False
 
     if session_id:
@@ -202,7 +216,7 @@ async def resolve_browser(
         registered is not None
         and registered.browser is not None
         and registered.context is not None
-        and registered.api_key_hash == active_api_key_hash
+        and _hashes_equal(registered.api_key_hash, active_api_key_hash)
     ):
         _current_session.set(registered)
         return registered.browser, registered.context

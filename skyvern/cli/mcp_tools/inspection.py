@@ -44,14 +44,14 @@ _REDACTED_HEADERS = frozenset({"authorization", "cookie", "set-cookie", "proxy-a
 _SECRET_QS_NAMES = frozenset(p.lower() for p in _SECRET_QUERY_PARAMS)
 
 _STATELESS_ERROR_MSG = (
-    "Inspection tools are not supported in stateless HTTP mode. "
-    "Event buffers are not persisted across requests in this transport. "
-    "Use stdio transport (Claude Code, gstack) for browser inspection, "
-    "or use skyvern_evaluate to run JavaScript that reads console/network state directly."
+    "Inspection tools (console_messages, network_requests, handle_dialog, get_errors, har_*) "
+    "are not available in stateless HTTP mode because event buffers are not persisted between requests. "
+    "Use skyvern_evaluate to read equivalent state directly from the page "
+    "(e.g., `performance.getEntriesByType('resource')` for network, captured console output, or DOM state)."
 )
 _STATELESS_HINT = (
-    "Connect via stdio transport: `skyvern mcp` (default). "
-    "Cloud-hosted inspection support is planned — see cloud_docs/mcp-inspection/TODOS.md"
+    "Call skyvern_evaluate with JavaScript that reads the page state you need. "
+    "Cloud-hosted inspection-buffer support is not yet available in this transport mode."
 )
 
 LOG = structlog.get_logger(__name__)
