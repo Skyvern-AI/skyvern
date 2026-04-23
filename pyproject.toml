@@ -251,6 +251,3 @@ plugins = "sqlalchemy.ext.mypy.plugin"
 
 [project.scripts]
 skyvern = "skyvern.__main__:main"
-
-[tool.pytest.ini_options]
-norecursedirs = ["eval", "tests/sdk"]
