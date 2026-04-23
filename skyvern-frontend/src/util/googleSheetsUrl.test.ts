@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
-  extractSpreadsheetIdFromUrl,
   buildSpreadsheetUrl,
+  columnLettersToIndex,
+  extractSpreadsheetIdFromUrl,
   isTemplateExpression,
 } from "./googleSheetsUrl";
 
@@ -83,5 +84,40 @@ describe("isTemplateExpression", () => {
 
   it("returns false for empty string", () => {
     expect(isTemplateExpression("")).toBe(false);
+  });
+});
+
+describe("columnLettersToIndex", () => {
+  it("maps A through Z", () => {
+    expect(columnLettersToIndex("A")).toBe(1);
+    expect(columnLettersToIndex("Z")).toBe(26);
+  });
+
+  it("maps double-letter columns past Z", () => {
+    expect(columnLettersToIndex("AA")).toBe(27);
+    expect(columnLettersToIndex("AZ")).toBe(52);
+    expect(columnLettersToIndex("ZZ")).toBe(702);
+  });
+
+  it("maps triple-letter columns up to ZZZ", () => {
+    expect(columnLettersToIndex("AAA")).toBe(703);
+    expect(columnLettersToIndex("ZZZ")).toBe(18278);
+  });
+
+  it("is case-insensitive", () => {
+    expect(columnLettersToIndex("aa")).toBe(27);
+  });
+
+  it("returns 0 for non-alpha input", () => {
+    expect(columnLettersToIndex("")).toBe(0);
+    expect(columnLettersToIndex("A1")).toBe(0);
+    expect(columnLettersToIndex("1")).toBe(0);
+  });
+
+  it("returns 0 for header-name strings past 3 letters", () => {
+    // Sheets columns top out at ZZZ, so longer all-caps tokens are literal
+    // header names (e.g. "TOTAL"), not column references.
+    expect(columnLettersToIndex("TOTAL")).toBe(0);
+    expect(columnLettersToIndex("AAAA")).toBe(0);
   });
 });
