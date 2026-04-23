@@ -696,6 +696,26 @@ class AgentFunction:
         """Resolve a tab title to its numeric sheetId. OSS no-op."""
         return None
 
+    async def google_sheets_get_grid_properties(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_title: str,
+    ) -> Any | None:
+        """Return the named tab's grid dimensions (sheet_id, column_count, row_count). OSS no-op."""
+        return None
+
+    async def google_sheets_get_grid_properties_by_id(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_id: int,
+    ) -> Any | None:
+        """Return grid dimensions for a sheet matched by numeric sheetId. OSS no-op."""
+        return None
+
     async def generate_async_operations(
         self,
         organization: Organization,

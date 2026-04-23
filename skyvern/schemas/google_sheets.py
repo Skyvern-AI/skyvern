@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 _SPREADSHEET_URL_RE = re.compile(r"/spreadsheets(?:/u/\d+)?/d/([a-zA-Z0-9-_]+)")
 _BARE_ID_RE = re.compile(r"^[a-zA-Z0-9-_]{20,}$")
@@ -49,6 +50,35 @@ def column_letters_to_index(letters: str) -> int:
     for ch in letters:
         index = index * 26 + (ord(ch) - ord("A") + 1)
     return index - 1
+
+
+def column_index_to_letter(index: int) -> str:
+    # 0 -> "A", 25 -> "Z", 26 -> "AA"
+    if index < 0:
+        raise ValueError(f"column index must be non-negative, got: {index}")
+    letters: list[str] = []
+    n = index
+    while True:
+        letters.append(chr(ord("A") + (n % 26)))
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return "".join(reversed(letters))
+
+
+def build_append_dimension_request(*, sheet_id: int, dimension: str, length: int) -> dict[str, Any]:
+    """Build a Sheets batchUpdate appendDimension request adding `length` columns or rows."""
+    if dimension not in ("COLUMNS", "ROWS"):
+        raise ValueError(f"dimension must be COLUMNS or ROWS, got: {dimension!r}")
+    if length <= 0:
+        raise ValueError(f"length must be positive, got: {length}")
+    return {
+        "appendDimension": {
+            "sheetId": sheet_id,
+            "dimension": dimension,
+            "length": length,
+        }
+    }
 
 
 def strip_a1_sheet_prefix(a1: str) -> str:
