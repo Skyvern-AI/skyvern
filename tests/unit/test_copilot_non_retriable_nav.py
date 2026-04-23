@@ -570,7 +570,7 @@ def test_tool_loop_error_blocks_run_blocks_and_collect_debug_after_dns_failure()
 
 def test_tool_loop_error_does_not_block_planning_tools() -> None:
     # get_run_results / list_credentials / update_workflow are scoped out of
-    # _BLOCK_RUNNING_TOOLS and should remain callable so the agent can inspect
+    # BLOCK_RUNNING_TOOLS and should remain callable so the agent can inspect
     # the failure and decide how to respond to the user.
     ctx = _fresh_context()
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON

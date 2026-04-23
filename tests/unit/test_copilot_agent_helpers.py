@@ -315,6 +315,37 @@ class TestTranslateToAgentResultGating:
         assert "All done" not in agent_result.user_response
         assert agent_result.updated_workflow is None
 
+    def test_inline_replace_workflow_wraps_block_goals_with_user_message(self, monkeypatch) -> None:
+        # SKY-9174 parity: update_and_run_blocks_tool wraps block goals with
+        # the user's chat message as big-goal context. The REPLACE_WORKFLOW
+        # inline path must do the same, otherwise the untested yaml latches
+        # onto ctx without user-intent framing and any downstream block run
+        # hits the verifier-on-confirmation-surface bug this PR fixes.
+        from skyvern.forge.sdk.copilot import agent as agent_module
+
+        captured: dict[str, str] = {}
+
+        def fake_process(**kwargs):
+            captured["yaml"] = kwargs["workflow_yaml"]
+            return SimpleNamespace(name="new-wf")
+
+        def fake_wrap(workflow_yaml: str, user_message: str) -> str:
+            return f"WRAPPED::{user_message}::{workflow_yaml}"
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.wrap_block_goals", fake_wrap)
+
+        ctx = _ctx(user_message="Submit a contact form on example.com.")
+        result = _fake_run_result(
+            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "raw: yaml"}
+        )
+        agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert captured["yaml"] == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+        assert ctx.last_workflow_yaml == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+
 
 class TestCredentialRefusalReachesAgent:
     """Prove the SKY-9189 refusal rule is actually delivered to the agent.
