@@ -15,6 +15,8 @@ from skyvern.schemas.google_sheets import (
     GoogleSheetsAPIError,
     a1_to_grid_range,
     build_a1,
+    build_append_dimension_request,
+    column_index_to_letter,
     column_letters_to_index,
     extract_a1_sheet_prefix,
     extract_spreadsheet_id,
@@ -307,11 +309,39 @@ class RichSheetsInput:
     sheet_title: str | None
 
 
+_COLUMN_OVERFLOW_RE = re.compile(
+    r"Attempting to write column:\s*(\d+),?\s*beyond the last requested column of:\s*(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _maybe_rewrite_column_overflow(message: str) -> str | None:
+    """Translate Google's 0-indexed 'attempting to write column N' error into a letter-friendly message.
+    Returns the rewritten message, or None if the pattern does not match.
+    """
+    match = _COLUMN_OVERFLOW_RE.search(message)
+    if not match:
+        return None
+    write_col_idx = int(match.group(1))
+    max_col_idx = int(match.group(2))
+    sheet_columns = max_col_idx + 1
+    write_letter = column_index_to_letter(write_col_idx)
+    max_letter = column_index_to_letter(max_col_idx)
+    return (
+        f"sheet has {sheet_columns} columns (last column is {max_letter}), "
+        f"but this write needs column {write_letter}. "
+        f"Widen the sheet, narrow the data, or remove the leading column offset on the range."
+    )
+
+
 def _failure_reason_from_sheets_error(action: str, exc: GoogleSheetsAPIError) -> str:
     if exc.status == 403 and exc.code == "reconnect_required":
         return f"Reconnect the Google account: {exc.message}"
     if exc.status == 429:
         return f"Google Sheets rate limit on {action}: {exc.message}"
+    rewritten = _maybe_rewrite_column_overflow(exc.message)
+    if rewritten is not None:
+        return f"Google Sheets {action} failed: {rewritten}"
     return f"Google Sheets {action} failed (HTTP {exc.status}): {exc.message}"
 
 
@@ -753,6 +783,7 @@ class GoogleSheetsWriteBlock(Block):
 
         fields_mask = "userEnteredValue,userEnteredFormat,note,hyperlink"
         requests: list[dict[str, Any]] = []
+        required_width = 0
 
         if self.write_mode == "append":
             append_col_offset = leading_column_offset(a1)
@@ -773,6 +804,8 @@ class GoogleSheetsWriteBlock(Block):
             )
             merge_origin_row: int | None = None
             merge_origin_col = append_col_offset
+            if padded_cells:
+                required_width = max(len(row) for row in padded_cells)
         else:
             rows_payload = [{"values": row} for row in rich.cells]
             try:
@@ -797,6 +830,7 @@ class GoogleSheetsWriteBlock(Block):
             )
             merge_origin_row = grid_range["startRowIndex"]
             merge_origin_col = grid_range["startColumnIndex"]
+            required_width = grid_range["endColumnIndex"]
 
         for merge in rich.merges:
             if self.write_mode == "append":
@@ -804,6 +838,7 @@ class GoogleSheetsWriteBlock(Block):
                 # updatedRange to shift merges correctly. Skip for now.
                 continue
             row_offset = merge_origin_row or 0
+            end_col = merge["end_column_index"] + merge_origin_col
             requests.append(
                 {
                     "mergeCells": {
@@ -812,12 +847,71 @@ class GoogleSheetsWriteBlock(Block):
                             "startRowIndex": merge["start_row_index"] + row_offset,
                             "endRowIndex": merge["end_row_index"] + row_offset,
                             "startColumnIndex": merge["start_column_index"] + merge_origin_col,
-                            "endColumnIndex": merge["end_column_index"] + merge_origin_col,
+                            "endColumnIndex": end_col,
                         },
                         "mergeType": "MERGE_ALL",
                     }
                 }
             )
+            if end_col > required_width:
+                required_width = end_col
+
+        # Per-tab cap is unconditional: the write can never succeed past ZZZ regardless
+        # of whether grid lookup is available, so fail fast before touching Google.
+        max_columns = MAX_COLUMN_INDEX + 1
+        if required_width > max_columns:
+            last_letter = column_index_to_letter(MAX_COLUMN_INDEX)
+            needed_letter = column_index_to_letter(required_width - 1)
+            sheet_label = self.sheet_name or extract_a1_sheet_prefix(a1) or rich.sheet_title or "destination"
+            failure_reason = (
+                f"Sheet '{sheet_label}' cannot fit this write: needs column "
+                f"{needed_letter} but the Google Sheets per-tab limit is {max_columns} "
+                f"columns ({last_letter}). Narrow the data or split it across tabs."
+            )
+            error_data = {"status_code": 400, "code": "column_overflow", "error": failure_reason}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Pre-flight the destination's column_count and prepend an appendDimension
+        # so a write that's wider than the current grid succeeds in the same atomic batch.
+        # If the grid lookup is unavailable (no AgentFunction impl, transient error of any
+        # kind including transport failures), fall through; the existing error mapper
+        # will produce a friendly message if the eventual write fails.
+        if required_width > 0:
+            grid_props: Any = None
+            try:
+                grid_props = await app.AGENT_FUNCTION.google_sheets_get_grid_properties_by_id(
+                    access_token=access_token,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_id=sheet_id,
+                )
+            except Exception as e:
+                LOG.warning(
+                    "Failed to fetch grid properties for pre-flight; falling through to write",
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_id=sheet_id,
+                    error=str(e),
+                )
+            # Duck-type the response: cloud returns SheetGridProperties; the OSS no-op
+            # returns None. Anything else (e.g. an AsyncMock in unrelated test fixtures)
+            # is treated as no-info to avoid false-positive failures.
+            current_column_count = getattr(grid_props, "column_count", None)
+            if isinstance(current_column_count, int) and current_column_count < required_width:
+                requests.insert(
+                    0,
+                    build_append_dimension_request(
+                        sheet_id=sheet_id,
+                        dimension="COLUMNS",
+                        length=required_width - current_column_count,
+                    ),
+                )
 
         try:
             payload = await app.AGENT_FUNCTION.google_sheets_batch_update(

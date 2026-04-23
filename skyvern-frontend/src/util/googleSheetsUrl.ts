@@ -26,3 +26,17 @@ export function buildSpreadsheetUrl(spreadsheetId: string): string {
 export function isTemplateExpression(input: string): boolean {
   return input.includes("{{") || input.includes("{%");
 }
+
+// "A" -> 1, "Z" -> 26, "AA" -> 27. Returns 0 for anything that is not a real
+// Sheets column reference: Google's per-tab cap is ZZZ (3 chars), so longer
+// all-caps tokens like "TOTAL" must be treated as literals - otherwise an
+// unmatched header name triggers a false-positive overflow warning.
+export function columnLettersToIndex(letters: string): number {
+  const upper = letters.toUpperCase();
+  if (!/^[A-Z]{1,3}$/.test(upper)) return 0;
+  let index = 0;
+  for (const ch of upper) {
+    index = index * 26 + (ch.charCodeAt(0) - "A".charCodeAt(0) + 1);
+  }
+  return index;
+}

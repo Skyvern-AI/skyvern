@@ -28,15 +28,18 @@ import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/Goo
 import { SpreadsheetCombobox } from "@/routes/workflows/components/SpreadsheetCombobox";
 import { SheetTabCombobox } from "@/routes/workflows/components/SheetTabCombobox";
 import {
+  columnLettersToIndex,
   extractSpreadsheetIdFromUrl,
   isTemplateExpression,
 } from "@/util/googleSheetsUrl";
 import { ColumnMappingEditor } from "@/routes/workflows/components/ColumnMappingEditor";
+import { parseColumnMapping } from "@/util/columnMappingSerialization";
 import { useGoogleSheetHeaders } from "@/hooks/useGoogleSheetHeaders";
+import { useGoogleSheetDimensions } from "@/hooks/useGoogleSheetDimensions";
 import { useGoogleOAuthCredentials } from "@/hooks/useGoogleOAuthCredentials";
 import { useGoogleSpreadsheet } from "@/hooks/useGoogleSpreadsheet";
 import { isReconnectRequired } from "@/util/googleSheetsErrors";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 function GoogleSheetsWriteNode({
   id,
@@ -67,7 +70,37 @@ function GoogleSheetsWriteNode({
     spreadsheetUrlOrId: data.spreadsheetUrl,
     sheetName: data.sheetName,
   });
+  const dimensionsQuery = useGoogleSheetDimensions({
+    credentialId: data.credentialId,
+    spreadsheetUrlOrId: data.spreadsheetUrl,
+    sheetName: data.sheetName,
+  });
   const needsReconnect = isReconnectRequired(headersQuery.error);
+
+  // Highlight column_mapping targets that fall past the destination tab's last
+  // column so authors see the resize ahead of run rather than discovering it
+  // as an HTTP 400 in the run log. The backend auto-extends on run, so this is
+  // informational, not an error. Reuses parseColumnMapping so the parsing
+  // rules stay in lockstep with ColumnMappingEditor.
+  const overflowingMappings = useMemo<
+    { field: string; letter: string }[]
+  >(() => {
+    if (!dimensionsQuery.data || !data.columnMapping) return [];
+    const lastIndex = columnLettersToIndex(
+      dimensionsQuery.data.last_column_letter,
+    );
+    // <= 0 covers both an unparseable last_column_letter and a sheet with 0
+    // columns (degenerate but theoretically possible) - either way, no warning.
+    if (lastIndex <= 0) return [];
+    const out: { field: string; letter: string }[] = [];
+    for (const { key, letter } of parseColumnMapping(data.columnMapping)) {
+      const targetIndex = columnLettersToIndex(letter);
+      if (targetIndex > 0 && targetIndex > lastIndex) {
+        out.push({ field: key, letter: letter.toUpperCase() });
+      }
+    }
+    return out;
+  }, [dimensionsQuery.data, data.columnMapping]);
   const rerender = useRerender({ prefix: "google-sheets-write" });
   const [spreadsheetDisplayName, setSpreadsheetDisplayName] = useState<
     string | null
@@ -318,6 +351,55 @@ function GoogleSheetsWriteNode({
                       onChange={(value) => update({ sheetName: value })}
                       onSelect={(tabName) => update({ sheetName: tabName })}
                     />
+                    {dimensionsQuery.data ? (
+                      <div className="space-y-1 rounded-md border border-slate-700 bg-slate-900/40 px-2 py-1.5 text-[0.7rem] text-slate-300">
+                        <div>
+                          Sheet{" "}
+                          <span className="font-medium text-slate-100">
+                            "{dimensionsQuery.data.title}"
+                          </span>{" "}
+                          - {dimensionsQuery.data.column_count} columns (last is{" "}
+                          <span className="font-mono">
+                            {dimensionsQuery.data.last_column_letter}
+                          </span>
+                          ) x {dimensionsQuery.data.row_count} rows.
+                        </div>
+                        {dimensionsQuery.data.headers.length > 0 ? (
+                          <details className="text-slate-400">
+                            <summary className="cursor-pointer">
+                              {dimensionsQuery.data.headers.length} header
+                              {dimensionsQuery.data.headers.length === 1
+                                ? ""
+                                : "s"}{" "}
+                              in row 1
+                            </summary>
+                            <ul className="mt-1 grid grid-cols-2 gap-x-3 pl-2">
+                              {dimensionsQuery.data.headers.map((h) => (
+                                <li key={h.letter}>
+                                  <span className="font-mono text-slate-500">
+                                    {h.letter}
+                                  </span>{" "}
+                                  {h.name}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
+                        ) : null}
+                        {overflowingMappings.length > 0 ? (
+                          <div className="rounded border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-amber-200">
+                            Column mapping writes past column{" "}
+                            <span className="font-mono">
+                              {dimensionsQuery.data.last_column_letter}
+                            </span>{" "}
+                            (
+                            {overflowingMappings
+                              .map((m) => `${m.field}->${m.letter}`)
+                              .join(", ")}
+                            ). The sheet will be auto-widened on run.
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
 
                   {/* Range - only for Update Range mode */}

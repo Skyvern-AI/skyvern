@@ -328,6 +328,15 @@ export interface GetSheetHeadersResponse {
   headers: SheetHeader[];
 }
 
+export interface GetSheetDimensionsResponse {
+  sheet_id: number;
+  title: string;
+  column_count: number;
+  row_count: number;
+  last_column_letter: string;
+  headers: SheetHeader[];
+}
+
 export interface CreateGoogleSpreadsheetResponse {
   spreadsheet: GoogleSpreadsheetSummary;
   first_sheet_name: string | null;
