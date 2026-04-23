@@ -5,15 +5,9 @@ These tests verify the LLM chokepoint span + SKY-8414
 `skyvern/forge/sdk/api/llm/api_handler_factory.py`. They serve as regression
 coverage for the instrumentation.
 
-Note: OTEL's global TracerProvider can only be set once per process. This
-module installs a shared TracerProvider + InMemorySpanExporter on first use
-via `_ensure_provider()`. Other test files that also call
-`otel_trace.set_tracer_provider(...)` will clobber or be clobbered depending
-on import order. If more test files need span capture, move the provider
-setup to a session-scoped fixture in conftest.py.
-
-The tests use OTEL's `InMemorySpanExporter` — no OTEL backend, collector, or
-network required. Fast and deterministic.
+The `span_exporter` fixture lives in `tests/unit/conftest.py` so any test
+module that needs span capture can depend on it without installing its own
+TracerProvider (OTEL's global provider can only be set once per process).
 """
 
 from __future__ import annotations
@@ -21,9 +15,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest  # type: ignore[import-not-found]
-from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -36,31 +27,6 @@ from tests.unit.helpers import FakeLLMResponse
 
 LLM_SPAN_NAME = "skyvern.llm.request"
 LLM_EVENT_NAME = "llm.request.completed"
-
-
-_SHARED_EXPORTER: InMemorySpanExporter | None = None
-
-
-def _ensure_provider() -> InMemorySpanExporter:
-    """OTEL's global TracerProvider can only be set once per process. Install
-    a shared TracerProvider + InMemorySpanExporter on first use; subsequent
-    tests reuse it and just clear the buffer between runs."""
-    global _SHARED_EXPORTER
-    if _SHARED_EXPORTER is None:
-        exporter = InMemorySpanExporter()
-        provider = TracerProvider()
-        provider.add_span_processor(SimpleSpanProcessor(exporter))
-        otel_trace.set_tracer_provider(provider)
-        _SHARED_EXPORTER = exporter
-    return _SHARED_EXPORTER
-
-
-@pytest.fixture
-def span_exporter() -> InMemorySpanExporter:
-    exporter = _ensure_provider()
-    exporter.clear()
-    yield exporter
-    exporter.clear()
 
 
 def _span_by_name(spans: list, name: str):

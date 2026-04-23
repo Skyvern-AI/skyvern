@@ -8,7 +8,6 @@ import pytest
 
 import skyvern.cli.mcp_tools.folder as folder_tools
 import skyvern.cli.mcp_tools.workflow as workflow_tools
-from skyvern.client.errors import BadRequestError
 from skyvern.client.raw_client import AsyncRawSkyvern, RawSkyvern
 
 
@@ -110,12 +109,28 @@ async def test_folder_delete_handles_non_dict_sdk_result(monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_workflow_update_folder_calls_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = SimpleNamespace(update_workflow_folder=AsyncMock(return_value=_fake_workflow_response()))
+    payload = {
+        "workflow_permanent_id": "wpid_test",
+        "workflow_id": "wf_test",
+        "title": "Example Workflow",
+        "version": 1,
+        "status": "published",
+        "description": None,
+        "is_saved_task": False,
+        "folder_id": "fld_test",
+        "created_at": "2026-04-23T10:00:00+00:00",
+        "modified_at": "2026-04-23T10:00:00+00:00",
+    }
+    response = SimpleNamespace(status_code=200, json=lambda: payload, text="")
+    request_mock = AsyncMock(return_value=response)
+    fake_client = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
     monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
 
     result = await workflow_tools.skyvern_workflow_update_folder("wpid_test", "fld_test")
 
-    fake_client.update_workflow_folder.assert_awaited_once_with("wpid_test", folder_id="fld_test")
+    request_mock.assert_awaited_once()
+    call_kwargs = request_mock.await_args.kwargs
+    assert call_kwargs["json"]["folder_id"] == "fld_test"
     assert result["ok"] is True
     assert result["data"]["workflow_permanent_id"] == "wpid_test"
     assert result["data"]["folder_id"] == "fld_test"
@@ -132,9 +147,10 @@ async def test_workflow_update_folder_rejects_invalid_folder_id() -> None:
 
 @pytest.mark.asyncio
 async def test_workflow_update_folder_surfaces_bad_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = SimpleNamespace(
-        update_workflow_folder=AsyncMock(side_effect=BadRequestError(body={"detail": "Folder fld_missing not found"}))
-    )
+    error_payload = {"detail": "Folder fld_missing not found"}
+    response = SimpleNamespace(status_code=400, json=lambda: error_payload, text="Folder fld_missing not found")
+    request_mock = AsyncMock(return_value=response)
+    fake_client = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
     monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
 
     result = await workflow_tools.skyvern_workflow_update_folder("wpid_test", "fld_missing")
