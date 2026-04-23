@@ -245,11 +245,11 @@ class BrowserContextFactory:
         preference_template = preference_template_path or f"{SKYVERN_DIR}/webeye/chromium_preferences.json"
 
         preference_file_content = ""
-        with open(preference_template) as f:
+        with open(preference_template, encoding="utf-8") as f:
             preference_file_content = f.read()
             preference_file_content = preference_file_content.replace("MASK_SAVEFILE_DEFAULT_DIRECTORY", download_dir)
             preference_file_content = preference_file_content.replace("MASK_DOWNLOAD_DEFAULT_DIRECTORY", download_dir)
-        with open(preference_dst_file, "w") as f:
+        with open(preference_dst_file, "w", encoding="utf-8") as f:
             f.write(preference_file_content)
 
     @staticmethod

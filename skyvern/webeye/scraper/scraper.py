@@ -84,7 +84,10 @@ def load_js_script() -> str:
     try:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
-        with open(path) as f:
+        # encoding="utf-8" is required: domUtils.js contains non-ASCII characters (e.g. ✱, —),
+        # and the Python default is the platform locale codec — which is cp936/gbk on CJK
+        # Windows locales, raising UnicodeDecodeError at import time (#2116).
+        with open(path, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)

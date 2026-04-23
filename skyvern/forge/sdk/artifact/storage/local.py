@@ -57,7 +57,7 @@ class LocalStorage(BaseStorage):
         if not file_path.exists():
             return []
         try:
-            async with aiofiles.open(file_path, "r") as f:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                 lines = await f.readlines()
                 return [line.strip() for line in lines if line.strip()]
         except Exception:

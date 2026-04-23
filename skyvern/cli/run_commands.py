@@ -488,7 +488,7 @@ def run_code(
     # Priority: params_file > params_json > individual -p flags
     if params_file:
         try:
-            with open(params_file) as f:
+            with open(params_file, encoding="utf-8") as f:
                 parameters = json.load(f)
             console.print(f"[blue]✓ Loaded parameters from file: {params_file}[/blue]")
         except FileNotFoundError:
