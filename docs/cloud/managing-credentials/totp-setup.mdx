@@ -171,7 +171,7 @@ This turns email-based 2FA into something nearly as automated as an authenticato
 
 ## Server-fetched codes (totp_url)
 
-Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Pass `totp_url` when running a [task](/running-automations/extract-structured-data) or [workflow](/multi-step-automations/build-a-workflow), and Skyvern will call your endpoint when it needs a verification code.
+Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Pass `totp_url` when running a [task](/cloud/getting-started/run-from-code) or [workflow](/cloud/building-workflows/build-a-workflow), and Skyvern will call your endpoint when it needs a verification code.
 
 Your endpoint must accept a POST request with `task_id`, `workflow_run_id`, and `workflow_permanent_id` in the body, and return:
 
@@ -203,8 +203,8 @@ def validate_skyvern_request(request) -> bool:
 
 Some sites use one-time login links instead of numeric codes. Skyvern supports these by splitting the flow into two steps:
 
-1. **Trigger the magic link** — Run a task that initiates the login. The site emails a one-time link.
-2. **Use the link** — Monitor the inbox (e.g., via Zapier), extract the URL, then start a new task with that URL as the starting point.
+1. **Trigger the magic link**: Run a task that initiates the login. The site emails a one-time link.
+2. **Use the link**: Monitor the inbox (e.g., via Zapier), extract the URL, then start a new task with that URL as the starting point.
 
 ```python
 # Step 1: Trigger the magic link email
@@ -222,7 +222,7 @@ await client.run_task(
 )
 ```
 
-The magic link URL becomes the `url` parameter for the second task — Skyvern opens it directly, which logs the user in, and then continues with the rest of the automation.
+The magic link URL becomes the `url` parameter for the second task. Skyvern opens it directly, which logs the user in, and then continues with the rest of the automation.
 
 ---
 

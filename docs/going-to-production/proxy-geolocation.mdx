@@ -256,7 +256,7 @@ export const PROXY_LOCATIONS = [
   { code: "JP", name: "Japan", value: "RESIDENTIAL_JP", timezone: "Asia/Tokyo", flag: "🇯🇵" },
   { code: "AU", name: "Australia", value: "RESIDENTIAL_AU", timezone: "Australia/Sydney", flag: "🇦🇺" },
   { code: "NZ", name: "New Zealand", value: "RESIDENTIAL_NZ", timezone: "Pacific/Auckland", flag: "🇳🇿" },
-  { code: "NONE", name: "No Proxy", value: "NONE", timezone: "—", flag: "🚫" },
+  { code: "NONE", name: "No Proxy", value: "NONE", timezone: "N/A", flag: "🚫" },
 ]
 
 export const AVAILABLE_COUNTRIES = ["US", "CA", "MX", "AR", "BR", "GB", "IE", "NL", "DE", "FR", "ES", "IT", "TR", "ZA", "IN", "PH", "KR", "SA", "JP", "AU", "NZ"]
@@ -417,7 +417,7 @@ export const ProxyMapSelector = () => {
   )
 }
 
-Many websites serve different content based on your location—prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 20 countries, so sites see a legitimate local visitor. 
+Many websites serve different content based on your location: prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 20 countries, so sites see a legitimate local visitor. 
 
 <Note>
 Proxy routing is only available in Skyvern Cloud. Self-hosted deployments require your own proxy infrastructure.
@@ -532,10 +532,10 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 ```
 </CodeGroup>
 
-For browser sessions, set `proxy_location` at creation. All tasks in that session use the same proxy IP, which matters for sites that track IP consistency across a login session—switching IPs mid-session often triggers security warnings or logouts.
+For browser sessions, set `proxy_location` at creation. All tasks in that session use the same proxy IP, which matters for sites that track IP consistency across a login session. Switching IPs mid-session often triggers security warnings or logouts.
 
 <Warning>
-**Browser profiles don't store proxy settings.** Profiles save cookies, localStorage, and authentication state—but not the proxy used to create them. When reusing a profile, explicitly set `proxy_location` to match the original session, or sites may detect the IP mismatch and invalidate your session.
+**Browser profiles don't store proxy settings.** Profiles save cookies, localStorage, and authentication state, but not the proxy used to create them. When reusing a profile, explicitly set `proxy_location` to match the original session, or sites may detect the IP mismatch and invalidate your session.
 </Warning>
 
 <CodeGroup>
@@ -601,11 +601,11 @@ Use these enum values for country-level targeting. Each routes through a residen
 | `RESIDENTIAL_SA` | Saudi Arabia | Asia/Riyadh |
 | `RESIDENTIAL_TR` | Türkiye | Europe/Istanbul |
 | `RESIDENTIAL_ZA` | South Africa | Africa/Johannesburg |
-| `NONE` | No proxy | — |
+| `NONE` | No proxy | N/A |
 
 - `RESIDENTIAL` is the default. It routes traffic through a random US residential IP.
 - `RESIDENTIAL_ISP` uses static ISP IPs instead of rotating residential IPs. Useful for sites that distrust rotating pools or require consistent IP addresses across requests.
-- `NONE` disables proxy routing entirely—traffic originates from Skyvern's US datacenters. Useful for testing or internal tools.
+- `NONE` disables proxy routing entirely. Traffic originates from Skyvern's US datacenters. Useful for testing or internal tools.
 
 <Note>
 **Default behavior:** If you don't specify `proxy_location`, Skyvern uses `RESIDENTIAL` which routes through a random US residential IP. Each request may get a different IP from the pool. For consistent IPs, use `RESIDENTIAL_ISP` or browser sessions.
@@ -632,7 +632,7 @@ Use these enum values for country-level targeting. Each routes through a residen
 
 ### State and city targeting
 
-For granular targeting—a specific US state, a city, or a country not in the presets—pass a `GeoTarget` object instead of an enum.
+For granular targeting (a specific US state, a city, or a country not in the presets), pass a `GeoTarget` object instead of an enum.
 
 <CodeGroup>
 ```python Python
@@ -725,7 +725,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 | Site still blocks requests | Bot detection beyond IP geolocation (fingerprinting, behavioral analysis) | Use `RESIDENTIAL_ISP` for static IPs, match proxy to site's region, add `wait` blocks between actions |
 | Need to debug proxy issues | Isolate whether proxy is causing failures | Set `proxy_location: "NONE"` to bypass proxy entirely |
 
-For sites with aggressive bot detection, combine residential proxies with the techniques in [Captcha & Bot Detection](/going-to-production/captcha-bot-detection).
+For sites with aggressive bot detection, combine residential proxies with the techniques in [CAPTCHA & Bot Bypass](/features/captcha-and-bot-bypass).
 
 Need a location that's not available? Get help in the [Skyvern Discord community](https://discord.gg/skyvern) to request new proxy pools.
 
@@ -737,7 +737,7 @@ Need a location that's not available? Get help in the [Skyvern Discord community
   <Card
     title="Captcha & Bot Detection"
     icon="robot"
-    href="/going-to-production/captcha-bot-detection"
+    href="/features/captcha-and-bot-bypass"
   >
     Combine proxies with anti-detection techniques
   </Card>

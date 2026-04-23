@@ -1,0 +1,22 @@
+---
+title: validate
+slug: sdk-reference/browser-automation/validate
+---
+
+Validate the current page state with AI.
+
+<CodeGroup>
+```python Python
+is_logged_in = await page.validate("Check if the user is logged in")
+print(is_logged_in)  # True or False
+```
+
+```typescript TypeScript
+const isLoggedIn = await page.validate("Check if the user is logged in");
+console.log(isLoggedIn); // true or false
+```
+</CodeGroup>
+
+## Returns `bool` / `boolean`
+
+`True` if the condition holds, `False` otherwise.

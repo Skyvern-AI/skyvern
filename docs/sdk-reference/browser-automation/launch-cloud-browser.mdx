@@ -1,0 +1,47 @@
+---
+title: launch_cloud_browser
+slug: sdk-reference/browser-automation/launch-cloud-browser
+---
+
+Create a new cloud browser session and connect to it. Returns a `SkyvernBrowser` with a live Playwright context.
+
+<Note>
+Python uses `snake_case` (e.g., `launch_cloud_browser`, `get_working_page`); TypeScript uses `camelCase` (e.g., `launchCloudBrowser`, `getWorkingPage`). Some features - form automation, iframe management, `AILocator`, and local browser launch - are Python-only and clearly marked below.
+</Note>
+
+---
+
+<CodeGroup>
+```python Python
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+
+await page.goto("https://example.com")
+await page.agent.run_task("Fill out the contact form and submit it")
+
+await browser.close()
+```
+
+```typescript TypeScript
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+await page.goto("https://example.com");
+await page.agent.runTask("Fill out the contact form and submit it");
+
+await browser.close();
+```
+</CodeGroup>
+
+## Parameters
+
+| Parameter (Python) | Parameter (TS) | Type | Required | Default | Description |
+|-------------------|----------------|------|----------|---------|-------------|
+| `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (5–1440). |
+| `proxy_location` | `proxyLocation` | `ProxyLocation` | No | `None` / `undefined` | Geographic proxy location for browser traffic. |
+
+## Returns `SkyvernBrowser`
+
+<Note>
+Cloud browser sessions are only available with `SkyvernEnvironment.CLOUD` / `.Cloud` or `SkyvernEnvironment.STAGING` / `.Staging`.
+</Note>

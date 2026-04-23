@@ -1,0 +1,18 @@
+---
+title: get_page_for
+slug: sdk-reference/browser-automation/get-page-for
+---
+
+Wrap an existing Playwright `Page` with Skyvern AI capabilities.
+
+```python
+skyvern_page = await browser.get_page_for(existing_playwright_page)
+```
+
+## Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page` | `Page` | Yes | An existing Playwright `Page` object to wrap. |
+
+## Returns `SkyvernBrowserPage`

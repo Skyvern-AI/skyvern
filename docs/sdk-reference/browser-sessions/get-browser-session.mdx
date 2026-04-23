@@ -1,0 +1,68 @@
+---
+title: "get_browser_session"
+slug: sdk-reference/browser-sessions/get-browser-session
+---
+
+Get the status and details of a session.
+
+<CodeGroup>
+```python Python
+session = await client.get_browser_session("pbs_abc123")
+print(session.status, session.browser_address)
+```
+
+```typescript TypeScript
+const session = await skyvern.getBrowserSession("pbs_abc123");
+console.log(session.status, session.browser_address);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browser_session_id` | `str` | Yes | The session ID. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `BrowserSessionResponse`
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

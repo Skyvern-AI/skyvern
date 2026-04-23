@@ -19,14 +19,14 @@ keywords:
 <Accordion title="Why did my task fail or terminate?">
 Check these in order:
 
-1. **Run status** — Use `get_run(run_id)` to see the status and `failure_reason`
-2. **Timeline** — Use `get_run_timeline(run_id)` to find which block failed
-3. **Artifacts** — Check `screenshot_final` to see where it stopped, and `recording` to watch what happened
+1. **Run status**: Use `get_run(run_id)` to see the status and `failure_reason`
+2. **Timeline**: Use `get_run_timeline(run_id)` to find which block failed
+3. **Artifacts**: Check `screenshot_final` to see where it stopped, and `recording` to watch what happened
 
 Common causes:
-- **`terminated`** — The AI couldn't complete the goal (CAPTCHA, login blocked, element not found)
-- **`timed_out`** — Exceeded `max_steps`. Increase it or simplify the task
-- **`failed`** — System error (browser crash, network failure)
+- **`terminated`**: The AI couldn't complete the goal (CAPTCHA, login blocked, element not found)
+- **`timed_out`**: Exceeded `max_steps`. Increase it or simplify the task
+- **`failed`**: System error (browser crash, network failure)
 
 See the [Troubleshooting Guide](/debugging/troubleshooting-guide) for detailed steps.
 </Accordion>
@@ -34,9 +34,9 @@ See the [Troubleshooting Guide](/debugging/troubleshooting-guide) for detailed s
 <Accordion title="Why is the AI clicking the wrong element?">
 Multiple similar elements on the page can confuse the AI. Fix this by:
 
-1. **Add visual context** — "Click the **blue** Submit button at the **bottom** of the form"
-2. **Reference surrounding text** — "Click Download in the row that says 'January 2024'"
-3. **Be specific about position** — "Click the first result" or "Click the link in the header"
+1. **Add visual context**: "Click the **blue** Submit button at the **bottom** of the form"
+2. **Reference surrounding text**: "Click Download in the row that says 'January 2024'"
+3. **Be specific about position**: "Click the first result" or "Click the link in the header"
 
 Check the `llm_response_parsed` artifact to see what action the AI decided to take.
 </Accordion>
@@ -98,13 +98,13 @@ result = await client.run_workflow(
 )
 ```
 
-Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Workflow Parameters](/multi-step-automations/workflow-parameters) for details.
+Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Workflow Parameters](/cloud/building-workflows/add-parameters) for details.
 </Accordion>
 
 <Accordion title="How do I use credentials in a workflow?">
-1. **Store credentials** — Go to Settings > Credentials and add your login
-2. **Reference in workflow** — Select the credential in the Login block's credential dropdown
-3. **Never hardcode** — Don't put passwords directly in prompts
+1. **Store credentials**: Go to Settings > Credentials and add your login
+2. **Reference in workflow**: Select the credential in the Login block's credential dropdown
+3. **Never hardcode**: Don't put passwords directly in prompts
 
 The AI will automatically fill the credential fields when it encounters a login form. See [Credentials](/sdk-reference/credentials) for setup instructions.
 </Accordion>
@@ -112,8 +112,8 @@ The AI will automatically fill the credential fields when it encounters a login 
 <Accordion title="Can I run workflows on a schedule?">
 Yes. Skyvern has built-in cron-based scheduling for workflows. You define a cron expression and timezone, and Skyvern triggers the workflow automatically at each interval.
 
-- **Cloud UI** — Create and manage schedules from the [Schedules page](/cloud/building-workflows/scheduling)
-- **API** — Use the [scheduling API](/multi-step-automations/scheduling-workflows) to create, update, enable/disable, and delete schedules programmatically
+- **Cloud UI**: Create and manage schedules from the [Schedules page](/cloud/building-workflows/scheduling)
+- **API**: Use the [scheduling API](/cloud/building-workflows/run-from-code#create-a-schedule) to create, update, enable/disable, and delete schedules programmatically
 
 Scheduled runs appear in [Run History](/cloud/viewing-results/run-history) with a calendar icon badge. Set up a [webhook](/going-to-production/webhooks) to get notified when scheduled runs complete.
 </Accordion>
@@ -154,8 +154,8 @@ For local installations, run `skyvern init` to generate a local API key, which w
 **Cloud:** The model is managed by Skyvern. Contact support for custom model requirements.
 
 **Self-hosted:** Run `skyvern init llm` to reconfigure, or set these environment variables:
-- `LLM_KEY` — Primary model (e.g., `OPENAI_GPT4O`, `ANTHROPIC_CLAUDE_SONNET`)
-- `SECONDARY_LLM_KEY` — Optional lightweight model for faster operations
+- `LLM_KEY`: Primary model (e.g., `OPENAI_GPT4O`, `ANTHROPIC_CLAUDE_SONNET`)
+- `SECONDARY_LLM_KEY`: Optional lightweight model for faster operations
 </Accordion>
 
 <Accordion title="How do I configure proxy settings?">
@@ -239,10 +239,10 @@ The workflow starts asynchronously. Poll the run status or configure a webhook t
 <Accordion title="Why is my login failing?">
 Check these common causes:
 
-1. **Credentials expired** — Verify username/password in your credential store
-2. **CAPTCHA appeared** — Use a browser profile with an existing session
-3. **MFA required** — Configure TOTP if the site requires 2FA
-4. **Site detected automation** — Use `RESIDENTIAL_ISP` proxy for trusted IPs
+1. **Credentials expired**: Verify username/password in your credential store
+2. **CAPTCHA appeared**: Use a browser profile with an existing session
+3. **MFA required**: Configure TOTP if the site requires 2FA
+4. **Site detected automation**: Use `RESIDENTIAL_ISP` proxy for trusted IPs
 
 Watch the `recording` artifact to see exactly what happened during login.
 </Accordion>
@@ -250,9 +250,9 @@ Watch the `recording` artifact to see exactly what happened during login.
 <Accordion title="How do I handle CAPTCHA?">
 Options to bypass CAPTCHAs:
 
-1. **Browser profile** — Create a profile with an authenticated session that skips login entirely
-2. **Human interaction block** — Pause the workflow for manual CAPTCHA solving
-3. **Residential proxy** — Use `RESIDENTIAL_ISP` for static IPs that sites trust more
+1. **Browser profile**: Create a profile with an authenticated session that skips login entirely
+2. **Human interaction block**: Pause the workflow for manual CAPTCHA solving
+3. **Residential proxy**: Use `RESIDENTIAL_ISP` for static IPs that sites trust more
 
 Skyvern has built-in CAPTCHA solving for common types, but some sites use advanced anti-bot measures.
 </Accordion>
@@ -365,8 +365,8 @@ Skyvern supports OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Gemini, and Ollam
 <Accordion title="How is pricing calculated?">
 Pricing depends on your plan:
 
-- **Pay-as-you-go** — Charged per step or per task completion
-- **Enterprise** — Custom pricing based on volume
+- **Pay-as-you-go**: Charged per step or per task completion
+- **Enterprise**: Custom pricing based on volume
 
 View your usage and billing at [Settings > Billing](https://app.skyvern.com/billing).
 </Accordion>

@@ -65,7 +65,7 @@ const result = await client.runTask({
 |---------|--------|
 | No proxy | Production EHR portals sit behind WAFs that block datacenter IPs |
 | Login every run | Wastes steps, fragile with session complexity |
-| Vague navigation | OpenEMR uses iframes and dynamic menus — needs explicit goals |
+| Vague navigation | OpenEMR uses iframes and dynamic menus, so it needs explicit goals |
 | No pagination | Only gets page 1 of multi-page results |
 
 The sections below solve each one.
@@ -263,7 +263,7 @@ Log in once, save the browser state as a profile, and skip login on future runs.
 </Tabs>
 
 <Note>
-`persist_browser_session` is a workflow definition property — set it when creating the workflow, not when running it. See [Browser Profiles](/optimization/browser-profiles) for the full lifecycle.
+`persist_browser_session` is a workflow definition property. Set it when creating the workflow, not when running it. See [Browser Profiles](/optimization/browser-profiles) for the full lifecycle.
 </Note>
 
 ---
@@ -276,8 +276,8 @@ Navigate to **Patient/Client > Finder** and extract the results table.
   <Tab title="Cloud UI">
     Create a workflow with two blocks:
 
-    1. **Navigation** block — URL: `https://demo.openemr.io/openemr/index.php`. Goal: "Click Patient/Client in the top menu, then click Finder. Click Search to display all patients."
-    2. **Extraction** block — Goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
+    1. **Navigation** block, URL: `https://demo.openemr.io/openemr/index.php`. Goal: "Click Patient/Client in the top menu, then click Finder. Click Search to display all patients."
+    2. **Extraction** block, Goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
 
     On the **Start** node, set **Proxy Location** to a country (e.g., **United States**). Run the workflow.
   </Tab>
@@ -410,8 +410,8 @@ Navigate to **Reports > Visits > Superbill**, set a date range, and extract the 
   <Tab title="Cloud UI">
     Create a workflow with two blocks:
 
-    1. **Navigation** block — Goal: "Click Reports in the top menu, then Visits, then Superbill. Set the From date to 2020-01-01 and the To date to today. Click Submit."
-    2. **Extraction** block — Goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
+    1. **Navigation** block, Goal: "Click Reports in the top menu, then Visits, then Superbill. Set the From date to 2020-01-01 and the To date to today. Click Submit."
+    2. **Extraction** block, Goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
 
     On the **Start** node, set **Proxy Location** to a country (e.g., **United States**). Run the workflow.
   </Tab>
@@ -786,13 +786,13 @@ OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on w
   </Tab>
 </Tabs>
 
-See [Error Handling](/going-to-production/error-handling) and [CAPTCHA & Bot Detection](/going-to-production/captcha-bot-detection) for more.
+See [Error Handling](/going-to-production/error-handling) and [CAPTCHA & Bot Bypass](/features/captcha-and-bot-bypass) for more.
 
 ---
 
 ## Complete workflow
 
-This workflow combines everything: navigate to the Patient Finder, extract demographics, navigate to Superbill, and extract billing data — with error recovery and residential proxy.
+This workflow combines everything: navigate to the Patient Finder, extract demographics, navigate to Superbill, and extract billing data, with error recovery and residential proxy.
 
 <Tabs>
   <Tab title="Cloud UI">
@@ -800,16 +800,16 @@ This workflow combines everything: navigate to the Patient Finder, extract demog
       <Step title="Create the workflow">
         Go to **Workflows** and create a new workflow named "OpenEMR Daily Extract." On the **Start** node, enable **Save & Reuse Session** and set **Proxy Location** to a country (e.g., **United States**).
       </Step>
-      <Step title="Block 1: Navigation — open Patient Finder">
+      <Step title="Block 1: Navigation (open Patient Finder)">
         Add a **Navigation** block. Set URL to `https://demo.openemr.io/openemr/index.php` and goal: "Click Patient/Client > Finder. Click Search to display all patients. If a login page appears, log in with 'admin'/'pass'." In **Advanced Settings**, enable **Error Messages** and add `{"session_expired": "Session expired, login required, or access denied page"}`.
       </Step>
-      <Step title="Block 2: Extraction — patient demographics">
+      <Step title="Block 2: Extraction (patient demographics)">
         Add an **Extraction** block. Set goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
       </Step>
-      <Step title="Block 3: Navigation — open Superbill">
+      <Step title="Block 3: Navigation (open Superbill)">
         Add another **Navigation** block. Set goal: "Click Reports > Visits > Superbill. Set From to 2020-01-01, To to today. Click Submit." Add the same error messages mapping.
       </Step>
-      <Step title="Block 4: Extraction — encounter billing">
+      <Step title="Block 4: Extraction (encounter billing)">
         Add another **Extraction** block. Set goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
       </Step>
       <Step title="Run">
@@ -1087,7 +1087,7 @@ The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In p
   <Card
     title="Credential Management"
     icon="key"
-    href="/sdk-reference/credentials"
+    href="/sdk-reference/credentials/create-credential"
   >
     Securely store and use login credentials
   </Card>

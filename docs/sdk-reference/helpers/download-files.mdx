@@ -1,0 +1,109 @@
+---
+title: "download_files"
+slug: sdk-reference/helpers/download-files
+---
+
+Navigate to a page and download files.
+
+<Warning>
+Python's `download_files` does **not** support `wait_for_completion` - it returns immediately with a `run_id`. Poll with `get_run()` or use a webhook to know when the download finishes. The TypeScript SDK **does** support `waitForCompletion` on `downloadFiles`.
+</Warning>
+
+<CodeGroup>
+```python Python
+result = await client.download_files(
+    navigation_goal="Download the latest monthly report PDF",
+    url="https://app.example.com/reports",
+)
+
+# Poll for completion
+import asyncio
+while True:
+    run = await client.get_run(result.run_id)
+    if run.status in ("completed", "failed", "terminated", "timed_out", "canceled"):
+        break
+    await asyncio.sleep(5)
+
+for f in run.downloaded_files:
+    print(f.name)
+```
+
+```typescript TypeScript
+const result = await skyvern.downloadFiles({
+  navigation_goal: "Download the latest monthly report PDF",
+  url: "https://app.example.com/reports",
+  waitForCompletion: true,
+});
+
+for (const f of result.downloaded_files ?? []) {
+  console.log(f.name);
+}
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `navigation_goal` | `str` | Yes | - | Natural language description of what to download. |
+| `url` | `str` | No | `None` | Starting page URL. |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing browser session. |
+| `browser_profile_id` | `str` | No | `None` | Load a browser profile. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route through a geographic proxy. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the download finishes. |
+| `download_suffix` | `str` | No | `None` | Expected file extension to wait for (e.g., `".pdf"`). |
+| `download_timeout` | `float` | No | `None` | Max time to wait for the download in seconds. |
+| `max_steps_per_run` | `int` | No | `None` | Cap AI steps. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
+| `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
+| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
+| `max_screenshot_scrolling_times` | `int` | No | `None` | Number of screenshot scrolls. |
+| `waitForCompletion` (TS only) | `boolean` | No | `false` | Block until the download finishes. |
+| `timeout` (TS only) | `number` | No | `1800` | Max wait time in seconds. |
+| `request_options` | `RequestOptions` | No | `None` | Per-request configuration (see below). |
+
+### Returns `WorkflowRunResponse`
+
+The `downloaded_files` field contains the list of files that were downloaded.
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

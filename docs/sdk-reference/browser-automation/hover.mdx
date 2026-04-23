@@ -1,0 +1,26 @@
+---
+title: hover
+slug: sdk-reference/browser-automation/hover
+---
+
+Move the mouse over an element. Python only.
+
+```python
+# Hover over a menu item
+await page.hover("#menu-item")
+
+# Hover with a hold duration
+await page.hover("#tooltip-trigger", hold_seconds=1.5)
+
+# Hover with intention logging
+await page.hover("#menu-item", intention="Hover over the main menu")
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` | Yes | CSS or XPath selector for the target element. |
+| `timeout` | `float` | No | Maximum time in milliseconds to wait for the element. Defaults to `BROWSER_ACTION_TIMEOUT_MS`. |
+| `hold_seconds` | `float` | No | How long to hold the hover, in seconds. Default `0.0`. |
+| `intention` | `str` | No | Description of the hover intent, used for logging. |
+
+Returns `str` - the resolved selector used.

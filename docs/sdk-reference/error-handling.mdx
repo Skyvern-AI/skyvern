@@ -16,7 +16,7 @@ keywords:
   - failure
 ---
 
-The SDK raises typed exceptions for API errors. All errors extend `ApiError` and include the HTTP status code, response headers, and body.
+The SDK raises typed exceptions for API errors. In Python, all errors extend `ApiError`. In TypeScript, all errors extend `SkyvernError`. Both include the HTTP status code, response body, and headers.
 
 ---
 
@@ -29,11 +29,13 @@ The SDK raises typed exceptions for API errors. All errors extend `ApiError` and
 | `NotFoundError` | 404 | Resource (run, workflow, session) not found. |
 | `ConflictError` | 409 | Resource conflict (e.g., duplicate creation). |
 | `UnprocessableEntityError` | 422 | Request validation failed. |
-| `ApiError` | Any | Base class for all API errors. Catch this as a fallback. |
+| `ApiError` (Python) / `SkyvernError` (TS) | Any | Base class for all API errors. Catch this as a fallback. |
+| `SkyvernTimeoutError` (TS only) | - | HTTP request timed out. |
 
-The specific error classes live in `skyvern.client.errors`. The base `ApiError` class lives in `skyvern.client.core`:
+Import errors from the package:
 
-```python
+<CodeGroup>
+```python Python
 from skyvern.client.core import ApiError
 from skyvern.client.errors import (
     BadRequestError,
@@ -44,11 +46,34 @@ from skyvern.client.errors import (
 )
 ```
 
+```typescript TypeScript
+import { SkyvernError, SkyvernTimeoutError, SkyvernApi } from "@skyvern/client";
+
+// Base errors are top-level exports:
+//   SkyvernError          - base class for all API errors
+//   SkyvernTimeoutError   - HTTP request timed out
+
+// HTTP status error subclasses are accessed via the SkyvernApi namespace:
+//   SkyvernApi.BadRequestError          - 400
+//   SkyvernApi.ForbiddenError           - 403
+//   SkyvernApi.NotFoundError            - 404
+//   SkyvernApi.ConflictError            - 409
+//   SkyvernApi.UnprocessableEntityError - 422
+```
+</CodeGroup>
+
+The specific Python error classes live in `skyvern.client.errors`. The base `ApiError` class lives in `skyvern.client.core`.
+
+<Warning>
+**TypeScript:** `SkyvernError` and `SkyvernTimeoutError` are top-level exports. The HTTP-specific errors (`BadRequestError`, etc.) extend `SkyvernError` and are accessed via the `SkyvernApi` namespace.
+</Warning>
+
 ---
 
 ## Catching errors
 
-```python
+<CodeGroup>
+```python Python
 from skyvern import Skyvern
 from skyvern.client.core import ApiError
 from skyvern.client.errors import NotFoundError
@@ -63,15 +88,34 @@ except ApiError as e:
     print(f"API error {e.status_code}: {e.body}")
 ```
 
+```typescript TypeScript
+import { Skyvern, SkyvernError, SkyvernApi } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+try {
+  const run = await skyvern.getRun("tsk_nonexistent");
+} catch (e) {
+  if (e instanceof SkyvernApi.NotFoundError) {
+    console.log(`Run not found: ${e.body}`);
+  } else if (e instanceof SkyvernError) {
+    console.log(`API error ${e.statusCode}: ${e.body}`);
+  }
+}
+```
+</CodeGroup>
+
 ### Error properties
 
 Every error has these attributes:
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `status_code` | `int \| None` | HTTP status code. |
-| `body` | `Any` | Response body (usually a dict with error details). |
-| `headers` | `dict[str, str] \| None` | Response headers. |
+| Property (Python) | Property (TS) | Type | Description |
+|-------------------|---------------|------|-------------|
+| `status_code` | `statusCode` | `int \| None` | HTTP status code. |
+| `body` | `body` | `Any` | Response body (usually a dict with error details). |
+| `headers` | - | `dict[str, str] \| None` | Response headers. |
+| - | `rawResponse` | `RawResponse \| undefined` | The raw HTTP response (TS only). |
+| - | `message` | `string` | Human-readable error message (TS only). |
 
 ---
 
@@ -83,7 +127,8 @@ Two different timeouts apply:
 
 Controls how long the SDK waits for the HTTP response from the Skyvern API. Set it in the constructor or per-request:
 
-```python
+<CodeGroup>
+```python Python
 # Global timeout (applies to all requests)
 client = Skyvern(api_key="YOUR_API_KEY", timeout=30.0)
 
@@ -96,11 +141,28 @@ result = await client.get_run(
 )
 ```
 
+```typescript TypeScript
+// Global timeout (applies to all requests)
+const skyvern = new Skyvern({
+  apiKey: "YOUR_API_KEY",
+  timeoutInSeconds: 30,
+});
+
+// Per-request timeout
+const result = await skyvern.getRun("tsk_abc123", {
+  timeoutInSeconds: 10,
+});
+```
+</CodeGroup>
+
+When an HTTP request times out in TypeScript, a `SkyvernTimeoutError` is thrown.
+
 ### Completion timeout
 
-Controls how long `wait_for_completion` polls before giving up. This is separate from the HTTP timeout:
+Controls how long `wait_for_completion` / `waitForCompletion` polls before giving up. This is separate from the HTTP timeout:
 
-```python
+<CodeGroup>
+```python Python
 try:
     result = await client.run_task(
         prompt="Extract data",
@@ -112,15 +174,34 @@ except TimeoutError:
     print("Task didn't complete in time")
 ```
 
-The completion timeout raises Python's built-in `TimeoutError` (via `asyncio.timeout`), not `ApiError`.
+```typescript TypeScript
+try {
+  const result = await skyvern.runTask({
+    body: {
+      prompt: "Extract data",
+      url: "https://example.com",
+    },
+    waitForCompletion: true,
+    timeout: 300, // Give up after 5 minutes
+  });
+} catch (e) {
+  if (e instanceof Error && e.message.includes("Timeout")) {
+    console.log("Task didn't complete in time");
+  }
+}
+```
+</CodeGroup>
+
+The completion timeout raises Python's built-in `TimeoutError` (via `asyncio.timeout`), not `ApiError`. In TypeScript, it throws a standard `Error` with a timeout message.
 
 ---
 
 ## Retries
 
-Configure automatic retries for transient failures using `RequestOptions`:
+Configure automatic retries for transient failures. Set it in the constructor or per-request:
 
-```python
+<CodeGroup>
+```python Python
 from skyvern.client.core import RequestOptions
 
 result = await client.run_task(
@@ -130,7 +211,56 @@ result = await client.run_task(
 )
 ```
 
-Retries apply to the HTTP request level (network errors, 5xx responses). They do not retry the entire task if it fails at the AI level — use `get_run` to check the status and re-run if needed.
+```typescript TypeScript
+// Global retries (default: 2)
+const skyvern = new Skyvern({
+  apiKey: "YOUR_API_KEY",
+  maxRetries: 3,
+});
+
+// Per-request retries
+const result = await skyvern.runTask(
+  {
+    body: {
+      prompt: "Extract product data",
+      url: "https://example.com/products",
+    },
+  },
+  { maxRetries: 5 },
+);
+```
+</CodeGroup>
+
+Retries apply to the HTTP request level (network errors, 5xx responses). They do not retry the entire task if it fails at the AI level - use `get_run` / `getRun` to check the status and re-run if needed.
+
+---
+
+## Abort requests (TypeScript only)
+
+Cancel in-flight requests using `AbortSignal`:
+
+```typescript
+const controller = new AbortController();
+
+// Cancel after 10 seconds
+setTimeout(() => controller.abort(), 10000);
+
+try {
+  const result = await skyvern.runTask(
+    {
+      body: {
+        prompt: "Extract data",
+        url: "https://example.com",
+      },
+    },
+    { abortSignal: controller.signal },
+  );
+} catch (e) {
+  if (e instanceof Error && e.name === "AbortError") {
+    console.log("Request was aborted");
+  }
+}
+```
 
 ---
 
@@ -138,9 +268,10 @@ Retries apply to the HTTP request level (network errors, 5xx responses). They do
 
 There are two distinct failure modes:
 
-**API error** — The HTTP request itself failed. The SDK raises an exception.
+**API error** - The HTTP request itself failed. The SDK raises an exception.
 
-```python
+<CodeGroup>
+```python Python
 from skyvern.client.core import ApiError
 
 try:
@@ -149,9 +280,25 @@ except ApiError as e:
     print(f"API call failed: {e.status_code}")
 ```
 
-**Run failure** — The API call succeeded, but the task/workflow failed during execution. No exception is raised. Check the `status` field:
+```typescript TypeScript
+import { SkyvernError } from "@skyvern/client";
 
-```python
+try {
+  const result = await skyvern.runTask({
+    body: { prompt: "..." },
+  });
+} catch (e) {
+  if (e instanceof SkyvernError) {
+    console.log(`API call failed: ${e.statusCode}`);
+  }
+}
+```
+</CodeGroup>
+
+**Run failure** - The API call succeeded, but the task/workflow failed during execution. No exception is raised. Check the `status` field:
+
+<CodeGroup>
+```python Python
 result = await client.run_task(
     prompt="Fill out the form",
     url="https://example.com",
@@ -165,6 +312,25 @@ elif result.status == "timed_out":
 elif result.status == "completed":
     print(f"Success: {result.output}")
 ```
+
+```typescript TypeScript
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Fill out the form",
+    url: "https://example.com",
+  },
+  waitForCompletion: true,
+});
+
+if (result.status === "failed") {
+  console.log(`Task failed: ${result.failure_reason}`);
+} else if (result.status === "timed_out") {
+  console.log(`Task exceeded step limit after ${result.step_count} steps`);
+} else if (result.status === "completed") {
+  console.log(`Success: ${JSON.stringify(result.output)}`);
+}
+```
+</CodeGroup>
 
 ### Run statuses
 

@@ -1,0 +1,50 @@
+---
+title: extract
+slug: sdk-reference/browser-automation/extract
+---
+
+Extract structured data from the current page.
+
+<CodeGroup>
+```python Python
+data = await page.extract(
+    "Extract all product names and prices",
+    schema={
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "price": {"type": "number"},
+            },
+        },
+    },
+)
+print(data)
+```
+
+```typescript TypeScript
+const data = await page.extract({
+  prompt: "Extract all product names and prices",
+  schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        price: { type: "number" },
+      },
+    },
+  },
+});
+console.log(data);
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `str` / `string` | Yes | What to extract. |
+| `schema` | `dict \| list \| str` / `Record<string, unknown>` | No | JSON schema for output. |
+| `error_code_mapping` / `errorCodeMapping` | `dict` / `Record<string, string>` | No | Custom error codes. |
+
+Returns `dict | list | str | None` / `Record<string, unknown> | unknown[] | string | null`.

@@ -1,0 +1,18 @@
+---
+title: scroll
+slug: sdk-reference/browser-automation/scroll
+---
+
+Scroll the page by a given number of pixels along the x and y axes.
+
+```python
+# Scroll down 500px
+await page.scroll(0, 500)
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `scroll_x` | `int` | Yes | Horizontal scroll offset in pixels. Positive values scroll right. |
+| `scroll_y` | `int` | Yes | Vertical scroll offset in pixels. Positive values scroll down. |
+
+Returns `None`.

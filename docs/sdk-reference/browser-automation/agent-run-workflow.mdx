@@ -1,0 +1,33 @@
+---
+title: agent.run_workflow
+slug: sdk-reference/browser-automation/agent-run-workflow
+---
+
+Run a pre-defined workflow in the context of the current page.
+
+<CodeGroup>
+```python Python
+result = await page.agent.run_workflow(
+    "wpid_abc123",
+    parameters={"company_name": "Acme Corp"},
+)
+print(result.output)
+```
+
+```typescript TypeScript
+const result = await page.agent.runWorkflow("wpid_abc123", {
+  parameters: { company_name: "Acme Corp" },
+});
+console.log(result.output);
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_id` / `workflowId` | `str` / `string` | Yes | The workflow permanent ID. |
+| `parameters` | `dict` / `Record<string, unknown>` | No | Workflow input parameters. |
+| `template` | `bool` / `boolean` | No | Whether it's a template. |
+| `title` | `str` / `string` | No | Run display name. |
+| `timeout` | `float` / `number` | No | Max wait time in seconds. Default: `1800`. |
+
+Returns `WorkflowRunResponse`.

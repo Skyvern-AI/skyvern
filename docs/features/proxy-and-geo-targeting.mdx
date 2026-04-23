@@ -1,0 +1,62 @@
+---
+title: Proxy & GEO Targeting
+subtitle: Route browser traffic through residential IPs in 21 countries
+description: Skyvern routes browser traffic through residential proxies in 21 countries, with city- and state-level targeting in the US. Use it to access region-locked content, test geo-specific experiences, and reduce bot detection risk.
+slug: features/proxy-and-geo-targeting
+icon: globe
+keywords:
+  - proxy
+  - geolocation
+  - residential proxy
+  - RESIDENTIAL
+  - RESIDENTIAL_ISP
+  - GeoTarget
+  - geo-targeting
+  - country
+  - city
+---
+
+Skyvern routes browser traffic through residential proxies so every run looks like it's coming from a real consumer ISP in the country you choose. Locale and timezone auto-match the proxy region, so you never end up with a mismatched fingerprint that gives the automation away.
+
+## Coverage
+
+21 countries of residential coverage spanning the Americas (US, CA, MX, AR, BR), Europe (GB, IE, NL, DE, FR, ES, IT, TR), Asia (IN, PH, KR, JP, SA), Africa (ZA), and Oceania (AU, NZ).
+
+For services that require a stable IP across a session, `RESIDENTIAL_ISP` provides a static ISP address instead of a rotating one. In the United States, you can target down to city and state level using `GeoTarget`, for example `{"country": "US", "subdivision": "CA", "city": "San Francisco"}`.
+
+## How it's applied
+
+**Per task:** pass `proxy_location` in the run request. **Per workflow:** set a default on the workflow and override on any individual run. **Per session:** lock a proxy to a [browser session](/optimization/browser-sessions) so every operation in that session shares the same IP.
+
+## When to use it
+
+Region-locked pricing, inventory, or UX becomes visible when you route through the right country. Regulatory filings that require a local IP can be submitted from inside the target jurisdiction. Residential IPs also help with bot detection since they look like real consumer traffic rather than a datacenter. And `RESIDENTIAL_ISP` keeps the same IP for a full session, which matters for services that track IP changes mid-flow.
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card
+    title="Proxy & geolocation guide"
+    href="/going-to-production/proxy-geolocation"
+  >
+    Full country list, `proxy_location` values, and `GeoTarget` examples.
+  </Card>
+  <Card
+    title="CAPTCHA & bot bypass"
+    href="/features/captcha-and-bot-bypass"
+  >
+    Pair residential proxies with stealth for sensitive sites.
+  </Card>
+  <Card
+    title="Browser sessions"
+    href="/optimization/browser-sessions"
+  >
+    Lock a proxy location across multiple operations in one session.
+  </Card>
+  <Card
+    title="Self-hosted proxy"
+    href="/self-hosted/proxy"
+  >
+    Bring your own proxy on self-hosted deployments.
+  </Card>
+</CardGroup>

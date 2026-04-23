@@ -1,0 +1,397 @@
+---
+title: Run from Code
+subtitle: Execute and schedule workflows via the API or SDK
+description: Run workflows programmatically, pass parameters, poll for results, and create recurring schedules using the Python SDK, TypeScript SDK, or REST API.
+slug: cloud/building-workflows/run-from-code
+keywords:
+  - run_workflow
+  - get_run
+  - get_workflows
+  - schedule
+  - cron
+  - polling
+  - webhook
+  - SDK
+  - API
+---
+
+If you've built a workflow in the Cloud UI and want to trigger it from your codebase, this page shows how. You can run workflows on demand, poll for results, and set up recurring schedules using the Python SDK, TypeScript SDK, or REST API.
+
+This is for workflows defined in the visual editor. If you're writing your entire automation in code (no workflow editor involved), see [Browser Automation](/browser-automations/overview) instead.
+
+---
+
+## Run a workflow
+
+Pass values for the workflow's input parameters. The call returns immediately with a `run_id` -- the workflow runs asynchronously in the background.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    run = await client.run_workflow(
+        workflow_id="wpid_123456789",
+        parameters={
+            "resume": "https://example.com/resume.pdf",
+            "job_url": "https://jobs.lever.co/company/position"
+        }
+    )
+
+    print(f"Run ID: {run.run_id}")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+async function main() {
+  const client = new SkyvernClient({
+    apiKey: process.env.SKYVERN_API_KEY,
+  });
+
+  const run = await client.runWorkflow({
+    body: {
+      workflow_id: "wpid_123456789",
+      parameters: {
+        resume: "https://example.com/resume.pdf",
+        job_url: "https://jobs.lever.co/company/position",
+      },
+    },
+  });
+
+  console.log(`Run ID: ${run.run_id}`);
+}
+
+main();
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "wpid_123456789",
+    "parameters": {
+      "resume": "https://example.com/resume.pdf",
+      "job_url": "https://jobs.lever.co/company/position"
+    }
+  }'
+```
+</CodeGroup>
+
+**Example response:**
+
+```json
+{
+  "run_id": "wr_486305187432193510",
+  "status": "created"
+}
+```
+
+### Run parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_id` | string | Yes | The `workflow_permanent_id` returned when creating the workflow |
+| `parameters` | object | No | Values for the workflow's input parameters. Keys must match the `key` field in the workflow's parameter definitions |
+| `title` | string | No | Display name for this specific run |
+| `proxy_location` | string or object | No | Override the workflow's default proxy location |
+| `webhook_url` | string | No | URL to receive a POST request when the workflow completes |
+| `browser_session_id` | string | No | Reuse a persistent browser session (prefix `pbs_`) |
+| `browser_profile_id` | string | No | Reuse a browser profile with saved cookies and storage (prefix `bp_`) |
+
+---
+
+## Get results
+
+Workflows run asynchronously, so you need to check back for results. You have two options: poll the API, or receive a webhook when the workflow completes.
+
+### Option 1: Polling
+
+Poll `get_run` until the status reaches a terminal state.
+
+<CodeGroup>
+```python Python
+run_id = run.run_id
+
+while True:
+    result = await client.get_run(run_id)
+
+    if result.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+print(f"Status: {result.status}")
+print(f"Output: {result.output}")
+```
+
+```typescript TypeScript
+const runId = run.run_id;
+
+while (true) {
+  const result = await client.getRun(runId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(result.status)) {
+    console.log(`Status: ${result.status}`);
+    console.log(`Output: ${JSON.stringify(result.output)}`);
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+```
+
+```bash cURL
+#!/bin/bash
+RUN_ID="wr_486305187432193510"
+
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo "$RESPONSE" | jq -r '.status')
+  echo "Status: $STATUS"
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
+    echo "$RESPONSE" | jq '.output'
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+### Option 2: Webhooks
+
+Pass a `webhook_url` when running the workflow. Skyvern sends a POST request to your URL when the workflow reaches a terminal state.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_id="wpid_123456789",
+    parameters={
+        "resume": "https://example.com/resume.pdf",
+        "job_url": "https://jobs.lever.co/company/position"
+    },
+    webhook_url="https://your-server.com/webhook"
+)
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow({
+  body: {
+    workflow_id: "wpid_123456789",
+    parameters: {
+      resume: "https://example.com/resume.pdf",
+      job_url: "https://jobs.lever.co/company/position",
+    },
+    webhook_url: "https://your-server.com/webhook",
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "wpid_123456789",
+    "parameters": {
+      "resume": "https://example.com/resume.pdf",
+      "job_url": "https://jobs.lever.co/company/position"
+    },
+    "webhook_url": "https://your-server.com/webhook"
+  }'
+```
+</CodeGroup>
+
+The webhook payload contains the same data as the polling response. See [Webhooks](/going-to-production/webhooks) for authentication and retry options.
+
+### Response fields
+
+```json
+{
+  "run_id": "wr_486305187432193510",
+  "run_type": "workflow_run",
+  "status": "completed",
+  "output": {
+    "parse_resume_output": {
+      "name": "John Smith",
+      "email": "john@example.com",
+      "work_experience": [...]
+    },
+    "apply_to_job_output": {
+      "task_id": "tsk_123456",
+      "status": "completed",
+      "extracted_information": null
+    }
+  },
+  "screenshot_urls": [
+    "https://skyvern-artifacts.s3.amazonaws.com/.../screenshot_final.png"
+  ],
+  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/.../recording.webm",
+  "failure_reason": null,
+  "created_at": "2026-01-20T12:00:00.000000",
+  "modified_at": "2026-01-20T12:05:00.000000"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | string | Unique identifier for this run (format: `wr_*`) |
+| `run_type` | string | Always `"workflow_run"` for workflow runs |
+| `status` | string | Current status: `created`, `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, `canceled` |
+| `output` | object | Output from each block, keyed by `{label}_output` |
+| `screenshot_urls` | array | Final screenshots from the last blocks |
+| `recording_url` | string | Video recording of the browser session |
+| `failure_reason` | string \| null | Error description if the run failed |
+| `downloaded_files` | array | Files downloaded during the run |
+| `app_url` | string \| null | Link to view this run in the Skyvern UI |
+| `created_at` | datetime | When the run started |
+| `modified_at` | datetime | When the run was last updated |
+| `started_at` | datetime \| null | When execution started |
+| `finished_at` | datetime \| null | When execution finished |
+
+---
+
+## Schedule a workflow
+
+Schedules let you run any workflow automatically on a recurring basis. Define a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+
+### Create a schedule
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    result = await client.agent.create_workflow_schedule(
+        workflow_permanent_id="wpid_123456789",
+        cron_expression="0 9 * * 1-5",
+        timezone="America/New_York",
+        name="Weekday morning report",
+        description="Runs the data extraction workflow every weekday at 9 AM ET",
+        parameters={
+            "url": "https://example.com/dashboard",
+            "output_format": "csv"
+        }
+    )
+
+    print(f"Schedule ID: {result.schedule.workflow_schedule_id}")
+
+asyncio.run(main())
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cron_expression": "0 9 * * 1-5",
+    "timezone": "America/New_York",
+    "name": "Weekday morning report",
+    "description": "Runs the data extraction workflow every weekday at 9 AM ET",
+    "parameters": {
+      "url": "https://example.com/dashboard",
+      "output_format": "csv"
+    }
+  }'
+```
+</CodeGroup>
+
+**Schedule parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cron_expression` | string | Yes | 5-field cron expression (minimum 5-minute interval) |
+| `timezone` | string | Yes | IANA timezone identifier (e.g., `America/New_York`) |
+| `name` | string | No | Human-readable name for the schedule |
+| `description` | string | No | Description of what this schedule does |
+| `parameters` | object | No | Workflow parameters to pass on each run |
+| `enabled` | boolean | No | Whether the schedule is active. Defaults to `true` |
+
+### Enable and disable a schedule
+
+<CodeGroup>
+```python Python
+# Disable
+await client.agent.disable_workflow_schedule(
+    workflow_permanent_id="wpid_123456789",
+    workflow_schedule_id="wfs_abc123"
+)
+
+# Re-enable
+await client.agent.enable_workflow_schedule(
+    workflow_permanent_id="wpid_123456789",
+    workflow_schedule_id="wfs_abc123"
+)
+```
+
+```bash cURL
+# Disable
+curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules/wfs_abc123/disable" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+
+# Re-enable
+curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules/wfs_abc123/enable" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+### Delete a schedule
+
+Permanently remove a schedule. This cannot be undone. Runs that were already triggered by this schedule are not affected.
+
+<CodeGroup>
+```python Python
+await client.agent.delete_workflow_schedule_route(
+    workflow_permanent_id="wpid_123456789",
+    workflow_schedule_id="wfs_abc123"
+)
+```
+
+```bash cURL
+curl -X DELETE "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules/wfs_abc123" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+---
+
+## List workflows
+
+Retrieve all workflows in your organization.
+
+<CodeGroup>
+```python Python
+workflows = await client.get_workflows()
+
+for workflow in workflows:
+    print(f"{workflow.workflow_permanent_id}: {workflow.title}")
+```
+
+```typescript TypeScript
+const workflows = await client.getWorkflows();
+
+for (const workflow of workflows) {
+  console.log(`${workflow.workflow_permanent_id}: ${workflow.title}`);
+}
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>

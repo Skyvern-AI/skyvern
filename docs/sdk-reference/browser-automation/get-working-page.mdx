@@ -1,0 +1,18 @@
+---
+title: get_working_page
+slug: sdk-reference/browser-automation/get-working-page
+---
+
+Get the most recent page or create a new one if none exists.
+
+<CodeGroup>
+```python Python
+page = await browser.get_working_page()
+```
+
+```typescript TypeScript
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+Returns a `SkyvernBrowserPage` - a Playwright `Page` with AI methods added.

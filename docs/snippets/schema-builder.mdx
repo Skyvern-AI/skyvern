@@ -1,0 +1,192 @@
+export const FIELD_TYPES = [
+  { value: "string", label: "String" },
+  { value: "number", label: "Number" },
+  { value: "integer", label: "Integer" },
+  { value: "boolean", label: "Boolean" },
+]
+
+export const SchemaBuilder = () => {
+  const [schemaType, setSchemaType] = useState("single")
+  const [arrayName, setArrayName] = useState("items")
+  const [fields, setFields] = useState([
+    { id: "1", name: "title", type: "string", description: "The title" },
+  ])
+  const [outputFormat, setOutputFormat] = useState("python")
+  const [copied, setCopied] = useState(false)
+
+  const addField = () => {
+    setFields([...fields, { id: String(Date.now()), name: "", type: "string", description: "" }])
+  }
+
+  const removeField = (id) => {
+    if (fields.length > 1) setFields(fields.filter((f) => f.id !== id))
+  }
+
+  const updateField = (id, key, value) => {
+    setFields(fields.map((f) => (f.id === id ? { ...f, [key]: value } : f)))
+  }
+
+  const duplicateNames = useMemo(() => {
+    const names = fields.map((f) => f.name).filter((n) => n.trim() !== "")
+    const counts = {}
+    for (const n of names) {
+      counts[n] = (counts[n] || 0) + 1
+    }
+    return new Set(Object.keys(counts).filter((n) => counts[n] > 1))
+  }, [fields])
+
+  const schema = useMemo(() => {
+    const properties = {}
+    fields.forEach((field) => {
+      if (field.name) {
+        properties[field.name] = {
+          type: field.type,
+          description: field.description || `The ${field.name}`,
+        }
+      }
+    })
+    if (schemaType === "array") {
+      return {
+        type: "object",
+        properties: {
+          [arrayName]: {
+            type: "array",
+            description: "List of extracted items",
+            items: { type: "object", properties },
+          },
+        },
+      }
+    }
+    return { type: "object", properties }
+  }, [fields, schemaType, arrayName])
+
+  const formattedOutput = useMemo(() => {
+    const jsonStr = JSON.stringify(schema, null, 2)
+    if (outputFormat === "python") {
+      return `data_extraction_schema=${jsonStr.replace(/: null/g, ": None").replace(/: true/g, ": True").replace(/: false/g, ": False")}`
+    }
+    if (outputFormat === "typescript") {
+      return `data_extraction_schema: ${jsonStr}`
+    }
+    return `"data_extraction_schema": ${jsonStr}`
+  }, [schema, outputFormat])
+
+  const copyToClipboard = async () => {
+    await navigator.clipboard.writeText(formattedOutput)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <div className="p-5 border rounded-lg mt-4 mb-4 not-prose" style={{ backgroundColor: "#f8fafc" }}>
+      <div className="mb-5">
+        <label className="block font-semibold mb-2 text-sm">What are you extracting?</label>
+        <div className="flex gap-3">
+          {[
+            { value: "single", label: "Single object", desc: "Extract one item with multiple fields" },
+            { value: "array", label: "List of items", desc: "Extract multiple items with the same structure" },
+          ].map((type) => (
+            <button
+              key={type.value}
+              onClick={() => setSchemaType(type.value)}
+              className={`flex-1 p-3 rounded-md text-left border-2 ${schemaType === type.value ? "border-indigo-500 bg-indigo-50" : "border-gray-200 bg-white"}`}
+            >
+              <div className="font-medium text-sm">{type.label}</div>
+              <div className="text-xs text-gray-500 mt-1">{type.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {schemaType === "array" && (
+        <div className="mb-5">
+          <label className="block text-xs font-medium mb-1 text-gray-700">Array field name</label>
+          <input
+            type="text"
+            value={arrayName}
+            onChange={(e) => setArrayName(e.target.value)}
+            className="w-full p-2 border rounded-md text-sm"
+            placeholder="items"
+          />
+        </div>
+      )}
+
+      <div className="mb-4">
+        <label className="block font-semibold mb-2 text-sm">Fields to extract</label>
+        <div className="flex flex-col gap-2">
+          {fields.map((field) => (
+            <div key={field.id} className="flex gap-2 items-center p-3 bg-white rounded-md border">
+              <input
+                type="text"
+                value={field.name}
+                onChange={(e) => updateField(field.id, "name", e.target.value)}
+                placeholder="Field name"
+                className={`w-32 p-2 border rounded-md text-sm ${duplicateNames.has(field.name) ? "border-red-500 bg-red-50" : ""}`}
+                title={duplicateNames.has(field.name) ? "Duplicate field name - will be overwritten in schema" : ""}
+              />
+              <select
+                value={field.type}
+                onChange={(e) => updateField(field.id, "type", e.target.value)}
+                className="w-24 p-2 border rounded-md text-sm bg-white"
+              >
+                {FIELD_TYPES.map((t) => (
+                  <option key={t.value} value={t.value}>{t.label}</option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={field.description}
+                onChange={(e) => updateField(field.id, "description", e.target.value)}
+                placeholder="Description (helps AI understand what to extract)"
+                className="flex-1 p-2 border rounded-md text-sm"
+              />
+              <button
+                onClick={() => removeField(field.id)}
+                disabled={fields.length === 1}
+                className={`px-2 py-1 rounded text-lg ${fields.length === 1 ? "text-gray-300 cursor-not-allowed" : "text-red-500 hover:bg-red-50"}`}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+        <button onClick={addField} className="w-full mt-2 p-2 border border-dashed rounded-md text-gray-500 text-sm hover:bg-gray-50">
+          + Add field
+        </button>
+        {duplicateNames.size > 0 && (
+          <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded-md text-red-700 text-xs">
+            Duplicate field names detected. Only the last field with each name will appear in the schema.
+          </div>
+        )}
+      </div>
+
+      <div>
+        <div className="flex justify-between items-center mb-2">
+          <label className="font-semibold text-sm">Generated schema</label>
+          <div className="flex gap-1">
+            {["python", "typescript", "curl"].map((format) => (
+              <button
+                key={format}
+                onClick={() => setOutputFormat(format)}
+                className={`px-3 py-1 rounded text-xs ${outputFormat === format ? "bg-indigo-100 border-indigo-500 border font-medium" : "bg-white border border-gray-200"}`}
+              >
+                {format === "curl" ? "cURL" : format.charAt(0).toUpperCase() + format.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="relative">
+          <pre className="bg-slate-800 text-slate-200 p-4 rounded-md overflow-auto text-xs leading-relaxed">
+            <code>{formattedOutput}</code>
+          </pre>
+          <button
+            onClick={copyToClipboard}
+            className={`absolute top-2 right-2 px-3 py-1 rounded text-xs text-white ${copied ? "bg-green-500" : "bg-slate-600 hover:bg-slate-500"}`}
+          >
+            {copied ? "Copied!" : "Copy"}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}

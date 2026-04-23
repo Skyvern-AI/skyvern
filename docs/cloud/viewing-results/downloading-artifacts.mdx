@@ -13,7 +13,7 @@ keywords:
   - extracted data
 ---
 
-Every run generates artifacts — video recordings, screenshots at each decision point, extracted data as JSON, and any downloaded files. Most are visible in the [Run Details](/cloud/viewing-results/run-details) page, but you can also save them locally or pull them into another system.
+Every run generates artifacts: video recordings, screenshots at each decision point, extracted data as JSON, and any downloaded files. Most are visible in the [Run Details](/cloud/viewing-results/run-details) page, but you can also save them locally or pull them into another system.
 
 ## From the UI
 
@@ -27,7 +27,7 @@ Every run generates artifacts — video recordings, screenshots at each decision
 
 ## From the API
 
-Use the API when you need artifacts programmatically — for a pipeline, an archive, or integration with another tool.
+Use the API when you need artifacts programmatically: for a pipeline, an archive, or integration with another tool.
 
 ### List artifacts for a run
 
@@ -45,7 +45,7 @@ curl -X GET "https://api.skyvern.com/v1/runs/{run_id}/artifacts?artifact_type=sc
 
 ### Download an artifact
 
-Each artifact in the response includes a `signed_url` — a temporary, pre-authenticated download link:
+Each artifact in the response includes a `signed_url`, a temporary, pre-authenticated download link:
 
 ```json
 {
@@ -69,17 +69,17 @@ Signed URLs expire after a short period. Always generate a fresh URL via the API
 | Value | What it is |
 |-------|-----------|
 | `recording` | Full browser session video |
-| `screenshot_llm` | Screenshots with numbered element annotations — what the AI analyzed |
+| `screenshot_llm` | Screenshots with numbered element annotations (what the AI analyzed) |
 | `screenshot_action` | Screenshots taken after each browser action |
 | `screenshot_final` | Final page state when the run ended |
 | `llm_prompt` | Complete prompt sent to the LLM (goal, element tree, system instructions) |
 | `llm_request` | Raw API request payload sent to the model provider |
 | `llm_response` | Raw model response |
-| `llm_response_parsed` | Parsed action list — what the AI decided to do |
+| `llm_response_parsed` | Parsed action list (what the AI decided to do) |
 | `visible_elements_tree` | DOM tree of interactive elements the AI could see (JSON) |
 | `html_scrape` | Full page HTML at the time of the step |
 | `skyvern_log` | Formatted execution logs |
-| `har` | HTTP Archive file — every network request the browser made |
+| `har` | HTTP Archive file (every network request the browser made) |
 | `trace` | Browser trace file for performance analysis |
 
 <Tip>

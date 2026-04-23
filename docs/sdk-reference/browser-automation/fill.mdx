@@ -1,0 +1,45 @@
+---
+title: fill
+slug: sdk-reference/browser-automation/fill
+---
+
+Fill an input field using a CSS selector, an AI prompt, or both. Supports TOTP code injection for 2FA fields.
+
+<CodeGroup>
+```python Python
+# Standard Playwright fill
+await page.fill("#email", value="user@example.com")
+
+# AI-powered fill
+await page.fill(prompt="Fill 'user@example.com' in the email field")
+
+# Selector with AI fallback
+await page.fill("#email", value="user@example.com",
+    prompt="Fill the email address field")
+```
+
+```typescript TypeScript
+// Standard Playwright fill
+await page.fill("#email", "user@example.com");
+
+// AI-powered fill
+await page.fill({ prompt: "Fill 'user@example.com' in the email field" });
+
+// Selector with AI fallback
+await page.fill("#email", "user@example.com", {
+  prompt: "Fill the email address field",
+});
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` / `string` | No | CSS selector for the input field. |
+| `value` | `str` / `string` | No | The text value to fill into the field. |
+| `prompt` | `str` / `string` | No | Natural language description of the field and the value to enter. |
+| `ai` | `str` / `string` | No | Controls AI behavior. `"fallback"` (default) tries the selector first, then AI. `None` / `null` disables AI. |
+| `totp_identifier` / `totpIdentifier` | `str` / `string` | No | Identifier for a stored TOTP secret to generate a one-time code. |
+| `totp_url` / `totpUrl` | `str` / `string` | No | TOTP provisioning URL (`otpauth://...`) to generate a one-time code on the fly. |
+| `**kwargs` | | No | Standard Playwright fill options (e.g., `timeout`, `force`). |
+
+Returns `str` / `string` -- the resolved selector used.

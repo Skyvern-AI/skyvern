@@ -1,5 +1,14 @@
 # Skyvern
 
+<<<<<<< HEAD
+> Skyvern automates browser-based workflows using LLMs and computer vision. It navigates websites it has never seen before; filling forms, extracting data, and completing multi-step tasks; via a simple API. Use the Python SDK, TypeScript SDK, REST API, MCP server, or Cloud UI to build and run browser automations. Key capabilities: natural-language task execution, multi-step workflows with loops and conditionals, credential management (passwords, credit cards, TOTP/2FA), browser session persistence, data extraction, file downloads, webhook notifications, and proxy/geolocation support.
+
+## Getting Started
+
+- [What is Skyvern?](https://skyvern.com/docs/getting-started/introduction.md): Overview of Skyvern's AI-powered browser automation platform; how it uses LLMs and computer vision to navigate any website without custom scripts
+- [Core Concepts](https://skyvern.com/docs/getting-started/core-concepts.md): Key building blocks; tasks, workflows, blocks, parameters, browser sessions, browser profiles, credentials, runs, and artifacts
+- [Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): Run your first browser automation task with the Skyvern REST API using Python, TypeScript, or cURL in under 5 minutes
+=======
 > Skyvern automates browser-based workflows using LLMs and computer vision. It navigates websites it has never seen before — filling forms, extracting data, and completing multi-step tasks — via a simple API. Use the Python SDK, TypeScript SDK, REST API, MCP server, or Cloud UI to build and run browser automations. Key capabilities: natural-language task execution, multi-step workflows with loops and conditionals, credential management (passwords, credit cards, TOTP/2FA), browser session persistence, data extraction, file downloads, webhook notifications, and proxy/geolocation support.
 
 ## Getting Started
@@ -7,10 +16,34 @@
 - [What is Skyvern?](https://skyvern.com/docs/getting-started/introduction.md): Overview of Skyvern's AI-powered browser automation platform — how it uses LLMs and computer vision to navigate any website without custom scripts
 - [Core Concepts](https://skyvern.com/docs/getting-started/core-concepts.md): Key building blocks — tasks, workflows, blocks, parameters, browser sessions, browser profiles, credentials, runs, and artifacts
 - [API Quickstart](https://skyvern.com/docs/getting-started/quickstart.md): Run your first browser automation task with the Skyvern REST API using Python, TypeScript, or cURL in under 5 minutes
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 - [AI Agents Quickstart](https://skyvern.com/docs/getting-started/ai-agents-quickstart.md): Set up Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, or any AI coding assistant can run browser automations
 
 ## Creating & Running Tasks
 
+<<<<<<< HEAD
+- [Run a Task](https://skyvern.com/docs/running-automations/run-a-task.md): Execute a single browser automation with a natural-language goal; configure URLs, navigation goals, data extraction schemas, webhooks, and proxy settings via API or SDK
+- [Task Parameters](https://skyvern.com/docs/running-automations/task-parameters.md): Configure task behavior; proxy location, browser session reuse, TOTP/2FA credentials, max steps, webhook callbacks, error handling, and extraction schemas
+- [Extract Structured Data](https://skyvern.com/docs/running-automations/extract-structured-data.md): Define JSON schemas to get consistent, typed data extraction output from tasks; prices, addresses, table rows, and more
+
+## Building Multi-Step Workflows
+
+- [Build a Workflow](https://skyvern.com/docs/cloud/building-workflows/build-a-workflow.md): Create multi-step browser automations by chaining task blocks, loops, conditionals, extraction, and file operations into reusable workflows
+- [Workflow Blocks Reference](https://skyvern.com/docs/cloud/building-workflows/configure-blocks.md): Complete reference for every block type; navigation block, action block, extract block, loop block, text prompt block, login block, file operations, email, webhook, and validation blocks
+- [Workflow Parameters](https://skyvern.com/docs/cloud/building-workflows/add-parameters.md): Pass dynamic values into workflows at runtime; configure proxy, webhook, browser session, and credential parameters per run
+- [File Operations](https://skyvern.com/docs/cloud/building-workflows/configure-blocks.md): Download, parse (CSV, PDF, Excel), and upload files within workflow blocks
+- [Scheduling Workflows](https://skyvern.com/docs/cloud/building-workflows/scheduling.md): Run workflows automatically on a recurring cron schedule via API, SDK, or the Cloud UI
+
+## Handling Authentication
+
+- [Store Credentials](https://skyvern.com/docs/credentials/store-credentials.md): Securely manage login passwords, credit cards, TOTP secrets, and API keys; with Bitwarden, 1Password, Azure Key Vault, or Skyvern's built-in vault
+- [Handle 2FA](https://skyvern.com/docs/credentials/handle-2fa.md): Configure TOTP-based two-factor authentication so Skyvern can complete login flows that require 2FA codes
+- [Troubleshooting Login](https://skyvern.com/docs/credentials/troubleshooting-login.md): Debug common authentication failures; credential issues, CAPTCHA blocks, bot detection, and session expiration
+
+## Optimizing Performance
+
+- [Browser Sessions](https://skyvern.com/docs/optimization/browser-sessions.md): Persist a live browser across multiple tasks and workflows; maintain login state, cookies, and page context between API calls
+=======
 - [Run a Task](https://skyvern.com/docs/running-automations/run-a-task.md): Execute a single browser automation with a natural-language goal — configure URLs, navigation goals, data extraction schemas, webhooks, and proxy settings via API or SDK
 - [Task Parameters](https://skyvern.com/docs/running-automations/task-parameters.md): Configure task behavior — proxy location, browser session reuse, TOTP/2FA credentials, max steps, webhook callbacks, error handling, and extraction schemas
 - [Extract Structured Data](https://skyvern.com/docs/running-automations/extract-structured-data.md): Define JSON schemas to get consistent, typed data extraction output from tasks — prices, addresses, table rows, and more
@@ -32,6 +65,7 @@
 ## Optimizing Performance
 
 - [Browser Sessions](https://skyvern.com/docs/optimization/browser-sessions.md): Persist a live browser across multiple tasks and workflows — maintain login state, cookies, and page context between API calls
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 - [Browser Profiles](https://skyvern.com/docs/optimization/browser-profiles.md): Save and reuse authenticated browser state (cookies, localStorage) across runs without re-logging in
 - [Cost Control](https://skyvern.com/docs/optimization/cost-control.md): Limit max steps, optimize prompts, and use caching to manage credit consumption
 
@@ -39,7 +73,11 @@
 
 - [Webhooks](https://skyvern.com/docs/going-to-production/webhooks.md): Receive HTTP callbacks when tasks and workflow runs complete, fail, or require human intervention
 - [Proxy & Geolocation](https://skyvern.com/docs/going-to-production/proxy-geolocation.md): Route browser traffic through residential proxies in specific countries and regions to handle geo-restricted content
+<<<<<<< HEAD
+- [Error Handling](https://skyvern.com/docs/going-to-production/error-handling.md): Detect, classify, and recover from task failures; retry strategies, cancel runs, and webhook error payloads
+=======
 - [Error Handling](https://skyvern.com/docs/going-to-production/error-handling.md): Detect, classify, and recover from task failures — retry strategies, cancel runs, and webhook error payloads
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 - [Reliability Tips](https://skyvern.com/docs/going-to-production/reliability-tips.md): Write robust prompts, handle edge cases, and build resilient automations that work across website changes
 - [CAPTCHA & Bot Detection](https://skyvern.com/docs/going-to-production/captcha-bot-detection.md): How Skyvern handles CAPTCHAs, anti-bot systems, and stealth browser configuration
 
@@ -47,7 +85,11 @@
 
 - [MCP Server](https://skyvern.com/docs/going-to-production/mcp.md): Install and configure Skyvern's Model Context Protocol server for Claude Desktop, Cursor, Windsurf, VS Code, and other AI assistants
 - [CLI & Skills](https://skyvern.com/docs/going-to-production/cli.md): Run tasks, manage workflows, store credentials, and open browser sessions from the command line
+<<<<<<< HEAD
+- [Zapier](https://skyvern.com/docs/integrations/zapier.md): Trigger browser automations from Zapier workflows; run tasks and get results via Zapier actions
+=======
 - [Zapier](https://skyvern.com/docs/integrations/zapier.md): Trigger browser automations from Zapier workflows — run tasks and get results via Zapier actions
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 - [Make.com](https://skyvern.com/docs/integrations/make.md): Integrate Skyvern browser automations into Make.com scenarios
 - [n8n](https://skyvern.com/docs/integrations/n8n.md): Run browser automations as nodes in n8n workflows
 - [Workato](https://skyvern.com/docs/integrations/workato.md): Run browser automations in Workato recipes with the Skyvern connector
@@ -56,6 +98,16 @@
 ## Python SDK Reference
 
 - [Python SDK Overview](https://skyvern.com/docs/sdk-reference/overview.md): Install, authenticate, and configure the Skyvern Python client
+<<<<<<< HEAD
+- [Tasks](https://skyvern.com/docs/sdk-reference/tasks.md): Run single browser automations; run_task(), get_run(), cancel_run(), and extraction
+- [Workflows](https://skyvern.com/docs/sdk-reference/workflows.md): Create and run multi-step workflows; create_workflow(), run_workflow(), and block configuration
+- [Browser Sessions](https://skyvern.com/docs/sdk-reference/browser-sessions.md): Manage live browser state; create_session(), get_session(), close_session()
+- [Browser Profiles](https://skyvern.com/docs/sdk-reference/browser-profiles.md): Save and reuse browser state; create_profile(), list_profiles(), delete_profile()
+- [Credentials](https://skyvern.com/docs/sdk-reference/credentials.md): Store passwords, TOTP secrets, and credit cards; create_credential(), send_totp()
+- [Helper Methods](https://skyvern.com/docs/sdk-reference/helpers.md): High-level convenience methods for login, credential management, and common patterns
+- [Error Handling](https://skyvern.com/docs/sdk-reference/error-handling.md): Handle API errors, timeouts, rate limits, and configure retry behavior
+- [Complete Reference](https://skyvern.com/docs/sdk-reference/complete-reference.md): Every method, parameter, and type in the Python SDK on one page; optimized for LLM consumption
+=======
 - [Tasks](https://skyvern.com/docs/sdk-reference/tasks.md): Run single browser automations — run_task(), get_run(), cancel_run(), and extraction
 - [Workflows](https://skyvern.com/docs/sdk-reference/workflows.md): Create and run multi-step workflows — create_workflow(), run_workflow(), and block configuration
 - [Browser Sessions](https://skyvern.com/docs/sdk-reference/browser-sessions.md): Manage live browser state — create_session(), get_session(), close_session()
@@ -64,10 +116,22 @@
 - [Helper Methods](https://skyvern.com/docs/sdk-reference/helpers.md): High-level convenience methods for login, credential management, and common patterns
 - [Error Handling](https://skyvern.com/docs/sdk-reference/error-handling.md): Handle API errors, timeouts, rate limits, and configure retry behavior
 - [Complete Reference](https://skyvern.com/docs/sdk-reference/complete-reference.md): Every method, parameter, and type in the Python SDK on one page — optimized for LLM consumption
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 
 ## TypeScript SDK Reference
 
 - [TypeScript SDK Overview](https://skyvern.com/docs/ts-sdk-reference/overview.md): Install, authenticate, and configure the Skyvern TypeScript client
+<<<<<<< HEAD
+- [Tasks](https://skyvern.com/docs/ts-sdk-reference/tasks.md): Run single browser automations; runTask(), getRun(), cancelRun(), and extraction
+- [Workflows](https://skyvern.com/docs/ts-sdk-reference/workflows.md): Create and run multi-step workflows; createWorkflow(), runWorkflow(), and block configuration
+- [Browser Sessions](https://skyvern.com/docs/ts-sdk-reference/browser-sessions.md): Manage live browser state; createSession(), getSession(), closeSession()
+- [Browser Profiles](https://skyvern.com/docs/ts-sdk-reference/browser-profiles.md): Save and reuse browser state; createProfile(), listProfiles(), deleteProfile()
+- [Credentials](https://skyvern.com/docs/ts-sdk-reference/credentials.md): Store passwords, TOTP secrets, and credit cards; createCredential(), sendTotp()
+- [Helper Methods](https://skyvern.com/docs/ts-sdk-reference/helpers.md): High-level convenience methods for login, credential management, and common patterns
+- [Browser Automation](https://skyvern.com/docs/ts-sdk-reference/browser-automation.md): Control cloud browsers with Playwright + AI; direct browser session automation
+- [Error Handling](https://skyvern.com/docs/ts-sdk-reference/error-handling.md): Handle API errors, timeouts, rate limits, and configure retry behavior
+- [Complete Reference](https://skyvern.com/docs/ts-sdk-reference/complete-reference.md): Every method, parameter, and type in the TypeScript SDK on one page; optimized for LLM consumption
+=======
 - [Tasks](https://skyvern.com/docs/ts-sdk-reference/tasks.md): Run single browser automations — runTask(), getRun(), cancelRun(), and extraction
 - [Workflows](https://skyvern.com/docs/ts-sdk-reference/workflows.md): Create and run multi-step workflows — createWorkflow(), runWorkflow(), and block configuration
 - [Browser Sessions](https://skyvern.com/docs/ts-sdk-reference/browser-sessions.md): Manage live browser state — createSession(), getSession(), closeSession()
@@ -77,13 +141,20 @@
 - [Browser Automation](https://skyvern.com/docs/ts-sdk-reference/browser-automation.md): Control cloud browsers with Playwright + AI — direct browser session automation
 - [Error Handling](https://skyvern.com/docs/ts-sdk-reference/error-handling.md): Handle API errors, timeouts, rate limits, and configure retry behavior
 - [Complete Reference](https://skyvern.com/docs/ts-sdk-reference/complete-reference.md): Every method, parameter, and type in the TypeScript SDK on one page — optimized for LLM consumption
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 
 ## Debugging & Troubleshooting
 
 - [Using Artifacts](https://skyvern.com/docs/debugging/using-artifacts.md): Access recordings, screenshots, action logs, and network data for every run
+<<<<<<< HEAD
+- [Troubleshooting Guide](https://skyvern.com/docs/debugging/troubleshooting-guide.md): Diagnose common issues; step timeline analysis, prompt tuning, and when to adjust task configuration
+- [Observability with Laminar](https://skyvern.com/docs/debugging/observability-with-laminar.md): Add tracing and observability to Skyvern automations using Laminar
+- [FAQ](https://skyvern.com/docs/debugging/faq.md): Frequently asked questions; CAPTCHA handling, retries, artifacts, recordings, and error codes
+=======
 - [Troubleshooting Guide](https://skyvern.com/docs/debugging/troubleshooting-guide.md): Diagnose common issues — step timeline analysis, prompt tuning, and when to adjust task configuration
 - [Observability with Laminar](https://skyvern.com/docs/debugging/observability-with-laminar.md): Add tracing and observability to Skyvern automations using Laminar
 - [FAQ](https://skyvern.com/docs/debugging/faq.md): Frequently asked questions — CAPTCHA handling, retries, artifacts, recordings, and error codes
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 
 ## Self-Hosted Deployment
 
@@ -93,7 +164,11 @@
 - [Browser Configuration](https://skyvern.com/docs/self-hosted/browser.md): Configure browser modes, display settings, headless vs headed, and external Chrome connections via Playwright
 - [Proxy Setup](https://skyvern.com/docs/self-hosted/proxy.md): Configure residential proxies and geolocation for bot detection avoidance in self-hosted deployments
 - [Kubernetes Deployment](https://skyvern.com/docs/self-hosted/kubernetes.md): Deploy Skyvern at scale with Kubernetes manifests and Helm charts
+<<<<<<< HEAD
+- [Storage Configuration](https://skyvern.com/docs/self-hosted/storage.md): Configure where Skyvern stores artifacts, recordings, and screenshots; local filesystem or S3-compatible storage
+=======
 - [Storage Configuration](https://skyvern.com/docs/self-hosted/storage.md): Configure where Skyvern stores artifacts, recordings, and screenshots — local filesystem or S3-compatible storage
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 
 ## Cookbooks
 
@@ -104,11 +179,19 @@
 
 ## Cloud UI
 
+<<<<<<< HEAD
+For visual dashboard documentation; running tasks, building workflows, managing credentials, viewing results, and account settings; see the [Cloud UI Guide](https://skyvern.com/docs/cloud/overview.md).
+
+## API Reference
+
+- [OpenAPI Specification](https://skyvern.com/docs/api-reference/openapi.json): Full OpenAPI 3.x spec for all Skyvern REST API endpoints; tasks, workflows, browser sessions, browser profiles, credentials, and artifacts
+=======
 For visual dashboard documentation — running tasks, building workflows, managing credentials, viewing results, and account settings — see the [Cloud UI Guide](https://skyvern.com/docs/cloud/overview.md).
 
 ## API Reference
 
 - [OpenAPI Specification](https://skyvern.com/docs/api-reference/openapi.json): Full OpenAPI 3.x spec for all Skyvern REST API endpoints — tasks, workflows, browser sessions, browser profiles, credentials, and artifacts
+>>>>>>> 022ec7b1 (docs: Add keywords and descriptions for every page, rewrote llms.txt, added another redirect (#5461))
 
 ## Changelog
 

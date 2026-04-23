@@ -1,0 +1,79 @@
+---
+title: Complete Example
+slug: sdk-reference/browser-automation/complete-example
+---
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+
+    # Navigate with Playwright
+    await page.goto("https://app.example.com")
+
+    # Login with AI
+    await page.agent.login(
+        credential_type="skyvern",
+        credential_id="cred_abc123",
+    )
+
+    # Mix Playwright and AI
+    await page.click("#billing-tab")
+    data = await page.extract(
+        "Extract all invoice numbers and amounts",
+        schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "invoice_number": {"type": "string"},
+                    "amount": {"type": "string"},
+                },
+            },
+        },
+    )
+    print(data)
+
+    await browser.close()
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+// Navigate with Playwright
+await page.goto("https://app.example.com");
+
+// Login with AI
+await page.agent.login("skyvern", { credentialId: "cred_abc123" });
+
+// Extract data with AI
+const data = await page.extract({
+  prompt: "Extract all invoice numbers and amounts from the billing page",
+  schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        invoice_number: { type: "string" },
+        amount: { type: "string" },
+      },
+    },
+  },
+});
+console.log(data);
+
+// Clean up
+await browser.close();
+```
+</CodeGroup>

@@ -125,7 +125,7 @@ If runs consistently time out, increase `max_steps` or simplify the task. If `st
 
 ## Use code generation for repeatable tasks
 
-On Skyvern Cloud, the default **Skyvern 2.0 with Code** engine records the actions the AI takes and generates reusable code from them. Subsequent runs execute the generated code instead of the AI agent — skipping LLM inference and screenshot analysis entirely. This makes them faster, deterministic, and significantly cheaper.
+On Skyvern Cloud, the default **Skyvern 2.0 with Code** engine records the actions the AI takes and generates reusable code from them. Subsequent runs execute the generated code instead of the AI agent, skipping LLM inference and screenshot analysis entirely. This makes them faster, deterministic, and significantly cheaper.
 
 1. Run your task with the default engine. Skyvern generates code from the recorded actions.
 2. Subsequent runs execute the cached code directly, no AI reasoning required.
@@ -203,7 +203,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 </CodeGroup>
 
 <Tip>
-Set `publish_workflow: true` to save the generated workflow so you can re-trigger it later or [schedule it on a recurring cron](/multi-step-automations/scheduling-workflows).
+Set `publish_workflow: true` to save the generated workflow so you can re-trigger it later or [schedule it on a recurring cron](/cloud/building-workflows/scheduling).
 </Tip>
 
 ---

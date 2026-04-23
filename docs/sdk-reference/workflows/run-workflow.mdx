@@ -1,0 +1,179 @@
+---
+title: run_workflow
+slug: sdk-reference/workflows/run-workflow
+---
+
+A workflow chains multiple steps (blocks) into a single automation. Workflows support loops, conditionals, data passing between steps, and code-based re-execution.
+
+For conceptual background, see [Build a Workflow](/cloud/building-workflows/build-a-workflow).
+
+<Note>
+Python uses `snake_case` (e.g., `run_workflow`); TypeScript uses `camelCase` (e.g., `runWorkflow`) and wraps request params in a `body` object. Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+</Note>
+
+Execute a workflow by its permanent ID. Skyvern opens a cloud browser and runs each block in sequence.
+
+<CodeGroup>
+```python Python
+result = await client.run_workflow(
+    workflow_id="wpid_abc123",
+    wait_for_completion=True,
+)
+print(result.output)
+```
+
+```typescript TypeScript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_abc123",
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `workflow_id` | `str` | Yes | - | The workflow's permanent ID (`wpid_...`). |
+| `parameters` | `dict` | No | `None` | Input parameters defined in the workflow. Keys must match parameter names. |
+| `wait_for_completion` | `bool` | No | `False` | Block until the workflow finishes. |
+| `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
+| `run_with` | `str` | No | `None` | Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
+| `ai_fallback` | `bool` | No | `None` | Fall back to AI if the cached code fails. |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/optimization/browser-sessions). |
+| `browser_profile_id` | `str` | No | `None` | Load a [browser profile](/optimization/browser-profiles) (cookies, storage) into the session. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
+| `max_steps_override` | `int` | No | `None` | Cap total AI steps across all blocks. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
+| `title` | `str` | No | `None` | Display name for this run in the dashboard. |
+| `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
+| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `template` | `bool` | No | `None` | Run a template workflow. |
+| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
+| `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
+| `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
+
+### Returns `WorkflowRunResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `str` | Unique identifier. Starts with `wr_` for workflow runs. |
+| `status` | `str` | `created`, `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, or `canceled`. |
+| `output` | `dict \| None` | Extracted data from the workflow's output block. |
+| `downloaded_files` | `list[FileInfo] \| None` | Files downloaded during the run. |
+| `recording_url` | `str \| None` | URL to the session recording. |
+| `failure_reason` | `str \| None` | Error description if the run failed. |
+| `app_url` | `str \| None` | Link to view this run in the Cloud UI. |
+| `step_count` | `int \| None` | Total AI steps taken across all blocks. |
+| `run_with` | `str \| None` | Whether the run used `"code"` or `"agent"`. |
+| `ai_fallback` | `bool \| None` | Whether AI fallback was configured. |
+| `script_run` | `ScriptRunResponse \| None` | Code execution result. Contains `ai_fallback_triggered` if code was used. |
+
+### Examples
+
+**Pass parameters to a workflow:**
+
+<CodeGroup>
+```python Python
+result = await client.run_workflow(
+    workflow_id="wpid_invoice_extraction",
+    parameters={
+        "company_name": "Acme Corp",
+        "date_range": "2025-01-01 to 2025-12-31",
+    },
+    wait_for_completion=True,
+)
+```
+
+```typescript TypeScript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_invoice_extraction",
+    parameters: {
+      company_name: "Acme Corp",
+      date_range: "2025-01-01 to 2025-12-31",
+    },
+  },
+  waitForCompletion: true,
+});
+```
+</CodeGroup>
+
+**Run with cached code (skip AI, use generated Playwright scripts):**
+
+```python
+result = await client.run_workflow(
+    workflow_id="wpid_daily_report",
+    run_with="code",
+    ai_fallback=True,  # Fall back to AI if code fails
+    wait_for_completion=True,
+)
+```
+
+**Run with a browser profile (skip login):**
+
+<CodeGroup>
+```python Python
+result = await client.run_workflow(
+    workflow_id="wpid_daily_report",
+    browser_profile_id="bpf_abc123",
+    wait_for_completion=True,
+)
+```
+
+```typescript TypeScript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_daily_report",
+    browser_profile_id: "bpf_abc123",
+  },
+  waitForCompletion: true,
+});
+```
+</CodeGroup>
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

@@ -34,7 +34,7 @@ A workflow that:
 
 ## Prerequisites
 
-- **Skyvern Cloud API key** — Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings) → API Keys
+- **Skyvern Cloud API key**: Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings) → API Keys
 
 Install the SDK:
 
@@ -169,7 +169,7 @@ Before defining the workflow, store the login email and password Skyvern will us
     </Steps>
   </Tab>
   <Tab title="API / SDK">
-    A **workflow definition** is a JSON or YAML file that describes your entire workflow — its metadata, parameters, and blocks. 
+    A **workflow definition** is a JSON or YAML file that describes your entire workflow: its metadata, parameters, and blocks. 
     
     This definition file contains no sensitive information (like credentials or input values) and can be shared publicly. Once we make this, it can either be uploaded via the Cloud UI or sent as an input parameter to `create_workflow()`. We'll do this in Step 4.
 
@@ -286,12 +286,12 @@ Parameters are the inputs your workflow accepts. Defining them upfront lets you 
 
 The workflow chains together several blocks to automate the full invoice collection process:
 
-1. **Login block** — Authenticates to the vendor portal using stored credentials
-2. **Navigation block** — Navigates to order history and applies date filters
-3. **Extraction block** — Extracts order metadata from the filtered results
-4. **For loop + File download** — Iterates over each order and downloads its invoice PDF
-5. **For loop + File parser** — Parses each downloaded PDF to extract structured data
-6. **Send email** — Sends a summary with PDFs attached to the recipient
+1. **Login block**: Authenticates to the vendor portal using stored credentials
+2. **Navigation block**: Navigates to order history and applies date filters
+3. **Extraction block**: Extracts order metadata from the filtered results
+4. **For loop + File download**: Iterates over each order and downloads its invoice PDF
+5. **For loop + File parser**: Parses each downloaded PDF to extract structured data
+6. **Send email**: Sends a summary with PDFs attached to the recipient
 
 In the Cloud UI, click the **+** button after the Start node to add blocks sequentially. For SDK users, add each block to the `blocks` array in your workflow definition file.
 
@@ -745,16 +745,16 @@ Send a summary email with PDFs attached.
       <Step title="Block 1: Login">
         Add a **Login** block. Set **URL** to the `portal_url` parameter. Select the `credentials` parameter. Set the goal: "Log in using the provided credentials. Handle any cookie consent popups. COMPLETE when on the account dashboard or orders page." In **Advanced Settings**, add error messages for `INVALID_CREDENTIALS` and `ACCOUNT_LOCKED`.
       </Step>
-      <Step title="Block 2: Navigation — filter orders">
+      <Step title="Block 2: Navigation (filter orders)">
         Add a **Navigation** block. Leave **URL** empty (continues from login). Add `start_date` and `end_date` as parameter keys. Set the goal: "Navigate to Order History or My Orders. Filter orders between start_date and end_date. Click the Filter button. COMPLETE when filtered results are visible."
       </Step>
-      <Step title="Block 3: Extraction — order metadata">
+      <Step title="Block 3: Extraction (order metadata)">
         Add an **Extraction** block. Set the goal: "Extract all visible orders: order ID, date, total amount, and status." Paste the orders JSON schema into **Data Schema**.
       </Step>
-      <Step title="Block 4: For Loop — download invoices">
+      <Step title="Block 4: For Loop (download invoices)">
         Add a **For Loop** block. Set **Loop Variable** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Next Loop on Failure**. Inside the loop, add a **File Download** block with goal: "Find order (current order ID). Click Download Invoice. COMPLETE when the PDF download starts." Set **Download Suffix** to `invoice_(order_id).pdf`.
       </Step>
-      <Step title="Block 5: For Loop — parse invoices">
+      <Step title="Block 5: For Loop (parse invoices)">
         Add another **For Loop** block with the same loop variable. Inside the loop, add a **File URL Parser** block. Set **File URL** to `SKYVERN_DOWNLOAD_DIRECTORY/invoice_(order_id).pdf`, **File Type** to PDF, and paste the invoice JSON schema.
       </Step>
       <Step title="Block 6: Send Email">
@@ -1230,13 +1230,13 @@ Create the workflow from your definition file and execute it.
 ## Resources
 
 <CardGroup cols={2}>
-  <Card title="Workflow Blocks Reference" icon="cube" href="/multi-step-automations/workflow-blocks-reference">
+  <Card title="Workflow Blocks Reference" icon="cube" href="/cloud/building-workflows/configure-blocks">
     Complete parameter reference for all block types
   </Card>
-  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials">
+  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials/create-credential">
     Securely store and use login credentials
   </Card>
-  <Card title="File Operations" icon="file" href="/multi-step-automations/file-operations">
+  <Card title="File Operations" icon="file" href="/cloud/building-workflows/configure-blocks">
     Download, parse, and upload files in workflows
   </Card>
   <Card title="Error Handling" icon="triangle-exclamation" href="/going-to-production/error-handling">

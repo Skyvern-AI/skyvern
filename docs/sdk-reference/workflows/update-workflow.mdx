@@ -1,0 +1,103 @@
+---
+title: update_workflow
+slug: sdk-reference/workflows/update-workflow
+---
+
+Update an existing workflow's definition.
+
+<CodeGroup>
+```python Python
+updated = await client.update_workflow(
+    "wpid_abc123",
+    json_definition={
+        "title": "Extract Products",
+        "workflow_definition": {
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "extract_data",
+                    "prompt": "Extract the top 5 products",
+                    "url": "https://example.com/products",
+                }
+            ],
+            "parameters": [],
+        },
+    },
+)
+print(f"Updated to v{updated.version}")
+```
+
+```typescript TypeScript
+const updated = await skyvern.updateWorkflow("wpid_abc123", {
+  json_definition: {
+    title: "Extract Products Updated",
+    workflow_definition: {
+      blocks: [
+        {
+          block_type: "task",
+          label: "extract_data",
+          prompt: "Extract the top 5 products",
+          url: "https://example.com/products",
+        },
+      ],
+      parameters: [],
+    },
+  },
+});
+console.log(`Updated to v${updated.version}`);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_id` | `str` | Yes | The workflow's permanent ID (`wpid_...`). |
+| `json_definition` | `WorkflowCreateYamlRequest` | No | Updated definition as a JSON object. |
+| `yaml_definition` | `str` | No | Updated definition as a YAML string. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `Workflow`
+
+Creates a new version of the workflow.
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

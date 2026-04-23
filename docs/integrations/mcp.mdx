@@ -1,7 +1,7 @@
 ---
 title: MCP Server
 subtitle: Connect AI assistants to browser automation via Model Context Protocol
-description: Install and configure Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, Hermes, and other AI tools can run browser automations.
+description: Install and configure Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, VS Code, Hermes, and other AI tools can run browser automations.
 slug: going-to-production/mcp
 keywords:
   - MCP
@@ -26,7 +26,7 @@ The MCP server exposes 75+ tools across many categories. Here are the key ones:
 
 | Category | Key tools | What they do |
 |----------|-----------|--------------|
-| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions — including connecting to a local browser via CDP |
+| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions, including connecting to a local browser via CDP |
 | **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language, CSS/XPath selectors, or both (hybrid mode) |
 | **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured JSON from pages, capture screenshots, run JavaScript |
 | **Validation** | `skyvern_validate` | Assert page conditions in natural language (returns true/false with reasoning) |
@@ -41,7 +41,7 @@ Your AI assistant decides which tools to call based on your instructions. For ex
 
 | | Cloud setup (recommended) | Local mode |
 |---|---|---|
-| **Best for** | Most users — Skyvern Cloud handles everything | Self-hosting Skyvern with your own infrastructure |
+| **Best for** | Most users (Skyvern Cloud handles everything) | Self-hosting Skyvern with your own infrastructure |
 | **Install required** | None | Python 3.11+ and `pip install skyvern` |
 | **How it connects** | Your AI client connects to Skyvern Cloud over HTTPS | A local Python process runs on your machine |
 | **API key** | From [app.skyvern.com](https://app.skyvern.com) | From your self-hosted Skyvern instance |
@@ -160,7 +160,7 @@ x-api-key = "SKYVERN_API_KEY"
 </Tab>
 <Tab title="Hermes">
 
-Using the Skyvern CLI (recommended — writes to all Hermes profiles automatically):
+Using the Skyvern CLI (recommended, writes to all Hermes profiles automatically):
 
 ```bash
 pip install skyvern
@@ -231,7 +231,7 @@ For local stdio mode (self-hosted), use `skyvern setup openclaw --local` instead
 </Tab>
 <Tab title="MCPorter">
 
-MCPorter auto-discovers Skyvern from your existing MCP client configs (Cursor, Claude Code, Windsurf, etc.). If you've already set up Skyvern in any of those clients, MCPorter finds it automatically — no extra configuration needed.
+MCPorter auto-discovers Skyvern from your existing MCP client configs (Cursor, Claude Code, Windsurf, etc.). If you've already set up Skyvern in any of those clients, MCPorter finds it automatically. No extra configuration needed.
 
 To check what MCPorter can discover:
 
@@ -243,7 +243,7 @@ skyvern setup mcporter
 </Tab>
 </Tabs>
 
-That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
+That's it. No Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
 
 <Tip>
 Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
@@ -425,7 +425,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 
 ## Connect to your local browser
 
-You can point your AI assistant at a browser running on your machine instead of a cloud browser. This lets you automate internal tools on localhost, reuse existing login sessions, and verify local dev changes — all through the same MCP tools.
+You can point your AI assistant at a browser running on your machine instead of a cloud browser. This lets you automate internal tools on localhost, reuse existing login sessions, and verify local dev changes, all through the same MCP tools.
 
 Start a local browser with a tunnel so Skyvern Cloud can reach it:
 
@@ -440,7 +440,7 @@ This launches Chrome with your existing cookies and logins, and creates an ngrok
 The `--use-local-profile` flag clones auth-relevant data from your default Chrome profile (cookies, saved passwords, local storage) so the browser starts pre-authenticated. Your original profile is never modified.
 
 <Tip>
-This is especially powerful during development: make a code change, then ask your AI assistant to navigate to `localhost:3000` and verify it works — fix code and validate in the same prompt.
+This is especially powerful during development: make a code change, then ask your AI assistant to navigate to `localhost:3000` and verify it works. Fix code and validate in the same prompt.
 </Tip>
 
 <Warning>
@@ -453,7 +453,7 @@ Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern
 
 ## QA your frontend changes
 
-For the local self-hosted path, run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills — including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+For the local self-hosted path, run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
 
 ```bash
 pip install skyvern
@@ -466,13 +466,13 @@ Then make a frontend change and type `/qa` in Claude Code. It will:
 1. Read your `git diff` and the full source of each changed file
 2. Generate targeted test cases (plus regression tests for adjacent behavior)
 3. Open a browser against your running dev server
-4. Run the tests — navigate, click, fill forms, check the DOM
+4. Run the tests (navigate, click, fill forms, check the DOM)
 5. Report pass/fail with screenshots
 
 For localhost testing, start your local Skyvern backend and frontend. You do not need `skyvern browser serve --tunnel` for this path.
 
 <Tip>
-The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff — no test files to maintain.
+The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff, so there are no test files to maintain.
 </Tip>
 
 ## Troubleshooting
@@ -484,7 +484,7 @@ If you recently regenerated your API key, run `skyvern mcp switch` if you instal
 </Accordion>
 
 <Accordion title="Tools not responding or timing out">
-Skyvern browser sessions take a few seconds to start. If a tool call times out, try again — the first call in a new session is slower than subsequent ones.
+Skyvern browser sessions take a few seconds to start. If a tool call times out, try again. The first call in a new session is slower than subsequent ones.
 
 If timeouts persist, check that your Skyvern account is active and has available credits at [app.skyvern.com](https://app.skyvern.com).
 </Accordion>

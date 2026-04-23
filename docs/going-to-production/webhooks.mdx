@@ -156,7 +156,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 </CodeGroup>
 
 <Info>
-When creating a workflow, use `webhook_callback_url` inside `json_definition` — this sets the default for all runs. When running a workflow, use `webhook_url` at the top level to override for that specific run.
+When creating a workflow, use `webhook_callback_url` inside `json_definition`; this sets the default for all runs. When running a workflow, use `webhook_url` at the top level to override for that specific run.
 </Info>
 
 **Quick reference:**
@@ -168,7 +168,7 @@ When creating a workflow, use `webhook_callback_url` inside `json_definition` �
 | Workflow run (override) | `webhook_url` | Top-level parameter |
 
 <Warning>
-**Watch the parameter names.** Using `webhook_url` when creating a workflow (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error—your runs will just complete without notifications.
+**Watch the parameter names.** Using `webhook_url` when creating a workflow (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error. Your runs will just complete without notifications.
 </Warning>
 
 ---
@@ -262,8 +262,8 @@ User-Agent: python-httpx/0.28.1
 Skyvern signs every webhook with your API key using HMAC-SHA256, so you can verify the request actually came from Skyvern before acting on it.
 
 **Headers sent with every webhook:**
-- `x-skyvern-signature` — HMAC-SHA256 signature of the payload
-- `x-skyvern-timestamp` — Unix timestamp when the webhook was sent
+- `x-skyvern-signature`: HMAC-SHA256 signature of the payload
+- `x-skyvern-timestamp`: Unix timestamp when the webhook was sent
 - `Content-Type: application/json`
 
 <CodeGroup>
@@ -377,7 +377,7 @@ Never use simple equality operators (`==` or `===`) for signature comparison as 
 
 ## Handling webhook failures
 
-Task execution and webhook delivery are independent—a task can succeed while webhook delivery fails. When this happens, the run shows `status: "failed"` even though your data was extracted successfully.
+Task execution and webhook delivery are independent; a task can succeed while webhook delivery fails. When this happens, the run shows `status: "failed"` even though your data was extracted successfully.
 
 ```mermaid
 graph TD
@@ -457,10 +457,10 @@ Even when webhook delivery fails, the task's `output` field may still contain ex
 
 **Common reasons webhooks fail:**
 
-- **Server unreachable** — Your server is down, behind a firewall, or the URL is incorrect. Verify the URL is publicly accessible (not `localhost`) and check your server logs for incoming requests.
-- **Timeout** — Skyvern waits 10 seconds for a response. If your server takes longer, the delivery is marked as failed even if processing eventually succeeds. Return `200 OK` immediately and process the payload in a background job.
-- **Server returns an error** — Your endpoint received the payload but responded with a non-2xx status code (e.g., 500). Check your server logs to identify the issue.
-- **Signature validation fails** — If your verification logic rejects the request, make sure you're validating against the raw request body, not parsed-and-re-serialized JSON (re-serializing changes the byte representation). Also verify you're using the same API key that created the run.
+- **Server unreachable**: Your server is down, behind a firewall, or the URL is incorrect. Verify the URL is publicly accessible (not `localhost`) and check your server logs for incoming requests.
+- **Timeout**: Skyvern waits 10 seconds for a response. If your server takes longer, the delivery is marked as failed even if processing eventually succeeds. Return `200 OK` immediately and process the payload in a background job.
+- **Server returns an error**: Your endpoint received the payload but responded with a non-2xx status code (e.g., 500). Check your server logs to identify the issue.
+- **Signature validation fails**: If your verification logic rejects the request, make sure you're validating against the raw request body, not parsed-and-re-serialized JSON (re-serializing changes the byte representation). Also verify you're using the same API key that created the run.
 
 **Recommended pattern:** Always have a fallback polling mechanism for critical workflows. If you don't receive a webhook within your expected window, call `get_run` to check if the run completed and retrieve the data directly.
 
@@ -469,7 +469,7 @@ Even when webhook delivery fails, the task's `output` field may still contain ex
 Once you've identified and fixed the issue, you can replay the webhook using `retry_run_webhook`.
 
 <Note>
-Skyvern does not automatically retry failed webhooks. This is intentional—automatic retries can cause duplicate processing if your server received the payload but returned an error. You must explicitly call `retry_run_webhook` after fixing the issue.
+Skyvern does not automatically retry failed webhooks. This is intentional: automatic retries can cause duplicate processing if your server received the payload but returned an error. You must explicitly call `retry_run_webhook` after fixing the issue.
 </Note>
 
 <CodeGroup>
@@ -509,14 +509,14 @@ curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_486305187432193504/retry_we
 </CodeGroup>
 
 <Warning>
-`retry_run_webhook` is fire-and-forget—it returns immediately without waiting for delivery confirmation. To verify success, monitor your webhook endpoint directly or check the run's `failure_reason` field after a short delay.
+`retry_run_webhook` is fire-and-forget; it returns immediately without waiting for delivery confirmation. To verify success, monitor your webhook endpoint directly or check the run's `failure_reason` field after a short delay.
 </Warning>
 
 <Tip>
-**Implement idempotency.** If you call `retry_run_webhook`, you may receive the same payload twice (once from the original attempt that your server processed but returned an error, and once from the retry). Use the `run_id` as an idempotency key—check if you've already processed this run before taking action.
+**Implement idempotency.** If you call `retry_run_webhook`, you may receive the same payload twice (once from the original attempt that your server processed but returned an error, and once from the retry). Use the `run_id` as an idempotency key: check if you've already processed this run before taking action.
 </Tip>
 
-You can pass a different `webhook_url` to send the payload to a new endpoint—useful if the original URL was misconfigured.
+You can pass a different `webhook_url` to send the payload to a new endpoint; useful if the original URL was misconfigured.
 
 ---
 

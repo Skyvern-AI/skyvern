@@ -1,0 +1,80 @@
+---
+title: get_workflows
+slug: sdk-reference/workflows/get-workflows
+---
+
+List all workflows. Supports filtering and pagination.
+
+<CodeGroup>
+```python Python
+workflows = await client.get_workflows()
+for wf in workflows:
+    print(f"{wf.title} ({wf.workflow_permanent_id})")
+```
+
+```typescript TypeScript
+const workflows = await skyvern.getWorkflows({});
+for (const wf of workflows) {
+  console.log(`${wf.title} (${wf.workflow_permanent_id})`);
+}
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `page` | `int` | No | `None` | Page number for pagination. |
+| `page_size` | `int` | No | `None` | Number of results per page. |
+| `only_saved_tasks` | `bool` | No | `None` | Only return saved tasks. |
+| `only_workflows` | `bool` | No | `None` | Only return workflows (not saved tasks). |
+| `only_templates` | `bool` | No | `None` | Only return templates. |
+| `template` | `bool` | No | `None` | Only return template workflows. |
+| `title` | `str` | No | `None` | Filter by title. Deprecated - use `search_key` instead. |
+| `search_key` | `str` | No | `None` | Case-insensitive substring search across workflow title, folder name, and parameter metadata. |
+| `folder_id` | `str` | No | `None` | Filter by folder. |
+| `status` | `WorkflowStatus \| list[WorkflowStatus]` | No | `None` | Filter by status. |
+| `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
+
+### Returns `list[Workflow]`
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

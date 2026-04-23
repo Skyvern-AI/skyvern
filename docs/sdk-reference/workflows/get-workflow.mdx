@@ -1,0 +1,74 @@
+---
+title: get_workflow
+slug: sdk-reference/workflows/get-workflow
+---
+
+<Info>
+Python: requires `skyvern` version 1.1.0 or later. Run `pip install --upgrade skyvern` to update.
+</Info>
+
+Get a specific workflow by its permanent ID.
+
+<CodeGroup>
+```python Python
+workflow = await client.get_workflow("wpid_abc123")
+print(workflow.title, f"v{workflow.version}")
+```
+
+```typescript TypeScript
+const workflow = await skyvern.getWorkflow("wpid_abc123");
+console.log(workflow.title, `v${workflow.version}`);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_permanent_id` | `str` | Yes | The workflow's permanent ID. |
+| `version` | `int` | No | Specific version to retrieve. Defaults to latest. |
+| `template` | `bool` | No | Whether to fetch a template workflow. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `Workflow`
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

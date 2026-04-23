@@ -1,0 +1,342 @@
+export const ApiKeyPrompt = ({ children }) => {
+  const [apiKey, setApiKey] = useState("");
+  const [copied, setCopied] = useState(false);
+  const text = typeof children === "string" ? children : String(children);
+  const lines = text.split("\n");
+  const indents = lines.slice(1).filter(l => l.trim()).map(l => l.match(/^(\s*)/)[1].length);
+  const min = indents.length ? Math.min(...indents) : 0;
+  const raw = min > 0 ? lines.map((l, i) => i === 0 ? l : l.slice(min)).join("\n") : text;
+  const content = apiKey ? raw.replace(/PASTE_YOUR_API_KEY_HERE/g, apiKey) : raw;
+  return (
+    <div>
+      <input
+        type="text"
+        placeholder="Paste your Skyvern API key"
+        value={apiKey}
+        onChange={(e) => setApiKey(e.target.value)}
+        spellCheck={false}
+        autoComplete="off"
+        style={{
+          width: "100%",
+          padding: "10px 14px",
+          marginBottom: "12px",
+          borderRadius: "8px",
+          border: "1px solid var(--border, #d1d5db)",
+          fontSize: "14px",
+          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+          backgroundColor: "var(--background, transparent)",
+          color: "inherit",
+          outline: "none",
+          boxSizing: "border-box",
+        }}
+      />
+      <div style={{ position: "relative", borderRadius: "8px", overflow: "hidden" }}>
+        <button
+          onClick={async () => {
+            await navigator.clipboard.writeText(content);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          }}
+          style={{
+            position: "absolute",
+            top: "10px",
+            right: "10px",
+            padding: "4px 12px",
+            fontSize: "12px",
+            borderRadius: "6px",
+            border: "none",
+            backgroundColor: "rgba(255, 255, 255, 0.1)",
+            color: "#a1a1aa",
+            cursor: "pointer",
+            zIndex: 1,
+          }}
+        >
+          {copied ? "Copied!" : "Copy"}
+        </button>
+        <pre style={{
+          margin: 0,
+          padding: "16px",
+          overflowX: "auto",
+          fontSize: "13px",
+          lineHeight: "1.7",
+          backgroundColor: "#0d1117",
+          color: "#e6edf3",
+        }}>
+          <code>{content}</code>
+        </pre>
+      </div>
+    </div>
+  );
+};
+
+Skyvern lets AI coding assistants (Claude Code, Cursor, Windsurf, Codex) control browsers, extract data, and run workflows. 
+
+**Copy the prompt below** into your AI coding agent and you'll have a running automation in minutes.
+
+<Note>
+Looking to self-host instead? See the [local installation guide](/getting-started/quickstart) for full setup instructions.
+</Note>
+
+## 1. Get your API key
+
+Go to [app.skyvern.com/settings](https://app.skyvern.com/settings) and get your API key.
+
+<Frame>
+  <img src="/images/get-api-key.png" alt="Skyvern Settings page showing the API Keys section with a masked key and reveal/copy buttons" width="500" />
+</Frame>
+
+## 2. Give this prompt to your AI coding agent
+
+Paste your API key below, then copy the prompt into your AI coding assistant. 
+
+It will:
+1. Install the Skyvern Python/TypeScript SDK
+2. Ask what you want to automate (say "Go to Hacker News and get the top comment of the #1 post" for example)
+3. Write a browser automation that launches a cloud browser, runs AI actions on pages, and prints the result
+
+<Tabs>
+<Tab title="Python">
+
+<ApiKeyPrompt>{`Set up Skyvern for browser automation:
+
+1. Install the Skyvern Python SDK (requires Python 3.11, 3.12, or 3.13).
+   If you hit version errors, use pipx to install in an isolated environment:
+   pip install skyvern
+   # or: pipx install skyvern
+
+2. Install all Skyvern skills into this project:
+   skyvern skill copy --output .claude/skills/
+
+3. Set my API key:
+   export SKYVERN_API_KEY="PASTE_YOUR_API_KEY_HERE"
+
+Now ask me what I want to automate in the browser. Suggest this as a default:
+"Go to Hacker News and get the top comment of the #1 post"
+
+After I respond, create a skyvern-tasks/ folder and save a Python file there
+using this template, replacing <URL>, <TASK>, and the schema fields with what
+I asked for. Use the Page/Agent/Browser pattern: launch a cloud browser, get a
+page, then run AI actions on it.
+
+    import os
+    import asyncio
+    from skyvern import Skyvern
+
+    async def main():
+        skyvern = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+        # 1. Launch a cloud browser and get a page
+        browser = await skyvern.launch_cloud_browser()
+        page = await browser.get_working_page()
+
+        try:
+            await page.goto("<URL>")
+
+            # 2. For a multi-step goal (navigate + extract), use the agent
+            result = await page.agent.run_task(
+                "<TASK>",
+                data_extraction_schema={
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                    },
+                },
+            )
+
+            print(f"Status: {result.status}")
+            print(f"View run: {result.app_url}")
+            print(f"Steps used: {result.step_count}")
+            if result.output is not None:
+                print(f"Output: {result.output}")
+            elif result.failure_reason:
+                print(f"Failed: {result.failure_reason}")
+        finally:
+            # 3. Always close the browser to release cloud resources
+            await browser.close()
+
+    asyncio.run(main())
+
+Run the file and show me the output.
+
+Notes:
+- For one-shot extraction on a single page, use page.extract() directly instead of agent.run_task().
+- For anything requiring login, use page.agent.login() before the task.
+- Always wrap browser usage in try/finally with browser.close().
+
+Reference docs you can fetch as needed:
+- https://skyvern.com/docs/llms.txt (full page index, LLM-friendly)
+- https://skyvern.com/docs/sdk-reference/complete-reference.md (every SDK method, parameter, and type; unified Python + TypeScript)
+- https://skyvern.com/docs/api-reference/openapi.json (OpenAPI spec for the REST API)`}</ApiKeyPrompt>
+
+</Tab>
+<Tab title="TypeScript">
+
+<ApiKeyPrompt>{`Set up Skyvern for browser automation:
+
+1. Initialize a Node.js project (if needed) and install the Skyvern TypeScript SDK:
+   npm init -y
+   npm install @skyvern/client
+
+2. Set my API key:
+   export SKYVERN_API_KEY="PASTE_YOUR_API_KEY_HERE"
+
+Now ask me what I want to automate in the browser. Suggest this as a default:
+"Go to Hacker News and get the top comment of the #1 post"
+
+After I respond, create a skyvern-tasks/ folder and save a TypeScript file there
+using this template, replacing <URL>, <TASK>, and the schema fields with what
+I asked for. Use the Page/Agent/Browser pattern: launch a cloud browser, get a
+page, then run AI actions on it.
+
+    import { Skyvern } from "@skyvern/client";
+
+    async function main() {
+      const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY });
+
+      // 1. Launch a cloud browser and get a page
+      const browser = await skyvern.launchCloudBrowser();
+      const page = await browser.getWorkingPage();
+
+      try {
+        await page.goto("<URL>");
+
+        // 2. For a multi-step goal (navigate + extract), use the agent
+        const result = await page.agent.runTask("<TASK>", {
+          dataExtractionSchema: {
+            type: "object",
+            properties: {
+              answer: { type: "string" },
+            },
+          },
+        });
+
+        console.log(\`Status: \${result.status}\`);
+        console.log(\`View run: \${result.appUrl}\`);
+        console.log(\`Steps used: \${result.stepCount}\`);
+        if (result.output != null) {
+          console.log("Output:", result.output);
+        } else if (result.failureReason) {
+          console.log(\`Failed: \${result.failureReason}\`);
+        }
+      } finally {
+        // 3. Always close the browser to release cloud resources
+        await browser.close();
+      }
+    }
+
+    main();
+
+Run the file and show me the output.
+
+Notes:
+- For one-shot extraction on a single page, use page.extract() directly instead of agent.runTask().
+- For anything requiring login, use page.agent.login() before the task.
+- Always wrap browser usage in try/finally with browser.close().
+
+Reference docs you can fetch as needed:
+- https://skyvern.com/docs/llms.txt (full page index, LLM-friendly)
+- https://skyvern.com/docs/sdk-reference/complete-reference.md (every SDK method, parameter, and type; unified Python + TypeScript)
+- https://skyvern.com/docs/api-reference/openapi.json (OpenAPI spec for the REST API)`}</ApiKeyPrompt>
+
+</Tab>
+</Tabs>
+
+## 3. Next steps
+
+### Connect the MCP server
+
+Give your AI coding assistant direct browser control through natural language. No SDK code needed.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
+```
+
+</Tab>
+<Tab title="Cursor">
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Windsurf">
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Codex">
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.skyvern]
+url = "https://api.skyvern.com/mcp/"
+
+[mcp_servers.skyvern.http_headers]
+x-api-key = "YOUR_SKYVERN_API_KEY"
+```
+
+</Tab>
+</Tabs>
+
+### Keep building
+
+<CardGroup cols={2}>
+  <Card
+    title="Build a Browser Automation"
+    icon="browser"
+    href="/browser-automations/overview"
+  >
+    The full Page/Agent/Browser walkthrough
+  </Card>
+  <Card
+    title="SDK Reference"
+    icon="code"
+    href="/sdk-reference/complete-reference"
+  >
+    Every SDK method, parameter, and type (Python + TypeScript)
+  </Card>
+  <Card
+    title="Full MCP Reference"
+    icon="server"
+    href="/integrations/mcp"
+  >
+    All tools, config options, local mode, and troubleshooting
+  </Card>
+  <Card
+    title="llms.txt"
+    icon="file-lines"
+    href="https://skyvern.com/docs/llms.txt"
+  >
+    Machine-readable doc index for AI coding agents
+  </Card>
+</CardGroup>

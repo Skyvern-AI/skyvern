@@ -20,11 +20,20 @@ keywords:
 
 ## Install and initialize
 
-```bash
+<CodeGroup>
+```bash Python
+# Requires Python 3.11+
 pip install skyvern
 ```
 
-```python
+```bash TypeScript
+# Requires Node.js 18+
+npm install @skyvern/client
+```
+</CodeGroup>
+
+<CodeGroup>
+```python Python
 import asyncio
 from skyvern import Skyvern
 
@@ -40,406 +49,356 @@ async def main():
 asyncio.run(main())
 ```
 
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Get the title of the top post on Hacker News",
+    url: "https://news.ycombinator.com",
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+</CodeGroup>
+
 **Constructor:**
 
-```python
+<CodeGroup>
+```python Python
 Skyvern(
     api_key: str,                          # Required
     base_url: str | None = None,           # Override for self-hosted deployments
-    environment: SkyvernEnvironment = CLOUD,# CLOUD or LOCAL
+    environment: SkyvernEnvironment = CLOUD,# CLOUD, STAGING, or LOCAL
     timeout: float | None = None,          # HTTP request timeout (seconds)
 )
-```
 
-**Local mode** (runs entirely on your machine, reads `.env`):
-
-```python
+# Local mode (Python only - runs entirely on your machine, reads .env)
 client = Skyvern.local()
 ```
 
-All methods are async. Use `await` inside `async def`, with `asyncio.run()` as entry point.
+```typescript TypeScript
+new Skyvern({
+  apiKey: string,                              // Required
+  baseUrl?: string,                            // Override for self-hosted deployments
+  environment?: SkyvernEnvironment | string,   // Cloud (default), Staging, or Local
+  timeoutInSeconds?: number,                   // HTTP request timeout (default: 60)
+  maxRetries?: number,                         // Retry count (default: 2)
+  headers?: Record<string, string>,            // Additional headers
+})
+```
+</CodeGroup>
 
 ---
 
-## Browser control
+## Browser Automation
 
-The SDK can launch and connect to browsers directly, giving you a Playwright-compatible page with AI capabilities layered on top. This is separate from the API-level browser session methods — here you get a live `SkyvernBrowser` and `SkyvernBrowserPage` you can script against.
+### SkyvernBrowser
 
-### `launch_local_browser`
+<CodeGroup>
+```python Python
+# Launch / connect
+browser = await client.launch_cloud_browser(timeout=60, proxy_location=None)
+browser = await client.use_cloud_browser(timeout=60, proxy_location=None)
+browser = await client.connect_to_cloud_browser_session("pbs_abc123")
+browser = await client.connect_to_browser_over_cdp("http://localhost:9222")
+browser = await client.launch_local_browser(headless=False, port=9222)  # Python only
 
-Launch a local Chromium browser with CDP enabled. Requires local mode (`Skyvern.local()`).
-
-```python
-browser = await client.launch_local_browser(
-    headless: bool = False,          # Run headless or with a visible window.
-    port: int = 9222,                # CDP port.
-    args: list[str] | None = None,   # Extra Chromium flags.
-    user_data_dir: str | None = None,# Persistent profile directory.
-) -> SkyvernBrowser
+# Get pages
+page = await browser.get_working_page()   # Most recent page, or creates one
+page = await browser.new_page()            # Always creates a new tab
+page = await browser.get_page_for(pw_page) # Wrap existing Playwright Page (Python only)
+await browser.close()                      # Close browser and cloud session
 ```
 
-### `connect_to_browser_over_cdp`
+```typescript TypeScript
+// Launch / connect
+const browser = await skyvern.launchCloudBrowser({ timeout: 60 });
+const browser = await skyvern.useCloudBrowser({ timeout: 60 });
+const browser = await skyvern.connectToCloudBrowserSession("pbs_abc123");
+const browser = await skyvern.connectToBrowserOverCdp("http://localhost:9222");
+// launch_local_browser - Python only, no TS equivalent
 
-Connect to any running browser via Chrome DevTools Protocol.
-
-```python
-browser = await client.connect_to_browser_over_cdp(
-    cdp_url: str,                    # e.g. "http://localhost:9222"
-) -> SkyvernBrowser
+// Get pages
+const page = await browser.getWorkingPage();   // Most recent page, or creates one
+const page = await browser.newPage();           // Always creates a new tab
+// get_page_for - Python only, no TS equivalent
+await browser.close();                          // Close browser and cloud session
 ```
+</CodeGroup>
 
-### `connect_to_cloud_browser_session`
+### SkyvernPage
 
-Connect to an existing cloud browser session by ID.
+AI-enhanced Playwright methods - pass a selector for standard Playwright, add a prompt for AI fallback, or use prompt alone for pure AI.
 
-```python
-browser = await client.connect_to_cloud_browser_session(
-    browser_session_id: str,
-) -> SkyvernBrowser
-```
-
-### `launch_cloud_browser`
-
-Create a new cloud browser session and connect to it.
-
-```python
-browser = await client.launch_cloud_browser(
-    timeout: int | None = None,              # Minutes (5-1440). Default 60.
-    proxy_location: ProxyLocation | None = None,
-) -> SkyvernBrowser
-```
-
-### `use_cloud_browser`
-
-Reuse the most recent available cloud session, or create a new one if none exists.
-
-```python
-browser = await client.use_cloud_browser(
-    timeout: int | None = None,
-    proxy_location: ProxyLocation | None = None,
-) -> SkyvernBrowser
-```
-
-### Getting a page
-
-```python
-page = await browser.get_working_page()  # Most recent page, or creates one
-page = await browser.new_page()          # Always creates a new tab
-```
-
-Both return a `SkyvernBrowserPage` — a Playwright `Page` with AI methods added.
-
----
-
-## Page-level AI methods
-
-`SkyvernBrowserPage` extends Playwright's `Page`. You can use all standard Playwright methods (`goto`, `fill`, `locator`, `screenshot`, etc.) plus these AI-powered methods.
-
-### `page.act`
-
-Perform an action described in natural language.
-
-```python
-await page.act(prompt: str) -> None
-```
-
-```python
+<CodeGroup>
+```python Python
+# act - freeform AI action
 await page.act("Click the login button")
-await page.act("Select 'United States' from the country dropdown")
-```
 
-### `page.click` (AI-enhanced)
+# extract - structured data extraction
+data = await page.extract("Extract all products", schema={...})
 
-Click an element using a CSS selector, an AI prompt, or both with fallback.
+# validate - page state assertion, returns bool
+ok = await page.validate("User is logged in")
 
-```python
-await page.click(
-    selector: str | None = None,       # CSS selector.
-    prompt: str | None = None,         # Natural language target description.
-    ai: str | None = "fallback",       # "fallback" (try selector, then AI) or None.
-    **kwargs,                          # Standard Playwright click options.
-) -> str | None
-```
+# prompt - ask LLM about the page
+result = await page.prompt("What is the heading?", schema={...})
 
-```python
-# Selector only
+# locator - AI element locator returning chainable AILocator (Python only)
+locator = page.locator(prompt="the submit button")
+await locator.click()
+
+# click - selector, AI, or both with fallback
 await page.click("#submit-btn")
+await page.click(prompt="Click the submit button")
+await page.click("#submit-btn", prompt="Click submit")
 
-# AI only
-await page.click(prompt="Click the 'Submit Order' button")
+# fill - selector, AI, or both with fallback
+await page.fill("#email", value="user@example.com")
+await page.fill(prompt="Fill email with user@example.com")
 
-# Selector with AI fallback
-await page.click("#submit-btn", prompt="Click the submit button")
+# select_option - selector, AI, or both with fallback
+await page.select_option("#country", value="us")
+await page.select_option(prompt="Select United States")
+
+# type - character-by-character input (Python only)
+await page.type("#search", value="query")
+
+# hover (Python only)
+await page.hover("#menu-item", intention="Hover over the menu")
+
+# scroll (Python only)
+await page.scroll(0, 500)
+
+# upload_file (Python only)
+await page.upload_file("#file-input", files="/path/to/file.pdf")
+
+# fill_form - AI full form fill (Python only)
+await page.fill_form(data={"name": "John", "email": "john@example.com"})
+
+# fill_multipage_form - across page transitions (Python only)
+await page.fill_multipage_form(data={...}, max_pages=5)
+
+# fill_from_mapping - explicit field→value mapping (Python only)
+await page.fill_from_mapping(form_fields=fields, mapping={0: "John"}, data={...})
+
+# extract_form_fields - get all fields with metadata (Python only)
+fields = await page.extract_form_fields()
+
+# validate_mapping - verify mapping works (Python only)
+is_valid = await page.validate_mapping(form_fields=fields, mapping={...}, prompt="Validate fields")
+
+# fill_autocomplete - typeahead handling (Python only)
+await page.fill_autocomplete(selector="#city", value="San Francisco")
+
+# frame_switch - switch iframe context (Python only)
+await page.frame_switch(selector="#payment-iframe")
+page.frame_main()                    # back to main frame
+frames = await page.frame_list()     # list all frames
 ```
 
-### `page.extract`
+```typescript TypeScript
+// act - freeform AI action
+await page.act("Click the login button");
 
-Extract structured data from the current page using AI.
+// extract - structured data extraction
+const data = await page.extract({ prompt: "Extract all products", schema: {...} });
 
-```python
-result = await page.extract(
-    prompt: str,                               # What to extract.
-    schema: dict | list | str | None = None,   # JSON Schema for the output.
-    error_code_mapping: dict[str, str] | None = None,
-) -> dict | list | str | None
+// validate - page state assertion, returns boolean
+const ok = await page.validate("User is logged in");
+
+// prompt - ask LLM about the page
+const result = await page.prompt("What is the heading?", { heading: { type: "string" } });
+
+// find / AILocator - Python only, no TS equivalent
+
+// click - selector, AI, or both with fallback
+await page.click("#submit-btn");
+await page.click({ prompt: "Click the submit button" });
+await page.click("#submit-btn", { prompt: "Click submit" });
+
+// fill - selector, AI, or both with fallback
+await page.fill("#email", "user@example.com");
+await page.fill({ prompt: "Fill email with user@example.com" });
+
+// selectOption - selector, AI, or both with fallback
+await page.selectOption("#country", "us");
+await page.selectOption({ prompt: "Select United States" });
+
+// type, hover, scroll, upload_file - Python only
+// fill_form, fill_multipage_form, fill_from_mapping - Python only
+// extract_form_fields, validate_mapping, fill_autocomplete - Python only
+// frame_switch, frame_main, frame_list - Python only
+```
+</CodeGroup>
+
+### Page Agent
+
+Full task/workflow execution in the context of the current page. Always waits for completion.
+
+<CodeGroup>
+```python Python
+# run_task
+result = await page.agent.run_task("Fill out the form", data_extraction_schema={...}, max_steps=10, timeout=1800)
+
+# login - supports skyvern, bitwarden, onepassword, azure_vault
+await page.agent.login(credential_type=CredentialType.skyvern, credential_id="cred_123")
+
+# download_files
+result = await page.agent.download_files("Download the invoice PDF", download_suffix=".pdf")
+
+# run_workflow
+result = await page.agent.run_workflow("wpid_abc123", parameters={"key": "value"})
 ```
 
-```python
-products = await page.extract(
-    prompt="Extract all products with name and price",
-    schema={
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "price": {"type": "number"},
-            },
-        },
-    },
-)
+```typescript TypeScript
+// runTask
+const result = await page.agent.runTask("Fill out the form", {
+  dataExtractionSchema: {...}, maxSteps: 10, timeout: 1800,
+});
+
+// login - supports skyvern, bitwarden, 1password, azure_vault
+await page.agent.login("skyvern", { credentialId: "cred_123" });
+
+// downloadFiles
+const result = await page.agent.downloadFiles("Download the invoice PDF", {
+  downloadSuffix: ".pdf",
+});
+
+// runWorkflow
+const result = await page.agent.runWorkflow("wpid_abc123", {
+  parameters: { key: "value" },
+});
 ```
-
-### `page.agent.run_task`
-
-Run an AI task in the context of the current page. Always waits for completion.
-
-```python
-result = await page.agent.run_task(
-    prompt: str,
-    engine: RunEngine = RunEngine.skyvern_v2,
-    url: str | None = None,           # Defaults to current page URL.
-    data_extraction_schema: dict | str | None = None,
-    max_steps: int | None = None,
-    timeout: float = 1800,
-    # Plus: model, webhook_url, totp_identifier, totp_url, title, error_code_mapping, user_agent
-) -> TaskRunResponse
-```
-
-### `page.agent.login`
-
-Run a login workflow in the context of the current page. Supports all credential types.
-
-```python
-# Skyvern credentials
-await page.agent.login(
-    credential_type=CredentialType.skyvern,
-    credential_id="cred_123",
-)
-
-# Bitwarden
-await page.agent.login(
-    credential_type=CredentialType.bitwarden,
-    bitwarden_item_id="item_id",
-)
-
-# 1Password
-await page.agent.login(
-    credential_type=CredentialType.onepassword,
-    onepassword_vault_id="vault_id",
-    onepassword_item_id="item_id",
-)
-
-# Azure Key Vault
-await page.agent.login(
-    credential_type=CredentialType.azure_vault,
-    azure_vault_name="vault_name",
-    azure_vault_username_key="username_key",
-    azure_vault_password_key="password_key",
-)
-```
-
-### `page.agent.download_files`
-
-Download files using AI navigation, in the context of the current page.
-
-```python
-result = await page.agent.download_files(
-    prompt: str,
-    url: str | None = None,
-    download_suffix: str | None = None,
-    download_timeout: float | None = None,
-    max_steps_per_run: int | None = None,
-    timeout: float = 1800,
-) -> WorkflowRunResponse
-```
-
-### `page.agent.run_workflow`
-
-Run a workflow in the context of the current page.
-
-```python
-result = await page.agent.run_workflow(
-    workflow_id: str,
-    parameters: dict | None = None,
-    timeout: float = 1800,
-) -> WorkflowRunResponse
-```
-
-### Full example
-
-```python
-from skyvern import Skyvern
-from skyvern.schemas.run_blocks import CredentialType
-
-async def main():
-    client = Skyvern(api_key="YOUR_API_KEY")
-    browser = await client.launch_cloud_browser()
-    page = await browser.get_working_page()
-
-    # Navigate and log in with AI
-    await page.goto("https://app.example.com")
-    await page.agent.login(
-        credential_type=CredentialType.skyvern,
-        credential_id="cred_123",
-    )
-
-    # Mix Playwright and AI
-    await page.click("#invoices-tab")
-    data = await page.extract(
-        prompt="Extract all invoice numbers and amounts",
-        schema={
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "invoice_number": {"type": "string"},
-                    "amount": {"type": "number"},
-                },
-            },
-        },
-    )
-    print(data)
-
-    await browser.close()
-
-import asyncio
-asyncio.run(main())
-```
-
----
-
-## Imports
-
-```python
-from skyvern import Skyvern
-from skyvern.client import SkyvernEnvironment              # CLOUD, LOCAL
-from skyvern.client.core import ApiError, RequestOptions   # Base error, per-request config
-from skyvern.client.errors import (                        # HTTP error subclasses
-    BadRequestError,       # 400
-    ForbiddenError,        # 403
-    NotFoundError,         # 404
-    ConflictError,         # 409
-    UnprocessableEntityError,  # 422
-)
-from skyvern.schemas.runs import RunEngine                 # skyvern_v1, skyvern_v2, openai_cua, anthropic_cua, ui_tars
-from skyvern.schemas.run_blocks import CredentialType      # skyvern, bitwarden, onepassword, azure_vault
-```
-
-**Important:** `ApiError` lives in `skyvern.client.core`, not `skyvern.client.errors`. The subclasses (`NotFoundError`, etc.) live in `skyvern.client.errors`.
+</CodeGroup>
 
 ---
 
 ## Tasks
 
-### `run_task`
+### run_task
 
-```python
+<CodeGroup>
+```python Python
 result = await client.run_task(
-    prompt: str,                                # Required. Natural language instructions.
-    url: str | None = None,                     # Starting page URL.
-    engine: RunEngine = RunEngine.skyvern_v2,   # AI engine.
-    wait_for_completion: bool = False,          # Block until finished.
-    timeout: float = 1800,                      # Max wait (seconds). Only with wait_for_completion.
-    max_steps: int | None = None,               # Cap AI steps to limit cost.
-    data_extraction_schema: dict | str | None = None,  # JSON Schema constraining output shape.
-    browser_session_id: str | None = None,      # Run in existing session.
-    publish_workflow: bool = False,             # Save generated code as reusable workflow.
+    prompt: str,                                # Required
+    url: str | None = None,
+    engine: RunEngine = RunEngine.skyvern_v2,
+    wait_for_completion: bool = False,
+    timeout: float = 1800,
+    max_steps: int | None = None,
+    data_extraction_schema: dict | str | None = None,
+    browser_session_id: str | None = None,
+    publish_workflow: bool = False,
     proxy_location: ProxyLocation | None = None,
     webhook_url: str | None = None,
     error_code_mapping: dict[str, str] | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
     title: str | None = None,
+    model: dict | None = None,
     user_agent: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    include_action_history_in_verification: bool | None = None,
+    max_screenshot_scrolls: int | None = None,
     browser_address: str | None = None,
+    run_with: str | None = None,
 ) -> TaskRunResponse
 ```
 
-**`TaskRunResponse` fields:**
+```typescript TypeScript
+const result = await skyvern.runTask({
+  body: {
+    prompt: string,                              // Required
+    url?: string,
+    engine?: RunEngine,                          // "skyvern_v2" default
+    max_steps?: number,
+    data_extraction_schema?: Record<string, unknown> | string,
+    browser_session_id?: string,
+    publish_workflow?: boolean,
+    proxy_location?: ProxyLocation,
+    webhook_url?: string,
+    error_code_mapping?: Record<string, string>,
+    totp_identifier?: string,
+    totp_url?: string,
+    title?: string,
+    model?: Record<string, unknown>,
+    user_agent?: string,
+    extra_http_headers?: Record<string, string>,
+    browser_address?: string,
+    run_with?: string,
+  },
+  waitForCompletion?: boolean,
+  timeout?: number,                              // Default: 1800
+}): Promise<TaskRunResponse>
+```
+</CodeGroup>
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `run_id` | `str` | Unique ID (`tsk_...`). |
-| `status` | `str` | `created` \| `queued` \| `running` \| `completed` \| `failed` \| `terminated` \| `timed_out` \| `canceled` |
-| `output` | `dict \| list \| None` | Extracted data. `None` until completed. |
-| `failure_reason` | `str \| None` | Error description if failed. |
-| `downloaded_files` | `list[FileInfo] \| None` | Files downloaded during the run. |
-| `recording_url` | `str \| None` | Session recording video URL. |
-| `screenshot_urls` | `list[str] \| None` | Final screenshots. |
-| `app_url` | `str \| None` | Link to run in Skyvern UI. |
-| `step_count` | `int \| None` | Number of AI steps taken. |
-| `created_at` | `datetime` | When the run was created. |
-| `finished_at` | `datetime \| None` | When the run finished. |
+**TaskRunResponse:** `run_id`, `status`, `output`, `failure_reason`, `downloaded_files`, `recording_url`, `screenshot_urls`, `app_url`, `step_count`, `script_run`, `created_at`, `finished_at`
 
-### `get_run`
+### get_run
 
-```python
-run = await client.get_run(run_id: str) -> GetRunResponse
+```
+get_run(run_id) → GetRunResponse
 ```
 
-Returns status and results for any run (task or workflow).
+### cancel_run
 
-### `cancel_run`
-
-```python
-await client.cancel_run(run_id: str)
+```
+cancel_run(run_id)
 ```
 
-### `get_run_timeline`
+### get_run_timeline
 
-```python
-timeline = await client.get_run_timeline(run_id: str) -> list[WorkflowRunTimeline]
+```
+get_run_timeline(run_id) → list[WorkflowRunTimeline]
 ```
 
-### `get_run_artifacts`
+### get_run_artifacts
 
-```python
-artifacts = await client.get_run_artifacts(
-    run_id: str,
-    artifact_type: ArtifactType | list[ArtifactType] | None = None,
-) -> list[Artifact]
+```
+get_run_artifacts(run_id, artifact_type?) → list[Artifact]
 ```
 
-### `get_artifact`
+### get_artifact
 
-```python
-artifact = await client.get_artifact(artifact_id: str) -> Artifact
+```
+get_artifact(artifact_id) → Artifact
 ```
 
-### `retry_run_webhook`
+### get_runs_v2
 
-```python
-await client.retry_run_webhook(run_id: str)
+```
+get_runs_v2(page?, page_size?, status?, search_key?) → list[TaskRunListItem]
+```
+
+### retry_run_webhook
+
+```
+retry_run_webhook(run_id, webhook_url?)
 ```
 
 ---
 
 ## Workflows
 
-### `run_workflow`
+### run_workflow
 
-```python
+<CodeGroup>
+```python Python
 result = await client.run_workflow(
     workflow_id: str,                       # Required. Permanent ID (wpid_...).
-    parameters: dict | None = None,         # Input params matching workflow definition.
+    parameters: dict | None = None,
     wait_for_completion: bool = False,
     timeout: float = 1800,
-    run_with: str | None = None,            # "code" (cached Playwright) or "agent" (AI).
-    ai_fallback: bool | None = None,        # Fall back to AI if code fails.
+    run_with: str | None = None,            # "code" or "agent"
+    ai_fallback: bool | None = None,
     browser_session_id: str | None = None,
-    browser_profile_id: str | None = None,  # Load saved browser state.
+    browser_profile_id: str | None = None,
     proxy_location: ProxyLocation | None = None,
     max_steps_override: int | None = None,
     webhook_url: str | None = None,
@@ -449,338 +408,222 @@ result = await client.run_workflow(
     totp_url: str | None = None,
     user_agent: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    max_screenshot_scrolls: int | None = None,
     browser_address: str | None = None,
 ) -> WorkflowRunResponse
 ```
 
-**`WorkflowRunResponse` fields:** Same as `TaskRunResponse` plus `run_with`, `ai_fallback`, `script_run`.
+```typescript TypeScript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: string,                       // Required
+    parameters?: Record<string, unknown>,
+    browser_session_id?: string,
+    browser_profile_id?: string,
+    proxy_location?: ProxyLocation,
+    webhook_url?: string,
+    title?: string,
+    totp_identifier?: string,
+    totp_url?: string,
+    user_agent?: string,
+    extra_http_headers?: Record<string, string>,
+    browser_address?: string,
+    ai_fallback?: boolean,
+    run_with?: string,
+  },
+  template?: boolean,
+  waitForCompletion?: boolean,
+  timeout?: number,                            // Default: 1800
+}): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
 
-### `create_workflow`
+**WorkflowRunResponse:** Same as TaskRunResponse plus `run_with`, `ai_fallback`, `script_run`.
 
-```python
-workflow = await client.create_workflow(
-    json_definition: dict | None = None,
-    yaml_definition: str | None = None,
-    folder_id: str | None = None,
-) -> Workflow
+### create_workflow
+
+```
+create_workflow(json_definition?, yaml_definition?, folder_id?) → Workflow
 ```
 
-Provide either `json_definition` or `yaml_definition`. Example:
+### get_workflow
 
-```python
-workflow = await client.create_workflow(
-    json_definition={
-        "title": "Extract Products",
-        "workflow_definition": {
-            "parameters": [
-                {
-                    "key": "target_url",
-                    "parameter_type": "workflow",
-                    "workflow_parameter_type": "string",
-                    "description": "URL to scrape",
-                }
-            ],
-            "blocks": [
-                {
-                    "block_type": "task",
-                    "label": "extract",
-                    "prompt": "Extract the top 3 products with name and price",
-                    "url": "{{ target_url }}",
-                }
-            ],
-        },
-    },
-)
-print(workflow.workflow_permanent_id)  # wpid_... — use this to run it
+```
+get_workflow(workflow_permanent_id, version?, template?) → Workflow
 ```
 
-**`Workflow` fields:** `workflow_id`, `workflow_permanent_id`, `version`, `title`, `workflow_definition`, `status`, `created_at`
+### get_workflows
 
-### `get_workflows`
-
-```python
-workflows = await client.get_workflows(
-    page: int | None = None,
-    page_size: int | None = None,
-    only_saved_tasks: bool | None = None,
-    only_workflows: bool | None = None,
-    title: str | None = None,
-    search_key: str | None = None,
-    folder_id: str | None = None,
-    status: WorkflowStatus | list[WorkflowStatus] | None = None,
-) -> list[Workflow]
+```
+get_workflows(page?, page_size?, only_saved_tasks?, only_workflows?, only_templates?, title?, search_key?, folder_id?, status?, template?) → list[Workflow]
 ```
 
-### `get_workflow`
+### get_workflow_versions
 
-```python
-workflow = await client.get_workflow(
-    workflow_permanent_id: str,
-    version: int | None = None,
-    template: bool | None = None,
-) -> Workflow
+```
+get_workflow_versions(workflow_permanent_id, template?) → list[Workflow]
 ```
 
-### `get_workflow_versions`
+### update_workflow
 
-```python
-versions = await client.get_workflow_versions(
-    workflow_permanent_id: str,
-    template: bool | None = None,
-) -> list[Workflow]
+```
+update_workflow(workflow_id, json_definition?, yaml_definition?) → Workflow
 ```
 
-### `update_workflow`
+### delete_workflow
 
-```python
-updated = await client.update_workflow(
-    workflow_id: str,          # The permanent ID (wpid_...).
-    json_definition: dict | None = None,
-    yaml_definition: str | None = None,
-) -> Workflow
+```
+delete_workflow(workflow_id)
 ```
 
-### `delete_workflow`
+### get_workflow_runs
 
-```python
-await client.delete_workflow(workflow_id: str)
 ```
+get_workflow_runs(page?, page_size?, status?, search_key?, error_code?) → list[WorkflowRun]
+```
+
+### update_workflow_folder
+
+```
+update_workflow_folder(workflow_permanent_id, folder_id?) → Workflow
+```
+
+**Workflow fields:** `workflow_id`, `workflow_permanent_id`, `version`, `title`, `workflow_definition`, `status`, `created_at`
 
 ---
 
-## Browser sessions
+## Browser Sessions
 
-A persistent browser instance that stays alive between API calls. Use to chain tasks without losing cookies or login state.
+### create_browser_session
 
-### `create_browser_session`
-
-```python
-session = await client.create_browser_session(
-    timeout: int | None = 60,               # Minutes (5-1440).
-    proxy_location: ProxyLocation | None = None,
-    extensions: list[Extensions] | None = None,      # "ad-blocker", "captcha-solver"
-    browser_type: PersistentBrowserType | None = None, # "chrome", "msedge"
-) -> BrowserSessionResponse
+```
+create_browser_session(timeout?, proxy_location?, extensions?, browser_type?, browser_profile_id?) → BrowserSessionResponse
 ```
 
-**`BrowserSessionResponse` fields:** `browser_session_id`, `status`, `browser_address`, `app_url`, `timeout`, `started_at`, `created_at`
+### get_browser_session
 
-### `get_browser_session`
-
-```python
-session = await client.get_browser_session(browser_session_id: str) -> BrowserSessionResponse
+```
+get_browser_session(browser_session_id) → BrowserSessionResponse
 ```
 
-### `get_browser_sessions`
+### get_browser_sessions
 
-```python
-sessions = await client.get_browser_sessions() -> list[BrowserSessionResponse]
+```
+get_browser_sessions() → list[BrowserSessionResponse]
 ```
 
-### `close_browser_session`
+### close_browser_session
 
-```python
-await client.close_browser_session(browser_session_id: str)
+```
+close_browser_session(browser_session_id)
 ```
 
-### Session chaining example
-
-```python
-session = await client.create_browser_session()
-
-# Step 1: Log in
-await client.run_task(
-    prompt="Log in with username demo@example.com",
-    url="https://app.example.com/login",
-    browser_session_id=session.browser_session_id,
-    wait_for_completion=True,
-)
-
-# Step 2: Extract data (same browser, already logged in)
-result = await client.run_task(
-    prompt="Go to the invoices page and extract all invoice numbers",
-    browser_session_id=session.browser_session_id,
-    wait_for_completion=True,
-)
-print(result.output)
-
-# Clean up
-await client.close_browser_session(session.browser_session_id)
-```
+**BrowserSessionResponse fields:** `browser_session_id`, `status`, `browser_address`, `app_url`, `timeout`, `started_at`, `created_at`
 
 ---
 
-## Browser profiles
+## Browser Profiles
 
-A saved snapshot of browser state (cookies, local storage). Persists indefinitely. Create from a completed workflow run, then reuse to skip login.
+### create_browser_profile
 
-### `create_browser_profile`
-
-```python
-profile = await client.create_browser_profile(
-    name: str,
-    description: str | None = None,
-    workflow_run_id: str | None = None,    # Run must have used persist_browser_session=True.
-    browser_session_id: str | None = None, # One of workflow_run_id or browser_session_id is required.
-) -> BrowserProfile
+```
+create_browser_profile(name, description?, workflow_run_id?, browser_session_id?) → BrowserProfile
 ```
 
-**`BrowserProfile` fields:** `browser_profile_id`, `name`, `description`, `created_at`
+### list_browser_profiles
 
-### `list_browser_profiles`
-
-```python
-profiles = await client.list_browser_profiles(
-    include_deleted: bool | None = None,
-) -> list[BrowserProfile]
+```
+list_browser_profiles(include_deleted?) → list[BrowserProfile]
 ```
 
-### `get_browser_profile`
+### get_browser_profile
 
-```python
-profile = await client.get_browser_profile(profile_id: str) -> BrowserProfile
+```
+get_browser_profile(profile_id) → BrowserProfile
 ```
 
-### `delete_browser_profile`
+### delete_browser_profile
 
-```python
-await client.delete_browser_profile(profile_id: str)
+```
+delete_browser_profile(profile_id)
 ```
 
-### Profile workflow example
-
-```python
-# Step 1: Run a login workflow
-run = await client.run_workflow(
-    workflow_id="wpid_login_flow",
-    parameters={"username": "demo@example.com"},
-    wait_for_completion=True,
-)
-
-# Step 2: Create a profile from the run
-profile = await client.create_browser_profile(
-    name="demo-account-login",
-    workflow_run_id=run.run_id,
-)
-
-# Step 3: Use the profile in future runs (skip login)
-result = await client.run_workflow(
-    workflow_id="wpid_extract_invoices",
-    browser_profile_id=profile.browser_profile_id,
-    wait_for_completion=True,
-)
-```
+**BrowserProfile fields:** `browser_profile_id`, `name`, `description`, `created_at`
 
 ---
 
 ## Credentials
 
-Store login information securely. Reference by ID instead of passing secrets in code.
+### create_credential
 
-### `create_credential`
-
-```python
-credential = await client.create_credential(
-    name: str,
-    credential_type: CredentialType,       # e.g. "password"
-    credential: dict,                      # Password: {"username": "...", "password": "..."}
-) -> CredentialResponse
+```
+create_credential(name, credential_type, credential, vault_type?) → CredentialResponse
 ```
 
-### `get_credentials`
+### get_credential
 
-```python
-creds = await client.get_credentials(
-    page: int | None = None,
-    page_size: int | None = None,
-) -> list[CredentialResponse]
+```
+get_credential(credential_id) → CredentialResponse
 ```
 
-### `get_credential`
+### get_credentials
 
-```python
-cred = await client.get_credential(credential_id: str) -> CredentialResponse
+```
+get_credentials(page?, page_size?, vault_type?) → list[CredentialResponse]
 ```
 
-### `delete_credential`
+### update_credential
 
-```python
-await client.delete_credential(credential_id: str)
+```
+update_credential(credential_id, name, credential_type, credential, vault_type?) → CredentialResponse
 ```
 
-### `send_totp_code`
+### delete_credential
 
-Send a TOTP code to Skyvern during a run that requires 2FA.
+```
+delete_credential(credential_id)
+```
 
-```python
-await client.send_totp_code(
-    totp_identifier: str,
-    content: str,               # The TOTP code value.
-    task_id: str | None = None,
-    workflow_id: str | None = None,
-    workflow_run_id: str | None = None,
-    source: str | None = None,
-    expired_at: datetime | None = None,
-) -> TotpCode
+### send_totp_code
+
+```
+send_totp_code(totp_identifier, content, task_id?, workflow_id?, workflow_run_id?, source?, expired_at?, type?) → TotpCode
 ```
 
 ---
 
-## Helper methods
+## Helpers
 
-### `login`
+### login
 
-Automate logging into a website using stored credentials.
-
-```python
-from skyvern.schemas.run_blocks import CredentialType
-
-result = await client.login(
-    credential_type: CredentialType,        # Required. skyvern, bitwarden, onepassword, azure_vault.
-    url: str | None = None,
-    credential_id: str | None = None,       # When using CredentialType.skyvern.
-    prompt: str | None = None,
-    browser_session_id: str | None = None,
-    wait_for_completion: bool = False,
-    timeout: float = 1800,
-    # Bitwarden: bitwarden_collection_id, bitwarden_item_id
-    # 1Password: onepassword_vault_id, onepassword_item_id
-    # Azure: azure_vault_name, azure_vault_username_key, azure_vault_password_key, azure_vault_totp_secret_key
-) -> WorkflowRunResponse
+```
+login(credential_type, url?, credential_id?, prompt?, browser_session_id?, browser_profile_id?, browser_address?, proxy_location?, webhook_url?, totp_identifier?, totp_url?, extra_http_headers?, max_screenshot_scrolling_times?, wait_for_completion?, timeout?) → WorkflowRunResponse
 ```
 
-### `download_files`
+Credential-specific parameters: `bitwarden_collection_id`, `bitwarden_item_id`, `onepassword_vault_id`, `onepassword_item_id`, `azure_vault_name`, `azure_vault_username_key`, `azure_vault_password_key`, `azure_vault_totp_secret_key`.
 
-Does **not** support `wait_for_completion`. Returns immediately — poll with `get_run()`.
+### download_files
 
-```python
-result = await client.download_files(
-    navigation_goal: str,                   # Required. What to download.
-    url: str | None = None,
-    browser_session_id: str | None = None,
-    browser_profile_id: str | None = None,
-    download_suffix: str | None = None,     # Expected extension, e.g. ".pdf"
-    download_timeout: float | None = None,
-    max_steps_per_run: int | None = None,
-) -> WorkflowRunResponse
+```
+download_files(navigation_goal, url?, browser_session_id?, browser_profile_id?, proxy_location?, webhook_url?, download_suffix?, download_timeout?, max_steps_per_run?, extra_http_headers?, totp_identifier?, totp_url?, browser_address?, max_screenshot_scrolling_times?) → WorkflowRunResponse
 ```
 
-### `upload_file`
+Python does not support `wait_for_completion` - poll with `get_run()`. TypeScript supports `waitForCompletion`.
 
-```python
-with open("data.csv", "rb") as f:
-    upload = await client.upload_file(file=f)
-    print(upload.s3uri)          # s3://skyvern-uploads/...
-    print(upload.presigned_url)  # https://...signed download URL
+### upload_file
+
+```
+upload_file(file) → UploadFileResponse
 ```
 
-Returns `UploadFileResponse` with fields: `s3uri`, `presigned_url`.
+Returns `s3uri` and `presigned_url`.
 
 ---
 
-## Error handling
+## Error Handling
 
-```python
+<CodeGroup>
+```python Python
 from skyvern.client.core import ApiError
 from skyvern.client.errors import NotFoundError
 
@@ -792,77 +635,60 @@ except ApiError as e:
     print(e.status_code, e.body)    # Any other HTTP error
 ```
 
-**Error types:** `BadRequestError` (400), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `UnprocessableEntityError` (422). All inherit from `ApiError`.
+```typescript TypeScript
+import { SkyvernError, SkyvernTimeoutError, SkyvernApi } from "@skyvern/client";
 
-**Completion timeout** raises Python's built-in `TimeoutError`:
-
-```python
-try:
-    result = await client.run_task(
-        prompt="...", url="...", wait_for_completion=True, timeout=300,
-    )
-except TimeoutError:
-    print("Task didn't complete in time")
+try {
+  const run = await skyvern.getRun("tsk_nonexistent");
+} catch (e) {
+  if (e instanceof SkyvernApi.NotFoundError) {
+    console.log(e.statusCode, e.body);    // 404
+  } else if (e instanceof SkyvernError) {
+    console.log(e.statusCode, e.body);    // Any other HTTP error
+  }
+}
 ```
+</CodeGroup>
 
-**Run failure** is not an exception — check `result.status`:
+**Error types:** `BadRequestError` (400), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `UnprocessableEntityError` (422). All inherit from `ApiError` (Python) or `SkyvernError` (TypeScript).
 
-```python
-if result.status == "failed":
-    print(result.failure_reason)
-elif result.status == "completed":
-    print(result.output)
-```
+Run failure is not an exception - check `result.status` (`completed`, `failed`, `terminated`, `timed_out`, `canceled`).
 
 ---
 
 ## Request options
 
-Override timeout, retries, or headers per-request:
+Every method accepts `request_options` (Python) or a second options argument (TypeScript) for per-request overrides:
 
-```python
+<CodeGroup>
+```python Python
 from skyvern.client.core import RequestOptions
 
-result = await client.run_task(
-    prompt="...",
-    url="...",
-    request_options=RequestOptions(
-        timeout_in_seconds=120,
-        max_retries=3,
-        additional_headers={"x-custom-header": "value"},
-    ),
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
 )
 ```
 
----
-
-## Polling pattern
-
-When not using `wait_for_completion`:
-
-```python
-import asyncio
-
-task = await client.run_task(prompt="...", url="...")
-
-while True:
-    run = await client.get_run(task.run_id)
-    if run.status in ("completed", "failed", "terminated", "timed_out", "canceled"):
-        break
-    await asyncio.sleep(5)
-
-print(run.output)
+```typescript TypeScript
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+  abortSignal: controller.signal,  // TypeScript only
+  apiKey: "override-key",          // TypeScript only
+}
 ```
+</CodeGroup>
 
 ---
 
 ## Key constraints
 
-- `browser_profile_id` works with `run_workflow` only — silently ignored by `run_task`.
-- `download_files` does not support `wait_for_completion` — poll manually or use webhooks.
+- `browser_profile_id` works with `run_workflow` only - silently ignored by `run_task`.
+- Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
 - Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
-- Session archiving is async — profile creation may need a short retry delay after a run completes.
-- `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`.
-- `launch_local_browser` only works in local mode (`Skyvern.local()`). Cloud browser methods (`launch_cloud_browser`, `use_cloud_browser`, `connect_to_cloud_browser_session`) require cloud environment.
-- `page.agent` methods always wait for completion — they don't support `wait_for_completion=False`.
-- TypeScript SDK does not support browser control (local or cloud) — use the Python SDK for browser automation.
+- `launch_local_browser` requires Python local mode (`Skyvern.local()`).
+- `page.agent` methods always wait for completion.
+- Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `fill_from_mapping`, `extract_form_fields`, `validate_mapping`, `fill_autocomplete`), iframe management (`frame_switch`, `frame_main`, `frame_list`).
