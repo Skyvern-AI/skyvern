@@ -3,6 +3,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.context import ResponseType
+
 
 class WorkflowCopilotChat(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -86,6 +88,11 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     message: str = Field(..., description="The message sent to the user")
     updated_workflow: dict | None = Field(None, description="The updated workflow")
     response_time: datetime = Field(..., description="When the assistant message was created")
+    total_tokens: int | None = Field(
+        None,
+        description="Total tokens consumed by the agent during this turn; None when no provider reported usage",
+    )
+    response_type: ResponseType = Field("REPLY", description="Agent response classification")
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):

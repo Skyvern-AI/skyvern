@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     _canonical_block_config,
@@ -45,6 +46,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 
 LOG = structlog.get_logger()
@@ -360,7 +362,7 @@ async def _attach_failed_block_screenshots(
             task_id_to_block[task_id]["screenshot_b64"] = b64
 
 
-_BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
@@ -376,7 +378,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
     # detecting) and further attempts will just burn the tool timeout. Scoped
     # to block-running tools so planning/metadata tools (update_workflow,
     # list_credentials, get_run_results) stay unaffected.
-    if tool_name in _BLOCK_RUNNING_TOOLS:
+    if tool_name in BLOCK_RUNNING_TOOLS:
         # Reconciliation guard: the previous block-running tool call exited
         # without a trustworthy terminal status for its workflow run (the
         # watchdog's stagnation / ceiling / task_exit_unfinalized paths, or
@@ -504,6 +506,14 @@ def _parameter_binding_invariant_error(
 
 async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
     workflow_yaml = params["workflow_yaml"]
+    # Post-emission reject of copilot-v2 writes that introduce a banned
+    # block type. The schema pre_hook only fires when the LLM consults the
+    # schema; this safety net fires regardless of emission path. Label-based
+    # diff preserves legacy workflows — only NEW banned labels trip the reject.
+    banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.workflow_yaml)
+    if banned_items:
+        _record_banned_block_reject_span("_update_workflow", banned_items)
+        return {"ok": False, "error": _banned_block_reject_message(banned_items)}
     try:
         workflow = _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
@@ -1435,6 +1445,157 @@ async def _resolve_url_title(raw: dict[str, Any], ctx: AgentContext) -> tuple[st
     return url, title
 
 
+# Block types the copilot must never emit. They delegate the entire goal to
+# a separate agent, which bypasses copilot-level block decomposition and
+# obfuscates issues the copilot should surface/handle directly.
+_COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = frozenset({"task", "task_v2"})
+
+# Shared suffix across every LLM-facing rejection message for banned
+# block emission — the pre-hook (schema-lookup reject) and the post-
+# emission detector both steer the LLM toward the same alternatives.
+_COPILOT_BANNED_BLOCK_ALTERNATIVES = (
+    "Use `navigation` for page actions (filling forms, clicking, multi-step flows), "
+    "`extraction` for data extraction, `validation` for completion checks, "
+    "`login` for authentication, or `goto_url` for pure URL navigation."
+)
+
+
+def _banned_block_reject_message(items: list[tuple[str, str]]) -> str:
+    """Uniform error text for the post-emission reject, sharing the
+    alternatives suffix with the schema pre-hook."""
+    labels = ", ".join(sorted({label for label, _ in items}))
+    types = sorted({block_type for _, block_type in items})
+    types_part = " / ".join(repr(t) for t in types)
+    return (
+        f"Block type {types_part} is not available in the workflow copilot. "
+        f"Offending labels: [{labels}]. "
+        f"{_COPILOT_BANNED_BLOCK_ALTERNATIVES}"
+    )
+
+
+def _record_banned_block_reject_span(source_tool: str, items: list[tuple[str, str]]) -> None:
+    """Emit the dedicated ``update_workflow_banned_block_reject`` span used
+    by post-rollout logfire trend queries."""
+    with copilot_span(
+        "update_workflow_banned_block_reject",
+        data={
+            "labels": [label for label, _ in items],
+            "block_types": sorted({block_type for _, block_type in items}),
+            "source_tool": source_tool,
+        },
+    ):
+        pass
+
+
+def _collect_banned_block_items(blocks: list[Any]) -> list[tuple[str, str]]:
+    """Recursively walk ``blocks`` (mirroring
+    :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`)
+    and return ``(label, normalized_block_type)`` for every block whose type is
+    in :data:`_COPILOT_BANNED_BLOCK_TYPES`. Blocks missing ``label`` are
+    skipped — the downstream Pydantic validator surfaces those errors on its
+    own."""
+    items: list[tuple[str, str]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        raw_type = block.get("block_type")
+        if isinstance(raw_type, str):
+            normalized = raw_type.strip().lower()
+            if normalized in _COPILOT_BANNED_BLOCK_TYPES:
+                label = block.get("label")
+                if isinstance(label, str):
+                    items.append((label, normalized))
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            items.extend(_collect_banned_block_items(loop_blocks))
+    return items
+
+
+def _parse_workflow_blocks(yaml_str: str | None) -> list[Any] | None:
+    """Parse ``yaml_str`` and return ``workflow_definition.blocks`` as a list,
+    or ``None`` if the YAML is missing, unparseable, or not in the expected
+    shape. Graceful on every failure so callers can treat ``None`` as 'nothing
+    to compare against.'"""
+    if not yaml_str:
+        return None
+    try:
+        parsed = safe_load_no_dates(yaml_str)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return None
+    blocks = definition.get("blocks")
+    return blocks if isinstance(blocks, list) else None
+
+
+def _detect_new_banned_blocks(
+    submitted_yaml: str,
+    prior_workflow_yaml: str | None,
+) -> list[tuple[str, str]]:
+    """Return ``[(label, block_type), ...]`` for every banned-type block in
+    ``submitted_yaml`` whose label is NOT present as a banned-type block in
+    ``prior_workflow_yaml``. Pure: no I/O, no logging.
+
+    Recurses into ``for_loop.loop_blocks`` mirroring
+    :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`.
+    Legacy workflows that carry ``task`` / ``task_v2`` blocks under unchanged
+    labels produce an empty list and therefore do not reject.
+
+    Malformed YAML, missing ``workflow_definition``, or a non-list ``blocks``
+    all produce an empty list — the downstream Pydantic validation in
+    ``_process_workflow_yaml`` surfaces the specific parse / shape error on
+    its own path.
+    """
+    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
+    if submitted_blocks is None:
+        return []
+    submitted_items = _collect_banned_block_items(submitted_blocks)
+    if not submitted_items:
+        return []
+    prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
+    prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [])}
+    return [(label, block_type) for label, block_type in submitted_items if label not in prior_labels]
+
+
+async def _get_block_schema_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    """Short-circuit requests for banned block types with an explicit error.
+    Without this pre-hook the underlying MCP tool silently redirects ``task``
+    and ``task_v2`` queries to ``navigation``'s schema, which makes the LLM
+    think the banned types are available."""
+    block_type = params.get("block_type")
+    if not isinstance(block_type, str):
+        return None
+    normalized = block_type.strip().lower()
+    if normalized not in _COPILOT_BANNED_BLOCK_TYPES:
+        return None
+    return {
+        "ok": False,
+        "error": f"Block type {block_type!r} is not available in the workflow copilot. {_COPILOT_BANNED_BLOCK_ALTERNATIVES}",
+    }
+
+
+async def _get_block_schema_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    """Scrub banned block types from list-mode responses. Belt-and-suspenders
+    against future drift in ``BLOCK_SUMMARIES`` (which currently omits them)."""
+    data = result.get("data")
+    if isinstance(data, dict):
+        block_types = data.get("block_types")
+        if isinstance(block_types, dict):
+            for banned in _COPILOT_BANNED_BLOCK_TYPES:
+                block_types.pop(banned, None)
+    return result
+
+
 async def _evaluate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -1621,7 +1782,10 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
 
 def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
     return {
-        "get_block_schema": SchemaOverlay(),
+        "get_block_schema": SchemaOverlay(
+            pre_hook=_get_block_schema_pre_hook,
+            post_hook=_get_block_schema_post_hook,
+        ),
         "validate_block": SchemaOverlay(),
         "navigate_browser": SchemaOverlay(
             description=(
@@ -2075,6 +2239,14 @@ async def update_and_run_blocks_tool(
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+
+    # Wrap each block's navigation_goal / complete_criterion / terminate_criterion
+    # with the user's message as "big goal" context so downstream LLMs (verifier,
+    # validation-block prompt) have user-intent framing — mirrors TaskV2.
+    if copilot_ctx.user_message:
+        workflow_yaml = wrap_block_goals(workflow_yaml, copilot_ctx.user_message)
+    else:
+        LOG.warning("update_and_run_blocks invoked without copilot_ctx.user_message; skipping block-goal wrap")
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):

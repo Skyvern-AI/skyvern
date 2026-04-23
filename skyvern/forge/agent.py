@@ -135,6 +135,7 @@ from skyvern.webeye.actions.actions import (
     KeypressAction,
     ReloadPageAction,
     TerminateAction,
+    VerificationStatus,
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
@@ -178,6 +179,66 @@ _LLM_STEP_EXCEPTIONS = frozenset(
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": reasoning}]
+
+
+# Phrases the verifier / validator LLMs use when they rely on exact-string
+# matching rather than semantic interpretation. Tagging reasoning text as
+# "literal" vs "semantic" gives us a post-hoc signal for how often the LLM
+# narrow-matches on a criterion or goal — queryable via the
+# validation.reasoning_kind / verification.reasoning_kind span attributes.
+# The heuristic is imperfect by design; its purpose is a rough trend
+# indicator across the copilot-v2 cohort and other callers.
+_LITERAL_REASONING_SIGNALS: tuple[str, ...] = (
+    "exact",
+    "literal",
+    "verbatim",
+    "word-for-word",
+    "word for word",
+)
+
+
+def _classify_reasoning_kind(reasoning: str | None) -> str:
+    """Classify a verifier / validator LLM's reasoning text as ``"literal"``
+    (relied on exact-string matching) or ``"semantic"``.
+
+    Shared between ``record_validation_span_attrs`` (validation-block step
+    spans) and ``record_verification_span_attrs`` (``complete_verify`` spans).
+    The keyword heuristic is imperfect by design — its purpose is a rough
+    trend signal, not a truth oracle.
+    """
+    text = (reasoning or "").lower()
+    return "literal" if any(s in text for s in _LITERAL_REASONING_SIGNALS) else "semantic"
+
+
+def record_validation_span_attrs(span: Any, task: Task, actions: list[Action]) -> None:
+    """Attach ``validation.decision`` and ``validation.reasoning_kind`` to
+    ``span`` when ``task`` is a ``TaskType.validation`` step whose first parsed
+    action is a ``CompleteAction`` or ``TerminateAction``.
+
+    Exposed as a module-level helper (rather than inlined at the call site) so
+    the logic is unit-testable without driving the full agent step. No-op on
+    non-validation tasks or non-decisive actions — callers don't need to guard.
+    """
+    if task.task_type != TaskType.validation or not actions:
+        return
+    decision = actions[0]
+    if not isinstance(decision, (CompleteAction, TerminateAction)):
+        return
+    validation_decision = "complete" if isinstance(decision, CompleteAction) else "terminate"
+    span.set_attribute("validation.decision", validation_decision)
+    span.set_attribute("validation.reasoning_kind", _classify_reasoning_kind(decision.reasoning))
+
+
+def record_verification_span_attrs(span: Any, verification_thoughts: str | None) -> None:
+    """Attach ``verification.reasoning_kind`` to the current
+    ``skyvern.agent.complete_verify`` span based on the verifier LLM's
+    ``thoughts`` field.
+
+    Complements ``verification.status`` / ``verification.template``, which
+    ``complete_verify`` already sets. Pure, module-level helper so the
+    classifier logic is unit-testable without driving the full verify path.
+    """
+    span.set_attribute("verification.reasoning_kind", _classify_reasoning_kind(verification_thoughts))
 
 
 @dataclass
@@ -1372,6 +1433,7 @@ class ForgeAgent:
                         speculative_llm_metadata = None
 
             detailed_agent_step_output.actions = actions
+            record_validation_span_attrs(_step_span, task, actions)
             if len(actions) == 0:
                 LOG.info(
                     "No actions to execute, marking step as failed",
@@ -2334,6 +2396,7 @@ class ForgeAgent:
                 exc_info=True,
             )
 
+    @traced(name="skyvern.agent.complete_verify")
     async def complete_verify(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
@@ -2437,7 +2500,18 @@ class ForgeAgent:
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name=prompt_name,
         )
-        return CompleteVerifyResult.model_validate(verification_result)
+        result = CompleteVerifyResult.model_validate(verification_result)
+        if result.is_complete:
+            verification_status = VerificationStatus.complete
+        elif result.is_terminate:
+            verification_status = VerificationStatus.terminate
+        else:
+            verification_status = VerificationStatus.continue_step
+        span = otel_trace.get_current_span()
+        span.set_attribute("verification.status", verification_status.value)
+        span.set_attribute("verification.template", template_name)
+        record_verification_span_attrs(span, result.thoughts)
+        return result
 
     async def check_user_goal_complete(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step

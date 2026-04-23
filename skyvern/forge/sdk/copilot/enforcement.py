@@ -918,6 +918,31 @@ class _SendTrackingStream:
         await self._inner.close()
 
 
+def _accumulate_usage(result: RunResultStreaming, ctx: Any) -> None:
+    """Sum actual token usage from raw_responses onto the context.
+
+    Called per enforcement iteration in a ``finally:`` so pre-overflow
+    response tokens are still counted even when ``stream_to_sse`` raises.
+    First observed usage flips the counters from ``None`` to ``0``; if no
+    response on this stream carries a usage object the counters stay
+    ``None``, which the eval surfaces as "telemetry missing" rather than
+    "ran for free".
+    """
+    if not hasattr(ctx, "total_tokens_used"):
+        return
+    for resp in getattr(result, "raw_responses", []) or []:
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            continue
+        if ctx.total_tokens_used is None:
+            ctx.total_tokens_used = 0
+            ctx.input_tokens_used = 0
+            ctx.output_tokens_used = 0
+        ctx.total_tokens_used += getattr(usage, "total_tokens", 0) or 0
+        ctx.input_tokens_used += getattr(usage, "input_tokens", 0) or 0
+        ctx.output_tokens_used += getattr(usage, "output_tokens", 0) or 0
+
+
 async def run_with_enforcement(
     agent: Agent,
     initial_input: str | list,
@@ -965,7 +990,10 @@ async def run_with_enforcement(
         ):
             try:
                 result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
-                await stream_to_sse(result, tracked_stream, ctx)
+                try:
+                    await stream_to_sse(result, tracked_stream, ctx)
+                finally:
+                    _accumulate_usage(result, ctx)
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -995,7 +1023,10 @@ async def run_with_enforcement(
                     result = Runner.run_streamed(
                         agent, input=current_input, context=ctx, session=session, **runner_kwargs
                     )
-                    await stream_to_sse(result, tracked_stream, ctx)
+                    try:
+                        await stream_to_sse(result, tracked_stream, ctx)
+                    finally:
+                        _accumulate_usage(result, ctx)
                 except Exception as retry_err:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
