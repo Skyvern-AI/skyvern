@@ -238,7 +238,7 @@ def test_trusted_post_drain_handles_missing_row() -> None:
 
 from types import SimpleNamespace as _NS  # noqa: E402  (grouped with test block)
 
-from skyvern.forge.sdk.copilot.tools import _BLOCK_RUNNING_TOOLS, _tool_loop_error  # noqa: E402
+from skyvern.forge.sdk.copilot.tools import BLOCK_RUNNING_TOOLS, _tool_loop_error  # noqa: E402
 
 
 def _guard_ctx(pending_run_id: str | None = None) -> _NS:
@@ -251,9 +251,9 @@ def _guard_ctx(pending_run_id: str | None = None) -> _NS:
     )
 
 
-@pytest.mark.parametrize("tool_name", sorted(_BLOCK_RUNNING_TOOLS))
+@pytest.mark.parametrize("tool_name", sorted(BLOCK_RUNNING_TOOLS))
 def test_reconciliation_guard_blocks_block_running_tools(tool_name: str) -> None:
-    """With a pending run set, every tool in ``_BLOCK_RUNNING_TOOLS`` is
+    """With a pending run set, every tool in ``BLOCK_RUNNING_TOOLS`` is
     rejected with an error that names the run id and directs the LLM to call
     ``get_run_results`` first."""
     ctx = _guard_ctx(pending_run_id="wr_pending_123")
@@ -268,7 +268,7 @@ def test_reconciliation_guard_blocks_block_running_tools(tool_name: str) -> None
     ["get_run_results", "update_workflow", "list_credentials"],
 )
 def test_reconciliation_guard_ignores_non_block_running_tools(tool_name: str) -> None:
-    """The guard is scoped to ``_BLOCK_RUNNING_TOOLS``. Planning / metadata
+    """The guard is scoped to ``BLOCK_RUNNING_TOOLS``. Planning / metadata
     tools (including ``get_run_results`` itself, which is the tool that can
     CLEAR the flag) must not be rejected."""
     ctx = _guard_ctx(pending_run_id="wr_pending_123")
@@ -279,7 +279,7 @@ def test_reconciliation_guard_passes_when_flag_empty() -> None:
     """No pending run → `_tool_loop_error` returns None for block-running
     tools (assuming no other guard trips)."""
     ctx = _guard_ctx(pending_run_id=None)
-    for name in _BLOCK_RUNNING_TOOLS:
+    for name in BLOCK_RUNNING_TOOLS:
         assert _tool_loop_error(ctx, name) is None
 
 
@@ -288,7 +288,7 @@ def test_reconciliation_guard_rejects_empty_string_run_id() -> None:
     not set. Prevents a spurious guard trip if anything ever clears the flag
     to ``''`` instead of ``None``."""
     ctx = _guard_ctx(pending_run_id="")
-    for name in _BLOCK_RUNNING_TOOLS:
+    for name in BLOCK_RUNNING_TOOLS:
         assert _tool_loop_error(ctx, name) is None
 
 
