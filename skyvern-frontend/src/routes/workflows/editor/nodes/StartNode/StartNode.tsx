@@ -7,6 +7,8 @@ import {
   useNodes,
   useReactFlow,
 } from "@xyflow/react";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { useParams } from "react-router-dom";
 import type { StartNode } from "./types";
 import { AppNode } from "..";
 import {
@@ -15,6 +17,16 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -41,6 +53,7 @@ import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
+import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
@@ -69,12 +82,19 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const [facing, setFacing] = useState<"front" | "back">("front");
+  const [isResetProfileDialogOpen, setIsResetProfileDialogOpen] =
+    useState(false);
+  const { workflowPermanentId } = useParams();
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const isRecording = recordingStore.isRecording;
+  const resetProfileMutation = useResetProfileMutation({
+    workflowPermanentId,
+    onSuccess: () => setIsResetProfileDialogOpen(false),
+  });
 
   // Local state for webhook URL to fix race condition where data.webhookCallbackUrl
   // isn't updated yet when user clicks "Test Webhook" after typing
@@ -394,6 +414,52 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             }}
                           />
                         </div>
+                        {data.persistBrowserSession && workflowPermanentId && (
+                          <Dialog
+                            open={isResetProfileDialogOpen}
+                            onOpenChange={setIsResetProfileDialogOpen}
+                          >
+                            <DialogTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                className="nopan"
+                              >
+                                <ReloadIcon className="mr-2 h-3 w-3" />
+                                Reset Profile
+                              </Button>
+                            </DialogTrigger>
+                            <DialogContent>
+                              <DialogHeader>
+                                <DialogTitle>Reset saved profile?</DialogTitle>
+                                <DialogDescription>
+                                  Clears the saved browser profile for this
+                                  workflow. The next run will start from a fresh
+                                  browser state. Use this if the saved profile
+                                  is stuck or producing errors.
+                                </DialogDescription>
+                              </DialogHeader>
+                              <DialogFooter>
+                                <DialogClose asChild>
+                                  <Button variant="secondary">Cancel</Button>
+                                </DialogClose>
+                                <Button
+                                  variant="destructive"
+                                  onClick={() => {
+                                    resetProfileMutation.mutate();
+                                  }}
+                                  disabled={resetProfileMutation.isPending}
+                                >
+                                  {resetProfileMutation.isPending && (
+                                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                                  )}
+                                  Reset Profile
+                                </Button>
+                              </DialogFooter>
+                            </DialogContent>
+                          </Dialog>
+                        )}
                       </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
