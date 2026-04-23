@@ -59,6 +59,20 @@ _FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
 )
 _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
 
+# Block types whose ``block.output`` is a ``TaskOutput.from_task()`` envelope
+# (schemas/tasks.py:TaskOutput) rather than the raw payload. The
+# meaningful-data check must unwrap these via ``_block_data_payload`` before
+# judging output, because envelope fields (task_id, status, artifact IDs) are
+# always populated on a completed run and would otherwise mask empty
+# extractions. This is a subset of ``_DATA_PRODUCING_BLOCK_TYPES`` — keep the
+# two in sync when adding a new task-backed type. ``TEXT_PROMPT`` is
+# deliberately excluded: its block.output is the raw LLM response dict (see
+# ``TextPromptBlock.execute``), no envelope to strip.
+_TASK_ENVELOPE_BLOCK_TYPES = frozenset({"EXTRACTION"})
+assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
+    "_TASK_ENVELOPE_BLOCK_TYPES must be a subset of _DATA_PRODUCING_BLOCK_TYPES"
+)
+
 # Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
 # as a last-resort trip wire for runaway loops — progressing runs should never
 # approach this. The OpenAI Agents SDK wraps the tool in
@@ -237,6 +251,34 @@ def _is_meaningful_extracted_data(extracted: Any) -> bool:
         return any(_is_meaningful_extracted_data(v) for v in extracted)
     # Numbers, booleans, and other scalars count as meaningful output.
     return True
+
+
+# Payload fields inside a ``TaskOutput.from_task()`` envelope
+# (schemas/tasks.py:TaskOutput). Only these carry "did the block produce
+# something useful?" signal; the rest (task_id, status, artifact IDs, etc.)
+# are always populated on a completed run and would short-circuit
+# _is_meaningful_extracted_data to True even when nothing useful was produced.
+_TASK_OUTPUT_PAYLOAD_FIELDS: tuple[str, ...] = (
+    "extracted_information",
+    "downloaded_files",
+    "downloaded_file_urls",
+)
+
+
+def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
+    """Return the payload view of a block's output for the meaningful-data check.
+
+    For task-envelope block types (``_TASK_ENVELOPE_BLOCK_TYPES``), slice the
+    envelope down to ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so envelope metadata
+    can't mask an empty result. Other data-producing types pass through
+    unchanged — e.g. TEXT_PROMPT's ``block.output`` is the raw LLM response
+    dict (TextPromptBlock.execute records ``output_parameter_value=response``
+    directly), so scoping the unwrap avoids slicing a user-defined
+    json_schema that happens to include an ``extracted_information`` field.
+    """
+    if block_type in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(extracted_data, dict):
+        return {field: extracted_data.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+    return extracted_data
 
 
 async def _attach_action_traces(
@@ -1752,9 +1794,11 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
             reason = block.get("failure_reason")
             if isinstance(reason, str):
                 texts_to_scan.append(reason)
-            if block.get("block_type") in _DATA_PRODUCING_BLOCK_TYPES and block.get("status") == "completed":
+            block_type = block.get("block_type")
+            if block_type in _DATA_PRODUCING_BLOCK_TYPES and block.get("status") == "completed":
                 has_data_blocks = True
-                if _is_meaningful_extracted_data(block.get("extracted_data")):
+                payload = _block_data_payload(block.get("extracted_data"), block_type)
+                if _is_meaningful_extracted_data(payload):
                     any_data_output = True
 
     combined = "\n".join(texts_to_scan)
