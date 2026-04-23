@@ -9,6 +9,7 @@ from opentelemetry import trace as otel_trace
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
+from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
     FailedToSendWebhook,
     TaskTerminationError,
@@ -76,12 +77,6 @@ RANDOM_STRING_POOL = string.ascii_letters + string.digits
 # Maximum number of planning iterations for TaskV2
 # This limits how many times the LLM can plan and execute actions
 DEFAULT_MAX_ITERATIONS = 50
-
-MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
-```{mini_goal}```
-
-This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
-```{main_goal}```"""
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:

@@ -2,8 +2,6 @@ from typing import Any, Pattern
 
 from playwright.async_api import Locator
 
-from skyvern.forge.sdk.event.factory import EventStrategyFactory
-
 
 class SkyvernLocator:
     """Locator for finding and interacting with elements on a page.
@@ -18,12 +16,7 @@ class SkyvernLocator:
     # Action methods
     async def click(self, **kwargs: Any) -> None:
         """Click the element."""
-        timeout = kwargs.pop("timeout", None)
-        if kwargs:
-            # Extra kwargs (e.g. position) — use raw Playwright click
-            await self._locator.click(timeout=timeout, **kwargs)
-        else:
-            await EventStrategyFactory.click(self._locator.page, self._locator, timeout=timeout)
+        await self._locator.click(**kwargs)
 
     async def fill(self, value: str, **kwargs: Any) -> None:
         """Fill an input element with text."""
