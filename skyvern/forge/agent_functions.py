@@ -4,6 +4,7 @@ import hashlib
 from datetime import timedelta
 from typing import Any, Dict, List
 
+import httpx
 import structlog
 from playwright.async_api import Frame, Page
 
@@ -15,6 +16,7 @@ from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -430,6 +432,38 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
+    workflow_schedules_enabled: bool = False
+    """Whether the workflow scheduler routes should serve traffic on this build.
+
+    OSS Skyvern has no scheduling backend wired up by default, so the routes return 501.
+    Cloud overrides this to True and provides the Temporal-backed implementations below.
+    """
+
+    def get_mcp_oauth_issuer_url(self) -> str | None:
+        """Return the cloud OAuth issuer URL when the build provides one.
+
+        OSS builds do not ship a remote OAuth issuer, so the base implementation
+        returns None and callers should treat OAuth validation as unavailable.
+        """
+        return None
+
+    async def get_mcp_oauth_jwt_key(self) -> Any | None:
+        """Return the current signing key/JWK for MCP OAuth token validation.
+
+        Cloud builds override this to provide the identity-provider signing key.
+        OSS builds return None.
+        """
+        return None
+
+    def build_mcp_auth_db(self, database_string: str, *, debug_enabled: bool) -> Any:
+        """Return the DB instance used by MCP auth middleware.
+
+        OSS builds use the base ``AgentDB``. Cloud overrides this to provide
+        the encryption-aware ``CloudAgentDB`` implementation without importing
+        cloud modules from the OSS-synced ``skyvern/`` tree.
+        """
+        return AgentDB(database_string, debug_enabled=debug_enabled)
+
     async def validate_step_execution(
         self,
         task: Task,
@@ -452,7 +486,7 @@ class AgentFunction:
         if not has_valid_step_status:
             reasons.append(f"invalid_step_status:{step.status}")
         # can't execute if the task has another step that is running
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+        steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         has_no_running_steps = not any(step.status == StepStatus.running for step in steps)
         if not has_no_running_steps:
             reasons.append(f"another_step_is_running_for_task:{task.task_id}")
@@ -492,11 +526,175 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
+    async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
+        """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
+        return False
+
+    async def lookup_cross_run_extraction_cache(
+        self,
+        workflow_permanent_id: str | None,
+        cache_key: str,
+    ) -> Any | None:
+        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op.
+
+        Cloud overrides this to consult the Redis tier (SKY-8873). Returns the
+        cached extraction value on a hit or None on a miss / error / disabled
+        flag. Implementations MUST swallow backend errors and return None so
+        the extract path always falls through to a fresh LLM call rather than
+        failing loud.
+        """
+        return None
+
+    async def store_cross_run_extraction_cache(
+        self,
+        workflow_permanent_id: str | None,
+        cache_key: str,
+        value: Any,
+    ) -> None:
+        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op.
+
+        Cloud overrides this to write to the Redis tier (SKY-8873) with a
+        long TTL. Called after a fresh LLM extraction so subsequent runs of
+        the same workflow against the same page content skip the LLM call.
+        Implementations MUST swallow backend errors — write-path failures
+        must never fail the user-visible request.
+        """
+        return None
+
+    def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
+        """Return the backend-specific schedule id used by the execution engine.
+
+        OSS has no execution backend, so this returns None and the schedule simply
+        lives in the database. Cloud overrides this to derive a Temporal schedule id.
+        """
+        return None
+
+    async def upsert_workflow_schedule(
+        self,
+        backend_schedule_id: str,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_schedule_id: str,
+        cron_expression: str,
+        timezone: str,
+        enabled: bool,
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        """Upsert a recurring schedule with the execution backend (e.g. Temporal).
+
+        OSS base is a no-op so the route layer can stay backend-agnostic.
+        Cloud overrides this to register the schedule with Temporal.
+        Implementations must be idempotent.
+        """
+        return None
+
+    async def set_workflow_schedule_enabled(self, backend_schedule_id: str, enabled: bool) -> None:
+        """Pause or resume a schedule on the execution backend. OSS no-op."""
+        return None
+
+    async def delete_workflow_schedule(self, backend_schedule_id: str) -> None:
+        """Delete a schedule from the execution backend. OSS no-op.
+
+        Implementations must be idempotent — deleting an already-absent schedule
+        should succeed silently rather than raising.
+        """
+        return None
+
     async def auto_solve_captchas(self, page: Page) -> bool:
         """Proactively detect and solve captchas on the current page.
         Returns True if a captcha was detected and solved.
         Cloud override provides actual solving; OSS base is a no-op."""
         return False
+
+    async def get_google_sheets_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+    ) -> str | None:
+        """Get a Google Sheets access token for the given credential.
+
+        Returns None in OSS. Cloud override uses the OAuth service to
+        decrypt the stored refresh token and exchange it for an access token.
+        """
+        return None
+
+    async def get_google_workspace_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+        required_scopes: list[str] | None = None,
+    ) -> object | None:
+        """OSS no-op; cloud override returns a refreshed google.oauth2.credentials.Credentials or None."""
+        return None
+
+    async def ensure_sheet_tab(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        title: str,
+    ) -> int | None:
+        """Ensure a sheet tab with the given title exists in the spreadsheet.
+
+        Returns the sheet_id of the newly created tab, or None if the caller
+        should fall back to its own lookup (e.g. a concurrent creator won the
+        race). OSS base is a no-op that returns None; cloud override calls the
+        Sheets v4 batchUpdate addSheet endpoint.
+        """
+        return None
+
+    async def google_sheets_values_get(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        ranges: str,
+        fields: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read ranges from a spreadsheet via spreadsheets.get. OSS no-op."""
+        return None
+
+    async def google_sheets_values_append(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        range_: str,
+        values: list[list[Any]],
+    ) -> dict[str, Any] | None:
+        """Append rows via spreadsheets.values.append. OSS no-op."""
+        return None
+
+    async def google_sheets_values_update(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        range_: str,
+        values: list[list[Any]],
+    ) -> dict[str, Any] | None:
+        """Update rows via spreadsheets.values.update. OSS no-op."""
+        return None
+
+    async def google_sheets_batch_update(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Apply a batchUpdate to a spreadsheet. OSS no-op."""
+        return None
+
+    async def google_sheets_get_sheet_id(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_title: str,
+    ) -> int | None:
+        """Resolve a tab title to its numeric sheetId. OSS no-op."""
+        return None
 
     async def generate_async_operations(
         self,
@@ -513,7 +711,7 @@ class AgentFunction:
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
 
-        @traced()
+        @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.
@@ -617,6 +815,28 @@ class AgentFunction:
 
     async def post_action_execution(self, action: Action) -> None:
         pass
+
+    async def deliver_webhook(
+        self,
+        url: str,
+        payload: str,
+        headers: dict[str, str],
+        timeout_seconds: float = 30.0,
+        organization_id: str | None = None,
+        run_id: str | None = None,
+    ) -> httpx.Response:
+        """Deliver a webhook POST request to *url*.
+
+        Returns the upstream ``httpx.Response``.  Cloud override routes NAT-org
+        traffic through the egress proxy so it egresses from a static IP.
+        """
+        async with httpx.AsyncClient() as client:
+            return await client.post(
+                url,
+                content=payload,
+                headers=headers,
+                timeout=httpx.Timeout(timeout_seconds),
+            )
 
     def get_copilot_security_rules(self) -> str:
         """Return security guardrails for the workflow copilot system prompt.

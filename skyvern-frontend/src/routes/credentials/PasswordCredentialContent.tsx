@@ -360,7 +360,7 @@ function PasswordCredentialContent({
                   </div>
                   <p className="text-sm text-slate-400">
                     <Link
-                      to="https://meetings.hubspot.com/skyvern/demo"
+                      to="https://www.skyvern.com/contact"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline underline-offset-2"

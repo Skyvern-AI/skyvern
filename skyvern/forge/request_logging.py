@@ -23,6 +23,9 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/credentials",
     "POST /v1/credentials/onepassword/create",
     "POST /v1/credentials/azure_credential/create",
+    "POST /v1/credentials/totp",
+    "POST /api/v1/totp",
+    "GET /v1/credentials/totp",
 }
 _MAX_BODY_LENGTH = 1000
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
@@ -47,6 +50,11 @@ _SENSITIVE_FIELDS: set[str] = {
     "auth",
     "authorization",
     "secret_key",
+    "totp",
+    "otp",
+    "one_time_code",
+    "one_time_password",
+    "mfa_code",
 }
 
 
@@ -79,7 +87,7 @@ def _is_sensitive_key(key: str) -> bool:
     return key.lower() in _SENSITIVE_FIELDS
 
 
-def _redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
+def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
     """Redact dict values whose *key name* exactly matches a known sensitive field.
 
     Uses exact-match (case-insensitive) rather than substring/regex to avoid
@@ -93,10 +101,10 @@ def _redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
         return obj
     if isinstance(obj, dict):
         return {
-            k: _REDACTED if _is_sensitive_key(k) else _redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
+            k: _REDACTED if _is_sensitive_key(k) else redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [_redact_sensitive_fields(item, _depth + 1) for item in obj]
+        return [redact_sensitive_fields(item, _depth + 1) for item in obj]
     return obj
 
 
@@ -117,7 +125,7 @@ def _sanitize_response_body(request: Request, body_str: str | None, content_type
         return _BINARY_PLACEHOLDER
     try:
         parsed = json.loads(body_str)
-        redacted = _redact_sensitive_fields(parsed)
+        redacted = redact_sensitive_fields(parsed)
         text = json.dumps(redacted)
     except (json.JSONDecodeError, TypeError):
         text = body_str

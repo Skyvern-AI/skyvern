@@ -18,6 +18,9 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 LOG = structlog.get_logger()
 
 _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
+# Keys that contain an MFA hint but are TOTP *metadata*, not actual OTP codes.
+# "totpidentifier" matches "otp" but carries a lookup key, not a 6-digit code.
+_MFA_METADATA_KEY_HINTS = ("identifier", "url", "secret", "seed", "key")
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
 
 MFANavigationPayload = dict | list | str | None
@@ -64,8 +67,14 @@ async def parse_otp_login(
 
 
 def _is_mfa_like_parameter_key(key: object) -> bool:
-    """Return True when a payload key appears to represent an MFA/OTP parameter."""
+    """Return True when a payload key appears to represent an MFA/OTP code value.
+
+    Excludes TOTP metadata keys (identifier, url, secret, etc.) that contain an
+    MFA hint but carry lookup/config data rather than an actual verification code.
+    """
     normalized_key = _NON_ALNUM_PATTERN.sub("", str(key).lower())
+    if any(meta in normalized_key for meta in _MFA_METADATA_KEY_HINTS):
+        return False
     return any(hint in normalized_key for hint in _MFA_PARAMETER_KEY_HINTS)
 
 

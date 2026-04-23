@@ -15,6 +15,7 @@ from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+from opentelemetry import trace as otel_trace
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -48,10 +49,16 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
+
+# Canonical span name for all LLM chokepoints. Milestone 1 of the agent
+# profiling project — keep consistent so SigNoz aggregations can query across
+# router / non-router / LLMCaller paths with a single filter.
+LLM_REQUEST_SPAN_NAME = "skyvern.llm.request"
+LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
@@ -59,6 +66,57 @@ CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termina
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
+
+
+def _enrich_llm_span(
+    span: otel_trace.Span,
+    *,
+    model: str,
+    prompt_name: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    reasoning_tokens: int = 0,
+    cached_tokens: int = 0,
+    latency_ms: int,
+    llm_cost: float = 0.0,
+) -> None:
+    """Set canonical attributes + emit llm.request.completed event on an LLM span.
+
+    Only called on success paths. Error paths set `status=error` as a custom
+    string attribute; the OTEL-native ``StatusCode.ERROR`` is set separately by
+    the ``@traced`` decorator when the re-raised exception propagates through it.
+    """
+    span.set_attribute("llm_model", model)
+    span.set_attribute("prompt_tokens", prompt_tokens)
+    span.set_attribute("completion_tokens", completion_tokens)
+    span.set_attribute("reasoning_tokens", reasoning_tokens)
+    span.set_attribute("cached_tokens", cached_tokens)
+    span.set_attribute("latency_ms", latency_ms)
+    span.set_attribute("status", "ok")
+    span.set_attribute("cache_hit", bool(cached_tokens))
+    span.set_attribute("llm_cost", llm_cost)
+    # Gen AI OTEL semantic conventions — enables auto-dashboards in providers
+    # that support the spec (Logfire, SigNoz gen_ai module).
+    # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
+    span.set_attribute("gen_ai.request.model", model)
+    span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
+    span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
+    span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
+    span.set_attribute("gen_ai.usage.cached_tokens", cached_tokens)
+    span.set_attribute("gen_ai.usage.cost", llm_cost)
+    span.add_event(
+        LLM_REQUEST_COMPLETED_EVENT,
+        attributes={
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cached_tokens": cached_tokens,
+            "latency_ms": latency_ms,
+            "llm_cost": llm_cost,
+            "prompt_name": prompt_name,
+        },
+    )
 
 
 def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
@@ -152,6 +210,25 @@ def _log_vertex_cache_hit_if_needed(
             cache_key=context.vertex_cache_key,
             cache_variant=context.vertex_cache_variant,
         )
+
+
+def _normalize_llm_model(model: str | None) -> str | None:
+    # LiteLLM's response.model can include a provider prefix
+    # (e.g. "vertex_ai/gemini-2.5-flash", "openai/gpt-4.1-mini") while
+    # config-side fallbacks tend to use the bare model name. Strip the
+    # prefix so dbt aggregates the same model under one bucket.
+    if not model:
+        return model
+    return model.split("/")[-1]
+
+
+def _assert_step_thought_exclusive(step: Step | None, thought: Thought | None) -> None:
+    # step and thought write the same llm_cost to different tables
+    # (steps.step_cost vs observer_thoughts.thought_cost). int_org_llm_costs
+    # UNION ALLs them, so setting both would double-count cost in
+    # fct_org_margin.llm_cost.
+    if step is not None and thought is not None:
+        raise ValueError("LLM API handler invoked with both step and thought set — these are mutually exclusive")
 
 
 def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
@@ -477,7 +554,7 @@ class LLMAPIHandlerFactory:
         )
         main_model_group = llm_config.main_model_group
 
-        @traced(tags=[llm_key])
+        @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             prompt_name: str,
@@ -507,7 +584,15 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
-            start_time = time.time()
+            _assert_step_thought_exclusive(step, thought)
+            start_time = time.perf_counter()
+            _llm_span = otel_trace.get_current_span()
+            _llm_span.set_attribute("llm_key", llm_key)
+            _llm_span.set_attribute("llm_model", main_model_group)
+            _llm_span.set_attribute("prompt_name", prompt_name)
+            # handler_type distinguishes the three LLM entry points that share
+            # the skyvern.llm.request span name. Dashboards filter on this attr.
+            _llm_span.set_attribute("handler_type", "router_with_fallback")
 
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
@@ -564,24 +649,32 @@ class LLMAPIHandlerFactory:
                         )
 
                 llm_prompt_value = prompt
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_prompt = llm_prompt_value.encode("utf-8")
-                        if screenshots and step:
-                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                                step=step,
-                                screenshots=screenshots,
-                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                # Pre-request artifact persistence cluster. Covers prompt + screenshot
+                # staging before the LLM call. The hot cost is inside the non-bundled
+                # branch (prepare_llm_artifact → S3 upload).
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                    apply_context_attrs(_pre_span)
+                    _pre_span.set_attribute("bundled", bool(_should_bundle))
+                    _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_prompt = llm_prompt_value.encode("utf-8")
+                            if screenshots and step:
+                                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                    step=step,
+                                    screenshots=screenshots,
+                                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                                )
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=llm_prompt_value.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_PROMPT,
+                                    screenshots=screenshots,
+                                    **artifact_targets,
+                                )
                             )
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=llm_prompt_value.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_PROMPT,
-                                screenshots=screenshots,
-                                **artifact_targets,
-                            )
-                        )
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
@@ -755,10 +848,14 @@ class LLMAPIHandlerFactory:
                                 primary_model=main_model_group,
                                 fallback_model=response_model,
                             )
+                # Error paths only set status=error, not token/cost attrs via
+                # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
+                    _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "context_exceeded")
                     LOG.exception(
                         "Context window exceeded",
                         llm_key=llm_key,
@@ -768,7 +865,8 @@ class LLMAPIHandlerFactory:
                     )
                     raise SkyvernContextWindowExceededError(model=main_model_group, prompt_name=prompt_name) from e
                 except ValueError as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "LLM token limit exceeded",
                         llm_key=llm_key,
@@ -777,8 +875,42 @@ class LLMAPIHandlerFactory:
                         duration_seconds=duration_seconds,
                     )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
+                except CancelledError:
+                    _duration = time.perf_counter() - start_time
+                    if is_speculative_step:
+                        _llm_span.set_attribute("status", "cancelled")
+                        LOG.debug(
+                            "LLM request cancelled (speculative step)",
+                            llm_key=llm_key,
+                            model=main_model_group,
+                            prompt_name=prompt_name,
+                            duration_seconds=_duration,
+                        )
+                        raise
+                    else:
+                        _llm_span.set_attribute("status", "error")
+                        LOG.error(
+                            "LLM request got cancelled",
+                            llm_key=llm_key,
+                            model=main_model_group,
+                            prompt_name=prompt_name,
+                            duration_seconds=_duration,
+                        )
+                        raise LLMProviderError(llm_key) from None
+                except litellm.exceptions.RateLimitError as e:
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "rate_limited")
+                    LOG.warning(
+                        "LLM request rate limited",
+                        llm_key=llm_key,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderError(llm_key, cause=e) from e
                 except Exception as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "LLM request failed unexpectedly",
                         llm_key=llm_key,
@@ -835,8 +967,18 @@ class LLMAPIHandlerFactory:
                     # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
                     if cached_tokens == 0:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+
+                # Prefer the actual backing model returned by LiteLLM so we don't persist the
+                # router group name (e.g. "GEMINI_2_5_FLASH_WITH_FALLBACK") when the router
+                # falls back. Mirrors the pattern in llm_api_handler/call.
+                # Phase 1 tradeoff: last_llm_model records the most recent model used in
+                # the step. dbt attributes the full step_cost to it, which is accurate
+                # only for single-model steps. For multi-model steps (router fallback,
+                # secondary LLM) the attribution is lossy — resolved in Phase 2 by a
+                # per-call tracking table.
+                actual_model = _normalize_llm_model(getattr(response, "model", None) or model_used)
                 if step and not is_speculative_step:
-                    await app.DATABASE.update_step(
+                    await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
                         organization_id=step.organization_id,
@@ -845,9 +987,10 @@ class LLMAPIHandlerFactory:
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                         incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 if thought:
-                    await app.DATABASE.update_thought(
+                    await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
@@ -855,6 +998,7 @@ class LLMAPIHandlerFactory:
                         thought_cost=llm_cost,
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
@@ -892,7 +1036,7 @@ class LLMAPIHandlerFactory:
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
-                duration_seconds = time.time() - start_time
+                duration_seconds = time.perf_counter() - start_time
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -909,6 +1053,19 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
+                )
+
+                _enrich_llm_span(
+                    _llm_span,
+                    model=model_used or main_model_group,
+                    prompt_name=prompt_name,
+                    prompt_tokens=int(prompt_tokens or 0),
+                    completion_tokens=int(completion_tokens or 0),
+                    reasoning_tokens=int(reasoning_tokens or 0),
+                    cached_tokens=int(cached_tokens or 0),
+                    latency_ms=int(duration_seconds * 1000),
+                    llm_cost=float(llm_cost or 0.0),
                 )
 
                 if step and is_speculative_step:
@@ -930,24 +1087,35 @@ class LLMAPIHandlerFactory:
 
                 return parsed_response
             finally:
-                try:
-                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-                except Exception:
-                    LOG.error("Failed to persist artifacts", exc_info=True)
-                if _should_bundle and should_persist_llm_artifacts and step:
-                    _ctx = skyvern_context.current()
-                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
-                        step=step,
-                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
-                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
-                        run_id=_ctx.run_id if _ctx else None,
-                        hashed_href_map=_bundle_hashed_href_map,
-                        prompt=_bundle_prompt,
-                        request=_bundle_request,
-                        response=_bundle_response,
-                        parsed_response=_bundle_parsed,
-                        rendered_response=_bundle_rendered,
+                # Post-response artifact persistence cluster. bulk_create_artifacts
+                # does the S3 uploads + DB rows for every LLM artifact queued during
+                # this request; the bundled-path archive accumulate is fast in-memory.
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                    apply_context_attrs(_post_span)
+                    _post_span.set_attribute("bundled", bool(_should_bundle))
+                    # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                    _post_span.set_attribute(
+                        "artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None)
                     )
+                    try:
+                        await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                    except Exception:
+                        LOG.error("Failed to persist artifacts", exc_info=True)
+                    if _should_bundle and should_persist_llm_artifacts and step:
+                        _ctx = skyvern_context.current()
+                        app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                            step=step,
+                            workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                            workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                            run_id=_ctx.run_id if _ctx else None,
+                            hashed_href_map=_bundle_hashed_href_map,
+                            prompt=_bundle_prompt,
+                            request=_bundle_request,
+                            response=_bundle_response,
+                            parsed_response=_bundle_parsed,
+                            rendered_response=_bundle_rendered,
+                        )
 
         llm_api_handler_with_router_and_fallback.llm_key = llm_key  # type: ignore[attr-defined]
         LLMAPIHandlerFactory._router_handler_cache[llm_key] = llm_api_handler_with_router_and_fallback
@@ -978,7 +1146,7 @@ class LLMAPIHandlerFactory:
 
         assert isinstance(llm_config, LLMConfig)
 
-        @traced(tags=[llm_key])
+        @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler(
             prompt: str,
             prompt_name: str,
@@ -996,7 +1164,15 @@ class LLMAPIHandlerFactory:
             force_dict: bool = True,
             system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
-            start_time = time.time()
+            _assert_step_thought_exclusive(step, thought)
+            start_time = time.perf_counter()
+            _llm_span = otel_trace.get_current_span()
+            # handler_type distinguishes the three LLM entry points that share
+            # the skyvern.llm.request span name. Dashboards filter on this attr.
+            _llm_span.set_attribute("handler_type", "single_handler")
+            _llm_span.set_attribute("llm_key", llm_key)
+            _llm_span.set_attribute("llm_model", llm_config.model_name)
+            _llm_span.set_attribute("prompt_name", prompt_name)
             active_parameters = base_parameters or {}
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
@@ -1060,24 +1236,32 @@ class LLMAPIHandlerFactory:
                         )
 
                 llm_prompt_value = prompt
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_prompt = llm_prompt_value.encode("utf-8")
-                        if screenshots and step:
-                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                                step=step,
-                                screenshots=screenshots,
-                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                # Pre-request artifact persistence cluster. Covers prompt + screenshot
+                # staging before the LLM call. The hot cost is inside the non-bundled
+                # branch (prepare_llm_artifact → S3 upload).
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                    apply_context_attrs(_pre_span)
+                    _pre_span.set_attribute("bundled", bool(_should_bundle))
+                    _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_prompt = llm_prompt_value.encode("utf-8")
+                            if screenshots and step:
+                                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                    step=step,
+                                    screenshots=screenshots,
+                                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                                )
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=llm_prompt_value.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_PROMPT,
+                                    screenshots=screenshots,
+                                    **artifact_targets,
+                                )
                             )
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=llm_prompt_value.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_PROMPT,
-                                screenshots=screenshots,
-                                **artifact_targets,
-                            )
-                        )
 
                 if not llm_config.supports_vision:
                     screenshots = None
@@ -1206,10 +1390,14 @@ class LLMAPIHandlerFactory:
                         drop_params=True,  # Drop unsupported parameters gracefully
                         **active_parameters,
                     )
+                # Error paths only set status=error, not token/cost attrs via
+                # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
+                    _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "context_exceeded")
                     LOG.exception(
                         "Context window exceeded",
                         llm_key=llm_key,
@@ -1223,6 +1411,7 @@ class LLMAPIHandlerFactory:
                     # so we log at debug level. Non-speculative cancellations are unexpected errors.
                     t_llm_cancelled = time.perf_counter()
                     if is_speculative_step:
+                        _llm_span.set_attribute("status", "cancelled")
                         LOG.debug(
                             "LLM request cancelled (speculative step)",
                             llm_key=llm_key,
@@ -1232,6 +1421,7 @@ class LLMAPIHandlerFactory:
                         )
                         raise
                     else:
+                        _llm_span.set_attribute("status", "error")
                         LOG.error(
                             "LLM request got cancelled",
                             llm_key=llm_key,
@@ -1240,8 +1430,20 @@ class LLMAPIHandlerFactory:
                             duration=t_llm_cancelled - t_llm_request,
                         )
                         raise LLMProviderError(llm_key) from None
+                except litellm.exceptions.RateLimitError as e:
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "rate_limited")
+                    LOG.warning(
+                        "LLM request rate limited",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderError(llm_key, cause=e) from e
                 except Exception as e:
-                    duration_seconds = time.time() - start_time
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
                     LOG.exception(
                         "LLM request failed unexpectedly",
                         llm_key=llm_key,
@@ -1301,8 +1503,9 @@ class LLMAPIHandlerFactory:
 
                 _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
 
+                actual_model = _normalize_llm_model(getattr(response, "model", None) or model_name)
                 if step and not is_speculative_step:
-                    await app.DATABASE.update_step(
+                    await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
                         organization_id=step.organization_id,
@@ -1311,9 +1514,10 @@ class LLMAPIHandlerFactory:
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                         incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                         incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                        last_llm_model=actual_model,
                     )
                 if thought:
-                    await app.DATABASE.update_thought(
+                    await app.DATABASE.observer.update_thought(
                         thought_id=thought.observer_thought_id,
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
@@ -1321,6 +1525,7 @@ class LLMAPIHandlerFactory:
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         thought_cost=llm_cost,
+                        last_llm_model=actual_model,
                     )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
@@ -1358,7 +1563,7 @@ class LLMAPIHandlerFactory:
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
-                duration_seconds = time.time() - start_time
+                duration_seconds = time.perf_counter() - start_time
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1375,6 +1580,23 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    service_tier=getattr(response, "service_tier", None),
+                )
+
+                # actual_model is the response's model normalized by _normalize_llm_model.
+                # It's only None if response.model AND model_name were both falsy (broken
+                # config). The llm_config.model_name fallback satisfies mypy and is a no-op
+                # safety net — it matches the value already fed to _normalize_llm_model.
+                _enrich_llm_span(
+                    _llm_span,
+                    model=actual_model or llm_config.model_name,
+                    prompt_name=prompt_name,
+                    prompt_tokens=int(prompt_tokens or 0),
+                    completion_tokens=int(completion_tokens or 0),
+                    reasoning_tokens=int(reasoning_tokens or 0),
+                    cached_tokens=int(cached_tokens or 0),
+                    latency_ms=int(duration_seconds * 1000),
+                    llm_cost=float(llm_cost or 0.0),
                 )
 
                 if step and is_speculative_step:
@@ -1396,24 +1618,35 @@ class LLMAPIHandlerFactory:
 
                 return parsed_response
             finally:
-                try:
-                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-                except Exception:
-                    LOG.error("Failed to persist artifacts", exc_info=True)
-                if _should_bundle and should_persist_llm_artifacts and step:
-                    _ctx = skyvern_context.current()
-                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
-                        step=step,
-                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
-                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
-                        run_id=_ctx.run_id if _ctx else None,
-                        hashed_href_map=_bundle_hashed_href_map,
-                        prompt=_bundle_prompt,
-                        request=_bundle_request,
-                        response=_bundle_response,
-                        parsed_response=_bundle_parsed,
-                        rendered_response=_bundle_rendered,
+                # Post-response artifact persistence cluster. bulk_create_artifacts
+                # does the S3 uploads + DB rows for every LLM artifact queued during
+                # this request; the bundled-path archive accumulate is fast in-memory.
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                    apply_context_attrs(_post_span)
+                    _post_span.set_attribute("bundled", bool(_should_bundle))
+                    # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                    _post_span.set_attribute(
+                        "artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None)
                     )
+                    try:
+                        await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                    except Exception:
+                        LOG.error("Failed to persist artifacts", exc_info=True)
+                    if _should_bundle and should_persist_llm_artifacts and step:
+                        _ctx = skyvern_context.current()
+                        app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                            step=step,
+                            workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                            workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                            run_id=_ctx.run_id if _ctx else None,
+                            hashed_href_map=_bundle_hashed_href_map,
+                            prompt=_bundle_prompt,
+                            request=_bundle_request,
+                            response=_bundle_response,
+                            parsed_response=_bundle_parsed,
+                            rendered_response=_bundle_rendered,
+                        )
 
         llm_api_handler.llm_key = llm_key  # type: ignore[attr-defined]
         return llm_api_handler
@@ -1507,6 +1740,7 @@ class LLMCaller:
     def clear_tool_results(self) -> None:
         self.current_tool_results = []
 
+    @traced(name=LLM_REQUEST_SPAN_NAME)
     async def call(
         self,
         prompt: str | None = None,
@@ -1526,7 +1760,15 @@ class LLMCaller:
         system_prompt: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
+        _assert_step_thought_exclusive(step, thought)
         start_time = time.perf_counter()
+        _llm_span = otel_trace.get_current_span()
+        _llm_span.set_attribute("llm_key", self.llm_key)
+        _llm_span.set_attribute("llm_model", self.llm_config.model_name)
+        _llm_span.set_attribute("prompt_name", prompt_name or "<unknown>")
+        # handler_type distinguishes the three LLM entry points that share
+        # the skyvern.llm.request span name. Dashboards filter on this attr.
+        _llm_span.set_attribute("handler_type", "direct_call")
         active_parameters = self.base_parameters or {}
         if parameters is None:
             parameters = LLMAPIHandlerFactory.get_api_parameters(self.llm_config)
@@ -1583,27 +1825,43 @@ class LLMCaller:
                             tool["display_height_px"] = target_dimension["height"]
                         if "display_width_px" in tool:
                             tool["display_width_px"] = target_dimension["width"]
-                screenshots = resize_screenshots(screenshots, target_dimension)
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.llm.screenshot_resize") as _resize_span:
+                    apply_context_attrs(_resize_span)
+                    _resize_span.set_attribute("input_count", len(screenshots))
+                    _resize_span.set_attribute("input_bytes", sum(len(s) for s in screenshots))
+                    _resize_span.set_attribute("target_width", target_dimension["width"])
+                    _resize_span.set_attribute("target_height", target_dimension["height"])
+                    screenshots = resize_screenshots(screenshots, target_dimension)
+                    _resize_span.set_attribute("output_bytes", sum(len(s) for s in screenshots))
 
             llm_prompt_value = prompt or ""
-            if prompt and should_persist_llm_artifacts:
-                if _should_bundle:
-                    _bundle_prompt = prompt.encode("utf-8")
-                    if screenshots and step:
-                        app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                            step=step,
-                            screenshots=screenshots,
-                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            # Pre-request artifact persistence cluster. Covers prompt + screenshot
+            # staging before the LLM call. The hot cost is inside the non-bundled
+            # branch (prepare_llm_artifact → S3 upload).
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                apply_context_attrs(_pre_span)
+                _pre_span.set_attribute("bundled", bool(_should_bundle))
+                _pre_span.set_attribute("persist", bool(prompt and should_persist_llm_artifacts))
+                if prompt and should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_prompt = prompt.encode("utf-8")
+                        if screenshots and step:
+                            app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                                step=step,
+                                screenshots=screenshots,
+                                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            )
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=prompt.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_PROMPT,
+                                screenshots=screenshots,
+                                **artifact_targets,
+                            )
                         )
-                else:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=prompt.encode("utf-8"),
-                            artifact_type=ArtifactType.LLM_PROMPT,
-                            screenshots=screenshots,
-                            **artifact_targets,
-                        )
-                    )
 
             if not self.llm_config.supports_vision:
                 screenshots = None
@@ -1656,9 +1914,13 @@ class LLMCaller:
                 if use_message_history:
                     # only update message_history when the request is successful
                     self.message_history = messages
+            # Error paths only set status=error, not token/cost attrs via
+            # _enrich_llm_span — no response object exists so there's nothing to report.
             except litellm.exceptions.APIError as e:
+                _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
+                _llm_span.set_attribute("status", "context_exceeded")
                 LOG.exception(
                     "Context window exceeded",
                     llm_key=self.llm_key,
@@ -1670,6 +1932,7 @@ class LLMCaller:
                 # so we log at debug level. Non-speculative cancellations are unexpected errors.
                 t_llm_cancelled = time.perf_counter()
                 if is_speculative_step:
+                    _llm_span.set_attribute("status", "cancelled")
                     LOG.debug(
                         "LLM request cancelled (speculative step)",
                         llm_key=self.llm_key,
@@ -1678,6 +1941,7 @@ class LLMCaller:
                     )
                     raise
                 else:
+                    _llm_span.set_attribute("status", "error")
                     LOG.error(
                         "LLM request got cancelled",
                         llm_key=self.llm_key,
@@ -1685,7 +1949,12 @@ class LLMCaller:
                         duration=t_llm_cancelled - t_llm_request,
                     )
                     raise LLMProviderError(self.llm_key) from None
+            except litellm.exceptions.RateLimitError as e:
+                _llm_span.set_attribute("status", "rate_limited")
+                LOG.warning("LLM request rate limited", llm_key=self.llm_key)
+                raise LLMProviderError(self.llm_key, cause=e) from e
             except Exception as e:
+                _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key, cause=e) from e
 
@@ -1703,8 +1972,9 @@ class LLMCaller:
                     )
 
             call_stats = await self.get_call_stats(response)
+            actual_model = _normalize_llm_model(getattr(response, "model", None) or self.llm_config.model_name)
             if step and not is_speculative_step:
-                await app.DATABASE.update_step(
+                await app.DATABASE.tasks.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
                     organization_id=step.organization_id,
@@ -1713,9 +1983,10 @@ class LLMCaller:
                     incremental_output_tokens=call_stats.output_tokens,
                     incremental_reasoning_tokens=call_stats.reasoning_tokens,
                     incremental_cached_tokens=call_stats.cached_tokens,
+                    last_llm_model=actual_model,
                 )
             if thought:
-                await app.DATABASE.update_thought(
+                await app.DATABASE.observer.update_thought(
                     thought_id=thought.observer_thought_id,
                     organization_id=thought.organization_id,
                     input_token_count=call_stats.input_tokens,
@@ -1723,6 +1994,7 @@ class LLMCaller:
                     reasoning_token_count=call_stats.reasoning_tokens,
                     cached_token_count=call_stats.cached_tokens,
                     thought_cost=call_stats.llm_cost,
+                    last_llm_model=actual_model,
                 )
 
             organization_id = organization_id or (
@@ -1741,11 +2013,27 @@ class LLMCaller:
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
-                reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
+                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
+                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
+                reasoning_tokens=call_stats.reasoning_tokens
+                if call_stats and call_stats.reasoning_tokens is not None
+                else None,
+                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
+                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+            )
+
+            # See comment on the non-router _enrich_llm_span call — same reasoning
+            # for the fallback to self.llm_config.model_name.
+            _enrich_llm_span(
+                _llm_span,
+                model=actual_model or self.llm_config.model_name,
+                prompt_name=prompt_name or "<unknown>",
+                prompt_tokens=int(call_stats.input_tokens or 0),
+                completion_tokens=int(call_stats.output_tokens or 0),
+                reasoning_tokens=int(call_stats.reasoning_tokens or 0),
+                cached_tokens=int(call_stats.cached_tokens or 0),
+                latency_ms=int(duration_seconds * 1000),
+                llm_cost=float(call_stats.llm_cost or 0.0),
             )
 
             # Raw response is used for CUA engine LLM calls.
@@ -1803,31 +2091,40 @@ class LLMCaller:
 
             return parsed_response
         finally:
-            try:
-                await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-            except Exception:
-                LOG.error("Failed to persist artifacts", exc_info=True)
-            if _should_bundle and should_persist_llm_artifacts and step:
-                _ctx = skyvern_context.current()
-                app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
-                    step=step,
-                    workflow_run_id=_ctx.workflow_run_id if _ctx else None,
-                    workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
-                    run_id=_ctx.run_id if _ctx else None,
-                    hashed_href_map=_bundle_hashed_href_map,
-                    prompt=_bundle_prompt,
-                    request=_bundle_request,
-                    response=_bundle_response,
-                    parsed_response=_bundle_parsed,
-                    rendered_response=_bundle_rendered,
-                )
+            # Post-response artifact persistence cluster. bulk_create_artifacts does
+            # the S3 uploads + DB rows for every LLM artifact queued during this
+            # request; the bundled-path archive accumulate is fast in-memory.
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                apply_context_attrs(_post_span)
+                _post_span.set_attribute("bundled", bool(_should_bundle))
+                # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                _post_span.set_attribute("artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None))
+                try:
+                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                except Exception:
+                    LOG.error("Failed to persist artifacts", exc_info=True)
+                if _should_bundle and should_persist_llm_artifacts and step:
+                    _ctx = skyvern_context.current()
+                    app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                        step=step,
+                        workflow_run_id=_ctx.workflow_run_id if _ctx else None,
+                        workflow_run_block_id=_ctx.parent_workflow_run_block_id if _ctx else None,
+                        run_id=_ctx.run_id if _ctx else None,
+                        hashed_href_map=_bundle_hashed_href_map,
+                        prompt=_bundle_prompt,
+                        request=_bundle_request,
+                        response=_bundle_response,
+                        parsed_response=_bundle_parsed,
+                        rendered_response=_bundle_rendered,
+                    )
 
     def get_screenshot_resize_target_dimension(self, window_dimension: Resolution | None) -> Resolution:
         if window_dimension and window_dimension != self.browser_window_dimension:
             return get_resize_target_dimension(window_dimension)
         return self.screenshot_resize_target_dimension
 
-    @traced()
+    @traced(name="skyvern.llm.dispatch")
     async def _dispatch_llm_call(
         self,
         messages: list[dict[str, Any]],

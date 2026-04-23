@@ -246,7 +246,7 @@ class TestBuildBlockResultPassesErrorCodes:
 
         from skyvern.forge import app
 
-        app.DATABASE.update_workflow_run_block.reset_mock()
+        app.DATABASE.observer.update_workflow_run_block.reset_mock()
 
         result = await block.build_block_result(
             success=False,
@@ -257,8 +257,8 @@ class TestBuildBlockResultPassesErrorCodes:
             error_codes=["FILE_PARSER_ERROR"],
         )
 
-        app.DATABASE.update_workflow_run_block.assert_called_once()
-        call_kwargs = app.DATABASE.update_workflow_run_block.call_args[1]
+        app.DATABASE.observer.update_workflow_run_block.assert_called_once()
+        call_kwargs = app.DATABASE.observer.update_workflow_run_block.call_args[1]
         assert call_kwargs["error_codes"] == ["FILE_PARSER_ERROR"]
         assert result.error_codes == ["FILE_PARSER_ERROR"]
 
@@ -268,7 +268,7 @@ class TestBuildBlockResultPassesErrorCodes:
 
         from skyvern.forge import app
 
-        app.DATABASE.update_workflow_run_block.reset_mock()
+        app.DATABASE.observer.update_workflow_run_block.reset_mock()
 
         result = await block.build_block_result(
             success=True,
@@ -278,7 +278,7 @@ class TestBuildBlockResultPassesErrorCodes:
             organization_id="org_test",
         )
 
-        app.DATABASE.update_workflow_run_block.assert_called_once()
-        call_kwargs = app.DATABASE.update_workflow_run_block.call_args[1]
+        app.DATABASE.observer.update_workflow_run_block.assert_called_once()
+        call_kwargs = app.DATABASE.observer.update_workflow_run_block.call_args[1]
         assert call_kwargs["error_codes"] is None
         assert result.error_codes == []

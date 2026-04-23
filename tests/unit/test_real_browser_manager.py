@@ -131,3 +131,44 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
     # Both entries should be synced
     assert manager.pages["wfr_child"] is parent_state
     assert manager.pages["wfr_parent"] is parent_state
+
+
+def _make_browser_state_with_video(video_path: str) -> MagicMock:
+    video_artifact = MagicMock()
+    video_artifact.video_path = video_path
+    video_artifact.video_data = None
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = [video_artifact]
+    return browser_state
+
+
+@pytest.mark.asyncio
+async def test_get_video_artifacts_finalize_true_invokes_ffmpeg(tmp_path) -> None:
+    """The default (finalize=True) path remuxes via ffmpeg so the final upload has Duration + Cues."""
+    src = tmp_path / "recording.webm"
+    src.write_bytes(b"raw-webm-bytes")
+    browser_state = _make_browser_state_with_video(str(src))
+
+    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock(return_value=b"remuxed")) as m:
+        artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
+
+    m.assert_awaited_once_with(str(src))
+    assert artifacts[0].video_data == b"remuxed"
+
+
+@pytest.mark.asyncio
+async def test_get_video_artifacts_finalize_false_skips_ffmpeg(tmp_path) -> None:
+    """finalize=False is the per-step-snapshot path: read raw bytes, never spawn ffmpeg.
+
+    This is what prevents long browser tasks from firing one ffmpeg subprocess per step
+    (the step-sync runs while the recording file is still open — remux is pointless there).
+    """
+    src = tmp_path / "recording.webm"
+    src.write_bytes(b"partial-webm-bytes")
+    browser_state = _make_browser_state_with_video(str(src))
+
+    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock()) as m:
+        artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state, finalize=False)
+
+    m.assert_not_awaited()
+    assert artifacts[0].video_data == b"partial-webm-bytes"

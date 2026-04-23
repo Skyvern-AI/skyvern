@@ -24,7 +24,7 @@ A typical task takes 2 to 10 steps. You can set `max_steps` to cap cost during d
 
 For anything beyond simple single-page tasks, Skyvern 2.0 wraps the agent loop in a higher-level system with three components:
 
-<img src="/images/skyvern-system-architecture.png" alt="Skyvern 2.0 architecture: Planner breaks prompt into sub-tasks, Task Agent executes them, Validator confirms completion" />
+<img src="/images/skyvern-explainer.png" alt="Skyvern 2.0 architecture: Planner breaks prompt into sub-tasks, Task Agent executes them, Validator confirms completion" />
 
 The **Planner** takes your prompt and breaks it into an ordered sequence of sub-tasks. If you say "log into the vendor portal, download all invoices from January, and save them as PDFs," the Planner sequences that into: navigate to login → authenticate → find the invoice section → loop through January invoices → download each one.
 

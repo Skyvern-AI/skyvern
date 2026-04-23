@@ -42,7 +42,7 @@ async def get_browser_sessions_all(
     """Get all browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get-all")
 
-    browser_sessions = await app.DATABASE.get_persistent_browser_sessions_history(
+    browser_sessions = await app.DATABASE.browser_sessions.get_persistent_browser_sessions_history(
         current_org.organization_id,
         page=page,
         page_size=page_size,
@@ -91,7 +91,7 @@ async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     if browser_session_request.browser_profile_id:
-        profile = await app.DATABASE.get_browser_profile(
+        profile = await app.DATABASE.browser_sessions.get_browser_profile(
             browser_session_request.browser_profile_id,
             current_org.organization_id,
         )

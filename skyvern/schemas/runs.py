@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -60,6 +60,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_NL = "RESIDENTIAL_NL"
     RESIDENTIAL_PH = "RESIDENTIAL_PH"
     RESIDENTIAL_KR = "RESIDENTIAL_KR"
+    RESIDENTIAL_SA = "RESIDENTIAL_SA"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -100,6 +101,7 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_NL,
             cls.RESIDENTIAL_PH,
             cls.RESIDENTIAL_KR,
+            cls.RESIDENTIAL_SA,
         }
 
     @staticmethod
@@ -125,6 +127,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_NL: 2000,
             ProxyLocation.RESIDENTIAL_PH: 2000,
             ProxyLocation.RESIDENTIAL_KR: 2000,
+            ProxyLocation.RESIDENTIAL_SA: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -151,6 +154,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_NL: "NL",
             ProxyLocation.RESIDENTIAL_PH: "PH",
             ProxyLocation.RESIDENTIAL_KR: "KR",
+            ProxyLocation.RESIDENTIAL_SA: "SA",
         }
         return mapping.get(proxy_location, "US")
 
@@ -176,6 +180,7 @@ SUPPORTED_GEO_COUNTRIES = frozenset(
         "NZ",
         "PH",
         "KR",
+        "SA",
         "TR",
         "ZA",
     }
@@ -262,7 +267,7 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
         return ZoneInfo("America/New_York")
 
     if proxy_location == ProxyLocation.US_WA:
-        return ZoneInfo("America/New_York")
+        return ZoneInfo("America/Los_Angeles")
 
     if proxy_location == ProxyLocation.RESIDENTIAL:
         return ZoneInfo("America/New_York")
@@ -324,6 +329,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     if proxy_location == ProxyLocation.RESIDENTIAL_KR:
         return ZoneInfo("Asia/Seoul")
 
+    if proxy_location == ProxyLocation.RESIDENTIAL_SA:
+        return ZoneInfo("Asia/Riyadh")
+
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")
 
@@ -382,7 +390,7 @@ class TaskRunRequest(BaseModel):
         examples=TASK_URL_EXAMPLES,
     )
     engine: RunEngine = Field(
-        default=RunEngine.skyvern_v2,
+        default=RunEngine.skyvern_v1,
         description=TASK_ENGINE_DOC_STRING,
     )
     title: str | None = Field(
@@ -481,6 +489,12 @@ class TaskRunRequest(BaseModel):
             return url
 
         return validate_url(url)
+
+    @model_validator(mode="after")
+    def _force_v2_for_publish_workflow(self) -> TaskRunRequest:
+        if self.publish_workflow and self.engine != RunEngine.skyvern_v2:
+            self.engine = RunEngine.skyvern_v2
+        return self
 
 
 class WorkflowRunRequest(BaseModel):

@@ -10,8 +10,10 @@ import { Separator } from "@/components/ui/separator";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { NodeHeader } from "../components/NodeHeader";
 import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
-import type { WorkflowTriggerNode as WorkflowTriggerNodeType } from "./types";
-import { isConcreteWpid } from "./types";
+import {
+  type WorkflowTriggerNode as WorkflowTriggerNodeType,
+  isConcreteWpid,
+} from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";

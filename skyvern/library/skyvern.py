@@ -275,7 +275,7 @@ class Skyvern(AsyncSkyvern):
     async def run_task(
         self,
         prompt: str,
-        engine: RunEngine = RunEngine.skyvern_v2,
+        engine: RunEngine = RunEngine.skyvern_v1,
         model: dict[str, Any] | None = None,
         url: str | None = None,
         webhook_url: str | None = None,

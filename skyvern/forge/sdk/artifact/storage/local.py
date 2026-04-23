@@ -164,10 +164,10 @@ class LocalStorage(BaseStorage):
             return None
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        return None
+        return artifact.uri if artifact.uri else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return None
+        return [artifact.uri for artifact in artifacts] or None
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         return
@@ -226,6 +226,29 @@ class LocalStorage(BaseStorage):
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
+
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to delete browser session outside storage base path",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        if not stored_folder_path.exists():
+            return
+        try:
+            shutil.rmtree(stored_folder_path)
+        except Exception:
+            LOG.exception(
+                "Failed to delete local browser session",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                path=str(stored_folder_path),
+            )
+            raise
 
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile locally."""

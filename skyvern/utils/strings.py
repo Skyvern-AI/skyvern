@@ -2,6 +2,7 @@ import os
 import random
 import re
 import string
+import unicodedata
 import uuid
 
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
@@ -46,3 +47,17 @@ def sanitize_identifier(value: str, default: str = "identifier") -> str:
         sanitized = default
 
     return sanitized
+
+
+def escape_code_fences(text: str | None) -> str:
+    """Neutralize Markdown code-fence delimiters in untrusted content.
+
+    Prompts that wrap user content inside triple-backtick (```` ``` ````) or
+    triple-tilde (``~~~``) fences can be broken out of by content that
+    contains the same delimiter, allowing injection of arbitrary instructions.
+    Replace both with spaced versions so the fence stays intact.
+    """
+    if text is None:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    return text.replace("```", "` ` `").replace("~~~", "~ ~ ~")

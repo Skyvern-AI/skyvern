@@ -6,10 +6,11 @@ Generate a runnable Skyvern workflow script.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
+import json
 import keyword
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,11 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
     generate_workflow_parameters_schema,
     hydrate_input_text_actions_with_field_names,
+)
+from skyvern.core.script_generations.parameter_reference_guard import (
+    HallucinatedParameterError,
+    log_or_raise_guard_result,
+    validate_context_parameter_refs,
 )
 from skyvern.forge import app
 from skyvern.schemas.workflows import FileStorageType
@@ -43,6 +49,108 @@ class ScriptBlockSource:
     workflow_run_block_id: str | None
     input_fields: list[str] | None
     requires_agent: bool | None = None
+
+
+@dataclass
+class CodeGenResult:
+    """Result of generate_workflow_script_python_code() with block-creation telemetry."""
+
+    source_code: str
+    blocks_created: int
+    blocks_failed: int
+
+
+# ----- SKY-8965: valid-keys collection for the parameter-reference guard --------
+
+# `\s+` tolerates any indentation a future formatter might pick; `[^=]+?` for
+# the type annotation captures complex types like `Optional[str]` and `list[str]`
+# without silently dropping those fields from the valid-keys set.
+_SCHEMA_FIELD_RE = re.compile(r"^\s+(\w+)\s*:\s*[^=]+?=\s*Field\(", re.MULTILINE)
+
+
+def _collect_declared_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Return the set of all parameter keys from the workflow definition.
+
+    Includes workflow, output, and context parameters — any parameter type whose
+    key can legally appear as `context.parameters['key']` at runtime. Secret
+    parameter types (aws_secret, bitwarden_*, etc.) are included too since their
+    presence in the valid-keys set only reduces false-positive guard violations.
+    """
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if key:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_upstream_schema_keys(blocks: list[dict[str, Any]]) -> frozenset[str]:
+    """Return the set of keys introduced by upstream blocks' data_schema.
+
+    Extracts `properties` keys from any block's `data_schema` (extract-info
+    blocks and task blocks with a `data_extraction_goal`). Handles both dict
+    schemas and JSON-encoded string schemas (BlockYAML allows either). Recurses
+    into ForLoop children (`loop_blocks`) since extract-info nested inside a
+    loop still contributes keys referenced by the generated script.
+
+    Phase 1 treats these as globally valid (a reference to `invoice_date` is OK
+    anywhere in the script, not just blocks that come after the block that
+    declares it). Phase 2 may tighten this to per-block ordering.
+    """
+    keys: set[str] = set()
+    for block in blocks or []:
+        schema = block.get("data_schema")
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except (ValueError, TypeError):
+                schema = None
+        if isinstance(schema, dict):
+            props = schema.get("properties")
+            if isinstance(props, dict):
+                keys.update(str(k) for k in props.keys())
+        nested = block.get("loop_blocks")
+        if isinstance(nested, list):
+            keys |= _collect_upstream_schema_keys(nested)
+    return frozenset(keys)
+
+
+def _collect_goal_templates(blocks: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each task_id to its unrendered navigation_goal template.
+
+    The deterministic picker uses these templates to detect jinja references
+    like ``{{ search_term }}`` and bind actions to declared parameters.
+
+    Recurses into ``loop_blocks`` so tasks nested inside ForLoops also get
+    Rule-1 context (CORR-3 from debate review).
+    """
+    result: dict[str, str] = {}
+    for block in blocks or []:
+        task_id = block.get("task_id")
+        if task_id:
+            goal = block.get("navigation_goal") or block.get("data_extraction_goal") or ""
+            if goal:
+                result[task_id] = goal
+        nested = block.get("loop_blocks")
+        if isinstance(nested, list):
+            result.update(_collect_goal_templates(nested))
+    return result
+
+
+def _collect_synthesized_field_keys(schema_code: str) -> frozenset[str]:
+    """Extract field names from a generated `GeneratedWorkflowParameters` class.
+
+    Parses the schema code by regex for the `name: type = Field(...)` pattern.
+    Returns an empty frozenset for the empty-schema case (`pass` body).
+    """
+    if not schema_code:
+        return frozenset()
+    return frozenset(_SCHEMA_FIELD_RE.findall(schema_code))
 
 
 def _build_existing_field_assignments(
@@ -66,15 +174,26 @@ def _build_existing_field_assignments(
     Returns:
         Dictionary mapping action index (1-based) to the existing field name that must be preserved
     """
-    # Build mapping of block label -> task_id
+    # Build mapping of block label -> task_id, recursing into loop_blocks so
+    # cached child blocks inside ForLoops are also covered. Without this,
+    # Phase 1-era LLM names in cached ForLoop children would not get
+    # re-registered and the Phase 2 guard would false-positive on regen
+    # (andrewneilson review feedback).
     block_label_to_task_id: dict[str, str] = {}
-    for idx, block in enumerate(blocks):
-        if block.get("block_type") not in SCRIPT_TASK_BLOCKS:
-            continue
-        label = block.get("label") or block.get("title") or block.get("task_id") or f"task_{idx}"
-        task_id = block.get("task_id")
-        if task_id:
-            block_label_to_task_id[label] = task_id
+
+    def _collect_block_label_to_task_id(blks: list[dict[str, Any]], counter: int = 0) -> None:
+        for block in blks:
+            if block.get("block_type") in SCRIPT_TASK_BLOCKS:
+                label = block.get("label") or block.get("title") or block.get("task_id") or f"task_{counter}"
+                task_id = block.get("task_id")
+                if task_id:
+                    block_label_to_task_id[label] = task_id
+            nested = block.get("loop_blocks")
+            if isinstance(nested, list):
+                _collect_block_label_to_task_id(nested, counter + 1)
+            counter += 1
+
+    _collect_block_label_to_task_id(blocks)
 
     # Build mapping of task_id -> list of existing field names (for unchanged blocks)
     task_id_to_existing_fields: dict[str, list[str]] = {}
@@ -529,7 +648,9 @@ def _render_value(
 ) -> cst.BaseExpression:
     """Create a prompt value with template rendering logic if needed."""
     if not prompt_text:
-        return cst.SimpleString("")
+        # Delegate to _value so empty/None inputs produce a valid CST node
+        # (libcst rejects SimpleString("") because it lacks enclosing quotes).
+        return _value(prompt_text)
     if "{{" in prompt_text and "}}" in prompt_text:
         args = [cst.Arg(value=_value(prompt_text))]
         if data_variable_name:
@@ -769,10 +890,15 @@ def _action_to_stmt(
         label = option.get("label")
         value = value or label
         if value:
-            # TODO: consider supporting fallback mode for select_option actions
-            # ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
-            # if _requires_mini_agent(act):
-            ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
+            # Mirror the click branch: with semantic selectors we have a real
+            # CSS selector + value, so try the selector path first and fall
+            # back to AI only if it misses.  Without semantic selectors the
+            # selector is an xpath harvested from iteration 0 and unlikely to
+            # be reliable, so go straight to AI.
+            if use_semantic_selectors:
+                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+            else:
+                ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
             if act.get("field_name"):
                 option_value = cst.Subscript(
                     value=cst.Attribute(
@@ -904,7 +1030,7 @@ def _action_to_stmt(
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_value(act["data_extraction_goal"]),
+                value=_render_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1019,52 +1145,6 @@ def _collect_block_input_fields(
     return all_fields
 
 
-def _is_form_filling_block(
-    actions: list[dict[str, Any]],
-) -> bool:
-    """Check if a block's actions indicate a form-filling pattern (4+ input/select actions)."""
-    form_action_count = sum(
-        1 for a in actions if a.get("action_type") in (ActionType.INPUT_TEXT, ActionType.SELECT_OPTION)
-    )
-    return form_action_count >= 4
-
-
-def _build_form_filling_block_fn(
-    block: dict[str, Any],
-    actions: list[dict[str, Any]],
-    value_to_param: dict[str, str] | None = None,
-) -> FunctionDef:
-    """Generate a form-filling block function that uses page.fill_form().
-
-    Produces a simple function that calls page.fill_form(context.parameters)
-    which internally uses LLM-based field mapping (extract → map → fill).
-    """
-    name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
-    cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
-
-    navigation_goal = block.get("navigation_goal") or "Fill out the form"
-
-    # Include page.goto(url) if the block has a URL, just like _build_block_fn does
-    goto_line = ""
-    if block.get("url"):
-        goto_line = f"    await page.goto({repr(block['url'])})\n"
-
-    func_code = (
-        f"async def {name}(page: SkyvernPage, context: RunContext):\n"
-        f"{goto_line}"
-        f"    await page.fill_form(context.parameters, prompt={repr(navigation_goal)})\n"
-    )
-
-    # Parse and add decorator
-    parsed = cst.parse_module(func_code)
-    func_def = parsed.body[0]
-    assert isinstance(func_def, FunctionDef)
-
-    # Add the @skyvern.cached decorator
-    decorated = func_def.with_changes(decorators=[make_decorator(cache_key, block)])
-    return decorated
-
-
 def _detect_block_ats_platform(block: dict[str, Any], all_blocks: list[dict[str, Any]] | None = None) -> str | None:
     """Check if a block belongs to a known platform with optimized scripts.
 
@@ -1115,9 +1195,11 @@ def _build_block_fn(
                 )
                 return pipeline_fn
 
-    # Check if this block is form-filling (4+ input_text/select actions)
-    if use_semantic_selectors and _is_form_filling_block(actions):
-        return _build_form_filling_block_fn(block, actions, value_to_param)
+    # NOTE: page.fill_form() is intentionally NOT generated here.  fill_form
+    # delegates entirely to AI at runtime, defeating the purpose of caching.
+    # ATS workflows use their own optimized pipeline via the
+    # _detect_block_ats_platform → build_ats_pipeline_block_fn path above.
+    # See PR #10043 (reviewer restriction) and PR #10195 (this change).
 
     name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
@@ -1127,15 +1209,24 @@ def _build_block_fn(
     actions = _annotate_multi_field_totp_sequence(actions)
 
     if block.get("url"):
-        body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
+        # Use skyvern.render_template() when the URL contains a Jinja expression
+        # (e.g. {{ outer_page_loop.current_value.url }}) so it resolves at runtime
+        # against workflow_run_context.values populated by skyvern.loop().
+        url_str = block["url"]
+        if isinstance(url_str, str) and "{{" in url_str and "}}" in url_str:
+            body_stmts.append(cst.parse_statement(f"await page.goto(skyvern.render_template({repr(url_str)}))"))
+        else:
+            body_stmts.append(cst.parse_statement(f"await page.goto({repr(url_str)})"))
 
-    # For file_download blocks inside for-loops, generate a dynamic click that uses
-    # per-iteration context instead of hardcoded xpath/prompt from iteration 0.
+    # For blocks inside for-loops that click on loop items, generate a dynamic click
+    # that uses per-iteration context instead of hardcoded xpath/prompt from iteration 0.
+    # loop_item_selector() builds a selector from the current loop value at runtime:
+    # URL path matching (a[href*="path-segment"]) or text matching (a:has-text("title")).
     block_type = block.get("block_type")
-    if is_in_for_loop and block_type == "file_download":
+    if is_in_for_loop and block_type in ("file_download", "navigation"):
         body_stmts.append(
             cst.parse_statement(
-                'await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")'
+                'await page.click(selector=context.loop_item_selector(), prompt=context.prompt, ai="fallback")'
             )
         )
     else:
@@ -1398,7 +1489,7 @@ def _build_extract_statement(
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("data_extraction_goal", "")),
+            value=_render_value(block.get("data_extraction_goal", ""), data_variable_name),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1406,6 +1497,8 @@ def _build_extract_statement(
         ),
         cst.Arg(
             keyword=cst.Name("schema"),
+            # data_schema is a dict/object, not a string template — _render_value only
+            # handles strings, so we intentionally keep _value here.
             value=_value(block.get("data_schema", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
@@ -1413,6 +1506,20 @@ def _build_extract_statement(
             ),
         ),
     ]
+    # Emit url so the extraction block navigates to the right page on cache hit.
+    # Uses _render_value so Jinja refs like {{ outer_page_loop.current_value.url }}
+    # resolve at runtime from workflow_run_context.values (populated by skyvern.loop()).
+    if block.get("url"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("url"),
+                value=_render_value(block.get("url", ""), data_variable_name),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
     if block.get("model"):
         args.append(
             cst.Arg(
@@ -2391,6 +2498,24 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     return for_loop
 
 
+_FOR_LOOP_CACHED_CODE_RE = re.compile(r"^async for\b.*\bin\s+skyvern\.loop\s*\(")
+
+
+def _is_for_loop_cached_code(code: str) -> bool:
+    """Return True if *code* is a bare `async for ... in skyvern.loop(...):` block.
+
+    for_loop block_code is only valid inside the async run_workflow body — appending it
+    at module level (as the preserve-cached-blocks loop otherwise does) produces
+    'async for outside async function' SyntaxError (SKY-9180).
+    """
+    for line in code.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _FOR_LOOP_CACHED_CODE_RE.match(stripped) is not None
+    return False
+
+
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
     if not args:
         return
@@ -2432,7 +2557,14 @@ def __build_base_task_statement(
     if value_to_param and prompt:
         prompt_value = _build_parameterized_prompt_cst(prompt, value_to_param)
     if prompt_value is None:
-        prompt_value = _value(prompt)
+        if prompt:
+            # Use _render_value so Jinja refs (e.g. {{ current_value }},
+            # {{ outer_loop.current_value.url }}) are resolved at runtime via
+            # skyvern.render_template() instead of emitted as Python literals.
+            prompt_value = _render_value(prompt, data_variable_name)
+        else:
+            # Preserve old behavior for None/empty prompts (emits `None` vs `""`).
+            prompt_value = _value(prompt)
 
     args = [
         cst.Arg(
@@ -2448,7 +2580,10 @@ def __build_base_task_statement(
         args.append(
             cst.Arg(
                 keyword=cst.Name("url"),
-                value=_value(block.get("url", "")),
+                # Use _render_value so Jinja refs (e.g. {{ current_value }},
+                # {{ outer_loop.current_value.url }}) resolve at runtime via
+                # skyvern.render_template() instead of being emitted as literals.
+                value=_render_value(block.get("url", ""), data_variable_name),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -2724,15 +2859,19 @@ async def generate_workflow_script_python_code(
     updated_block_labels: set[str] | None = None,
     use_semantic_selectors: bool = False,
     adaptive_caching: bool = False,
-) -> str:
+) -> CodeGenResult:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
 
     Cached script blocks can be reused by providing them via `cached_blocks`. Any labels present in
     `updated_block_labels` will be regenerated from the latest workflow run execution data.
+
+    Returns a CodeGenResult containing the source code and block-creation success/failure counts.
     """
     cached_blocks = cached_blocks or {}
     updated_block_labels = set(updated_block_labels or [])
+    blocks_created = 0
+    blocks_failed = 0
 
     # Drop cached entries that do not have usable source
     cached_blocks = {label: source for label, source in cached_blocks.items() if source.code}
@@ -2789,8 +2928,18 @@ async def generate_workflow_script_python_code(
         cached_blocks=cached_blocks,
         updated_block_labels=updated_block_labels,
     )
+    # SKY-8965 Phase 2: pass declared-param and upstream-schema keys so the
+    # deterministic picker can match actions to known fields instead of the
+    # LLM inventing names.
+    declared_keys = _collect_declared_param_keys(workflow)
+    upstream_keys = _collect_upstream_schema_keys(blocks)
+    goal_template_by_task = _collect_goal_templates(blocks)
     generated_schema, field_mappings = await generate_workflow_parameters_schema(
-        actions_by_task, existing_field_assignments
+        actions_by_task,
+        existing_field_assignments,
+        declared_param_keys=declared_keys,
+        upstream_schema_keys=upstream_keys,
+        goal_template_by_task=goal_template_by_task,
     )
     actions_by_task = hydrate_input_text_actions_with_field_names(actions_by_task, field_mappings)
 
@@ -2872,21 +3021,22 @@ async def generate_workflow_script_python_code(
             block_workflow_run_block_id = task.get("workflow_run_block_id")
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=block_code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=block_name,
-                    update=pending,
-                    run_signature=run_signature,
-                    workflow_run_id=block_workflow_run_id,
-                    workflow_run_block_id=block_workflow_run_block_id,
-                    input_fields=input_fields,
-                )
-            except Exception as e:
-                LOG.error("Failed to create script block", error=str(e), exc_info=True)
+            ok = await create_or_update_script_block(
+                block_code=block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=block_name,
+                update=pending,
+                run_signature=run_signature,
+                workflow_run_id=block_workflow_run_id,
+                workflow_run_block_id=block_workflow_run_block_id,
+                input_fields=input_fields,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         append_block_code(block_code)
 
@@ -2945,21 +3095,22 @@ async def generate_workflow_script_python_code(
             run_signature = cst.Module(body=[task_v2_stmt]).code.strip()
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=block_code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=task_v2_label,
-                    update=pending,
-                    run_signature=run_signature,
-                    workflow_run_id=block_workflow_run_id,
-                    workflow_run_block_id=block_workflow_run_block_id,
-                    input_fields=input_fields,
-                )
-            except Exception as e:
-                LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
+            ok = await create_or_update_script_block(
+                block_code=block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=task_v2_label,
+                update=pending,
+                run_signature=run_signature,
+                workflow_run_id=block_workflow_run_id,
+                workflow_run_block_id=block_workflow_run_block_id,
+                input_fields=input_fields,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         append_block_code(block_code)
 
@@ -2989,21 +3140,22 @@ async def generate_workflow_script_python_code(
             run_signature = block_code.strip()
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=block_code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=for_loop_label,
-                    update=pending,
-                    run_signature=run_signature,
-                    workflow_run_id=block_workflow_run_id,
-                    workflow_run_block_id=block_workflow_run_block_id,
-                    input_fields=None,
-                )
-            except Exception as e:
-                LOG.error("Failed to create for_loop script block", error=str(e), exc_info=True)
+            ok = await create_or_update_script_block(
+                block_code=block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=for_loop_label,
+                update=pending,
+                run_signature=run_signature,
+                workflow_run_id=block_workflow_run_id,
+                workflow_run_block_id=block_workflow_run_block_id,
+                input_fields=None,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
 
         # NOTE: Do NOT call append_block_code() for for_loop blocks.
         # Unlike task blocks (which produce function definitions valid at module level),
@@ -3015,8 +3167,86 @@ async def generate_workflow_script_python_code(
         # Inner blocks (e.g. extraction inside a loop) are nested in loop_blocks and
         # are NOT in the top-level blocks list, so they need separate processing here.
         # This follows the same pattern as task_v2 child block handling (lines 2704-2714).
-        for loop_block in for_loop_block.get("loop_blocks", []):
-            if loop_block.get("block_type") not in SCRIPT_TASK_BLOCKS:
+        # Uses a BFS queue to recursively handle nested for-loops (SKY-8757).
+        # Each queue entry is (block_dict, parent_forloop_label) so cache
+        # invalidation propagates from the correct parent at any depth.
+        loop_block_queue: deque[tuple[dict[str, Any], str]] = deque(
+            (lb, for_loop_label) for lb in for_loop_block.get("loop_blocks", [])
+        )
+        while loop_block_queue:
+            loop_block, parent_fl_label = loop_block_queue.popleft()
+            loop_block_type = loop_block.get("block_type")
+
+            # block_type is a string here (from dict.get on model_dump output),
+            # not a BlockType enum — unlike transform_workflow_run.py which
+            # works with ORM objects. Both compare correctly to string literals.
+            #
+            # Nested for-loop: create script_block for the inner for-loop itself,
+            # then push its children onto the queue for processing.
+            # NOTE: Do NOT call append_block_code() for nested for_loop blocks
+            # (same as top-level for_loops) — they produce bare `async for`
+            # statements that cause SyntaxError at module level.
+            if loop_block_type == "for_loop":
+                nested_label = loop_block.get("label") or f"for_loop_{loop_block.get('workflow_run_block_id')}"
+
+                cached_nested = cached_blocks.get(nested_label)
+                # Force rebuild when the nested label OR its immediate parent
+                # for-loop is marked for regeneration (invalidation propagates
+                # down at every nesting depth, not just from the top-level).
+                use_nested_cached = (
+                    cached_nested is not None
+                    and nested_label not in updated_block_labels
+                    and parent_fl_label not in updated_block_labels
+                )
+
+                nested_wrbi = loop_block.get("workflow_run_block_id")
+                nested_wri = loop_block.get("workflow_run_id") or run_id
+
+                # use_nested_cached already guarantees cached_nested is not None;
+                # the explicit check is retained only for mypy type narrowing.
+                if (
+                    use_nested_cached
+                    and cached_nested is not None
+                    and cached_nested.code
+                    and cached_nested.run_signature
+                ):
+                    nested_code = cached_nested.code
+                    nested_sig = cached_nested.run_signature
+                    nested_wrbi = cached_nested.workflow_run_block_id
+                    nested_wri = cached_nested.workflow_run_id
+                else:
+                    # No usable cache entry (missing, incomplete, or needs update)
+                    # — rebuild from current run data. Mark this label as updated
+                    # so invalidation cascades to deeper descendants.
+                    updated_block_labels.add(nested_label)
+                    nested_stmt = _build_for_loop_statement(nested_label, loop_block)
+                    temp_mod = cst.Module(body=[nested_stmt])
+                    nested_code = temp_mod.code
+                    nested_sig = nested_code.strip()
+
+                if script_id and script_revision_id and organization_id:
+                    ok = await create_or_update_script_block(
+                        block_code=nested_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=nested_label,
+                        update=pending,
+                        run_signature=nested_sig,
+                        workflow_run_id=nested_wri,
+                        workflow_run_block_id=nested_wrbi,
+                        input_fields=None,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
+
+                # Push nested for-loop's children with this loop as their parent
+                loop_block_queue.extend((child, nested_label) for child in loop_block.get("loop_blocks", []))
+                continue
+
+            if loop_block_type not in SCRIPT_TASK_BLOCKS:
                 continue
 
             inner_label = (
@@ -3036,7 +3266,11 @@ async def generate_workflow_script_python_code(
             else:
                 inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
                 if not inner_actions:
-                    continue  # No actions from agent run = can't generate cached function
+                    # No actions from agent run = can't generate cached function.
+                    # No script_block row is created; the block will be cached on
+                    # a future run when actions become available. This is intentional
+                    # — generating a stub would produce broken code.
+                    continue
 
                 inner_fn_def = _build_block_fn(
                     loop_block,
@@ -3055,29 +3289,25 @@ async def generate_workflow_script_python_code(
 
             # Create script_block entry for preservation across regenerations
             if script_id and script_revision_id and organization_id:
-                try:
-                    inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
-                    if not inner_input_fields and cached_inner and cached_inner.input_fields:
-                        inner_input_fields = cached_inner.input_fields
-                    await create_or_update_script_block(
-                        block_code=inner_block_code,
-                        script_revision_id=script_revision_id,
-                        script_id=script_id,
-                        organization_id=organization_id,
-                        block_label=inner_label,
-                        update=pending,
-                        run_signature=inner_run_signature,
-                        workflow_run_id=inner_wri,
-                        workflow_run_block_id=inner_wrbi,
-                        input_fields=inner_input_fields,
-                    )
-                except Exception as e:
-                    LOG.error(
-                        "Failed to create for_loop inner block script block",
-                        error=str(e),
-                        block_label=inner_label,
-                        exc_info=True,
-                    )
+                inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
+                if not inner_input_fields and cached_inner and cached_inner.input_fields:
+                    inner_input_fields = cached_inner.input_fields
+                ok = await create_or_update_script_block(
+                    block_code=inner_block_code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=inner_label,
+                    update=pending,
+                    run_signature=inner_run_signature,
+                    workflow_run_id=inner_wri,
+                    workflow_run_block_id=inner_wrbi,
+                    input_fields=inner_input_fields,
+                )
+                if ok:
+                    blocks_created += 1
+                else:
+                    blocks_failed += 1
 
             append_block_code(inner_block_code)
 
@@ -3097,39 +3327,41 @@ async def generate_workflow_script_python_code(
             if cached_source and cached_source.run_signature and not cached_source.requires_agent:
                 # Reviewer upgraded this block to code — preserve it
                 if script_id and script_revision_id and organization_id:
-                    try:
-                        await create_or_update_script_block(
-                            block_code=cached_source.code,
-                            script_revision_id=script_revision_id,
-                            script_id=script_id,
-                            organization_id=organization_id,
-                            block_label=arb_label,
-                            update=pending,
-                            run_signature=cached_source.run_signature,
-                            workflow_run_id=cached_source.workflow_run_id,
-                            workflow_run_block_id=cached_source.workflow_run_block_id,
-                            requires_agent=False,
-                        )
-                    except Exception as e:
-                        LOG.error("Failed to preserve coded agent block", error=str(e), exc_info=True)
+                    ok = await create_or_update_script_block(
+                        block_code=cached_source.code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=arb_label,
+                        update=pending,
+                        run_signature=cached_source.run_signature,
+                        workflow_run_id=cached_source.workflow_run_id,
+                        workflow_run_block_id=cached_source.workflow_run_block_id,
+                        requires_agent=False,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
                     append_block_code(cached_source.code)
             else:
                 # Create a requires_agent entry (no code, no run_signature)
                 placeholder_code = f"# Block '{arb_label}' ({arb['block_type']}) — executed via agent"
                 if script_id and script_revision_id and organization_id:
-                    try:
-                        await create_or_update_script_block(
-                            block_code=placeholder_code,
-                            script_revision_id=script_revision_id,
-                            script_id=script_id,
-                            organization_id=organization_id,
-                            block_label=arb_label,
-                            update=pending,
-                            run_signature=None,
-                            requires_agent=True,
-                        )
-                    except Exception as e:
-                        LOG.error("Failed to create agent-required script block", error=str(e), exc_info=True)
+                    ok = await create_or_update_script_block(
+                        block_code=placeholder_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=arb_label,
+                        update=pending,
+                        run_signature=None,
+                        requires_agent=True,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
 
     # --- preserve cached blocks from unexecuted branches ----------------
     # When a workflow has conditional blocks, not all branches execute in a single run.
@@ -3147,10 +3379,22 @@ async def generate_workflow_script_python_code(
     for flb in for_loop_blocks:
         label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
         processed_labels.add(label)
-        # Also track inner block labels to prevent duplication in the
-        # "preserve unexecuted branch" section below
-        for lb in flb.get("loop_blocks", []):
-            inner_lbl = lb.get("label") or lb.get("title")
+        # Recursively track all inner block labels (including nested for-loops)
+        # to prevent duplication in the "preserve unexecuted branch" section below.
+        # Use the same label derivation as the main code generation loop to ensure
+        # labels match (e.g., for_loop blocks without explicit labels get the
+        # "for_loop_{workflow_run_block_id}" fallback).
+        inner_queue: deque[dict[str, Any]] = deque(flb.get("loop_blocks", []))
+        while inner_queue:
+            lb = inner_queue.popleft()
+            lb_type = lb.get("block_type")
+            if lb_type == "for_loop":
+                inner_lbl = lb.get("label") or f"for_loop_{lb.get('workflow_run_block_id')}"
+                inner_queue.extend(lb.get("loop_blocks", []))
+            else:
+                # Use the same 3-fallback chain as the main generation loop
+                # (label → title → block_{wrb_id}) so labels always match.
+                inner_lbl = lb.get("label") or lb.get("title") or f"block_{lb.get('workflow_run_block_id')}"
             if inner_lbl:
                 processed_labels.add(inner_lbl)
     if adaptive_caching:
@@ -3166,26 +3410,31 @@ async def generate_workflow_script_python_code(
             continue  # Skip entries without usable code/metadata
 
         if script_id and script_revision_id and organization_id:
-            try:
-                await create_or_update_script_block(
-                    block_code=cached_source.code,
-                    script_revision_id=script_revision_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    block_label=cached_label,
-                    update=pending,
-                    run_signature=cached_source.run_signature,
-                    workflow_run_id=cached_source.workflow_run_id,
-                    workflow_run_block_id=cached_source.workflow_run_block_id,
-                    input_fields=cached_source.input_fields,
-                )
-            except Exception as e:
-                LOG.error(
-                    "Failed to preserve cached script block from unexecuted branch",
-                    error=str(e),
-                    block_label=cached_label,
-                    exc_info=True,
-                )
+            ok = await create_or_update_script_block(
+                block_code=cached_source.code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_label=cached_label,
+                update=pending,
+                run_signature=cached_source.run_signature,
+                workflow_run_id=cached_source.workflow_run_id,
+                workflow_run_block_id=cached_source.workflow_run_block_id,
+                input_fields=cached_source.input_fields,
+            )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
+
+        # SKY-9180: for_loop cached code is a bare `async for` statement, which is a
+        # SyntaxError at module level. The DB row stays (so the script_block cache
+        # entry is retained), but the code is only valid when inlined inside the
+        # async run_workflow body via _build_block_statement — which only happens
+        # for for_loops in the current run's `blocks`. Skip appending to main.py
+        # for for_loop cached code from unexecuted branches to avoid the error.
+        if _is_for_loop_cached_code(cached_source.code):
+            continue
 
         append_block_code(cached_source.code)
         preserved_count += 1
@@ -3196,8 +3445,11 @@ async def generate_workflow_script_python_code(
             preserved_count=preserved_count,
             preserved_labels=[
                 label
-                for label in cached_blocks
-                if label not in processed_labels and cached_blocks[label].code and cached_blocks[label].run_signature
+                for label, source in cached_blocks.items()
+                if label not in processed_labels
+                and source.code
+                and source.run_signature
+                and not _is_for_loop_cached_code(source.code)
             ],
         )
 
@@ -3241,7 +3493,7 @@ async def generate_workflow_script_python_code(
             start_block_module = cst.Module(body=start_block_body)
             start_block_code = start_block_module.code
 
-            await create_or_update_script_block(
+            ok = await create_or_update_script_block(
                 block_code=start_block_code,
                 script_revision_id=script_revision_id,
                 script_id=script_id,
@@ -3249,9 +3501,13 @@ async def generate_workflow_script_python_code(
                 block_label=settings.WORKFLOW_START_BLOCK_LABEL,
                 update=pending,
             )
+            if ok:
+                blocks_created += 1
+            else:
+                blocks_failed += 1
         except Exception as e:
             LOG.error("Failed to create __start_block__", error=str(e), exc_info=True)
-            # Continue without script block creation if it fails
+            blocks_failed += 1
 
     # Build module body with the start block content and other blocks
     module_body = [
@@ -3260,7 +3516,46 @@ async def generate_workflow_script_python_code(
     ]
 
     module = cst.Module(body=module_body)
-    return module.code
+    source_code = module.code
+
+    # SKY-8965 Phase 2: validate `context.parameters[X]` references against the
+    # expanded valid-keys set (declared params ∪ upstream block schema keys ∪
+    # synthesized `GeneratedWorkflowParameters` fields). Phase 2 raises on
+    # violation, preventing phantom-parameter scripts from being cached.
+    # Phase 1 (now in prod) logged warnings; 13 violations in 7 days confirmed
+    # the bug is real and low-frequency (~0.05%), safe to enforce.
+    try:
+        synthesized_keys = _collect_synthesized_field_keys(generated_schema)
+        guard_result = validate_context_parameter_refs(
+            code=source_code,
+            declared_param_keys=declared_keys,
+            upstream_schema_keys=upstream_keys,
+            synthesized_keys=synthesized_keys,
+        )
+        log_or_raise_guard_result(
+            guard_result,
+            raise_on_violation=True,
+            workflow_permanent_id=workflow.get("workflow_permanent_id"),
+            workflow_run_id=run_id,
+        )
+    except HallucinatedParameterError as hpe:
+        # Dedicated structured log so this is distinguishable from a codegen
+        # crash in Datadog. The broad except-Exception in the caller
+        # (workflow_script_service) would otherwise swallow the distinction
+        # (andrewneilson review feedback).
+        LOG.warning(
+            "parameter_reference_guard_rejected_script",
+            workflow_permanent_id=workflow.get("workflow_permanent_id"),
+            workflow_run_id=run_id,
+            undeclared_refs=sorted(r.key for r in hpe.result.undeclared_refs),
+            valid_keys=sorted(hpe.result.valid_keys),
+            sky_ticket="SKY-8965",
+        )
+        raise
+    except Exception:
+        LOG.warning("parameter_reference_guard_failed_to_run", exc_info=True)
+
+    return CodeGenResult(source_code=source_code, blocks_created=blocks_created, blocks_failed=blocks_failed)
 
 
 async def create_or_update_script_block(
@@ -3275,10 +3570,12 @@ async def create_or_update_script_block(
     workflow_run_block_id: str | None = None,
     input_fields: list[str] | None = None,
     requires_agent: bool | None = None,
-) -> None:
+) -> bool:
     """
     Create a script block in the database and save the block code to a script file.
     If update is True, the script block will be updated instead of created.
+
+    Returns True on success, False if an error occurred (logged but not raised).
 
     Args:
         block_code: The code to save
@@ -3294,15 +3591,17 @@ async def create_or_update_script_block(
         requires_agent: Whether this block must be executed via agent (None = don't change on update)
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
+    content_hash = f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}"
+
     try:
-        # Step 3: Create script block in database
-        script_block = await app.DATABASE.get_script_block_by_label(
+        # Step 1: Get or create ScriptBlock record for this revision
+        script_block = await app.DATABASE.scripts.get_script_block_by_label(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
             script_block_label=block_label,
         )
         if not script_block:
-            script_block = await app.DATABASE.create_script_block(
+            script_block = await app.DATABASE.scripts.create_script_block(
                 script_revision_id=script_revision_id,
                 script_id=script_id,
                 organization_id=organization_id,
@@ -3318,7 +3617,7 @@ async def create_or_update_script_block(
             for value in [run_signature, workflow_run_id, workflow_run_block_id, input_fields, requires_agent]
         ):
             # Update metadata when new values are provided
-            script_block = await app.DATABASE.update_script_block(
+            script_block = await app.DATABASE.scripts.update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 run_signature=run_signature,
@@ -3328,50 +3627,118 @@ async def create_or_update_script_block(
                 requires_agent=requires_agent,
             )
 
-        # Step 4: Create script file for the block
-        # Generate a unique filename for the block
+        # Step 2: Create or update ScriptFile with content deduplication
         file_name = f"{block_label}.skyvern"
         file_path = f"blocks/{file_name}"
 
-        # Create artifact and upload to S3
-        artifact_id = None
         if update and script_block.script_file_id:
-            script_file = await app.DATABASE.get_script_file_by_id(
+            # UPDATE path: block already has a ScriptFile in this revision
+            script_file = await app.DATABASE.scripts.get_script_file_by_id(
                 script_revision_id,
                 script_block.script_file_id,
                 organization_id,
             )
+            if script_file and script_file.content_hash == content_hash:
+                # Content unchanged — skip S3 upload entirely
+                LOG.info(
+                    "script_block_dedup_hit",
+                    script_id=script_id,
+                    block_label=block_label,
+                    content_hash=content_hash,
+                    dedup_type="update_same_revision",
+                )
+                return True
+
+            # Content changed — await S3 upload, then update hash only on success.
+            # Intentionally sequential (not fire-and-forget) so content_hash is never
+            # updated unless S3 write succeeds, preventing stale-artifact dedup hits.
             if script_file and script_file.artifact_id:
-                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                 if artifact:
-                    asyncio.create_task(app.STORAGE.store_artifact(artifact, block_code_bytes))
+                    await app.STORAGE.store_artifact(artifact, block_code_bytes)
+                    await app.DATABASE.scripts.update_script_file(
+                        script_file_id=script_file.file_id,
+                        organization_id=organization_id,
+                        content_hash=content_hash,
+                    )
+                    LOG.info(
+                        "script_block_dedup_miss",
+                        script_id=script_id,
+                        block_label=block_label,
+                        content_hash=content_hash,
+                        dedup_type="update_content_changed",
+                    )
+                    return True
+                else:
+                    LOG.error(
+                        "Artifact not found, cannot update S3",
+                        artifact_id=script_file.artifact_id,
+                        script_file_id=script_file.file_id,
+                    )
+                    return False
             else:
                 LOG.error("Script file or artifact not found", script_file_id=script_block.script_file_id)
+                return False
         else:
-            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-                organization_id=organization_id,
-                script_id=script_id,
-                script_version=1,  # Assuming version 1 for now
-                file_path=file_path,
-                data=block_code_bytes,
-            )
-
-            # Create script file record
-            script_file = await app.DATABASE.create_script_file(
-                script_revision_id=script_revision_id,
+            # CREATE path: check for existing ScriptFile with matching hash (cross-revision dedup)
+            existing_file = await app.DATABASE.scripts.get_script_file_by_content_hash(
                 script_id=script_id,
                 organization_id=organization_id,
-                file_path=file_path,
-                file_name=file_name,
-                file_type="file",
-                content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
-                file_size=len(block_code_bytes),
-                mime_type="text/x-python",
-                artifact_id=artifact_id,
+                content_hash=content_hash,
             )
 
-            # update script block with script file id
-            await app.DATABASE.update_script_block(
+            if existing_file and existing_file.artifact_id:
+                # Content matches a previous version — reuse artifact, skip S3 upload
+                script_file = await app.DATABASE.scripts.create_script_file(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type="file",
+                    content_hash=content_hash,
+                    file_size=len(block_code_bytes),
+                    mime_type="text/x-python",
+                    artifact_id=existing_file.artifact_id,
+                )
+                LOG.info(
+                    "script_block_dedup_hit",
+                    script_id=script_id,
+                    block_label=block_label,
+                    content_hash=content_hash,
+                    dedup_type="create_cross_revision",
+                )
+            else:
+                # No match — full S3 upload
+                artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    script_version=1,
+                    file_path=file_path,
+                    data=block_code_bytes,
+                )
+                script_file = await app.DATABASE.scripts.create_script_file(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type="file",
+                    content_hash=content_hash,
+                    file_size=len(block_code_bytes),
+                    mime_type="text/x-python",
+                    artifact_id=artifact_id,
+                )
+                LOG.info(
+                    "script_block_dedup_miss",
+                    script_id=script_id,
+                    block_label=block_label,
+                    content_hash=content_hash,
+                    dedup_type="create_new_content",
+                )
+
+            # Link ScriptBlock to its ScriptFile
+            await app.DATABASE.scripts.update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 script_file_id=script_file.file_id,
@@ -3379,8 +3746,13 @@ async def create_or_update_script_block(
                 workflow_run_block_id=workflow_run_block_id,
             )
 
-    except Exception as e:
-        # Log error but don't fail the entire generation process
-        LOG.error("Failed to create script block", error=str(e), exc_info=True)
-        # For now, just log the error and continue
-        # In production, you might want to handle this differently
+        return True
+
+    except Exception:
+        LOG.exception(
+            "Failed to create or update script block — caller will track failure",
+            block_label=block_label,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
+        )
+        return False

@@ -50,7 +50,7 @@ class SchedulesRepository(BaseRepository):
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
-        temporal_schedule_id: str | None = None,
+        backend_schedule_id: str | None = None,
         name: str | None = None,
         description: str | None = None,
     ) -> WorkflowSchedule:
@@ -62,7 +62,7 @@ class SchedulesRepository(BaseRepository):
                 timezone=timezone,
                 enabled=enabled,
                 parameters=parameters,
-                temporal_schedule_id=temporal_schedule_id,
+                backend_schedule_id=backend_schedule_id,
                 name=name,
                 description=description,
             )
@@ -181,12 +181,12 @@ class SchedulesRepository(BaseRepository):
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled), count
 
-    @db_operation("set_temporal_schedule_id")
-    async def set_temporal_schedule_id(
+    @db_operation("set_backend_schedule_id")
+    async def set_backend_schedule_id(
         self,
         workflow_schedule_id: str,
         organization_id: str,
-        temporal_schedule_id: str,
+        backend_schedule_id: str,
     ) -> WorkflowSchedule | None:
         async with self.Session() as session:
             workflow_schedule = (
@@ -202,7 +202,7 @@ class SchedulesRepository(BaseRepository):
             if not workflow_schedule:
                 return None
 
-            workflow_schedule.temporal_schedule_id = temporal_schedule_id
+            workflow_schedule.backend_schedule_id = backend_schedule_id
             workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(workflow_schedule)
@@ -217,7 +217,7 @@ class SchedulesRepository(BaseRepository):
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
-        temporal_schedule_id: str | None | object = _UNSET,
+        backend_schedule_id: str | None | object = _UNSET,
         name: str | None | object = _UNSET,
         description: str | None | object = _UNSET,
     ) -> WorkflowSchedule | None:
@@ -239,8 +239,8 @@ class SchedulesRepository(BaseRepository):
             workflow_schedule.timezone = timezone
             workflow_schedule.enabled = enabled
             workflow_schedule.parameters = parameters
-            if temporal_schedule_id is not _UNSET:
-                workflow_schedule.temporal_schedule_id = temporal_schedule_id
+            if backend_schedule_id is not _UNSET:
+                workflow_schedule.backend_schedule_id = backend_schedule_id
             if name is not _UNSET:
                 workflow_schedule.name = name
             if description is not _UNSET:

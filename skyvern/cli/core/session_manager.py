@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
+import secrets
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -15,6 +17,8 @@ from .client import get_active_api_key, get_skyvern
 from .result import BrowserContext, ErrorCode, make_error
 
 LOG = structlog.get_logger(__name__)
+
+_BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
 
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
@@ -31,8 +35,10 @@ class SessionState:
     console_messages: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    page_errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     tracing_active: bool = False
     har_enabled: bool = False
+    _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
     # -- Active page tracking (tab management) --
     _active_page: Page | None = None
     # -- Page event buffer for tab_wait_for_new --
@@ -42,13 +48,47 @@ class SessionState:
     # -- Multi-page inspection hooks --
     _hooked_page_ids: set[int] = field(default_factory=set)
     _hooked_handlers_map: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Per-request network state: ID counter, body cache, concurrency limiter, route interceptions
+    _request_id_counter: itertools.count[int] = field(default_factory=itertools.count)
+    # Body store keyed by request_id. Evicts by completion order (FIFO on dict insertion),
+    # capped at _BODY_STORE_MAX. Entries may outlive their network_requests deque counterparts
+    # (deque maxlen=1000 vs store max=100) — bounded at ~25MB worst case, acceptable.
+    _body_store: dict[int, str] = field(default_factory=dict)
+    _body_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_BODY_SEMAPHORE_LIMIT))
+    _pending_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
+    active_routes: dict[int, set[str]] = field(default_factory=dict)
     # -- Iframe frame context --
     _working_frame: Frame | None = None
+
+    def get_response_body(self, request_id: int) -> str | None:
+        """Public accessor for cached response bodies (keyed by request_id)."""
+        return self._body_store.get(request_id)
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
 _global_session: SessionState | None = None
 _stateless_http_mode = False
+
+# Process-wide registry for copilot browser sessions. Keyed by browser_session_id.
+# This bypasses ContextVar propagation issues when FastMCP runs tool handlers
+# in a separate task whose context snapshot predates scoped_session().
+_copilot_sessions: dict[str, SessionState] = {}
+
+
+def register_copilot_session(session_id: str, state: SessionState) -> None:
+    """Register a pre-configured browser session for cross-task lookup.
+
+    The registry is process-local and in-memory: entries do not survive a
+    process restart and are not shared across uvicorn workers. Callers that
+    need cross-process continuity must reconnect via the cloud session API.
+    """
+    _copilot_sessions[session_id] = state
+
+
+def unregister_copilot_session(session_id: str) -> None:
+    """Remove a copilot browser session from the process-local registry."""
+    _copilot_sessions.pop(session_id, None)
 
 
 def get_current_session() -> SessionState:
@@ -79,6 +119,20 @@ def set_current_session(state: SessionState) -> None:
     _current_session.set(state)
 
 
+@asynccontextmanager
+async def scoped_session(state: SessionState) -> AsyncIterator[None]:
+    """Temporarily push a SessionState into ContextVar scope.
+
+    Restores the previous value on exit. Does NOT touch _global_session,
+    so it is safe for concurrent API-server requests.
+    """
+    token = _current_session.set(state)
+    try:
+        yield
+    finally:
+        _current_session.reset(token)
+
+
 def set_stateless_http_mode(enabled: bool) -> None:
     global _stateless_http_mode
     _stateless_http_mode = enabled
@@ -94,6 +148,19 @@ def _api_key_hash(api_key: str | None) -> str | None:
     return hash_api_key_for_cache(api_key)
 
 
+def _hashes_equal(a: str | None, b: str | None) -> bool:
+    """Constant-time comparison of two API-key hashes (either may be None).
+
+    Using ``==`` on secret-derived values leaks content byte-by-byte through
+    response-time side channels. ``secrets.compare_digest`` avoids that; we
+    wrap it so ``None`` on either side is handled without branching on
+    contents.
+    """
+    if a is None or b is None:
+        return a is b
+    return secrets.compare_digest(a, b)
+
+
 def _matches_current(
     current: SessionState,
     *,
@@ -103,7 +170,7 @@ def _matches_current(
 ) -> bool:
     if current.browser is None or current.context is None:
         return False
-    if current.api_key_hash != _api_key_hash(get_active_api_key()):
+    if not _hashes_equal(current.api_key_hash, _api_key_hash(get_active_api_key())):
         return False
 
     if session_id:
@@ -141,6 +208,19 @@ async def resolve_browser(
         return current.browser, current.context
 
     active_api_key_hash = _api_key_hash(get_active_api_key())
+
+    # Check copilot session registry (cross-task fallback when ContextVar
+    # does not propagate through FastMCP in-process transport).
+    registered = _copilot_sessions.get(session_id) if session_id else None
+    if (
+        registered is not None
+        and registered.browser is not None
+        and registered.context is not None
+        and _hashes_equal(registered.api_key_hash, active_api_key_hash)
+    ):
+        _current_session.set(registered)
+        return registered.browser, registered.context
+
     browser: SkyvernBrowser | None = None
     try:
         if session_id:
@@ -200,9 +280,17 @@ async def close_current_session() -> None:
                     session_id=current.context.session_id,
                     exc_info=True,
                 )
+        # Cancel pending body-capture tasks before closing the browser to avoid
+        # "target closed" noise from CDP calls against a defunct context.
+        for task in current._pending_tasks:
+            task.cancel()
+        current._pending_tasks.clear()
+        current.active_routes.clear()
         if current.browser is not None:
             await current.browser.close()
     finally:
+        if current.context and current.context.session_id:
+            unregister_copilot_session(current.context.session_id)
         set_current_session(SessionState())
 
 

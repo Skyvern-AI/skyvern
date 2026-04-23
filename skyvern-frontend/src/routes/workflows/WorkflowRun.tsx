@@ -2,6 +2,7 @@ import { AxiosError } from "axios";
 import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
+import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import {
   SwitchBarNavigation,
@@ -229,7 +230,10 @@ function WorkflowRun() {
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div className="space-y-2 rounded-md border border-red-600 bg-error-light p-4">
-      <div className="font-bold">{failureReasonTitle}</div>
+      <div className="flex items-center gap-2">
+        <div className="font-bold">{failureReasonTitle}</div>
+        <FailureCategoryBadge failureCategory={workflowRun.failure_category} />
+      </div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
       {shouldShowFinallyNote && (
@@ -556,10 +560,10 @@ function WorkflowRun() {
         </div>
       )}
       <div className="flex h-[42rem] gap-6">
-        <div className="w-2/3">
+        <div className="min-w-0 flex-[2]">
           <Outlet />
         </div>
-        <div className="w-1/3">
+        <div className="min-w-0 flex-1 overflow-hidden">
           <WorkflowRunTimeline
             activeItem={selection}
             onActionItemSelected={(item) => {

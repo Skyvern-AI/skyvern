@@ -58,13 +58,13 @@ def _network_entry(url: str = "https://a.com", method: str = "GET", status: int 
 
 
 class TestEnsureHooks:
-    def test_registers_three_listeners(self) -> None:
+    def test_registers_four_listeners(self) -> None:
         state = _make_state()
         raw = MagicMock()
         raw.on = MagicMock()
         _register_hooks_on_page(state, raw)
-        assert raw.on.call_count == 3
-        assert {c.args[0] for c in raw.on.call_args_list} == {"console", "response", "dialog"}
+        assert raw.on.call_count == 4
+        assert {c.args[0] for c in raw.on.call_args_list} == {"console", "response", "dialog", "pageerror"}
 
     def test_idempotent(self) -> None:
         state = _make_state()
@@ -72,7 +72,7 @@ class TestEnsureHooks:
         raw.on = MagicMock()
         _register_hooks_on_page(state, raw)
         _register_hooks_on_page(state, raw)
-        assert raw.on.call_count == 3
+        assert raw.on.call_count == 4
 
     def test_keeps_hooks_on_both_pages(self) -> None:
         """Multi-page: hooks are registered on ALL pages, not removed on switch."""
@@ -86,8 +86,8 @@ class TestEnsureHooks:
         _register_hooks_on_page(state, raw2)
         # Both pages should have hooks registered — no removal
         assert raw1.remove_listener.call_count == 0
-        assert raw1.on.call_count == 3
-        assert raw2.on.call_count == 3
+        assert raw1.on.call_count == 4
+        assert raw2.on.call_count == 4
 
 
 # --- Console messages ---

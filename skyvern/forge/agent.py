@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Tuple, cast
 
-import httpx
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
@@ -83,17 +82,19 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -112,7 +113,15 @@ from skyvern.services.otp_service import (
     try_generate_totp_from_credential,
 )
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
+from skyvern.utils.prompt_engine import (
+    PROMPT_HARD_CEILING_TOKENS,
+    MaxStepsReasonResponse,
+    enforce_prompt_ceiling_tracked,
+    load_prompt_with_elements,
+)
+from skyvern.utils.prompt_truncation import truncate_extraction_schema
+from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -144,8 +153,31 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
+
+
+class _PromptCeilingExceeded(Exception):
+    """Internal signal: the cached split-template prompt blew past the
+    PROMPT_HARD_CEILING_TOKENS budget. Raised inside the cached extract-action
+    branch to trigger the fall-through to load_prompt_with_elements, which
+    applies the per-template fallback drop chain."""
+
+
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
+
+# Exception types that indicate an LLM-specific step failure (context window, provider errors).
+# Used by summary_failure_reason_for_max_retries to distinguish LLM failures from browser/runtime crashes.
+_LLM_STEP_EXCEPTIONS = frozenset(
+    {
+        "SkyvernContextWindowExceededError",
+        "LLMProviderError",
+        "LLMProviderErrorRetryableTask",
+    }
+)
+
+
+def _llm_error_category(reasoning: str) -> list[dict]:
+    return [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": reasoning}]
 
 
 @dataclass
@@ -167,6 +199,82 @@ class ActionLinkedNode:
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
+
+    async def _finalize_downloaded_files_for_task(
+        self,
+        task: Task,
+        *,
+        organization_id: str,
+        download_suffix: str | None,
+        list_files_before: list[str],
+        randomize_if_missing: bool,
+    ) -> list[str]:
+        """Rename newly downloaded files for a task before persistence.
+
+        Returns the list of pre-rename file names discovered as new since
+        ``list_files_before``, for logging continuity with the legacy inline
+        path.
+        """
+        if not task.workflow_run_id:
+            return []
+
+        context = skyvern_context.current()
+        workflow_download_directory = get_path_for_workflow_download_directory(
+            context.run_id if context and context.run_id else task.workflow_run_id
+        )
+        list_files_after = list_files_in_directory(workflow_download_directory)
+        if task.browser_session_id:
+            browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
+                organization_id=organization_id,
+                browser_session_id=task.browser_session_id,
+            )
+            list_files_after = list_files_after + browser_session_downloaded_files_after
+
+        files_to_rename = list(set(list_files_after) - set(list_files_before))
+        if not files_to_rename:
+            return []
+        for file in files_to_rename:
+            local_file_name = file
+            if file.startswith("s3://"):
+                file_data = await get_aws_client().download_file(file, log_exception=False)
+                if not file_data:
+                    continue
+                local_file_name = file.split("/")[-1]
+                with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
+                    f.write(file_data)
+
+            file_extension = Path(local_file_name).suffix
+            if file_extension == BROWSER_DOWNLOADING_SUFFIX:
+                LOG.warning(
+                    "Detecting incompleted download file, skip the rename",
+                    file=local_file_name,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                continue
+
+            if download_suffix:
+                final_file_name = download_suffix
+            elif randomize_if_missing:
+                random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
+            else:
+                continue
+
+            base_final_file_name = final_file_name
+            target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+            counter = 1
+            while os.path.exists(target_path):
+                final_file_name = f"{base_final_file_name}_{counter}"
+                target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+                counter += 1
+
+            rename_file(
+                os.path.join(workflow_download_directory, local_file_name),
+                final_file_name + file_extension,
+            )
+
+        return files_to_rename
 
     async def create_task_and_step_from_block(
         self,
@@ -204,7 +312,7 @@ class ForgeAgent:
                 LOG.info("No browser state found for workflow run, setting task url to empty string")
                 task_url = ""
 
-        task = await app.DATABASE.create_task(
+        task = await app.DATABASE.tasks.create_task(
             url=task_url,
             task_type=task_block.task_type,
             complete_criterion=task_block.complete_criterion,
@@ -231,6 +339,7 @@ class ForgeAgent:
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
             download_timeout=task_block.download_timeout,
+            include_extracted_text=task_block.include_extracted_text,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -244,13 +353,13 @@ class ForgeAgent:
             task_retry=task_retry,
         )
         # Update task status to running
-        task = await app.DATABASE.update_task(
+        task = await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=task.organization_id,
             status=TaskStatus.running,
         )
 
-        step = await app.DATABASE.create_step(
+        step = await app.DATABASE.tasks.create_step(
             task.task_id,
             order=0,
             retry_index=0,
@@ -270,14 +379,14 @@ class ForgeAgent:
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
         # validate browser session id
         if task_request.browser_session_id:
-            browser_session = await app.DATABASE.get_persistent_browser_session(
+            browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
                 session_id=task_request.browser_session_id,
                 organization_id=organization_id,
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
 
-        task = await app.DATABASE.create_task(
+        task = await app.DATABASE.tasks.create_task(
             url=str(task_request.url),
             title=task_request.title,
             webhook_callback_url=webhook_callback_url,
@@ -299,6 +408,7 @@ class ForgeAgent:
             extra_http_headers=task_request.extra_http_headers,
             browser_session_id=task_request.browser_session_id,
             browser_address=task_request.browser_address,
+            include_extracted_text=task_request.include_extracted_text,
         )
         LOG.info(
             "Created new task",
@@ -313,7 +423,12 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
-    @traced()
+    # Span name intentionally differs from the method: this is the outer wrapper
+    # that handles cancellation checks, status updates, retries, and cleanup around
+    # the inner step body. "step_orchestration" reads better on the trace dashboard
+    # than "execute_step", which was easy to confuse with the inner span below.
+    # code.function still carries the qualname for grep.
+    @traced(name="skyvern.agent.step_orchestration", role="wrapper")
     async def execute_step(
         self,
         organization: Organization,
@@ -327,6 +442,7 @@ class ForgeAgent:
         engine: RunEngine = RunEngine.skyvern_v1,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
+        download_baseline_files: list[str] | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
@@ -345,7 +461,7 @@ class ForgeAgent:
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=task.workflow_run_id,
                 organization_id=organization.organization_id,
             )
@@ -381,7 +497,9 @@ class ForgeAgent:
                 )
                 return step, None, None
 
-        refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
+        refreshed_task = await app.DATABASE.tasks.get_task(
+            task_id=task.task_id, organization_id=organization.organization_id
+        )
         if refreshed_task:
             task = refreshed_task
 
@@ -402,6 +520,8 @@ class ForgeAgent:
                 need_call_webhook=True,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=download_baseline_files,
             )
             return step, None, None
 
@@ -413,23 +533,23 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
         if max_steps_per_run and task.max_steps_per_run != max_steps_per_run:
-            await app.DATABASE.update_task(
+            await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
                 organization_id=organization.organization_id,
                 max_steps_per_run=max_steps_per_run,
             )
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
-        list_files_before: list[str] = []
+        list_files_before: list[str] = download_baseline_files.copy() if download_baseline_files is not None else []
         browser_state: BrowserState | None = None
         try:
-            if task.workflow_run_id:
+            if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(
                         context.run_id if context and context.run_id else task.workflow_run_id
                     )
                 )
-            if task.browser_session_id:
+            if task.browser_session_id and download_baseline_files is None:
                 browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
                     organization_id=organization.organization_id,
                     browser_session_id=task.browser_session_id,
@@ -542,59 +662,19 @@ class ForgeAgent:
                             workflow_run_id=task.workflow_run_id,
                         )
 
-                list_files_after = list_files_in_directory(workflow_download_directory)
-                if task.browser_session_id:
-                    browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
-                        organization_id=organization.organization_id,
-                        browser_session_id=task.browser_session_id,
-                    )
-                    list_files_after = list_files_after + browser_session_downloaded_files_after
-                if len(list_files_after) > len(list_files_before):
-                    files_to_rename = list(set(list_files_after) - set(list_files_before))
-                    for file in files_to_rename:
-                        if file.startswith("s3://"):
-                            file_data = await get_aws_client().download_file(file, log_exception=False)
-                            if not file_data:
-                                continue
-                            file = file.split("/")[-1]  # Extract filename from the end of S3 URI
-                            with open(os.path.join(workflow_download_directory, file), "wb") as f:
-                                f.write(file_data)
-
-                        file_extension = Path(file).suffix
-                        if file_extension == BROWSER_DOWNLOADING_SUFFIX:
-                            LOG.warning(
-                                "Detecting incompleted download file, skip the rename",
-                                file=file,
-                                task_id=task.task_id,
-                                workflow_run_id=task.workflow_run_id,
-                            )
-                            continue
-
-                        if task_block.download_suffix:
-                            # Use download_suffix as the complete filename (without extension)
-                            final_file_name = task_block.download_suffix
-                        else:
-                            # Fallback to random filename if no download_suffix provided
-                            random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-                            final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
-
-                        # Check if file with this name already exists
-                        final_file_name = final_file_name
-                        target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
-                        counter = 1
-                        while os.path.exists(target_path):
-                            # If file exists, append counter to filename
-                            final_file_name = f"{final_file_name}_{counter}"
-                            target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
-                            counter += 1
-
-                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
-
+                files_to_rename = await self._finalize_downloaded_files_for_task(
+                    task,
+                    organization_id=organization.organization_id,
+                    download_suffix=task_block.download_suffix,
+                    list_files_before=list_files_before,
+                    randomize_if_missing=True,
+                )
+                if files_to_rename:
                     LOG.info(
                         "Task marked as completed due to download",
                         task_id=task.task_id,
                         num_files_before=len(list_files_before),
-                        num_files_after=len(list_files_after),
+                        num_files_after=len(list_files_before) + len(files_to_rename),
                         new_files=files_to_rename,
                     )
                     last_step = await self.update_step(step, is_last=True)
@@ -603,6 +683,10 @@ class ForgeAgent:
                         status=TaskStatus.completed,
                     )
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                    # Skip per-step video sync: clean_up_task performs the authoritative final upload.
+                    # Do not pass download finalization inputs into cleanup here:
+                    # the early complete_on_download path already finalized files
+                    # against the pre-step baseline and cleanup must not do it again.
                     await self.clean_up_task(
                         task=completed_task,
                         last_step=last_step,
@@ -619,6 +703,8 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 # If there is no next step, it means that the task has failed
                 if maybe_next_step:
+                    # Only sync on retry; clean_up_task handles the final upload on terminal paths.
+                    await self._sync_video_artifact_after_step(task, browser_state)
                     next_step = maybe_next_step
                     retry = True
                 else:
@@ -628,6 +714,8 @@ class ForgeAgent:
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        download_suffix=task_block.download_suffix if task_block else None,
+                        list_files_before=list_files_before,
                     )
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
@@ -653,15 +741,20 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
+                    # Skip per-step video sync: clean_up_task performs the authoritative final upload.
                     await self.clean_up_task(
                         task=task,
                         last_step=last_step,
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        download_suffix=task_block.download_suffix if task_block else None,
+                        list_files_before=list_files_before,
                     )
                     return last_step, detailed_output, None
                 elif maybe_next_step:
+                    # Only sync when continuing to the next step; clean_up_task handles terminal paths.
+                    await self._sync_video_artifact_after_step(task, browser_state)
                     next_step = maybe_next_step
                     retry = False
                 else:
@@ -678,11 +771,15 @@ class ForgeAgent:
                 )
                 # Flush for unexpected step status to release any buffered data.
                 await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                await self._sync_video_artifact_after_step(task, browser_state)
 
             cua_response_param = detailed_output.cua_response if detailed_output else None
             if not cua_response_param and cua_response:
                 cua_response_param = cua_response
 
+            # Forward the initial download baseline into recursive execute_step calls so
+            # files downloaded on this step are still seen as "new" by cleanup on a later step.
+            # Any additional recursive execute_step call site must preserve this kwarg.
             if retry and next_step:
                 return await self.execute_step(
                     organization,
@@ -696,6 +793,7 @@ class ForgeAgent:
                     engine=engine,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
+                    download_baseline_files=list_files_before,
                 )
             elif settings.execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -710,6 +808,7 @@ class ForgeAgent:
                     engine=engine,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
+                    download_baseline_files=list_files_before,
                 )
             else:
                 LOG.info(
@@ -732,6 +831,8 @@ class ForgeAgent:
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except StepTerminationError as e:
@@ -747,6 +848,8 @@ class ForgeAgent:
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after step termination. NOT clean up the task")
@@ -774,6 +877,8 @@ class ForgeAgent:
                     close_browser_on_completion=close_browser_on_completion,
                     need_final_screenshot=False,
                     browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after navigation failure. NOT clean up the task")
@@ -790,6 +895,8 @@ class ForgeAgent:
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except InvalidTaskStatusTransition:
@@ -802,6 +909,8 @@ class ForgeAgent:
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -818,6 +927,8 @@ class ForgeAgent:
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except ScrapingFailed as sfe:
@@ -840,6 +951,8 @@ class ForgeAgent:
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except MissingBrowserStatePage as e:
@@ -857,6 +970,8 @@ class ForgeAgent:
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
             )
             return step, detailed_output, None
         except Exception as e:
@@ -872,6 +987,8 @@ class ForgeAgent:
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
                 )
             else:
                 LOG.warning("Task isn't marked as failed, after unexpected exception. NOT clean up the task")
@@ -938,7 +1055,7 @@ class ForgeAgent:
                     # Only pass new errors — update_task() appends to existing errors
                     if detected_errors:
                         new_errors = [error.model_dump() for error in detected_errors]
-                        await app.DATABASE.update_task(
+                        await app.DATABASE.tasks.update_task(
                             task_id=task.task_id,
                             organization_id=task.organization_id,
                             errors=new_errors,
@@ -972,7 +1089,12 @@ class ForgeAgent:
             )
             return True
 
-    @traced()
+    # Span name intentionally differs from the method: this is the inner body
+    # that actually runs a step (scrape, LLM call, action execution). It sits
+    # under the "step_orchestration" span above. "step_body" vs the old
+    # "skyvern.agent.step" makes the parent/child relationship obvious at a glance
+    # on the dashboard. code.function still carries the qualname for grep.
+    @traced(name="skyvern.agent.step_body", role="wrapper")
     async def agent_step(
         self,
         task: Task,
@@ -985,6 +1107,19 @@ class ForgeAgent:
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
+        # task_id, step_id, workflow_run_id, organization_id overlap with auto-
+        # attached context attrs from @traced. Kept because the Task/Step objects
+        # are authoritative — context can lag if populated asynchronously.
+        _step_span = otel_trace.get_current_span()
+        _step_span.set_attribute("task_id", task.task_id)
+        _step_span.set_attribute("step_id", step.step_id)
+        _step_span.set_attribute("step_order", step.order)
+        _step_span.set_attribute("step_retry", step.retry_index)
+        _step_span.set_attribute("engine", str(engine))
+        if task.workflow_run_id:
+            _step_span.set_attribute("workflow_run_id", task.workflow_run_id)
+        if task.organization_id:
+            _step_span.set_attribute("organization_id", task.organization_id)
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
             extract_action_prompt=None,
@@ -1321,7 +1456,7 @@ class ForgeAgent:
                         action_order=action_idx,
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
-                    action.action_id = (await app.DATABASE.create_action(action=action)).action_id
+                    action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
                     await self.record_artifacts_after_action(task, step, browser_state, engine, action)
                     break
 
@@ -1429,6 +1564,10 @@ class ForgeAgent:
                 if is_page_level_scroll:
                     wait_time = 0.0
 
+                _step_span.add_event(
+                    "action.post_wait",
+                    attributes={"wait_time_ms": int(wait_time * 1000), "action_idx": action_idx},
+                )
                 await asyncio.sleep(wait_time)
                 if not is_page_level_scroll:
                     await self.record_artifacts_after_action(task, step, browser_state, engine, action)
@@ -1570,7 +1709,7 @@ class ForgeAgent:
             ):
                 working_page = await browser_state.must_get_working_page()
                 # refresh task in case the extracted information is updated previously
-                refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+                refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
                 assert refreshed_task is not None
                 task = refreshed_task
                 extract_action = await self.create_extract_action(task, step, scraped_page)
@@ -1664,7 +1803,7 @@ class ForgeAgent:
             cached_tokens = first_response.usage.input_tokens_details.cached_tokens or 0
             reasoning_tokens = first_response.usage.output_tokens_details.reasoning_tokens or 0
             llm_cost = (3.0 / 1000000) * input_tokens + (12.0 / 1000000) * output_tokens
-            await app.DATABASE.update_step(
+            await app.DATABASE.tasks.update_step(
                 task_id=task.task_id,
                 step_id=step.step_id,
                 organization_id=task.organization_id,
@@ -1777,7 +1916,7 @@ class ForgeAgent:
         cached_tokens = current_response.usage.input_tokens_details.cached_tokens or 0
         reasoning_tokens = current_response.usage.output_tokens_details.reasoning_tokens or 0
         llm_cost = (3.0 / 1000000) * input_tokens + (12.0 / 1000000) * output_tokens
-        await app.DATABASE.update_step(
+        await app.DATABASE.tasks.update_step(
             task_id=task.task_id,
             step_id=step.step_id,
             organization_id=task.organization_id,
@@ -2107,7 +2246,7 @@ class ForgeAgent:
             or incremental_reasoning_tokens is not None
             or incremental_cached_tokens is not None
         ):
-            await app.DATABASE.update_step(
+            await app.DATABASE.tasks.update_step(
                 task_id=step.task_id,
                 step_id=step.step_id,
                 organization_id=step.organization_id,
@@ -2342,6 +2481,34 @@ class ForgeAgent:
             )
             return None
 
+    async def _sync_video_artifact_after_step(self, task: Task, browser_state: BrowserState | None) -> None:
+        """Upload the current video snapshot once per step so in-progress recordings are visible.
+
+        The video file is still open while recording, so this is a partial snapshot rather than a
+        finalized recording. The authoritative final upload happens in cleanup_and_persist_task after
+        the browser closes and Playwright writes the complete file.
+        """
+        if not browser_state:
+            return
+        try:
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                task_id=task.task_id, browser_state=browser_state, finalize=False
+            )
+            for video_artifact in video_artifacts:
+                await app.ARTIFACT_MANAGER.update_artifact_data(
+                    artifact_id=video_artifact.video_artifact_id,
+                    organization_id=task.organization_id,
+                    data=video_artifact.video_data,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to sync video artifact after step",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                exc_info=True,
+            )
+
+    @traced(name="skyvern.agent.record_artifacts_after_action")
     async def record_artifacts_after_action(
         self,
         task: Task,
@@ -2389,26 +2556,34 @@ class ForgeAgent:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
                 _ctx = skyvern_context.current()
-                if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
-                    ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                        step=step,
-                        screenshots=[screenshot],
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    )
-                    if ids:
-                        screenshot_artifact_id = ids[0]
-                else:
-                    screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=screenshot,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        step=step,
-                    )
-                    if screenshot_request:
-                        artifacts.append(screenshot_request)
-                        for artifact_data in screenshot_request.artifacts:
-                            if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
-                                screenshot_artifact_id = artifact_data.artifact_model.artifact_id
-                                break
+                # Derive bundled from the actual branch condition, not just the context flag —
+                # step=None and speculative steps force the non-bundled path.
+                _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.agent.artifact.screenshot_action") as _ss_art_span:
+                    apply_context_attrs(_ss_art_span)
+                    _ss_art_span.set_attribute("screenshot_bytes", len(screenshot))
+                    _ss_art_span.set_attribute("bundled", _bundled)
+                    if _bundled:
+                        ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                            step=step,
+                            screenshots=[screenshot],
+                            artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        )
+                        if ids:
+                            screenshot_artifact_id = ids[0]
+                    else:
+                        screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=screenshot,
+                            artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                            step=step,
+                        )
+                        if screenshot_request:
+                            artifacts.append(screenshot_request)
+                            for artifact_data in screenshot_request.artifacts:
+                                if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
+                                    screenshot_artifact_id = artifact_data.artifact_model.artifact_id
+                                    break
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2419,24 +2594,38 @@ class ForgeAgent:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
             _ctx = skyvern_context.current()
-            if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
-                app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html.encode("utf-8"))
-            else:
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=html.encode(),
-                        artifact_type=ArtifactType.HTML_ACTION,
-                        step=step,
+            # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
+            # second pass through html.encode() in the chosen branch.
+            html_bytes = html.encode("utf-8")
+            _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.agent.artifact.html_action") as _html_art_span:
+                apply_context_attrs(_html_art_span)
+                _html_art_span.set_attribute("html_bytes", len(html_bytes))
+                _html_art_span.set_attribute("bundled", _bundled)
+                if _bundled:
+                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html_bytes)
+                else:
+                    artifacts.append(
+                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                            data=html_bytes,
+                            artifact_type=ArtifactType.HTML_ACTION,
+                            step=step,
+                        )
                     )
-                )
         except Exception:
             LOG.exception("Failed to record html after action")
 
         if artifacts:
-            try:
-                await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
-            except Exception:
-                LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.agent.artifact.bulk_create") as _bulk_span:
+                apply_context_attrs(_bulk_span)
+                # Count underlying artifacts (main + screenshots per request), not request wrappers.
+                _bulk_span.set_attribute("artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None))
+                try:
+                    await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+                except Exception:
+                    LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
 
         if screenshot_artifact_id and action.action_id and action.organization_id:
             action.screenshot_artifact_id = screenshot_artifact_id
@@ -2451,32 +2640,22 @@ class ForgeAgent:
                     artifact_id=screenshot_artifact_id,
                 )
             else:
-                try:
-                    await app.DATABASE.update_action_screenshot_artifact_id(
-                        organization_id=action.organization_id,
-                        action_id=action.action_id,
-                        screenshot_artifact_id=screenshot_artifact_id,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to update action with screenshot artifact id",
-                        action_id=action.action_id,
-                        screenshot_artifact_id=screenshot_artifact_id,
-                        exc_info=True,
-                    )
-
-        try:
-            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
-            )
-            for video_artifact in video_artifacts:
-                await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
-                    organization_id=task.organization_id,
-                    data=video_artifact.video_data,
-                )
-        except Exception:
-            LOG.exception("Failed to record video after action")
+                _tracer = otel_trace.get_tracer("skyvern")
+                with _tracer.start_as_current_span("skyvern.agent.artifact.update_action_screenshot_fk") as _fk_span:
+                    apply_context_attrs(_fk_span)
+                    try:
+                        await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
+                            organization_id=action.organization_id,
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to update action with screenshot artifact id",
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                            exc_info=True,
+                        )
 
     async def initialize_execution_state(
         self,
@@ -2497,10 +2676,12 @@ class ForgeAgent:
                 task=task,
                 browser_session_id=browser_session_id,
             )
-        # Initialize video artifact for the task here, afterwards it'll only get updated
+        # Initialize video artifact for the task here, afterwards it'll only get updated.
+        # The recording file is still open here, so skip the ffmpeg remux — matches the
+        # per-step sync path; the finalized upload happens in cleanup_and_persist_task.
         if browser_state and browser_state.browser_artifacts:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
+                task_id=task.task_id, browser_state=browser_state, finalize=False
             )
             for idx, video_artifact in enumerate(video_artifacts):
                 if video_artifact.video_artifact_id:
@@ -2559,6 +2740,7 @@ class ForgeAgent:
             scroll=scroll,
         )
 
+    @traced(name="skyvern.agent.scrape_and_prompt", role="wrapper")
     async def build_and_record_step_prompt(
         self,
         task: Task,
@@ -2568,6 +2750,11 @@ class ForgeAgent:
         *,
         persist_artifacts: bool = True,
     ) -> tuple[ScrapedPage, str, bool, str]:
+        _scrape_span = otel_trace.get_current_span()
+        _scrape_span.set_attribute("engine", str(engine))
+        _scrape_span.set_attribute("pre_scraped", False)
+        if task.url:
+            _scrape_span.set_attribute("page_url", strip_query_params(task.url))
         # Check if we have pre-scraped data from parallel verification optimization
         context = skyvern_context.current()
         scraped_page: ScrapedPage | None = None
@@ -2587,6 +2774,7 @@ class ForgeAgent:
                     num_elements=len(scraped_page.elements),
                     age_seconds=age_seconds,
                 )
+                _scrape_span.set_attribute("pre_scraped", True)
                 # Clear the cached data
                 context.next_step_pre_scraped_data = None
 
@@ -2709,8 +2897,12 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
 
+        _scrape_span.set_attribute("element_count", len(scraped_page.elements))
+        _scrape_span.set_attribute("prompt_name", prompt_name)
+        _scrape_span.set_attribute("use_caching", bool(use_caching))
         return scraped_page, extract_action_prompt, use_caching, prompt_name
 
+    @traced(name="skyvern.agent.persist_artifacts")
     async def _persist_scrape_artifacts(
         self,
         *,
@@ -2723,6 +2915,10 @@ class ForgeAgent:
         Persist the core scrape artifacts (HTML + element metadata) for a step.
         This is used both for regular runs and when adopting a speculative plan.
         """
+        _artifacts_span = otel_trace.get_current_span()
+        _artifacts_span.set_attribute("use_artifact_bundling", bool(context and context.use_artifact_bundling))
+        _artifacts_span.set_attribute("element_count", len(scraped_page.elements))
+        _artifacts_span.set_attribute("html_bytes", len(scraped_page.html) if scraped_page.html else 0)
 
         element_tree_format = ElementTreeFormat.HTML
         element_tree_in_prompt = self._build_element_tree_for_prompt(
@@ -2830,7 +3026,7 @@ class ForgeAgent:
             variant_parts.append("ml")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
-            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:6]
+            digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
             variant_parts.append(f"cc{digest}")
         return "-".join(variant_parts) if variant_parts else "std"
 
@@ -2979,6 +3175,7 @@ class ForgeAgent:
                 exc_info=True,
             )
 
+    @traced(name="skyvern.agent.prompt_build")
     async def _build_extract_action_prompt(
         self,
         task: Task,
@@ -3131,6 +3328,16 @@ class ForgeAgent:
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
+                if count_tokens(combined_prompt) > PROMPT_HARD_CEILING_TOKENS:
+                    # The cached split-template path renders static+dynamic separately,
+                    # so the load_prompt_with_elements ceiling logic never sees this
+                    # prompt. Raise the dedicated sentinel to trigger the except below,
+                    # which falls through to the full load_prompt_with_elements render
+                    # where the fallback drop chain can apply.
+                    raise _PromptCeilingExceeded(
+                        f"cached extract-action prompt exceeded {PROMPT_HARD_CEILING_TOKENS} tokens"
+                    )
+
                 LOG.info(
                     "Using cached prompt",
                     task_id=task.task_id,
@@ -3167,6 +3374,14 @@ class ForgeAgent:
 
         # Map template to prompt_name for logging/caching guards
         prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+
+        # Tag the span so we can explain the 26x p95/p50 variance — prompt size
+        # is almost always the reason prompt_build gets slow.
+        _prompt_build_span = otel_trace.get_current_span()
+        _prompt_build_span.set_attribute("prompt_name", prompt_name)
+        _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
+        _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+
         return full_prompt, use_caching, prompt_name
 
     async def _get_prompt_caching_settings(self, context: SkyvernContext) -> dict[str, bool]:
@@ -3406,7 +3621,7 @@ class ForgeAgent:
         Find the last successful ScrapeAction for the task and return the extracted information.
         """
         # TODO: make sure we can get extracted information with the ExtractAction change
-        steps = await app.DATABASE.get_task_steps(
+        steps = await app.DATABASE.tasks.get_task_steps(
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
@@ -3439,7 +3654,7 @@ class ForgeAgent:
         Find the TerminateAction for the task and return the reasoning.
         # TODO (kerem): Also return meaningful exceptions when we add them [WYV-311]
         """
-        steps = await app.DATABASE.get_task_steps(
+        steps = await app.DATABASE.tasks.get_task_steps(
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
@@ -3460,6 +3675,7 @@ class ForgeAgent:
         )
         return None
 
+    @traced(name="skyvern.agent.cleanup")
     async def clean_up_task(
         self,
         task: Task,
@@ -3469,13 +3685,22 @@ class ForgeAgent:
         close_browser_on_completion: bool = True,
         need_final_screenshot: bool = True,
         browser_session_id: str | None = None,
+        download_suffix: str | None = None,
+        list_files_before: list[str] | None = None,
     ) -> None:
         """
         send the task response to the webhook callback url
         """
+        _cleanup_span = otel_trace.get_current_span()
+        # task_id, workflow_run_id auto-attached by @traced from SkyvernContext.
+        _cleanup_span.set_attribute("close_browser_on_completion", bool(close_browser_on_completion))
+        _cleanup_span.set_attribute("need_call_webhook", bool(need_call_webhook))
+        _cleanup_span.set_attribute("need_final_screenshot", bool(need_final_screenshot))
         # refresh the task from the db to get the latest status
         try:
-            refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+            refreshed_task = await app.DATABASE.tasks.get_task(
+                task_id=task.task_id, organization_id=task.organization_id
+            )
             if not refreshed_task:
                 LOG.error("Failed to get task from db when clean up task", task_id=task.task_id)
                 raise TaskNotFound(task_id=task.task_id)
@@ -3518,26 +3743,42 @@ class ForgeAgent:
                     LOG.exception("Failed to take screenshot before sending task response")
 
         if task.organization_id:
-            try:
-                async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                    context = skyvern_context.current()
-                    await app.STORAGE.save_downloaded_files(
-                        organization_id=task.organization_id,
-                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
+            _tracer = otel_trace.get_tracer("skyvern")
+            with _tracer.start_as_current_span("skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
+                apply_context_attrs(_cl_save_span)
+                try:
+                    # Keep both finalize and save inside a single timeout budget so a hung
+                    # finalize call cannot block persistence forever; accept the trade-off
+                    # that a very slow finalize on many files could crowd out save.
+                    async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                        if download_suffix and list_files_before is not None:
+                            await self._finalize_downloaded_files_for_task(
+                                task,
+                                organization_id=task.organization_id,
+                                download_suffix=download_suffix,
+                                list_files_before=list_files_before,
+                                randomize_if_missing=False,
+                            )
+                        context = skyvern_context.current()
+                        await app.STORAGE.save_downloaded_files(
+                            organization_id=task.organization_id,
+                            run_id=context.run_id
+                            if context and context.run_id
+                            else task.workflow_run_id or task.task_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout to save downloaded files",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
                     )
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "Timeout to save downloaded files",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to save downloaded files",
-                    exc_info=True,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
+                except Exception:
+                    LOG.warning(
+                        "Failed to save downloaded files",
+                        exc_info=True,
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
 
         # if it's a task block from workflow run,
         # we don't need to close the browser, save browser artifacts, or call webhook
@@ -3551,15 +3792,22 @@ class ForgeAgent:
 
         await self.async_operation_pool.remove_task(task.task_id)
 
-        await self.cleanup_browser_and_create_artifacts(
-            close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
-        )
+        _tracer = otel_trace.get_tracer("skyvern")
+        with _tracer.start_as_current_span("skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
+            apply_context_attrs(_cl_br_span)
+            await self.cleanup_browser_and_create_artifacts(
+                close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
+            )
 
         # Wait for all tasks to complete before generating the links for the artifacts
-        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
+        with _tracer.start_as_current_span("skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
+            apply_context_attrs(_cl_wait_span)
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            await self.execute_task_webhook(task=task, api_key=api_key)
+            with _tracer.start_as_current_span("skyvern.agent.cleanup.webhook") as _cl_wh_span:
+                apply_context_attrs(_cl_wh_span)
+                await self.execute_task_webhook(task=task, api_key=api_key)
 
     async def execute_task_webhook(
         self,
@@ -3579,7 +3827,11 @@ class ForgeAgent:
                 task_id=task.task_id,
             )
             return
-        last_step = await app.DATABASE.get_latest_step(task.task_id, organization_id=task.organization_id)
+
+        # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
+        task.webhook_callback_url = task.webhook_callback_url.strip()
+
+        last_step = await app.DATABASE.tasks.get_latest_step(task.task_id, organization_id=task.organization_id)
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
         # try to build the new TaskRunResponse for backward compatibility
@@ -3608,13 +3860,14 @@ class ForgeAgent:
                 headers=signed_data.headers,
             )
 
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    task.webhook_callback_url,
-                    data=signed_data.signed_payload,
-                    headers=signed_data.headers,
-                    timeout=httpx.Timeout(30.0),
-                )
+            resp = await app.AGENT_FUNCTION.deliver_webhook(
+                url=task.webhook_callback_url,
+                payload=signed_data.signed_payload,
+                headers=signed_data.headers,
+                timeout_seconds=30.0,
+                organization_id=task.organization_id,
+                run_id=task.task_id,
+            )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
@@ -3622,7 +3875,7 @@ class ForgeAgent:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
-                await app.DATABASE.update_task(
+                await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
                     organization_id=task.organization_id,
                     webhook_failure_reason="",
@@ -3635,7 +3888,7 @@ class ForgeAgent:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
-                await app.DATABASE.update_task(
+                await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
                     organization_id=task.organization_id,
                     webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
@@ -3665,7 +3918,7 @@ class ForgeAgent:
         downloaded_files: list[FileInfo] | None = None
 
         # get the artifact of the screenshot and get the screenshot_url
-        screenshot_artifact = await app.DATABASE.get_artifact(
+        screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
             task_id=task.task_id,
             step_id=last_step.step_id,
             artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -3689,9 +3942,11 @@ class ForgeAgent:
                 LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
 
         if recording_url is None:
-            first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+            first_step = await app.DATABASE.tasks.get_first_step(
+                task_id=task.task_id, organization_id=task.organization_id
+            )
             if first_step:
-                recording_artifact = await app.DATABASE.get_artifact(
+                recording_artifact = await app.DATABASE.artifacts.get_artifact(
                     task_id=task.task_id,
                     step_id=first_step.step_id,
                     artifact_type=ArtifactType.RECORDING,
@@ -3701,7 +3956,7 @@ class ForgeAgent:
                     recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
-        latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
+        latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
             task_id=task.task_id,
             organization_id=task.organization_id,
             artifact_types=[ArtifactType.SCREENSHOT_ACTION],
@@ -3737,7 +3992,7 @@ class ForgeAgent:
                 )
 
         if need_browser_log:
-            browser_console_log = await app.DATABASE.get_latest_artifact(
+            browser_console_log = await app.DATABASE.artifacts.get_latest_artifact(
                 task_id=task.task_id,
                 artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
                 organization_id=task.organization_id,
@@ -3746,7 +4001,7 @@ class ForgeAgent:
                 browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
 
         # get the latest task from the db to get the latest status, extracted_information, and failure_reason
-        task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if not task_from_db:
             LOG.error("Failed to get task from db when sending task response")
             raise TaskNotFound(task_id=task.task_id)
@@ -3782,9 +4037,11 @@ class ForgeAgent:
             task.organization_id,
         )
         if browser_state:
-            # Update recording artifact after closing the browser, so we can get an accurate recording
+            # Only remux via ffmpeg when the browser was actually closed — otherwise
+            # the recording file is still open (persistent/remote sessions) and the
+            # remux would fail on the partial container anyway.
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state
+                task_id=task.task_id, browser_state=browser_state, finalize=close_browser_on_completion
             )
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
@@ -3884,9 +4141,21 @@ class ForgeAgent:
                 organization_id=step.organization_id,
             )
 
+        # Flush event strategy metrics on any terminal status (including canceled)
+        if status in [StepStatus.completed, StepStatus.failed, StepStatus.canceled]:
+            try:
+                EventStrategyFactory.flush_metrics(
+                    step_id=step.step_id,
+                    task_id=step.task_id,
+                    step_status=status,
+                    organization_id=step.organization_id,
+                )
+            except Exception:
+                LOG.warning("Failed to flush event strategy metrics", exc_info=True)
+
         await save_step_logs(step.step_id)
 
-        return await app.DATABASE.update_step(
+        return await app.DATABASE.tasks.update_step(
             task_id=step.task_id,
             step_id=step.step_id,
             organization_id=step.organization_id,
@@ -3904,7 +4173,7 @@ class ForgeAgent:
         failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
-        task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if task_from_db:
             task = task_from_db
 
@@ -3944,7 +4213,7 @@ class ForgeAgent:
 
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
-        return await app.DATABASE.update_task(
+        return await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
@@ -3990,7 +4259,7 @@ class ForgeAgent:
             name=f"verify_goal_{step.step_id}",
         )
 
-        next_step = await app.DATABASE.create_step(
+        next_step = await app.DATABASE.tasks.create_step(
             task_id=task.task_id,
             order=step.order + 1,
             retry_index=0,
@@ -4280,7 +4549,10 @@ class ForgeAgent:
                 task_status="failed",
                 failure_category=failure_category,
                 primary_failure_category=failure_category[0].get("category") if failure_category else None,
-                failure_category_source="llm" if failure_response.failure_categories else "code_level",
+                failure_category_source=(
+                    failure_response.failure_category_source
+                    or ("llm" if failure_response.failure_categories else "code_level")
+                ),
                 failure_category_path="max_retries",
             )
             await self.update_task(
@@ -4297,7 +4569,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            next_step = await app.DATABASE.create_step(
+            next_step = await app.DATABASE.tasks.create_step(
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 order=step.order,
@@ -4316,7 +4588,7 @@ class ForgeAgent:
         llm_errors: list[str] = []
 
         try:
-            steps = await app.DATABASE.get_task_steps(
+            steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
             for step_cnt, step in enumerate(steps):
@@ -4434,17 +4706,21 @@ class ForgeAgent:
         steps_without_actions = 0
 
         try:
-            steps = await app.DATABASE.get_task_steps(
+            steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
 
             # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
                 if cur_step.status == StepStatus.failed:
-                    # Only count steps where the LLM call itself failed (no output at all).
-                    # Steps with output but empty actions mean the LLM worked fine but found
-                    # nothing to interact with — those fall through to normal summarization.
-                    if not cur_step.output:
+                    # Count steps that failed without producing actions due to LLM issues:
+                    # - No output at all (catastrophic failure before any result persisted)
+                    # - Output exists but no actions AND step_exception confirms an
+                    #   LLM-specific failure (e.g. context window exceeded)
+                    if not cur_step.output or (
+                        not cur_step.output.actions_and_results
+                        and cur_step.output.step_exception in _LLM_STEP_EXCEPTIONS
+                    ):
                         steps_without_actions += 1
 
                 if cur_step.output and cur_step.output.actions_and_results:
@@ -4485,6 +4761,10 @@ class ForgeAgent:
                         f"Error details: {llm_error_details}"
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        f"LLM provider errors detected across retry steps: {llm_error_details}"
+                    ),
+                    failure_category_source="code_level",
                 )
 
             # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
@@ -4493,10 +4773,16 @@ class ForgeAgent:
                     page_info="",
                     reasoning=(
                         f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                        f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
-                        f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                        f"This is typically caused by the page content exceeding the LLM context window, "
+                        f"LLM service errors during action extraction (rate limiting, service outages), "
+                        f"or oversized input data. Please reduce the page content or input data size and try again."
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        "All retry steps failed without producing actions — "
+                        "LLM context window exceeded or provider error during action extraction."
+                    ),
+                    failure_category_source="code_level",
                 )
 
             if page is not None:
@@ -4533,6 +4819,10 @@ class ForgeAgent:
                         f"Error details: {llm_error_details}"
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        f"LLM provider errors detected across retry steps: {llm_error_details}"
+                    ),
+                    failure_category_source="code_level",
                 )
             # If multiple steps failed without actions during summarization failure, still report it
             if steps_without_actions >= max_retries:
@@ -4543,6 +4833,11 @@ class ForgeAgent:
                         f"This is typically caused by LLM service errors during action extraction."
                     ),
                     errors=[],
+                    failure_categories=_llm_error_category(
+                        "All retry steps failed without producing actions — "
+                        "LLM context window exceeded or provider error during action extraction."
+                    ),
+                    failure_category_source="code_level",
                 )
             if steps_results:
                 last_step_result = steps_results[-1]
@@ -4722,7 +5017,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            next_step = await app.DATABASE.create_step(
+            next_step = await app.DATABASE.tasks.create_step(
                 task_id=task.task_id,
                 order=step.order + 1,
                 retry_index=0,
@@ -4843,7 +5138,7 @@ class ForgeAgent:
         if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             workflow_id = workflow_permanent_id = None
             if task.workflow_run_id:
-                workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
                 if workflow_run:
                     workflow_id = workflow_run.workflow_id
                     workflow_permanent_id = workflow_run.workflow_permanent_id
@@ -4891,7 +5186,7 @@ class ForgeAgent:
 
     @staticmethod
     async def get_task_errors(task: Task) -> list[UserDefinedError]:
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+        steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         errors = []
         for step in steps:
             if step.output and step.output.errors:
@@ -4907,7 +5202,7 @@ class ForgeAgent:
         step_errors = detailed_step_output.extract_errors() or []
         task_errors.extend([error.model_dump() for error in step_errors])
 
-        return await app.DATABASE.update_task(
+        return await app.DATABASE.tasks.update_task(
             task_id=task.task_id,
             organization_id=task.organization_id,
             errors=task_errors,
@@ -4916,18 +5211,106 @@ class ForgeAgent:
     @staticmethod
     async def create_extract_action(task: Task, step: Step, scraped_page: ScrapedPage) -> ExtractAction:
         context = skyvern_context.ensure_context()
+        local_datetime_str = datetime.now(context.tz_info).isoformat()
+        capped_schema = truncate_extraction_schema(task.extracted_information_schema)
         # generate reasoning by prompt llm to think briefly what data to extract
-        prompt = prompt_engine.load_prompt(
-            "data-extraction-summary",
-            data_extraction_goal=task.data_extraction_goal,
-            data_extraction_schema=task.extracted_information_schema,
-            current_url=scraped_page.url,
-            local_datetime=datetime.now(context.tz_info).isoformat(),
+        summary_kwargs: dict[str, Any] = {
+            "data_extraction_goal": task.data_extraction_goal,
+            "data_extraction_schema": capped_schema,
+            "local_datetime": local_datetime_str,
+        }
+        prompt = prompt_engine.load_prompt("data-extraction-summary", **summary_kwargs)
+        prompt, post_ceiling_kwargs = enforce_prompt_ceiling_tracked(
+            prompt,
+            prompt_engine=prompt_engine,
+            template_name="data-extraction-summary",
+            kwargs=summary_kwargs,
         )
 
-        data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-            prompt=prompt, step=step, prompt_name="data-extraction-summary"
-        )
+        # Cache the summary LLM call — the inputs (goal, schema) are identical
+        # across loop iterations that share an extraction configuration, even
+        # when each iteration navigates to a different URL. The `try` is
+        # narrowed to just compute_cache_key + lookup so a downstream log
+        # failure can't double-count as a lookup_error.
+        workflow_run_id = context.workflow_run_id if context else None
+        cache_key: str | None = None
+        lookup_result: extraction_cache.LookupResult | None = None
+        try:
+            # data-extraction-summary plans *what* will be extracted from
+            # goal + schema; only those inputs, plus the date (via datetime),
+            # affect the rendered prompt, so everything else is intentionally
+            # omitted. Hash the post-ceiling value for `data_extraction_schema`
+            # — when the rendered prompt exceeds PROMPT_HARD_CEILING_TOKENS the
+            # ceiling drops that field to None, so two oversized-schema requests
+            # that both get dropped produce an identical LLM prompt and must
+            # share a cache key.
+            cache_key = extraction_cache.compute_cache_key(
+                call_path="agent",
+                data_extraction_goal=task.data_extraction_goal,
+                extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
+                llm_key=None,
+            )
+            lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
+        except Exception:
+            LOG.warning(
+                "data-extraction-summary cache lookup failed",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                cache_hit=False,
+                cache_scope=extraction_cache.SCOPE_RUN,
+                cache_age_seconds=None,
+                fallback_reason=extraction_cache.FALLBACK_LOOKUP_ERROR,
+                cache_path="agent",
+                exc_info=True,
+            )
+            # Preserve cache_key so the store() below can still warm the cache
+            # for subsequent identical calls even when lookup() fails transiently.
+
+        if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, dict):
+            LOG.info(
+                "data-extraction-summary cache hit — skipping LLM call",
+                workflow_run_id=workflow_run_id,
+                cache_key=cache_key,
+                cache_hit=True,
+                cache_scope=lookup_result.scope,
+                cache_age_seconds=lookup_result.age_seconds,
+                fallback_reason=None,
+                cache_path="agent",
+            )
+            data_extraction_summary_resp = lookup_result.value
+        else:
+            if lookup_result is not None and lookup_result.hit and not isinstance(lookup_result.value, dict):
+                LOG.warning(
+                    "data-extraction-summary cache hit returned non-dict value; falling through to LLM",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    value_type=type(lookup_result.value).__name__,
+                    cache_path="agent",
+                )
+            elif lookup_result is not None:
+                # Genuine miss only — non-dict hits are logged as a warning above and
+                # must NOT also emit a miss log (would double-count in Datadog).
+                LOG.info(
+                    "data-extraction-summary cache miss",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_hit=False,
+                    cache_scope=lookup_result.scope,
+                    cache_age_seconds=None,
+                    fallback_reason=lookup_result.fallback_reason,
+                    cache_path="agent",
+                )
+            data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="data-extraction-summary"
+            )
+            if cache_key and isinstance(data_extraction_summary_resp, dict):
+                extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+
+        if data_extraction_summary_resp is None:
+            raise RuntimeError(
+                "data_extraction_summary_resp unexpectedly None after cache/LLM block "
+                f"(workflow_run_id={workflow_run_id!r}, cache_key={cache_key!r})"
+            )
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,
@@ -4962,7 +5345,7 @@ class ForgeAgent:
         """
         Run the extraction flow when a task with a data extraction goal completes during parallel verification.
         """
-        refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+        refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
         if refreshed_task:
             task = refreshed_task
 

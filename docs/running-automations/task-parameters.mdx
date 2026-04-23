@@ -1,7 +1,20 @@
 ---
 title: Task Parameters
 subtitle: Configure how your task runs
+description: Full reference for all task parameters including prompt, URL, engine, data extraction schema, proxy location, browser sessions, TOTP, webhooks, and cost control options.
 slug: running-automations/task-parameters
+keywords:
+  - prompt
+  - url
+  - engine
+  - data_extraction_schema
+  - max_steps
+  - proxy_location
+  - browser_session_id
+  - totp_identifier
+  - webhook_url
+  - error_code_mapping
+  - user_agent
 ---
 
 This page covers all parameters you can pass to `run_task`.
@@ -112,14 +125,14 @@ The AI engine that powers the task. These are not iterations—they're suited fo
 
 | Engine | Description |
 |--------|-------------|
-| `skyvern-2.0` | **Default.** Multi-objective, flexible, handles complex multi-step tasks. 85.85% on WebVoyager benchmark. Slower and more expensive. |
-| `skyvern-1.0` | Single objective, precise, faster, cheaper. Best for simple tasks like form filling or single-page extraction. |
+| `skyvern-1.0` | **Default.** Single objective, precise, faster, cheaper. Best for simple tasks like form filling or single-page extraction. |
+| `skyvern-2.0` | Multi-objective, flexible, handles complex multi-step tasks. 85.85% on WebVoyager benchmark. Slower and more expensive. |
 | `openai-cua` | OpenAI's Computer Use Agent |
 | `anthropic-cua` | Anthropic Claude Sonnet with computer use |
 | `ui-tars` | UI-TARS model (Seed1.5-VL) via Doubao API |
 
 <Tip>
-Use `skyvern-1.0` when you have a clear, single goal and want faster, cheaper execution. Use `skyvern-2.0` when the task requires flexibility or multiple steps.
+The default engine `skyvern-1.0` works well for clear, single-goal tasks with faster, cheaper execution. Switch to `skyvern-2.0` when the task requires flexibility or multiple steps.
 </Tip>
 
 <CodeGroup>
@@ -295,6 +308,7 @@ Use this for geo-restricted content or to reduce bot detection.
 | `RESIDENTIAL_NL` | Netherlands |
 | `RESIDENTIAL_PH` | Philippines |
 | `RESIDENTIAL_KR` | South Korea |
+| `RESIDENTIAL_SA` | Saudi Arabia |
 | `RESIDENTIAL_TR` | Turkey |
 | `RESIDENTIAL_ISP` | ISP proxy |
 | `US-CA` | California, US |

@@ -1,7 +1,19 @@
 ---
 title: Error Handling
 subtitle: Handle API errors, timeouts, and configure retries
+description: Handle API errors, timeouts, and configure retries in the Skyvern Python SDK. Covers error types, exception handling, HTTP and completion timeouts, retry configuration, and run failure vs API error patterns.
 slug: sdk-reference/error-handling
+keywords:
+  - BadRequestError
+  - ForbiddenError
+  - NotFoundError
+  - ConflictError
+  - UnprocessableEntityError
+  - timeout
+  - retry
+  - polling
+  - run status
+  - failure
 ---
 
 The SDK raises typed exceptions for API errors. All errors extend `ApiError` and include the HTTP status code, response headers, and body.

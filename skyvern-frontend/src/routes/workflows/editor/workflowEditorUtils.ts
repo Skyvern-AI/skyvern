@@ -1,6 +1,5 @@
 import Dagre from "@dagrejs/dagre";
-import type { Node } from "@xyflow/react";
-import { Edge } from "@xyflow/react";
+import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
@@ -48,6 +47,8 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  GoogleSheetsReadBlockYAML,
+  GoogleSheetsWriteBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -114,9 +115,12 @@ import {
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
-import { loginNodeDefaultData } from "./nodes/LoginNode/types";
+import { isLoginNode, loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
-import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
+import {
+  fileDownloadNodeDefaultData,
+  isFileDownloadNode,
+} from "./nodes/FileDownloadNode/types";
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   isPdfParserNode,
@@ -133,10 +137,21 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
+import {
+  googleSheetsReadNodeDefaultData,
+  isGoogleSheetsReadNode,
+} from "./nodes/GoogleSheetsReadNode/types";
+import { validateGoogleSheetsReadNode } from "./nodes/GoogleSheetsReadNode/validate";
+import {
+  googleSheetsWriteNodeDefaultData,
+  isGoogleSheetsWriteNode,
+} from "./nodes/GoogleSheetsWriteNode/types";
+import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -385,7 +400,7 @@ function layout(
       ...childNodes.map((child) =>
         child.type === "loop"
           ? getLoopNodeWidth(child, nodes)
-          : child.measured?.width ?? 0,
+          : (child.measured?.width ?? 0),
       ),
     );
     const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
@@ -682,9 +697,9 @@ function convertToNode(
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
           // When engine is SkyvernV2, use navigation_goal as the prompt
-          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          prompt: isV2Engine ? (block.navigation_goal ?? "") : "",
           maxSteps: isV2Engine
-            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            ? (block.max_steps_per_run ?? MAX_STEPS_DEFAULT)
             : MAX_STEPS_DEFAULT,
         },
       };
@@ -833,7 +848,7 @@ function convertToNode(
       const loopVariableReference =
         block.loop_variable_reference !== null
           ? block.loop_variable_reference
-          : block.loop_over?.key ?? "";
+          : (block.loop_over?.key ?? "");
       return {
         ...identifiers,
         ...common,
@@ -861,6 +876,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           model: block.model,
         },
@@ -985,6 +1001,43 @@ function convertToNode(
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
           useParentBrowserSession: block.use_parent_browser_session ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "google_sheets_read": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "google_sheets_write": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          writeMode: block.write_mode ?? "append",
+          values: block.values ?? "",
+          columnMapping: block.column_mapping
+            ? JSON.stringify(block.column_mapping, null, 2)
+            : "",
+          createSheetIfMissing: block.create_sheet_if_missing ?? false,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -1813,9 +1866,9 @@ function getElements(
     const branchHidden =
       Boolean(
         conditionalNodeId &&
-          conditionalBranchId &&
-          activeBranchId &&
-          conditionalBranchId !== activeBranchId,
+        conditionalBranchId &&
+        activeBranchId &&
+        conditionalBranchId !== activeBranchId,
       ) ?? false;
 
     const nodeHidden =
@@ -2088,6 +2141,28 @@ function createNode(
         type: "workflowTrigger",
         data: {
           ...workflowTriggerNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "googleSheetsRead": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...googleSheetsReadNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "googleSheetsWrite": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...googleSheetsWriteNodeDefaultData,
           label,
         },
       };
@@ -2508,7 +2583,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv", // Backend will auto-detect based on file extension
+        file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
@@ -2594,6 +2669,41 @@ function getWorkflowBlock(
         wait_for_completion: node.data.waitForCompletion,
         browser_session_id: node.data.browserSessionId || null,
         use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsRead": {
+      return {
+        ...base,
+        block_type: "google_sheets_read",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsWrite": {
+      let parsedColumnMapping: Record<string, string> | null = null;
+      if (node.data.columnMapping) {
+        try {
+          parsedColumnMapping = JSON.parse(node.data.columnMapping);
+        } catch {
+          // ignore invalid JSON
+        }
+      }
+      return {
+        ...base,
+        block_type: "google_sheets_write",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        write_mode: node.data.writeMode,
+        values: node.data.values,
+        column_mapping: parsedColumnMapping,
+        create_sheet_if_missing: node.data.createSheetIfMissing,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4035,6 +4145,35 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "google_sheets_read": {
+        const blockYaml: GoogleSheetsReadBlockYAML = {
+          ...base,
+          block_type: "google_sheets_read",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          has_header_row: block.has_header_row,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "google_sheets_write": {
+        const blockYaml: GoogleSheetsWriteBlockYAML = {
+          ...base,
+          block_type: "google_sheets_write",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          write_mode: block.write_mode,
+          values: block.values,
+          column_mapping: block.column_mapping,
+          create_sheet_if_missing: block.create_sheet_if_missing,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -4091,11 +4230,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (node.data.navigationGoal.length === 0) {
       errors.push(`${node.data.label}: Action Instruction is required.`);
     }
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   // check loop node parameters
@@ -4112,11 +4249,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   // check task node json fields
   const taskNodes = nodes.filter(isTaskNode);
   taskNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     // Validate Task data schema JSON when enabled (value different from "null")
     if (node.data.dataSchema && node.data.dataSchema !== "null") {
       const result = TSON.parse(node.data.dataSchema);
@@ -4131,11 +4266,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const validationNodes = nodes.filter(isValidationNode);
   validationNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     if (
       node.data.completeCriterion.length === 0 &&
       node.data.terminateCriterion.length === 0
@@ -4165,6 +4298,23 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         errors.push(`${node.data.label}: Prompt is required.`);
       }
     }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const loginNodes = nodes.filter(isLoginNode);
+  loginNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const fileDownloadNodes = nodes.filter(isFileDownloadNode);
+  fileDownloadNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   const conditionalNodes = nodes.filter((node) => node.type === "conditional");
@@ -4271,6 +4421,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(`${node.data.label}: Payload - ${payloadResult.message}`);
     }
   });
+
+  nodes
+    .filter(isGoogleSheetsReadNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+
+  nodes
+    .filter(isGoogleSheetsWriteNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
 
   return errors;
 }

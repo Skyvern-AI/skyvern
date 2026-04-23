@@ -79,6 +79,29 @@ def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
     return value
 
 
+def _rewrite_error_code_mapping_refs_atomic(mapping: Any, substitutions: list[tuple[str, str]]) -> Any:
+    """Atomically rewrites Jinja references (keys and values) in an error_code_mapping dict.
+
+    Uses unique sentinels so chained rewrites don't occur when one substitution's new
+    identifier matches another's old identifier (e.g. foo-bar -> foo_bar AND foo_bar -> foo_bar_2).
+    """
+    if not isinstance(mapping, dict) or not substitutions:
+        return mapping
+
+    sentinels = [(old, new, f"\x00SKY_SANITIZE_{i}\x00") for i, (old, new) in enumerate(substitutions)]
+
+    def _apply(text: str) -> str:
+        for old, _new, sentinel in sentinels:
+            text = replace_jinja_reference(text, old, sentinel)
+        for _old, new, sentinel in sentinels:
+            text = text.replace(sentinel, new)
+        return text
+
+    return {
+        (_apply(k) if isinstance(k, str) else k): (_apply(v) if isinstance(v, str) else v) for k, v in mapping.items()
+    }
+
+
 def _replace_direct_string_in_value(value: Any, old_key: str, new_key: str) -> Any:
     """Recursively replaces exact string matches in a value (for fields like source_parameter_key)."""
     if isinstance(value, str):
@@ -316,6 +339,20 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
                 workflow_definition["parameters"], old_key, new_key
             )
 
+    # Rewrite workflow-level error_code_mapping atomically so substitutions don't chain
+    # (e.g. foo-bar -> foo_bar and foo_bar -> foo_bar_2 must not combine into foo_bar_2).
+    if "error_code_mapping" in workflow_definition:
+        substitutions: list[tuple[str, str]] = []
+        for old_label, new_label in label_mapping.items():
+            # More specific output-key substitution must come before the bare label.
+            substitutions.append((f"{old_label}_output", f"{new_label}_output"))
+            substitutions.append((old_label, new_label))
+        for old_key, new_key in param_key_mapping.items():
+            substitutions.append((old_key, new_key))
+        workflow_definition["error_code_mapping"] = _rewrite_error_code_mapping_refs_atomic(
+            workflow_definition["error_code_mapping"], substitutions
+        )
+
     # Step 5: Update parameter_keys arrays in blocks
     if param_key_mapping and "blocks" in workflow_definition:
         workflow_definition["blocks"] = _update_parameter_keys_in_blocks(
@@ -381,6 +418,8 @@ class BlockType(StrEnum):
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
+    GOOGLE_SHEETS_READ = "google_sheets_read"
+    GOOGLE_SHEETS_WRITE = "google_sheets_write"
 
 
 class BlockStatus(StrEnum):
@@ -405,6 +444,7 @@ class BlockResult:
 
 
 class FileType(StrEnum):
+    AUTO_DETECT = "auto_detect"
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
@@ -794,7 +834,7 @@ class FileParserBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
 
     file_url: str
-    file_type: FileType
+    file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
 
 
@@ -991,6 +1031,29 @@ class WorkflowTriggerBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class GoogleSheetsReadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOOGLE_SHEETS_READ] = BlockType.GOOGLE_SHEETS_READ  # type: ignore
+    spreadsheet_url: str
+    sheet_name: str | None = None
+    range: str | None = None
+    credential_id: str | None = None
+    has_header_row: bool = True
+    parameter_keys: list[str] | None = None
+
+
+class GoogleSheetsWriteBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOOGLE_SHEETS_WRITE] = BlockType.GOOGLE_SHEETS_WRITE  # type: ignore
+    spreadsheet_url: str
+    sheet_name: str | None = None
+    range: str | None = None
+    credential_id: str | None = None
+    write_mode: Literal["append", "update"] = "append"
+    values: str = ""
+    column_mapping: dict[str, str] | None = None
+    create_sheet_if_missing: bool = False
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -1030,6 +1093,8 @@ BLOCK_YAML_SUBCLASSES = (
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | WorkflowTriggerBlockYAML
+    | GoogleSheetsReadBlockYAML
+    | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
@@ -1039,6 +1104,7 @@ class WorkflowDefinitionYAML(BaseModel):
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
+    error_code_mapping: dict[str, str] | None = None
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":

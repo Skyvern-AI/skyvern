@@ -1,9 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Flippable } from "@/components/Flippable";
 import { Handle, NodeProps, Position } from "@xyflow/react";
 import type { URLNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-import { useState } from "react";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";

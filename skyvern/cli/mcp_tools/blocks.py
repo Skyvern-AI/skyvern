@@ -28,6 +28,8 @@ from skyvern.schemas.workflows import (
     FileParserBlockYAML,
     FileUploadBlockYAML,
     ForLoopBlockYAML,
+    GoogleSheetsReadBlockYAML,
+    GoogleSheetsWriteBlockYAML,
     HttpRequestBlockYAML,
     HumanInteractionBlockYAML,
     LoginBlockYAML,
@@ -78,6 +80,8 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.HUMAN_INTERACTION.value: HumanInteractionBlockYAML,
     BlockType.PRINT_PAGE.value: PrintPageBlockYAML,
     BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
+    BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
+    BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
 }
 
 # ---------------------------------------------------------------------------
@@ -107,6 +111,8 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
     "workflow_trigger": "Trigger another workflow by permanent ID, with optional payload and wait-for-completion",
+    "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
+    "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
 }
 
 # ---------------------------------------------------------------------------
@@ -210,6 +216,25 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "workflow_permanent_id": "wpid_xxx",
         "payload": {"url": "{{ some_parameter }}"},
         "wait_for_completion": True,
+    },
+    "google_sheets_read": {
+        "block_type": "google_sheets_read",
+        "label": "read_sheet_data",
+        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit",
+        "sheet_name": "Sheet1",
+        "range": "A1:D100",
+        "credential_id": "{{ google_credential_id }}",
+        "has_header_row": True,
+    },
+    "google_sheets_write": {
+        "block_type": "google_sheets_write",
+        "label": "write_sheet_data",
+        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit",
+        "sheet_name": "Sheet1",
+        "range": "A1",
+        "credential_id": "{{ google_credential_id }}",
+        "write_mode": "append",
+        "values": "{{ output_data | tojson }}",
     },
 }
 
@@ -316,13 +341,7 @@ async def skyvern_block_schema(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Get the schema for a workflow block type, or list all available block types.
-
-    Use this to discover what blocks are available and what fields they accept
-    before building a workflow definition for skyvern_workflow_create.
-
-    Call with no arguments to see all block types. Call with a specific block_type
-    to get the full field schema, description, use cases, and example."""
+    """Get the schema for a workflow block type, or list all available types if block_type is omitted."""
 
     action = "skyvern_block_schema"
 
@@ -405,12 +424,7 @@ async def skyvern_block_validate(
         Field(description="JSON string of a single block definition to validate"),
     ],
 ) -> dict[str, Any]:
-    """Validate a workflow block definition before using it in skyvern_workflow_create.
-
-    Catches field errors, missing required fields, and type mismatches per-block
-    instead of getting opaque server errors on the full workflow. Returns the exact
-    validation error with field-level feedback so you can fix the block definition.
-    """
+    """Validate a workflow block definition before using it in skyvern_workflow_create. Returns field-level errors."""
     action = "skyvern_block_validate"
 
     try:

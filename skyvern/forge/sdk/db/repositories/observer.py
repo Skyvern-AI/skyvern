@@ -232,6 +232,7 @@ class ObserverRepository(BaseRepository):
         cached_token_count: int | None = None,
         thought_cost: float | None = None,
         organization_id: str | None = None,
+        last_llm_model: str | None = None,
     ) -> Thought:
         async with self.Session() as session:
             thought_obj = (
@@ -258,16 +259,18 @@ class ObserverRepository(BaseRepository):
                     thought_obj.answer = answer
                 if output:
                     thought_obj.output = output
-                if input_token_count:
+                if input_token_count is not None:
                     thought_obj.input_token_count = input_token_count
-                if output_token_count:
+                if output_token_count is not None:
                     thought_obj.output_token_count = output_token_count
-                if reasoning_token_count:
+                if reasoning_token_count is not None:
                     thought_obj.reasoning_token_count = reasoning_token_count
-                if cached_token_count:
+                if cached_token_count is not None:
                     thought_obj.cached_token_count = cached_token_count
-                if thought_cost:
+                if thought_cost is not None:
                     thought_obj.thought_cost = thought_cost
+                if last_llm_model is not None:
+                    thought_obj.last_llm_model = last_llm_model
                 await session.commit()
                 await session.refresh(thought_obj)
                 return Thought.model_validate(thought_obj)

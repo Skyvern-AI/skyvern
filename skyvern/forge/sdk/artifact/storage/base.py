@@ -127,6 +127,10 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        pass
+
+    @abstractmethod
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store a browser profile from a directory."""
 

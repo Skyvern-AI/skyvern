@@ -1021,3 +1021,1007 @@ async def test_workflow_update_does_not_duplicate_existing_credential_parameter(
     cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
     # Should still be exactly 1, not duplicated
     assert len(cred_params) == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_credential_keys_injected_when_login_block_label_renamed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Claude renames a login block label (e.g. 'login_block' -> 'login'),
+    credential parameter_keys should still be injected via type-based matching."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                        "navigation_goal": "Login",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude renamed the login block from "login_block" to "login"
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login",
+                    "parameter_keys": [],
+                    "navigation_goal": "Log in to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    # Credential parameter must be injected
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+    assert cred_params[0].credential_id == "cred_abc123"
+
+    # Login block must have credential key despite label mismatch
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_always_replaces_wrong_credential_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Claude includes a credential parameter with the wrong credential_id,
+    the existing workflow's credential_id should always win."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_CORRECT",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude includes credential param but with a WRONG credential_id
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "credential",
+                    "key": "credentials",
+                    "credential_id": "cred_WRONG_STALE",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": ["credentials"],
+                    "navigation_goal": "Login",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+    # The existing (correct) credential_id must win
+    assert cred_params[0].credential_id == "cred_CORRECT"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_correct_credential_still_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Claude includes the credential parameter correctly, the always-replace
+    strategy should still work (idempotent, no regression)."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                    {
+                        "parameter_type": "workflow",
+                        "key": "url_input",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://example.com",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude includes credential param correctly AND the block references it
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "credential",
+                    "key": "credentials",
+                    "credential_id": "cred_abc123",
+                },
+                {
+                    "parameter_type": "workflow",
+                    "key": "url_input",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://new-url.com",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": ["credentials"],
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+    assert cred_params[0].credential_id == "cred_abc123"
+
+    # Non-credential params should be preserved from the update
+    wf_params = [p for p in params if getattr(p, "parameter_type", None) == "workflow"]
+    assert len(wf_params) == 1
+    assert wf_params[0].default_value == "https://new-url.com"
+
+    # Login block should have the credential key
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_multiple_login_blocks_all_get_credential_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the update has multiple login blocks, ALL of them should get credential
+    parameter_keys injected (even if labels don't match existing blocks)."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude split the workflow into two login blocks with new labels
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "initial_login",
+                    "navigation_goal": "Login to the site",
+                },
+                {
+                    "block_type": "task",
+                    "label": "do_work",
+                    "navigation_goal": "Do some work",
+                },
+                {
+                    "block_type": "login",
+                    "label": "reauth_login",
+                    "navigation_goal": "Re-authenticate",
+                },
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    blocks = sent_def.workflow_definition.blocks
+
+    # Both login blocks should have credential keys
+    login_blocks = [b for b in blocks if getattr(b, "block_type", None) == "login"]
+    assert len(login_blocks) == 2
+    for lb in login_blocks:
+        pkeys = getattr(lb, "parameter_keys", [])
+        assert "credentials" in pkeys, f"Login block {getattr(lb, 'label', '?')} missing credential key"
+
+    # Task block should NOT have credential keys (no label match, not a login block)
+    task_block = next(b for b in blocks if getattr(b, "block_type", None) == "task")
+    task_pkeys = getattr(task_block, "parameter_keys", None) or []
+    assert "credentials" not in task_pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_credential_keys_injected_into_login_block_nested_in_for_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a login block is nested inside a for_loop block, credential parameter_keys
+    should still be injected via type-based matching."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "for_loop",
+                        "label": "loop_block",
+                        "loop_blocks": [
+                            {
+                                "block_type": "login",
+                                "label": "login_block",
+                                "parameter_keys": ["credentials"],
+                                "navigation_goal": "Login",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude renamed the nested login block inside the for_loop
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "for_loop",
+                    "label": "loop_block",
+                    "loop_blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "login",
+                            "navigation_goal": "Log in to the site",
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    # Credential parameter must be injected
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+    assert cred_params[0].credential_id == "cred_abc123"
+
+    # The nested login block inside for_loop must have credential keys
+    blocks = sent_def.workflow_definition.blocks
+    loop_block = next(b for b in blocks if getattr(b, "block_type", None) == "for_loop")
+    nested_blocks = getattr(loop_block, "loop_blocks", [])
+    login_block = next(b for b in nested_blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_login_block_only_gets_credential_type_keys_not_aws_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a workflow has both a credential param and an aws_secret param,
+    login blocks should only get the credential key, not the aws_secret key."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                    },
+                    {
+                        "parameter_type": "aws_secret",
+                        "key": "api_secret",
+                        "aws_key": "my-secret-key",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    },
+                    {
+                        "block_type": "task",
+                        "label": "api_call",
+                        "parameter_keys": ["api_secret"],
+                        "navigation_goal": "Make API call",
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    # Claude renamed login block and dropped all parameter info
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login",
+                    "navigation_goal": "Login",
+                },
+                {
+                    "block_type": "task",
+                    "label": "api_call",
+                    "navigation_goal": "Make API call",
+                },
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    # Both params should be preserved
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    aws_params = [p for p in params if getattr(p, "parameter_type", None) == "aws_secret"]
+    assert len(cred_params) == 1
+    assert len(aws_params) == 1
+
+    blocks = sent_def.workflow_definition.blocks
+
+    # Login block should ONLY get credential key, NOT aws_secret
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    login_pkeys = getattr(login_block, "parameter_keys", [])
+    assert "credentials" in login_pkeys
+    assert "api_secret" not in login_pkeys
+
+    # Task block should get aws_secret via label fallback (label unchanged)
+    task_block = next(b for b in blocks if getattr(b, "block_type", None) == "task")
+    task_pkeys = getattr(task_block, "parameter_keys", [])
+    assert "api_secret" in task_pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_strips_runtime_fields_from_credential_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the existing workflow returns credential params with runtime fields
+    (credential_parameter_id, workflow_id, created_at, modified_at, deleted_at),
+    those fields must be stripped before re-injecting into the update definition."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                        "description": "Login credentials",
+                        # Runtime fields from GET API response
+                        "credential_parameter_id": "cp_runtime_123",
+                        "workflow_id": "wpid_runtime_456",
+                        "created_at": "2025-01-01T00:00:00Z",
+                        "modified_at": "2025-06-15T12:00:00Z",
+                        "deleted_at": None,
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login",
+                    "navigation_goal": "Login",
+                },
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    params = sent_def.workflow_definition.parameters
+    cred_params = [p for p in params if getattr(p, "parameter_type", None) == "credential"]
+    assert len(cred_params) == 1
+
+    cred = cred_params[0]
+    # Business fields should be preserved
+    assert getattr(cred, "key", None) == "credentials"
+    assert getattr(cred, "credential_id", None) == "cred_abc123"
+    assert getattr(cred, "description", None) == "Login credentials"
+
+    # Runtime fields must NOT be present — Fern SDK types use extra="allow"
+    # so extra fields survive as attributes if passed through
+    cred_dict = cred.dict() if hasattr(cred, "dict") else cred.__dict__
+    assert "credential_parameter_id" not in cred_dict
+    assert "workflow_id" not in cred_dict
+    assert "created_at" not in cred_dict
+    assert "modified_at" not in cred_dict
+    assert "deleted_at" not in cred_dict
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_workflow_credential_id_params_and_injects_login_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workflow parameters with `credential_id` type should be preserved like direct credential params."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "my_creds",
+                        "workflow_parameter_type": "credential_id",
+                        "default_value": "cred_abc123",
+                        "workflow_parameter_id": "wp_runtime_123",
+                        "workflow_id": "wpid_runtime_456",
+                        "created_at": "2025-01-01T00:00:00Z",
+                        "modified_at": "2025-06-15T12:00:00Z",
+                        "deleted_at": None,
+                    },
+                    {
+                        "parameter_type": "workflow",
+                        "key": "url_input",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://example.com",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["my_creds"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "url_input",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://new-url.com",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login",
+                    "parameter_keys": [],
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    params = sent_def.workflow_definition.parameters
+    workflow_cred_params = [
+        p
+        for p in params
+        if getattr(p, "parameter_type", None) == "workflow"
+        and str(getattr(p, "workflow_parameter_type", None)) == "credential_id"
+    ]
+    assert len(workflow_cred_params) == 1
+
+    workflow_cred = workflow_cred_params[0]
+    assert getattr(workflow_cred, "key", None) == "my_creds"
+    assert getattr(workflow_cred, "default_value", None) == "cred_abc123"
+
+    workflow_cred_dict = workflow_cred.dict() if hasattr(workflow_cred, "dict") else workflow_cred.__dict__
+    assert "workflow_parameter_id" not in workflow_cred_dict
+    assert "workflow_id" not in workflow_cred_dict
+    assert "created_at" not in workflow_cred_dict
+    assert "modified_at" not in workflow_cred_dict
+    assert "deleted_at" not in workflow_cred_dict
+
+    workflow_params = [p for p in params if getattr(p, "parameter_type", None) == "workflow"]
+    url_param = next(p for p in workflow_params if getattr(p, "key", None) == "url_input")
+    assert getattr(url_param, "default_value", None) == "https://new-url.com"
+
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "my_creds" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_always_replaces_wrong_workflow_credential_id_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential-id workflow params should keep the existing default credential on MCP updates."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "my_creds",
+                        "workflow_parameter_type": "credential_id",
+                        "default_value": "cred_CORRECT",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["my_creds"],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "my_creds",
+                    "workflow_parameter_type": "credential_id",
+                    "default_value": "cred_WRONG_STALE",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": ["my_creds"],
+                    "navigation_goal": "Login",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    params = sent_def.workflow_definition.parameters
+    workflow_cred_params = [
+        p
+        for p in params
+        if getattr(p, "parameter_type", None) == "workflow"
+        and str(getattr(p, "workflow_parameter_type", None)) == "credential_id"
+    ]
+    assert len(workflow_cred_params) == 1
+    assert getattr(workflow_cred_params[0], "default_value", None) == "cred_CORRECT"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_injects_onepassword_key_into_login_block_parameter_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Login blocks should keep external credential keys like onepassword after MCP edits."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "onepassword",
+                        "key": "site_login_cred",
+                        "vault_id": "vault_123",
+                        "item_id": "item_456",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "Login_cont",
+                        "parameter_keys": ["site_login_cred"],
+                        "navigation_goal": "Login",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "Login_cont_renamed",
+                    "parameter_keys": [],
+                    "navigation_goal": "Log in to the site",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    params = sent_def.workflow_definition.parameters
+    onepassword_params = [p for p in params if getattr(p, "parameter_type", None) == "onepassword"]
+    assert len(onepassword_params) == 1
+    assert getattr(onepassword_params[0], "key", None) == "site_login_cred"
+    assert getattr(onepassword_params[0], "vault_id", None) == "vault_123"
+    assert getattr(onepassword_params[0], "item_id", None) == "item_456"
+
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "site_login_cred" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_injects_bitwarden_login_key_into_login_block_parameter_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Login blocks should keep bitwarden_login_credential keys after MCP edits."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "bitwarden_login_credential",
+                        "key": "portal_login",
+                        "bitwarden_login_credential_parameter_id": "blc_fake",
+                        "workflow_id": "w_fake",
+                        "bitwarden_client_id_aws_secret_key": "bw_client",
+                        "bitwarden_client_secret_aws_secret_key": "bw_secret",
+                        "bitwarden_master_password_aws_secret_key": "bw_master",
+                        "bitwarden_collection_id": "col_123",
+                        "url_filter": "https://portal.example.com",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "modified_at": "2026-01-01T00:00:00Z",
+                        "deleted_at": None,
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "Portal_Login",
+                        "parameter_keys": ["portal_login"],
+                        "navigation_goal": "Log in to the portal",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "Portal_Login_Renamed",
+                    "parameter_keys": [],
+                    "navigation_goal": "Log in to the portal - updated",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    params = sent_def.workflow_definition.parameters
+    bw_params = [p for p in params if getattr(p, "parameter_type", None) == "bitwarden_login_credential"]
+    assert len(bw_params) == 1
+    assert getattr(bw_params[0], "key", None) == "portal_login"
+
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "portal_login" in pkeys
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_injects_azure_vault_key_into_login_block_parameter_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Login blocks should keep azure_vault_credential keys after MCP edits."""
+
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "azure_vault_credential",
+                        "key": "azure_creds",
+                        "azure_vault_credential_parameter_id": "avc_fake",
+                        "workflow_id": "w_fake",
+                        "vault_name": "my-vault",
+                        "username_key": "portal-user",
+                        "password_key": "portal-pass",
+                        "totp_secret_key": None,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "modified_at": "2026-01-01T00:00:00Z",
+                        "deleted_at": None,
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "Azure_Login",
+                        "parameter_keys": ["azure_creds"],
+                        "navigation_goal": "Log in with Azure credentials",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "Azure_Login_Renamed",
+                    "parameter_keys": [],
+                    "navigation_goal": "Log in - updated",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+
+    sent_def = fake_client.update_workflow.await_args.kwargs["json_definition"]
+
+    params = sent_def.workflow_definition.parameters
+    az_params = [p for p in params if getattr(p, "parameter_type", None) == "azure_vault_credential"]
+    assert len(az_params) == 1
+    assert getattr(az_params[0], "key", None) == "azure_creds"
+
+    blocks = sent_def.workflow_definition.blocks
+    login_block = next(b for b in blocks if getattr(b, "block_type", None) == "login")
+    pkeys = getattr(login_block, "parameter_keys", [])
+    assert "azure_creds" in pkeys

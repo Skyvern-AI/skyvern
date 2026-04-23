@@ -421,12 +421,12 @@ async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
                 return_value=mock_context,
             ),
             patch(
-                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_task",
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
                 new_callable=AsyncMock,
                 return_value=mock_task,
             ),
             patch(
-                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_step",
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
                 new_callable=AsyncMock,
                 return_value=mock_step,
             ),
@@ -481,12 +481,12 @@ async def test_terminate_raises_even_when_task_not_found(mock_scraped_page, mock
                 return_value=mock_context,
             ),
             patch(
-                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_task",
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
             patch(
-                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_step",
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -538,12 +538,12 @@ async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_
                 return_value=mock_context,
             ),
             patch(
-                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_task",
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
                 new_callable=AsyncMock,
                 return_value=mock_task,
             ),
             patch(
-                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_step",
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
                 new_callable=AsyncMock,
                 return_value=mock_step,
             ),

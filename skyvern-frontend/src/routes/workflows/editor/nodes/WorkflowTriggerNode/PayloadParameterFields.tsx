@@ -8,6 +8,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { CredentialSelector } from "../../../components/CredentialSelector";
 import { useCredentialsQuery } from "../../../hooks/useCredentialsQuery";
+import { formatDefaultValue } from "./formatDefaultValue";
 
 interface PayloadParameterFieldsProps {
   parameters: Array<WorkflowParameter>;
@@ -23,7 +24,7 @@ function getDynamicInputPlaceholder(
 ): string {
   if (isCredential) return "e.g. {{ credential }}";
   if (param.default_value != null)
-    return `Default: ${String(param.default_value)}`;
+    return `Default: ${formatDefaultValue(param.default_value)}`;
   return `Enter ${param.key}...`;
 }
 

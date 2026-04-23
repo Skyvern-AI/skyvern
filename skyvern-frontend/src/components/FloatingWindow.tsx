@@ -6,8 +6,7 @@
  * and `re-resizable`; but I don't want to do that until it's worth the effort.)
  */
 
-import { OpenInNewWindowIcon } from "@radix-ui/react-icons";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { OpenInNewWindowIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { Resizable } from "re-resizable";
 import {
   useCallback,
@@ -566,7 +565,7 @@ function FloatingWindow({
         onStart={() => setIsDragging(true)}
         onDrag={(_, data) => onDrag(data)}
         onStop={() => setIsDragging(false)}
-        bounds={bounded ?? true ? "parent" : undefined}
+        bounds={(bounded ?? true) ? "parent" : undefined}
         disabled={isResizing}
       >
         <Resizable

@@ -23,6 +23,14 @@ LOG = structlog.get_logger()
 AUTHENTICATION_TTL = 60 * 60  # one hour
 CACHE_SIZE = 128
 ALGORITHM = "HS256"
+_SAFE_JWT_ERROR_REASONS = {
+    "Not enough segments",
+    "Invalid payload padding",
+    "Invalid header padding",
+    "Invalid crypto padding",
+    "Signature verification failed",
+    "Invalid header string: must be a json object",
+}
 
 
 @dataclass
@@ -30,6 +38,110 @@ class ApiKeyValidationResult:
     organization: Organization
     payload: TokenPayload
     token: OrganizationAuthToken
+
+
+def _normalize_api_key_with_flags(raw_api_key: str) -> tuple[str, dict[str, bool]]:
+    normalized = raw_api_key
+    flags = {
+        "api_key_had_whitespace_padding": False,
+        "api_key_had_bearer_prefix": False,
+        "api_key_had_outer_quotes": False,
+    }
+
+    def _strip_and_track(value: str) -> str:
+        stripped = value.strip()
+        if stripped != value:
+            flags["api_key_had_whitespace_padding"] = True
+        return stripped
+
+    # At most three wrapper layers matter here: whitespace, Bearer prefix, outer quotes.
+    for _ in range(3):
+        updated = normalized
+
+        updated = _strip_and_track(updated)
+
+        if updated[:7].lower() == "bearer ":
+            flags["api_key_had_bearer_prefix"] = True
+            updated = _strip_and_track(updated[7:])
+
+        if len(updated) >= 2 and updated[0] == updated[-1] and updated[0] in {"'", '"'}:
+            flags["api_key_had_outer_quotes"] = True
+            updated = _strip_and_track(updated[1:-1])
+
+        if updated == normalized:
+            break
+        normalized = updated
+
+    return normalized, flags
+
+
+def _get_api_key_debug_fields(
+    raw_api_key: str | None, normalized_api_key: str | None, flags: dict[str, bool] | None
+) -> dict[str, bool | int | str | None]:
+    if raw_api_key is None or normalized_api_key is None or flags is None:
+        return {
+            "api_key_original_length": None,
+            "api_key_normalized_length": None,
+            "api_key_raw_segment_count": None,
+            "api_key_normalized_segment_count": None,
+            "api_key_had_whitespace_padding": None,
+            "api_key_had_bearer_prefix": None,
+            "api_key_had_outer_quotes": None,
+            "api_key_was_normalized": None,
+            "normalized_api_key_decodes": None,
+            "normalized_api_key_would_be_expired": None,
+            "normalized_api_key_error_type": None,
+            "normalized_api_key_error_reason": None,
+        }
+
+    debug_fields: dict[str, bool | int | str | None] = {
+        "api_key_original_length": len(raw_api_key),
+        "api_key_normalized_length": len(normalized_api_key),
+        "api_key_raw_segment_count": raw_api_key.count(".") + 1 if raw_api_key else 0,
+        "api_key_normalized_segment_count": normalized_api_key.count(".") + 1 if normalized_api_key else 0,
+        "api_key_had_whitespace_padding": flags["api_key_had_whitespace_padding"],
+        "api_key_had_bearer_prefix": flags["api_key_had_bearer_prefix"],
+        "api_key_had_outer_quotes": flags["api_key_had_outer_quotes"],
+        "api_key_was_normalized": normalized_api_key != raw_api_key,
+        "normalized_api_key_decodes": None,
+        "normalized_api_key_would_be_expired": None,
+        "normalized_api_key_error_type": None,
+        "normalized_api_key_error_reason": None,
+    }
+    if not normalized_api_key or normalized_api_key == raw_api_key:
+        return debug_fields
+
+    try:
+        payload = jwt.decode(
+            normalized_api_key,
+            settings.SECRET_KEY,
+            algorithms=[ALGORITHM],
+            # Diagnostic only: determine whether the token shape is valid regardless of expiry.
+            options={"verify_exp": False},
+        )
+        api_key_data = TokenPayload(**payload)
+        debug_fields["normalized_api_key_decodes"] = True
+        debug_fields["normalized_api_key_would_be_expired"] = api_key_data.exp < time.time()
+    # Diagnostic code should never change the main 403 path.
+    except Exception as exc:
+        debug_fields["normalized_api_key_decodes"] = False
+        debug_fields["normalized_api_key_error_type"] = type(exc).__name__
+        debug_fields["normalized_api_key_error_reason"] = _get_safe_auth_error_reason(exc)
+
+    return debug_fields
+
+
+def _get_safe_auth_error_reason(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        locations = [tuple(error["loc"]) for error in exc.errors()]
+        return f"{exc.error_count()} validation error(s): {locations}"
+
+    if isinstance(exc, PyJWTError):
+        message = str(exc)
+        if message in _SAFE_JWT_ERROR_REASONS:
+            return message
+
+    return type(exc).__name__
 
 
 async def get_current_org(
@@ -199,8 +311,25 @@ async def resolve_org_from_api_key(
             options={"verify_exp": False},
         )
         api_key_data = TokenPayload(**payload)
-    except (PyJWTError, ValidationError):
-        LOG.error("Error decoding JWT", exc_info=True)
+    except (PyJWTError, ValidationError) as exc:
+        try:
+            if x_api_key is None:
+                normalized_api_key = None
+                normalization_flags = None
+            else:
+                normalized_api_key, normalization_flags = _normalize_api_key_with_flags(x_api_key)
+            api_key_debug_fields = _get_api_key_debug_fields(x_api_key, normalized_api_key, normalization_flags)
+            LOG.error(
+                "Error decoding JWT",
+                error_type=type(exc).__name__,
+                error_reason=_get_safe_auth_error_reason(exc),
+                **api_key_debug_fields,
+            )
+        except Exception as diagnostic_exc:
+            LOG.warning(
+                "Diagnostic helper failed during JWT error logging",
+                diagnostic_error_type=type(diagnostic_exc).__name__,
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Could not validate credentials",

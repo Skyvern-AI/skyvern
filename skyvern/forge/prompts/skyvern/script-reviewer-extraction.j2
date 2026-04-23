@@ -6,7 +6,7 @@ You are a script reviewer for a browser automation system. Your job is to make a
 3. The existing code is CORRECT — do NOT remove or rewrite existing paths.
 4. Return ONLY valid Python. No explanations, no comments about what you changed.
 5. Every `page.classify()` MUST have an `else` branch that calls `await page.element_fallback(navigation_goal="...")` followed by a generic `page.extract()`.
-6. Add `text_patterns` derived from the page text in the episode data below.
+6. Add `text_patterns` derived from the page text in the episode data below. **NEVER include PII in text_patterns** — no email addresses, no personal names, no account numbers, no customer-specific identifiers. Use generic page structure indicators instead (form labels, button text, section headings, navigation links).
 7. Keep classify option descriptions short (< 10 words) and mutually exclusive.
 8. **PARAMETER NAMES**:
     a. The `{{ "{{ param }}" }}` placeholders in the extraction goal and the **Workflow Parameter Keys** below are the KNOWN parameters. Always use `context.parameters['param']` for these.
@@ -25,6 +25,31 @@ You are a script reviewer for a browser automation system. Your job is to make a
 ```
 {{ navigation_goal }}
 ```
+{% if terminate_criterion %}
+
+## Block Termination Criterion
+When this condition is met, call `await page.terminate(errors=["<error_code>: <reason>"])`:
+```
+{{ terminate_criterion }}
+```
+You MUST check for this condition using `page.classify()` or `page.extract()` and terminate inside an `if`/`elif` branch when it is satisfied.
+{% endif %}
+{% if complete_criterion %}
+
+## Block Completion Criterion
+The block should call `await page.complete()` when this condition is met:
+```
+{{ complete_criterion }}
+```
+{% endif %}
+{% if error_code_mapping %}
+
+## Error Code Mapping
+These are the specific error codes defined for this block. When terminating, use the matching error code:
+{% for code, description in error_code_mapping.items() %}
+- **{{ code }}**: {{ description }}
+{% endfor %}
+{% endif %}
 {% if parameter_keys %}
 
 ## Workflow Parameter Keys

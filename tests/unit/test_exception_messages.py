@@ -67,3 +67,45 @@ def test_non_browser_error_not_intercepted() -> None:
     """Regular errors should still pass through as-is."""
     message = get_user_facing_exception_message(ValueError("some other error"))
     assert message == "Unexpected error: some other error"
+
+
+def test_unknown_error_display_server_missing_xserver() -> None:
+    inner_exception = Exception(
+        "BrowserType.launch_persistent_context: Target page, context or browser has been closed\n\n"
+        "Browser logs:\n"
+        "Looks like you launched a headed browser without having a XServer running.\n"
+        "[err] Missing X server or $DISPLAY\n"
+        "[err] ui/aura/env.cc: The platform failed to initialize. Exiting."
+    )
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
+    message = str(error)
+    assert "browser display/graphics stack" in message
+    assert "browser-environment issue" in message
+    assert "support@skyvern.com" in message
+
+
+def test_unknown_error_display_server_platform_failed() -> None:
+    inner_exception = Exception("[err] ui/aura/env.cc: The platform failed to initialize. Exiting.")
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
+    message = str(error)
+    assert "browser display/graphics stack" in message
+
+
+def test_unknown_error_display_server_egl_failure() -> None:
+    inner_exception = Exception(
+        "[err] [297028:297028:0407/015340.854525:ERROR:ui/gl/gl_surface_egl.cc:1013] "
+        "No suitable EGL configs found for initialization.\n"
+        "[err] [297028:297028:0407/015340.854713:ERROR:gpu/ipc/service/gpu_init.cc:118] "
+        "CollectGraphicsInfo failed."
+    )
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
+    message = str(error)
+    assert "browser display/graphics stack" in message
+    assert "browser profile problem" in message
+
+
+def test_unknown_error_display_server_no_display() -> None:
+    inner_exception = Exception("No display environment variable set")
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
+    message = str(error)
+    assert "browser display/graphics stack" in message

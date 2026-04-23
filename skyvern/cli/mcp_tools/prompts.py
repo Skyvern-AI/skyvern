@@ -496,10 +496,12 @@ def extract_data(
 # qa_test
 # ---------------------------------------------------------------------------
 
-# NOTE: This content is maintained in three places — keep all in sync:
+# NOTE: The local/stdio QA workflow is maintained in three places — keep all in sync:
 # 1. skyvern/cli/skills/qa/SKILL.md         (bundled with pip package — canonical)
 # 2. .claude/skills/qa/SKILL.md              (project-local copy for this repo)
 # 3. skyvern/cli/mcp_tools/prompts.py        (QA_TEST_CONTENT — this file)
+# The MCP prompt renderer adds a stateless-HTTP variant at runtime for remote
+# connectors, because those clients cannot assume local shell/filesystem/gh access.
 QA_TEST_CONTENT = """\
 # QA — Validate Frontend and Backend Changes
 
@@ -952,6 +954,148 @@ The primary mode is still **diff-driven**. Always try to understand the code cha
 """
 
 
+QA_TEST_STATELESS_HTTP_CONTENT = """\
+# QA — Validate Frontend and Backend Changes
+
+Validate the changed behavior with the right tools, but do not assume local shell, git,
+filesystem, or `gh` access in this transport mode.
+
+Use the available context in this order:
+1. A provided PR URL, diff, or changed-file list
+2. The `url` / `context` arguments passed into this prompt
+3. The behavior the user explicitly asks you to validate
+
+If you do not have enough context to identify the changed behavior, ask the user for the PR URL,
+diff, or exact area to validate before proceeding.
+
+---
+
+## Step 1: Understand the Changes
+
+### Use supplied change context
+
+- Review the provided PR, diff, changed-file list, or pasted code snippets
+- Read any repository files or docs only if they are already available through the active tools/resources
+- Do NOT instruct the model to read local files like `README`, `AGENTS.md`, `CLAUDE.md`, `package.json`,
+  or `pyproject.toml` unless those contents were explicitly provided
+
+Classify the work:
+
+| Mode | Trigger | Primary validation |
+|------|---------|--------------------|
+| Frontend/browser | UI/routes/components/styles changed | Browser QA against a reachable URL |
+| Backend API | Route handlers, schemas, or externally visible API behavior changed | Targeted HTTP/API validation against a reachable URL |
+| Backend-internal | Services/workers/business logic changed without public API surface changes | Repo-native checks only if the host already provides repo execution capability; otherwise report the blocker |
+| Mixed | Frontend/browser and backend changed together | Backend validation first, then frontend/browser QA |
+
+If the backend contract is broken, frontend results are not trustworthy.
+
+---
+
+## Step 2: Choose the Validation Strategy
+
+### Frontend/browser mode
+
+- Validate the specific UI changes plus 1-2 nearby regressions
+- Prefer publicly reachable URLs or a URL explicitly provided by the user
+- If the only target is `localhost` and no tunnel/CDP endpoint is available, say that clearly and stop instead of pretending coverage
+
+### Backend API mode
+
+- Validate the changed endpoint(s) against a reachable base URL
+- Check happy path, invalid input, and a representative edge case where relevant
+- Capture status codes and response snippets as evidence
+
+### Backend-internal mode
+
+- If no repo execution surface is available in this transport, report that backend-internal validation is blocked on missing local execution context
+- Do not invent random API/browser checks as a substitute for real backend-internal verification
+
+### Mixed mode
+
+- Validate the backend contract first
+- Then validate the frontend flow that depends on it
+
+---
+
+## Step 3A: Frontend/Browser QA
+
+- Use browser automation against the provided URL
+- Prefer deterministic assertions with `skyvern_evaluate`
+- Use `skyvern_act` only when a real interaction is required
+- Capture a screenshot when visual evidence matters
+
+Example checks:
+- element exists
+- page text changed as expected
+- button interaction succeeds
+- no obvious UI error or blank page
+
+---
+
+## Step 3B: Backend API QA
+
+- Use the documented auth scheme and reachable API base URL if it was provided
+- If auth is required and credentials are unavailable, report the blocker clearly
+- Capture:
+  - request being tested
+  - status code
+  - response body snippet or parsed result
+  - whether the changed behavior is present
+
+---
+
+## Step 4: Report Results
+
+Report inline with evidence:
+
+```markdown
+## QA Report
+
+### Validation Mode
+- Mode: Backend API
+- Scope: changed endpoint / UI flow
+
+### Results
+| # | Test | Result | Evidence |
+|---|------|--------|----------|
+| 1 | Example check | PASS | status code / screenshot / assertion |
+
+### Issues Found
+1. Describe any regressions or blockers clearly.
+
+### Verdict
+Summarize pass/fail and any coverage gaps.
+```
+
+Use the evidence that actually matters:
+- screenshots for frontend/browser results
+- status codes and response snippets for backend API results
+- explicit blocker notes when local execution context is unavailable
+
+---
+
+## Step 5: Remote / Stateless Constraints
+
+- Do NOT assume `git diff`, local shell commands, or writing a local report file
+- Do NOT assume PR-comment posting via a local CLI is available
+- Do NOT claim backend-internal verification if you only exercised browser/API surfaces
+- If more context is required, ask for the PR URL, diff, or a reachable target URL
+
+---
+
+## Fallback: Explore Mode
+
+If there is no useful diff:
+1. Ask what behavior should be validated
+2. Use browser QA for frontend flows
+3. Use targeted API checks for backend flows
+4. Report findings inline with the same evidence standard
+
+The primary mode is still **diff-driven**. Always try to understand the code changes first.
+"""
+
+
 def qa_test(
     url: Annotated[
         str,
@@ -969,7 +1113,11 @@ def qa_test(
     Frontend checks use Skyvern browser tools; backend validation uses repo-native startup,
     HTTP requests, and targeted tests where appropriate.
     """
-    parts = [QA_TEST_CONTENT]
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    prompt_content = QA_TEST_STATELESS_HTTP_CONTENT if is_stateless_http_mode() else QA_TEST_CONTENT
+
+    parts = [prompt_content]
     if url or context:
         parts.append("\n---\n")
     if url:

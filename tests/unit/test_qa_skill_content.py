@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from skyvern.cli.core.session_manager import set_stateless_http_mode
 from skyvern.cli.mcp_tools.prompts import QA_TEST_CONTENT, qa_test
 from tests.unit.skill_test_helpers import first_nonempty_line_after_h1
 
@@ -81,6 +82,20 @@ def test_qa_test_prompt_includes_target_url_and_focus_area() -> None:
     assert "Target URL: `http://localhost:8000`" in rendered
     assert "Focus area: validate the workflow filters API" in rendered
     assert "choose the correct validation mode" in rendered
+
+
+def test_qa_test_prompt_stateless_http_omits_local_shell_and_filesystem_steps() -> None:
+    set_stateless_http_mode(True)
+    try:
+        rendered = qa_test()
+    finally:
+        set_stateless_http_mode(False)
+
+    assert ".qa/latest-report.md" not in rendered
+    assert "gh pr comment" not in rendered
+    assert "git diff --name-only HEAD~1" not in rendered
+    assert "local shell, git,\nfilesystem, or `gh` access" in rendered
+    assert "writing a local report file" in rendered
 
 
 def test_qa_pr_evidence_markers_present() -> None:

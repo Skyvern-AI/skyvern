@@ -250,6 +250,8 @@ async def replay_run_webhook(
         url=validated_url,
         payload=signed_data.signed_payload,
         headers=signed_data.headers,
+        organization_id=organization_id,
+        run_id=run_id,
     )
 
     return RunWebhookReplayResponse(
@@ -267,13 +269,13 @@ async def replay_run_webhook(
 
 
 async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookPayload:
-    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         # Attempt to resolve task v2 runs that may not yet be in the runs table.
-        task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(run_id, organization_id=organization_id)
         if task_v2:
             return await _build_task_v2_payload(task_v2)
-        workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=run_id,
             organization_id=organization_id,
         )
@@ -300,7 +302,7 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
             run_type_str=run_type,
         )
     if run.task_run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             raise SkyvernHTTPException(
                 f"Task v2 run {run_id} missing task record",
@@ -314,7 +316,7 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
 
 
 async def _build_task_payload(organization_id: str, run_id: str, run_type_str: str) -> _WebhookPayload:
-    task: Task | None = await app.DATABASE.get_task(run_id, organization_id=organization_id)
+    task: Task | None = await app.DATABASE.tasks.get_task(run_id, organization_id=organization_id)
     if not task:
         raise TaskNotFound(task_id=run_id)
     if not task.status.is_final():
@@ -324,7 +326,7 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
             status=task.status,
         )
         raise WebhookReplayError(f"Run {run_id} has not reached a terminal state (status={task.status}).")
-    latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
+    latest_step = await app.DATABASE.tasks.get_latest_step(run_id, organization_id=organization_id)
     task_response = await app.agent.build_task_response(task=task, last_step=latest_step)
 
     payload_dict = json.loads(task_response.model_dump_json(exclude={"request"}))
@@ -382,7 +384,7 @@ async def _build_workflow_payload(
     organization_id: str,
     workflow_run_id: str,
 ) -> _WebhookPayload:
-    workflow_run: WorkflowRun | None = await app.DATABASE.get_workflow_run(
+    workflow_run: WorkflowRun | None = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
@@ -465,7 +467,11 @@ async def _get_api_key(organization_id: str) -> str:
 
 
 async def _deliver_webhook(
-    url: str, payload: str, headers: dict[str, str]
+    url: str,
+    payload: str,
+    headers: dict[str, str],
+    organization_id: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[int | None, int, str | None, str | None]:
     start = perf_counter()
     status_code: int | None = None
@@ -473,8 +479,14 @@ async def _deliver_webhook(
     error: str | None = None
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, content=payload, headers=headers, timeout=httpx.Timeout(60.0))
+        response = await app.AGENT_FUNCTION.deliver_webhook(
+            url=url,
+            payload=payload,
+            headers=headers,
+            timeout_seconds=60.0,
+            organization_id=organization_id,
+            run_id=run_id,
+        )
         status_code = response.status_code
         body_text = response.text or ""
         if len(body_text) > RESPONSE_BODY_TRUNCATION_LIMIT:
@@ -504,6 +516,7 @@ def _as_run_type_str(run_type: RunType | str | None) -> str:
 
 
 def _validate_target_url(url: str) -> str:
+    url = url.strip()
     try:
         validated_url = validate_url(url)
         if not validated_url:

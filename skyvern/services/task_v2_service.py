@@ -1,9 +1,9 @@
+import copy
 import json
 import string
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import structlog
 from opentelemetry import trace as otel_trace
 from sqlalchemy.exc import OperationalError
@@ -119,14 +119,14 @@ async def _summarize_max_steps_failure_reason(
 
         screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=str(task_v2.url), draw_boxes=False)
 
-        run_blocks = await app.DATABASE.get_workflow_run_blocks(
+        run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
             workflow_run_id=task_v2.workflow_run_id,
             organization_id=organization_id,
         )
 
         history = [f"{idx + 1}. {block.description} -- {block.status}" for idx, block in enumerate(run_blocks[::-1])]
 
-        thought = await app.DATABASE.create_thought(
+        thought = await app.DATABASE.observer.create_thought(
             task_v2_id=task_v2.observer_cruise_id,
             organization_id=task_v2.organization_id,
             workflow_run_id=task_v2.workflow_run_id,
@@ -197,7 +197,7 @@ async def _handle_task_v2_termination(
     )
 
     # Create a dedicated termination thought for UI visibility
-    termination_thought = await app.DATABASE.create_thought(
+    termination_thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
         workflow_run_id=workflow_run_id,
@@ -216,7 +216,7 @@ async def _handle_task_v2_termination(
     if source:
         output["source"] = source
 
-    await app.DATABASE.update_thought(
+    await app.DATABASE.observer.update_thought(
         thought_id=termination_thought.observer_thought_id,
         organization_id=organization_id,
         output=output,
@@ -265,7 +265,7 @@ async def initialize_task_v2(
     browser_address: str | None = None,
     run_with: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.create_task_v2(
+    task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
         url=user_url if user_url else None,
         organization_id=organization.organization_id,
@@ -329,7 +329,7 @@ async def initialize_task_v2(
 
     # update observer cruise
     try:
-        task_v2 = await app.DATABASE.update_task_v2(
+        task_v2 = await app.DATABASE.observer.update_task_v2(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=new_workflow.workflow_id,
@@ -337,7 +337,7 @@ async def initialize_task_v2(
             organization_id=organization.organization_id,
         )
         if create_task_run:
-            await app.DATABASE.create_task_run(
+            await app.DATABASE.tasks.create_task_run(
                 task_run_type=RunType.task_v2,
                 organization_id=organization.organization_id,
                 run_id=task_v2.observer_cruise_id,
@@ -369,7 +369,7 @@ async def initialize_task_v2_metadata(
     current_browser_url: str | None,
     user_url: str | None,
 ) -> TaskV2:
-    thought = await app.DATABASE.create_thought(
+    thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=organization.organization_id,
         thought_type=ThoughtType.metadata,
@@ -403,7 +403,7 @@ async def initialize_task_v2_metadata(
         raise UrlGenerationFailure()
 
     try:
-        await app.DATABASE.update_thought(
+        await app.DATABASE.observer.update_thought(
             thought_id=thought.observer_thought_id,
             organization_id=organization.organization_id,
             workflow_run_id=workflow_run.workflow_run_id,
@@ -422,7 +422,7 @@ async def initialize_task_v2_metadata(
             organization_id=organization.organization_id,
             title=metadata.workflow_title,
         )
-        task_v2 = await app.DATABASE.update_task_v2(
+        task_v2 = await app.DATABASE.observer.update_task_v2(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=workflow.workflow_id,
@@ -430,11 +430,11 @@ async def initialize_task_v2_metadata(
             url=metadata.url,
             organization_id=organization.organization_id,
         )
-        task_run = await app.DATABASE.get_run(
+        task_run = await app.DATABASE.tasks.get_run(
             run_id=task_v2.observer_cruise_id, organization_id=organization.organization_id
         )
         if task_run:
-            await app.DATABASE.update_task_run(
+            await app.DATABASE.tasks.update_task_run(
                 organization_id=organization.organization_id,
                 run_id=task_v2.observer_cruise_id,
                 title=metadata.workflow_title,
@@ -455,7 +455,7 @@ async def initialize_task_v2_metadata(
     return task_v2
 
 
-@traced()
+@traced(name="skyvern.task_v2.run")
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
@@ -465,7 +465,7 @@ async def run_task_v2(
 ) -> TaskV2:
     organization_id = organization.organization_id
     try:
-        task_v2 = await app.DATABASE.get_task_v2(task_v2_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
     except Exception:
         LOG.error(
             "Failed to get task v2",
@@ -483,59 +483,73 @@ async def run_task_v2(
         raise TaskV2NotFound(task_v2_id=task_v2_id)
 
     workflow, workflow_run = None, None
-    try:
-        workflow, workflow_run, task_v2 = await run_task_v2_helper(
-            organization=organization,
-            task_v2=task_v2,
-            request_id=request_id,
-            max_steps_override=max_steps_override,
-            browser_session_id=browser_session_id,
-        )
-    except TaskTerminationError as e:
-        task_v2 = await mark_task_v2_as_terminated(
-            task_v2_id=task_v2_id,
-            workflow_run_id=task_v2.workflow_run_id,
-            organization_id=organization_id,
-            failure_reason=e.message,
-        )
-        LOG.info("Task v2 is terminated", task_v2_id=task_v2_id, failure_reason=e.message)
-        return task_v2
-    except OperationalError:
-        LOG.error("Database error when running task v2", exc_info=True)
-        task_v2 = await mark_task_v2_as_failed(
-            task_v2_id,
-            workflow_run_id=task_v2.workflow_run_id,
-            failure_reason="Database error when running task 2.0",
-            organization_id=organization_id,
-        )
-    except Exception as e:
-        LOG.error("Failed to run task v2", exc_info=True)
-        failure_reason = f"Failed to run task 2.0: {str(e)}"
-        task_v2 = await mark_task_v2_as_failed(
-            task_v2_id,
-            workflow_run_id=task_v2.workflow_run_id,
-            failure_reason=failure_reason,
-            organization_id=organization_id,
-        )
-    finally:
-        if task_v2.workflow_id and not workflow:
-            workflow = await app.WORKFLOW_SERVICE.get_workflow(task_v2.workflow_id, organization_id=organization_id)
-        if task_v2.workflow_run_id and not workflow_run:
-            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-                task_v2.workflow_run_id, organization_id=organization_id
-            )
-        if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
-            await app.WORKFLOW_SERVICE.clean_up_workflow(
-                workflow=workflow,
-                workflow_run=workflow_run,
+    parent_context = skyvern_context.current()
+    current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
+    context = SkyvernContext(
+        organization_id=organization_id,
+        organization_name=organization.organization_name,
+        root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+        task_v2_id=task_v2_id,
+        run_id=current_run_id,
+        request_id=request_id,
+        browser_session_id=browser_session_id,
+        loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
+    )
+    # SKY-7005: scoped() restores the parent context on exit, preserving
+    # loop_internal_state so per-iteration download filtering continues to
+    # work for subsequent blocks in the same loop iteration.
+    with skyvern_context.scoped(context):
+        try:
+            workflow, workflow_run, task_v2 = await run_task_v2_helper(
+                organization=organization,
+                task_v2=task_v2,
+                request_id=request_id,
+                max_steps_override=max_steps_override,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
-                need_call_webhook=False,
             )
-        else:
-            LOG.warning("Workflow or workflow run not found")
-
-        skyvern_context.reset()
+        except TaskTerminationError as e:
+            task_v2 = await mark_task_v2_as_terminated(
+                task_v2_id=task_v2_id,
+                workflow_run_id=task_v2.workflow_run_id,
+                organization_id=organization_id,
+                failure_reason=e.message,
+            )
+            LOG.info("Task v2 is terminated", task_v2_id=task_v2_id, failure_reason=e.message)
+            return task_v2
+        except OperationalError:
+            LOG.error("Database error when running task v2", exc_info=True)
+            task_v2 = await mark_task_v2_as_failed(
+                task_v2_id,
+                workflow_run_id=task_v2.workflow_run_id,
+                failure_reason="Database error when running task 2.0",
+                organization_id=organization_id,
+            )
+        except Exception as e:
+            LOG.error("Failed to run task v2", exc_info=True)
+            failure_reason = f"Failed to run task 2.0: {str(e)}"
+            task_v2 = await mark_task_v2_as_failed(
+                task_v2_id,
+                workflow_run_id=task_v2.workflow_run_id,
+                failure_reason=failure_reason,
+                organization_id=organization_id,
+            )
+        finally:
+            if task_v2.workflow_id and not workflow:
+                workflow = await app.WORKFLOW_SERVICE.get_workflow(task_v2.workflow_id, organization_id=organization_id)
+            if task_v2.workflow_run_id and not workflow_run:
+                workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                    task_v2.workflow_run_id, organization_id=organization_id
+                )
+            if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
+                await app.WORKFLOW_SERVICE.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
+                    need_call_webhook=False,
+                )
+            else:
+                LOG.warning("Workflow or workflow run not found")
 
     return task_v2
 
@@ -619,31 +633,32 @@ async def run_task_v2_helper(
 
     ###################### run task v2 ######################
 
-    context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+    # NOTE: run_task_v2 pushes a partial SkyvernContext via scoped() before
+    # calling this function. We enrich it here with workflow-level fields
+    # that are only available after the DB lookups above. This function
+    # MUST be called inside run_task_v2's scoped() block.
+    context = skyvern_context.ensure_context()
     current_run_id = context.run_id if context and context.run_id else task_v2_id
     # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
     root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
+    context.organization_id = organization_id
+    context.workflow_id = workflow_id
+    context.workflow_permanent_id = workflow.workflow_permanent_id
+    context.workflow_run_id = workflow_run_id
+    context.root_workflow_run_id = root_workflow_run_id
+    context.request_id = request_id
+    context.task_v2_id = task_v2_id
+    context.run_id = current_run_id
+    context.browser_session_id = browser_session_id
+    context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
     enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
         current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},
     )
-    skyvern_context.set(
-        SkyvernContext(
-            organization_id=organization_id,
-            workflow_id=workflow_id,
-            workflow_run_id=workflow_run_id,
-            root_workflow_run_id=root_workflow_run_id,
-            request_id=request_id,
-            task_v2_id=task_v2_id,
-            run_id=current_run_id,
-            browser_session_id=browser_session_id,
-            max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
-            enable_parse_select_in_extract=bool(enable_parse_select_in_extract),
-        )
-    )
+    context.enable_parse_select_in_extract = bool(enable_parse_select_in_extract)
 
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -802,7 +817,7 @@ async def run_task_v2_helper(
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
             )
-            thought = await app.DATABASE.create_thought(
+            thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run.workflow_run_id,
@@ -837,7 +852,7 @@ async def run_task_v2_helper(
             plan = task_v2_response.get("plan", "")
             task_type = task_v2_response.get("task_type", "")
             # Create and save task thought
-            await app.DATABASE.update_thought(
+            await app.DATABASE.observer.update_thought(
                 thought_id=thought.observer_thought_id,
                 organization_id=organization_id,
                 thought=thoughts,
@@ -1055,7 +1070,7 @@ async def run_task_v2_helper(
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
             )
-            thought = await app.DATABASE.create_thought(
+            thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
@@ -1082,7 +1097,7 @@ async def run_task_v2_helper(
             termination_reason = completion_resp.get("termination_reason")
             completion_failure_categories = completion_resp.get("failure_categories")
             thought_content = completion_resp.get("thoughts", "")
-            await app.DATABASE.update_thought(
+            await app.DATABASE.observer.update_thought(
                 thought_id=thought.observer_thought_id,
                 organization_id=organization_id,
                 thought=thought_content,
@@ -1128,8 +1143,8 @@ async def run_task_v2_helper(
                 return workflow, workflow_run, task_v2
 
         # total step number validation
-        workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
-        total_step_count = await app.DATABASE.get_total_unique_step_order_count_by_task_ids(
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+        total_step_count = await app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids(
             task_ids=[task.task_id for task in workflow_run_tasks],
             organization_id=organization_id,
         )
@@ -1314,7 +1329,7 @@ async def _generate_loop_task(
         plan=plan,
     )
     data_extraction_thought = f"Going to generate a list of values to go through based on the plan: {plan}."
-    thought = await app.DATABASE.create_thought(
+    thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=task_v2.organization_id,
         workflow_run_id=workflow_run_id,
@@ -1383,7 +1398,7 @@ async def _generate_loop_task(
         raise
 
     # update the thought
-    await app.DATABASE.update_thought(
+    await app.DATABASE.observer.update_thought(
         thought_id=thought.observer_thought_id,
         organization_id=task_v2.organization_id,
         output=output_value_obj,
@@ -1441,7 +1456,7 @@ async def _generate_loop_task(
         is_link=is_loop_value_link,
         loop_values=loop_values,
     )
-    thought_task_in_loop = await app.DATABASE.create_thought(
+    thought_task_in_loop = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=task_v2.organization_id,
         workflow_run_id=workflow_run_id,
@@ -1461,7 +1476,7 @@ async def _generate_loop_task(
     data_extraction_goal = task_in_loop_metadata_response.get("data_extraction_goal")
     data_extraction_schema = task_in_loop_metadata_response.get("data_schema")
     thought_content = task_in_loop_metadata_response.get("thoughts")
-    await app.DATABASE.update_thought(
+    await app.DATABASE.observer.update_thought(
         thought_id=thought_task_in_loop.observer_thought_id,
         organization_id=task_v2.organization_id,
         thought=thought_content,
@@ -1675,7 +1690,7 @@ async def _generate_goto_url_task(
 
 
 async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
-    thoughts = await app.DATABASE.get_thoughts(
+    thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
         thought_types=[
@@ -1695,7 +1710,7 @@ async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> lis
 
 
 async def get_task_v2(task_v2_id: str, organization_id: str | None = None) -> TaskV2 | None:
-    return await app.DATABASE.get_task_v2(task_v2_id, organization_id=organization_id)
+    return await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
 
 
 async def _update_task_v2_status(
@@ -1706,7 +1721,7 @@ async def _update_task_v2_status(
     output: dict[str, Any] | None = None,
     failure_category: list[dict] | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id,
         organization_id=organization_id,
         status=status,
@@ -1939,7 +1954,7 @@ async def _summarize_task_v2(
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
 ) -> TaskV2:
-    thought = await app.DATABASE.create_thought(
+    thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=task_v2.organization_id,
         workflow_run_id=task_v2.workflow_run_id,
@@ -1966,7 +1981,7 @@ async def _summarize_task_v2(
 
     summary_description = task_v2_summary_resp.get("description")
     summarized_output = task_v2_summary_resp.get("output")
-    await app.DATABASE.update_thought(
+    await app.DATABASE.observer.update_thought(
         thought_id=thought.observer_thought_id,
         organization_id=task_v2.organization_id,
         thought=summary_description,
@@ -2037,6 +2052,8 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
 async def send_task_v2_webhook(task_v2: TaskV2) -> None:
     if not task_v2.webhook_callback_url:
         return
+    # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
+    task_v2.webhook_callback_url = task_v2.webhook_callback_url.strip()
     organization_id = task_v2.organization_id
     if not organization_id:
         return
@@ -2067,13 +2084,14 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        timeout = httpx.Timeout(30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                task_v2.webhook_callback_url,
-                data=payload,
-                headers=headers,
-            )
+        resp = await app.AGENT_FUNCTION.deliver_webhook(
+            url=task_v2.webhook_callback_url,
+            payload=payload,
+            headers=headers,
+            timeout_seconds=30.0,
+            organization_id=task_v2.organization_id,
+            run_id=task_v2.observer_cruise_id,
+        )
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",
@@ -2081,7 +2099,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
-            await app.DATABASE.update_task_v2(
+            await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
                 webhook_failure_reason="",
@@ -2094,7 +2112,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
-            await app.DATABASE.update_task_v2(
+            await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
                 webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",

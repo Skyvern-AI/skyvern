@@ -8,6 +8,15 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
 class OrganizationScheduleItem(UniversalBaseModel):
+    """
+    Compact schedule projection for the org-wide list endpoint.
+
+    Intentionally omits `backend_schedule_id` — the list view is for browsing
+    schedules in the dashboard, not for managing the underlying execution-backend
+    binding. Callers that need the backend id should fetch the individual
+    schedule via the per-workflow get endpoint.
+    """
+
     workflow_schedule_id: str
     organization_id: str
     workflow_permanent_id: str

@@ -74,18 +74,46 @@
     return null;
   }
 
+  // Returns true for IDs that are likely stable (meaningful names like
+  // "email", "firstName", "address--city"). Returns false for IDs that
+  // look like session-specific random hashes (e.g., "gf3ag", "_7xK2",
+  // "4a1633a5-e29f-44d6-...") which change every page load.
+  // Validated against production form pages from multiple employer platforms:
+  //   STABLE:    address--city, name--legalName--firstName (semantic, contain --)
+  //   UNSTABLE:  ugy05, ugy0g (short random), 4a1633a5-... (UUID), input-4 (positional)
+  function isStableId(id) {
+    if (!id) return false;
+    // UUIDs
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id)) return false;
+    // Positional IDs: input-4, field-12, element-0, item-3, ctrl00, ctl-5
+    if (/^(input|field|element|item|ctrl|ctl|comp|widget)[-_]?\d+$/i.test(id))
+      return false;
+    // Purely numeric
+    if (/^\d+$/.test(id)) return false;
+    // Short random-looking strings (< 12 chars, no word-like patterns)
+    // Rejects: ugy05, gf3ag, _7xK2. Allows: email, firstName, source--source
+    if (
+      id.length < 12 &&
+      /^[a-zA-Z0-9_-]+$/.test(id) &&
+      !/[a-z]{3,}[A-Z]|[a-z]{3,}$|[A-Z][a-z]{3,}/.test(id)
+    )
+      return false;
+    return true;
+  }
+
   function buildSelector(el, label) {
     const tag = el.tagName.toLowerCase();
     const elType = (el.getAttribute("type") || "").toLowerCase();
     const vis = elType === "file" ? "" : ":visible";
+
+    // 1. name attribute — stable across sessions
     if (el.name) return tag + '[name="' + el.name + '"]' + vis;
-    if (el.id) return "#" + CSS.escape(el.id) + vis;
-    // File inputs with no name/id: no name/id, use data-automation-id or type selector
-    if (elType === "file") {
-      const autoId = el.getAttribute("data-automation-id");
-      if (autoId) return tag + '[data-automation-id="' + autoId + '"]';
-      return 'input[type="file"]';
-    }
+
+    // 2. data-automation-id — stable on platforms that use automation attributes
+    const autoId = el.getAttribute("data-automation-id");
+    if (autoId) return tag + '[data-automation-id="' + autoId + '"]' + vis;
+
+    // 3. Label-based semantic selectors — stable across sessions
     if (label && label.length < 80) {
       const escapedLabel = label
         .replace(/\\/g, "\\\\")
@@ -102,17 +130,31 @@
         return tag + '[aria-label="' + escapedLabel + '"]:visible';
       }
     }
+
+    // 4. ID — only if it looks stable (not a random session hash)
+    if (el.id && isStableId(el.id)) return "#" + CSS.escape(el.id) + vis;
+
+    // 5. File input fallback
+    if (elType === "file") {
+      return 'input[type="file"]';
+    }
+
     return null;
   }
 
   function buildOptionSelector(el) {
-    if (el.id) return "#" + CSS.escape(el.id);
     const tag = el.tagName.toLowerCase();
     const name = el.name;
     const value = el.value;
+    // 1. data-automation-id — stable on platforms that use automation attributes
+    const autoId = el.getAttribute("data-automation-id");
+    if (autoId) return '[data-automation-id="' + autoId + '"]';
+    // 2. name + value — stable form attribute
     if (name && value)
       return tag + '[name="' + name + '"][value="' + value + '"]';
     if (name) return tag + '[name="' + name + '"]';
+    // 3. Stable ID only (skip random session hashes)
+    if (el.id && isStableId(el.id)) return "#" + CSS.escape(el.id);
     // Anonymous <input aria-checked> — find the associated label and
     // build a selector. Structure varies: label may wrap input, be a sibling, or
     // both may be inside a <div role="group">.
@@ -533,9 +575,13 @@
         r.getAttribute("aria-label") || r.textContent.trim() || null;
       const optSelector = r.getAttribute("data-automation-id")
         ? '[data-automation-id="' + r.getAttribute("data-automation-id") + '"]'
-        : r.id
+        : r.id && isStableId(r.id)
           ? "#" + CSS.escape(r.id)
-          : null;
+          : optLabel && optLabel.length < 50
+            ? '[role="radio"][aria-label="' +
+              optLabel.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
+              '"]'
+            : null;
       if (optSelector) {
         options.push({
           label: optLabel,
@@ -596,9 +642,13 @@
           ? '[data-automation-id="' +
             r.getAttribute("data-automation-id") +
             '"]'
-          : r.id
+          : r.id && isStableId(r.id)
             ? "#" + CSS.escape(r.id)
-            : null;
+            : optLabel && optLabel.length < 50
+              ? '[role="radio"][aria-label="' +
+                optLabel.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
+                '"]'
+              : null;
         if (optSelector) {
           options.push({
             label: optLabel,
@@ -628,7 +678,8 @@
   );
   for (const cb of ariaCheckboxes) {
     if (!isVisible(cb)) continue;
-    const cbId = cb.getAttribute("data-automation-id") || cb.id || null;
+    const cbAutoId = cb.getAttribute("data-automation-id");
+    const cbId = cbAutoId || cb.id || null;
     if (!cbId || seen.has("aria_cb_" + cbId)) continue;
     seen.add("aria_cb_" + cbId);
     const label =
@@ -636,11 +687,15 @@
       getLabel(cb) ||
       cb.textContent.trim() ||
       null;
-    const selector = cbId
-      ? '[data-automation-id="' + cbId + '"]'
-      : cb.id
+    const selector = cbAutoId
+      ? '[data-automation-id="' + cbAutoId + '"]'
+      : cb.id && isStableId(cb.id)
         ? "#" + CSS.escape(cb.id)
-        : null;
+        : label && label.length < 80
+          ? '[role="checkbox"][aria-label="' +
+            label.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
+            '"]'
+          : null;
     if (selector) {
       fields.push({
         label: label,

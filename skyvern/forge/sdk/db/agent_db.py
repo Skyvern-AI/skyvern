@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError  # noqa: F401
+from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
 )
+from skyvern.forge.sdk.trace import traced
 
 LOG = structlog.get_logger()
 
@@ -169,9 +171,6 @@ class AgentDB(BaseAlchemyDB):
 
     # ======================================================================
     # Backward-compatible delegate methods
-    # TODO(SKY-62): These delegates erase type information (*args: Any -> Any).
-    # Migrate callers to use typed repository attributes directly
-    # (e.g., db.tasks.get_task(...) instead of db.get_task(...)), then remove.
     # ======================================================================
 
     # -- Task delegates --
@@ -200,6 +199,9 @@ class AgentDB(BaseAlchemyDB):
     async def get_total_unique_step_order_count_by_task_ids(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_total_unique_step_order_count_by_task_ids(*args, **kwargs)
 
+    async def get_workflow_run_progress_timestamps(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.tasks.get_workflow_run_progress_timestamps(*args, **kwargs)
+
     async def get_task_step_models(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_task_step_models(*args, **kwargs)
 
@@ -224,12 +226,14 @@ class AgentDB(BaseAlchemyDB):
     async def get_latest_step(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_latest_step(*args, **kwargs)
 
+    @traced(name="skyvern.db.update_step")
     async def update_step(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.update_step(*args, **kwargs)
 
     async def clear_task_failure_reason(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.clear_task_failure_reason(*args, **kwargs)
 
+    @traced(name="skyvern.db.update_task")
     async def update_task(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.update_task(*args, **kwargs)
 
@@ -399,6 +403,7 @@ class AgentDB(BaseAlchemyDB):
     async def get_task_generation_by_prompt_hash(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_params.get_task_generation_by_prompt_hash(*args, **kwargs)
 
+    @traced(name="skyvern.db.create_action")
     async def create_action(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_params.create_action(*args, **kwargs)
 
@@ -431,9 +436,11 @@ class AgentDB(BaseAlchemyDB):
 
     # -- Artifact delegates --
 
+    @traced(name="skyvern.db.create_artifact")
     async def create_artifact(self, *args: Any, **kwargs: Any) -> Any:
         return await self.artifacts.create_artifact(*args, **kwargs)
 
+    @traced(name="skyvern.db.bulk_create_artifacts")
     async def bulk_create_artifacts(self, *args: Any, **kwargs: Any) -> Any:
         return await self.artifacts.bulk_create_artifacts(*args, **kwargs)
 
@@ -529,17 +536,17 @@ class AgentDB(BaseAlchemyDB):
     async def close_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
         return await self.browser_sessions.close_persistent_browser_session(*args, **kwargs)
 
-    async def get_all_active_persistent_browser_sessions(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_all_active_persistent_browser_sessions(*args, **kwargs)
+    async def get_all_active_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
+        return await self.browser_sessions.get_all_active_persistent_browser_sessions()
 
     async def archive_browser_session_address(self, *args: Any, **kwargs: Any) -> Any:
         return await self.browser_sessions.archive_browser_session_address(*args, **kwargs)
 
-    async def get_uncompleted_persistent_browser_sessions(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_uncompleted_persistent_browser_sessions(*args, **kwargs)
+    async def get_uncompleted_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
+        return await self.browser_sessions.get_uncompleted_persistent_browser_sessions()
 
     async def get_debug_session_by_browser_session_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_debug_session_by_browser_session_id(*args, **kwargs)
+        return await self.debug.get_debug_session_by_browser_session_id(*args, **kwargs)
 
     # -- Schedule delegates --
 
@@ -549,8 +556,8 @@ class AgentDB(BaseAlchemyDB):
     async def create_workflow_schedule_with_limit(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.create_workflow_schedule_with_limit(*args, **kwargs)
 
-    async def set_temporal_schedule_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.schedules.set_temporal_schedule_id(*args, **kwargs)
+    async def set_backend_schedule_id(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.schedules.set_backend_schedule_id(*args, **kwargs)
 
     async def update_workflow_schedule(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.update_workflow_schedule(*args, **kwargs)
@@ -628,6 +635,9 @@ class AgentDB(BaseAlchemyDB):
 
     async def get_script_file_by_path(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.get_script_file_by_path(*args, **kwargs)
+
+    async def get_script_file_by_content_hash(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.scripts.get_script_file_by_content_hash(*args, **kwargs)
 
     async def update_script_file(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.update_script_file(*args, **kwargs)

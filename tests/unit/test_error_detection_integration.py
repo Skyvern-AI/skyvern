@@ -84,7 +84,7 @@ async def test_navigate_failure_with_error_detection(agent, mock_browser_state):
 
             with create_error_detection_mocks(detected_errors):
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     # Simulate FailedToNavigateToUrl scenario
                     from skyvern.exceptions import FailedToNavigateToUrl
@@ -103,8 +103,8 @@ async def test_navigate_failure_with_error_detection(agent, mock_browser_state):
                         assert result is True
 
                         # Verify errors were stored
-                        mock_app.DATABASE.update_task.assert_called_once()
-                        call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                        mock_app.DATABASE.tasks.update_task.assert_called_once()
+                        call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                         assert len(call_kwargs["errors"]) == 1
                         assert call_kwargs["errors"][0]["error_code"] == "page_not_found"
 
@@ -138,9 +138,9 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER.get_for_task.return_value = mock_browser_state
-        mock_app.DATABASE.get_task_steps = AsyncMock(return_value=[step, step, step])
-        mock_app.DATABASE.get_task = AsyncMock(return_value=task)
-        mock_app.DATABASE.update_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[step, step, step])
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
         # create_step is awaited in handle_failed_step retry branch; avoid MagicMock in await
         next_step = make_step(
             now,
@@ -151,9 +151,9 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
             retry_index=step.retry_index + 1,
             output=None,
         )
-        mock_app.DATABASE.create_step = AsyncMock(return_value=next_step)
+        mock_app.DATABASE.tasks.create_step = AsyncMock(return_value=next_step)
 
-        # Async mock that forwards to mock_app.DATABASE.update_task so we never await MagicMock inside real update_task
+        # Async mock that forwards to mock_app.DATABASE.tasks.update_task so we never await MagicMock inside real update_task
         async def mock_update_task(
             _self,
             task,
@@ -173,7 +173,9 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
                 updates["errors"] = errors
             if failure_category is not None:
                 updates["failure_category"] = failure_category
-            return await mock_app.DATABASE.update_task(task.task_id, organization_id=task.organization_id, **updates)
+            return await mock_app.DATABASE.tasks.update_task(
+                task.task_id, organization_id=task.organization_id, **updates
+            )
 
         with patch.object(ForgeAgent, "summary_failure_reason_for_max_retries", mock_summary):
             with patch.object(ForgeAgent, "update_task", mock_update_task):
@@ -182,8 +184,8 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
                 assert result is None  # No next step when max retries exceeded
 
                 # Verify errors include both system and user-defined errors
-                mock_app.DATABASE.update_task.assert_called_once()
-                call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                mock_app.DATABASE.tasks.update_task.assert_called_once()
+                call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
 
                 errors = call_kwargs["errors"]
                 assert len(errors) == 2
@@ -220,7 +222,7 @@ async def test_scraping_failure_with_error_detection(agent, mock_browser_state):
 
             with create_error_detection_mocks(detected_errors):
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     # Simulate ScrapingFailed scenario
                     from skyvern.exceptions import ScrapingFailed
@@ -233,8 +235,8 @@ async def test_scraping_failure_with_error_detection(agent, mock_browser_state):
                         assert result is True
 
                         # Verify errors were stored
-                        mock_app.DATABASE.update_task.assert_called_once()
-                        call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                        mock_app.DATABASE.tasks.update_task.assert_called_once()
+                        call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                         assert len(call_kwargs["errors"]) == 1
                         assert call_kwargs["errors"][0]["error_code"] == "login_required"
 
@@ -268,12 +270,12 @@ async def test_multiple_failures_accumulate_errors(agent, mock_browser_state):
 
             with create_error_detection_mocks(first_detected):
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     await agent.fail_task(task, step, "First failure", mock_browser_state)
 
                     # Only new errors are passed — DB handles appending to existing ones
-                    call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                    call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                     assert len(call_kwargs["errors"]) == 1
                     assert call_kwargs["errors"][0]["error_code"] == "payment_failed"
 
@@ -304,15 +306,15 @@ async def test_error_detection_with_workflow_task(agent, mock_browser_state):
 
             with create_error_detection_mocks(detected_errors):
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     result = await agent.fail_task(task, step, "Workflow task failed", mock_browser_state)
 
                     assert result is True
 
                     # Verify errors were stored for workflow task
-                    mock_app.DATABASE.update_task.assert_called_once()
-                    call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                    mock_app.DATABASE.tasks.update_task.assert_called_once()
+                    call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                     assert call_kwargs["task_id"] == task.task_id
                     # workflow_run_id is not passed in the update call, only task_id and errors
                     assert "workflow_run_id" not in call_kwargs
@@ -350,7 +352,7 @@ async def test_error_detection_performance_doesnt_block_failure(agent, mock_brow
                 mock_detect.side_effect = slow_detection
 
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     import time
 

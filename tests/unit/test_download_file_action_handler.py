@@ -406,7 +406,6 @@ async def test_handle_action_navigates_back_from_blank_page_after_download() -> 
     # Page starts at a real URL; the mocked action will navigate it to about:blank
     page = MagicMock()
     page.url = original_url
-    page.is_closed.return_value = False
 
     browser_state = MagicMock()
     # Same page count before and after (no extra tab opened by the print action)
@@ -445,7 +444,7 @@ async def test_handle_action_navigates_back_from_blank_page_after_download() -> 
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
-        mock_app.DATABASE.create_action = AsyncMock(return_value=action)
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
         mock_app.STORAGE = MagicMock()
 
         with (
@@ -518,7 +517,7 @@ async def test_handle_action_does_not_navigate_back_when_page_url_unchanged() ->
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
-        mock_app.DATABASE.create_action = AsyncMock(return_value=action)
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
         mock_app.STORAGE = MagicMock()
 
         with (

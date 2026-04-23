@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Flippable } from "@/components/Flippable";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
@@ -11,7 +11,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
-import { useState } from "react";
 import { dataSchemaExampleValue } from "../types";
 import type { ExtractionNode } from "./types";
 

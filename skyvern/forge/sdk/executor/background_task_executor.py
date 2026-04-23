@@ -36,14 +36,14 @@ class BackgroundTaskExecutor(AsyncExecutor):
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
-        step = await app.DATABASE.create_step(
+        step = await app.DATABASE.tasks.create_step(
             task_id,
             order=0,
             retry_index=0,
             organization_id=organization_id,
         )
 
-        task = await app.DATABASE.update_task(
+        task = await app.DATABASE.tasks.update_task(
             task_id,
             status=TaskStatus.running,
             organization_id=organization_id,
@@ -51,7 +51,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
 
         close_browser_on_completion = browser_session_id is None and not task.browser_address
 
-        run_obj = await app.DATABASE.get_run(run_id=task_id, organization_id=organization_id)
+        run_obj = await app.DATABASE.tasks.get_run(run_id=task_id, organization_id=organization_id)
         engine = RunEngine.skyvern_v1
         if run_obj and run_obj.task_run_type == RunType.openai_cua:
             engine = RunEngine.openai_cua
@@ -136,17 +136,17 @@ class BackgroundTaskExecutor(AsyncExecutor):
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
-        task_v2 = await app.DATABASE.get_task_v2(task_v2_id=task_v2_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id=task_v2_id, organization_id=organization_id)
         if not task_v2 or not task_v2.workflow_run_id:
             raise ValueError("No task v2 or no workflow run associated with task v2")
 
         # mark task v2 as queued
-        await app.DATABASE.update_task_v2(
+        await app.DATABASE.observer.update_task_v2(
             task_v2_id=task_v2_id,
             status=TaskV2Status.queued,
             organization_id=organization_id,
         )
-        await app.DATABASE.update_workflow_run(
+        await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=task_v2.workflow_run_id,
             status=WorkflowRunStatus.queued,
         )

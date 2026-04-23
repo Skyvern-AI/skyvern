@@ -10,11 +10,12 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 from urllib.parse import urlparse, urlunparse
 
-import toml
+import structlog
 import typer
+import yaml
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
@@ -31,8 +32,15 @@ from .setup_commands import (
     _find_server_key,
     _get_env_credentials,
     _load_mcp_config,
+    _load_openclaw_config,
+    _load_yaml_config,
     _mask_key,
     _mask_secrets,
+    _normalize_openclaw_remote_entry,
+    _openclaw_config_path,
+    _save_yaml_config,
+    _walk_nested_path,
+    _warn_openclaw_json_normalization,
     _windsurf_config_path,
     _write_mcp_config,
 )
@@ -40,13 +48,16 @@ from .setup_commands import (
 mcp_app = typer.Typer(help="Manage local MCP configs and optional saved Skyvern profiles.", no_args_is_help=True)
 profile_app = typer.Typer(help="Manage saved Skyvern MCP profiles.", no_args_is_help=True)
 mcp_app.add_typer(profile_app, name="profile")
+LOG = structlog.get_logger(__name__)
 
 _MANUAL_SOURCE_NAME = "Manual entry"
 _DEFAULT_BASE_URL = "https://api.skyvern.com"
 _PROFILE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _CONFIG_FORMAT_JSON = "json"
+_CONFIG_FORMAT_JSON5 = "json5"
 _CONFIG_FORMAT_CODEX = "codex_toml"
+_CONFIG_FORMAT_YAML = "yaml"
 
 
 @dataclass(frozen=True)
@@ -64,6 +75,7 @@ class SwitchTarget:
     entry: dict | None
     config_format: str = _CONFIG_FORMAT_JSON
     error: str | None = None
+    entry_path: list[str] | None = None
 
 
 @dataclass
@@ -79,6 +91,7 @@ class SwitchTargetSpec:
     name: str
     config_path_fn: Callable[[], Path]
     config_format: str = _CONFIG_FORMAT_JSON
+    entry_path: list[str] | None = None
 
 
 def _sanitize_prompt_response(value: str) -> str:
@@ -254,10 +267,14 @@ def _extract_entry_base_url(entry: dict) -> str:
 
 
 def _server_block_key(config_format: str) -> str:
-    return "mcp_servers" if config_format == _CONFIG_FORMAT_CODEX else "mcpServers"
+    if config_format in (_CONFIG_FORMAT_CODEX, _CONFIG_FORMAT_YAML):
+        return "mcp_servers"
+    return "mcpServers"
 
 
 def _load_codex_config(config_path: Path) -> tuple[dict | None, str | None]:
+    import toml  # noqa: PLC0415
+
     if not config_path.exists():
         return {}, None
 
@@ -279,10 +296,19 @@ def _load_codex_config(config_path: Path) -> tuple[dict | None, str | None]:
 def _load_switch_config(config_path: Path, config_format: str) -> tuple[dict | None, str | None]:
     if config_format == _CONFIG_FORMAT_CODEX:
         return _load_codex_config(config_path)
+    if config_format == _CONFIG_FORMAT_JSON5:
+        return _load_openclaw_config(config_path)
+    if config_format == _CONFIG_FORMAT_YAML:
+        data = _load_yaml_config(config_path)
+        if data is None:
+            return None, f"Cannot parse {config_path}. Fix the YAML and re-run."
+        return data, None
     return _load_mcp_config(config_path)
 
 
 def _write_codex_config(config_path: Path, config: dict, create_backup: bool = True) -> Path | None:
+    import toml  # noqa: PLC0415
+
     backup_path: Path | None = None
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if create_backup and config_path.exists():
@@ -299,18 +325,58 @@ def _write_codex_config(config_path: Path, config: dict, create_backup: bool = T
 def _write_switch_config(config_path: Path, config: dict, config_format: str) -> Path | None:
     if config_format == _CONFIG_FORMAT_CODEX:
         return _write_codex_config(config_path, config, create_backup=True)
+    if config_format == _CONFIG_FORMAT_JSON5:
+        _warn_openclaw_json_normalization(config_path, dry_run=False)
+        return _write_mcp_config(config_path, config, create_backup=True)
+    if config_format == _CONFIG_FORMAT_YAML:
+        backup_path: Path | None = None
+        if config_path.exists():
+            backup_path = _backup_config_path(config_path)
+            shutil.copy2(config_path, backup_path)
+        _save_yaml_config(config_path, config)
+        return backup_path
     return _write_mcp_config(config_path, config, create_backup=True)
 
 
+def _hermes_config_path() -> Path:
+    return Path.home() / ".hermes" / "config.yaml"
+
+
 def _switch_target_specs() -> list[SwitchTargetSpec]:
-    return [
+    specs = [
         SwitchTargetSpec("Claude Code (global)", _claude_code_global_config_path),
         SwitchTargetSpec("Claude Code (project)", _claude_code_project_config_path),
         SwitchTargetSpec("Claude Desktop", _claude_desktop_config_path),
         SwitchTargetSpec("Cursor", _cursor_config_path),
         SwitchTargetSpec("Windsurf", _windsurf_config_path),
         SwitchTargetSpec("Codex", _codex_config_path, config_format=_CONFIG_FORMAT_CODEX),
+        SwitchTargetSpec(
+            "OpenClaw",
+            _openclaw_config_path,
+            config_format=_CONFIG_FORMAT_JSON5,
+            entry_path=["mcp", "servers"],
+        ),
+        SwitchTargetSpec("Hermes", _hermes_config_path, config_format=_CONFIG_FORMAT_YAML),
     ]
+    # Discover per-profile Hermes configs alongside the global one
+    profiles_dir = Path.home() / ".hermes" / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir()):
+            profile_config = profile_dir / "config.yaml"
+            if profile_dir.is_dir() and profile_config.exists():
+                profile_name = profile_dir.name
+
+                def _make_path_fn(p: Path = profile_config) -> Path:
+                    return p
+
+                specs.append(
+                    SwitchTargetSpec(
+                        f"Hermes ({profile_name})",
+                        _make_path_fn,
+                        config_format=_CONFIG_FORMAT_YAML,
+                    )
+                )
+    return specs
 
 
 def _entry_kind(entry: dict | None) -> str:
@@ -495,6 +561,15 @@ def _entry_location(entry: dict) -> str:
     return ""
 
 
+def _nested_mapping_path_exists(config: dict, path: list[str]) -> bool:
+    node: object = config
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return isinstance(node, dict)
+
+
 def _discover_switch_targets() -> tuple[list[SwitchTarget], list[tuple[str, Path]]]:
     discovered: list[SwitchTarget] = []
     missing: list[tuple[str, Path]] = []
@@ -515,13 +590,39 @@ def _discover_switch_targets() -> tuple[list[SwitchTarget], list[tuple[str, Path
                     entry=None,
                     config_format=spec.config_format,
                     error=error,
+                    entry_path=spec.entry_path,
                 )
             )
             continue
 
-        servers = (config or {}).get(_server_block_key(spec.config_format), {})
+        if spec.entry_path:
+            if not _nested_mapping_path_exists(config or {}, spec.entry_path):
+                LOG.warning(
+                    "Nested MCP server path missing in config",
+                    target=spec.name,
+                    config_path=str(path),
+                    entry_path=".".join(spec.entry_path),
+                )
+            servers_result, error = _walk_nested_path(config or {}, spec.entry_path, create=False)
+            if error:
+                discovered.append(
+                    SwitchTarget(
+                        name=spec.name,
+                        config_path=path,
+                        entry_key=None,
+                        entry=None,
+                        config_format=spec.config_format,
+                        error=error,
+                        entry_path=spec.entry_path,
+                    )
+                )
+                continue
+            servers = cast(dict[object, object], servers_result)
+        else:
+            servers = (config or {}).get(_server_block_key(spec.config_format), {})
         server_key = _find_server_key(servers, preferred="skyvern") if isinstance(servers, dict) else None
-        entry = servers.get(server_key) if server_key else None
+        raw_entry = servers.get(server_key) if server_key else None
+        entry = raw_entry if isinstance(raw_entry, dict) else None
         discovered.append(
             SwitchTarget(
                 name=spec.name,
@@ -530,6 +631,7 @@ def _discover_switch_targets() -> tuple[list[SwitchTarget], list[tuple[str, Path
                 entry=entry,
                 config_format=spec.config_format,
                 error=None,
+                entry_path=spec.entry_path,
             )
         )
 
@@ -635,6 +737,8 @@ def _patch_entry_with_profile(
 
     if kind == "remote http":
         target_url = _profile_to_mcp_url(profile.base_url)
+        if config_format == _CONFIG_FORMAT_JSON5:
+            return _normalize_openclaw_remote_entry(patched, api_key=profile.api_key, url=target_url)
         if config_format == _CONFIG_FORMAT_CODEX or "http_headers" in patched:
             headers = dict(patched.get("http_headers") or {})
             headers["x-api-key"] = profile.api_key
@@ -645,7 +749,8 @@ def _patch_entry_with_profile(
         headers = dict(patched.get("headers") or {})
         headers["x-api-key"] = profile.api_key
         patched["headers"] = headers
-        patched["type"] = "http"
+        if config_format != _CONFIG_FORMAT_YAML:
+            patched["type"] = "http"
         patched["url"] = target_url
         return patched
 
@@ -682,12 +787,33 @@ def _patch_entry_with_profile(
     raise ValueError(f"Unsupported Skyvern MCP entry format: {kind}")
 
 
+def _render_entry_preview(target: SwitchTarget, masked: dict) -> dict:
+    if target.entry_key is None:
+        return masked
+    if target.entry_path:
+        preview: dict = {}
+        node = preview
+        for key in target.entry_path:
+            child: dict = {}
+            node[key] = child
+            node = child
+        node[target.entry_key] = masked
+        return preview
+    return {_server_block_key(target.config_format): {target.entry_key: masked}}
+
+
 def _render_patched_entry(target: SwitchTarget, patched: dict) -> Syntax:
+    import toml  # noqa: PLC0415
+
     masked = _mask_secrets(patched)
+    preview = _render_entry_preview(target, masked)
     if target.config_format == _CONFIG_FORMAT_CODEX and target.entry_key:
-        snippet = toml.dumps({_server_block_key(target.config_format): {target.entry_key: masked}})
+        snippet = toml.dumps(preview)
         return Syntax(snippet, "toml")
-    return Syntax(json.dumps(masked, indent=2), "json")
+    if target.config_format == _CONFIG_FORMAT_YAML and target.entry_key:
+        snippet = yaml.dump(preview, default_flow_style=False, sort_keys=False)
+        return Syntax(snippet, "yaml")
+    return Syntax(json.dumps(preview, indent=2), "json")
 
 
 def _apply_profile_to_target(
@@ -704,8 +830,15 @@ def _apply_profile_to_target(
         raise ValueError(error)
 
     existing = config or {}
-    server_block = _server_block_key(target.config_format)
-    servers = existing.setdefault(server_block, {})
+    if target.entry_path:
+        servers, error = _walk_nested_path(existing, target.entry_path, create=True)
+        if error:
+            raise ValueError(error)
+        if servers is None:
+            raise RuntimeError("Unexpected missing OpenClaw server mapping during apply.")
+    else:
+        server_block = _server_block_key(target.config_format)
+        servers = existing.setdefault(server_block, {})
     current = servers.get(target.entry_key)
     if not isinstance(current, dict):
         raise ValueError(f"{target.name} does not have a valid Skyvern MCP entry.")
@@ -715,6 +848,8 @@ def _apply_profile_to_target(
         return False, None
 
     if dry_run:
+        if target.config_format == _CONFIG_FORMAT_JSON5:
+            _warn_openclaw_json_normalization(target.config_path, dry_run=True)
         console.print(f"\n[bold]{target.name}[/bold] -> {target.config_path}")
         console.print(_render_patched_entry(target, patched))
         return True, None
@@ -784,7 +919,7 @@ def switch_command(
     if not discovered:
         console.print(
             "[red]No supported MCP client config files were found for Claude Code, Claude Desktop, Cursor, "
-            "Windsurf, or Codex.[/red]"
+            "Windsurf, Codex, Hermes, or OpenClaw.[/red]"
         )
         raise typer.Exit(code=1)
 

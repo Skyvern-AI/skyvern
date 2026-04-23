@@ -191,6 +191,9 @@ class WorkflowRunsRepository(BaseRepository):
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        started_at: datetime | None | object = _UNSET,
+        queued_at: datetime | None | object = _UNSET,
+        finished_at: datetime | None | object = _UNSET,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -225,7 +228,7 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.browser_session_id = browser_session_id
                 if browser_address:
                     workflow_run.browser_address = browser_address
-                if extra_http_headers:
+                if extra_http_headers is not None:
                     workflow_run.extra_http_headers = extra_http_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
@@ -242,12 +245,59 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.browser_profile_id = browser_profile_id
                 if failure_category is not None:
                     workflow_run.failure_category = failure_category
+                # Explicit timestamp overrides (used when resetting workflow runs)
+                if started_at is not _UNSET:
+                    workflow_run.started_at = started_at
+                if queued_at is not _UNSET:
+                    workflow_run.queued_at = queued_at
+                if finished_at is not _UNSET:
+                    workflow_run.finished_at = finished_at
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    @db_operation("update_workflow_run_if_not_final")
+    async def update_workflow_run_if_not_final(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        failure_reason: str | None = None,
+    ) -> WorkflowRun | None:
+        """Transition a workflow run to ``status`` only if it is not already in a
+        terminal state. Returns the updated row, or ``None`` when the row was
+        already terminal (or missing). Implemented as a single conditional
+        ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
+        finalization write cannot be clobbered by a late cancel.
+        """
+        non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        values: dict[str, Any] = {"status": status}
+        if status.is_final():
+            values["finished_at"] = datetime.now(timezone.utc)
+        if failure_reason is not None:
+            values["failure_reason"] = failure_reason
+
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status.in_(non_terminal),
+                )
+                .values(**values)
+                .returning(WorkflowRunModel.workflow_run_id)
+            )
+            affected = result.scalar_one_or_none()
+            await session.commit()
+            if affected is None:
+                return None
+            refreshed = (
+                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+            ).one()
+            await save_workflow_run_logs(workflow_run_id)
+            return convert_to_workflow_run(refreshed)
 
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
@@ -437,7 +487,13 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter(effective_status.in_(status))
 
             if search_key:
-                query = query.filter(TaskRunModel.searchable_text.icontains(search_key, autoescape=True))
+                query = query.filter(
+                    or_(
+                        TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
+                        TaskRunModel.run_id.icontains(search_key, autoescape=True),
+                        TaskRunModel.workflow_permanent_id.icontains(search_key, autoescape=True),
+                    )
+                )
 
             offset = (page - 1) * page_size
             query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
@@ -756,6 +812,49 @@ class WorkflowRunsRepository(BaseRepository):
             if status:
                 count_query = count_query.filter(WorkflowRunModel.status.in_(status))
             return (await session.execute(count_query)).scalar_one()
+
+    @db_operation("get_workflow_runs_for_organization_by_status")
+    async def get_workflow_runs_for_organization_by_status(
+        self,
+        organization_id: str,
+        status: WorkflowRunStatus,
+        limit: int | None = None,
+    ) -> list[WorkflowRun]:
+        """Return workflow runs for an organization ordered oldest-first."""
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.status == status.value)
+                .order_by(WorkflowRunModel.created_at.asc())
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            workflow_runs = (await session.scalars(query)).all()
+            return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
+
+    @db_operation("get_workflow_runs_for_organization_by_statuses")
+    async def get_workflow_runs_for_organization_by_statuses(
+        self,
+        organization_id: str,
+        statuses: list[WorkflowRunStatus],
+        limit: int | None = None,
+    ) -> list[WorkflowRun]:
+        """Return workflow runs for an organization filtered by multiple statuses."""
+        if not statuses:
+            return []
+
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.status.in_([status.value for status in statuses]))
+                .order_by(WorkflowRunModel.created_at.asc())
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            workflow_runs = (await session.scalars(query)).all()
+            return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
     @db_operation("get_workflow_runs_for_workflow_permanent_id")
     async def get_workflow_runs_for_workflow_permanent_id(

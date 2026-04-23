@@ -47,7 +47,6 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -308,6 +307,14 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
 
+  const blockingParameterTypes = new Set([
+    "boolean",
+    "integer",
+    "float",
+    "file_url",
+    "json",
+  ]);
+
   const form = useForm<RunWorkflowFormType>({
     mode: "onTouched",
     reValidateMode: "onChange",
@@ -325,6 +332,13 @@ function RunWorkflowForm({
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
+
+  const formErrors = form.formState.errors;
+  const hasBlockingParameterError = workflowParameters.some(
+    (param) =>
+      blockingParameterTypes.has(param.workflow_parameter_type) &&
+      formErrors[param.key],
+  );
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -498,11 +512,7 @@ function RunWorkflowForm({
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
     const hasBlockingErrors = workflowParameters.some(
       (param) =>
-        (param.workflow_parameter_type === "boolean" ||
-          param.workflow_parameter_type === "integer" ||
-          param.workflow_parameter_type === "float" ||
-          param.workflow_parameter_type === "file_url" ||
-          param.workflow_parameter_type === "json") &&
+        blockingParameterTypes.has(param.workflow_parameter_type) &&
         errors[param.key],
     );
 
@@ -552,7 +562,7 @@ function RunWorkflowForm({
 
                 return {
                   method: "POST",
-                  url: `${runsApiBaseUrl}/run/workflows`,
+                  url: `${env.runsApiBaseUrl}/run/workflows`,
                   body: transformedBody,
                   headers,
                 } satisfies ApiCommandOptions;
@@ -561,7 +571,9 @@ function RunWorkflowForm({
             <Button
               type="submit"
               disabled={
-                runWorkflowMutation.isPending || hasLoginBlockValidationError
+                runWorkflowMutation.isPending ||
+                hasLoginBlockValidationError ||
+                hasBlockingParameterError
               }
             >
               {runWorkflowMutation.isPending && (
