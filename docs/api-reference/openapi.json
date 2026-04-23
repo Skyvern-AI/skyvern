@@ -2168,6 +2168,7 @@
     },
     "/v1/sdk/run_action": {
       "post": {
+        "x-excluded": true,
         "tags": [
           "SDK"
         ],
@@ -2224,6 +2225,7 @@
     },
     "/api/v1/billing/checkout": {
       "post": {
+        "x-excluded": true,
         "summary": "Create Checkout Session",
         "description": "Create a Stripe Checkout Session for subscribing to a tier.\n\nFrontend should redirect the user to the returned URL.\nAfter successful checkout, Stripe will send a webhook that we handle\nto store the subscription and initialize billing state.\n\nReturns 400 if org already has an active subscription (use portal instead).",
         "operationId": "create_checkout_session_api_v1_billing_checkout_post",
