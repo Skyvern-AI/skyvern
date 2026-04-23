@@ -1,21 +1,24 @@
 ---
 title: MCP Server
 subtitle: Connect AI assistants to browser automation via Model Context Protocol
-description: Install and configure Skyvern's MCP server so Claude Desktop, Cursor, Windsurf, VS Code, Hermes, and other AI tools can run browser automations.
+description: Install and configure Skyvern's MCP server so Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Hermes, OpenClaw, and other AI tools can run browser automations over OAuth or API key.
 slug: going-to-production/mcp
 keywords:
   - MCP
   - Model Context Protocol
+  - OAuth
   - Claude Desktop
+  - Claude Code
   - Cursor
   - Windsurf
-  - VS Code
+  - Codex
   - Hermes
+  - OpenClaw
   - MCPorter
   - AI assistant
   - tools
   - stdio
-  - SSE
+  - streamable-http
 ---
 
 The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Codex, Cursor, and Windsurf control a browser. Your AI can fill out forms, extract data, download files, and run multi-step workflows, all through natural language.
@@ -37,18 +40,60 @@ Additional tools cover tab management, iframe switching, drag-and-drop, file upl
 
 Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_browser_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_browser_session_close` automatically.
 
-## Which setup should I use?
+## Pick your setup
 
-| | Cloud setup (recommended) | Local mode |
-|---|---|---|
-| **Best for** | Most users (Skyvern Cloud handles everything) | Self-hosting Skyvern with your own infrastructure |
-| **Install required** | None | Python 3.11+ and `pip install skyvern` |
-| **How it connects** | Your AI client connects to Skyvern Cloud over HTTPS | A local Python process runs on your machine |
-| **API key** | From [app.skyvern.com](https://app.skyvern.com) | From your self-hosted Skyvern instance |
+You have three ways to connect a client to Skyvern:
 
-If you have a Skyvern Cloud account, use the cloud setup below. It takes 30 seconds and works immediately.
+| | OAuth (sign in with browser) | API key | Local mode |
+|---|---|---|---|
+| **Best for** | Claude Code, Cursor, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Codex, Hermes, OpenClaw, or any client where you prefer a static key | Self-hosting Skyvern |
+| **Install required** | None | None | Python 3.11+ and `pip install skyvern` |
+| **Credential** | Browser sign-in with your Skyvern account | API key from [app.skyvern.com](https://app.skyvern.com) | API key from your self-hosted instance |
+| **Where it runs** | Directly against Skyvern Cloud over HTTPS | Directly against Skyvern Cloud over HTTPS | Local Python process talking to your Skyvern server |
 
-## Quick start
+If your client appears in the OAuth section below, start there. Otherwise use the API-key setup.
+
+## Option A: Sign in with browser (OAuth)
+
+Supported clients today: **Claude Code**, **Cursor**, and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
+
+There is **no install step**. You do not need `pip install skyvern`, Node.js, or an API key.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add --transport http skyvern https://api.skyvern.com/mcp/ --scope user
+```
+
+Then run `/mcp` in Claude Code and follow the authentication prompt. Claude Code opens your browser for Skyvern sign-in and stores the token for future sessions.
+
+No `--header`, no API key. If you previously configured Skyvern with `x-api-key`, run `claude mcp remove skyvern` first so Claude Code does not skip the OAuth handshake.
+
+</Tab>
+<Tab title="Cursor">
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/"
+    }
+  }
+}
+```
+
+Use a current Cursor release. Restart Cursor, open MCP settings, and authenticate the Skyvern server when prompted. If the prompt does not appear, update Cursor and reopen MCP settings. Cursor opens your browser for Skyvern sign-in and stores the token for future sessions.
+
+</Tab>
+</Tabs>
+
+## Option B: API key
+
+Use this path for Claude Desktop, Windsurf, Codex, Hermes, OpenClaw, and any client that does not yet support the MCP OAuth flow. You can also use it with Claude Code and Cursor if you prefer a static key.
 
 Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard, then pick your client below.
 
@@ -97,7 +142,7 @@ Add this manual bridge to your Claude Desktop config file:
 }
 ```
 
-This fallback uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio. It still requires Node.js >= 20.
+Use this fallback for Linux or any Claude Desktop setup where the one-click bundle is not available. It uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio and requires Node.js >= 20.
 
 </Tab>
 <Tab title="Cursor">
@@ -243,7 +288,7 @@ skyvern setup mcporter
 </Tab>
 </Tabs>
 
-That's it. No Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
+After setup, restart your MCP client. Skyvern should appear as an MCP server and is ready for browser tasks.
 
 <Tip>
 Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
@@ -481,6 +526,18 @@ The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and
 Double-check that your API key is correct. You can find or regenerate it at [Settings](https://app.skyvern.com). Make sure there are no extra spaces or newlines when pasting the key.
 
 If you recently regenerated your API key, run `skyvern mcp switch` if you installed the CLI, or update the MCP config manually, then restart your AI client.
+</Accordion>
+
+<Accordion title="Browser sign-in does not complete">
+If the browser opens but the MCP client remains unauthenticated, confirm you can sign in to [app.skyvern.com](https://app.skyvern.com) in the same browser, then restart authentication from your MCP client. Browser extensions or strict privacy settings can interrupt the sign-in flow.
+
+If you previously connected with `x-api-key` and are switching to OAuth, remove the stale MCP entry first (`claude mcp remove skyvern`, or delete the entry in `~/.cursor/mcp.json`) and re-add it without the `headers` field. A static header prevents the client from starting OAuth.
+
+If the sign-in page shows an authorization failure, start the flow again from your MCP client instead of reloading the browser page.
+</Accordion>
+
+<Accordion title="OAuth session expires">
+OAuth sessions use the access-token lifetime described in the OAuth setup section above. When authentication expires, re-run the MCP client's authentication flow. To stop using Skyvern from a client before then, clear that client's saved Skyvern authentication or remove the Skyvern MCP server entry.
 </Accordion>
 
 <Accordion title="Tools not responding or timing out">
