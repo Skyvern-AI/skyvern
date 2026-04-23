@@ -2124,7 +2124,7 @@ async def handle_select_option_action(
 
         try:
             await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
-            await EventStrategyFactory.click(page, skyvern_element.get_locator(), timeout=timeout)
+            await skyvern_element.get_locator().click(timeout=timeout)
         except Exception:
             LOG.info(
                 "fail to open dropdown by clicking, try to press arrow down to open",
@@ -2664,7 +2664,7 @@ async def chain_click(
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await EventStrategyFactory.move_to_element(page, locator)
-            await EventStrategyFactory.click(page, locator, timeout=timeout)
+            await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
 
@@ -2680,7 +2680,7 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_element := await skyvern_element.find_label_for(dom=dom):
-                    await EventStrategyFactory.click(page, bound_element.get_locator(), timeout=timeout)
+                    await bound_element.get_locator().click(timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2698,7 +2698,7 @@ async def chain_click(
                 if bound_element := await skyvern_element.find_element_in_label_children(
                     dom=dom, element_type=InteractiveElement.INPUT
                 ):
-                    await EventStrategyFactory.click(page, bound_element.get_locator(), timeout=timeout)
+                    await bound_element.get_locator().click(timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2716,8 +2716,6 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
-                    # Intentional positional click bypassing EventStrategyFactory — position
-                    # anchoring at (0,0) avoids mis-targeting nested elements inside labels
                     await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
@@ -2735,8 +2733,6 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
-                    # Intentional positional click bypassing EventStrategyFactory — position
-                    # anchoring at (0,0) avoids mis-targeting nested elements inside labels
                     await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
@@ -2816,7 +2812,7 @@ async def chain_click(
                     locator=locator,
                 )
 
-                await EventStrategyFactory.click(page, blocking_element.get_locator(), timeout=timeout)
+                await blocking_element.get_locator().click(timeout=timeout)
                 action_results.append(ActionSuccess())
                 return action_results
         except Exception as e:
@@ -2927,9 +2923,7 @@ async def choose_auto_completion_dropdown(
                             input_value=text,
                         )
                         try:
-                            await EventStrategyFactory.click(
-                                page, fast_path_locator, timeout=settings.BROWSER_ACTION_TIMEOUT_MS
-                            )
+                            await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                             clear_input = False
                             result.action_result = ActionSuccess()
                             return result
@@ -3261,9 +3255,7 @@ async def discover_and_select_from_full_dropdown(
 
         # Try click first to open the dropdown (most combobox components respond to click)
         try:
-            await EventStrategyFactory.click(
-                page, skyvern_element.get_locator(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS
-            )
+            await skyvern_element.get_locator().click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         except Exception:
             LOG.info(
                 "Click failed in discover fallback, continuing to ArrowDown",
@@ -3880,7 +3872,7 @@ async def select_from_dropdown(
             value=value,
         )
         await EventStrategyFactory.move_to_element(page, locator)
-        await EventStrategyFactory.click(page, locator, timeout=timeout)
+        await locator.click(timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
     except Exception as e:
@@ -3909,7 +3901,7 @@ async def select_from_dropdown_by_value(
 
     element_locator = await incremental_scraped.select_one_element_by_value(value=value)
     if element_locator is not None:
-        await EventStrategyFactory.click(page, element_locator, timeout=timeout)
+        await element_locator.click(timeout=timeout)
         return ActionSuccess()
 
     if dropdown_menu_element is None:
@@ -3945,7 +3937,7 @@ async def select_from_dropdown_by_value(
 
         element_locator = await incre_scraped.select_one_element_by_value(value=value)
         if element_locator is not None:
-            await EventStrategyFactory.click(page, element_locator, timeout=timeout)
+            await element_locator.click(timeout=timeout)
             nonlocal selected
             selected = True
             return False
@@ -4234,7 +4226,9 @@ async def normal_select(
     value: str | None = json_response.get("value")
 
     try:
-        await EventStrategyFactory.click(locator.page, locator, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        await locator.click(
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
     except Exception as e:
         LOG.info(
             "Failed to click before select action",
@@ -4792,7 +4786,7 @@ async def click_listbox_option(
                 try:
                     skyvern_element = await dom.get_skyvern_element_by_id(child["id"])
                     locator = skyvern_element.locator
-                    await EventStrategyFactory.click(page, locator, timeout=1000)
+                    await locator.click(timeout=1000)
 
                     return True
                 except Exception:

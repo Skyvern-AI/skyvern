@@ -910,6 +910,8 @@ async def _new_copilot_chat_post(
                     message=user_response,
                     updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
                     response_time=assistant_message.created_at,
+                    total_tokens=getattr(agent_result, "total_tokens", None),
+                    response_type=getattr(agent_result, "response_type", "REPLY"),
                 )
             )
         except HTTPException as exc:
