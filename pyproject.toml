@@ -39,6 +39,7 @@ dependencies = [
     "types-toml>=0.10.8.7,<0.11",
     "httpx[socks]>=0.27.0",
     "filetype>=1.2.0,<2",
+    "fuzzysearch>=0.8,<1",
     "aioredlock>=0.7.3,<0.8",
     "tldextract>=5.1.2,<6",
     "websockets>=12.0,<15.1",
