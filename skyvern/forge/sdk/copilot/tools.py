@@ -1977,6 +1977,59 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
     return anti_bot_match, empty_data_blocks, categories
 
 
+# Generic failure-reason template emitted by the shared agent when the
+# browser-side scraper catches ScrapingFailed / NoElementFound. Matching on
+# the template (not the shared classifier) lets the copilot notice a repeated
+# site-block/unreadable-page pattern even though the classifier routes it to
+# DATA_EXTRACTION_FAILURE, not ANTI_BOT_DETECTION.
+# Coupling note: these substrings come from the run-level failure_reason
+# produced when the shared scraper raises ScrapingFailed. If the template
+# wording changes, update this tuple and the test that locks it in
+# (tests/unit/test_copilot_probable_site_block.py).
+_PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS = (
+    "failed to load the website",
+    "page may have navigated unexpectedly",
+)
+
+_NAV_BLOCK_TYPES = ("goto_url", "navigation")
+
+
+def _detect_probable_site_block_wall(result: dict[str, Any]) -> bool:
+    """Return True when the run shows the "site-block-wall" pattern: a
+    navigation block completed successfully but every subsequent block
+    failed to scrape the page.
+
+    Pattern:
+      - ``ok`` is false (run failed)
+      - at least one ``goto_url`` / ``navigation`` block completed successfully
+      - at least one block's ``failure_reason`` matches the generic
+        "Skyvern failed to load the website..." template
+    """
+    if bool(result.get("ok", False)):
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return False
+
+    nav_completed = False
+    matched_reason = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("block_type") in _NAV_BLOCK_TYPES and block.get("status") == "completed":
+            nav_completed = True
+        reason = block.get("failure_reason")
+        if isinstance(reason, str):
+            lowered = reason.lower()
+            if any(sub in lowered for sub in _PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS):
+                matched_reason = True
+
+    return nav_completed and matched_reason
+
+
 def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
     """Return the first failure_reason that matches SKIP_INNER_NAV_RETRY_ERRORS
     (DNS / cert / SSL / invalid URL), preferring run-level over block-level.
@@ -2022,10 +2075,13 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                 "(missing, empty, or all-null fields). "
                 "The workflow may not be working correctly."
             )
+            # Clean-ish success (no scrape-fail pattern): reset the streak.
+            copilot_ctx.probable_site_block_streak_count = 0
             update_repeated_failure_state(copilot_ctx, result)
             return
         copilot_ctx.failed_test_nudge_count = 0
         copilot_ctx.null_data_streak_count = 0
+        copilot_ctx.probable_site_block_streak_count = 0
         copilot_ctx.last_failed_workflow_yaml = None
         # Real success: clear the signature latch so a subsequent bad URL in
         # the same session can re-fire the stop nudge.
@@ -2035,6 +2091,10 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
     copilot_ctx.last_test_non_retriable_nav_error = _detect_non_retriable_nav_error(result)
+    if _detect_probable_site_block_wall(result):
+        copilot_ctx.probable_site_block_streak_count += 1
+    else:
+        copilot_ctx.probable_site_block_streak_count = 0
 
     data = result.get("data")
     if isinstance(data, dict):

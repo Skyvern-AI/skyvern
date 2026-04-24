@@ -37,6 +37,10 @@ NULL_DATA_STREAK_ESCALATE_AT = 2
 # Streak levels for repeated-failure (same frontier + same failure signature).
 REPEATED_FRONTIER_STREAK_ESCALATE_AT = 2
 REPEATED_FRONTIER_STREAK_STOP_AT = 3
+# Stop after this many consecutive runs where navigation succeeded but the
+# scraper could not read the page. Aligned with MAX_FAILED_TEST_NUDGES so the
+# copilot gets one generic retry nudge, then stops on the second occurrence.
+PROBABLE_SITE_BLOCK_STREAK_STOP_AT = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 600
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -217,6 +221,21 @@ POST_PARAMETER_BINDING_STOP_NUDGE = (
     "to decide what belongs in the parameters list, respond with an "
     "ASK_QUESTION instead. Do not resubmit a workflow that still has the "
     "same parameter-binding drift."
+)
+
+POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
+    "STOP — the target site has failed to scrape on every attempt across "
+    "multiple workflow shapes. Every run navigated successfully but the "
+    'scraper could not read the page ("failed to load the website" / '
+    '"page may have navigated unexpectedly"). This pattern indicates the '
+    "site is either blocking automated access, genuinely unresponsive in "
+    "this environment, or rendering content Skyvern cannot read reliably.\n"
+    "Do NOT retry with another workflow variation. Do NOT call "
+    "update_and_run_blocks or run_blocks_and_collect_debug again.\n"
+    "Reply to the user now: state that the site could not be loaded after "
+    "multiple attempts, quote the last failure_reason verbatim, and ask "
+    "whether to try a different URL, configure a proxy, or provide an "
+    "alternate entry point."
 )
 
 POST_ANTI_BOT_FAILED_TEST_NUDGE = (
@@ -428,6 +447,16 @@ def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     return bool(getattr(ctx, "last_test_suspicious_success", False))
 
 
+def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
+    """Return True when the site-block-wall streak has reached the stop level.
+
+    The streak is maintained in :func:`tools._record_run_blocks_result` and
+    crosses workflow-shape changes deliberately (the repeated-frontier streak
+    resets on shape edits; this one tracks the shape-independent scrape wall).
+    """
+    return _get_int(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+
+
 def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
     """Return True when suspicious-success has happened enough times to escalate."""
     # Same as above: non-retriable nav state never belongs on this branch.
@@ -524,6 +553,15 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
 
     if _needs_suspicious_success_nudge(ctx):
         return POST_SUSPICIOUS_SUCCESS_NUDGE
+
+    # Checked before the generic failed-test nudge so a scrape-wall streak
+    # emits the specific STOP text and does not also consume a
+    # failed_test_nudge_count slot. The two states are orthogonal by
+    # construction (scrape-wall requires a completed nav block;
+    # non_retriable_nav / anti_bot / suspicious_success populate different
+    # ctx fields).
+    if _needs_probable_site_block_stop_nudge(ctx):
+        return POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
@@ -824,6 +862,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_PARAMETER_BINDING_WARN_NUDGE: "parameter_binding_warn",
     POST_PARAMETER_BINDING_STOP_NUDGE: "parameter_binding_stop",
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
+    POST_PROBABLE_SITE_BLOCK_STOP_NUDGE: "probable_site_block_stop",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
 }

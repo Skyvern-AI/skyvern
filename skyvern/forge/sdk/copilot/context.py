@@ -189,6 +189,13 @@ class CopilotContext(AgentContext):
     # run produces real data. Used to escalate when the agent is stuck
     # retrying extraction against a page that doesn't contain the data.
     null_data_streak_count: int = 0
+    # Consecutive failed runs where navigation completed but the scraper
+    # could not read the page (generic "failed to load the website" template).
+    # Resets on any non-matching run outcome. Streak crosses workflow-shape
+    # changes deliberately — the frontier fingerprint resets each time the
+    # copilot rewrites the workflow, but the underlying site-block pattern is
+    # shape-independent.
+    probable_site_block_streak_count: int = 0
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
