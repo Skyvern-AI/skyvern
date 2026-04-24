@@ -1,6 +1,8 @@
+import atexit
 import functools
 import importlib.metadata
 import platform
+import threading
 import traceback
 from typing import Any, Dict, Optional
 
@@ -13,10 +15,14 @@ from skyvern.config import settings
 
 LOG = structlog.get_logger(__name__)
 
+_FLUSH_TIMEOUT_SECONDS = 2
+
 
 def _build_posthog_client(api_key: str, host: str) -> Posthog | None:
     try:
-        return Posthog(api_key, host=host, disable_geoip=False, timeout=2)
+        client = Posthog(api_key, host=host, disable_geoip=False, timeout=2, max_retries=1)
+        atexit.unregister(client.join)
+        return client
     except Exception:
         return None
 
@@ -95,8 +101,11 @@ def flush(
     host: str | None = None,
 ) -> None:
     client = _resolve_posthog_client(api_key=api_key, host=host)
-    if client is not None:
-        client.flush()
+    if client is None:
+        return
+    t = threading.Thread(target=client.flush, daemon=True)
+    t.start()
+    t.join(timeout=_FLUSH_TIMEOUT_SECONDS)
 
 
 def capture(
