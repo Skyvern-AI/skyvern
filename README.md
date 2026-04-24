@@ -232,32 +232,40 @@ print(task)
 ## Advanced Usage
 
 ### Control your own browser (Chrome)
-> [!WARNING]
-> Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.
 
-1. Just With Python Code
+Let Skyvern control your existing Chrome browser — with all your cookies, logins, and extensions.
+
+#### Step 1: Enable remote debugging in Chrome
+
+1. Open Chrome and navigate to `chrome://inspect/#remote-debugging`
+2. Click **Enable** to start the debugging server
+3. You should see: **Server running at: 127.0.0.1:9222**
+
+> [!TIP]
+> The `skyvern init browser` command can do this automatically — it opens `chrome://inspect/#remote-debugging`, waits for you to enable it, and saves the config.
+
+#### Step 2: Connect Skyvern
+
+**Option A — Python Code:**
 ```python
 from skyvern import Skyvern
 
-# The path to your Chrome browser. This example path is for Mac.
-browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 skyvern = Skyvern(
     base_url="http://localhost:8000",
     api_key="YOUR_API_KEY",
-    browser_path=browser_path,
+    browser_address="http://127.0.0.1:9222",
 )
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
 )
 ```
 
-2. With Skyvern Service
+**Option B — Skyvern Service:**
 
 Add two variables to your .env file:
 ```bash
-# The path to your Chrome browser. This example path is for Mac.
-CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 BROWSER_TYPE=cdp-connect
+BROWSER_REMOTE_DEBUGGING_URL=http://127.0.0.1:9222
 ```
 
 Restart Skyvern service `skyvern run all` and run the task through UI or code

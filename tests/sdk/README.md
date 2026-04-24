@@ -36,17 +36,9 @@ pytest tests/sdk/python_sdk/test_sdk_simple_actions.py::test_clicks
 - Requires Chrome/Chromium with CDP on `localhost:9222` (see below)
 - Web server auto-starts via `run-test.js`
 
-**Launch Chromium with CDP:**
-```bash
-# Find your Playwright Chromium path
-ls ~/Library/Caches/ms-playwright/
-
-# Then launch it (adjust the chromium-XXXX version to match yours)
-~/Library/Caches/ms-playwright/chromium-XXXX/chrome-mac/Chromium.app/Contents/MacOS/Chromium \
-  --remote-debugging-port=9222 \
-  --user-data-dir=~/tmp/chrome-playwright \
-  about:blank
-```
+**Enable Chrome remote debugging:**
+1. Open Chrome and navigate to `chrome://inspect/#remote-debugging`
+2. Click **Enable** — you should see "Server running at: 127.0.0.1:9222"
 
 ### Running Tests
 
