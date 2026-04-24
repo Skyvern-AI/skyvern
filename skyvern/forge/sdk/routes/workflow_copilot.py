@@ -82,6 +82,27 @@ class BlockRunInfo:
     output: str | None
 
 
+async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: bool) -> None:
+    """Emit a fallback ERROR frame if the turn hasn't sent a terminal one.
+
+    Shielded so cancellation on the outer scope doesn't abort the send;
+    swallows BaseException so a failed cleanup never masks the original.
+    """
+    if already_emitted:
+        return
+    try:
+        await asyncio.shield(
+            stream.send(
+                WorkflowCopilotStreamErrorUpdate(
+                    type=WorkflowCopilotStreamMessageType.ERROR,
+                    error="The assistant didn't finish this turn. Please try again.",
+                )
+            )
+        )
+    except BaseException:
+        pass
+
+
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
     """Return True when a persisted draft should be rolled back.
 
@@ -741,6 +762,7 @@ async def _new_copilot_chat_post(
         original_workflow: Workflow | None = None
         chat = None
         agent_result: Any = None
+        terminal_frame_emitted = False
 
         try:
             await stream.send(
@@ -903,6 +925,7 @@ async def _new_copilot_chat_post(
                 global_llm_context=updated_global_llm_context,
             )
 
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamResponseUpdate(
                     type=WorkflowCopilotStreamMessageType.RESPONSE,
@@ -917,6 +940,7 @@ async def _new_copilot_chat_post(
         except HTTPException as exc:
             if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
                 await _restore_workflow_definition(original_workflow, organization.organization_id)
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
@@ -932,6 +956,7 @@ async def _new_copilot_chat_post(
                 error=str(exc),
                 exc_info=True,
             )
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
@@ -954,12 +979,15 @@ async def _new_copilot_chat_post(
                 error=str(exc),
                 exc_info=True,
             )
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error="An error occurred. Please try again.",
                 )
             )
+        finally:
+            await _ensure_terminal_frame(stream, terminal_frame_emitted)
 
     return FastAPIEventSourceStream.create(request, stream_handler)
 
@@ -1008,6 +1036,7 @@ async def workflow_copilot_chat_post(
             organization_id=organization.organization_id,
         )
 
+        terminal_frame_emitted = False
         try:
             await stream.send(
                 WorkflowCopilotProcessingUpdate(
@@ -1096,6 +1125,7 @@ async def workflow_copilot_chat_post(
                 global_llm_context=updated_global_llm_context,
             )
 
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamResponseUpdate(
                     type=WorkflowCopilotStreamMessageType.RESPONSE,
@@ -1106,6 +1136,7 @@ async def workflow_copilot_chat_post(
                 )
             )
         except HTTPException as exc:
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
@@ -1119,6 +1150,7 @@ async def workflow_copilot_chat_post(
                 error=str(exc),
                 exc_info=True,
             )
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
@@ -1132,12 +1164,15 @@ async def workflow_copilot_chat_post(
                 error=str(exc),
                 exc_info=True,
             )
+            terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error="An error occurred. Please try again.",
                 )
             )
+        finally:
+            await _ensure_terminal_frame(stream, terminal_frame_emitted)
 
     return FastAPIEventSourceStream.create(request, stream_handler)
 
