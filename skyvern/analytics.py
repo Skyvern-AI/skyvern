@@ -27,6 +27,7 @@ def _build_posthog_client(api_key: str, host: str) -> Posthog | None:
         return None
 
 
+
 posthog: Posthog | None = _build_posthog_client(
     settings.POSTHOG_PROJECT_API_KEY,
     settings.POSTHOG_PROJECT_HOST,
