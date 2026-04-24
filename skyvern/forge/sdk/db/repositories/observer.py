@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from sqlalchemy import and_, delete, select
+import structlog
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -29,6 +30,8 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, Tho
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.runs import ProxyLocationInput, RunEngine
 from skyvern.schemas.workflows import BlockStatus, BlockType
+
+LOG = structlog.get_logger()
 
 
 class ObserverRepository(BaseRepository):
@@ -119,6 +122,64 @@ class ObserverRepository(BaseRepository):
                 query = query.filter(ThoughtModel.observer_thought_type.in_(thought_types))
             thoughts = (await session.scalars(query)).all()
             return [Thought.model_validate(thought) for thought in thoughts]
+
+    @db_operation("get_thought_cost_sum_by_workflow_run_id")
+    async def get_thought_cost_sum_by_workflow_run_id(self, workflow_run_id: str, organization_id: str) -> float:
+        """Sum `thought_cost` across all thoughts for the given workflow_run_id.
+
+        Returns 0.0 for runs without task_v2 planning.
+        """
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(ThoughtModel.thought_cost), 0))
+                .where(ThoughtModel.workflow_run_id == workflow_run_id)
+                .where(ThoughtModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
+
+    @db_operation("get_block_llm_cost_sum_by_workflow_run_id")
+    async def get_block_llm_cost_sum_by_workflow_run_id(self, workflow_run_id: str, organization_id: str) -> float:
+        """Sum `llm_cost` across all workflow_run_blocks for this workflow_run_id."""
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(WorkflowRunBlockModel.llm_cost), 0))
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
+
+    @db_operation("increment_workflow_run_block_llm_cost")
+    async def increment_workflow_run_block_llm_cost(
+        self,
+        workflow_run_block_id: str,
+        organization_id: str,
+        amount: float,
+    ) -> None:
+        """Atomically add `amount` to `workflow_run_blocks.llm_cost`.
+
+        Single SQL UPDATE so concurrent writers don't lose increments.
+        No-op for non-positive `amount`.
+        """
+        if amount <= 0:
+            return
+        async with self.Session() as session:
+            stmt = (
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_block_id == workflow_run_block_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .values(llm_cost=WorkflowRunBlockModel.llm_cost + amount)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if result.rowcount == 0:
+                LOG.warning(
+                    "Block LLM cost increment matched zero rows — cost dropped",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    amount=amount,
+                )
 
     @db_operation("create_task_v2")
     async def create_task_v2(

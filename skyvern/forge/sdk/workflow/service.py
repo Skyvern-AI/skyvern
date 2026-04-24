@@ -4428,6 +4428,43 @@ class WorkflowService:
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
         return [u for u in urls if u is not None]
 
+    async def get_workflow_run_llm_cost_sum(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> float:
+        """Sum per-LLM-call cost across step_cost, thought_cost, and
+        workflow_run_blocks.llm_cost for this workflow_run.
+
+        `organization_id` is required: passing None makes repo filters
+        evaluate as `IS NULL` and silently return 0.0.
+        """
+        if not organization_id:
+            raise ValueError(
+                "get_workflow_run_llm_cost_sum requires organization_id; "
+                "passing None would compile to IS NULL and silently return 0.0"
+            )
+        # thought + block sums are independent of the task list; run them in
+        # parallel with the task fetch + step sum (which depends on task ids).
+        thought_task = app.DATABASE.observer.get_thought_cost_sum_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        block_task = app.DATABASE.observer.get_block_llm_cost_sum_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+        step_cost_sum, thought_cost_sum, block_llm_cost_sum = await asyncio.gather(
+            app.DATABASE.tasks.get_step_cost_sum_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks],
+                organization_id=organization_id,
+            ),
+            thought_task,
+            block_task,
+        )
+        return step_cost_sum + thought_cost_sum + block_llm_cost_sum
+
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
@@ -4600,7 +4637,7 @@ class WorkflowService:
                 text_prompt_blocks = [
                     block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
                 ]
-                # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
+                # This is a temporary cost calculation.
                 total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
         return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
