@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
@@ -982,6 +983,48 @@ def _accumulate_usage(result: RunResultStreaming, ctx: Any) -> None:
         ctx.output_tokens_used += getattr(usage, "output_tokens", 0) or 0
 
 
+async def _run_streamed_with_deadline(
+    agent: Agent,
+    current_input: str | list,
+    ctx: Any,
+    session: Any,
+    tracked_stream: _SendTrackingStream,
+    runner_kwargs: dict[str, Any],
+    start_time: float,
+    iteration: int,
+) -> Any:
+    """Run ``Runner.run_streamed`` + ``stream_to_sse`` with a deadline
+    against ``TOTAL_TIMEOUT_SECONDS``.
+
+    The top-of-loop elapsed check only fires between iterations; a
+    long-running tool inside ``Runner.run_streamed`` needs ``wait_for``
+    to raise ``CopilotTotalTimeoutError`` mid-tool so the caller's
+    ``_build_exit_result`` path emits a non-empty REPLY before the
+    client's own transport timeout closes the stream.
+
+    ``max(1.0, ...)`` floors ``remaining`` so ``wait_for(timeout=0)``
+    never panics on an already-spent budget.
+    """
+    from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
+
+    elapsed = time.monotonic() - start_time
+    remaining = max(1.0, TOTAL_TIMEOUT_SECONDS - elapsed)
+    result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
+    try:
+        try:
+            await asyncio.wait_for(stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+        finally:
+            _accumulate_usage(result, ctx)
+    except asyncio.TimeoutError:
+        LOG.warning(
+            "Copilot total timeout exceeded mid-iteration",
+            elapsed_seconds=round(time.monotonic() - start_time, 3),
+            iteration=iteration,
+        )
+        raise CopilotTotalTimeoutError() from None
+    return result
+
+
 async def run_with_enforcement(
     agent: Agent,
     initial_input: str | list,
@@ -990,9 +1033,6 @@ async def run_with_enforcement(
     **runner_kwargs: Any,
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
-    # Lazy import: streaming_adapter lives in a sibling PR in the stack.
-    from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
-
     session = runner_kwargs.pop("session", None)
     current_input: str | list = initial_input
     start_time = time.monotonic()
@@ -1028,11 +1068,16 @@ async def run_with_enforcement(
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
             try:
-                result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
-                try:
-                    await stream_to_sse(result, tracked_stream, ctx)
-                finally:
-                    _accumulate_usage(result, ctx)
+                result = await _run_streamed_with_deadline(
+                    agent,
+                    current_input,
+                    ctx,
+                    session,
+                    tracked_stream,
+                    runner_kwargs,
+                    start_time,
+                    iteration,
+                )
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -1059,13 +1104,16 @@ async def run_with_enforcement(
                     pending_recovery_nudge = SCREENSHOT_DROPPED_NUDGE
                 tracked_stream = _SendTrackingStream(stream)
                 try:
-                    result = Runner.run_streamed(
-                        agent, input=current_input, context=ctx, session=session, **runner_kwargs
+                    result = await _run_streamed_with_deadline(
+                        agent,
+                        current_input,
+                        ctx,
+                        session,
+                        tracked_stream,
+                        runner_kwargs,
+                        start_time,
+                        iteration,
                     )
-                    try:
-                        await stream_to_sse(result, tracked_stream, ctx)
-                    finally:
-                        _accumulate_usage(result, ctx)
                 except Exception as retry_err:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
