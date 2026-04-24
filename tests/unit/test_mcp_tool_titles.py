@@ -22,6 +22,15 @@ async def test_every_tool_has_a_title() -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_tool_has_read_only_hint() -> None:
+    tools = await mcp.list_tools()
+    assert tools, "MCP server registered zero tools"
+
+    missing = [t.name for t in tools if t.annotations is None or t.annotations.readOnlyHint is None]
+    assert not missing, f"Tools missing readOnlyHint annotation: {missing}"
+
+
+@pytest.mark.asyncio
 async def test_destructive_tools_flagged() -> None:
     """Tools that delete / close / cancel must carry destructiveHint=True."""
     tools = await mcp.list_tools()
