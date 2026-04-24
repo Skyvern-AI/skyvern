@@ -9582,6 +9582,16 @@
             "type": "boolean",
             "title": "Ai Fallback Triggered",
             "default": false
+          },
+          "script_id": {
+            "type": "string",
+            "nullable": true,
+            "title": "Script Id"
+          },
+          "script_revision_id": {
+            "type": "string",
+            "nullable": true,
+            "title": "Script Revision Id"
           }
         },
         "type": "object",
