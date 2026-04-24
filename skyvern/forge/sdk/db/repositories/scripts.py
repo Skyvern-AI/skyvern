@@ -521,6 +521,35 @@ class ScriptsRepository(BaseRepository):
             workflow_script_model = (await session.scalars(query)).first()
             return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
 
+    @db_operation("get_workflow_script_source_workflow_id")
+    async def get_workflow_script_source_workflow_id(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        script_id: str,
+        cache_key_value: str,
+    ) -> str | None:
+        """Return the workflow version (w_*) that produced a given cached script row.
+
+        Used to detect when the workflow definition has changed since the cached
+        script was generated (SKY-9254).
+        """
+        async with self.Session() as session:
+            query = (
+                select(WorkflowScriptModel.workflow_id)
+                .where(
+                    WorkflowScriptModel.organization_id == organization_id,
+                    WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowScriptModel.script_id == script_id,
+                    WorkflowScriptModel.cache_key_value == cache_key_value,
+                    WorkflowScriptModel.deleted_at.is_(None),
+                )
+                .order_by(WorkflowScriptModel.created_at.desc())
+                .limit(1)
+            )
+            return (await session.scalars(query)).first()
+
     @db_operation("get_workflow_script_by_cache_key_value")
     async def get_workflow_script_by_cache_key_value(
         self,
