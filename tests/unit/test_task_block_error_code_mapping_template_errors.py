@@ -2,8 +2,11 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
@@ -79,3 +82,29 @@ def test_error_code_mapping_key_reports_precise_jinja_syntax_error() -> None:
     error_message = str(exc_info.value)
     assert "error_code_mapping key '{{ error code }}'" in error_message
     assert "expected token 'end of print statement'" in error_message
+
+
+def test_error_code_mapping_value_reports_undefined_variable_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strict_env = SandboxedEnvironment(undefined=StrictUndefined)
+    strict_env.filters["json"] = block_module._json_type_filter
+    monkeypatch.setattr(block_module, "jinja_sandbox_env", strict_env)
+
+    block = TaskBlock(
+        label="block_1",
+        block_type="task",
+        title="Test block",
+        output_parameter=_build_output_parameter(),
+        error_code_mapping={
+            "ACCOUNT_GROUP_NOT_FOUND": "return this error when {{ nonexistent_output }} is missing"
+        },
+    )
+    ctx = _build_mock_context()
+
+    with pytest.raises(FailedToFormatJinjaStyleParameter) as exc_info:
+        block.format_potential_template_parameters(ctx)
+
+    error_message = str(exc_info.value)
+    assert "error_code_mapping value for key 'ACCOUNT_GROUP_NOT_FOUND'" in error_message
+    assert "'nonexistent_output' is undefined" in error_message

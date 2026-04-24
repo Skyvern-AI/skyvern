@@ -29,7 +29,7 @@ import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
@@ -803,12 +803,14 @@ class BaseTaskBlock(Block):
                     formatted_error_code = self.format_block_parameter_template_from_workflow_run_context(
                         error_code, workflow_run_context
                     )
-                except TemplateSyntaxError as exc:
+                except (TemplateSyntaxError, UndefinedError) as exc:
+                    error_detail = exc.message if isinstance(exc, UndefinedError) else exc.message
+                    error_location = "" if isinstance(exc, UndefinedError) else f" (line {exc.lineno})"
                     raise FailedToFormatJinjaStyleParameter(
                         template=error_code,
                         msg=(
-                            "Invalid Jinja syntax in error_code_mapping key "
-                            f"'{error_code}': {exc.message} (line {exc.lineno})"
+                            "Invalid Jinja template in error_code_mapping key "
+                            f"'{error_code}': {error_detail}{error_location}"
                         ),
                     ) from exc
 
@@ -816,12 +818,14 @@ class BaseTaskBlock(Block):
                     formatted_error_description = self.format_block_parameter_template_from_workflow_run_context(
                         error_description, workflow_run_context
                     )
-                except TemplateSyntaxError as exc:
+                except (TemplateSyntaxError, UndefinedError) as exc:
+                    error_detail = exc.message if isinstance(exc, UndefinedError) else exc.message
+                    error_location = "" if isinstance(exc, UndefinedError) else f" (line {exc.lineno})"
                     raise FailedToFormatJinjaStyleParameter(
                         template=error_description,
                         msg=(
-                            "Invalid Jinja syntax in error_code_mapping value for key "
-                            f"'{error_code}': {exc.message} (line {exc.lineno})"
+                            "Invalid Jinja template in error_code_mapping value for key "
+                            f"'{error_code}': {error_detail}{error_location}"
                         ),
                     ) from exc
 
