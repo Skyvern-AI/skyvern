@@ -23,6 +23,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, is
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
@@ -114,12 +115,28 @@ def _jinja_domain_filter(url: str) -> str:
 jinja_sandbox_env.filters["domain"] = _jinja_domain_filter
 
 
-def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any]) -> str:
-    """Extract the domain from the first block that has a URL field.
+def _resolve_block_url_for_cache_key(url_template: str, parameters: dict[str, Any]) -> str:
+    """Resolve a block ``url`` the same way runtime does: param-key swap,
+    Jinja render, prepend-scheme validate. Must stay in sync with
+    ``BaseTaskBlock.execute`` / ``format_potential_template_parameters``.
+    """
+    candidate = url_template
+    if url_template in parameters:
+        value = parameters[url_template]
+        if value:
+            candidate = str(value)
+    rendered = jinja_sandbox_env.from_string(candidate).render(parameters)
+    if not rendered:
+        return ""
+    return prepend_scheme_and_validate_url(rendered)
 
-    Used to automatically enrich the cache key with the target domain so that
-    the same workflow running against different sites gets separate cached scripts.
-    Returns empty string if no block URL is found.
+
+def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any]) -> str:
+    """Extract the domain from the first block's URL for cache-key enrichment.
+
+    Calls ``_resolve_block_url_for_cache_key`` on each block's ``url`` and
+    returns the first non-empty domain. The helper mirrors runtime's URL
+    resolution — see its docstring for the pipeline.
     """
     try:
         blocks = get_all_blocks(workflow.workflow_definition.blocks)
@@ -127,7 +144,7 @@ def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any]) 
             url_template = getattr(block, "url", None)
             if not url_template:
                 continue
-            rendered_url = jinja_sandbox_env.from_string(str(url_template)).render(parameters)
+            rendered_url = _resolve_block_url_for_cache_key(str(url_template), parameters)
             if rendered_url:
                 domain = _jinja_domain_filter(rendered_url)
                 if domain:
