@@ -10,6 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import CloudContext from "@/store/CloudContext";
 import { useContext, useMemo } from "react";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
@@ -75,6 +76,9 @@ function LoginBlockCredentialSelector({
     parameters: workflowParameters,
     setParameters: setWorkflowParameters,
   } = useWorkflowParametersStore();
+  const setHasChanges = useWorkflowHasChangesStore(
+    (state) => state.setHasChanges,
+  );
   const credentialParameters = workflowParameters.filter(
     (parameter) =>
       parameter.parameterType === "credential" ||
@@ -252,6 +256,8 @@ function LoginBlockCredentialSelector({
           // This ensures workflowParameters is updated before the parent re-renders
           // with the new value, so selectedCredentialId computes correctly
           setWorkflowParameters(newParameters);
+          // Zustand mutation is invisible to the node-change listener, so the unsaved-changes blocker would miss this edit.
+          setHasChanges(true);
           onChange?.(parameterKeyToUse);
 
           // Auto-fill the login block URL from the credential's tested_url
@@ -334,6 +340,7 @@ function LoginBlockCredentialSelector({
               key: newKey,
             },
           ]);
+          setHasChanges(true);
           onChange?.(newKey);
         }}
       />
