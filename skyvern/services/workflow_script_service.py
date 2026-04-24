@@ -246,6 +246,60 @@ async def generate_or_update_pending_workflow_script(
     )
 
 
+async def _invalidate_if_parameters_changed(
+    workflow: Workflow,
+    existing_script: Script,
+    cache_key_value: str,
+    workflow_run_id: str,
+) -> bool:
+    """Return True if the cached script should be invalidated because the
+    workflow's parameter key set has changed since the script was generated.
+
+    Only fires when the workflow version id differs from the version that
+    produced the cached script, so steady-state cache hits pay no extra DB
+    work. A missing prior workflow row (hard-deleted) is treated as a cache
+    miss for safety.
+    """
+    cache_workflow_id = await app.DATABASE.scripts.get_workflow_script_source_workflow_id(
+        organization_id=workflow.organization_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        script_id=existing_script.script_id,
+        cache_key_value=cache_key_value,
+    )
+    if not cache_workflow_id or cache_workflow_id == workflow.workflow_id:
+        return False
+
+    old_workflow = await app.DATABASE.workflows.get_workflow(
+        workflow_id=cache_workflow_id,
+        organization_id=workflow.organization_id,
+    )
+    if old_workflow is None:
+        LOG.info(
+            "Cached script invalidated: prior workflow version not found",
+            workflow_id=workflow.workflow_id,
+            cache_workflow_id=cache_workflow_id,
+            script_id=existing_script.script_id,
+            workflow_run_id=workflow_run_id,
+        )
+        return True
+
+    old_param_keys = {p.key for p in old_workflow.workflow_definition.parameters}
+    new_param_keys = {p.key for p in workflow.workflow_definition.parameters}
+    if old_param_keys != new_param_keys:
+        LOG.info(
+            "Cached script invalidated: workflow parameter set changed",
+            workflow_id=workflow.workflow_id,
+            cache_workflow_id=cache_workflow_id,
+            script_id=existing_script.script_id,
+            workflow_run_id=workflow_run_id,
+            added_params=sorted(new_param_keys - old_param_keys),
+            removed_params=sorted(old_param_keys - new_param_keys),
+        )
+        return True
+
+    return False
+
+
 async def get_workflow_script(
     workflow: Workflow,
     workflow_run: WorkflowRun,
@@ -313,6 +367,22 @@ async def get_workflow_script(
         )
 
         if existing_script:
+            # SKY-9254: invalidate the cached script when the workflow's parameter
+            # set has changed since it was generated. Cache lookup keys on
+            # (org, wpid, cache_key_value) — none of which change when a user
+            # edits the workflow to add/remove a parameter. Without this check
+            # the old cached code (which has no reference to the new param)
+            # keeps getting served, and the new param ends up injected wherever
+            # the agent guesses.
+            invalidated = await _invalidate_if_parameters_changed(
+                workflow=workflow,
+                existing_script=existing_script,
+                cache_key_value=rendered_cache_key_value,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            if invalidated:
+                return None, rendered_cache_key_value, False
+
             LOG.info(
                 "Found cached script for workflow (cache hit)",
                 workflow_id=workflow.workflow_id,
