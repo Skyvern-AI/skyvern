@@ -29,7 +29,7 @@ import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined
+from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
@@ -797,14 +797,37 @@ class BaseTaskBlock(Block):
         if workflow_error_code_mapping or self.error_code_mapping:
             merged_mapping = dict(workflow_error_code_mapping or {})
             merged_mapping.update(self.error_code_mapping or {})
-            self.error_code_mapping = {
-                self.format_block_parameter_template_from_workflow_run_context(error_code, workflow_run_context): (
-                    self.format_block_parameter_template_from_workflow_run_context(
+            formatted_error_code_mapping: dict[str, str] = {}
+            for error_code, error_description in merged_mapping.items():
+                try:
+                    formatted_error_code = self.format_block_parameter_template_from_workflow_run_context(
+                        error_code, workflow_run_context
+                    )
+                except TemplateSyntaxError as exc:
+                    raise FailedToFormatJinjaStyleParameter(
+                        template=error_code,
+                        msg=(
+                            "Invalid Jinja syntax in error_code_mapping key "
+                            f"'{error_code}': {exc.message} (line {exc.lineno})"
+                        ),
+                    ) from exc
+
+                try:
+                    formatted_error_description = self.format_block_parameter_template_from_workflow_run_context(
                         error_description, workflow_run_context
                     )
-                )
-                for error_code, error_description in merged_mapping.items()
-            }
+                except TemplateSyntaxError as exc:
+                    raise FailedToFormatJinjaStyleParameter(
+                        template=error_description,
+                        msg=(
+                            "Invalid Jinja syntax in error_code_mapping value for key "
+                            f"'{error_code}': {exc.message} (line {exc.lineno})"
+                        ),
+                    ) from exc
+
+                formatted_error_code_mapping[formatted_error_code] = formatted_error_description
+
+            self.error_code_mapping = formatted_error_code_mapping
 
     @staticmethod
     async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
