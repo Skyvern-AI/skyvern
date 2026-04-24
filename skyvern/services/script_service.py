@@ -2537,6 +2537,8 @@ async def run_script(
         workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run_id,
             ai_fallback_triggered=False,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
         )
         context.workflow_run_id = workflow_run_id
         context.organization_id = organization_id

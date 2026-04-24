@@ -100,7 +100,7 @@ Important Rules:
 
 ** NAVIGATION BLOCK (navigation) **
 
-Purpose: Take actions to achieve a task. This is the "Browser Task" block in the UI.
+Purpose: Take actions on a page to achieve a focused goal — fill a form, click through a multi-step flow, prepare the page before an extraction.
 
 Structure:
 block_type: navigation
@@ -199,6 +199,16 @@ blocks:
     url: "https://example.com/checkout"
     navigation_goal: "Check the terms checkbox"
     max_retries: 1
+
+** TASK BLOCK (task) — NOT AVAILABLE IN WORKFLOW COPILOT **
+
+DO NOT EMIT "task" blocks. They are not available in the workflow copilot and will be rejected at persistence. Use:
+- "navigation" for page actions (filling forms, clicking, multi-step flows)
+- "extraction" for data extraction (with data_extraction_goal + data_schema)
+- "validation" for completion checks
+- "login" for authentication
+- "goto_url" for pure URL navigation
+Legacy workflows that already contain "task" blocks continue to run outside the copilot; this ban applies only to copilot emission.
 
 ** TASK V2 BLOCK (task_v2) — DEPRECATED **
 

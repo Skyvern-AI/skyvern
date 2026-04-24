@@ -14353,6 +14353,14 @@
             "type": "boolean",
             "title": "Ai Fallback Triggered",
             "default": false
+          },
+          "script_id": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "title": "Script Id"
+          },
+          "script_revision_id": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "title": "Script Revision Id"
           }
         },
         "type": "object",

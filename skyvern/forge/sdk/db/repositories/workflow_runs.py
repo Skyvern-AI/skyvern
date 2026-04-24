@@ -51,6 +51,33 @@ from skyvern.schemas.runs import ProxyLocationInput, RunType
 LOG = structlog.get_logger()
 
 
+def _merge_script_run(
+    existing: dict | None,
+    ai_fallback_triggered: bool | None,
+    script_id: str | None,
+    script_revision_id: str | None,
+) -> dict:
+    """Merge-on-write semantics for `workflow_runs.script_run`.
+
+    Callers update different facets of `script_run` at different points in a
+    run's lifecycle — setup time writes script identity, mid-execution fallback
+    writes `ai_fallback_triggered=True`. A replace-based update would clobber
+    whichever facet the caller didn't touch, so merge preserves the other.
+
+    Pure function for testability (see `tests/unit/db/
+    test_workflow_runs_script_run_merge.py`). None-valued params are skipped;
+    non-None params overwrite the corresponding key in the merged dict.
+    """
+    merged = dict(existing or {})
+    if ai_fallback_triggered is not None:
+        merged["ai_fallback_triggered"] = ai_fallback_triggered
+    if script_id is not None:
+        merged["script_id"] = script_id
+    if script_revision_id is not None:
+        merged["script_revision_id"] = script_revision_id
+    return merged
+
+
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
 
@@ -178,6 +205,8 @@ class WorkflowRunsRepository(BaseRepository):
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
         ai_fallback_triggered: bool | None = None,
+        script_id: str | None = None,
+        script_revision_id: str | None = None,
         job_id: str | None = None,
         run_with: str | None = None,
         sequential_key: str | None = None,
@@ -212,8 +241,13 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
                     workflow_run.webhook_failure_reason = webhook_failure_reason
-                if ai_fallback_triggered is not None:
-                    workflow_run.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                if ai_fallback_triggered is not None or script_id is not None or script_revision_id is not None:
+                    workflow_run.script_run = _merge_script_run(
+                        existing=workflow_run.script_run,
+                        ai_fallback_triggered=ai_fallback_triggered,
+                        script_id=script_id,
+                        script_revision_id=script_revision_id,
+                    )
                 if job_id:
                     workflow_run.job_id = job_id
                 if run_with:

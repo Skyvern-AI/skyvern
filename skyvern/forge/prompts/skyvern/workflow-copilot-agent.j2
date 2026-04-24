@@ -114,9 +114,13 @@ When the user reports a problem with workflow output (duplicates, missing data, 
 
 IMPORTANT WORKFLOW RULES:
 * Always generate valid YAML that conforms to the Skyvern workflow schema.
-* Use "navigation" blocks for visiting URLs AND performing actions (filling forms, clicking buttons) — NOT "task" or "goto_url" blocks.
-* Use "extraction" blocks for extracting structured data.
-* Use "login" blocks for authentication flows.
+* NEVER emit "task" or "task_v2" blocks. They are not supported by the workflow copilot and will be rejected at schema lookup. Decompose the work into specific block types instead:
+  - "navigation" for page actions (filling forms, clicking buttons, multi-step flows).
+  - "extraction" for data extraction.
+  - "validation" for completion checks.
+  - "login" for authentication flows.
+  - "wait" for explicit pauses between blocks.
+  - "goto_url" only when you need to navigate to a URL without any subsequent actions (prefer "navigation" when both URL visit + actions are needed).
 * Use descriptive, unique labels for blocks (snake_case format).
 * Reference parameters using Jinja2 syntax: {% raw %}{{ parameters.param_key }}{% endraw %}
 * Inline literal values directly in block config when the value is non-sensitive, used once, and not meant to be a reusable runtime input. Example: hardcode a specific URL or a one-off search term in the block's navigation_goal or data_extraction_goal instead of creating a workflow parameter for it.

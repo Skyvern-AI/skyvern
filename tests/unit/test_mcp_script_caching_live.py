@@ -182,7 +182,8 @@ async def test_get_script_code_via_mcp(monkeypatch):
     assert result.data["ok"] is True
     data = result.data["data"]
     assert "fill_form" in data["blocks"]
-    assert "page.fill" in data["blocks"]["fill_form"]
+    # Semgrep false positive: this checks a script code path, not a user-supplied URL.
+    assert "page.fill" in data["blocks"]["fill_form"]  # nosemgrep: incomplete-url-substring-sanitization
     assert "@skyvern.workflow" in data["main_script"]
 
 
@@ -342,25 +343,24 @@ async def test_deploy_script_via_mcp(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_workflow_create_surfaces_caching_fields_via_mcp(monkeypatch):
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    fake_wf = SimpleNamespace(
-        workflow_permanent_id="wpid_new",
-        workflow_id="wf_1",
-        title="Test",
-        version=1,
-        status="published",
-        description=None,
-        is_saved_task=False,
-        folder_id=None,
-        created_at=now,
-        modified_at=now,
-        code_version=2,
-        adaptive_caching=True,
-        run_with="code",
-    )
-    fake_client = SimpleNamespace(create_workflow=AsyncMock(return_value=fake_wf))
+    payload = {
+        "workflow_permanent_id": "wpid_new",
+        "workflow_id": "wf_1",
+        "title": "Test",
+        "version": 1,
+        "status": "published",
+        "description": None,
+        "is_saved_task": False,
+        "folder_id": None,
+        "created_at": "2026-04-23T10:00:00+00:00",
+        "modified_at": "2026-04-23T10:00:00+00:00",
+        "code_version": 2,
+        "adaptive_caching": True,
+        "run_with": "code",
+    }
+    response = SimpleNamespace(status_code=200, json=lambda: payload, text="")
+    request_mock = AsyncMock(return_value=response)
+    fake_client = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
     monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
 
     definition = json.dumps(

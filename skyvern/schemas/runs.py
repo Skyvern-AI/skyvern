@@ -590,7 +590,29 @@ class BlockRunRequest(WorkflowRunRequest):
 
 
 class ScriptRunResponse(BaseModel):
+    # True iff a fallback fired during this run, flipping at least one
+    # block's execution from cached script to the agent. Writers: the two
+    # `services/script_service.py` fallback paths (script-block failure +
+    # conditional-agent episode) and the `_execute_single_block` script-
+    # failure path. `False` here does NOT imply "no AI execution" — blocks
+    # that were ALWAYS-agent (via `requires_agent`, `disable_cache`, or
+    # non-cacheable block types) never create a fallback episode and don't
+    # flip this flag. For per-block routing ground truth, consult the
+    # `Block execution mode resolved` log emitted at per-block execution
+    # time in `skyvern/forge/sdk/workflow/service.py`.
     ai_fallback_triggered: bool = False
+
+    # Identity of the cached script that was loaded for this run at
+    # workflow setup time. Non-null iff a script was loaded. Does NOT
+    # imply that every (or any) block actually executed from that cache —
+    # per-block `block_labels` filtering, `requires_agent`, `disable_cache`,
+    # or non-cacheable block types can still route individual blocks to AI.
+    # Populated by the server-side execution path (workflow/service.py) and
+    # the local CLI entrypoint (services/script_service.run_script). None
+    # on rows written by older code paths that only recorded
+    # `ai_fallback_triggered`.
+    script_id: str | None = None
+    script_revision_id: str | None = None
 
 
 class UploadFileResponse(BaseModel):

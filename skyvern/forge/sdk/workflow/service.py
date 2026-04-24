@@ -1524,6 +1524,12 @@ class WorkflowService:
             empty_blocks_detected=script is not None and is_script_run and not script_blocks_by_label,
         )
 
+        if script_mode_active and script is not None:
+            # Regression-locked by tests/unit/workflow/test_mark_script_run_loaded.py
+            # ::test_mark_script_run_loaded_calls_update_with_script_identity.
+            # If you modify this branch, update that test.
+            await self._mark_script_run_loaded(workflow_run_id, script)
+
         if block_labels and len(block_labels):
             blocks: list[BlockTypeVar] = []
             all_labels = {block.label: block for block in all_blocks}
@@ -2282,6 +2288,33 @@ class WorkflowService:
                         parent_workflow_run_block_id=parent_workflow_run_block_id,
                         organization_id=organization_id,
                         browser_session_id=browser_session_id,
+                    )
+                    # Record that this run experienced a script → AI fallback if
+                    # the agent execution we just ran was a consequence of a failed
+                    # script attempt. The gate correctly excludes:
+                    #   - ai_fallback=False kept-the-failure (execute_safe not reached)
+                    #   - requires_agent / uncached / disable_cache / non-cacheable
+                    #     routes (valid_to_run_code is False for these)
+                    #   - agent-only workflows (is_script_run=False → valid_to_run_code=False)
+                    # and correctly covers all three script-failure modes: script-
+                    # block failed, script threw, and script-ran-but-no-block-found.
+                    # Complements the task-block AI-fallback writers in `services/script_service.py`
+                    # writers which handle a separate task-block AI-fallback surface.
+                    # Perf: a fallback-heavy run issues N writes for N fallbacks.
+                    # Typical runs have 0-3. `_merge_script_run` is idempotent at the
+                    # DB layer. If observed latency regresses, add a context-scoped
+                    # already-flipped cache (tracked separately).
+                    await self._mark_script_fallback_triggered(
+                        workflow_run_id=workflow_run_id,
+                        # `valid_to_run_code` is computed as a chain of `and`s that
+                        # includes `block.label` (str | None), so its static type is
+                        # `Literal[''] | bool` when block.label is an empty string.
+                        # The helper treats it as a pure truthiness gate; `bool(...)`
+                        # narrows the type cleanly for mypy without changing runtime
+                        # semantics.
+                        valid_to_run_code=bool(valid_to_run_code),
+                        block_executed_with_code=block_executed_with_code,
+                        block_label=block.label,
                     )
 
                 # Update fallback episode with agent actions for both success and failure.
@@ -6019,3 +6052,88 @@ class WorkflowService:
         if workflow_run.run_with is not None:
             return workflow_run.run_with == "code"
         return workflow.run_with == "code"
+
+    async def _mark_script_run_loaded(self, workflow_run_id: str, script: Script) -> None:
+        """Record that a cached script was loaded for this workflow run.
+
+        Populates `workflow_run.script_run` with the script's identity at
+        workflow setup time so API consumers can detect cache use. Sets
+        `ai_fallback_triggered=False` as the initial state; if a fallback
+        fires mid-execution, other writers (`services/script_service.py`
+        and `_mark_script_fallback_triggered` below) merge the flipped
+        `ai_fallback_triggered=True` on top without clobbering identity
+        via the merge-on-write behavior in `update_workflow_run`.
+
+        Semantic: `script_run != null` after this runs means "a cached
+        script was loaded for this run at setup time." It does NOT imply
+        that every (or any) block actually executed from that cache —
+        `block_labels` filtering, `requires_agent`, `disable_cache`, and
+        non-cacheable block types can still route individual blocks to AI.
+        See `ScriptRunResponse` docstrings for the full semantic.
+
+        Wrapped in try/except (matching `_mark_script_fallback_triggered`) so
+        a transient DB error on the metadata write doesn't abort workflow
+        setup. The `script_run` payload is informational — reporting state
+        to API consumers — not load-bearing for the run's own execution.
+        """
+        try:
+            await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                ai_fallback_triggered=False,
+                script_id=script.script_id,
+                script_revision_id=script.script_revision_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to mark script_run loaded at workflow setup",
+                workflow_run_id=workflow_run_id,
+                script_id=script.script_id,
+                script_revision_id=script.script_revision_id,
+                exc_info=True,
+            )
+
+    async def _mark_script_fallback_triggered(
+        self,
+        workflow_run_id: str,
+        valid_to_run_code: bool,
+        block_executed_with_code: bool,
+        block_label: str | None,
+    ) -> None:
+        """Flip `ai_fallback_triggered=True` on the run iff the just-executed
+        agent block was a script→AI fallback (not an always-agent route).
+
+        Gate semantics:
+        - `valid_to_run_code=True` ⇒ we attempted script execution for this
+          block. False rules out always-agent routes (requires_agent,
+          disable_cache, uncached, non-cacheable block types, agent-only
+          workflows).
+        - `block_executed_with_code=False` ⇒ script didn't succeed. True means
+          script ran cleanly; no fallback occurred; no flag flip.
+
+        Together, a True/False combination means "we tried script, it failed,
+        we then ran agent." That's the precise definition of a mid-execution
+        script→AI fallback.
+
+        Caller must only invoke this AFTER `block.execute_safe` actually ran
+        (i.e., the fallback agent execution happened). Calling before would
+        risk false positives in the `ai_fallback=False` kept-the-failure
+        case where `execute_safe` is never reached.
+
+        Wrapped in try/except so a transient DB error on the flag flip can't
+        abort downstream block post-processing. Regression-locked by
+        `tests/unit/workflow/test_mark_script_fallback_triggered.py`.
+        """
+        if not (valid_to_run_code and not block_executed_with_code):
+            return
+        try:
+            await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                ai_fallback_triggered=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to mark ai_fallback_triggered after script→AI fallback",
+                workflow_run_id=workflow_run_id,
+                block_label=block_label,
+                exc_info=True,
+            )

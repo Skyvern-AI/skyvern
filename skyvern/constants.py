@@ -75,6 +75,17 @@ DEFAULT_LOGIN_COMPLETE_CRITERION = (
     "Do NOT assume login failed just because you are on the homepage or the same page as before."
 )
 
+# Template for wrapping a block-level mini-goal with the user's original prompt as context.
+# Used by both TaskV2 planning and the workflow-copilot-v2 tool handler so that every block's
+# navigation_goal carries the user's overarching intent — the verifier (complete_verify) can
+# then reason about completion against the user's goal rather than the block's narrow action
+# decomposition.
+MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
+```{mini_goal}```
+
+This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
+```{main_goal}```"""
+
 # reserved fields for navigation payload
 SPECIAL_FIELD_VERIFICATION_CODE = "verification_code"
 

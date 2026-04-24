@@ -21,7 +21,7 @@ class CursorEventStrategy(ABC):
         pass
 
     @abstractmethod
-    async def click(self, page: Page, locator: Locator, timeout: float | None = None) -> None:
+    async def click(self, page: Page, locator: Locator) -> None:
         pass
 
 

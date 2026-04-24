@@ -795,11 +795,6 @@ async def _connect_to_cdp_browser(
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
 
-    # Mark as remote browser so strategies can adapt their dispatch method
-    ctx = current()
-    if ctx is not None:
-        ctx.is_remote_browser = True
-
     if apply_download_behaviour:
         await _apply_download_behaviour(browser)
 

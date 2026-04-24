@@ -851,7 +851,7 @@ class SkyvernElement:
 
         await EventStrategyFactory.move_to_element(page, self.get_locator())
         try:
-            await EventStrategyFactory.click(page, self.get_locator(), timeout=timeout)
+            await self.get_locator().click(timeout=timeout)
             return
         except Exception:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
@@ -863,7 +863,7 @@ class SkyvernElement:
                 blocking_element, _ = await self.find_blocking_element(dom=dom, incremental_page=incremental_page)
                 if blocking_element:
                     LOG.debug("Find the blocking element", element_id=blocking_element.get_id())
-                    await EventStrategyFactory.click(page, blocking_element.get_locator(), timeout=timeout)
+                    await blocking_element.get_locator().click(timeout=timeout)
                     return
             except Exception:
                 LOG.info("Failed to click on the blocking element", exc_info=True, element_id=self.get_id())
