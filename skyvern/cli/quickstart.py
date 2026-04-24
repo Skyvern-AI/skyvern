@@ -154,7 +154,10 @@ def run_docker_compose_setup() -> None:
                 "[bold]Enable Remote Debugging in Chrome[/bold]\n\n"
                 "1. We'll open [cyan]chrome://inspect/#remote-debugging[/cyan] in your browser\n"
                 "2. Click [bold]Enable[/bold] to start the debugging server\n"
-                "3. You should see: [green]Server running at: 127.0.0.1:9222[/green]",
+                "3. You should see: [green]Server running at: 127.0.0.1:9222[/green]\n\n"
+                "Then uncomment these lines in [cyan]docker-compose.yml[/cyan]:\n"
+                "  [dim]BROWSER_TYPE=cdp-connect[/dim]\n"
+                "  [dim]BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/[/dim]",
                 border_style="cyan",
             )
         )
@@ -163,11 +166,9 @@ def run_docker_compose_setup() -> None:
             _open_chrome_inspect()
         confirmed = Confirm.ask("Have you enabled remote debugging in Chrome?", default=False)
         if confirmed:
-            from skyvern.cli.llm_setup import update_or_add_env_var
-
-            update_or_add_env_var("BROWSER_TYPE", "cdp-connect")
-            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", "http://host.docker.internal:9222/")
-            console.print("✅ [green]Browser debugging configured in .env. Restart with:[/green]")
+            console.print(
+                "✅ [green]Great! Uncomment the BROWSER_TYPE and BROWSER_REMOTE_DEBUGGING_URL lines in docker-compose.yml, then run:[/green]"
+            )
             console.print("  [cyan]docker compose up -d[/cyan]")
         else:
             console.print(
