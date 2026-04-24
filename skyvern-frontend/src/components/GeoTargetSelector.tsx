@@ -47,27 +47,48 @@ export function GeoTargetSelector({
     cities: [],
   });
   const [loading, setLoading] = React.useState(false);
+  // Monotonic id for the latest in-flight search. Stale completions whose
+  // id no longer matches are ignored so a slow prior request cannot clobber
+  // results from a newer one (e.g. reopen after a granular search).
+  const searchIdRef = React.useRef(0);
 
-  const handleSearch = useDebouncedCallback(async (searchQuery: string) => {
-    setLoading(true);
-    try {
-      const data = await searchGeoData(searchQuery, {
-        includeGranularResults: allowGranularSearch,
-      });
-      setResults(data);
-    } catch (error) {
-      console.error("Failed to search geo data", error);
-    } finally {
-      setLoading(false);
-    }
-  }, 300);
+  const runSearch = React.useCallback(
+    async (searchQuery: string) => {
+      const id = ++searchIdRef.current;
+      setLoading(true);
+      try {
+        const data = await searchGeoData(searchQuery, {
+          includeGranularResults: allowGranularSearch,
+        });
+        if (searchIdRef.current === id) {
+          setResults(data);
+        }
+      } catch (error) {
+        if (searchIdRef.current === id) {
+          console.error("Failed to search geo data", error);
+        }
+      } finally {
+        if (searchIdRef.current === id) {
+          setLoading(false);
+        }
+      }
+    },
+    [allowGranularSearch],
+  );
 
-  // Initial load of countries
+  const handleSearch = useDebouncedCallback(runSearch, 300);
+
+  // Reset query, drop any stale granular results, and reload countries each
+  // time the popover opens. The search runs without debounce so the list
+  // matches the empty input immediately rather than after a 300ms window.
   React.useEffect(() => {
     if (open) {
-      handleSearch("");
+      handleSearch.cancel();
+      setQuery("");
+      setResults({ countries: [], subdivisions: [], cities: [] });
+      runSearch("");
     }
-  }, [open, handleSearch]);
+  }, [open, handleSearch, runSearch]);
 
   const onInput = (val: string) => {
     setQuery(val);
@@ -109,7 +130,7 @@ export function GeoTargetSelector({
           <CommandInput
             placeholder={
               allowGranularSearch
-                ? "Search country, state, or city..."
+                ? "Type a country, state, or city..."
                 : "Search country..."
             }
             value={query}
@@ -127,6 +148,12 @@ export function GeoTargetSelector({
               results.cities.length === 0 && (
                 <CommandEmpty>No location found.</CommandEmpty>
               )}
+
+            {!loading && allowGranularSearch && query.trim().length < 2 && (
+              <div className="border-b px-3 py-2 text-xs text-muted-foreground">
+                Type to search by state or city.
+              </div>
+            )}
 
             {!loading && (
               <>
