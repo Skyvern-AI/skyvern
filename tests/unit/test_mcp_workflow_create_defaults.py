@@ -130,5 +130,7 @@ def test_parse_definition_unaffected() -> None:
     json_def, _, err = _parse_definition(definition, "json")
     assert err is None
     assert json_def is not None
+    assert isinstance(json_def, dict)
     # run_with should be "agent" (schema default), not "code"
-    assert json_def.run_with == "agent"
+    assert json_def.get("run_with") == "agent"
+    assert json_def.get("code_version") != 2

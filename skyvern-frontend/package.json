@@ -116,6 +116,10 @@
   "overrides": {
     "vite": {
       "rollup": "npm:@rollup/wasm-node"
-    }
+    },
+    "vitest": {
+      "vite": "^7.3.2"
+    },
+    "@types/node": "$@types/node"
   }
 }

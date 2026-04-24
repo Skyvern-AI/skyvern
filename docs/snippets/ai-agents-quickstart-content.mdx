@@ -247,12 +247,18 @@ Reference docs you can fetch as needed:
 
 Give your AI coding assistant direct browser control through natural language. No SDK code needed.
 
+Claude Code and Cursor support MCP OAuth: point them at Skyvern Cloud and sign in through your browser. No API key is required in the MCP config. Other clients still use the API key from Section 1.
+
 <Tabs>
 <Tab title="Claude Code">
 
 ```bash
-claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
+claude mcp add --transport http skyvern https://api.skyvern.com/mcp/ --scope user
 ```
+
+Then run `/mcp` in Claude Code and follow the authentication prompt. Your browser opens for Skyvern sign-in and the token is stored for future sessions.
+
+Prefer a static key instead? Use `claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user`.
 
 </Tab>
 <Tab title="Cursor">
@@ -264,14 +270,15 @@ Add to `~/.cursor/mcp.json`:
   "mcpServers": {
     "Skyvern": {
       "type": "streamable-http",
-      "url": "https://api.skyvern.com/mcp/",
-      "headers": {
-        "x-api-key": "YOUR_SKYVERN_API_KEY"
-      }
+      "url": "https://api.skyvern.com/mcp/"
     }
   }
 }
 ```
+
+This config intentionally has no `headers` field. Cursor starts OAuth for remote servers that require authentication. Use a current Cursor release; if the prompt does not appear, update Cursor and reopen MCP settings.
+
+Restart Cursor, open MCP settings, and authenticate the Skyvern server when prompted.
 
 </Tab>
 <Tab title="Windsurf">

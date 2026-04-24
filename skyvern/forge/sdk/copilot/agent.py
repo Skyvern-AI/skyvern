@@ -22,6 +22,7 @@ import yaml
 from pydantic import ValidationError
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
@@ -168,6 +169,7 @@ def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_conte
         global_llm_context=global_llm_context,
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
+        total_tokens=ctx.total_tokens_used,
     )
 
 
@@ -178,6 +180,7 @@ def _translate_to_agent_result(
     chat_request: WorkflowCopilotChatRequest,
     organization_id: str,
 ) -> AgentResult:
+    # Deferred tools.py imports here and below: tools.py -> routes.workflow_copilot -> this module (circular at import time).
     from skyvern.forge.sdk.copilot.tools import _process_workflow_yaml
 
     text = extract_final_text(result)
@@ -198,6 +201,26 @@ def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
+            # REPLACE_WORKFLOW bypasses _update_workflow, so the post-emission
+            # reject has to run here too. Skip processing on detection; leave
+            # last_workflow / last_workflow_yaml at their pre-REPLACE values so
+            # the rejected YAML does not latch onto ctx.
+            from skyvern.forge.sdk.copilot.tools import (
+                _banned_block_reject_message,
+                _detect_new_banned_blocks,
+                _record_banned_block_reject_span,
+            )
+
+            banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
+            if banned_items:
+                _record_banned_block_reject_span("replace_workflow_inline", banned_items)
+                user_response = f"{user_response}\n\n(Note: {_banned_block_reject_message(banned_items)})"
+                workflow_yaml = ""
+        if workflow_yaml:
+            if ctx.user_message:
+                workflow_yaml = wrap_block_goals(workflow_yaml, ctx.user_message)
+            else:
+                LOG.warning("REPLACE_WORKFLOW inline path missing ctx.user_message; skipping block-goal wrap")
             try:
                 last_workflow = _process_workflow_yaml(
                     workflow_id=chat_request.workflow_id,
@@ -251,6 +274,7 @@ def _translate_to_agent_result(
         response_type=resp_type,
         workflow_yaml=last_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
+        total_tokens=ctx.total_tokens_used,
     )
 
 
@@ -486,6 +510,7 @@ async def run_copilot_agent(
                     global_llm_context=global_llm_context,
                     workflow_yaml=None,
                     workflow_was_persisted=ctx.workflow_persisted,
+                    total_tokens=ctx.total_tokens_used,
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)

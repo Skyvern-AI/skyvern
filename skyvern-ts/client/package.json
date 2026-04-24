@@ -68,6 +68,15 @@
     "engines": {
         "node": ">=18.0.0"
     },
+    "pnpm": {
+        "overrides": {
+            "vite": "^7.3.2",
+            "rollup": "^4.59.0",
+            "serialize-javascript": "^7.0.3",
+            "picomatch@2": "^2.3.2",
+            "picomatch@4": "^4.0.4"
+        }
+    },
     "sideEffects": false,
     "description": "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript.",
     "publishConfig": {

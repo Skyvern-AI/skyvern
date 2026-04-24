@@ -34,12 +34,8 @@ class DefaultCursorStrategy(CursorEventStrategy):
             LOG.debug("move_to_element failed", exc_info=True)
             return 0.0, 0.0
 
-    async def click(self, page: Page, locator: Locator, timeout: float | None = None) -> None:
-        LOG.debug("DefaultCursorStrategy.click", timeout=timeout)
-        kwargs: dict = {}
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        await locator.click(**kwargs)
+    async def click(self, page: Page, locator: Locator) -> None:
+        await locator.click()
 
 
 class DefaultInputStrategy(InputEventStrategy):
