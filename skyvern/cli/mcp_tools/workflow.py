@@ -17,6 +17,7 @@ import structlog
 import yaml
 from pydantic import Field
 
+from skyvern.client.core.api_error import ApiError
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
@@ -25,7 +26,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
-from ._validation import validate_folder_id, validate_run_id, validate_workflow_id
+from ._validation import validate_browser_profile_id, validate_folder_id, validate_run_id, validate_workflow_id
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -116,6 +117,7 @@ def _serialize_run(run: Any) -> dict[str, Any]:
         "recording_url",
         "app_url",
         "browser_session_id",
+        "browser_profile_id",
         "run_with",
         "ai_fallback",
     ):
@@ -1371,6 +1373,12 @@ async def skyvern_workflow_run(
     browser_session_id: Annotated[
         str | None, Field(description="Reuse an existing browser session (pbs_...) to preserve login state")
     ] = None,
+    browser_profile_id: Annotated[
+        str | None,
+        Field(
+            description="Load a cloud browser profile (bp_...) with saved authenticated state. Can be combined with browser_session_id to explicitly choose the profile."
+        ),
+    ] = None,
     webhook_url: Annotated[str | None, Field(description="URL for status webhook callbacks after completion")] = None,
     proxy_location: Annotated[
         str | None, Field(description="Geographic proxy: RESIDENTIAL, RESIDENTIAL_GB, NONE, etc.")
@@ -1392,6 +1400,12 @@ async def skyvern_workflow_run(
     or use wait=false and poll with skyvern_workflow_status."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_run"):
         return err
+    # Accept `is not None` (not truthy) so an empty string reaches the
+    # validator and is rejected with a pointed INVALID_INPUT instead of
+    # silently passing "" through to the SDK.
+    if browser_profile_id is not None:
+        if err := validate_browser_profile_id(browser_profile_id, "skyvern_workflow_run"):
+            return err
 
     parsed_params: dict[str, Any] | None = None
     if parameters is not None:
@@ -1431,6 +1445,7 @@ async def skyvern_workflow_run(
                 workflow_id=workflow_id,
                 parameters=parsed_params,
                 browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
                 webhook_url=webhook_url,
                 proxy_location=proxy,
                 wait_for_completion=wait,
@@ -1449,16 +1464,46 @@ async def skyvern_workflow_run(
                     "Increase timeout_seconds or set wait=false and poll with skyvern_workflow_status",
                 ),
             )
-        except NotFoundError:
+        except ApiError as e:
+            # The Fern-generated run_workflow client only explicitly maps
+            # 400/422; a 404 (bad workflow_id OR bad browser_profile_id) is
+            # raised as a generic ApiError, not NotFoundError. Catch ApiError
+            # and key off status_code so the 404-routing fires in production,
+            # not only in tests that happen to raise NotFoundError directly.
+            # NotFoundError IS-A ApiError(status_code=404), so tests that
+            # raise NotFoundError still land here.
+            if getattr(e, "status_code", None) == 404:
+                detail = ""
+                if isinstance(e.body, dict):
+                    detail = str(e.body.get("detail") or "")
+                if browser_profile_id and "browser profile" in detail.lower():
+                    return make_result(
+                        "skyvern_workflow_run",
+                        ok=False,
+                        timing_ms=timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.INVALID_INPUT,
+                            detail or f"Browser profile {browser_profile_id} not found",
+                            "Verify browser_profile_id with skyvern_browser_profile_list, or drop the flag to run without a saved profile.",
+                        ),
+                    )
+                return make_result(
+                    "skyvern_workflow_run",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.WORKFLOW_NOT_FOUND,
+                        f"Workflow {workflow_id!r} not found",
+                        "Verify the workflow ID with skyvern_workflow_list",
+                    ),
+                )
+            # Non-404 ApiError -> fall through to the generic handler
+            LOG.error("workflow_run_failed", workflow_id=workflow_id, error=str(e))
             return make_result(
                 "skyvern_workflow_run",
                 ok=False,
                 timing_ms=timer.timing_ms,
-                error=make_error(
-                    ErrorCode.WORKFLOW_NOT_FOUND,
-                    f"Workflow {workflow_id!r} not found",
-                    "Verify the workflow ID with skyvern_workflow_list",
-                ),
+                error=make_error(ErrorCode.API_ERROR, str(e), "Check the workflow ID, parameters, and API key"),
             )
         except Exception as e:
             LOG.error("workflow_run_failed", workflow_id=workflow_id, error=str(e))
@@ -1471,9 +1516,19 @@ async def skyvern_workflow_run(
 
     LOG.info("workflow_run_started", workflow_id=workflow_id, run_id=run.run_id, wait=wait)
     data = _serialize_run(run)
+    # The run_workflow response does not always echo back browser_profile_id
+    # even when the server used the profile; fall back to the requested value
+    # so agents can see what they sent. Treat the surfaced value as
+    # "requested, not confirmed by the server" (downstream API gap).
+    if browser_profile_id and "browser_profile_id" not in data:
+        data["browser_profile_id"] = browser_profile_id
     params_str = f", parameters={parsed_params}" if parsed_params else ""
+    session_str = f", browser_session_id={browser_session_id!r}" if browser_session_id else ""
+    profile_str = f", browser_profile_id={browser_profile_id!r}" if browser_profile_id else ""
     wait_str = f", wait_for_completion=True, timeout={timeout_seconds}" if wait else ""
-    data["sdk_equivalent"] = f"await skyvern.run_workflow(workflow_id={workflow_id!r}{params_str}{wait_str})"
+    data["sdk_equivalent"] = (
+        f"await skyvern.run_workflow(workflow_id={workflow_id!r}{params_str}{session_str}{profile_str}{wait_str})"
+    )
     return make_result("skyvern_workflow_run", data=data, timing_ms=timer.timing_ms)
 
 

@@ -39,6 +39,12 @@ from .browser import (
     skyvern_validate,
     skyvern_wait,
 )
+from .browser_profile import (
+    skyvern_browser_profile_create,
+    skyvern_browser_profile_delete,
+    skyvern_browser_profile_get,
+    skyvern_browser_profile_list,
+)
 from .credential import (
     skyvern_credential_delete,
     skyvern_credential_get,
@@ -194,6 +200,7 @@ file_upload, find, navigate, screenshot, evaluate
 **Tier 3 — Management** (no session needed):
 - **Sessions:** browser_session_create/close/list/get/connect
 - **Workflows:** workflow_create/run/status/get/list/update/delete/cancel/update_folder
+- **Browser Profiles:** browser_profile_list/get/create/delete for cloud saved-login management
 - **Scripts:** script_list_for_workflow, script_get_code, script_versions, script_fallback_episodes, script_deploy
 - **Credentials:** credential_list/get/delete
 - **Folders/Blocks:** folder_list/get/create/update/delete, block_schema, block_validate
@@ -215,6 +222,15 @@ Prefer cloud sessions by default. Use local=true for localhost URLs or self-host
 Use skyvern_browser_session_connect(cdp_url="...") to attach to an existing browser.
 
 Multi-tab flow: tab_list -> tab_new or click link -> tab_wait_for_new -> tab_switch -> work -> tab_switch back.
+
+## Cloud Auth Reuse
+
+Use browser profiles for durable cloud login reuse. Only create a browser profile when the user clearly asks to "save" or "remember" authenticated state; do not silently persist cookies from vague future-use language.
+Two source paths:
+- Session path: log in -> skyvern_browser_session_close(...) -> wait a few seconds -> skyvern_browser_profile_create(browser_session_id="pbs_..."). Calling create against an OPEN session returns ARCHIVE_NOT_READY indefinitely; the session must be closed and its archive uploaded first.
+- Workflow-run path: log in via a workflow with persist_browser_session=true -> skyvern_browser_profile_create(workflow_run_id="wr_..."). The server polls internally (~30s), so no close-wait dance is needed. Only wr_ IDs; tsk_v2_ task IDs are not accepted.
+Reuse by passing browser_profile_id to skyvern_browser_session_create or skyvern_workflow_run.
+state_save/state_load are local JSON browser-state files for local/OSS workflows; they are not the cloud browser-profile path. Browser-profile CRUD tools are secondary management tools; use normal session/workflow entrypoints for actual work.
 
 ## Workflows
 
@@ -322,6 +338,12 @@ mcp.tool(tags={"browser_primitive"}, annotations=_ro("List Iframes"))(skyvern_fr
 # -- Auth state persistence --
 mcp.tool(tags={"state"}, annotations=_mut("Save Browser State"))(skyvern_state_save)
 mcp.tool(tags={"state"}, annotations=_mut("Load Browser State"))(skyvern_state_load)
+
+# -- Browser profiles (cloud-durable auth state) --
+mcp.tool(tags={"browser_profile"}, annotations=_ro("List Browser Profiles"))(skyvern_browser_profile_list)
+mcp.tool(tags={"browser_profile"}, annotations=_ro("Get Browser Profile"))(skyvern_browser_profile_get)
+mcp.tool(tags={"browser_profile"}, annotations=_mut("Create Browser Profile"))(skyvern_browser_profile_create)
+mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(skyvern_browser_profile_delete)
 
 # -- Inspection tools (console, network, dialog, page errors, DOM) --
 mcp.tool(tags={"inspection"}, annotations=_ro("Get Console Messages"))(skyvern_console_messages)
@@ -477,6 +499,11 @@ __all__ = [
     # Auth state persistence
     "skyvern_state_save",
     "skyvern_state_load",
+    # Browser profiles (cloud-durable auth state)
+    "skyvern_browser_profile_list",
+    "skyvern_browser_profile_get",
+    "skyvern_browser_profile_create",
+    "skyvern_browser_profile_delete",
     # Prompts
     "build_workflow",
     "debug_automation",

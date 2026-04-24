@@ -528,6 +528,7 @@ class Skyvern(AsyncSkyvern):
         *,
         timeout: int | None = None,
         proxy_location: ProxyLocation | None = None,
+        browser_profile_id: str | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -538,6 +539,7 @@ class Skyvern(AsyncSkyvern):
                 Must be between 5 and 1440. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
+            browser_profile_id: Browser profile ID to load into the new session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
@@ -546,6 +548,7 @@ class Skyvern(AsyncSkyvern):
         browser_session = await self.create_browser_session(
             timeout=timeout,
             proxy_location=proxy_location,
+            browser_profile_id=browser_profile_id,
         )
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(

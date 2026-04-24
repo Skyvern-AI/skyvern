@@ -9,6 +9,7 @@ from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
+from skyvern.client.errors import NotFoundError
 from skyvern.schemas.runs import ProxyLocation
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
@@ -19,6 +20,7 @@ from ._session import (
     resolve_browser,
     set_current_session,
 )
+from ._validation import validate_browser_profile_id
 
 
 def _session_api_key_hash() -> str | None:
@@ -40,6 +42,10 @@ def _should_default_to_cdp() -> tuple[bool, str | None]:
 async def skyvern_browser_session_create(
     timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
     proxy_location: Annotated[str | None, Field(description="Proxy location: RESIDENTIAL, US, etc.")] = None,
+    browser_profile_id: Annotated[
+        str | None,
+        Field(description="Cloud browser profile ID (bp_...) to load saved authenticated state."),
+    ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
 ) -> dict[str, Any]:
@@ -52,6 +58,25 @@ async def skyvern_browser_session_create(
     # resolve_browser() stores the browser in session state via set_current_session()
     # internally, so we don't need to call it again here.
     use_cdp, cdp_url = _should_default_to_cdp()
+    if browser_profile_id and (local or use_cdp):
+        return make_result(
+            "skyvern_browser_session_create",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "browser_profile_id is only supported for cloud browser sessions",
+                "Use local=false with a cloud session, or omit browser_profile_id for local/CDP sessions.",
+            ),
+        )
+    # Accept `is not None` (not truthy) so an empty string reaches the
+    # validator and is rejected with a pointed INVALID_INPUT instead of
+    # silently passing "" through to the SDK, where the server also
+    # truthy-checks and treats "" as "no profile" — which would quietly
+    # break login-reuse flows when callers pass an empty env-expanded value.
+    if browser_profile_id is not None:
+        if err := validate_browser_profile_id(browser_profile_id, "skyvern_browser_session_create"):
+            return err
+
     if use_cdp and not local and cdp_url:
         with Timer() as timer:
             try:
@@ -92,16 +117,29 @@ async def skyvern_browser_session_create(
             skyvern = get_skyvern()
             if is_stateless_http_mode():
                 proxy = ProxyLocation(proxy_location) if proxy_location else None
-                session = await skyvern.create_browser_session(timeout=timeout or 60, proxy_location=proxy)
+                session = await skyvern.create_browser_session(
+                    timeout=timeout or 60,
+                    proxy_location=proxy,
+                    browser_profile_id=browser_profile_id,
+                )
                 timer.mark("sdk")
                 ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
+                response_data = {
+                    "session_id": session.browser_session_id,
+                    "timeout_minutes": timeout or 60,
+                }
+                # The create-browser-session response does not currently echo
+                # back browser_profile_id even when the server loaded one, so
+                # fall back to the requested id for display purposes. Callers
+                # should treat the returned value as "requested, not confirmed
+                # by the server." Tracked as a downstream API gap.
+                loaded_profile_id = getattr(session, "browser_profile_id", None) or browser_profile_id
+                if loaded_profile_id:
+                    response_data["browser_profile_id"] = loaded_profile_id
                 return make_result(
                     "skyvern_browser_session_create",
                     browser_context=ctx,
-                    data={
-                        "session_id": session.browser_session_id,
-                        "timeout_minutes": timeout or 60,
-                    },
+                    data=response_data,
                     timing_ms=timer.timing_ms,
                 )
 
@@ -109,6 +147,7 @@ async def skyvern_browser_session_create(
                 skyvern,
                 timeout=timeout or 60,
                 proxy_location=proxy_location,
+                browser_profile_id=browser_profile_id,
                 local=local,
                 headless=headless,
             )
@@ -131,6 +170,31 @@ async def skyvern_browser_session_create(
                     "Cloud sessions require SKYVERN_API_KEY. Check your environment.",
                 ),
             )
+        except NotFoundError as e:
+            # The session-create route returns 404 "Browser profile {id} not found"
+            # when browser_profile_id is invalid or deleted. Surface it as an
+            # input error so agents/operators fix the profile ID rather than
+            # chase an opaque SDK failure.
+            detail = ""
+            if isinstance(e.body, dict):
+                detail = str(e.body.get("detail") or "")
+            if browser_profile_id and "browser profile" in detail.lower():
+                return make_result(
+                    "skyvern_browser_session_create",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.INVALID_INPUT,
+                        detail or f"Browser profile {browser_profile_id} not found",
+                        "Verify browser_profile_id with skyvern_browser_profile_list, or drop the flag to create a fresh session.",
+                    ),
+                )
+            return make_result(
+                "skyvern_browser_session_create",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.SDK_ERROR, detail or str(e), "Failed to create browser session"),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_browser_session_create",
@@ -147,13 +211,17 @@ async def skyvern_browser_session_create(
             timing_ms=timer.timing_ms,
         )
 
+    response_data = {
+        "session_id": result.session_id,
+        "timeout_minutes": result.timeout_minutes,
+    }
+    result_profile_id = getattr(result, "browser_profile_id", None)
+    if result_profile_id:
+        response_data["browser_profile_id"] = result_profile_id
     return make_result(
         "skyvern_browser_session_create",
         browser_context=ctx,
-        data={
-            "session_id": result.session_id,
-            "timeout_minutes": result.timeout_minutes,
-        },
+        data=response_data,
         timing_ms=timer.timing_ms,
     )
 
