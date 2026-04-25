@@ -57,6 +57,7 @@ class TasksRepository(BaseRepository):
         retry: int | None = None,
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
+        workflow_system_prompt: str | None = None,
         task_type: str = TaskType.general,
         application: str | None = None,
         include_action_history_in_verification: bool | None = None,
@@ -79,6 +80,7 @@ class TasksRepository(BaseRepository):
         url = sanitize_postgres_text(url)
         complete_criterion = _sanitize(complete_criterion)
         terminate_criterion = _sanitize(terminate_criterion)
+        workflow_system_prompt = _sanitize(workflow_system_prompt)
 
         async with self.Session() as session:
             new_task = TaskModel(
@@ -102,6 +104,7 @@ class TasksRepository(BaseRepository):
                 retry=retry,
                 max_steps_per_run=max_steps_per_run,
                 error_code_mapping=error_code_mapping,
+                workflow_system_prompt=workflow_system_prompt,
                 application=application,
                 include_action_history_in_verification=include_action_history_in_verification,
                 model=model,

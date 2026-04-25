@@ -245,6 +245,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         retry=task_obj.retry,
         max_steps_per_run=task_obj.max_steps_per_run,
         error_code_mapping=task_obj.error_code_mapping,
+        workflow_system_prompt=task_obj.workflow_system_prompt,
         errors=task_obj.errors,
         application=task_obj.application,
         model=task_obj.model,
@@ -372,6 +373,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
         bundle_key=artifact_model.bundle_key,
+        checksum=artifact_model.checksum,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
@@ -488,6 +490,7 @@ def convert_to_workflow_run(
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
+        ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
     )
 
 

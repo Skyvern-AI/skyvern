@@ -321,6 +321,16 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
                 workflow_definition["parameters"], old_output_key, new_output_key
             )
 
+        # workflow_system_prompt is rendered through Jinja at execution time, so
+        # references inside it need the same rename treatment as block fields.
+        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_output_key, new_output_key
+            )
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_label, new_label
+            )
+
     # Step 4: Update all parameter key references
     for old_key, new_key in param_key_mapping.items():
         # Update Jinja references in blocks (e.g., {{ old_key }})
@@ -337,6 +347,11 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
             # Also update direct string references (e.g., source_parameter_key)
             workflow_definition["parameters"] = _replace_direct_string_in_value(
                 workflow_definition["parameters"], old_key, new_key
+            )
+
+        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_key, new_key
             )
 
     # Rewrite workflow-level error_code_mapping atomically so substitutions don't chain
@@ -614,6 +629,10 @@ class BlockYAML(BaseModel, abc.ABC):
     )
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+    # Opt-out from workflow-level workflow_system_prompt inheritance (and, on a
+    # WorkflowTriggerBlock, from propagating the parent chain's prompt into the
+    # spawned child run). A no-op for deterministic blocks that don't call an LLM.
+    ignore_workflow_system_prompt: bool = False
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
@@ -1105,6 +1124,7 @@ class WorkflowDefinitionYAML(BaseModel):
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":

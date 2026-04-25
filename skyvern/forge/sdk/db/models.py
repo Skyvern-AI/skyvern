@@ -103,6 +103,7 @@ class TaskModel(Base):
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
+    workflow_system_prompt = Column(UnicodeText, nullable=True)
     errors = Column(JSON, default=[], nullable=False)
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
@@ -248,6 +249,7 @@ class ArtifactModel(Base):
     uri = Column(String)
     bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True)
+    checksum = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -426,6 +428,14 @@ class WorkflowRunModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    # When True, this run was spawned by a WorkflowTriggerBlock whose
+    # ignore_workflow_system_prompt flag was set, and the child must not
+    # inherit the parent chain's workflow_system_prompt. Set at spawn time so
+    # async (Temporal-dispatched) child runs can honor the flag even though
+    # they start in a separate worker without in-process context.
+    ignore_inherited_workflow_system_prompt = Column(
+        Boolean, nullable=False, default=False, server_default=sqlalchemy.false()
+    )
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -864,6 +874,7 @@ class TaskV2Model(Base):
     proxy_location = Column(String, nullable=True)
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
+    workflow_system_prompt = Column(UnicodeText, nullable=True)
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)

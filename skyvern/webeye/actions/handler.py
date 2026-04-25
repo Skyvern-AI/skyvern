@@ -4463,6 +4463,7 @@ async def extract_information_for_navigation_goal(
             error_code_mapping=error_code_mapping_str,
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
+            workflow_system_prompt=task.workflow_system_prompt,
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
@@ -4548,6 +4549,7 @@ async def extract_information_for_navigation_goal(
                     # reasons unrelated to cache correctness.
                     prompt_name="extract-information",
                     force_dict=False,
+                    system_prompt=task.workflow_system_prompt,
                 )
                 # Apply the same post-processing the miss path applies so the
                 # comparison is apples-to-apples against the cached value.
@@ -4696,6 +4698,7 @@ async def extract_information_for_navigation_goal(
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
         force_dict=False,
+        system_prompt=task.workflow_system_prompt,
     )
 
     # Validate and fill missing fields based on schema

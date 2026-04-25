@@ -80,6 +80,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     NavigationBlock,
     TaskV2Block,
+    WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
 )
@@ -649,6 +650,7 @@ class WorkflowService:
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        ignore_inherited_workflow_system_prompt: bool = False,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -708,6 +710,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
+            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -940,6 +943,79 @@ class WorkflowService:
 
         return None
 
+    async def _collect_inherited_workflow_system_prompt(
+        self,
+        parent_workflow_run_id: str | None,
+    ) -> str | None:
+        """Walk up the parent workflow-run chain and join each ancestor's raw
+        ``workflow_system_prompt`` (outermost first). Returns None when no ancestor
+        has one set. A depth cap matches ``WorkflowTriggerBlock.MAX_TRIGGER_DEPTH``
+        to keep the traversal bounded against malformed chains.
+
+        This reads raw prompt strings from each ancestor's ``workflow_definition``
+        without Jinja rendering — the child's context will render them later via
+        ``WorkflowRunContext.resolve_effective_workflow_system_prompt``. Using raw
+        strings here avoids depending on the parent's live ``WorkflowRunContext``,
+        which isn't available for async/fire-and-forget child runs.
+
+        Chain-break on opt-out: when an ancestor has ``ignore_inherited_workflow_system_prompt``
+        set, its own prompt is still included (it ran without its own ancestors'
+        prompts, but its own rules remain its statement to descendants), but the
+        traversal stops there. A workflow explicitly opting out of its parents'
+        rules creates a clean boundary for itself and everything it triggers —
+        otherwise descendants would silently reintroduce prompts the opted-out
+        workflow rejected.
+        """
+        # Two-phase walk to keep DB round trips bounded. Phase 1 is an
+        # inherently sequential chain walk (each ``parent_workflow_run_id`` is
+        # only known after fetching the previous run), capped at
+        # ``MAX_TRIGGER_DEPTH``. Phase 2 batches the independent workflow-
+        # definition fetches with ``asyncio.gather`` so all N definition
+        # lookups happen in one concurrent burst instead of N sequential
+        # awaits — brings the worst case from 2N round trips down to
+        # N + 1 (depth-bounded at 10). A deeper optimization (single
+        # recursive CTE across workflow_runs + workflows) is possible if
+        # trigger chains ever get deep enough to matter.
+        chain: list[tuple[str, bool]] = []  # [(workflow_id, ignore_inherited), ...] outermost child first
+        current_parent_id: str | None = parent_workflow_run_id
+        visited: set[str] = set()
+        depth = 0
+        while current_parent_id and depth < WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
+            if current_parent_id in visited:
+                break
+            visited.add(current_parent_id)
+            parent_run = await app.DATABASE.workflow_runs.get_workflow_run(current_parent_id)
+            if parent_run is None:
+                break
+            chain.append((parent_run.workflow_id, parent_run.ignore_inherited_workflow_system_prompt))
+            if parent_run.ignore_inherited_workflow_system_prompt:
+                break
+            current_parent_id = parent_run.parent_workflow_run_id
+            depth += 1
+
+        if not chain:
+            return None
+
+        # Fetch all ancestor workflow definitions concurrently.
+        ancestor_workflows = await asyncio.gather(
+            *(self.get_workflow(workflow_id=workflow_id) for workflow_id, _ in chain),
+            return_exceptions=False,
+        )
+
+        prompts: list[str] = []
+        for workflow in ancestor_workflows:
+            if workflow is None or workflow.workflow_definition is None:
+                continue
+            raw = workflow.workflow_definition.workflow_system_prompt
+            if raw:
+                prompts.append(raw)
+
+        if not prompts:
+            return None
+        # Outermost ancestor first so child-local rules appear after broader rules.
+        prompts.reverse()
+        return "\n\n".join(prompts)
+
     @traced(name="skyvern.workflow.execute", role="wrapper")
     async def execute_workflow(
         self,
@@ -951,7 +1027,15 @@ class WorkflowService:
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
     ) -> WorkflowRun:
-        """Execute a workflow."""
+        """Execute a workflow.
+
+        When the workflow_run row has ``ignore_inherited_workflow_system_prompt``
+        set (populated at spawn time by a ``WorkflowTriggerBlock`` whose
+        ``ignore_workflow_system_prompt`` flag is True), the child workflow
+        starts with a clean slate — no inherited prompt from the ancestor
+        chain. Persisting the intent on the row means the flag is honored for
+        both sync and async (Temporal-dispatched) trigger modes.
+        """
         organization_id = organization.organization_id
 
         LOG.info(
@@ -1008,6 +1092,19 @@ class WorkflowService:
         # Get all <workflow parameter, workflow run parameter> tuples
         wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
         workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
+        # Collect resolved workflow_system_prompt from every ancestor workflow so child
+        # blocks inherit them (SKY-9147). We read each parent's workflow_definition from
+        # the DB because the parent's in-memory WorkflowRunContext may be gone by the
+        # time a fire-and-forget child runs on its own worker. Jinja placeholders in
+        # ancestor prompts are rendered against this run's values; parent-only
+        # parameters will simply render empty in non-strict mode.
+        inherited_workflow_system_prompt = (
+            None
+            if workflow_run.ignore_inherited_workflow_system_prompt
+            else await self._collect_inherited_workflow_system_prompt(
+                parent_workflow_run_id=workflow_run.parent_workflow_run_id,
+            )
+        )
         try:
             await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
                 organization,
@@ -1021,6 +1118,7 @@ class WorkflowService:
                 secret_parameters,
                 block_outputs,
                 workflow,
+                inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             )
         except Exception as e:
             LOG.exception(
@@ -2121,6 +2219,22 @@ class WorkflowService:
                     block_label=block.label,
                     run_signature=script_block.run_signature,
                 )
+                # Script path skips the block's own execute() (which is where
+                # format_potential_template_parameters runs in the agent path),
+                # so we apply the workflow_system_prompt here to thread the
+                # block-resolved value into the ``WorkflowRunContext`` cache.
+                # ``ai_extract`` reads from that cache so the script-generated
+                # extraction honors ``ignore_workflow_system_prompt`` the same
+                # way the agent path does — same string, same cache key.
+                try:
+                    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+                    block._apply_workflow_system_prompt(workflow_run_context)
+                except Exception:
+                    LOG.warning(
+                        "Failed to apply workflow_system_prompt for script-path block; continuing",
+                        block_label=block.label,
+                        exc_info=True,
+                    )
                 block_exec_start = time.monotonic()
                 try:
                     vars_dict = vars(loaded_script_module) if loaded_script_module else {}
@@ -3750,6 +3864,7 @@ class WorkflowService:
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        ignore_inherited_workflow_system_prompt: bool = False,
     ) -> WorkflowRun:
         # validate the browser session or profile id
         browser_profile_id = workflow_request.browser_profile_id
@@ -3840,6 +3955,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
+            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         )
 
     async def _update_workflow_run_status(
