@@ -618,6 +618,8 @@ prompt: <text_prompt>                          # Required: Prompt to run
 parameter_keys: []                             # Optional: Parameters used in this block
 json_schema: <json_schema>                     # Optional: Structured output schema
 
+Referencing output from downstream blocks: fields live on the block directly, NOT under `.output`. Write `{{ summarize_notes.summary }}`, not `{{ summarize_notes.output.summary }}`. See PARAMETER TEMPLATING for the full per-block-type rule and the null-guard requirement.
+
 Use Cases:
 - Summarize extracted text or documents
 - Normalize free-form content into a schema
@@ -716,10 +718,22 @@ There are TWO types of references:
    Requires: parameter_keys list must include the param_key
 
 2. BLOCK OUTPUTS - Reference output from a previous block by its label
-   Syntax: {{ block_label.output }}
+   Syntax depends on the upstream block type; see below.
    Requires: NOTHING - block outputs are automatically available, no parameter_keys needed
 
-IMPORTANT: Block outputs use the block's label directly (e.g., {{ block_1.output }}).
+IMPORTANT — block output shapes are NOT uniform across block types. Using the wrong shape either raises "dict object has no attribute 'output'" at render time or (worse) silently renders a None value into a URL field, producing `https://None` which fails with `net::ERR_NAME_NOT_RESOLVED`.
+
+* Browser-task blocks (navigation, extraction, goto_url, login, action, file_download):
+  - `{{ label.output }}` — the full TaskOutput envelope.
+  - `{{ label.output.extracted_information }}` — the extracted payload.
+  - Example: `{{ extract_items.output }}` inside a downstream prompt.
+
+* Non-task blocks (text_prompt, http_request, file_url_parser):
+  - `{{ label.<field> }}` — fields from the returned JSON are on the block directly; there is NO `.output` wrapper.
+  - Example: `{{ summarize_notes.summary }}` (NOT `{{ summarize_notes.output.summary }}`).
+  - Writing `{{ summarize_notes.output.summary }}` raises "dict object has no attribute 'output'" because `summarize_notes` IS the dict.
+
+NULL-GUARD RULE — when a downstream field may legitimately be null/empty (e.g., a text_prompt returned `{"store_url": null}` because no such link exists on the page), wrap the reference in a `conditional` block BEFORE using it as a URL. Unguarded `goto_url` with `url: "{{ x.field }}"` where `x.field` is None renders as `https://None` and is not recoverable by retrying the same workflow — it is a nullity bug, not a navigation bug.
 
 Examples - Workflow Parameters:
 
@@ -733,7 +747,7 @@ parameter_keys: [product_name, category]
 
 Examples - Block Outputs (no parameter_keys needed):
 
-* Send previous block output to webhook:
+* Send previous task-block output to webhook (task block → use .output):
 blocks:
   - block_type: navigation
     label: get_data
@@ -747,7 +761,7 @@ blocks:
       data: "{{ get_data.output }}"
     parameter_keys: []  # Empty - block outputs don't need to be declared
 
-* Use extraction output in next block:
+* Use extraction output in next block (task block → use .output):
 blocks:
   - block_type: extraction
     label: extract_items
@@ -755,6 +769,16 @@ blocks:
   - block_type: navigation
     label: process_items
     navigation_goal: "Process these items: {{ extract_items.output }}"
+
+* Use text_prompt output in next block (non-task block → reference fields directly, NO .output):
+blocks:
+  - block_type: text_prompt
+    label: summarize_notes
+    prompt: "Summarize ..."
+    json_schema: {type: object, properties: {summary: {type: string}}}
+  - block_type: navigation
+    label: use_summary
+    navigation_goal: "Act on: {{ summarize_notes.summary }}"    # NOT {{ summarize_notes.output.summary }}
 
 * In schemas (as descriptions):
 data_schema:

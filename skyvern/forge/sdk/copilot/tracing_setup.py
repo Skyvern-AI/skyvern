@@ -103,6 +103,58 @@ def ensure_tracing_initialized() -> None:
         LOG.info("Initialized copilot tracing", exporter="logfire")
 
 
+def _usage_field(obj: Any, *keys: str) -> Any:
+    """Return the first present field by key on a usage object/dict."""
+    if obj is None:
+        return None
+    for key in keys:
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+        else:
+            value = getattr(obj, key, None)
+            if value is not None:
+                return value
+    return None
+
+
+def _attach_cost_attr(attrs: dict[str, Any], usage: Any, model: str | None) -> None:
+    """Stamp ``operation.cost`` (USD) on a GenerationSpanData span.
+
+    Matches the attribute Logfire's native ``instrument_openai`` / ``instrument_anthropic``
+    integrations emit (via ``genai_prices``). Logfire's AI Agents dashboard keys cost
+    off this attribute. Silent on any failure so telemetry cannot break the copilot path.
+    """
+    if not model or usage is None:
+        return
+    input_tokens = _usage_field(usage, "input_tokens", "prompt_tokens")
+    output_tokens = _usage_field(usage, "output_tokens", "completion_tokens")
+    if not isinstance(input_tokens, (int, float)) or not isinstance(output_tokens, (int, float)):
+        return
+    # OpenAI reports cached prompt tokens nested under input_tokens_details; pull
+    # them out so cost reflects the cache discount instead of full input pricing.
+    cached = _usage_field(
+        _usage_field(usage, "input_tokens_details", "prompt_tokens_details"),
+        "cached_tokens",
+    )
+    cache_read = int(cached) if isinstance(cached, (int, float)) and cached > 0 else None
+    try:
+        from genai_prices import Usage, calc_price
+
+        price = calc_price(
+            Usage(
+                input_tokens=int(input_tokens),
+                output_tokens=int(output_tokens),
+                cache_read_tokens=cache_read,
+            ),
+            model_ref=model,
+            provider_id="openai",
+        )
+    except Exception:
+        return
+    attrs["operation.cost"] = float(price.total_price)
+
+
 def _patch_agent_span_attributes() -> None:
     """Patch logfire to emit OTel GenAI semantic convention attributes on agent spans.
 
@@ -147,6 +199,7 @@ def _patch_agent_span_attributes() -> None:
                     attrs["gen_ai.request.model"] = model
             elif isinstance(span_data, GenerationSpanData):
                 attrs.setdefault("gen_ai.operation.name", "chat")
+                _attach_cost_attr(attrs, getattr(span_data, "usage", None), getattr(span_data, "model", None))
             elif isinstance(span_data, FunctionSpanData):
                 attrs.setdefault("gen_ai.operation.name", "execute_tool")
                 if "name" in attrs:

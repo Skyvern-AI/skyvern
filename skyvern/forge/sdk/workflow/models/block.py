@@ -568,7 +568,10 @@ class Block(BaseModel, abc.ABC):
                 block=block_data,
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
+                prompt=description_generation_prompt,
+                prompt_name="generate-workflow-run-block-description",
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             description = json_response.get("summary")
             LOG.info(
@@ -2833,7 +2836,12 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
+        response = await llm_api_handler(
+            prompt=prompt,
+            prompt_name="text-prompt",
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -3980,7 +3988,12 @@ class FileParserBlock(Block):
                 file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse Excel file: {str(e)}"
             )
 
-    async def _parse_pdf_file(self, file_path: str) -> str:
+    async def _parse_pdf_file(
+        self,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         """Parse PDF file and return extracted text.
 
         Uses the shared PDF parsing utility that tries pypdf first,
@@ -4016,6 +4029,8 @@ class FileParserBlock(Block):
                 prompt_name="extract-text-from-image",
                 screenshots=page_images,
                 force_dict=True,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             return llm_response.get("extracted_text", "")
         except Exception:
@@ -4025,7 +4040,12 @@ class FileParserBlock(Block):
             )
             raise
 
-    async def _parse_image_file(self, file_path: str) -> str:
+    async def _parse_image_file(
+        self,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         """Parse image file using vision LLM for OCR."""
         try:
             with open(file_path, "rb") as f:
@@ -4040,6 +4060,8 @@ class FileParserBlock(Block):
                 prompt_name="extract-text-from-image",
                 screenshots=[image_bytes],
                 force_dict=True,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             return llm_response.get("extracted_text", "")
         except Exception:
@@ -4117,7 +4139,11 @@ class FileParserBlock(Block):
             )
 
     async def _extract_with_ai(
-        self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
+        self,
+        content: str | list[dict[str, Any]],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
     ) -> dict[str, Any]:
         """Extract structured data using AI based on json_schema."""
         # Use local variable to avoid mutating the instance
@@ -4146,7 +4172,11 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
 
         llm_response = await llm_api_handler(
-            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+            prompt=llm_prompt,
+            prompt_name="extract-information-from-file-text",
+            force_dict=False,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
         return llm_response
 
@@ -4223,9 +4253,17 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.EXCEL:
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
-            parsed_data = await self._parse_pdf_file(file_path)
+            parsed_data = await self._parse_pdf_file(
+                file_path,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         elif self.file_type == FileType.IMAGE:
-            parsed_data = await self._parse_image_file(file_path)
+            parsed_data = await self._parse_image_file(
+                file_path,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         elif self.file_type == FileType.DOCX:
             parsed_data = await self._parse_docx_file(file_path)
         else:
@@ -4250,7 +4288,12 @@ class FileParserBlock(Block):
 
         if self.json_schema:
             try:
-                ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
+                ai_extracted_data = await self._extract_with_ai(
+                    parsed_data,
+                    workflow_run_context,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
                 final_data = ai_extracted_data
             except Exception as e:
                 return await self.build_block_result(
@@ -4370,7 +4413,11 @@ class PDFParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+            prompt=llm_prompt,
+            prompt_name="extract-information-from-file-text",
+            force_dict=False,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)

@@ -222,13 +222,45 @@ def _normalize_llm_model(model: str | None) -> str | None:
     return model.split("/")[-1]
 
 
-def _assert_step_thought_exclusive(step: Step | None, thought: Thought | None) -> None:
-    # step and thought write the same llm_cost to different tables
-    # (steps.step_cost vs observer_thoughts.thought_cost). int_org_llm_costs
-    # UNION ALLs them, so setting both would double-count cost in
-    # fct_org_margin.llm_cost.
-    if step is not None and thought is not None:
-        raise ValueError("LLM API handler invoked with both step and thought set — these are mutually exclusive")
+def _assert_step_thought_block_exclusive(
+    step: Step | None,
+    thought: Thought | None,
+    workflow_run_block_id: str | None,
+) -> None:
+    # Each LLM call writes cost to exactly one of: steps.step_cost,
+    # observer_thoughts.thought_cost, workflow_run_blocks.llm_cost.
+    # Both the run-level SUM and the int_org_llm_costs dbt model rely on
+    # this exclusivity to avoid double-counting.
+    set_count = sum(1 for x in (step, thought, workflow_run_block_id) if x is not None)
+    if set_count > 1:
+        raise ValueError(
+            "LLM API handler invoked with more than one of step / thought / workflow_run_block_id set — "
+            "these are mutually exclusive"
+        )
+
+
+async def _persist_block_llm_cost(
+    workflow_run_block_id: str,
+    organization_id: str | None,
+    context: skyvern_context.SkyvernContext | None,
+    llm_cost: float,
+    prompt_name: str | None,
+) -> None:
+    """Increment workflow_run_blocks.llm_cost or warn if no org_id resolves."""
+    block_org_id = organization_id or (context.organization_id if context else None)
+    if block_org_id:
+        await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=block_org_id,
+            amount=llm_cost,
+        )
+    else:
+        LOG.warning(
+            "Block LLM cost dropped: workflow_run_block_id set but no organization_id resolved",
+            workflow_run_block_id=workflow_run_block_id,
+            llm_cost=llm_cost,
+            prompt_name=prompt_name,
+        )
 
 
 def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
@@ -562,6 +594,7 @@ class LLMAPIHandlerFactory:
             task_v2: TaskV2 | None = None,
             thought: Thought | None = None,
             ai_suggestion: AISuggestion | None = None,
+            workflow_run_block_id: str | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
             organization_id: str | None = None,
@@ -584,7 +617,7 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
-            _assert_step_thought_exclusive(step, thought)
+            _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
             start_time = time.perf_counter()
             _llm_span = otel_trace.get_current_span()
             _llm_span.set_attribute("llm_key", llm_key)
@@ -1000,6 +1033,12 @@ class LLMAPIHandlerFactory:
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         last_llm_model=actual_model,
                     )
+                if workflow_run_block_id:
+                    # Atomic UPDATE: description gen (asyncio.create_task in
+                    # execute_safe) races with the block's own execute() calls.
+                    await _persist_block_llm_cost(
+                        workflow_run_block_id, organization_id, context, llm_cost, prompt_name
+                    )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
@@ -1154,6 +1193,7 @@ class LLMAPIHandlerFactory:
             task_v2: TaskV2 | None = None,
             thought: Thought | None = None,
             ai_suggestion: AISuggestion | None = None,
+            workflow_run_block_id: str | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
             organization_id: str | None = None,
@@ -1164,7 +1204,7 @@ class LLMAPIHandlerFactory:
             force_dict: bool = True,
             system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
-            _assert_step_thought_exclusive(step, thought)
+            _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
             start_time = time.perf_counter()
             _llm_span = otel_trace.get_current_span()
             # handler_type distinguishes the three LLM entry points that share
@@ -1527,6 +1567,10 @@ class LLMAPIHandlerFactory:
                         thought_cost=llm_cost,
                         last_llm_model=actual_model,
                     )
+                if workflow_run_block_id:
+                    await _persist_block_llm_cost(
+                        workflow_run_block_id, organization_id, context, llm_cost, prompt_name
+                    )
                 parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
@@ -1749,6 +1793,7 @@ class LLMCaller:
         task_v2: TaskV2 | None = None,
         thought: Thought | None = None,
         ai_suggestion: AISuggestion | None = None,
+        workflow_run_block_id: str | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
         organization_id: str | None = None,
@@ -1760,7 +1805,7 @@ class LLMCaller:
         system_prompt: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
-        _assert_step_thought_exclusive(step, thought)
+        _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
         start_time = time.perf_counter()
         _llm_span = otel_trace.get_current_span()
         _llm_span.set_attribute("llm_key", self.llm_key)
@@ -1995,6 +2040,12 @@ class LLMCaller:
                     cached_token_count=call_stats.cached_tokens,
                     thought_cost=call_stats.llm_cost,
                     last_llm_model=actual_model,
+                )
+            if workflow_run_block_id and call_stats and call_stats.llm_cost is not None:
+                # call_stats.llm_cost is None when litellm can't compute cost
+                # (volcengine, some OPENAI_COMPATIBLE targets).
+                await _persist_block_llm_cost(
+                    workflow_run_block_id, organization_id, context, call_stats.llm_cost, prompt_name
                 )
 
             organization_id = organization_id or (

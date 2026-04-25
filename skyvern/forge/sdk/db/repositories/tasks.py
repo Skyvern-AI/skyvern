@@ -229,6 +229,23 @@ class TasksRepository(BaseRepository):
             row = (await session.execute(query)).one()
             return row.total, row.completed
 
+    @db_operation("get_step_cost_sum_by_task_ids")
+    async def get_step_cost_sum_by_task_ids(self, task_ids: list[str], organization_id: str) -> float:
+        """Sum `step_cost` across all steps belonging to the given task_ids.
+
+        Returns 0.0 for empty task_ids. Includes failed steps.
+        """
+        if not task_ids:
+            return 0.0
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(StepModel.step_cost), 0))
+                .where(StepModel.task_id.in_(task_ids))
+                .where(StepModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
+
     @db_operation("get_workflow_run_progress_timestamps")
     async def get_workflow_run_progress_timestamps(
         self,

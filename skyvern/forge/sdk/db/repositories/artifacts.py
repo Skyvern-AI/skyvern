@@ -372,6 +372,7 @@ class ArtifactsRepository(BaseRepository):
                     .filter(ArtifactModel.artifact_type == artifact_type)
                     .filter(ArtifactModel.organization_id == organization_id)
                     .order_by(ArtifactModel.created_at.desc())
+                    .limit(1)
                 )
             ).first()
             if artifact:
