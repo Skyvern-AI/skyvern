@@ -56,6 +56,7 @@ class WorkflowDefinition(BaseModel):
     blocks: List[BlockTypeVar]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -199,6 +200,7 @@ class WorkflowRun(BaseModel):
     code_gen: bool | None = None
     trigger_type: WorkflowRunTriggerType | None = None
     workflow_schedule_id: str | None = None
+    ignore_inherited_workflow_system_prompt: bool = False
 
     @field_validator("run_with", mode="before")
     @classmethod

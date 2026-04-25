@@ -27,6 +27,7 @@ async def prepare_workflow(
     code_gen: bool | None = None,
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    ignore_inherited_workflow_system_prompt: bool = False,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -47,6 +48,7 @@ async def prepare_workflow(
         code_gen=code_gen,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
+        ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
@@ -87,6 +89,7 @@ async def run_workflow(
     block_outputs: dict[str, t.Any] | None = None,
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    ignore_inherited_workflow_system_prompt: bool = False,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -98,6 +101,7 @@ async def run_workflow(
         request_id=request_id,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
+        ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(

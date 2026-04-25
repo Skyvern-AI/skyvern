@@ -47,6 +47,7 @@ class ArtifactsRepository(BaseRepository):
         run_id: str | None = None,
         thought_id: str | None = None,
         ai_suggestion_id: str | None = None,
+        checksum: str | None = None,
     ) -> Artifact:
         async with self.Session() as session:
             new_artifact = ArtifactModel(
@@ -62,6 +63,7 @@ class ArtifactsRepository(BaseRepository):
                 run_id=run_id,
                 ai_suggestion_id=ai_suggestion_id,
                 organization_id=organization_id,
+                checksum=checksum,
             )
             session.add(new_artifact)
             await session.commit()
@@ -356,6 +358,60 @@ class ArtifactsRepository(BaseRepository):
             if artifact:
                 return convert_to_artifact(artifact, self.debug_enabled)
             return None
+
+    @db_operation("find_download_artifact")
+    async def find_download_artifact(
+        self,
+        organization_id: str,
+        run_id: str,
+        uri: str,
+    ) -> Artifact | None:
+        """Return the existing DOWNLOAD artifact for ``(run_id, uri)`` if any.
+
+        Used by :meth:`ArtifactManager.create_download_artifact` to stay
+        idempotent: repeated saves of the same file in the same run (e.g.
+        within a loop block iteration) must reuse the existing artifact_id
+        so downstream URL-based dedup keeps seeing a stable URL.
+        """
+        async with self.Session() as session:
+            artifact = (
+                await session.scalars(
+                    select(ArtifactModel)
+                    .filter(ArtifactModel.run_id == run_id)
+                    .filter(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
+                    .filter(ArtifactModel.organization_id == organization_id)
+                    .filter(ArtifactModel.uri == uri)
+                    .order_by(ArtifactModel.created_at.desc())
+                )
+            ).first()
+            if artifact:
+                return convert_to_artifact(artifact, self.debug_enabled)
+            return None
+
+    @db_operation("list_artifacts_for_run_by_type")
+    async def list_artifacts_for_run_by_type(
+        self,
+        run_id: str,
+        organization_id: str,
+        artifact_type: ArtifactType,
+    ) -> list[Artifact]:
+        """List all artifacts for a run filtered by type, using the dedicated ``run_id`` column.
+
+        Unlike :meth:`get_artifacts_for_run` this does not consult a ``RunReader`` —
+        it filters directly on the partial index ``ix_artifacts_run_id_partial`` and
+        returns the rows ordered by creation time.
+        """
+        async with self.Session() as session:
+            artifacts = (
+                await session.scalars(
+                    select(ArtifactModel)
+                    .filter(ArtifactModel.run_id == run_id)
+                    .filter(ArtifactModel.artifact_type == artifact_type)
+                    .filter(ArtifactModel.organization_id == organization_id)
+                    .order_by(ArtifactModel.created_at)
+                )
+            ).all()
+            return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
 
     @db_operation("get_artifact_for_run")
     async def get_artifact_for_run(

@@ -261,6 +261,19 @@ class Block(BaseModel, abc.ABC):
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
     disable_cache: bool = False
+    # Opt-out from workflow-level workflow_system_prompt inheritance (and, on a
+    # WorkflowTriggerBlock, from propagating the parent chain's prompt into the
+    # spawned child run). A no-op for deterministic blocks that don't call an LLM.
+    ignore_workflow_system_prompt: bool = False
+    # Runtime cache populated by ``Block._apply_workflow_system_prompt`` — not
+    # user-settable. Excluded from serialization (``model_dump`` / JSON / API
+    # responses) so the resolved prompt doesn't leak into logs, workflow
+    # definition round-trips, or responses that weren't meant to carry it.
+    # Deliberately absent from the BlockYAML schema so it can never be set
+    # through YAML or the API. The user-facing opt-out is
+    # ``ignore_workflow_system_prompt``. Only consumed by block types that call
+    # an LLM; deterministic blocks ignore it.
+    workflow_system_prompt: str | None = Field(default=None, exclude=True)
 
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
@@ -516,6 +529,42 @@ class Block(BaseModel, abc.ABC):
                 )
 
         return template.render(template_data)
+
+    def _apply_workflow_system_prompt(
+        self,
+        workflow_run_context: WorkflowRunContext,
+    ) -> None:
+        """Resolve the workflow-level ``workflow_system_prompt`` for this block and
+        materialize it onto ``self.workflow_system_prompt``.
+
+        Concatenates any prompt inherited from ancestor workflows (propagated through
+        ``WorkflowTriggerBlock``) with this workflow's own ``workflow_system_prompt``.
+        Jinja substitutions on this workflow's own prompt are resolved against
+        ``workflow_run_context``; the inherited portion is already resolved at the
+        trigger boundary.
+
+        Shared by every block type that needs to inherit the workflow system prompt
+        into its own ``workflow_system_prompt`` runtime cache before dispatching an
+        LLM call. Callers invoke this inside ``format_potential_template_parameters``
+        so the value is available at execute time. ``workflow_system_prompt`` on each
+        block is a runtime cache — it's deliberately absent from the BlockYAML schema
+        and not user-settable.
+
+        When a block opts out via ``ignore_workflow_system_prompt``, this leaves
+        the block's own ``workflow_system_prompt`` untouched (falling back to the
+        system default if none is set). The opt-out covers both this workflow's
+        prompt and any inherited prompt from parent workflows.
+        """
+        if self.ignore_workflow_system_prompt:
+            # Record the opt-out so the script path (``ai_extract``) reads the
+            # same decision instead of re-resolving the flag from the
+            # definition. See ``WorkflowRunContext.record_block_workflow_system_prompt``.
+            workflow_run_context.record_block_workflow_system_prompt(self.label, None)
+            return
+        resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        if resolved is not None:
+            self.workflow_system_prompt = resolved
+        workflow_run_context.record_block_workflow_system_prompt(self.label, resolved)
 
     @classmethod
     def get_subclasses(cls) -> tuple[type[Block], ...]:
@@ -808,6 +857,10 @@ class BaseTaskBlock(Block):
                 )
                 for error_code, error_description in merged_mapping.items()
             }
+
+        # Materialize the workflow-level workflow_system_prompt onto this block so
+        # ForgeAgent.create_task can hand it off to the Task row verbatim.
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     @staticmethod
     async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
@@ -2787,6 +2840,8 @@ class TextPromptBlock(Block):
         if self.json_schema:
             self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def send_prompt(
         self,
         prompt: str,
@@ -2839,6 +2894,7 @@ class TextPromptBlock(Block):
         response = await llm_api_handler(
             prompt=prompt,
             prompt_name="text-prompt",
+            system_prompt=self.workflow_system_prompt,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
@@ -3786,6 +3842,8 @@ class FileParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
         url_parsed = urlparse(file_url)
@@ -4024,6 +4082,8 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key, default=app.LLM_API_HANDLER
             )
+            # OCR transcription intentionally skips system_prompt
+            # It still applies to the downstream extract-information-from-file-text call.
             llm_response = await llm_api_handler(
                 prompt=llm_prompt,
                 prompt_name="extract-text-from-image",
@@ -4055,6 +4115,8 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key, default=app.LLM_API_HANDLER
             )
+            # OCR transcription intentionally skips system_prompt — see
+            # _parse_pdf_file_with_vision_ocr for rationale.
             llm_response = await llm_api_handler(
                 prompt=llm_prompt,
                 prompt_name="extract-text-from-image",
@@ -4175,6 +4237,7 @@ class FileParserBlock(Block):
             prompt=llm_prompt,
             prompt_name="extract-information-from-file-text",
             force_dict=False,
+            system_prompt=self.workflow_system_prompt,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
@@ -4348,6 +4411,8 @@ class PDFParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4416,6 +4481,7 @@ class PDFParserBlock(Block):
             prompt=llm_prompt,
             prompt_name="extract-information-from-file-text",
             force_dict=False,
+            system_prompt=self.workflow_system_prompt,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
@@ -4837,6 +4903,10 @@ class TaskV2Block(Block):
             )
             self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
+        # Materialize the workflow-level workflow_system_prompt onto this block so
+        # execute() can hand it off to the TaskV2 row verbatim.
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4912,6 +4982,7 @@ class TaskV2Block(Block):
                 totp_identifier=resolved_totp_identifier,
                 totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
+                workflow_system_prompt=self.workflow_system_prompt,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -7091,6 +7162,7 @@ class WorkflowTriggerBlock(Block):
                         workflow_permanent_id=resolved_workflow_permanent_id,
                         organization=organization,
                         parent_workflow_run_id=workflow_run_id,
+                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                     )
                 except Exception as e:
                     error_msg = get_user_facing_exception_message(e)
@@ -7106,6 +7178,9 @@ class WorkflowTriggerBlock(Block):
                 )
 
                 try:
+                    # The opt-out flag is persisted on the child's workflow_run row at
+                    # spawn time (setup_workflow_run above), so execute_workflow reads
+                    # it from the DB. This works identically for sync and async triggers.
                     final_run = await app.WORKFLOW_SERVICE.execute_workflow(
                         workflow_run_id=triggered_run_id,
                         api_key=None,
@@ -7173,6 +7248,12 @@ class WorkflowTriggerBlock(Block):
                 browser_session_id=resolved_browser_session_id,
             )
             try:
+                # ``run_workflow`` persists this flag to the child's
+                # workflow_run row via its internal setup_workflow_run call,
+                # then dispatches to Temporal without passing the flag
+                # separately; the worker reads it back from the DB inside
+                # ``execute_workflow``. Symmetric with the sync branch above
+                # — the flag is written once, at spawn time, for both paths.
                 triggered_workflow_run = await run_workflow(
                     workflow_id=resolved_workflow_permanent_id,
                     organization=organization,
@@ -7180,6 +7261,7 @@ class WorkflowTriggerBlock(Block):
                     request=None,
                     background_tasks=None,
                     parent_workflow_run_id=workflow_run_id,
+                    ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                 )
             except Exception as e:
                 error_msg = get_user_facing_exception_message(e)

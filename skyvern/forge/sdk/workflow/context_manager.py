@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
 import structlog
@@ -26,7 +27,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_secret
-from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -45,6 +46,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.utils.strings import generate_random_string
+from skyvern.utils.templating import get_missing_variables
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
@@ -83,6 +85,7 @@ class WorkflowRunContext:
         ],
         block_outputs: dict[str, Any] | None = None,
         workflow: "Workflow | None" = None,
+        inherited_workflow_system_prompt: str | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -92,6 +95,7 @@ class WorkflowRunContext:
             workflow_run_id=workflow_run_id,
             aws_client=aws_client,
             workflow=workflow,
+            inherited_workflow_system_prompt=inherited_workflow_system_prompt,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -170,12 +174,34 @@ class WorkflowRunContext:
         workflow_run_id: str,
         aws_client: AsyncAWSClient,
         workflow: "Workflow | None" = None,
+        inherited_workflow_system_prompt: str | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
         self.workflow = workflow
+        # Joined raw workflow_system_prompt(s) from ancestor workflows (outermost
+        # first) collected by walking workflow_run.parent_workflow_run_id at
+        # execute_workflow time. Jinja-rendered on demand and concatenated with
+        # this workflow's own workflow_system_prompt inside
+        # resolve_effective_workflow_system_prompt so parent-workflow rules flow
+        # into every child block and agent (SKY-9147).
+        self.inherited_workflow_system_prompt = inherited_workflow_system_prompt
+        # Sentinel for the lazy-resolved effective workflow_system_prompt cache.
+        # Using a sentinel (not None) so "resolved to None" is distinguishable
+        # from "not yet resolved". Invalidated by set_workflow() because late
+        # hydration can change the workflow's own workflow_system_prompt.
+        self._effective_workflow_system_prompt_cache: str | None = None
+        self._effective_workflow_system_prompt_resolved: bool = False
+        # Per-block record of the effective workflow_system_prompt once a block
+        # has run through ``Block._apply_workflow_system_prompt``. Keyed by
+        # block label. ``None`` is a valid recorded value (block opted out).
+        # Read by the script path (``RealSkyvernPageAi.ai_extract``) so a
+        # cached-script extraction uses the same string the agent path would
+        # — single source of truth, no re-resolving the opt-out from the
+        # workflow definition in two places (SKY-9147).
+        self._block_workflow_system_prompts: dict[str, str | None] = {}
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
@@ -193,6 +219,12 @@ class WorkflowRunContext:
         This is used when the workflow is fetched from the database as a fallback.
         """
         self.workflow = workflow
+        # Late-hydrated workflow may carry a different workflow_system_prompt than
+        # what was visible at construction time. Drop the cache so the next
+        # resolve_effective_workflow_system_prompt() re-renders against the new
+        # definition.
+        self._effective_workflow_system_prompt_resolved = False
+        self._effective_workflow_system_prompt_cache = None
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -224,6 +256,108 @@ class WorkflowRunContext:
         if label is None:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
+
+    def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
+        """Record the effective ``workflow_system_prompt`` a block resolved to.
+
+        Called by ``Block._apply_workflow_system_prompt`` (agent path) and by
+        the script-path dispatch before handing execution to cached code. Both
+        paths use the same recorded value in ``ai_extract`` so agent and
+        script extractions for the same block hash to the same cache key and
+        the same LLM input.
+        """
+        if label:
+            self._block_workflow_system_prompts[label] = value
+
+    def get_block_workflow_system_prompt(self, label: str | None) -> tuple[bool, str | None]:
+        """Return ``(recorded, value)`` for a block label.
+
+        ``recorded`` is True only when the block has actually run through
+        ``_apply_workflow_system_prompt`` — a recorded ``None`` (opt-out) is
+        distinguished from "never recorded" so callers can fall back safely
+        for non-block invocations (e.g. standalone scripts).
+        """
+        if label and label in self._block_workflow_system_prompts:
+            return True, self._block_workflow_system_prompts[label]
+        return False, None
+
+    def resolve_effective_workflow_system_prompt(self) -> str | None:
+        """Return the effective workflow-level system prompt for this run.
+
+        Concatenates any prompt inherited from ancestor workflows (propagated via
+        ``WorkflowTriggerBlock`` — outermost first) with this workflow's own
+        ``workflow_system_prompt``. Jinja substitutions are rendered against this
+        run's values for both portions so ancestor templates can still reference
+        common variables like ``workflow_title``; placeholders that only exist in
+        the parent's context render empty under non-strict mode. Parts join with
+        a blank line so distinct rule sets stay readable to the LLM. Returns
+        ``None`` when nothing is configured at any level so callers can short-
+        circuit on a simple falsy check.
+
+        The resolved string is cached on first call and reused for the life of
+        the run so every block sees the same effective prompt — and the LLM
+        cache keys that derive from it stay stable across blocks. The cache is
+        invalidated in ``set_workflow`` for the late-hydration path.
+        """
+        if self._effective_workflow_system_prompt_resolved:
+            return self._effective_workflow_system_prompt_cache
+        own_raw: str | None = None
+        if self.workflow is not None and self.workflow.workflow_definition is not None:
+            candidate = self.workflow.workflow_definition.workflow_system_prompt
+            # ``isinstance`` guard: a malformed workflow definition (or a test
+            # MagicMock whose attribute access returns another mock) could
+            # hand us a non-string here. Jinja's ``from_string`` would then
+            # raise ``Can't compile non template nodes`` deep inside the
+            # render path. Narrowing to ``str`` keeps the fallback silent.
+            if isinstance(candidate, str):
+                own_raw = candidate
+        inherited = (
+            self.inherited_workflow_system_prompt if isinstance(self.inherited_workflow_system_prompt, str) else None
+        )
+        inherited_resolved = self.render_workflow_level_template(inherited) if inherited else None
+        own_resolved = self.render_workflow_level_template(own_raw) if own_raw else None
+        parts = [p for p in (inherited_resolved, own_resolved) if p]
+        resolved = "\n\n".join(parts) if parts else None
+        self._effective_workflow_system_prompt_cache = resolved
+        self._effective_workflow_system_prompt_resolved = True
+        return resolved
+
+    def render_workflow_level_template(self, raw_template: str) -> str:
+        """Render a Jinja template against workflow-scoped variables only.
+
+        Shared by every path that resolves the workflow-level workflow_system_prompt
+        (block execution, script-path ai_extract) so both produce the same string —
+        same cache key, same LLM output. Deliberately omits block-scoped context:
+        a workflow-wide prompt has no single "current block" to bind against.
+        """
+        if not raw_template:
+            return raw_template
+
+        template_data: dict[str, Any] = self.values.copy()
+        template_data.setdefault("workflow_title", self.workflow_title)
+        template_data.setdefault("workflow_id", self.workflow_id)
+        template_data.setdefault("workflow_permanent_id", self.workflow_permanent_id)
+        template_data.setdefault("workflow_run_id", self.workflow_run_id)
+        template_data.setdefault("browser_session_id", self.browser_session_id or "")
+        template_data.setdefault("current_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        template_data["workflow_run_outputs"] = self.workflow_run_outputs
+        template_data["workflow_run_summary"] = self.build_workflow_run_summary()
+
+        if missing_variables := get_missing_variables(raw_template, template_data):
+            if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+                raise MissingJinjaVariables(template=raw_template, variables=missing_variables)
+            # Non-strict mode silently renders undefined variables as empty strings,
+            # which makes typos like {{ persona }} invisible to the user. Emit a
+            # warning so the operator has a breadcrumb when a workflow_system_prompt
+            # isn't picking up the value they expected.
+            LOG.warning(
+                "Undefined Jinja variables in workflow-level template; rendering them as empty strings",
+                missing_variables=missing_variables,
+                workflow_run_id=self.workflow_run_id,
+                workflow_permanent_id=self.workflow_permanent_id,
+            )
+
+        return jinja_sandbox_env.from_string(raw_template).render(template_data)
 
     async def _should_include_secrets_in_templates(self) -> bool:
         """
@@ -1266,6 +1400,7 @@ class WorkflowContextManager:
         ],
         block_outputs: dict[str, Any] | None = None,
         workflow: "Workflow | None" = None,
+        inherited_workflow_system_prompt: str | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -1280,6 +1415,7 @@ class WorkflowContextManager:
             secret_parameters,
             block_outputs,
             workflow,
+            inherited_workflow_system_prompt=inherited_workflow_system_prompt,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

@@ -61,6 +61,9 @@ class ArtifactType(StrEnum):
     # Task archive: one ZIP per task containing task-level cleanup artifacts (HAR, console log, trace, final screenshot)
     TASK_ARCHIVE = "task_archive"
 
+    # Files downloaded by the browser during a run (stored in the uploads bucket, not the artifacts bucket).
+    DOWNLOAD = "download"
+
 
 class Artifact(BaseModel):
     created_at: datetime = Field(
@@ -82,6 +85,7 @@ class Artifact(BaseModel):
     artifact_type: ArtifactType
     uri: str
     bundle_key: str | None = None
+    checksum: str | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_run_id: str | None = None

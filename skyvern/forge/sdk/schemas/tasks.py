@@ -69,6 +69,11 @@ class TaskBase(BaseModel):
             }
         ],
     )
+    workflow_system_prompt: str | None = Field(
+        default=None,
+        description="System prompt applied to every LLM call for this task. Inherited from the workflow-level workflow_system_prompt when unset.",
+        examples=["Never guess at an answer. If unsure, respond with UNKNOWN."],
+    )
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,

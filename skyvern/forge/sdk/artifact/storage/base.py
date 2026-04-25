@@ -1,12 +1,40 @@
 from abc import ABC, abstractmethod
 from typing import BinaryIO
 
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+
+
+def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
+    """Build the API-shaped ``FileInfo`` list from DOWNLOAD artifact rows.
+
+    Filename is the URI basename (the save site writes ``{base_uri}/{file}``);
+    checksum and modified_at come straight from the row, so retrieval needs
+    zero S3 round-trips.
+    """
+    infos: list[FileInfo] = []
+    for artifact in artifacts:
+        filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+        url = app.ARTIFACT_MANAGER.build_signed_content_url(
+            artifact_id=artifact.artifact_id,
+            artifact_name=filename,
+            artifact_type=ArtifactType.DOWNLOAD.value,
+        )
+        infos.append(
+            FileInfo(
+                url=url,
+                checksum=artifact.checksum,
+                filename=filename,
+                modified_at=artifact.created_at,
+            )
+        )
+    return infos
+
 
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {

@@ -11,6 +11,7 @@ import zstandard as zstd
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    _file_infos_from_download_artifacts,
 )
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -432,15 +434,91 @@ class S3Storage(BaseStorage):
                 organization_id=organization_id,
                 storage_class=storage_class,
             )
-            # Upload file with checksum metadata
-            await self.async_client.upload_file_from_path(
-                uri=uri,
-                file_path=fpath,
-                metadata={"sha256_checksum": checksum, "original_filename": file},
-                storage_class=storage_class,
-            )
+            # S3 object metadata only allows ASCII; non-ASCII filenames (CJK,
+            # emoji) would otherwise raise ParamValidationError at upload time.
+            # The full filename is still preserved in the S3 key and on the
+            # Artifact row's URI.
+            metadata: dict[str, str] = {"sha256_checksum": checksum}
+            if file.isascii():
+                metadata["original_filename"] = file
+            # Upload with raise_exception=True so a partial failure aborts
+            # this iteration and we never create an Artifact row for bytes
+            # that didn't actually land in S3.
+            try:
+                await self.async_client.upload_file_from_path(
+                    uri=uri,
+                    file_path=fpath,
+                    metadata=metadata,
+                    storage_class=storage_class,
+                    raise_exception=True,
+                )
+            except Exception:
+                LOG.warning(
+                    "Skipping downloaded file — S3 upload failed",
+                    file=file,
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    exc_info=True,
+                )
+                continue
+
+            # Register the file as an Artifact so GET run output can serve it via
+            # the signed /v1/artifacts/{id}/content endpoint (SKY-8861). Persist
+            # the SHA-256 we already computed so retrieval doesn't need an
+            # extra S3 HEAD per file.
+            if run_id is not None:
+                try:
+                    await app.ARTIFACT_MANAGER.create_download_artifact(
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        uri=uri,
+                        filename=file,
+                        checksum=checksum,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to register downloaded file as artifact; falling back to S3 listing for retrieval",
+                        file=file,
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        exc_info=True,
+                    )
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        # Artifact-first: when a run has DOWNLOAD artifact rows, return them as
+        # the source of truth — the row carries enough to build a short signed
+        # /v1/artifacts/{id}/content URL plus the SHA-256 we persisted at save
+        # time, so we skip the S3 LIST and per-file HEAD entirely (SKY-8861).
+        #
+        # If HMAC signing isn't configured (self-hosted OSS default), the signed
+        # endpoint requires an API key webhook consumers don't have, so we stay
+        # on the legacy S3-list+presign path even when rows exist.
+        if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            if artifacts:
+                return _file_infos_from_download_artifacts(artifacts)
+
+        # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
+        # OSS-default deployments without HMAC signing both arrive here.
+        return await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+
+    async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
+        try:
+            return await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                run_id=run_id,
+                organization_id=organization_id,
+                artifact_type=ArtifactType.DOWNLOAD,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to look up download artifacts; falling back to presigned S3 URLs",
+                organization_id=organization_id,
+                run_id=run_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _get_downloaded_files_via_s3_listing(self, *, organization_id: str, run_id: str | None) -> list[FileInfo]:
         bucket = settings.AWS_S3_BUCKET_UPLOADS
         uri = f"s3://{bucket}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
@@ -451,25 +529,22 @@ class S3Storage(BaseStorage):
         for key in object_keys:
             object_uri = f"s3://{bucket}/{key}"
 
-            # Get metadata (including checksum)
             metadata = await self.async_client.get_file_metadata(object_uri, log_exception=False)
-
-            # Create FileInfo object
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
+            display_name = metadata.get("original_filename", filename) if metadata else filename
 
-            # Get presigned URL
             presigned_urls = await self.async_client.create_presigned_urls([object_uri])
             if not presigned_urls:
                 continue
 
-            file_info = FileInfo(
-                url=presigned_urls[0],
-                checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
+            file_infos.append(
+                FileInfo(
+                    url=presigned_urls[0],
+                    checksum=checksum,
+                    filename=display_name,
+                )
             )
-            file_infos.append(file_info)
-
         return file_infos
 
     async def save_legacy_file(

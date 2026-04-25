@@ -1,7 +1,9 @@
 import asyncio
 import json
+import unicodedata
 from enum import Enum
 from typing import Annotated, Any
+from urllib.parse import quote
 
 import structlog
 import yaml
@@ -1459,8 +1461,104 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
     ArtifactType.RECORDING: "video/webm",
+    ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+
+
+def _sanitize_header_filename(name: str) -> str:
+    """Strip characters that would break or inject into a Content-Disposition header.
+
+    The artifact URI basename is derived from a user-controlled S3 key. Rejects:
+
+    - C0 (<0x20), DEL (0x7F), C1 (0x80-0x9F) — RFC 7230 violations.
+    - ``"`` and ``\\`` — would terminate or escape the quoted value.
+    - Unicode *format* (Cf) and *separator-line/paragraph* (Zl/Zp) chars —
+      includes bidi overrides (U+202E), ZWSP (U+200B), ZWNBSP (U+FEFF);
+      these enable filename spoofing in the browser download UI.
+    """
+    cleaned = []
+    for ch in name:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
+            continue
+        if ch in ('"', "\\"):
+            continue
+        if unicodedata.category(ch) in {"Cf", "Zl", "Zp"}:
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned) or "download"
+
+
+def _ascii_fallback_filename(name: str) -> str:
+    """Best-effort ASCII form of ``name`` for the ``filename=`` parameter.
+
+    NFKD-normalizes and drops combining marks first so accented Latin
+    characters survive as their base letters (``fïlè.pdf`` → ``file.pdf``)
+    instead of being stripped entirely. The RFC 5987 ``filename*=UTF-8''...``
+    form still carries the full name for modern clients.
+
+    If the ASCII stem ends up empty (e.g. pure CJK or emoji names),
+    prepend ``download`` so legacy clients don't save a bare ``.pdf``
+    hidden file.
+    """
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    sanitized = _sanitize_header_filename(ascii_only)
+    stem, dot, ext = sanitized.rpartition(".")
+    if dot and not stem:
+        return f"download.{ext}"
+    return sanitized
+
+
+def _build_attachment_disposition(filename: str) -> str:
+    """Build a Content-Disposition header that survives non-ASCII filenames.
+
+    Emits both ``filename="<ascii>"`` (for legacy clients) and
+    ``filename*=UTF-8''<pct-encoded>`` (RFC 5987, for everything modern).
+    Ensures the header value is Latin-1 encodable so Starlette doesn't 500.
+    """
+    safe = _sanitize_header_filename(filename)
+    ascii_part = _ascii_fallback_filename(safe)
+    encoded = quote(safe, safe="")
+    return f"attachment; filename=\"{ascii_part}\"; filename*=UTF-8''{encoded}"
+
+
+def _artifact_filename_from_uri(uri: str | None) -> str:
+    """Extract the basename from an ``s3://``/``azure://`` URI without using
+    ``urlparse`` — that would split on ``?``/``#`` characters, which are legal
+    in S3 keys."""
+    if not uri:
+        return ""
+    return uri.rsplit("/", 1)[-1]
+
+
+def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
+    """Return (media_type, Content-Disposition) for the artifact content response.
+
+    DOWNLOAD artifacts use ``attachment`` disposition with the sanitized filename
+    so browsers never render user-supplied content inline (SKY-8862). All other
+    types keep the historical ``inline`` behaviour.
+    """
+    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    if artifact.artifact_type == ArtifactType.DOWNLOAD:
+        raw_name = _artifact_filename_from_uri(artifact.uri)
+        return media_type, _build_attachment_disposition(raw_name)
+    return media_type, "inline"
+
+
+def _artifact_content_response_headers(*, disposition: str, is_signed: bool) -> dict[str, str]:
+    """Response headers for the artifact content endpoint.
+
+    Includes ``X-Content-Type-Options: nosniff`` as defence-in-depth for
+    SKY-8862: even if something upstream strips the attachment disposition,
+    the browser will not sniff the octet-stream body back into HTML/PDF.
+    """
+    return {
+        "Content-Disposition": disposition,
+        "Cache-Control": f"private, max-age={ARTIFACT_URL_EXPIRY_SECONDS}" if is_signed else "private, no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
 
 
 @base_router.get(
@@ -1529,16 +1627,15 @@ async def get_artifact_content(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail="Artifact content not available",
         )
-    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    media_type, content_disposition = _artifact_response_config(artifact)
     is_signed = sig is not None and expiry is not None and kid is not None
-    cache_control = f"private, max-age={ARTIFACT_URL_EXPIRY_SECONDS}" if is_signed else "private, no-cache"
     return Response(
         content=content,
         media_type=media_type,
-        headers={
-            "Content-Disposition": "inline",
-            "Cache-Control": cache_control,
-        },
+        headers=_artifact_content_response_headers(
+            disposition=content_disposition,
+            is_signed=is_signed,
+        ),
     )
 
 

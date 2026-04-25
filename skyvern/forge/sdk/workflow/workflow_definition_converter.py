@@ -327,6 +327,7 @@ def convert_workflow_definition(
         version=dag_version,
         finally_block_label=workflow_definition_yaml.finally_block_label,
         error_code_mapping=workflow_definition_yaml.error_code_mapping,
+        workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
     )
 
     LOG.info(
@@ -383,6 +384,7 @@ def _build_block_kwargs(
         "continue_on_failure": block_yaml.continue_on_failure,
         "next_loop_on_failure": block_yaml.next_loop_on_failure,
         "model": block_yaml.model,
+        "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
 
 
