@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.task_v2 import Thought
-from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.runs import RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.actions import Action
 
@@ -65,6 +65,10 @@ class WorkflowRunBlock(BaseModel):
     executed_branch_expression: str | None = None
     executed_branch_result: bool | None = None
     executed_branch_next_block: str | None = None
+
+    # Set when a script→AI fallback fires on this block. `None` covers
+    # clean cached execution, always-agent blocks, and pre-column rows.
+    script_run: ScriptRunResponse | None = None
 
 
 class WorkflowRunTimelineType(StrEnum):

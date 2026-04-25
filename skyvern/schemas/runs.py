@@ -590,6 +590,10 @@ class BlockRunRequest(WorkflowRunRequest):
 
 
 class ScriptRunResponse(BaseModel):
+    # `extra="ignore"` is the Pydantic v2 default; making it explicit
+    # pins the forward-compat guarantee (unknown keys silently dropped).
+    model_config = ConfigDict(extra="ignore")
+
     # True iff a fallback fired during this run, flipping at least one
     # block's execution from cached script to the agent. Writers: the two
     # `services/script_service.py` fallback paths (script-block failure +

@@ -827,6 +827,13 @@ class WorkflowRunBlockModel(Base):
     # Accumulates LLM cost for block-scoped calls (no step/thought attribution).
     llm_cost = Column(Numeric, default=0, nullable=False)
 
+    # Per-block cached-script execution state. Written (via the writer bridge
+    # in `services/script_service.py::_update_workflow_block`) when a script
+    # block falls back to AI mid-execution. Always null for blocks that ran
+    # cleanly from cache or were always-agent. Mirrors the `script_run`
+    # column on `WorkflowRunModel` but at block granularity.
+    script_run = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 

@@ -28,7 +28,7 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.schemas.runs import ProxyLocationInput, RunEngine
+from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
@@ -550,7 +550,9 @@ class ObserverRepository(BaseRepository):
                 if http_request_follow_redirects is not None:
                     workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 if ai_fallback_triggered is not None:
-                    workflow_run_block.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                    workflow_run_block.script_run = ScriptRunResponse(
+                        ai_fallback_triggered=ai_fallback_triggered
+                    ).model_dump(mode="json")
                 if error_codes is not None:
                     workflow_run_block.error_codes = error_codes
                 # human interaction block fields

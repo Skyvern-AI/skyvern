@@ -686,6 +686,9 @@ def convert_to_workflow_run_block(
         executed_branch_expression=workflow_run_block_model.executed_branch_expression,
         executed_branch_result=workflow_run_block_model.executed_branch_result,
         executed_branch_next_block=workflow_run_block_model.executed_branch_next_block,
+        script_run=ScriptRunResponse.model_validate(workflow_run_block_model.script_run)
+        if workflow_run_block_model.script_run
+        else None,
     )
     if task:
         if task.finished_at and task.started_at:
