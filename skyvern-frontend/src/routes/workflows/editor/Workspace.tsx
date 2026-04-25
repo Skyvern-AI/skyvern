@@ -1206,6 +1206,8 @@ function Workspace({
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
         workflowData.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        workflowData.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -1254,6 +1256,8 @@ function Workspace({
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
         selectedVersion.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -2006,6 +2010,8 @@ function Workspace({
               blocks: saveData.blocks,
               finally_block_label:
                 saveData.settings.finallyBlockLabel ?? undefined,
+              workflow_system_prompt:
+                saveData.settings.workflowSystemPrompt ?? undefined,
             });
 
             // Convert current workflow definition YAML to blocks

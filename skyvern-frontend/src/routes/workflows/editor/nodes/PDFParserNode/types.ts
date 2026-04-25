@@ -22,6 +22,7 @@ export const pdfParserNodeDefaultData: PDFParserNodeData = {
   continueOnFailure: false,
   jsonSchema: "null",
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isPdfParserNode(node: AppNode): node is PDFParserNode {

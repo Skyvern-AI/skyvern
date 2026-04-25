@@ -20,6 +20,7 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   continueOnFailure: false,
   parameterKeys: [],
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isTextPromptNode(node: AppNode): node is TextPromptNode {

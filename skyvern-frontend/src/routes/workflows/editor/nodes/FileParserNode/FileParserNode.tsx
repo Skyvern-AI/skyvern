@@ -22,6 +22,8 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { ModelSelector } from "@/components/ModelSelector";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { Separator } from "@/components/ui/separator";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 
 const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
   { value: "auto_detect", label: "Auto detect" },
@@ -186,6 +188,18 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
             value={data.model}
             onChange={(value) => {
               update({ model: value });
+            }}
+          />
+          <Separator />
+          <IgnoreWorkflowSystemPrompt
+            ignoreWorkflowSystemPrompt={
+              data.ignoreWorkflowSystemPrompt ?? false
+            }
+            editable={editable}
+            onIgnoreWorkflowSystemPromptChange={(
+              ignoreWorkflowSystemPrompt,
+            ) => {
+              update({ ignoreWorkflowSystemPrompt });
             }}
           />
         </div>

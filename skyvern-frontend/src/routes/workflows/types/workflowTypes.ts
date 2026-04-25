@@ -292,6 +292,7 @@ export type WorkflowBlockBase = {
   next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
   next_block_label?: string | null;
+  ignore_workflow_system_prompt?: boolean;
 };
 
 export const BranchCriteriaTypes = {
@@ -603,6 +604,7 @@ export type WorkflowDefinition = {
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
+  workflow_system_prompt?: string | null;
 };
 
 export type WorkflowApiResponse = {
@@ -652,6 +654,7 @@ export type WorkflowSettings = {
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

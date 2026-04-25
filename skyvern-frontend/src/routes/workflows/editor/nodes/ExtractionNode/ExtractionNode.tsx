@@ -38,6 +38,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
@@ -240,6 +241,17 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                     editable={editable}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
+                    }}
+                  />
+                  <IgnoreWorkflowSystemPrompt
+                    ignoreWorkflowSystemPrompt={
+                      data.ignoreWorkflowSystemPrompt ?? false
+                    }
+                    editable={editable}
+                    onIgnoreWorkflowSystemPromptChange={(
+                      ignoreWorkflowSystemPrompt,
+                    ) => {
+                      update({ ignoreWorkflowSystemPrompt });
                     }}
                   />
                 </div>
