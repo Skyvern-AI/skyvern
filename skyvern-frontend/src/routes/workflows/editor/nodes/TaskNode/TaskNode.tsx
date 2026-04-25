@@ -40,6 +40,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 
 function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
@@ -353,6 +354,17 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     editable={editable}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
+                    }}
+                  />
+                  <IgnoreWorkflowSystemPrompt
+                    ignoreWorkflowSystemPrompt={
+                      data.ignoreWorkflowSystemPrompt ?? false
+                    }
+                    editable={editable}
+                    onIgnoreWorkflowSystemPromptChange={(
+                      ignoreWorkflowSystemPrompt,
+                    ) => {
+                      update({ ignoreWorkflowSystemPrompt });
                     }}
                   />
                   <Separator />

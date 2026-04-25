@@ -164,6 +164,8 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           parameters: saveData.parameters,
           blocks: saveData.blocks,
           finally_block_label: saveData.settings.finallyBlockLabel ?? undefined,
+          workflow_system_prompt:
+            saveData.settings.workflowSystemPrompt ?? undefined,
         },
         is_saved_task: saveData.workflow.is_saved_task,
         status: opts?.status ?? saveData.workflow.status,

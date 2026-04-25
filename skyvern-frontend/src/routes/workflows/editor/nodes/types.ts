@@ -12,6 +12,7 @@ export type NodeBaseData = {
   model: WorkflowModel | null;
   showCode?: boolean;
   comparisonColor?: string;
+  ignoreWorkflowSystemPrompt?: boolean;
   /**
    * Optional metadata used for conditional branches.
    * These values are only set on nodes that live within a conditional block.
