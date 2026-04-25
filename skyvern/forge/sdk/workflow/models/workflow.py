@@ -270,6 +270,7 @@ class WorkflowRunResponseBase(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
+    recording_urls: list[str] | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None

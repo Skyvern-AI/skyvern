@@ -1,6 +1,6 @@
 import os
 import shutil
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -367,7 +367,9 @@ class LocalStorage(BaseStorage):
             if file_size == 0:
                 continue
 
-            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime)
+            # Return UTC-aware so consumers can safely compare against S3 LastModified
+            # (also UTC-aware) without hitting naive-vs-aware TypeErrors.
+            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime, tz=UTC)
             checksum = calculate_sha256_for_file(file_path)
             filename = path_obj.name
 
