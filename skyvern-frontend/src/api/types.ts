@@ -577,6 +577,7 @@ export type WorkflowRunStatusApiResponse = {
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
@@ -608,6 +609,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
