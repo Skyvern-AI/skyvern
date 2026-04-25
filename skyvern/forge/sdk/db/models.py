@@ -248,6 +248,7 @@ class ArtifactModel(Base):
     uri = Column(String)
     bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True)
+    checksum = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

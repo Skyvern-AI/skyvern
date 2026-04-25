@@ -272,6 +272,56 @@ class ArtifactManager:
             path=path,
         )
 
+    async def create_download_artifact(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        uri: str,
+        filename: str,
+        workflow_run_id: str | None = None,
+        checksum: str | None = None,
+    ) -> str:
+        """Register a downloaded file as an Artifact row without re-uploading.
+
+        The bytes already live at ``uri`` (the uploads bucket). We only record a
+        row so the file can be served through the signed ``/v1/artifacts/{id}/content``
+        endpoint.
+        """
+        # Idempotent on (run_id, uri): if a DOWNLOAD artifact already exists for the
+        # same physical file (e.g. a loop iteration re-uploads the same download dir),
+        # return the existing artifact_id so signed URLs stay stable across calls —
+        # otherwise ``loop_download_filter.to_downloaded_file_signature`` would treat
+        # every iteration's URL as new.
+        existing = await app.DATABASE.artifacts.find_download_artifact(
+            organization_id=organization_id,
+            run_id=run_id,
+            uri=uri,
+        )
+        if existing is not None:
+            return existing.artifact_id
+
+        artifact_id = generate_artifact_id()
+        context = skyvern_context.current()
+        if workflow_run_id is None and context is not None:
+            workflow_run_id = context.workflow_run_id
+        await app.DATABASE.artifacts.create_artifact(
+            artifact_id=artifact_id,
+            artifact_type=ArtifactType.DOWNLOAD,
+            uri=uri,
+            organization_id=organization_id,
+            run_id=run_id,
+            workflow_run_id=workflow_run_id,
+            checksum=checksum,
+        )
+        LOG.debug(
+            "Registered downloaded file as artifact",
+            artifact_id=artifact_id,
+            run_id=run_id,
+            filename=filename,
+        )
+        return artifact_id
+
     async def create_thought_artifact(
         self,
         thought: Thought,
@@ -835,6 +885,25 @@ class ArtifactManager:
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)
+
+    def build_signed_content_url(
+        self,
+        artifact_id: str,
+        artifact_name: str | None = None,
+        artifact_type: str | None = None,
+    ) -> str:
+        """Return a signed ``/v1/artifacts/{id}/content`` URL for any artifact.
+
+        Non-bundled artifacts normally get a presigned S3 URL from
+        ``STORAGE.get_share_link``. This method always builds the Skyvern-origin
+        signed URL regardless of ``bundle_key`` — used for DOWNLOAD artifacts
+        so webhook payloads stay short and clients hit our origin.
+        """
+        return self._bundle_content_url(
+            artifact_id=artifact_id,
+            artifact_name=artifact_name,
+            artifact_type=artifact_type,
+        )
 
     def _bundle_content_url(
         self,
