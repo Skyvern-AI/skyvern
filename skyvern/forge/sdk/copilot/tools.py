@@ -34,7 +34,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
@@ -1097,6 +1097,12 @@ async def _run_blocks_and_collect_debug(
                     parameter_key=wp.key,
                     parameter_type=str(wp.workflow_parameter_type),
                 )
+
+    # Without a session, the workflow service launches the browser in-process,
+    # which only works in worker pods (cloakbrowser isn't in the API image).
+    session_err = await ensure_browser_session(ctx)
+    if session_err is not None:
+        return session_err
 
     workflow_request = WorkflowRequestBody(
         data=data if data else None,
