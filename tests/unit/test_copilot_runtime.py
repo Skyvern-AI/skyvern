@@ -123,6 +123,65 @@ async def test_ensure_browser_session_error_dict_omits_raw_exception(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # DefaultPersistentSessionsManager.create_session returns before chromium
+    # has finished booting; ensure_browser_session must poll until
+    # browser_context is set so the next mcp_browser_context lookup succeeds.
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    session = MagicMock()
+    session.persistent_browser_session_id = "bs_1"
+
+    pending_state = MagicMock()
+    pending_state.browser_context = None
+    ready_state = MagicMock()
+    ready_state.browser_context = MagicMock()
+
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(return_value=session)
+    mock_manager.get_browser_state = AsyncMock(side_effect=[None, pending_state, ready_state])
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    ctx = _make_ctx()
+    result = await ensure_browser_session(ctx)
+    assert result is None
+    assert ctx.browser_session_id == "bs_1"
+    assert mock_manager.get_browser_state.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_ensure_browser_session_times_out_and_cleans_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # If chromium never boots within _BROWSER_BOOT_WAIT_SECONDS, fall into the
+    # cleanup branch so the agent does not keep building on a phantom session.
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    session = MagicMock()
+    session.persistent_browser_session_id = "bs_2"
+
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(return_value=session)
+    mock_manager.get_browser_state = AsyncMock(return_value=None)
+    mock_manager.close_session = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    ctx = _make_ctx()
+    result = await ensure_browser_session(ctx)
+    assert result == {"ok": False, "error": "Failed to create browser session"}
+    assert ctx.browser_session_id is None
+    mock_manager.close_session.assert_awaited_once_with(
+        organization_id="org_1",
+        browser_session_id="bs_2",
+    )
+
+
+@pytest.mark.asyncio
 async def test_mcp_browser_context_rejects_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Silently skipping set_api_key_override when ctx.api_key is None would
     let get_active_api_key() fall back to settings.SKYVERN_API_KEY — the
