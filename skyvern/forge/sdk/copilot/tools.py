@@ -366,8 +366,11 @@ BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run
 
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
+    # The name-only guard false-positives on the intended iterative build
+    # (one new block per update_and_run_blocks). Block-running tools rely
+    # on the progress-aware checks below instead.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list):
+    if isinstance(tracker, list) and tool_name not in BLOCK_RUNNING_TOOLS:
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
             return detected

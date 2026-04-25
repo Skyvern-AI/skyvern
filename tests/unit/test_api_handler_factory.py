@@ -236,15 +236,21 @@ def test_normalize_llm_model_strips_provider_prefix() -> None:
     assert api_handler_factory._normalize_llm_model(None) is None
 
 
-def test_assert_step_thought_exclusive_rejects_both_set() -> None:
+def test_assert_step_thought_block_exclusive_rejects_both_set() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
-        api_handler_factory._assert_step_thought_exclusive(MagicMock(), MagicMock())
+        api_handler_factory._assert_step_thought_block_exclusive(MagicMock(), MagicMock(), None)
 
 
-def test_assert_step_thought_exclusive_allows_single_or_neither() -> None:
-    api_handler_factory._assert_step_thought_exclusive(None, None)
-    api_handler_factory._assert_step_thought_exclusive(MagicMock(), None)
-    api_handler_factory._assert_step_thought_exclusive(None, MagicMock())
+def test_assert_step_thought_block_exclusive_rejects_step_and_block() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        api_handler_factory._assert_step_thought_block_exclusive(MagicMock(), None, "wfb_123")
+
+
+def test_assert_step_thought_block_exclusive_allows_single_or_neither() -> None:
+    api_handler_factory._assert_step_thought_block_exclusive(None, None, None)
+    api_handler_factory._assert_step_thought_block_exclusive(MagicMock(), None, None)
+    api_handler_factory._assert_step_thought_block_exclusive(None, MagicMock(), None)
+    api_handler_factory._assert_step_thought_block_exclusive(None, None, "wfb_123")
 
 
 @pytest.mark.asyncio

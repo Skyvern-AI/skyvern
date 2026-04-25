@@ -5,7 +5,7 @@ from typing import Any, cast
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_LOGIN_COMPLETE_CRITERION, DEFAULT_LOGIN_PROMPT
+from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -646,9 +646,6 @@ def block_yaml_to_block(
         login_navigation_goal = block_yaml.navigation_goal
         if not login_navigation_goal or not login_navigation_goal.strip():
             login_navigation_goal = DEFAULT_LOGIN_PROMPT
-        login_complete_criterion = block_yaml.complete_criterion
-        if not login_complete_criterion or not login_complete_criterion.strip():
-            login_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION
         return LoginBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -662,7 +659,7 @@ def block_yaml_to_block(
             totp_verification_url=block_yaml.totp_verification_url,
             totp_identifier=block_yaml.totp_identifier,
             disable_cache=block_yaml.disable_cache,
-            complete_criterion=login_complete_criterion,
+            complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
         )

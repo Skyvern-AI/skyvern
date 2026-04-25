@@ -824,6 +824,9 @@ class WorkflowRunBlockModel(Base):
     executed_branch_result = Column(Boolean, nullable=True)
     executed_branch_next_block = Column(String, nullable=True)
 
+    # Accumulates LLM cost for block-scoped calls (no step/thought attribution).
+    llm_cost = Column(Numeric, default=0, nullable=False)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
