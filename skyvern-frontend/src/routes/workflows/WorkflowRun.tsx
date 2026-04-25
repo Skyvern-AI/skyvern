@@ -40,6 +40,7 @@ import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkf
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
+import { filenameForDownloadedFileUrl } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
@@ -515,9 +516,7 @@ function WorkflowRun() {
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
                     fileUrls.map((url) => {
-                      // Extract filename from URL path, stripping query params from signed URLs
-                      const urlPath = url.split("?")[0] ?? url;
-                      const filename = urlPath.split("/").pop() || "download";
+                      const filename = filenameForDownloadedFileUrl(url);
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
