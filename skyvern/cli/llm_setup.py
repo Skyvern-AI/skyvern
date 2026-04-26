@@ -76,13 +76,12 @@ def setup_llm_providers() -> None:
             enabled_providers.append("openai")
             model_options.extend(
                 [
+                    "OPENAI_GPT5_5",
                     "OPENAI_GPT5_4",
                     "OPENAI_GPT5",
-                    "OPENAI_GPT5_2",
                     "OPENAI_GPT4_1",
                     "OPENAI_O3",
                     "OPENAI_O4_MINI",
-                    "OPENAI_GPT4O",
                 ]
             )
     else:
@@ -101,8 +100,9 @@ def setup_llm_providers() -> None:
             enabled_providers.append("anthropic")
             model_options.extend(
                 [
+                    "ANTHROPIC_CLAUDE4.7_OPUS",
                     "ANTHROPIC_CLAUDE4.6_OPUS",
-                    "ANTHROPIC_CLAUDE4.5_OPUS",
+                    "ANTHROPIC_CLAUDE4.6_SONNET",
                     "ANTHROPIC_CLAUDE4.5_SONNET",
                     "ANTHROPIC_CLAUDE4.5_HAIKU",
                 ]
@@ -146,7 +146,7 @@ def setup_llm_providers() -> None:
         update_or_add_env_var("ENABLE_GEMINI", "false")
 
     console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
-    console.print("Use any locally-running model via Ollama (e.g. llama3, mistral, qwen).")
+    console.print("Use any locally-running model via Ollama (e.g. llama4, qwen3, deepseek-r1).")
     console.print("[dim]Requires Ollama running locally: https://ollama.com[/dim]")
     enable_ollama = Confirm.ask("Do you want to enable a local Ollama model?")
     if enable_ollama:
@@ -155,7 +155,7 @@ def setup_llm_providers() -> None:
             default="http://localhost:11434",
         )
         ollama_model = Prompt.ask(
-            "Enter model name (e.g. llama3.3, mistral, qwen2.5)",
+            "Enter model name (e.g. llama4, qwen3, deepseek-r1)",
         )
         if not ollama_model:
             console.print("[red]Error: Model name is required. Ollama will not be enabled.[/red]")
