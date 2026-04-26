@@ -537,26 +537,79 @@ class WorkflowService:
         ordered = [by_id[aid] for aid in artifact_ids if aid in by_id]
         return _file_infos_from_download_artifacts(ordered)
 
-    async def _refresh_output_screenshot_urls(
+    async def _file_infos_for_workflow_run_filtered_by_filenames(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        filenames: set[str],
+    ) -> list[FileInfo]:
+        """Look up DOWNLOAD artifact rows for the workflow run and filter to
+        the given filename set.
+
+        Used as a backwards-compat fallback for block-output snapshots that
+        were persisted without ``downloaded_file_artifact_ids`` — typically
+        because the block's ``get_downloaded_files`` ran before
+        ``save_downloaded_files`` finished creating the artifact rows. We
+        match by filename so a multi-block run doesn't merge sibling blocks'
+        downloads into one another's snapshots.
+
+        Filenames are matched case-sensitively against ``Artifact.uri``'s
+        basename, mirroring how ``_file_infos_from_download_artifacts``
+        derives ``filename`` from the URI.
+        """
+        if not workflow_run_id or not organization_id or not filenames:
+            return []
+        try:
+            artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                run_id=workflow_run_id,
+                organization_id=organization_id,
+                artifact_type=ArtifactType.DOWNLOAD,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to refresh block-output downloaded_files via run-id lookup",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return []
+        if not artifacts:
+            return []
+        matched: list[Artifact] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            basename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+            if basename in filenames and basename not in seen:
+                matched.append(artifact)
+                seen.add(basename)
+        return _file_infos_from_download_artifacts(matched)
+
+    async def _refresh_output_urls(
         self,
         value: Any,
         organization_id: str | None,
         workflow_run_id: str,
     ) -> Any:
-        """
-        Recursively walk through output values and generate presigned URLs for screenshots.
+        """Recursively refresh URL fields inside persisted block-output snapshots.
 
-        TaskOutput dicts stored in workflow_run_output_parameters contain artifact IDs.
-        This method finds any TaskOutput-like dicts and generates fresh presigned URLs
-        from the stored artifact IDs.
+        ``TaskOutput`` dicts stored in ``workflow_run_output_parameters`` carry
+        URLs that were minted at execution time and may now be stale: legacy
+        S3 presigned URLs whose signature has expired, or short signed
+        ``/v1/artifacts/{id}/content`` URLs whose ``expiry`` has passed. This
+        method finds any TaskOutput-like dict and rebuilds:
 
-        For backwards compatibility with old data that stored URLs directly (now expired),
-        we also check for task_id and regenerate URLs using the task_id lookup.
+        - ``task_screenshots`` / ``workflow_screenshots`` from the stored
+          screenshot artifact IDs (or ``task_id`` lookup for legacy snapshots
+          that pre-date the artifact-ID format).
+        - ``downloaded_files`` / ``downloaded_file_urls`` from
+          ``downloaded_file_artifact_ids``, or — when those IDs are missing
+          (race with ``save_downloaded_files`` at block completion) — by
+          looking up the run's DOWNLOAD artifact rows and matching by
+          basename.
 
-        Also refreshes ``downloaded_files`` / ``downloaded_file_urls`` from
-        ``downloaded_file_artifact_ids`` so block outputs return short signed
-        ``/v1/artifacts/{id}/content`` URLs even when the URL captured at
-        execution time was a legacy presigned S3 URL.
+        End result: every URL in the response is a freshly minted short
+        signed ``/v1/artifacts/{id}/content`` URL, regardless of what was
+        captured at execution time.
         """
         if isinstance(value, dict):
             # Check if this looks like a TaskOutput with screenshot artifact IDs (new format)
@@ -584,6 +637,30 @@ class WorkflowService:
                     if refreshed:
                         value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
                         value["downloaded_file_urls"] = [fi.url for fi in refreshed]
+                elif value.get("downloaded_files") and organization_id:
+                    # Backwards compatibility / race fallback: the snapshot has
+                    # ``downloaded_files`` but no ``downloaded_file_artifact_ids``.
+                    # This happens when the block ran the artifact-first read in
+                    # ``get_downloaded_files`` BEFORE save_downloaded_files
+                    # finished creating the artifact rows (or before this PR
+                    # was deployed). Re-query the run's current DOWNLOAD rows
+                    # and match by filename so we don't pick up downloads from
+                    # sibling blocks in a multi-block run.
+                    stored_filenames: set[str] = set()
+                    for fi in value["downloaded_files"]:
+                        if isinstance(fi, dict):
+                            filename = fi.get("filename")
+                            if isinstance(filename, str) and filename:
+                                stored_filenames.add(filename)
+                    if stored_filenames:
+                        refreshed = await self._file_infos_for_workflow_run_filtered_by_filenames(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            filenames=stored_filenames,
+                        )
+                        if refreshed:
+                            value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
+                            value["downloaded_file_urls"] = [fi.url for fi in refreshed]
             elif has_old_format:
                 # Old format (backwards compat): regenerate URLs using task_id lookup
                 task_id = value.get("task_id")
@@ -600,11 +677,11 @@ class WorkflowService:
             else:
                 # Recurse into nested dicts
                 for k, v in value.items():
-                    value[k] = await self._refresh_output_screenshot_urls(v, organization_id, workflow_run_id)
+                    value[k] = await self._refresh_output_urls(v, organization_id, workflow_run_id)
         elif isinstance(value, list):
             # Recurse into list items
             for i, item in enumerate(value):
-                value[i] = await self._refresh_output_screenshot_urls(item, organization_id, workflow_run_id)
+                value[i] = await self._refresh_output_urls(item, organization_id, workflow_run_id)
         return value
 
     async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
@@ -4812,7 +4889,7 @@ class WorkflowService:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
             # Refresh any expired presigned screenshot URLs in the outputs
-            outputs = await self._refresh_output_screenshot_urls(
+            outputs = await self._refresh_output_urls(
                 outputs, organization_id=organization_id, workflow_run_id=workflow_run_id
             )
 
