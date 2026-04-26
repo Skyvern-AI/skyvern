@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -524,6 +525,9 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml,
         )
+
+        created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
+
         await app.WORKFLOW_SERVICE.update_workflow_definition(
             workflow_id=ctx.workflow_id,
             organization_id=ctx.organization_id,
@@ -541,6 +545,8 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             cache_key=workflow.cache_key,
             run_sequentially=workflow.run_sequentially,
             sequential_key=workflow.sequential_key,
+            created_by=created_by_stamp,
+            edited_by="copilot",
         )
         ctx.workflow_yaml = workflow_yaml
         return {
@@ -1120,6 +1126,7 @@ async def _run_blocks_and_collect_debug(
         version=None,
         max_steps=None,
         request_id=None,
+        copilot_session_id=ctx.workflow_copilot_chat_id,
     )
 
     from skyvern.utils.files import initialize_skyvern_state_file

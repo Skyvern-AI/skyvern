@@ -115,6 +115,8 @@ class Workflow(BaseModel):
     sequential_key: str | None = None
     folder_id: str | None = None
     import_error: str | None = None
+    created_by: str | None = None
+    edited_by: str | None = None
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -201,6 +203,7 @@ class WorkflowRun(BaseModel):
     trigger_type: WorkflowRunTriggerType | None = None
     workflow_schedule_id: str | None = None
     ignore_inherited_workflow_system_prompt: bool = False
+    copilot_session_id: str | None = None
 
     @field_validator("run_with", mode="before")
     @classmethod

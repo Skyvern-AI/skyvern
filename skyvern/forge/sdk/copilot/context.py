@@ -142,6 +142,8 @@ class CopilotContext(AgentContext):
     avoid drift.
     """
 
+    workflow_copilot_chat_id: str | None = None
+
     # Enforcement state
     navigate_called: bool = False
     observation_after_navigate: bool = False

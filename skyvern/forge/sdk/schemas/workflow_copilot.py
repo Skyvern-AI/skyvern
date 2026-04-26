@@ -49,6 +49,14 @@ class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
     auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
 
 
+class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="The chat whose proposed workflow should be applied")
+    auto_accept: bool = Field(
+        False,
+        description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
+    )
+
+
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")

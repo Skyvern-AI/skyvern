@@ -389,6 +389,7 @@ async def run_copilot_agent(
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
+        workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
     )
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(llm_api_handler)

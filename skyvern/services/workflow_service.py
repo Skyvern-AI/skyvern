@@ -28,6 +28,7 @@ async def prepare_workflow(
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
+    copilot_session_id: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -49,6 +50,7 @@ async def prepare_workflow(
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+        copilot_session_id=copilot_session_id,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(

@@ -441,6 +441,8 @@ def convert_to_workflow(
         sequential_key=workflow_model.sequential_key,
         folder_id=workflow_model.folder_id,
         import_error=workflow_model.import_error,
+        created_by=workflow_model.created_by,
+        edited_by=workflow_model.edited_by,
     )
 
 
@@ -491,6 +493,7 @@ def convert_to_workflow_run(
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
+        copilot_session_id=workflow_run_model.copilot_session_id,
     )
 
 

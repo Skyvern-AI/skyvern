@@ -99,6 +99,8 @@ class WorkflowsRepository(BaseRepository):
         run_sequentially: bool = False,
         sequential_key: str | None = None,
         folder_id: str | None = None,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -125,6 +127,8 @@ class WorkflowsRepository(BaseRepository):
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,
+                created_by=created_by,
+                edited_by=edited_by,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -593,6 +597,8 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -635,6 +641,10 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
                     workflow.sequential_key = sequential_key
+                if created_by is not _UNSET:
+                    workflow.created_by = cast(str | None, created_by)
+                if edited_by is not _UNSET:
+                    workflow.edited_by = cast(str | None, edited_by)
                 await session.commit()
                 await session.refresh(workflow)
                 is_template = (
@@ -675,6 +685,8 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -753,6 +765,10 @@ class WorkflowsRepository(BaseRepository):
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:
                 workflow.sequential_key = sequential_key
+            if created_by is not _UNSET:
+                workflow.created_by = cast(str | None, created_by)
+            if edited_by is not _UNSET:
+                workflow.edited_by = cast(str | None, edited_by)
 
             await session.commit()
             await session.refresh(workflow)

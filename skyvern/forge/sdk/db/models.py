@@ -323,6 +323,8 @@ class WorkflowModel(SoftDeleteMixin, Base):
     sequential_key = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
     import_error = Column(String, nullable=True)  # Error message if import failed
+    created_by = Column(String, nullable=True)
+    edited_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -436,6 +438,7 @@ class WorkflowRunModel(Base):
     ignore_inherited_workflow_system_prompt = Column(
         Boolean, nullable=False, default=False, server_default=sqlalchemy.false()
     )
+    copilot_session_id = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

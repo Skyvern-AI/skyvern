@@ -18,6 +18,7 @@ import structlog
 # Reuse the HTTP-logging redactor so trace-side and SSE-side redaction share
 # one exact-match sensitive-key policy.
 from skyvern.forge.request_logging import redact_sensitive_fields
+from skyvern.forge.sdk.core import skyvern_context
 
 LOG = structlog.get_logger()
 
@@ -225,6 +226,10 @@ def _patch_agent_span_attributes() -> None:
                             # trace backend.
                             attrs["input"] = "[redacted: serialization error]"
                             LOG.warning("Copilot tool-call input redaction failed", error=repr(exc))
+            ctx = skyvern_context.current()
+            if ctx is not None and ctx.copilot_session_id is not None:
+                if isinstance(span_data, (AgentSpanData, GenerationSpanData, FunctionSpanData)):
+                    attrs["copilot.session_id"] = ctx.copilot_session_id
             return attrs
 
         _oai_mod.attributes_from_span_data = _patched

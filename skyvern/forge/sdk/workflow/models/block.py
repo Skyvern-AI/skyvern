@@ -7153,6 +7153,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                 )
             ):
                 try:

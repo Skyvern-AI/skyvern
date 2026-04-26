@@ -651,6 +651,7 @@ class WorkflowService:
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
+        copilot_session_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -697,6 +698,16 @@ class WorkflowService:
                 )
                 workflow_request.ai_fallback = True
 
+        # Inherit from ambient context so descendant runs (TriggerWorkflowBlock children)
+        # carry the parent's chat id forward without per-call plumbing. Resolved here so
+        # the same value reaches both the DB row and the new SkyvernContext below.
+        ambient_context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+        resolved_copilot_session_id = (
+            copilot_session_id
+            if copilot_session_id is not None
+            else (ambient_context.copilot_session_id if ambient_context else None)
+        )
+
         # Create the workflow run and set skyvern context
         workflow_run = await self.create_workflow_run(
             workflow_request=workflow_request,
@@ -711,6 +722,7 @@ class WorkflowService:
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+            copilot_session_id=resolved_copilot_session_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -743,6 +755,7 @@ class WorkflowService:
                 max_steps_override=max_steps_override,
                 max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                 loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
+                copilot_session_id=resolved_copilot_session_id,
             )
         )
 
@@ -3180,6 +3193,8 @@ class WorkflowService:
         adaptive_caching: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         try:
             return await app.DATABASE.workflows.create_workflow(
@@ -3208,6 +3223,8 @@ class WorkflowService:
                 adaptive_caching=adaptive_caching,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
+                created_by=created_by,
+                edited_by=edited_by,
             )
         except IntegrityError as e:
             if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
@@ -3580,6 +3597,8 @@ class WorkflowService:
         cache_key: str | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         if workflow_definition is not None:
             updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
@@ -3599,6 +3618,8 @@ class WorkflowService:
                 cache_key=cache_key,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
+                created_by=created_by,
+                edited_by=edited_by,
             )
             return updated_workflow
 
@@ -3619,6 +3640,8 @@ class WorkflowService:
             cache_key=cache_key,
             run_sequentially=run_sequentially,
             sequential_key=sequential_key,
+            created_by=created_by,
+            edited_by=edited_by,
         )
 
         return updated_workflow
@@ -3865,6 +3888,7 @@ class WorkflowService:
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
+        copilot_session_id: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session or profile id
         browser_profile_id = workflow_request.browser_profile_id
@@ -3956,6 +3980,7 @@ class WorkflowService:
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+            copilot_session_id=copilot_session_id,
         )
 
     async def _update_workflow_run_status(
@@ -5220,6 +5245,8 @@ class WorkflowService:
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
         delete_script: bool = True,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         organization_id = organization.organization_id
 
@@ -5288,6 +5315,8 @@ class WorkflowService:
                     if request.code_version is not None
                     else existing_latest_workflow.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
+                    created_by=created_by,
+                    edited_by=edited_by,
                 )
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -5315,6 +5344,8 @@ class WorkflowService:
                     adaptive_caching=request.adaptive_caching,
                     code_version=request.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
+                    created_by=created_by,
+                    edited_by=edited_by,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = potential_workflow.workflow_id
