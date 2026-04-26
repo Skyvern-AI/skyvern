@@ -79,9 +79,6 @@ def setup_llm_providers() -> None:
                     "OPENAI_GPT5_5",
                     "OPENAI_GPT5_4",
                     "OPENAI_GPT5",
-                    "OPENAI_GPT4_1",
-                    "OPENAI_O3",
-                    "OPENAI_O4_MINI",
                 ]
             )
     else:
@@ -142,6 +139,14 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("GEMINI_API_KEY", gemini_api_key)
             update_or_add_env_var("ENABLE_GEMINI", "true")
             enabled_providers.append("gemini")
+            model_options.extend(
+                [
+                    "GEMINI_3_PRO",
+                    "GEMINI_3.0_FLASH",
+                    "GEMINI_2.5_PRO",
+                    "GEMINI_2.5_FLASH",
+                ]
+            )
     else:
         update_or_add_env_var("ENABLE_GEMINI", "false")
 
