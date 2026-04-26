@@ -159,10 +159,8 @@ class CopilotContext(AgentContext):
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
 
-    # Token usage summed from raw_responses after each streamed run. None
-    # until the first response that carries a usage object — some providers
-    # (notably non-OpenAI streaming routes) omit usage entirely, and we want
-    # eval cost grading to see "no data" rather than "0 tokens".
+    # ``None`` until usage is observed; ``0`` only when a provider explicitly
+    # reported zero. Distinct values let cost grading flag missing telemetry.
     total_tokens_used: int | None = None
     input_tokens_used: int | None = None
     output_tokens_used: int | None = None
