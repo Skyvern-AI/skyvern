@@ -415,6 +415,11 @@ class TaskOutput(BaseModel):
     failure_category: list[dict[str, Any]] | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None  # For backward compatibility
+    # Persisted artifact ids for refresh-on-read (mirrors task_screenshot_artifact_ids).
+    # When set, the workflow-run-status response rebuilds ``downloaded_files`` and
+    # ``downloaded_file_urls`` from these IDs every API fetch so a presigned URL
+    # captured at execution time never makes it to the client.
+    downloaded_file_artifact_ids: list[str] | None = None
     task_screenshots: list[str] | None = None
     workflow_screenshots: list[str] | None = None
     task_screenshot_artifact_ids: list[str] | None = None
@@ -429,6 +434,10 @@ class TaskOutput(BaseModel):
     ) -> TaskOutput:
         # For backward compatibility, extract just the URLs from FileInfo objects
         downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
+        # Carry artifact ids through so the API can rebuild fresh signed URLs.
+        downloaded_file_artifact_ids = (
+            [fi.artifact_id for fi in downloaded_files if fi.artifact_id] if downloaded_files else None
+        ) or None
 
         return TaskOutput(
             task_id=task.task_id,
@@ -439,6 +448,7 @@ class TaskOutput(BaseModel):
             failure_category=task.failure_category,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
+            downloaded_file_artifact_ids=downloaded_file_artifact_ids,
             task_screenshot_artifact_ids=task_screenshot_artifact_ids,
             workflow_screenshot_artifact_ids=workflow_screenshot_artifact_ids,
         )

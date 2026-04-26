@@ -31,6 +31,7 @@ def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileI
                 checksum=artifact.checksum,
                 filename=filename,
                 modified_at=artifact.created_at,
+                artifact_id=artifact.artifact_id,
             )
         )
     return infos

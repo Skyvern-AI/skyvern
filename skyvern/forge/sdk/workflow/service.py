@@ -54,6 +54,7 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
@@ -514,6 +515,28 @@ class WorkflowService:
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
         return [u for u in urls if u is not None]
 
+    async def _file_infos_from_download_artifact_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str | None,
+    ) -> list[FileInfo]:
+        """Rebuild ``FileInfo`` objects from DOWNLOAD artifact IDs.
+
+        Used to refresh persisted block-output ``downloaded_files`` snapshots:
+        the URL captured at execution time may be a legacy presigned S3 URL,
+        but the artifact row has everything we need to mint a fresh signed
+        ``/v1/artifacts/{id}/content`` URL on each API fetch.
+        """
+        if not artifact_ids or not organization_id:
+            return []
+        artifacts = await app.DATABASE.artifacts.get_artifacts_by_ids(artifact_ids, organization_id)
+        if not artifacts:
+            return []
+        # Preserve the input order so block outputs render files in save order.
+        by_id = {a.artifact_id: a for a in artifacts}
+        ordered = [by_id[aid] for aid in artifact_ids if aid in by_id]
+        return _file_infos_from_download_artifacts(ordered)
+
     async def _refresh_output_screenshot_urls(
         self,
         value: Any,
@@ -529,6 +552,11 @@ class WorkflowService:
 
         For backwards compatibility with old data that stored URLs directly (now expired),
         we also check for task_id and regenerate URLs using the task_id lookup.
+
+        Also refreshes ``downloaded_files`` / ``downloaded_file_urls`` from
+        ``downloaded_file_artifact_ids`` so block outputs return short signed
+        ``/v1/artifacts/{id}/content`` URLs even when the URL captured at
+        execution time was a legacy presigned S3 URL.
         """
         if isinstance(value, dict):
             # Check if this looks like a TaskOutput with screenshot artifact IDs (new format)
@@ -548,6 +576,14 @@ class WorkflowService:
                         value["workflow_screenshot_artifact_ids"],
                         organization_id,
                     )
+                if value.get("downloaded_file_artifact_ids"):
+                    refreshed = await self._file_infos_from_download_artifact_ids(
+                        value["downloaded_file_artifact_ids"],
+                        organization_id,
+                    )
+                    if refreshed:
+                        value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
+                        value["downloaded_file_urls"] = [fi.url for fi in refreshed]
             elif has_old_format:
                 # Old format (backwards compat): regenerate URLs using task_id lookup
                 task_id = value.get("task_id")
