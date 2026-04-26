@@ -156,7 +156,7 @@ def setup_llm_providers() -> None:
         update_or_add_env_var("ENABLE_GEMINI", "false")
 
     console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
-    console.print("Use any locally-running model via Ollama (e.g. llama4, qwen3, deepseek-r1).")
+    console.print("Use any locally-running model via Ollama (e.g. gemma4, qwen3, deepseek-r1).")
     console.print("[dim]Requires Ollama running locally: https://ollama.com[/dim]")
     enable_ollama = Confirm.ask("Do you want to enable a local Ollama model?")
     if enable_ollama:
@@ -165,7 +165,7 @@ def setup_llm_providers() -> None:
             default="http://localhost:11434",
         )
         ollama_model = Prompt.ask(
-            "Enter model name (e.g. llama4, qwen3, deepseek-r1)",
+            "Enter model name (e.g. gemma4, qwen3, deepseek-r1)",
         )
         if not ollama_model:
             console.print("[red]Error: Model name is required. Ollama will not be enabled.[/red]")
