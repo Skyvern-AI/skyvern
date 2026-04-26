@@ -1,0 +1,253 @@
+---
+title: Handle Browsers
+subtitle: Launch, connect, configure, and manage browser sessions
+description: Launch cloud browsers, connect via CDP, configure proxies and timeouts, open multiple tabs, and manage browser lifecycle for Skyvern automations.
+slug: browser-automations/handle-browsers
+keywords:
+  - launch_cloud_browser
+  - use_cloud_browser
+  - connect_to_cloud_browser_session
+  - connect_to_browser_over_cdp
+  - launch_local_browser
+  - get_working_page
+  - new_page
+  - close
+  - proxy
+  - CDP
+  - session timeout
+---
+
+Every browser automation starts with a browser. You launch a cloud Chromium instance, get a Playwright context, and write your automation against it. Cookies, localStorage, and auth state persist across every page you open inside that browser.
+
+This page covers browser lifecycle for code-based automations using the Skyvern SDK. If you're running automations through the Cloud UI workflow editor, browser management is handled automatically. See [Browser Sessions](/cloud/browser-management/browser-sessions) for the Cloud UI equivalent.
+
+---
+
+## Launch a cloud browser
+
+<CodeGroup>
+```python Python
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+```
+```typescript TypeScript
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `timeout` | `int` | `None` | Session timeout in minutes (5-1440). Server default: 60 minutes |
+| `proxy_location` | `ProxyLocation` | `None` | Route traffic through a geographic proxy |
+
+The browser stays alive until `timeout` expires or you call `browser.close()`.
+
+After a successful launch the handle exposes:
+
+- `browser.browser_session_id`: the `pbs_*` session id, useful for locking tasks to this session or for logging
+- `browser.pages`: the list of open Playwright pages in this browser context
+
+If `timeout < 5`, Skyvern rejects the request with `UnprocessableEntityError` (422). An invalid `proxy_location` enum is rejected the same way.
+
+<CodeGroup>
+```python Python
+# Launch with a 2-hour timeout and US residential proxy
+browser = await skyvern.launch_cloud_browser(
+    timeout=120,
+    proxy_location="RESIDENTIAL"
+)
+```
+```typescript TypeScript
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser({
+    timeout: 120,
+    proxyLocation: "RESIDENTIAL",
+});
+```
+</CodeGroup>
+
+---
+
+## Reuse an existing browser
+
+If you have a cloud browser session already running, reuse it instead of launching a new one.
+
+<CodeGroup>
+```python Python
+# Reuse the most recent available session, or create one if none exists
+browser = await skyvern.use_cloud_browser()
+
+# Connect to a specific session by ID
+browser = await skyvern.connect_to_cloud_browser_session("pbs_abc123")
+```
+```typescript TypeScript
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+// Reuse the most recent available session, or create one if none exists
+const browser = await skyvern.useCloudBrowser();
+
+// Connect to a specific session by ID
+const browser = await skyvern.connectToCloudBrowserSession("pbs_abc123");
+```
+</CodeGroup>
+
+`use_cloud_browser` checks for an available session first. If one exists, it connects to it. If not, it creates a new one with the options you provide.
+
+Passing an unknown session id to `connect_to_cloud_browser_session` raises `NotFoundError` (HTTP 404).
+
+---
+
+## Connect to a local browser
+
+Connect to any browser running with Chrome DevTools Protocol (CDP) enabled. This works with local Chrome, Chromium, or any CDP-compatible browser.
+
+<CodeGroup>
+```python Python
+browser = await skyvern.connect_to_browser_over_cdp("http://localhost:9222")
+page = await browser.get_working_page()
+```
+```typescript TypeScript
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.connectToBrowserOverCdp("http://localhost:9222");
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+Start Chrome with CDP enabled:
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Linux
+google-chrome --remote-debugging-port=9222
+```
+
+For self-hosted Skyvern deployments, you can also launch a local Chromium browser directly (Python only):
+
+```python
+# Requires Skyvern.local() - not available in cloud mode
+skyvern = Skyvern.local()
+browser = await skyvern.launch_local_browser(headless=False, port=9222)
+```
+
+See the [Self-Hosted Browser Configuration](/self-hosted/browser) guide for headless/headful modes, display settings, and Docker setups.
+
+---
+
+## Working with pages
+
+### Get the current page
+
+<CodeGroup>
+```python Python
+page = await browser.get_working_page()
+```
+```typescript TypeScript
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+Returns the most recent page. If no pages are open, creates a new one. Each call returns a fresh `SkyvernBrowserPage` wrapper. Don't rely on identity (`is` / `===`) comparisons between the return value and earlier page references.
+
+### Open a new tab
+
+<CodeGroup>
+```python Python
+page2 = await browser.new_page()
+await page2.goto("https://example.com/other-page")
+```
+```typescript TypeScript
+const page2 = await browser.newPage();
+await page2.goto("https://example.com/other-page");
+```
+</CodeGroup>
+
+Both pages share the same browser context (cookies, auth state).
+
+### Wrap an existing Playwright page (Python only)
+
+```python
+skyvern_page = await browser.get_page_for(existing_playwright_page)
+```
+
+Adds AI methods to a Playwright page you already have.
+
+---
+
+## Close the browser
+
+<CodeGroup>
+```python Python
+await browser.close()
+```
+```typescript TypeScript
+await browser.close();
+```
+</CodeGroup>
+
+Closes the browser and releases cloud resources. If connected to a cloud session, the session ends. Any unsaved state (cookies, localStorage) is lost unless you saved a [browser profile](/optimization/browser-profiles) first.
+
+---
+
+## Proxy and geolocation
+
+Route browser traffic through residential proxies in specific countries.
+
+<CodeGroup>
+```python Python
+browser = await skyvern.launch_cloud_browser(
+    proxy_location="RESIDENTIAL"
+)
+```
+```typescript TypeScript
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser({
+    proxyLocation: "RESIDENTIAL",
+});
+```
+</CodeGroup>
+
+Available locations:
+
+| Value | Region |
+|-------|--------|
+| `RESIDENTIAL` | United States (default) |
+| `RESIDENTIAL_GB` | United Kingdom |
+| `RESIDENTIAL_DE` | Germany |
+| `RESIDENTIAL_ES` | Spain |
+| `RESIDENTIAL_FR` | France |
+| `RESIDENTIAL_IE` | Ireland |
+| `RESIDENTIAL_IN` | India |
+| `RESIDENTIAL_JP` | Japan |
+| `RESIDENTIAL_AU` | Australia |
+| `RESIDENTIAL_CA` | Canada |
+| `NONE` | No proxy (direct connection) |
+
+For self-hosted proxy configuration, see [Proxy Setup](/self-hosted/proxy).
+
+---
+
+## Session persistence
+
+Two mechanisms for preserving browser state between automation runs:
+
+**Browser Sessions** keep a browser alive between API calls. Use `create_browser_session` from the [Tasks API](/sdk-reference/tasks/run-task) to create a session, then pass its ID to multiple `run_task` calls. See [Browser Sessions](/optimization/browser-sessions).
+
+**Browser Profiles** save a snapshot of browser state (cookies, localStorage) that persists indefinitely. Create a profile from a completed run, then load it into future runs to skip login. See [Browser Profiles](/optimization/browser-profiles).
+
+---
+
+## Full reference
+
+- [launch_cloud_browser](/sdk-reference/browser-automation/launch-cloud-browser)
+- [use_cloud_browser](/sdk-reference/browser-automation/use-cloud-browser)
+- [connect_to_cloud_browser_session](/sdk-reference/browser-automation/connect-to-cloud-browser-session)
+- [connect_to_browser_over_cdp](/sdk-reference/browser-automation/connect-to-browser-over-cdp)
+- [launch_local_browser](/sdk-reference/browser-automation/launch-local-browser) (Python only)
+- [get_working_page](/sdk-reference/browser-automation/get-working-page)
+- [new_page](/sdk-reference/browser-automation/new-page)
+- [get_page_for](/sdk-reference/browser-automation/get-page-for) (Python only)
+- [close](/sdk-reference/browser-automation/close)

@@ -1,0 +1,68 @@
+---
+title: Authentication & 2FA
+subtitle: Log in to any site, including sites with multi-factor authentication
+description: Skyvern handles logins with stored credentials, TOTP/authenticator codes, email and SMS verification, magic links, and password manager integrations with Bitwarden, 1Password, and Azure Key Vault.
+slug: features/authentication-and-2fa
+icon: key
+keywords:
+  - authentication
+  - login
+  - 2FA
+  - MFA
+  - TOTP
+  - magic link
+  - SSO
+  - Bitwarden
+  - 1Password
+  - Azure Key Vault
+---
+
+Most browser automations hit a login wall within the first few seconds. Skyvern handles authentication end-to-end, from simple passwords to multi-factor flows with TOTP codes, email verification, and magic links. Secrets live in your vault and never touch the LLM.
+
+## What's supported
+
+**Credential types:** passwords (with optional TOTP secret bundled in), credit cards for checkout automations, and arbitrary secrets or API keys.
+
+**2FA methods:**
+
+- **TOTP / authenticator apps** store the secret once and Skyvern generates valid codes on every run.
+- **Email or SMS codes** can be pushed to Skyvern via API, or you can expose an endpoint that Skyvern polls every 10 seconds until the code arrives.
+- **Magic links** work the same way: push the one-time login URL and Skyvern detects and follows it automatically.
+- **Multi-field TOTP** handles split-box layouts (one digit per input) by filling all fields with the same code.
+
+**Vault integrations:** Bitwarden (Cloud and self-hosted / Vaultwarden), 1Password (via service account token), Azure Key Vault, and a custom HTTP vault option if you want to bring your own service.
+
+## How credentials stay safe
+
+When a run needs a credential, Skyvern fetches it from your vault, injects it directly into the browser's form field, and discards it as soon as the field is filled. The value never enters an LLM prompt, never lands in a log line, and never gets written to any persistent Skyvern storage.
+
+You'll see this in practice: run recordings, action timelines, and LLM prompts show stable placeholder tokens like `BW_PASSWORD`, `BW_USERNAME`, and `BW_TOTP` wherever real credentials were used. The prefix reflects the vault source (`BW_` for Bitwarden, `OP_` for 1Password, `AZ_` for Azure Key Vault, `SK_` for Skyvern's built-in vault) so you can audit which credential fired without the secret ever leaving your vault.
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card
+    title="Store credentials"
+    href="/credentials/store-credentials"
+  >
+    Create passwords, cards, and secrets. Wire up Bitwarden, 1Password, Azure, or a custom vault.
+  </Card>
+  <Card
+    title="Handle 2FA"
+    href="/credentials/handle-2fa"
+  >
+    TOTP setup, pushed codes, polled endpoints, and magic links.
+  </Card>
+  <Card
+    title="Troubleshoot logins"
+    href="/credentials/troubleshooting-login"
+  >
+    Debug 2FA and login failures.
+  </Card>
+  <Card
+    title="SDK reference"
+    href="/sdk-reference/browser-automation/agent-login"
+  >
+    `agent.login()`, `send_totp_code()`, and the credentials API.
+  </Card>
+</CardGroup>

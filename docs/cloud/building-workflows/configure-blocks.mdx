@@ -19,7 +19,7 @@ keywords:
 
 Workflows are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the Cloud UI [workflow editor](/cloud/building-workflows/build-a-workflow), grouped by category.
 
-If you're writing automations in code instead, the equivalent operations are Page and Agent methods. See the [Actions Reference](/developers/browser-automations/actions-reference) for the code-first counterparts to these blocks.
+If you're writing automations in code instead, the equivalent operations are Page and Agent methods. See the [Actions Reference](/browser-automations/actions-reference) for the code-first counterparts to these blocks.
 
 <Frame caption="To add a block in your workflow, click the **+** button, click on Add block, then select the block type from the menu.">
 <img src="/images/cloud/add-block-ui.png" alt="how to add a block to a workflow in Skyvern" />
@@ -98,7 +98,7 @@ Additional fields in **Advanced Settings** (Skyvern 1.0 only):
 *Plus [common browser fields](#common-fields).*
 
 <Frame>
-<img width="400" src="/images/cloud/br_task_block.png" alt="Browser Task block configuration with URL and prompt fields" />
+<img src="/images/cloud/br_task_block.png" alt="Browser Task block configuration with URL and prompt fields" />
 </Frame>
 
 <Tip>
@@ -135,7 +135,7 @@ Extract structured data from the current page using AI.
 *Plus [common browser fields](#common-fields).*
 
 <Frame>
-<img width="400" src="/images/cloud/extract_block.png" alt="Extraction block configuration with Data Extraction Goal and Data Schema fields" />
+<img src="/images/cloud/extract_block.png" alt="Extraction block configuration with Data Extraction Goal and Data Schema fields" />
 </Frame>
 
 ### Login
@@ -157,7 +157,7 @@ Additional fields in **Advanced Settings:**
 *Plus [common browser fields](#common-fields).*
 
 <Frame>
-<img width="400" src="/images/cloud/login_block.png" alt="Login block configuration with URL, Login Goal, and Credential fields" />    
+<img src="/images/cloud/login_block.png" alt="Login block configuration with URL, Login Goal, and Credential fields" />    
 </Frame>
 
 ### Go to URL
@@ -169,7 +169,7 @@ Navigate the browser directly to a specific URL without AI interaction.
 | **URL** | text | **(Required)** The URL to navigate to. Supports [parameter references](/cloud/building-workflows/add-parameters#referencing-parameters-in-blocks). |
 
 <Frame>
-<img width="400" src="/images/cloud/url_block.png" alt="Go to URL block configuration with URL field" />
+<img src="/images/cloud/url_block.png" alt="Go to URL block configuration with URL field" />
 </Frame>
 
 ### Print Page
@@ -190,7 +190,7 @@ Additional fields in **Advanced Settings:**
 | **Landscape** | boolean | Use landscape orientation |
 
 <Frame>
-<img width="400" src="/images/cloud/print_block.png" alt="Print Page block configuration with page format, print background, and headers & footers options" />
+<img src="/images/cloud/print_block.png" alt="Print Page block configuration with page format, print background, and headers & footers options" />
 </Frame>
 
 ---
@@ -208,7 +208,7 @@ Send text to the LLM for processing without browser interaction. Useful for summ
 | **Data Schema** | JSON | Expected output structure. Enable the checkbox to reveal the editor. Click **Generate with AI** to auto-suggest a schema. |
 
 <Frame>
-<img width="400" src="/images/cloud/text_block.png" alt="Text Prompt block configuration with Prompt, Model, and Data Schema fields" />
+<img src="/images/cloud/text_block.png" alt="Text Prompt block configuration with Prompt, Model, and Data Schema fields" />
 </Frame>
 
 ### File Parser
@@ -222,7 +222,7 @@ Parse PDFs, CSVs, Excel files, and images to extract structured data.
 | **Model** | selector | Which LLM model to use |
 
 <Frame>
-<img width="400" src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
+<img src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
 </Frame>
 
 ---
@@ -243,7 +243,7 @@ Inside loop blocks, use these [reserved variables](/cloud/building-workflows/add
 - `{{ current_index }}`: the iteration number (0-based)
 
 <Frame>
-<img width="400" src="/images/cloud/block-loop-config.png" alt="Loop block configuration" />
+<img src="/images/cloud/block-loop-config.png" alt="Loop block configuration" />
 </Frame>
 
 ### Conditional
@@ -261,7 +261,7 @@ Branch the workflow based on conditions. The UI shows branches as tabs (A, B, C,
 ```
 
 <Frame>
-<img width="400" src="/images/cloud/conditional_block.png" alt="Conditional block configuration with branch expressions" />
+<img src="/images/cloud/conditional_block.png" alt="Conditional block configuration with branch expressions" />
 </Frame>
 
 ### AI Validation
@@ -281,7 +281,7 @@ Additional fields in **Advanced Settings:**
 | **Input Parameters** | select | Parameters to evaluate |
 
 <Frame>
-<img width="400" src="/images/cloud/ai_val_block.png" alt="AI Validation block configuration with Complete if and Terminate if fields" />
+<img src="/images/cloud/ai_val_block.png" alt="AI Validation block configuration with Complete if and Terminate if fields" />
 </Frame>
 
 ### Code
@@ -294,7 +294,7 @@ Execute custom Python code. Input parameters are available as global variables. 
 | **Input Parameters** | select | Parameters available as globals in the code |
 
 <Frame>
-<img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
+<img src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
 </Frame>
 
 ### Wait
@@ -306,7 +306,7 @@ Pause workflow execution for a specified duration.
 | **Wait in Seconds** | number | Seconds to wait (0–300) |
 
 <Frame>
-<img width="400" src="/images/cloud/wait_block.png" alt="Wait block configuration with Wait in Seconds field" />
+<img src="/images/cloud/wait_block.png" alt="Wait block configuration with Wait in Seconds field" />
 </Frame>
 
 ---
@@ -332,7 +332,7 @@ Additional fields in **Advanced Settings:**
 *Plus [common browser fields](#common-fields).*
 
 <Frame>
-<img width="400" src="/images/cloud/download_block.png" alt="File Download block configuration with URL, Download Goal, and Download Timeout fields" />
+<img src="/images/cloud/download_block.png" alt="File Download block configuration with URL, Download Goal, and Download Timeout fields" />
 </Frame>
 
 ### Cloud Storage Upload
@@ -366,7 +366,7 @@ Upload downloaded files to S3 or Azure Blob Storage.
 </Accordion>
 
 <Frame>
-<img width="400" src="/images/cloud/cloud_block.png" alt="Cloud Storage Upload block configuration with Storage Type and Folder Path fields" />
+<img src="/images/cloud/cloud_block.png" alt="Cloud Storage Upload block configuration with Storage Type and Folder Path fields" />
 </Frame>
 
 ---
@@ -385,7 +385,7 @@ Send an email notification, optionally with file attachments from previous block
 | **File Attachments** | text | Path to files to attach |
 
 <Frame>
-<img width="400" src="/images/cloud/email_block.png" alt="Send Email block configuration with Recipients, Subject, Body, and File Attachments fields" />
+<img src="/images/cloud/email_block.png" alt="Send Email block configuration with Recipients, Subject, Body, and File Attachments fields" />
 </Frame>
 
 ### HTTP Request
@@ -411,7 +411,7 @@ Additional fields in **Advanced Settings:**
 | **Download Filename** | text | Filename for the saved response (shown when Save Response as File is enabled) |
 
 <Frame>
-<img width="400" src="/images/cloud/http_block.png" alt="HTTP Request block configuration with Method, URL, Headers, and Body fields" />
+<img src="/images/cloud/http_block.png" alt="HTTP Request block configuration with Method, URL, Headers, and Body fields" />
 </Frame>
 
 ### Human Interaction
@@ -439,5 +439,5 @@ Additional fields in **Advanced Settings:**
 | **Negative Button Label** | text | Label for the rejection action (default: "Reject") |
 
 <Frame>
-<img width="400" src="/images/cloud/human_block.png" alt="Human Interaction block configuration with Instructions For Human and Timeout fields" />
+<img src="/images/cloud/human_block.png" alt="Human Interaction block configuration with Instructions For Human and Timeout fields" />
 </Frame>

@@ -43,8 +43,8 @@ console.log(result.output);
 | `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
 | `run_with` | `str` | No | `None` | Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
 | `ai_fallback` | `bool` | No | `None` | Fall back to AI if the cached code fails. |
-| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/developers/optimization/browser-sessions). |
-| `browser_profile_id` | `str` | No | `None` | Load a [browser profile](/developers/optimization/browser-profiles) (cookies, storage) into the session. |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/optimization/browser-sessions). |
+| `browser_profile_id` | `str` | No | `None` | Load a [browser profile](/optimization/browser-profiles) (cookies, storage) into the session. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
 | `max_steps_override` | `int` | No | `None` | Cap total AI steps across all blocks. |
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |

@@ -49,7 +49,7 @@ console.log(result.output);
 | `max_steps` | `int` | No | `None` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
 | `data_extraction_schema` | `dict \| str` | No | `None` | JSON schema or Pydantic model name constraining the output shape. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
-| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/developers/optimization/browser-sessions). |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/optimization/browser-sessions). |
 | `publish_workflow` | `bool` | No | `False` | Save the generated code as a reusable workflow. Only works with `skyvern_v2`. |
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
 | `error_code_mapping` | `dict[str, str]` | No | `None` | Map custom error codes to failure reasons. |
@@ -281,7 +281,7 @@ console.log(run.output);
 </CodeGroup>
 
 <Tip>
-For production, prefer `wait_for_completion=True` / `waitForCompletion: true` or [webhooks](/developers/going-to-production/webhooks) over manual polling.
+For production, prefer `wait_for_completion=True` / `waitForCompletion: true` or [webhooks](/going-to-production/webhooks) over manual polling.
 </Tip>
 
 ---

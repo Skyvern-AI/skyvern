@@ -1,0 +1,85 @@
+---
+title: CAPTCHA & Bot Bypass
+subtitle: How Skyvern handles CAPTCHAs and avoids triggering anti-bot systems
+description: Learn how Skyvern automatically detects and solves CAPTCHAs including reCAPTCHA, hCaptcha, and Cloudflare Turnstile, and how to reduce bot detection risk using residential proxies, browser sessions, and browser profiles.
+slug: features/captcha-and-bot-bypass
+icon: shield-halved
+keywords:
+  - CAPTCHA
+  - reCAPTCHA
+  - hCaptcha
+  - Cloudflare Turnstile
+  - bot detection
+  - fingerprinting
+  - residential proxy
+  - stealth
+  - anti-bot
+---
+
+Skyvern detects CAPTCHAs using its vision model and solves them automatically. This works for reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile, FunCaptcha/ArkoseLabs, MTCaptcha, and standard text/number image CAPTCHAs.
+
+That said, CAPTCHA solving is not guaranteed. Solvers can fail on novel challenges or rate-limited IPs. The rest of this page covers what Skyvern does automatically and what you can do to improve your success rate.
+
+## Built-in bot detection avoidance
+
+Every run gets these protections automatically, with no configuration needed:
+
+- The `AutomationControlled` Blink feature flag is disabled so the browser isn't marked as automated.
+- `navigator.webdriver` is hidden by suppressing the `enable-automation` flag, which defeats the most common JavaScript detection scripts.
+- Viewport and user agent are set to match real consumer browsers.
+- Locale and timezone auto-match the proxy location, so you never end up with a mismatched fingerprint (an English locale on a Japanese IP, for example).
+
+## Reducing detection risk
+
+Beyond fingerprinting, how you structure your automation affects whether you get flagged.
+
+**Use residential proxies for sensitive sites.** Datacenter IPs are the single most common bot signal. Residential proxies route through real ISP addresses. Set `proxy_location="RESIDENTIAL"` or use `RESIDENTIAL_ISP` for a static IP that persists across the session. See [Proxy & Geolocation](/going-to-production/proxy-geolocation).
+
+**Reuse browser sessions for multi-step flows.** Creating a fresh browser for every step is suspicious. A persistent session maintains cookies, cache, and history between operations. See [Browser Sessions](/optimization/browser-sessions).
+
+**Use browser profiles for repeat visits.** Profiles save browser state from a previous session. The site sees a known browser with familiar cookies instead of a blank slate. See [Browser Profiles](/optimization/browser-profiles).
+
+**Add wait blocks between rapid actions.** Instant back-to-back actions can trigger behavioral detection. A short pause between steps looks more human.
+
+## If you get blocked
+
+Increase `max_steps` first, because some bot challenges (especially Cloudflare) loop through multiple verification pages and the solver needs more attempts. If that doesn't help, switch to a `RESIDENTIAL_ISP` proxy for a static IP that services trust more. Try loading a browser profile that previously passed the challenge on that domain. You can also load Chrome extensions for additional stealth by setting `EXTENSIONS` and `EXTENSIONS_BASE_PATH` in your environment.
+
+## Manual fallback
+
+If automatic solving fails and you need a human in the loop, you can manually solve any CAPTCHA without cancelling the run. In the Cloud UI, go to **Runs**, click your run, and click the **Take Control** button over the browser stream. Release control when you're done and the agent resumes where you left off.
+
+<img src="/images/take-control.png" />
+
+## Self-hosted deployments
+
+Automatic CAPTCHA solving is not available for self-hosted deployments. When a CAPTCHA is detected, the agent pauses for 30 seconds to allow manual intervention. Solve it in the browser window yourself, then the agent continues automatically.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card
+    title="Proxy & Geolocation"
+    href="/going-to-production/proxy-geolocation"
+  >
+    Route traffic through residential proxies in 21 countries.
+  </Card>
+  <Card
+    title="Handle 2FA"
+    href="/credentials/handle-2fa"
+  >
+    Configure TOTP, email, and SMS verification codes.
+  </Card>
+  <Card
+    title="Browser Sessions"
+    href="/optimization/browser-sessions"
+  >
+    Persist browser state across multiple runs.
+  </Card>
+  <Card
+    title="Error Handling"
+    href="/going-to-production/error-handling"
+  >
+    Map CAPTCHA and bot failures to custom error codes.
+  </Card>
+</CardGroup>
