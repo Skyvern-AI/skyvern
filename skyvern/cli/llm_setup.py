@@ -143,8 +143,10 @@ def setup_llm_providers() -> None:
                 [
                     "GEMINI_3_PRO",
                     "GEMINI_3.0_FLASH",
+                    "GEMINI_3.1_FLASH_LITE",
                     "GEMINI_2.5_PRO",
                     "GEMINI_2.5_FLASH",
+                    "GEMINI_2.5_FLASH_LITE",
                 ]
             )
     else:
