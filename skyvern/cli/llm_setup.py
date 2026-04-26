@@ -79,9 +79,6 @@ def setup_llm_providers() -> None:
                     "OPENAI_GPT5_5",
                     "OPENAI_GPT5_4",
                     "OPENAI_GPT5",
-                    "OPENAI_GPT4_1",
-                    "OPENAI_O3",
-                    "OPENAI_O4_MINI",
                 ]
             )
     else:
