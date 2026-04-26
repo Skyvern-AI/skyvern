@@ -116,6 +116,8 @@ LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 | `ANTHROPIC_CLAUDE4.5_OPUS` | |
 | `ANTHROPIC_CLAUDE4.5_SONNET` | |
 | `ANTHROPIC_CLAUDE4.5_HAIKU` | Fastest |
+| **Claude 4.1** | |
+| `ANTHROPIC_CLAUDE4.1_OPUS` | |
 | **Claude 4** | |
 | `ANTHROPIC_CLAUDE4_OPUS` | |
 | `ANTHROPIC_CLAUDE4_SONNET` | |
@@ -442,7 +444,7 @@ Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, 
 ```bash .env
 ENABLE_OLLAMA=true
 LLM_KEY=OLLAMA
-OLLAMA_MODEL=gemma4
+OLLAMA_MODEL=llama4
 OLLAMA_SERVER_URL=http://host.docker.internal:11434
 OLLAMA_SUPPORTS_VISION=false
 ```
@@ -450,7 +452,7 @@ OLLAMA_SUPPORTS_VISION=false
 ### Setup steps
 
 1. [Install Ollama](https://ollama.ai/download)
-2. Pull a model: `ollama pull gemma4`
+2. Pull a model: `ollama pull llama4`
 3. Start Ollama: `ollama serve`
 4. Configure Skyvern to connect
 

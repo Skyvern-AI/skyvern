@@ -84,7 +84,7 @@ services:
     # Ollama (local models):
     # - ENABLE_OLLAMA=true
     # - LLM_KEY=OLLAMA
-    # - OLLAMA_MODEL=gemma4:e4b
+    # - OLLAMA_MODEL=qwen3:8b
     # - OLLAMA_SERVER_URL=http://host.docker.internal:11434
     # - OLLAMA_SUPPORTS_VISION=false
     #
@@ -98,7 +98,7 @@ services:
     # - ENABLE_GROQ=true
     # - LLM_KEY=GROQ
     # - GROQ_API_KEY=<your_key>
-    # - GROQ_MODEL=openai/gpt-oss-120b
+    # - GROQ_MODEL=llama-3.3-70b-versatile
 
     # Bitwarden Settings
     # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.

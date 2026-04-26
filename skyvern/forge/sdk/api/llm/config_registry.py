@@ -505,6 +505,18 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.1_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-1-20250805",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=32000,
+            temperature=1,
+        ),
+    )
+
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
