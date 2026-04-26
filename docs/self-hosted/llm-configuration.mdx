@@ -448,7 +448,7 @@ Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, 
 ```bash .env
 ENABLE_OLLAMA=true
 LLM_KEY=OLLAMA
-OLLAMA_MODEL=llama4
+OLLAMA_MODEL=gemma4
 OLLAMA_SERVER_URL=http://host.docker.internal:11434
 OLLAMA_SUPPORTS_VISION=false
 ```
@@ -456,7 +456,7 @@ OLLAMA_SUPPORTS_VISION=false
 ### Setup steps
 
 1. [Install Ollama](https://ollama.ai/download)
-2. Pull a model: `ollama pull llama4`
+2. Pull a model: `ollama pull gemma4`
 3. Start Ollama: `ollama serve`
 4. Configure Skyvern to connect
 
@@ -481,7 +481,7 @@ Connect to any service that implements the OpenAI API format, including LiteLLM,
 
 ```bash .env
 ENABLE_OPENAI_COMPATIBLE=true
-OPENAI_COMPATIBLE_MODEL_NAME=llama3.1
+OPENAI_COMPATIBLE_MODEL_NAME=gemma4
 OPENAI_COMPATIBLE_API_KEY=sk-test
 OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
 LLM_KEY=OPENAI_COMPATIBLE
