@@ -3842,12 +3842,41 @@ class ForgeAgent:
                                 randomize_if_missing=False,
                             )
                         context = skyvern_context.current()
+                        finalization_run_id = (
+                            context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+                        )
                         await app.STORAGE.save_downloaded_files(
                             organization_id=task.organization_id,
-                            run_id=context.run_id
-                            if context and context.run_id
-                            else task.workflow_run_id or task.task_id,
+                            run_id=finalization_run_id,
                         )
+                        # Tag any session-scoped DOWNLOAD artifacts created during
+                        # this run with run_id, so GET /v1/runs/{id} surfaces them
+                        # (the watcher in browser_controller can't know the active
+                        # run at upload time — see
+                        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                        browser_session_id = context.browser_session_id if context else None
+                        if browser_session_id and task.organization_id and finalization_run_id:
+                            try:
+                                claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
+                                    run_id=finalization_run_id,
+                                    browser_session_id=browser_session_id,
+                                    organization_id=task.organization_id,
+                                    run_started_at=task.created_at,
+                                )
+                                if claimed:
+                                    LOG.debug(
+                                        "Claimed session-scoped download artifacts for run",
+                                        run_id=finalization_run_id,
+                                        browser_session_id=browser_session_id,
+                                        claimed=claimed,
+                                    )
+                            except Exception:
+                                LOG.warning(
+                                    "Failed to claim session-scoped download artifacts for run",
+                                    run_id=finalization_run_id,
+                                    browser_session_id=browser_session_id,
+                                    exc_info=True,
+                                )
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to save downloaded files",

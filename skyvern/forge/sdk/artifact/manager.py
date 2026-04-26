@@ -322,6 +322,55 @@ class ArtifactManager:
         )
         return artifact_id
 
+    async def create_browser_session_download_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        checksum: str | None = None,
+    ) -> str:
+        """Register a session-scoped downloaded file as an Artifact row.
+
+        Used by the browser_controller's watcher write site
+        (``S3Storage.sync_browser_session_file(artifact_type="downloads")``).
+        Idempotent on ``(organization_id, browser_session_id, uri)`` — the
+        watcher fires repeatedly as a downloaded file grows, so we look up
+        the existing row before inserting.
+
+        ``run_id`` is intentionally NOT set here. The watcher runs in a
+        separate process from the agent and does not know which run is
+        currently using the session. Run finalization runs the
+        ``claim_session_download_artifacts_for_run`` UPDATE to tag rows
+        whose ``created_at`` falls inside the run's window.
+        """
+        existing = await app.DATABASE.artifacts.find_artifact_for_browser_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            artifact_type=ArtifactType.DOWNLOAD,
+        )
+        if existing is not None:
+            return existing.artifact_id
+
+        artifact_id = generate_artifact_id()
+        await app.DATABASE.artifacts.create_artifact(
+            artifact_id=artifact_id,
+            artifact_type=ArtifactType.DOWNLOAD,
+            uri=uri,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            checksum=checksum,
+        )
+        LOG.debug(
+            "Registered session-scoped downloaded file as artifact",
+            artifact_id=artifact_id,
+            browser_session_id=browser_session_id,
+            filename=filename,
+        )
+        return artifact_id
+
     async def create_thought_artifact(
         self,
         thought: Thought,

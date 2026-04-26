@@ -91,6 +91,7 @@ class Artifact(BaseModel):
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
     run_id: str | None = None
+    browser_session_id: str | None = None
     observer_cruise_id: str | None = None
     observer_thought_id: str | None = None
     ai_suggestion_id: str | None = None

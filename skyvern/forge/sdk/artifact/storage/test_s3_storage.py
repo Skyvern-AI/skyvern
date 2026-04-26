@@ -2,6 +2,7 @@ import io
 from datetime import datetime
 from pathlib import Path
 from typing import Generator
+from unittest.mock import AsyncMock
 
 import boto3
 import pytest
@@ -55,6 +56,27 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mocked AWS Credentials for moto."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+
+
+@pytest.fixture(autouse=True)
+def mock_browser_session_download_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Stub out the DB-side artifact-row insert for browser-session downloads.
+
+    ``S3Storage.sync_browser_session_file(artifact_type="downloads")`` now
+    awaits ``app.ARTIFACT_MANAGER.create_browser_session_download_artifact``
+    (SKY-8861 follow-up). These storage tests run against a moto S3 with no
+    forge app initialized, so we monkey-patch the module-level ``app``
+    reference in ``s3.py`` — patching ``app.ARTIFACT_MANAGER`` directly
+    would trip the lazy-init guard on AppHolder.
+    """
+    from unittest.mock import MagicMock
+
+    import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+    fake_app = MagicMock()
+    fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
+    monkeypatch.setattr(s3_module, "app", fake_app)
+    yield
 
 
 @pytest.fixture(scope="module")

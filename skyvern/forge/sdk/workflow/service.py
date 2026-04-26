@@ -4924,10 +4924,37 @@ class WorkflowService:
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 context = skyvern_context.current()
+                finalization_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
                 await app.STORAGE.save_downloaded_files(
                     organization_id=workflow_run.organization_id,
-                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
+                    run_id=finalization_run_id,
                 )
+                # Tag any session-scoped DOWNLOAD artifacts created during this
+                # workflow run with run_id (see
+                # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                browser_session_id = context.browser_session_id if context else None
+                if browser_session_id and finalization_run_id:
+                    try:
+                        claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
+                            run_id=finalization_run_id,
+                            browser_session_id=browser_session_id,
+                            organization_id=workflow_run.organization_id,
+                            run_started_at=workflow_run.created_at,
+                        )
+                        if claimed:
+                            LOG.debug(
+                                "Claimed session-scoped download artifacts for workflow run",
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                browser_session_id=browser_session_id,
+                                claimed=claimed,
+                            )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to claim session-scoped download artifacts for workflow run",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            browser_session_id=browser_session_id,
+                            exc_info=True,
+                        )
         except asyncio.TimeoutError:
             LOG.warning(
                 "Timeout to save downloaded files",

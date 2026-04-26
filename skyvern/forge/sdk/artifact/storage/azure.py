@@ -242,16 +242,88 @@ class AzureStorage(BaseStorage):
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
+        """Return Azure URIs of completed downloads. DB-backed; mirrors s3.py."""
+        return await self._list_downloads_for_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            in_progress=False,
+        )
+
+    async def _list_downloads_for_session(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        in_progress: bool,
+    ) -> list[str]:
+        """Shared DB-backed lister with a partial-vs-final discriminator."""
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to list browser-session download artifacts; falling back to Azure LIST",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    in_progress=in_progress,
+                    exc_info=True,
+                )
+                artifacts = None
+            if artifacts is not None:
+                return [a.uri for a in artifacts if a.uri and a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
+
         uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        return [
+        files = [
             f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
             for file in await self.async_client.list_files(uri=uri)
         ]
+        return [f for f in files if f.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
 
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        object_keys = await self.list_downloaded_files_in_browser_session(organization_id, browser_session_id)
+        # Artifact-first when keyring is configured — see s3.py for rationale.
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to look up browser-session download artifacts; falling back to SAS URLs",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                artifacts = []
+            # Filter out in-progress partials — user-facing listing must only
+            # show completed downloads. Mirrors s3.py.
+            artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+            if artifacts:
+                return _file_infos_from_download_artifacts(artifacts)
+
+        return await self._get_shared_downloaded_files_in_browser_session_via_listing(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+
+    async def _get_shared_downloaded_files_in_browser_session_via_listing(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        # Direct Azure LIST: legacy fallback for sessions pre-cutover.
+        # ``list_downloaded_files_in_browser_session`` is now DB-backed, so
+        # we can't reuse it here.
+        listing_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        object_keys = [
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
+            for file in await self.async_client.list_files(uri=listing_uri)
+            if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+        ]
         if len(object_keys) == 0:
             return []
 
@@ -290,12 +362,12 @@ class AzureStorage(BaseStorage):
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
-        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        files = [
-            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
-            for file in await self.async_client.list_files(uri=uri)
-        ]
-        return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+        """Return Azure URIs of in-progress (``*.crdownload``) downloads. DB-backed."""
+        return await self._list_downloads_for_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            in_progress=True,
+        )
 
     async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
         """List all recording files for a browser session from Azure."""
@@ -594,6 +666,27 @@ class AzureStorage(BaseStorage):
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
         await self.async_client.upload_file_from_path(uri, local_file_path, tier=tier, tags=tags)
+
+        # See s3.py — DB is the single source of truth for both the user-facing
+        # listing and the agent's baseline / complete_on_download checks.
+        # Partials get a row with checksum=None so the agent can detect "still
+        # downloading"; the row is dropped on Chrome's atomic-rename
+        # ``Change.deleted`` event.
+        #
+        # Exceptions propagate so the watcher's bounded retry can recover from
+        # a transient DB outage — silently swallowing would leave the file in
+        # Azure with no row, invisible to baseline diffs.
+        if artifact_type == "downloads":
+            is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
+            checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                filename=os.path.basename(remote_path),
+                checksum=checksum,
+            )
+
         return uri
 
     async def delete_browser_session_file(
@@ -604,8 +697,29 @@ class AzureStorage(BaseStorage):
         remote_path: str,
         date: str | None = None,
     ) -> None:
-        """Delete a file from browser session storage in Azure."""
+        """Delete a file from browser session storage in Azure.
+
+        For ``downloads``, also drop the matching DOWNLOAD artifact row so a
+        subsequent ``GET /v1/browser_sessions/{id}`` doesn't hand out a signed
+        URL that 404s. Mirrors the S3 implementation.
+        """
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
+        if artifact_type == "downloads":
+            try:
+                await app.DATABASE.artifacts.delete_artifact_for_browser_session(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    uri=uri,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to delete browser-session download artifact row; proceeding with Azure delete",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    remote_path=remote_path,
+                    exc_info=True,
+                )
         await self.async_client.delete_file(uri)
 
     async def browser_session_file_exists(

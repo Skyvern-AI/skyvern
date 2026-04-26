@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING, Callable
 
 import structlog
@@ -48,6 +49,7 @@ class ArtifactsRepository(BaseRepository):
         thought_id: str | None = None,
         ai_suggestion_id: str | None = None,
         checksum: str | None = None,
+        browser_session_id: str | None = None,
     ) -> Artifact:
         async with self.Session() as session:
             new_artifact = ArtifactModel(
@@ -64,6 +66,7 @@ class ArtifactsRepository(BaseRepository):
                 ai_suggestion_id=ai_suggestion_id,
                 organization_id=organization_id,
                 checksum=checksum,
+                browser_session_id=browser_session_id,
             )
             session.add(new_artifact)
             await session.commit()
@@ -412,6 +415,119 @@ class ArtifactsRepository(BaseRepository):
                 )
             ).all()
             return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
+
+    @db_operation("find_artifact_for_browser_session")
+    async def find_artifact_for_browser_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        artifact_type: ArtifactType,
+    ) -> Artifact | None:
+        """Return the existing artifact row for ``(browser_session_id, uri)`` if any.
+
+        Used by :meth:`ArtifactManager.create_browser_session_download_artifact`
+        to stay idempotent: the watcher fires repeatedly as a downloaded file
+        grows, so we look up the existing row before inserting.
+        """
+        async with self.Session() as session:
+            artifact = (
+                await session.scalars(
+                    select(ArtifactModel)
+                    .filter(ArtifactModel.browser_session_id == browser_session_id)
+                    .filter(ArtifactModel.artifact_type == artifact_type)
+                    .filter(ArtifactModel.organization_id == organization_id)
+                    .filter(ArtifactModel.uri == uri)
+                    .order_by(ArtifactModel.created_at.desc())
+                )
+            ).first()
+            if artifact:
+                return convert_to_artifact(artifact, self.debug_enabled)
+            return None
+
+    @db_operation("list_artifacts_for_browser_session_by_type")
+    async def list_artifacts_for_browser_session_by_type(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+        artifact_type: ArtifactType,
+    ) -> list[Artifact]:
+        """List all artifacts for a browser session filtered by type.
+
+        Filters directly on the partial index ``ix_artifacts_browser_session_id_partial``
+        and returns the rows ordered by creation time. Used by the
+        ``GET /v1/browser_sessions/{id}`` read path.
+        """
+        async with self.Session() as session:
+            artifacts = (
+                await session.scalars(
+                    select(ArtifactModel)
+                    .filter(ArtifactModel.browser_session_id == browser_session_id)
+                    .filter(ArtifactModel.artifact_type == artifact_type)
+                    .filter(ArtifactModel.organization_id == organization_id)
+                    .order_by(ArtifactModel.created_at)
+                )
+            ).all()
+            return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
+
+    @db_operation("claim_session_download_artifacts_for_run")
+    async def claim_session_download_artifacts_for_run(
+        self,
+        run_id: str,
+        browser_session_id: str,
+        organization_id: str,
+        run_started_at: datetime.datetime,
+    ) -> int:
+        """Tag session-scoped DOWNLOAD artifacts that landed during this run with ``run_id``.
+
+        Called at run finalization. ``occupy_browser_session`` ensures at
+        most one run is active on a session at a time, so the time-window
+        match is unambiguous.
+
+        Returns the number of rows updated. Idempotent: re-running picks up
+        only ``run_id IS NULL`` rows, so a retry after success is a no-op.
+        """
+        async with self.Session() as session:
+            result = await session.execute(
+                update(ArtifactModel)
+                .where(ArtifactModel.browser_session_id == browser_session_id)
+                .where(ArtifactModel.organization_id == organization_id)
+                .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
+                .where(ArtifactModel.run_id.is_(None))
+                .where(ArtifactModel.created_at >= run_started_at)
+                .values(run_id=run_id)
+            )
+            await session.commit()
+            return result.rowcount or 0
+
+    @db_operation("delete_artifact_for_browser_session")
+    async def delete_artifact_for_browser_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        artifact_type: ArtifactType,
+    ) -> int:
+        """Delete the artifact row for ``(browser_session_id, uri)`` if any.
+
+        Mirror of :meth:`find_artifact_for_browser_session` for the watcher's
+        ``Change.deleted`` path: when the user/browser removes a downloaded
+        file we drop the row too, otherwise the next API read would return a
+        signed URL pointing at a deleted S3 object.
+
+        Returns the number of rows removed (0 or 1). Safe to call when no row
+        exists.
+        """
+        async with self.Session() as session:
+            result = await session.execute(
+                delete(ArtifactModel)
+                .where(ArtifactModel.browser_session_id == browser_session_id)
+                .where(ArtifactModel.organization_id == organization_id)
+                .where(ArtifactModel.artifact_type == artifact_type)
+                .where(ArtifactModel.uri == uri)
+            )
+            await session.commit()
+            return result.rowcount or 0
 
     @db_operation("get_artifact_for_run")
     async def get_artifact_for_run(

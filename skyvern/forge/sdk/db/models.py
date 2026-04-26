@@ -234,6 +234,11 @@ class ArtifactModel(Base):
             "run_id",
             postgresql_where=text("run_id IS NOT NULL"),
         ),
+        Index(
+            "ix_artifacts_browser_session_id_partial",
+            "browser_session_id",
+            postgresql_where=text("browser_session_id IS NOT NULL"),
+        ),
     )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
@@ -249,6 +254,7 @@ class ArtifactModel(Base):
     uri = Column(String)
     bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True)
+    browser_session_id = Column(String, nullable=True)
     checksum = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

@@ -379,6 +379,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         workflow_run_id=artifact_model.workflow_run_id,
         workflow_run_block_id=artifact_model.workflow_run_block_id,
         run_id=artifact_model.run_id,
+        browser_session_id=artifact_model.browser_session_id,
         observer_cruise_id=artifact_model.observer_cruise_id,
         observer_thought_id=artifact_model.observer_thought_id,
         created_at=artifact_model.created_at,
