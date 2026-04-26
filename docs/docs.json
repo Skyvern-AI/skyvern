@@ -58,7 +58,8 @@
               "cloud/getting-started/introduction",
               "cloud/getting-started/core-concepts",
               "cloud/getting-started/ai-agents-quickstart",
-              "cloud/getting-started/overview"
+              "cloud/getting-started/overview",
+              "cloud/getting-started/mcp"
             ]
           },
           {
@@ -74,9 +75,7 @@
           },
           {
             "group": "Workflow Blocks",
-            "pages": [
-              "cloud/building-workflows/configure-blocks"
-            ]
+            "pages": ["cloud/building-workflows/configure-blocks"]
           },
           {
             "group": "Running Tasks",
@@ -118,8 +117,7 @@
               "integrations/zapier",
               "integrations/make",
               "integrations/n8n",
-              "integrations/workato",
-              "integrations/mcp"
+              "integrations/workato"
             ]
           },
           {
@@ -143,7 +141,7 @@
               "developers/getting-started/core-concepts",
               "developers/getting-started/quickstart",
               "developers/getting-started/ai-agents-quickstart",
-              "integrations/mcp",
+              "developers/getting-started/mcp",
               "integrations/cli"
             ]
           },
@@ -168,9 +166,7 @@
           },
           {
             "group": "Workflow Blocks",
-            "pages": [
-              "developers/browser-automations/actions-reference"
-            ]
+            "pages": ["developers/browser-automations/actions-reference"]
           },
           {
             "group": "Handling Authentication",
@@ -375,14 +371,13 @@
   "navbar": {
     "links": [
       {
-        "label": "Dashboard",
-        "href": "https://app.skyvern.com"
+        "label": "Get API Key",
+        "href": "https://app.skyvern.com/settings"
       }
     ],
     "primary": {
-      "type": "button",
-      "label": "Get API Key",
-      "href": "https://app.skyvern.com/settings/"
+      "type": "github",
+      "href": "https://github.com/Skyvern-AI/skyvern"
     }
   },
   "footer": {
@@ -679,11 +674,19 @@
     },
     {
       "source": "/integrations/mcp-server",
-      "destination": "/integrations/mcp"
+      "destination": "/developers/getting-started/mcp"
     },
     {
       "source": "/home/integrations/mcp-server",
-      "destination": "/integrations/mcp"
+      "destination": "/developers/getting-started/mcp"
+    },
+    {
+      "source": "/integrations/mcp",
+      "destination": "/developers/getting-started/mcp"
+    },
+    {
+      "source": "/going-to-production/mcp",
+      "destination": "/developers/getting-started/mcp"
     },
     {
       "source": "/api-reference/api-reference/agent/run-task",
