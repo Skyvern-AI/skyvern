@@ -146,7 +146,7 @@ async def test_refresh_rebuilds_downloaded_files_from_artifact_ids():
         ),
     ):
         service = WorkflowService()
-        refreshed = await service._refresh_output_screenshot_urls(
+        refreshed = await service._refresh_output_urls(
             persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
         )
 
@@ -191,7 +191,7 @@ async def test_refresh_leaves_legacy_outputs_untouched():
         mock_get,
     ):
         service = WorkflowService()
-        refreshed = await service._refresh_output_screenshot_urls(
+        refreshed = await service._refresh_output_urls(
             persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
         )
 
@@ -228,9 +228,182 @@ async def test_refresh_handles_missing_artifact_rows():
         new=AsyncMock(return_value=[]),
     ):
         service = WorkflowService()
-        refreshed = await service._refresh_output_screenshot_urls(
+        refreshed = await service._refresh_output_urls(
             persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
         )
 
     # Falls back to whatever URL was already stored; doesn't blank out.
     assert refreshed["downloaded_files"][0]["url"] == "https://skyvern-uploads.s3.amazonaws.com/.../old.pdf?sig=x"
+
+
+@pytest.mark.asyncio
+async def test_refresh_falls_back_to_workflow_run_lookup_when_artifact_ids_missing():
+    """Race / pre-#10580 fallback: snapshot has ``downloaded_files`` with stale
+    presigned URLs but ``downloaded_file_artifact_ids`` is null/missing
+    (because at block-completion time the artifact rows hadn't been created
+    yet). Refresh must look up by workflow_run_id and match by filename so a
+    multi-block run doesn't merge sibling blocks' downloads."""
+    from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    persisted_block_output = {
+        "task_id": "tsk_1",
+        "task_screenshot_artifact_ids": [],
+        "workflow_screenshot_artifact_ids": [],
+        # No downloaded_file_artifact_ids at all — the bug case from staging.
+        "downloaded_file_artifact_ids": None,
+        "downloaded_files": [
+            {
+                "url": "https://skyvern-uploads.s3.amazonaws.com/.../mybook.zip?sig=stale",
+                "checksum": "sha-1",
+                "filename": "mybook.zip",
+                "modified_at": None,
+                "artifact_id": None,
+            }
+        ],
+        "downloaded_file_urls": [
+            "https://skyvern-uploads.s3.amazonaws.com/.../mybook.zip?sig=stale",
+        ],
+    }
+
+    matching_artifact = Artifact(
+        artifact_id="a_recovered",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://skyvern-uploads/downloads/staging/o_1/wr_1/mybook.zip",
+        organization_id="o_1",
+        run_id="wr_1",
+        checksum="sha-1",
+        created_at="2026-04-26T00:00:00Z",
+        modified_at="2026-04-26T00:00:00Z",
+    )
+    sibling_artifact = Artifact(
+        artifact_id="a_sibling",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://skyvern-uploads/downloads/staging/o_1/wr_1/other-block-file.zip",
+        organization_id="o_1",
+        run_id="wr_1",
+        checksum="sha-2",
+        created_at="2026-04-26T00:00:01Z",
+        modified_at="2026-04-26T00:00:01Z",
+    )
+    fresh_file_info = FileInfo(
+        url="https://api.skyvern.com/v1/artifacts/a_recovered/content?sig=fresh",
+        checksum="sha-1",
+        filename="mybook.zip",
+        modified_at=matching_artifact.created_at,
+        artifact_id="a_recovered",
+    )
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.list_artifacts_for_run_by_type",
+            new=AsyncMock(return_value=[matching_artifact, sibling_artifact]),
+        ),
+        # Patch the helper at the call site rather than the original symbol —
+        # service.py imports the symbol once at module load.
+        patch(
+            "skyvern.forge.sdk.workflow.service._file_infos_from_download_artifacts",
+            return_value=[fresh_file_info],
+        ),
+    ):
+        service = WorkflowService()
+        refreshed = await service._refresh_output_urls(
+            persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
+        )
+
+    assert len(refreshed["downloaded_files"]) == 1
+    assert refreshed["downloaded_files"][0]["url"].startswith(
+        "https://api.skyvern.com/v1/artifacts/a_recovered/content"
+    )
+    assert refreshed["downloaded_file_urls"] == ["https://api.skyvern.com/v1/artifacts/a_recovered/content?sig=fresh"]
+    # Sibling artifact must NOT leak in — match was filtered to mybook.zip only.
+    assert refreshed["downloaded_files"][0]["filename"] == "mybook.zip"
+
+
+@pytest.mark.asyncio
+async def test_refresh_fallback_skips_when_no_filename():
+    """Snapshot has downloaded_files but each entry lacks filename.
+    No match key → don't lookup; leave snapshot untouched."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    persisted_block_output = {
+        "task_id": "tsk_1",
+        "task_screenshot_artifact_ids": [],
+        "workflow_screenshot_artifact_ids": [],
+        "downloaded_file_artifact_ids": None,
+        "downloaded_files": [
+            {
+                "url": "https://example.com/x",
+                "checksum": None,
+                "filename": None,
+                "modified_at": None,
+                "artifact_id": None,
+            }
+        ],
+        "downloaded_file_urls": ["https://example.com/x"],
+    }
+
+    mock_list = AsyncMock()  # must NOT be called
+
+    with patch(
+        "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.list_artifacts_for_run_by_type",
+        mock_list,
+    ):
+        service = WorkflowService()
+        refreshed = await service._refresh_output_urls(
+            persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
+        )
+
+    assert refreshed["downloaded_files"][0]["url"] == "https://example.com/x"
+    mock_list.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_fallback_skips_when_run_lookup_finds_no_match():
+    """Filename in snapshot doesn't match any current run artifact (e.g.,
+    legacy run that pre-dates artifact rows entirely). Leave snapshot untouched
+    rather than blanking the URL."""
+    from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    persisted_block_output = {
+        "task_id": "tsk_1",
+        "task_screenshot_artifact_ids": [],
+        "workflow_screenshot_artifact_ids": [],
+        "downloaded_file_artifact_ids": None,
+        "downloaded_files": [
+            {
+                "url": "https://skyvern-uploads.s3.amazonaws.com/.../legacy.zip?sig=x",
+                "checksum": "sha-1",
+                "filename": "legacy.zip",
+                "modified_at": None,
+                "artifact_id": None,
+            }
+        ],
+        "downloaded_file_urls": [
+            "https://skyvern-uploads.s3.amazonaws.com/.../legacy.zip?sig=x",
+        ],
+    }
+
+    different_artifact = Artifact(
+        artifact_id="a_other",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://skyvern-uploads/downloads/staging/o_1/wr_1/different.zip",
+        organization_id="o_1",
+        run_id="wr_1",
+        checksum="sha-9",
+        created_at="2026-04-26T00:00:00Z",
+        modified_at="2026-04-26T00:00:00Z",
+    )
+
+    with patch(
+        "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.list_artifacts_for_run_by_type",
+        new=AsyncMock(return_value=[different_artifact]),
+    ):
+        service = WorkflowService()
+        refreshed = await service._refresh_output_urls(
+            persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
+        )
+
+    # No match → stored URL preserved.
+    assert refreshed["downloaded_files"][0]["url"] == "https://skyvern-uploads.s3.amazonaws.com/.../legacy.zip?sig=x"
