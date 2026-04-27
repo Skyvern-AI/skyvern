@@ -39,17 +39,19 @@ def azure_storage() -> AzureStorageForTests:
 
 
 @pytest.fixture(autouse=True)
-def mock_browser_session_download_artifact_create(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub out the DB-side artifact-row insert for browser-session downloads.
+def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub out the DB-side artifact-row inserts for browser-session files.
 
     Mirrors the s3 storage test fixture — see SKY-8861 follow-up. Patches
     the module-level ``app`` reference in ``azure.py`` because the forge
-    app isn't initialized in these storage-only tests.
+    app isn't initialized in these storage-only tests. Covers both
+    download and recording artifact creators.
     """
     import skyvern.forge.sdk.artifact.storage.azure as azure_module
 
     fake_app = MagicMock()
     fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
+    fake_app.ARTIFACT_MANAGER.create_browser_session_recording_artifact = AsyncMock(return_value="a_test")
     monkeypatch.setattr(azure_module, "app", fake_app)
 
 

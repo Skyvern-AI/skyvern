@@ -10,16 +10,21 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 
-async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
-    """Build the API-shaped ``FileInfo`` list from DOWNLOAD artifact rows.
+async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type: ArtifactType) -> list[FileInfo]:
+    """Build the API-shaped ``FileInfo`` list from a homogeneous batch of
+    artifact rows (e.g. all DOWNLOAD or all RECORDING).
 
     Filename is the URI basename (the save site writes ``{base_uri}/{file}``);
     checksum and modified_at come straight from the row, so retrieval needs
     zero S3 round-trips.
 
-    All artifacts in a single batch share the same organization (downloads are
-    scoped to a run, which is scoped to an org), so the per-org URL TTL is
-    resolved once and applied to every URL.
+    All artifacts in a single batch share the same organization (downloads /
+    recordings are scoped to a run or browser session, which is scoped to an
+    org), so the per-org URL TTL is resolved once and applied to every URL.
+
+    The ``artifact_type`` is only used for the URL's informational query
+    parameter — it does not affect the HMAC signature. Callers must pass rows
+    of a single type so the URL hint is correct.
     """
     if not artifacts:
         return []
@@ -31,7 +36,7 @@ async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list
         url = app.ARTIFACT_MANAGER.build_signed_content_url(
             artifact_id=artifact.artifact_id,
             artifact_name=filename,
-            artifact_type=ArtifactType.DOWNLOAD.value,
+            artifact_type=artifact_type.value,
             expiry_seconds=expiry_seconds,
         )
         infos.append(
@@ -44,6 +49,16 @@ async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list
             )
         )
     return infos
+
+
+async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
+    """Backward-compat alias for DOWNLOAD-typed callers.
+
+    Forwards to :func:`_file_infos_from_artifacts` with the DOWNLOAD type so
+    pre-existing import sites keep working without each having to thread the
+    artifact_type through.
+    """
+    return await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.DOWNLOAD)
 
 
 # TODO: This should be a part of the ArtifactType model
@@ -192,10 +207,6 @@ class BaseStorage(ABC):
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        pass
-
-    @abstractmethod
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
         pass
 
     @abstractmethod

@@ -350,11 +350,57 @@ class ArtifactManager:
         ``claim_session_download_artifacts_for_run`` UPDATE to tag rows
         whose ``created_at`` falls inside the run's window.
         """
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.DOWNLOAD,
+            checksum=checksum,
+        )
+
+    async def create_browser_session_recording_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        checksum: str | None = None,
+    ) -> str:
+        """Register a session-scoped recording (video) as a RECORDING Artifact row.
+
+        Mirrors :meth:`create_browser_session_download_artifact`. Called from
+        ``S3Storage.sync_browser_session_file(artifact_type="videos")`` once
+        Playwright finalizes the recording at session close. Idempotent on
+        ``(organization_id, browser_session_id, uri)`` — re-runs of the
+        end-of-session sync are safe.
+        """
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.RECORDING,
+            checksum=checksum,
+        )
+
+    async def _create_browser_session_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        artifact_type: ArtifactType,
+        checksum: str | None = None,
+    ) -> str:
+        """Shared idempotent insert keyed on ``(browser_session_id, uri, artifact_type)``."""
         existing = await app.DATABASE.artifacts.find_artifact_for_browser_session(
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             uri=uri,
-            artifact_type=ArtifactType.DOWNLOAD,
+            artifact_type=artifact_type,
         )
         if existing is not None:
             return existing.artifact_id
@@ -362,17 +408,18 @@ class ArtifactManager:
         artifact_id = generate_artifact_id()
         await app.DATABASE.artifacts.create_artifact(
             artifact_id=artifact_id,
-            artifact_type=ArtifactType.DOWNLOAD,
+            artifact_type=artifact_type,
             uri=uri,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             checksum=checksum,
         )
         LOG.debug(
-            "Registered session-scoped downloaded file as artifact",
+            "Registered session-scoped artifact",
             artifact_id=artifact_id,
             browser_session_id=browser_session_id,
             filename=filename,
+            artifact_type=artifact_type.value,
         )
         return artifact_id
 
