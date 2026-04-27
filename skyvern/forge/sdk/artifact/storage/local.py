@@ -314,8 +314,10 @@ class LocalStorage(BaseStorage):
     ) -> list[str]:
         return []
 
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
-        """List all recording files for a browser session from local storage.
+    async def get_shared_recordings_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        """Get recording files with URLs for a browser session from local storage.
 
         Videos are synced to the browser_sessions storage path when the session closes.
         """
@@ -328,20 +330,14 @@ class LocalStorage(BaseStorage):
             / "videos"
         )
 
-        recording_files: list[str] = []
-        if videos_base.exists():
-            for root, _, files in os.walk(videos_base):
-                for file in files:
-                    file_path = Path(root) / file
-                    recording_files.append(f"file://{file_path}")
+        if not videos_base.exists():
+            return []
 
-        return recording_files
+        file_uris: list[str] = []
+        for root, _, files in os.walk(videos_base):
+            for file in files:
+                file_uris.append(f"file://{Path(root) / file}")
 
-    async def get_shared_recordings_in_browser_session(
-        self, organization_id: str, browser_session_id: str
-    ) -> list[FileInfo]:
-        """Get recording files with URLs for a browser session from local storage."""
-        file_uris = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
         if not file_uris:
             return []
 

@@ -59,15 +59,17 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def mock_browser_session_download_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
-    """Stub out the DB-side artifact-row insert for browser-session downloads.
+def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Stub out the DB-side artifact-row inserts for browser-session files.
 
-    ``S3Storage.sync_browser_session_file(artifact_type="downloads")`` now
-    awaits ``app.ARTIFACT_MANAGER.create_browser_session_download_artifact``
-    (SKY-8861 follow-up). These storage tests run against a moto S3 with no
-    forge app initialized, so we monkey-patch the module-level ``app``
-    reference in ``s3.py`` — patching ``app.ARTIFACT_MANAGER`` directly
-    would trip the lazy-init guard on AppHolder.
+    ``S3Storage.sync_browser_session_file`` now awaits
+    ``app.ARTIFACT_MANAGER.create_browser_session_download_artifact`` (for
+    ``artifact_type="downloads"``) and
+    ``app.ARTIFACT_MANAGER.create_browser_session_recording_artifact`` (for
+    ``artifact_type="videos"``). These storage tests run against a moto S3
+    with no forge app initialized, so we monkey-patch the module-level
+    ``app`` reference in ``s3.py`` — patching ``app.ARTIFACT_MANAGER``
+    directly would trip the lazy-init guard on AppHolder.
     """
     from unittest.mock import MagicMock
 
@@ -75,6 +77,7 @@ def mock_browser_session_download_artifact_create(monkeypatch: pytest.MonkeyPatc
 
     fake_app = MagicMock()
     fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
+    fake_app.ARTIFACT_MANAGER.create_browser_session_recording_artifact = AsyncMock(return_value="a_test")
     monkeypatch.setattr(s3_module, "app", fake_app)
     yield
 

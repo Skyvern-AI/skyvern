@@ -23,6 +23,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
 )
 from skyvern.forge.sdk.models import Step
@@ -369,19 +370,58 @@ class AzureStorage(BaseStorage):
             in_progress=True,
         )
 
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
-        """List all recording files for a browser session from Azure."""
-        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
-        return [
-            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
-            for file in await self.async_client.list_files(uri=uri)
-        ]
-
     async def get_shared_recordings_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        """Get recording files with SAS URLs for a browser session."""
-        object_keys = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
+        """Get recording files for a browser session.
+
+        Artifact-first when the keyring is configured — see s3.py for the
+        rationale. Falls back to direct Azure LIST + SAS URLs for legacy
+        sessions and OSS-default deployments.
+        """
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.RECORDING,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to look up browser-session recording artifacts; falling back to SAS URLs",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                artifacts = []
+            artifacts = [
+                a for a in artifacts if a.uri and (a.uri.lower().endswith(".webm") or a.uri.lower().endswith(".mp4"))
+            ]
+            if artifacts:
+                file_infos = await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.RECORDING)
+                file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
+                return file_infos
+
+        # Legacy fallback: keyring unset, DB raised, or session pre-cutover
+        # with no rows at all. SKY-9286: drop entirely after the bake-in
+        # window (target 2026-05-03) — every call here is a billable
+        # ListBlobs request.
+        return await self._get_shared_recordings_in_browser_session_via_listing(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+
+    async def _get_shared_recordings_in_browser_session_via_listing(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        # Direct Azure LIST: legacy fallback for pre-cutover sessions and
+        # OSS deployments without a keyring.
+        # SKY-9286: scheduled for removal once production sessions all have
+        # rows — every call here is a billable ListBlobs request.
+        listing_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
+        object_keys = [
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
+            for file in await self.async_client.list_files(uri=listing_uri)
+        ]
         if len(object_keys) == 0:
             return []
 
@@ -667,19 +707,32 @@ class AzureStorage(BaseStorage):
         tags = await self._get_tags_for_org(organization_id)
         await self.async_client.upload_file_from_path(uri, local_file_path, tier=tier, tags=tags)
 
-        # See s3.py — DB is the single source of truth for both the user-facing
-        # listing and the agent's baseline / complete_on_download checks.
-        # Partials get a row with checksum=None so the agent can detect "still
-        # downloading"; the row is dropped on Chrome's atomic-rename
-        # ``Change.deleted`` event.
-        #
-        # Exceptions propagate so the watcher's bounded retry can recover from
-        # a transient DB outage — silently swallowing would leave the file in
-        # Azure with no row, invisible to baseline diffs.
         if artifact_type == "downloads":
+            # See s3.py — DB is the single source of truth for the user-facing
+            # listing and the agent's baseline / complete_on_download checks.
+            # Partials get a row with checksum=None; the row is dropped on
+            # Chrome's atomic-rename ``Change.deleted`` event. Exceptions
+            # propagate so the watcher's bounded retry can recover from a
+            # transient DB outage — both ops are idempotent.
             is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
             checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                filename=os.path.basename(remote_path),
+                checksum=checksum,
+            )
+        elif artifact_type == "videos":
+            # Recording uploaded once at session close — see s3.py. Artifact-
+            # row creation is best-effort: the only caller swallows
+            # exceptions without retry, so the gated legacy listing fallback
+            # in ``get_shared_recordings_in_browser_session`` is the safety
+            # net for missed writes (when the session has no RECORDING rows
+            # we fall through to the Azure LIST path, so a row-less recording
+            # still surfaces via the legacy SAS URL).
+            checksum = calculate_sha256_for_file(local_file_path)
+            await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
