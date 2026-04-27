@@ -300,6 +300,7 @@ async def test_get_shared_downloaded_files_in_browser_session_uses_artifact_urls
         with patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app:
             s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
             base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+            base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
             result = await storage.get_shared_downloaded_files_in_browser_session(
                 organization_id="o_1", browser_session_id="pbs_1"
             )
@@ -370,6 +371,7 @@ async def test_get_shared_downloaded_files_in_browser_session_filters_partial_ar
     ):
         s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
         base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+        base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
         result = await storage.get_shared_downloaded_files_in_browser_session(
             organization_id="o_1", browser_session_id="pbs_1"
         )

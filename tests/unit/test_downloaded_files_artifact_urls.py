@@ -208,6 +208,7 @@ async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_c
         with patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app:
             s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
             base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+            base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
             result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
 
     assert len(result) == 1
@@ -247,6 +248,7 @@ async def test_get_downloaded_files_preserves_artifact_row_order(keyring_configu
         with patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app:
             s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
             base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+            base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
             result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
 
     assert [fi.filename for fi in result] == ["first.pdf", "second.pdf"]
