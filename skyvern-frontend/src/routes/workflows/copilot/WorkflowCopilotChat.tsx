@@ -48,15 +48,21 @@ interface ToolActivity {
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   update_workflow: "Updating workflow",
+  update_and_run_blocks: "Updating & running blocks",
   list_credentials: "Listing credentials",
   get_block_schema: "Looking up block schema",
   validate_block: "Validating block",
   run_blocks_and_collect_debug: "Running blocks",
+  get_run_results: "Getting run results",
   get_browser_screenshot: "Taking screenshot",
   navigate_browser: "Navigating browser",
   evaluate: "Evaluating JavaScript",
   click: "Clicking element",
   type_text: "Typing text",
+  scroll: "Scrolling",
+  console_messages: "Reading console",
+  select_option: "Selecting option",
+  press_key: "Pressing key",
 };
 
 const formatChatTimestamp = (value: string) => {
