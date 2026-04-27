@@ -325,6 +325,83 @@ class TestSummarizeToolResult:
         summary = self._summarize("unknown_tool", {"ok": True})
         assert summary == "OK"
 
+    def test_evaluate_does_not_dump_raw_list(self) -> None:
+        # The activity bullet must describe shape only — JS return values
+        # (which are page-controlled) must never reach the SSE payload.
+        summary = self._summarize(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {
+                    "result": [
+                        {"text": "Tickets", "href": "https://example.com/tickets/"},
+                        {"text": "Hospitality", "href": "https://example.com/hospitality/"},
+                    ]
+                },
+            },
+        )
+        assert "Tickets" not in summary
+        assert "Hospitality" not in summary
+        assert "example.com" not in summary
+        assert "list" in summary
+        assert "2" in summary
+
+    def test_evaluate_dict_returns_structural_summary(self) -> None:
+        summary = self._summarize(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {"result": {"title": "Official Site", "url": "https://example.com/"}},
+            },
+        )
+        assert "Official Site" not in summary
+        assert "example.com" not in summary
+        assert "title" in summary  # key names describe shape, not values
+        assert "url" in summary
+
+    def test_evaluate_none_returns_plain_label(self) -> None:
+        summary = self._summarize(
+            "evaluate",
+            {"ok": True, "data": {"result": None}},
+        )
+        assert summary == "Evaluated JavaScript"
+
+    def test_failure_strips_http_headers_blob(self) -> None:
+        # Failure summaries must never embed an HTTP-response-headers dict.
+        summary = self._summarize(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "headers: {'date': 'Mon, 27 Apr 2026 05:03:27 GMT', "
+                    "'content-type': 'application/json', 'content-length': '43', "
+                    "'connection': 'keep-alive'}"
+                ),
+            },
+        )
+        assert "'date'" not in summary
+        assert "'content-type'" not in summary
+        assert "keep-alive" not in summary
+        assert summary.startswith("Failed:")
+        assert len(summary) <= 128  # "Failed: " + ≤120 sanitized body
+
+    def test_failure_caps_at_120_chars(self) -> None:
+        long_message = "An unexpected error happened while doing the thing. " * 10
+        assert len(long_message) > 200
+        summary = self._summarize(
+            "click",
+            {"ok": False, "error": long_message},
+        )
+        body = summary[len("Failed: ") :]
+        assert len(body) <= 120
+
+    def test_screenshot_without_url_no_empty_parens(self) -> None:
+        summary = self._summarize(
+            "get_browser_screenshot",
+            {"ok": True, "data": {}},
+        )
+        assert summary == "Screenshot taken"
+
 
 class TestParseFinalResponse:
     """parse_final_response is the last mile between model output and the frontend.
