@@ -23,9 +23,9 @@
 
 ---
 
-Traditional tools that automate web tasks end up failing because they treat the web like it's static when it isn't. A small change on a website can break everything, leaving you with failures or having to constantly jump in to pay the "maintenance tax" of manually fixing things. 
+Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
 
-[Skyvern](https://www.skyvern.com) is a browser automation tool that solves this problem by using AI that "sees" websites the way a human does. This means it can adapt when pages change and keep your automations running smoothly without you having to constantly babysit them. 
+[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code workflow builder to help both technical and non-technical users automate manual workflows on any website, replacing brittle or unreliable automation solutions.
 
 <!-- Demo Link-->
 https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f

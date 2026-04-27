@@ -1,0 +1,32 @@
+---
+title: prompt
+slug: sdk-reference/browser-automation/prompt
+---
+
+Send a prompt to the LLM and get a structured response about the current page.
+
+<CodeGroup>
+```python Python
+result = await page.prompt(
+    "What is the main heading on this page?",
+    schema={"heading": {"type": "string"}},
+)
+print(result)
+```
+
+```typescript TypeScript
+const result = await page.prompt(
+  "What is the main heading on this page?",
+  { heading: { type: "string" } },
+);
+console.log(result);
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `str` / `string` | Yes | The question or instruction to send to the LLM about the current page. |
+| `schema` | `dict` / `Record<string, unknown>` | No | JSON schema that constrains the response shape. When provided, the LLM returns data matching this schema. |
+| `model` | `dict` / `Record<string, unknown>` | No | LLM model configuration override. Use to select a different model for this call. |
+
+Returns `dict | list | str | None` / `Record<string, unknown> | unknown[] | string | null`.

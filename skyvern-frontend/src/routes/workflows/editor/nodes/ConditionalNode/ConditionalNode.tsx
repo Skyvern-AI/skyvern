@@ -1,17 +1,17 @@
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
   Handle,
   NodeProps,
   Position,
   useNodes,
   useReactFlow,
+  type Node,
 } from "@xyflow/react";
 import {
   PlusIcon,
   ChevronDownIcon,
   DotsVerticalIcon,
 } from "@radix-ui/react-icons";
-import type { Node } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -31,21 +31,36 @@ import {
   getLoopNodeWidth,
   updateNodeAndDescendantsVisibility,
 } from "../../workflowEditorUtils";
-import type { ConditionalNode } from "./types";
 import {
+  type ConditionalNode,
   ConditionalNodeData,
   createBranchCondition,
   defaultBranchCriteria,
 } from "./types";
 import type { BranchCondition } from "../../../types/workflowTypes";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const nodes = useNodes<AppNode>();
-  const { setNodes, setEdges } = useReactFlow();
+  const { setNodes, setEdges, updateNodeData } = useReactFlow();
   const node = nodes.find((n) => n.id === id);
-  const { setIsInternalUpdate } = useWorkflowHasChangesStore();
+  const { beginInternalUpdate, endInternalUpdate } =
+    useWorkflowHasChangesStore();
+  // Track pending endInternalUpdate timer from handleSelectBranch so we can
+  // clean it up on unmount and prevent a stuck counter.
+  const branchSelectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  useEffect(() => {
+    return () => {
+      if (branchSelectTimerRef.current !== null) {
+        clearTimeout(branchSelectTimerRef.current);
+        endInternalUpdate();
+        branchSelectTimerRef.current = null;
+      }
+    };
+  }, [endInternalUpdate]);
 
   const update = useUpdate<ConditionalNodeData>({
     id,
@@ -86,6 +101,26 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     return node ? getLoopNodeWidth(node, nodes) : 450;
   }, [node, nodes]);
 
+  const headerRef = useRef<HTMLDivElement>(null);
+  const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver(() => {
+      const height = Math.round(el.offsetHeight);
+      if (lastHeaderHeight.current !== height) {
+        lastHeaderHeight.current = height;
+        updateNodeData(id, { _headerHeight: height });
+        window.dispatchEvent(new Event("conditional-header-resized"));
+      }
+    });
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [id, updateNodeData]);
+
   const orderedBranches = useMemo(() => {
     const defaultBranch = data.branches.find((branch) => branch.is_default);
     const nonDefault = data.branches.filter((branch) => !branch.is_default);
@@ -112,22 +147,39 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   useEffect(() => {
     if (!data.activeBranchId && orderedBranches.length > 0) {
       // Mark as internal update to prevent triggering "unsaved changes" dialog
-      setIsInternalUpdate(true);
+      beginInternalUpdate();
       update({
         activeBranchId: orderedBranches[0]?.id ?? null,
       });
       // Clear the flag after layout completes
-      setTimeout(() => {
-        setIsInternalUpdate(false);
+      let ended = false;
+      const timer = setTimeout(() => {
+        ended = true;
+        endInternalUpdate();
       }, 50);
+      return () => {
+        clearTimeout(timer);
+        if (!ended) {
+          endInternalUpdate();
+        }
+      };
     }
-  }, [data.activeBranchId, orderedBranches, update, setIsInternalUpdate]);
+  }, [
+    data.activeBranchId,
+    orderedBranches,
+    update,
+    beginInternalUpdate,
+    endInternalUpdate,
+  ]);
 
   // Toggle visibility of branch nodes/edges when activeBranchId changes
   useEffect(() => {
     if (!data.activeBranchId) {
       return;
     }
+
+    // Mark as internal update to prevent triggering "unsaved changes" dialog
+    beginInternalUpdate();
 
     const activeBranchId = data.activeBranchId;
     let updatedNodesSnapshot: Array<AppNode> = [];
@@ -229,7 +281,27 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     setTimeout(() => {
       window.dispatchEvent(new CustomEvent("conditional-branch-changed"));
     }, 0);
-  }, [data.activeBranchId, id, setNodes, setEdges]);
+
+    // Clear the internal update flag after changes propagate
+    let ended = false;
+    const timer = setTimeout(() => {
+      ended = true;
+      endInternalUpdate();
+    }, 50);
+    return () => {
+      clearTimeout(timer);
+      if (!ended) {
+        endInternalUpdate();
+      }
+    };
+  }, [
+    data.activeBranchId,
+    id,
+    setNodes,
+    setEdges,
+    beginInternalUpdate,
+    endInternalUpdate,
+  ]);
 
   const handleAddCondition = () => {
     if (!data.editable) {
@@ -275,19 +347,29 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     });
   };
 
-  const handleSelectBranch = (branchId: string) => {
-    if (!data.editable) {
-      return;
-    }
-    // Mark as internal update to prevent triggering "unsaved changes" dialog
-    // Switching branches is UI state, not actual workflow data changes
-    setIsInternalUpdate(true);
-    update({ activeBranchId: branchId });
-    // Clear the flag after layout completes (layout uses setTimeout(10))
-    setTimeout(() => {
-      setIsInternalUpdate(false);
-    }, 50);
-  };
+  const handleSelectBranch = useCallback(
+    (branchId: string) => {
+      if (!data.editable) {
+        return;
+      }
+      // Mark as internal update to prevent triggering "unsaved changes" dialog
+      // Switching branches is UI state, not actual workflow data changes
+      // Cancel any pending timer from a previous rapid call to keep the counter balanced
+      if (branchSelectTimerRef.current !== null) {
+        clearTimeout(branchSelectTimerRef.current);
+        endInternalUpdate();
+      }
+      beginInternalUpdate();
+      update({ activeBranchId: branchId });
+      // Clear the flag after layout completes (layout uses setTimeout(10))
+      // Store timer in ref so it can be cleaned up on unmount
+      branchSelectTimerRef.current = setTimeout(() => {
+        branchSelectTimerRef.current = null;
+        endInternalUpdate();
+      }, 50);
+    },
+    [data.editable, beginInternalUpdate, update, endInternalUpdate],
+  );
 
   const handleRemoveBranch = (branchId: string) => {
     if (!data.editable) {
@@ -326,7 +408,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     // If the deleted branch was active, switch to the first branch
     const newActiveBranchId =
       data.activeBranchId === branchId
-        ? updatedBranches[0]?.id ?? null
+        ? (updatedBranches[0]?.id ?? null)
         : data.activeBranchId;
 
     update({
@@ -466,6 +548,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
       >
         <div className="flex w-full justify-center">
           <div
+            ref={headerRef}
             className={cn(
               "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
               data.comparisonColor,
@@ -701,18 +784,19 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                       />
                     )}
                   </div>
-                  <WorkflowBlockInput
+                  <WorkflowBlockInputTextarea
                     nodeId={id}
                     value={
                       activeBranch.is_default
                         ? "Executed when no other condition matches"
-                        : activeBranch.criteria?.expression ?? ""
+                        : (activeBranch.criteria?.expression ?? "")
                     }
                     disabled={!data.editable || activeBranch.is_default}
                     onChange={(value) => {
                       handleExpressionChange(value);
                     }}
                     placeholder="Enter condition to evaluate (Jinja, natural language, or both)"
+                    className="nopan text-xs"
                   />
                 </div>
               )}

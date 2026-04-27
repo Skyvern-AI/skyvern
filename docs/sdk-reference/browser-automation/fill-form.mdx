@@ -1,0 +1,25 @@
+---
+title: fill_form
+slug: sdk-reference/browser-automation/fill-form
+---
+
+Fill a single-page form using AI. Pass a `data` dict describing the values to fill.
+
+```python
+await page.fill_form(
+    data={"name": "John Doe", "email": "john@example.com", "role": "Engineer"},
+)
+
+# With a custom prompt to guide the AI
+await page.fill_form(
+    data={"name": "John Doe", "email": "john@example.com"},
+    prompt="Fill out the registration form with the provided user details",
+)
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `data` | `dict[str, Any]` | Yes | Key-value pairs of form data to fill. |
+| `prompt` | `str` | No | Instruction for the AI. Defaults to `"Fill out the form"`. |
+
+## Returns `None`

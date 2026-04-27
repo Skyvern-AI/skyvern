@@ -2,6 +2,7 @@ import { AxiosError } from "axios";
 import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
+import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import {
   SwitchBarNavigation,
@@ -24,6 +25,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { runsApiBaseUrl } from "@/util/env";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import {
   CodeIcon,
   FileIcon,
@@ -38,6 +40,7 @@ import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkf
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
+import { filenameForDownloadedFileUrl } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
@@ -52,6 +55,8 @@ import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
 import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
+import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
+import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -108,8 +113,10 @@ function WorkflowRun() {
   });
 
   useEffect(() => {
-    const keys = Object.keys(blockScriptsPublished ?? {});
-    setHasPublishedCode(keys.length > 0);
+    const keys = Object.keys(blockScriptsPublished?.blocks ?? {});
+    setHasPublishedCode(
+      keys.length > 0 || Boolean(blockScriptsPublished?.main_script),
+    );
   }, [blockScriptsPublished, setHasPublishedCode]);
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
@@ -148,6 +155,12 @@ function WorkflowRun() {
     workflowRun && statusIsCancellable(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
+
+  const { data: fallbackEpisodes } = useFallbackEpisodesQuery({
+    workflowPermanentId,
+    workflowRunId: workflowRun?.workflow_run_id,
+    enabled: workflowRunIsFinalized === true,
+  });
   const finallyBlockLabel =
     workflow?.workflow_definition?.finally_block_label ?? null;
   const selection = findActiveItem(
@@ -218,7 +231,10 @@ function WorkflowRun() {
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div className="space-y-2 rounded-md border border-red-600 bg-error-light p-4">
-      <div className="font-bold">{failureReasonTitle}</div>
+      <div className="flex items-center gap-2">
+        <div className="font-bold">{failureReasonTitle}</div>
+        <FailureCategoryBadge failureCategory={workflowRun.failure_category} />
+      </div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
       {shouldShowFinallyNote && (
@@ -345,6 +361,21 @@ function WorkflowRun() {
               ) : null}
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
+            {workflowRun &&
+              (workflowRun.started_at || workflowRun.finished_at) && (
+                <div className="flex gap-4 text-sm text-slate-400">
+                  {workflowRun.started_at && (
+                    <span title={basicTimeFormat(workflowRun.started_at)}>
+                      Started: {basicLocalTimeFormat(workflowRun.started_at)}
+                    </span>
+                  )}
+                  {workflowRun.finished_at && (
+                    <span title={basicTimeFormat(workflowRun.finished_at)}>
+                      Finished: {basicLocalTimeFormat(workflowRun.finished_at)}
+                    </span>
+                  )}
+                </div>
+              )}
             {workflowRun?.browser_session_id && (
               <Link
                 className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
@@ -442,6 +473,7 @@ function WorkflowRun() {
                     proxyLocation,
                     webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
                     maxScreenshotScrolls,
+                    runWith: workflowRun?.run_with ?? "agent",
                   }}
                 >
                   <PlayIcon className="mr-2 h-4 w-4" />
@@ -484,9 +516,7 @@ function WorkflowRun() {
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
                     fileUrls.map((url) => {
-                      // Extract filename from URL path, stripping query params from signed URLs
-                      const urlPath = url.split("?")[0] ?? url;
-                      const filename = urlPath.split("/").pop() || "download";
+                      const filename = filenameForDownloadedFileUrl(url);
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
@@ -510,6 +540,12 @@ function WorkflowRun() {
         </div>
       )}
       {workflowFailureReason}
+      {fallbackEpisodes && fallbackEpisodes.episodes.length > 0 && (
+        <ScriptUpdateCard
+          episodes={fallbackEpisodes.episodes}
+          scriptId={blockScriptsPublished?.script_id}
+        />
+      )}
       {!isEmbedded && (
         <div className="flex items-center justify-between">
           <SwitchBarNavigation options={switchBarOptions} />
@@ -523,10 +559,10 @@ function WorkflowRun() {
         </div>
       )}
       <div className="flex h-[42rem] gap-6">
-        <div className="w-2/3">
+        <div className="min-w-0 flex-[2]">
           <Outlet />
         </div>
-        <div className="w-1/3">
+        <div className="min-w-0 flex-1 overflow-hidden">
           <WorkflowRunTimeline
             activeItem={selection}
             onActionItemSelected={(item) => {

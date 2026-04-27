@@ -3,6 +3,7 @@ import { NavLinkGroup } from "@/components/NavLinkGroup";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { cn } from "@/util/utils";
 import {
+  CalendarIcon,
   CounterClockwiseClockIcon,
   GearIcon,
   GlobeIcon,
@@ -36,6 +37,11 @@ function SideNav() {
             label: "Runs",
             to: "/runs",
             icon: <CounterClockwiseClockIcon className="size-6" />,
+          },
+          {
+            label: "Schedules",
+            to: "/schedules",
+            icon: <CalendarIcon className="size-6" />,
           },
           {
             label: "Browsers",

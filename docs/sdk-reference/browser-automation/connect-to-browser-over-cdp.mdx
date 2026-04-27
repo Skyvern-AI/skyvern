@@ -1,0 +1,26 @@
+---
+title: connect_to_browser_over_cdp
+slug: sdk-reference/browser-automation/connect-to-browser-over-cdp
+---
+
+Connect to any browser running with Chrome DevTools Protocol (CDP) enabled, whether local or remote.
+
+<CodeGroup>
+```python Python
+browser = await skyvern.connect_to_browser_over_cdp("http://localhost:9222")
+page = await browser.get_working_page()
+```
+
+```typescript TypeScript
+const browser = await skyvern.connectToBrowserOverCdp("http://localhost:9222");
+const page = await browser.getWorkingPage();
+```
+</CodeGroup>
+
+## Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `cdp_url` / `cdpUrl` | `str` / `string` | Yes | The CDP WebSocket URL (e.g., `"http://localhost:9222"`). |
+
+## Returns `SkyvernBrowser`

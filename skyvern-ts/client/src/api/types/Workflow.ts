@@ -24,6 +24,9 @@ export interface Workflow {
     run_with?: string;
     ai_fallback?: boolean;
     cache_key?: string;
+    adaptive_caching?: boolean;
+    code_version?: number;
+    generate_script_on_terminal?: boolean;
     run_sequentially?: boolean;
     sequential_key?: string;
     folder_id?: string;

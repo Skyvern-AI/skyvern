@@ -69,6 +69,11 @@ class TaskBase(BaseModel):
             }
         ],
     )
+    workflow_system_prompt: str | None = Field(
+        default=None,
+        description="System prompt applied to every LLM call for this task. Inherited from the workflow-level workflow_system_prompt when unset.",
+        examples=["Never guess at an answer. If unsure, respond with UNKNOWN."],
+    )
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
@@ -117,6 +122,10 @@ class TaskBase(BaseModel):
         default=None,
         description="The maximum time to wait for downloads to complete, in seconds. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT seconds.",
         examples=[15.0],
+    )
+    include_extracted_text: bool = Field(
+        default=True,
+        description="If False, omit the scraped page text dump from the extract-information prompt. ExtractionBlock opts out; everything else keeps the default.",
     )
 
 
@@ -284,14 +293,11 @@ class Task(TaskBase):
     retry: int | None = None
     max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
+    failure_category: list[dict[str, Any]] | None = None
     model: dict[str, Any] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
-    # 2FA verification code waiting state fields
-    waiting_for_verification_code: bool = False
-    verification_code_identifier: str | None = None
-    verification_code_polling_started_at: datetime | None = None
 
     @property
     def llm_key(self) -> str | None:
@@ -356,6 +362,7 @@ class Task(TaskBase):
             finished_at=self.finished_at,
             extracted_information=self.extracted_information,
             failure_reason=failure_reason or self.failure_reason,
+            failure_category=self.failure_category,
             webhook_failure_reason=self.webhook_failure_reason,
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
@@ -369,9 +376,6 @@ class Task(TaskBase):
             max_screenshot_scrolls=self.max_screenshot_scrolls,
             step_count=step_count,
             browser_session_id=self.browser_session_id,
-            waiting_for_verification_code=self.waiting_for_verification_code,
-            verification_code_identifier=self.verification_code_identifier,
-            verification_code_polling_started_at=self.verification_code_polling_started_at,
         )
 
 
@@ -389,6 +393,7 @@ class TaskResponse(BaseModel):
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     failure_reason: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
     webhook_failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None
@@ -399,10 +404,6 @@ class TaskResponse(BaseModel):
     max_screenshot_scrolls: int | None = None
     step_count: int | None = None
     browser_session_id: str | None = None
-    # 2FA verification code waiting state fields
-    waiting_for_verification_code: bool = False
-    verification_code_identifier: str | None = None
-    verification_code_polling_started_at: datetime | None = None
 
 
 class TaskOutput(BaseModel):
@@ -411,8 +412,14 @@ class TaskOutput(BaseModel):
     extracted_information: list | dict[str, Any] | str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
+    failure_category: list[dict[str, Any]] | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None  # For backward compatibility
+    # Persisted artifact ids for refresh-on-read (mirrors task_screenshot_artifact_ids).
+    # When set, the workflow-run-status response rebuilds ``downloaded_files`` and
+    # ``downloaded_file_urls`` from these IDs every API fetch so a presigned URL
+    # captured at execution time never makes it to the client.
+    downloaded_file_artifact_ids: list[str] | None = None
     task_screenshots: list[str] | None = None
     workflow_screenshots: list[str] | None = None
     task_screenshot_artifact_ids: list[str] | None = None
@@ -427,6 +434,10 @@ class TaskOutput(BaseModel):
     ) -> TaskOutput:
         # For backward compatibility, extract just the URLs from FileInfo objects
         downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
+        # Carry artifact ids through so the API can rebuild fresh signed URLs.
+        downloaded_file_artifact_ids = (
+            [fi.artifact_id for fi in downloaded_files if fi.artifact_id] if downloaded_files else None
+        ) or None
 
         return TaskOutput(
             task_id=task.task_id,
@@ -434,8 +445,10 @@ class TaskOutput(BaseModel):
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
             errors=task.errors,
+            failure_category=task.failure_category,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
+            downloaded_file_artifact_ids=downloaded_file_artifact_ids,
             task_screenshot_artifact_ids=task_screenshot_artifact_ids,
             workflow_screenshot_artifact_ids=workflow_screenshot_artifact_ids,
         )

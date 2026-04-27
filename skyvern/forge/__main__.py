@@ -43,4 +43,5 @@ if __name__ == "__main__":
             f"{artifact_path_for_excludes}/{settings.ENV}/**/scripts/**/**/*.py",
         ],
         factory=True,
+        ws="websockets-sansio",
     )

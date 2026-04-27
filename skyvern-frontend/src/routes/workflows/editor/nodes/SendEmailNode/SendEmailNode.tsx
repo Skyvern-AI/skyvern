@@ -126,6 +126,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               update({ fileAttachments: value });
             }}
             disabled
+            hideParameterSelect
             className="nopan text-xs"
           />
         </div>

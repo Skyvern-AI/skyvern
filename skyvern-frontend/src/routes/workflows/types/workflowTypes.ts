@@ -213,7 +213,9 @@ export type WorkflowBlock =
   | URLBlock
   | HttpRequestBlock
   | PrintPageBlock
-  | WorkflowTriggerBlock;
+  | WorkflowTriggerBlock
+  | GoogleSheetsReadBlock
+  | GoogleSheetsWriteBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -240,6 +242,8 @@ export const WorkflowBlockTypes = {
   HttpRequest: "http_request",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
+  GoogleSheetsRead: "google_sheets_read",
+  GoogleSheetsWrite: "google_sheets_write",
 } as const;
 
 // all of them
@@ -288,6 +292,7 @@ export type WorkflowBlockBase = {
   next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
   next_block_label?: string | null;
+  ignore_workflow_system_prompt?: boolean;
 };
 
 export const BranchCriteriaTypes = {
@@ -410,7 +415,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
   json_schema: Record<string, unknown> | null;
 };
 
@@ -571,11 +576,35 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type GoogleSheetsReadBlock = WorkflowBlockBase & {
+  block_type: "google_sheets_read";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  has_header_row: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
+  block_type: "google_sheets_write";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  write_mode: "append" | "update";
+  values: string;
+  column_mapping: Record<string, string> | null;
+  create_sheet_if_missing?: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
+  workflow_system_prompt?: string | null;
 };
 
 export type WorkflowApiResponse = {
@@ -600,10 +629,11 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  run_with: string | null; // 'agent', 'code', or 'code_v2'
+  run_with: string; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
   adaptive_caching: boolean | null;
+  code_version: number | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
@@ -617,12 +647,14 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: string | null; // 'agent' or 'code'
+  runWith: string; // 'agent' or 'code'
+  codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

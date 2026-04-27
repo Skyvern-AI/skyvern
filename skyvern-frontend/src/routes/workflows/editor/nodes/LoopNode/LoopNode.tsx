@@ -3,13 +3,13 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
-import type { Node } from "@xyflow/react";
 import {
   Handle,
   NodeProps,
   Position,
   useNodes,
   useReactFlow,
+  type Node,
 } from "@xyflow/react";
 import { AppNode } from "..";
 import { helpTooltips } from "../../helpContent";
@@ -47,7 +47,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const recordingStore = useRecordingStore();
   const headerRef = useRef<HTMLDivElement>(null);
   const { updateNodeData } = useReactFlow();
-  const lastHeaderHeight = useRef<number | undefined>(undefined);
+  const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
 
   useEffect(() => {
     const el = headerRef.current;

@@ -13,11 +13,11 @@ type BannerStatus = Exclude<AuthStatusValue, "ok"> | "error";
 
 function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
-    case "missing_env":
+    case "missing_api_key":
       return {
-        title: "Skyvern API key missing",
+        title: "Frontend API key missing",
         description:
-          "All requests from the UI to the local backend will fail until a valid key is configured.",
+          "The UI is not sending an x-api-key header. The backend server can still run locally, but authenticated requests from the UI will fail until VITE_SKYVERN_API_KEY is set or a runtime key is stored.",
       };
     case "invalid_format":
       return {
@@ -76,7 +76,7 @@ function SelfHealApiKeyBanner() {
     return null;
   }
 
-  const copy = getCopy(bannerStatus ?? "missing_env");
+  const copy = getCopy(bannerStatus ?? "missing_api_key");
   const queryErrorMessage = error?.message ?? null;
 
   const handleRepair = async () => {
@@ -166,6 +166,12 @@ function SelfHealApiKeyBanner() {
                 by running <code>skyvern init</code> or click the button below
                 to regenerate it automatically.
               </p>
+              {data?.detail ? (
+                <p className="text-xs text-slate-300">{data.detail}</p>
+              ) : null}
+              {data?.next_step ? (
+                <p className="text-xs text-slate-300">{data.next_step}</p>
+              ) : null}
               {isProductionBuild && (
                 <p className="text-yellow-300">
                   When running a production build, the regenerated API key is

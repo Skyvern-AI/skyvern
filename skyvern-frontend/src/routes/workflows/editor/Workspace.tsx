@@ -26,14 +26,17 @@ import {
   Edge,
 } from "@xyflow/react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
-import { DebugSessionApiResponse } from "@/api/types";
+import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
-import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
+import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
+import { browserStreamingMode } from "@/util/env";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -77,27 +80,25 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
+import { isMacPlatform } from "@/util/platform";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
+import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
-import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
+import {
+  WorkflowComparisonPanel,
+  type CopilotReviewStatus,
+} from "./panels/WorkflowComparisonPanel";
 import {
   getWorkflowErrors,
   getElements,
   getAffectedBlocks,
   getOutputParameterKey,
-} from "./workflowEditorUtils";
-import { WorkflowHeader } from "./WorkflowHeader";
-import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
-import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import { WorkflowSettings } from "../types/workflowTypes";
-import { ProxyLocation } from "@/api/types";
-import {
   nodeAdderNode,
   createNode,
   defaultEdge,
@@ -105,16 +106,25 @@ import {
   layout,
   startNode,
 } from "./workflowEditorUtils";
+import { WorkflowHeader } from "./WorkflowHeader";
+import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
+import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
+import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
+import { WorkflowSettings } from "../types/workflowTypes";
+
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
-import type { CopilotReviewStatus } from "./panels/WorkflowComparisonPanel";
+
 import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
 
 const Constants = {
   NewBrowserCooldown: 30000,
 } as const;
+
+// How long to poll before recording one rate-limit attempt (60s)
+const POLL_ATTEMPT_THRESHOLD_MS = 60_000;
 
 type Props = Pick<FlowRendererProps, "initialTitle" | "workflow"> & {
   initialNodes: Array<AppNode>;
@@ -236,8 +246,15 @@ function Workspace({
   const [nudge, setNudge] = useState(false);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
+  const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  const {
+    undo: undoWorkflowEdit,
+    redo: redoWorkflowEdit,
+    canUndo: canUndoWorkflowEdit,
+    canRedo: canRedoWorkflowEdit,
+  } = useWorkflowHistory({ nodes, edges, setNodes, setEdges });
   const { getNodes, getEdges } = useReactFlow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -287,6 +304,12 @@ function Workspace({
 
   const handleRequestDeleteNode = useCallback(
     (nodeId: string, nodeLabel: string, confirmCallback: () => void) => {
+      const outputKey = getOutputParameterKey(nodeLabel);
+      const affected = getAffectedBlocks(nodes, outputKey);
+      if (affected.length === 0) {
+        confirmCallback();
+        return;
+      }
       deleteConfirmCallbackRef.current = confirmCallback;
       setDeleteBlockDialogState({
         open: true,
@@ -294,7 +317,7 @@ function Workspace({
         nodeLabel,
       });
     },
-    [],
+    [nodes],
   );
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
@@ -304,6 +327,17 @@ function Workspace({
         ? cacheKeyValueParam
         : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
   );
+
+  // Track whether the cache-key-value was explicitly provided in URL or user-selected.
+  // When false, the auto-computed value should NOT appear in the URL.
+  const cacheKeyValueIsExplicitRef = useRef(!!cacheKeyValueParam);
+
+  // Helper that marks the cache key value as explicitly user-selected before updating state.
+  // Centralizes the ref+state pair so future handlers can't forget to set the ref.
+  const setExplicitCacheKeyValue = useCallback((v: string) => {
+    cacheKeyValueIsExplicitRef.current = true;
+    setCacheKeyValue(v);
+  }, []);
 
   const [showAllCode, setShowAllCode] = useState(false);
   const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
@@ -370,8 +404,82 @@ function Workspace({
     };
   }, []);
 
+  // Undo/redo keyboard shortcuts. Skip when the user is typing inside an
+  // editable element so the browser's native per-input undo keeps working.
+  const isRecording = recordingStore.isRecording;
+  // macOS users expect Cmd+Y to be browser "History Forward" (some apps
+  // bind it to "Redo Typing"), so we only honour Ctrl+Y on non-Mac.
+  // Memoized so the platform sniff runs exactly once per mount.
+  const isMac = useMemo(() => isMacPlatform(), []);
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+        return true;
+      }
+      if (target.isContentEditable) return true;
+      // Monaco wraps its editor surface in a div with role="textbox"; let
+      // it keep native undo as well.
+      if (target.getAttribute("role") === "textbox") return true;
+      return false;
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Recording owns the editor - don't let hotkeys mutate state behind
+      // the disabled toolbar buttons.
+      if (isRecording) return;
+      // IME composition (CJK, accents) fires keydown events we must not
+      // intercept - those belong to the composition flow.
+      if (event.isComposing) return;
+      const mod = event.metaKey || event.ctrlKey;
+      if (!mod) return;
+      // Match the typed character via event.key rather than event.code.
+      // On QWERTZ / Dvorak / AZERTY the labeled Z key is at a different
+      // physical position than US QWERTY, so matching event.code would
+      // either miss the user's Cmd+Z entirely or fire undo when they
+      // press a different key. event.key honors the keycap label.
+      const key = event.key.toLowerCase();
+      const isZ = key === "z";
+      const isY = key === "y";
+      if (!isZ && !isY) return;
+      if (isY && isMac) return;
+      if (isEditableTarget(event.target)) return;
+
+      if (isZ && !event.shiftKey) {
+        event.preventDefault();
+        undoWorkflowEdit();
+      } else if ((isZ && event.shiftKey) || isY) {
+        // Cmd/Ctrl+Shift+Z is the universal redo; Ctrl+Y is the
+        // Windows/Linux alternate redo binding (not accepted on Mac).
+        event.preventDefault();
+        redoWorkflowEdit();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [undoWorkflowEdit, redoWorkflowEdit, isRecording, isMac]);
+
   useEffect(() => {
     const currentUrlValue = searchParams.get("cache-key-value");
+
+    if (!cacheKeyValueIsExplicitRef.current) {
+      // Auto-computed value: remove param from URL if present
+      if (currentUrlValue !== null) {
+        setSearchParams(
+          (prev) => {
+            const newParams = new URLSearchParams(prev);
+            newParams.delete("cache-key-value");
+            return newParams;
+          },
+          { replace: true },
+        );
+      }
+      return;
+    }
+
     const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
 
     if (currentUrlValue !== targetValue) {
@@ -397,10 +505,14 @@ function Workspace({
     status: "published",
   });
 
-  const publishedLabelCount = Object.keys(blockScriptsPublished ?? {}).length;
+  const publishedLabelCount = Object.keys(
+    blockScriptsPublished?.blocks ?? {},
+  ).length;
+  const hasPublishedScript =
+    publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    publishedLabelCount === 0 && !isFinalized && Boolean(workflowRun);
+    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
@@ -420,9 +532,13 @@ function Workspace({
       workflowPermanentId,
     });
 
+  const { isRateLimited, recordAttempt, resetOnSuccess } =
+    useBrowserSessionRateLimit(workflowPermanentId);
+
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
     enabled: shouldFetchDebugSession && !!workflowPermanentId,
+    isRateLimited,
   });
 
   const setCollapsed = useSidebarStore((state) => {
@@ -560,7 +676,7 @@ function Workspace({
   }, [isFinalized, queryClient, workflowRun]);
 
   useEffect(() => {
-    blockScriptStore.setScripts(blockScriptsPublished ?? {});
+    blockScriptStore.setScripts(blockScriptsPublished?.blocks ?? {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blockScriptsPublished]);
 
@@ -585,6 +701,7 @@ function Workspace({
     onSuccess: (response) => {
       const newDebugSession = response.data;
       setActiveDebugSession(newDebugSession);
+      resetOnSuccess();
 
       queryClient.invalidateQueries({
         queryKey: ["debugSession", workflowPermanentId],
@@ -599,6 +716,8 @@ function Workspace({
       afterCycleBrowser();
     },
     onError: (error: AxiosError) => {
+      recordAttempt();
+
       toast({
         variant: "destructive",
         title: "Failed to cycle browser",
@@ -639,23 +758,44 @@ function Workspace({
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const powerButtonTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingStartRef = useRef<number | null>(null);
 
+  // Polling loop: invalidate the debug-session query on an interval while
+  // we're waiting for a browser session. Records a rate-limit attempt after
+  // sustained polling without success.
   useEffect(() => {
     if (
       (!debugSession || !debugSession.browser_session_id) &&
       shouldFetchDebugSession &&
-      workflowPermanentId
+      workflowPermanentId &&
+      !isRateLimited
     ) {
+      if (!pollingStartRef.current) {
+        pollingStartRef.current = Date.now();
+      }
+
       intervalRef.current = setInterval(() => {
+        // After sustained polling without success, record one attempt
+        if (
+          pollingStartRef.current &&
+          Date.now() - pollingStartRef.current >= POLL_ATTEMPT_THRESHOLD_MS
+        ) {
+          recordAttempt();
+          pollingStartRef.current = Date.now();
+        }
+
         queryClient.invalidateQueries({
           queryKey: ["debugSession", workflowPermanentId],
         });
-      }, 2000);
+      }, 5000);
     } else {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      // Reset polling timer so it doesn't carry a stale timestamp into the
+      // next polling cycle (e.g. after a rate-limit window expires).
+      pollingStartRef.current = null;
 
       if (debugSession) {
         setActiveDebugSession(debugSession);
@@ -667,7 +807,23 @@ function Workspace({
         clearInterval(intervalRef.current);
       }
     };
-  }, [debugSession, shouldFetchDebugSession, workflowPermanentId, queryClient]);
+  }, [
+    debugSession,
+    shouldFetchDebugSession,
+    workflowPermanentId,
+    queryClient,
+    isRateLimited,
+    recordAttempt,
+  ]);
+
+  // Reset rate-limit state when a browser session is successfully acquired.
+  // Separated from the polling effect to avoid a circular dependency where
+  // resetOnSuccess is both called inside and listed as a dependency.
+  useEffect(() => {
+    if (debugSession?.browser_session_id) {
+      resetOnSuccess();
+    }
+  }, [debugSession?.browser_session_id, resetOnSuccess]);
 
   useEffect(() => {
     const splitLeft = dom.splitLeft.current;
@@ -746,6 +902,31 @@ function Workspace({
       window.removeEventListener(
         "loop-header-resized",
         handleLoopHeaderResized,
+      );
+    };
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
+
+  // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
+  useEffect(() => {
+    const handleConditionalHeaderResized = () => {
+      setTimeout(() => {
+        const currentNodes = getNodes() as Array<AppNode>;
+        const currentEdges = getEdges();
+
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
+        setNodes(layoutedElements.nodes);
+        setEdges(layoutedElements.edges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "conditional-header-resized",
+      handleConditionalHeaderResized,
+    );
+    return () => {
+      window.removeEventListener(
+        "conditional-header-resized",
+        handleConditionalHeaderResized,
       );
     };
   }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
@@ -910,6 +1091,11 @@ function Workspace({
       ...nodes.slice(previousNodeIndex + 1),
     ];
     workflowChangesStore.setHasChanges(true);
+    postHog.capture("builder.block.added", {
+      org_id: workflow.organization_id,
+      block_type: nodeType,
+      position: previousNodeIndex + 1,
+    });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
@@ -966,8 +1152,13 @@ function Workspace({
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScriptsPublished).join("");
-  const codePending = getCode(orderedBlockLabels, blockScriptsPending).join("");
+  const code = getCode(orderedBlockLabels, blockScriptsPublished?.blocks).join(
+    "",
+  );
+  const codePending = getCode(
+    orderedBlockLabels,
+    blockScriptsPending?.blocks,
+  ).join("");
 
   const handleCompareVersions = (
     version1: WorkflowVersion,
@@ -1007,16 +1198,16 @@ function Workspace({
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
-      runWith:
-        workflowData.adaptive_caching && workflowData.run_with === "code"
-          ? "code_v2"
-          : workflowData.run_with ?? null,
+      runWith: workflowData.run_with ?? "agent",
+      codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       runSequentially: workflowData.run_sequentially ?? false,
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
         workflowData.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        workflowData.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -1057,16 +1248,16 @@ function Workspace({
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
         : null,
-      runWith:
-        selectedVersion.adaptive_caching && selectedVersion.run_with === "code"
-          ? "code_v2"
-          : selectedVersion.run_with,
+      runWith: selectedVersion.run_with ?? "agent",
+      codeVersion: selectedVersion.code_version ?? null,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
         selectedVersion.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -1169,6 +1360,10 @@ function Workspace({
         <WorkflowHeader
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
+          canUndo={canUndoWorkflowEdit}
+          canRedo={canRedoWorkflowEdit}
+          onUndo={undoWorkflowEdit}
+          onRedo={redoWorkflowEdit}
           isGeneratingCode={isGeneratingCode}
           isTemplate={workflow?.is_template}
           saving={workflowChangesStore.saveIsPending}
@@ -1180,14 +1375,18 @@ function Workspace({
             workflowPanelState.active &&
             workflowPanelState.content === "parameters"
           }
+          schedulesPanelOpen={
+            workflowPanelState.active &&
+            workflowPanelState.content === "schedules"
+          }
           showAllCode={showAllCode}
           onCacheKeyValueAccept={(v) => {
-            setCacheKeyValue(v ?? "");
+            setExplicitCacheKeyValue(v ?? "");
             setCacheKeyValueFilter("");
             closeWorkflowPanel();
           }}
           onCacheKeyValuesBlurred={(v) => {
-            setCacheKeyValue(v ?? "");
+            setExplicitCacheKeyValue(v ?? "");
           }}
           onCacheKeyValuesKeydown={(e) => {
             if (e.key === "Enter") {
@@ -1215,6 +1414,19 @@ function Workspace({
               setWorkflowPanelState({
                 active: true,
                 content: "parameters",
+              });
+            }
+          }}
+          onScheduleClick={() => {
+            if (
+              workflowPanelState.active &&
+              workflowPanelState.content === "schedules"
+            ) {
+              closeWorkflowPanel();
+            } else {
+              setWorkflowPanelState({
+                active: true,
+                content: "schedules",
               });
             }
           }}
@@ -1280,7 +1492,7 @@ function Workspace({
                     setPage(page);
                   }}
                   onSelect={(cacheKeyValue) => {
-                    setCacheKeyValue(cacheKeyValue);
+                    setExplicitCacheKeyValue(cacheKeyValue);
                     setCacheKeyValueFilter("");
                     closeWorkflowPanel();
                   }}
@@ -1289,6 +1501,11 @@ function Workspace({
               {workflowPanelState.content === "parameters" && (
                 <div className="z-30">
                   <WorkflowParametersPanel />
+                </div>
+              )}
+              {workflowPanelState.content === "schedules" && (
+                <div className="z-30">
+                  <WorkflowSchedulePanel />
                 </div>
               )}
               {workflowPanelState.content === "history" && (
@@ -1355,7 +1572,7 @@ function Workspace({
                         setPage(page);
                       }}
                       onSelect={(cacheKeyValue) => {
-                        setCacheKeyValue(cacheKeyValue);
+                        setExplicitCacheKeyValue(cacheKeyValue);
                         setCacheKeyValueFilter("");
                         closeWorkflowPanel();
                       }}
@@ -1364,6 +1581,11 @@ function Workspace({
                   {workflowPanelState.content === "parameters" && (
                     <div className="z-30">
                       <WorkflowParametersPanel />
+                    </div>
+                  )}
+                  {workflowPanelState.content === "schedules" && (
+                    <div className="z-30">
+                      <WorkflowSchedulePanel />
                     </div>
                   )}
                   {workflowPanelState.content === "history" && (
@@ -1411,7 +1633,7 @@ function Workspace({
                   setPage(page);
                 }}
                 onSelect={(cacheKeyValue) => {
-                  setCacheKeyValue(cacheKeyValue);
+                  setExplicitCacheKeyValue(cacheKeyValue);
                   setCacheKeyValueFilter("");
                   closeWorkflowPanel();
                 }}
@@ -1419,6 +1641,9 @@ function Workspace({
             )}
             {workflowPanelState.content === "parameters" && (
               <WorkflowParametersPanel />
+            )}
+            {workflowPanelState.content === "schedules" && (
+              <WorkflowSchedulePanel />
             )}
             {workflowPanelState.content === "history" && (
               <div className="h-[calc(100vh-14rem)]">
@@ -1534,17 +1759,46 @@ function Workspace({
                 {(!activeDebugSession ||
                   activeDebugSession.vnc_streaming_supported) && (
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                    <div key={reloadKey} className="w-full flex-1">
-                      <BrowserStream
-                        exfiltrate={recordingStore.isRecording}
-                        interactive={true}
-                        browserSessionId={
-                          activeDebugSession?.browser_session_id
-                        }
-                        showControlButtons={true}
-                        resizeTrigger={windowResizeTrigger}
-                      />
-                    </div>
+                    {isRateLimited ? (
+                      <div
+                        data-testid="browser-rate-limit-message"
+                        className="flex w-full flex-1 items-center justify-center"
+                      >
+                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-slate-700 bg-slate-900 p-8 text-center">
+                          <p className="text-sm text-slate-300">
+                            Failed to load a browser. We have a high demand for
+                            browsers right now. The browser will become
+                            available again automatically in ~30 minutes. If the
+                            issue persists, please contact support.
+                          </p>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              resetOnSuccess();
+                              queryClient.invalidateQueries({
+                                queryKey: ["debugSession", workflowPermanentId],
+                              });
+                            }}
+                          >
+                            Try again
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div key={reloadKey} className="w-full flex-1">
+                        <BrowserStream
+                          exfiltrate={recordingStore.isRecording}
+                          interactive={true}
+                          browserSessionId={
+                            activeDebugSession?.browser_session_id
+                          }
+                          showControlButtons={true}
+                          resizeTrigger={windowResizeTrigger}
+                          isExecuting={!!workflowRun && !isFinalized}
+                        />
+                      </div>
+                    )}
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
                       <WorkflowCopilotButton
                         ref={copilotButtonRef}
@@ -1562,10 +1816,12 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {!recordingStore.isRecording && showPowerButton && (
-                          <PowerButton onClick={() => cycle()} />
-                        )}
-                        {!recordingStore.isRecording && (
+                        {!recordingStore.isRecording &&
+                          showPowerButton &&
+                          !isRateLimited && (
+                            <PowerButton onClick={() => cycle()} />
+                          )}
+                        {!recordingStore.isRecording && !isRateLimited && (
                           <ReloadButton
                             isReloading={isReloading}
                             onClick={() => reload()}
@@ -1576,14 +1832,22 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Screenshot browser} */}
+                {/* CDP screencast: only in local mode when VNC is not supported */}
                 {activeDebugSession &&
-                  !activeDebugSession.vnc_streaming_supported && (
+                  !activeDebugSession.vnc_streaming_supported &&
+                  browserStreamingMode === "cdp" && (
                     <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div className="flex w-full flex-1 items-center justify-center">
-                        <div className="aspect-video w-full">
-                          <WorkflowRunStream alwaysShowStream={true} />
-                        </div>
+                      <div
+                        key={reloadKey}
+                        className="flex w-full flex-1 items-center justify-center"
+                      >
+                        <BrowserSessionStream
+                          browserSessionId={
+                            activeDebugSession.browser_session_id
+                          }
+                          interactive={true}
+                          showControlButtons={true}
+                        />
                       </div>
                       <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
                         <WorkflowCopilotButton
@@ -1591,7 +1855,34 @@ function Workspace({
                           messageCount={copilotMessageCount}
                           onClick={() => setIsCopilotOpen((prev) => !prev)}
                         />
+                        <div className="flex items-center gap-2">
+                          <GlobeIcon /> Live Browser
+                        </div>
+                        <div
+                          className={cn("ml-auto flex items-center gap-2", {
+                            "mr-16": !blockLabel,
+                          })}
+                        >
+                          {!recordingStore.isRecording && showPowerButton && (
+                            <PowerButton onClick={() => cycle()} />
+                          )}
+                          {!recordingStore.isRecording && (
+                            <ReloadButton
+                              isReloading={isReloading}
+                              onClick={() => reload()}
+                            />
+                          )}
+                        </div>
                       </footer>
+                    </div>
+                  )}
+
+                {/* Fallback: non-local without VNC (edge case) */}
+                {activeDebugSession &&
+                  !activeDebugSession.vnc_streaming_supported &&
+                  browserStreamingMode !== "cdp" && (
+                    <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 items-center justify-center text-muted-foreground">
+                      Browser streaming unavailable
                     </div>
                   )}
 
@@ -1719,6 +2010,8 @@ function Workspace({
               blocks: saveData.blocks,
               finally_block_label:
                 saveData.settings.finallyBlockLabel ?? undefined,
+              workflow_system_prompt:
+                saveData.settings.workflowSystemPrompt ?? undefined,
             });
 
             // Convert current workflow definition YAML to blocks
@@ -1759,13 +2052,14 @@ function Workspace({
               created_at: new Date().toISOString(),
               modified_at: new Date().toISOString(),
               deleted_at: null,
-              run_with:
-                saveData.settings.runWith === "code_v2"
-                  ? "code"
-                  : saveData.settings.runWith,
+              run_with: saveData.settings.runWith,
               cache_key: saveData.settings.scriptCacheKey,
               ai_fallback: saveData.settings.aiFallback,
-              adaptive_caching: saveData.settings.runWith === "code_v2",
+              adaptive_caching: false,
+              code_version:
+                saveData.settings.runWith === "code"
+                  ? (saveData.settings.codeVersion ?? 2)
+                  : null,
               run_sequentially: saveData.settings.runSequentially,
               sequential_key: saveData.settings.sequentialKey,
               folder_id: null,

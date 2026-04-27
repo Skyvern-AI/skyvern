@@ -57,6 +57,8 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   file_upload: "fileUpload",
   goto_url: "url",
   http_request: "http_request",
+  google_sheets_read: "googleSheetsRead",
+  google_sheets_write: "googleSheetsWrite",
 };
 
 function getBlockIdentifier(block: WorkflowBlock): string {
@@ -156,15 +158,15 @@ function getWorkflowElements(version: WorkflowVersion) {
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,
-    runWith:
-      version.adaptive_caching && version.run_with === "code"
-        ? "code_v2"
-        : version.run_with,
+    runWith: version.run_with ?? "agent",
+    codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      version.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor

@@ -1,4 +1,7 @@
 Evaluate if the following condition(s) are TRUE or FALSE.
+
+CRITICAL RULE: If all the data needed to evaluate a condition is already present in the condition text, you MUST evaluate it using ONLY the condition text. Do NOT reference the page content. Only use the page content (screenshot/HTML) when the condition explicitly asks about what is on the page (e.g., "the date in the page", "the column under payments section").
+
 {% if conditions|length == 1 %}
 Condition: {{ conditions[0] }}
 {% else %}

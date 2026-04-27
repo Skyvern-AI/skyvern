@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class FolderBase(BaseModel):
@@ -22,14 +22,13 @@ class FolderUpdate(BaseModel):
 class Folder(FolderBase):
     """Response model for a folder"""
 
+    model_config = ConfigDict(from_attributes=True)
+
     folder_id: str
     organization_id: str
     workflow_count: int = Field(0, description="Number of workflows in this folder")
     created_at: datetime
     modified_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class UpdateWorkflowFolderRequest(BaseModel):

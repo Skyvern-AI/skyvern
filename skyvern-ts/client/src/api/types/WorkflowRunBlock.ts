@@ -15,6 +15,7 @@ export interface WorkflowRunBlock {
     output?: WorkflowRunBlock.Output;
     continue_on_failure?: boolean;
     failure_reason?: string;
+    error_codes?: string[];
     engine?: Skyvern.RunEngine;
     task_id?: string;
     url?: string;

@@ -76,3 +76,34 @@ Use the following config if you want to set up Skyvern for any other MCP-enabled
   }
 }
 ```
+
+## Glama Release Setup
+
+Glama's "release" flow is different from publishing the package to PyPI or the
+official MCP Registry. For Glama, you need a runnable server container so Glama
+can boot the MCP server, inspect the tool schema, and publish an installable
+release in their directory.
+
+Use the dedicated [`Dockerfile`](./Dockerfile) in this directory for that flow.
+The root [`Dockerfile`](../../Dockerfile) is for the full Skyvern app stack and
+starts `python -m skyvern.forge`, which is the wrong runtime for an MCP-only
+Glama release.
+
+Recommended Glama setup:
+
+1. Claim the server in Glama. This repository already includes
+   [`glama.json`](../../glama.json), so authorized maintainers can claim the
+   `Skyvern-AI/skyvern` entry.
+2. In Glama's Dockerfile admin page, point the build to `Dockerfile.glama`.
+3. Keep the default command unless Glama explicitly asks for HTTP transport.
+   The image defaults to `python -m skyvern run mcp` over stdio.
+4. If you want the hosted Glama release to use Skyvern Cloud browser sessions,
+   add a real `SKYVERN_API_KEY` secret in Glama. Otherwise the container boots
+   in local embedded mode, which is enough for inspection but not ideal for
+   cloud-backed browser sessions.
+5. Deploy, wait for inspection to pass, then use Glama's "Make Release" action
+   in the server admin UI.
+
+If you are also publishing to the official MCP Registry, treat that as a
+separate step. The official registry uses package metadata and `server.json`;
+Glama releases are container-based.

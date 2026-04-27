@@ -1,5 +1,6 @@
 import copy
-from typing import TYPE_CHECKING, Any, Self
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -15,6 +16,7 @@ from skyvern.exceptions import (
     ImaginarySecretValue,
     SkyvernException,
     WorkflowRunContextNotInitialized,
+    sanitize_credential_for_error,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -25,7 +27,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_secret
-from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -44,6 +46,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.utils.strings import generate_random_string
+from skyvern.utils.templating import get_missing_variables
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
@@ -51,6 +54,7 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
+BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
 
 jinja_sandbox_env = SandboxedEnvironment()
 
@@ -81,6 +85,7 @@ class WorkflowRunContext:
         ],
         block_outputs: dict[str, Any] | None = None,
         workflow: "Workflow | None" = None,
+        inherited_workflow_system_prompt: str | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -90,6 +95,7 @@ class WorkflowRunContext:
             workflow_run_id=workflow_run_id,
             aws_client=aws_client,
             workflow=workflow,
+            inherited_workflow_system_prompt=inherited_workflow_system_prompt,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -168,12 +174,34 @@ class WorkflowRunContext:
         workflow_run_id: str,
         aws_client: AsyncAWSClient,
         workflow: "Workflow | None" = None,
+        inherited_workflow_system_prompt: str | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
         self.workflow = workflow
+        # Joined raw workflow_system_prompt(s) from ancestor workflows (outermost
+        # first) collected by walking workflow_run.parent_workflow_run_id at
+        # execute_workflow time. Jinja-rendered on demand and concatenated with
+        # this workflow's own workflow_system_prompt inside
+        # resolve_effective_workflow_system_prompt so parent-workflow rules flow
+        # into every child block and agent (SKY-9147).
+        self.inherited_workflow_system_prompt = inherited_workflow_system_prompt
+        # Sentinel for the lazy-resolved effective workflow_system_prompt cache.
+        # Using a sentinel (not None) so "resolved to None" is distinguishable
+        # from "not yet resolved". Invalidated by set_workflow() because late
+        # hydration can change the workflow's own workflow_system_prompt.
+        self._effective_workflow_system_prompt_cache: str | None = None
+        self._effective_workflow_system_prompt_resolved: bool = False
+        # Per-block record of the effective workflow_system_prompt once a block
+        # has run through ``Block._apply_workflow_system_prompt``. Keyed by
+        # block label. ``None`` is a valid recorded value (block opted out).
+        # Read by the script path (``RealSkyvernPageAi.ai_extract``) so a
+        # cached-script extraction uses the same string the agent path would
+        # — single source of truth, no re-resolving the opt-out from the
+        # workflow definition in two places (SKY-9147).
+        self._block_workflow_system_prompts: dict[str, str | None] = {}
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
@@ -191,6 +219,12 @@ class WorkflowRunContext:
         This is used when the workflow is fetched from the database as a fallback.
         """
         self.workflow = workflow
+        # Late-hydrated workflow may carry a different workflow_system_prompt than
+        # what was visible at construction time. Drop the cache so the next
+        # resolve_effective_workflow_system_prompt() re-renders against the new
+        # definition.
+        self._effective_workflow_system_prompt_resolved = False
+        self._effective_workflow_system_prompt_cache = None
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -222,6 +256,108 @@ class WorkflowRunContext:
         if label is None:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
+
+    def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
+        """Record the effective ``workflow_system_prompt`` a block resolved to.
+
+        Called by ``Block._apply_workflow_system_prompt`` (agent path) and by
+        the script-path dispatch before handing execution to cached code. Both
+        paths use the same recorded value in ``ai_extract`` so agent and
+        script extractions for the same block hash to the same cache key and
+        the same LLM input.
+        """
+        if label:
+            self._block_workflow_system_prompts[label] = value
+
+    def get_block_workflow_system_prompt(self, label: str | None) -> tuple[bool, str | None]:
+        """Return ``(recorded, value)`` for a block label.
+
+        ``recorded`` is True only when the block has actually run through
+        ``_apply_workflow_system_prompt`` — a recorded ``None`` (opt-out) is
+        distinguished from "never recorded" so callers can fall back safely
+        for non-block invocations (e.g. standalone scripts).
+        """
+        if label and label in self._block_workflow_system_prompts:
+            return True, self._block_workflow_system_prompts[label]
+        return False, None
+
+    def resolve_effective_workflow_system_prompt(self) -> str | None:
+        """Return the effective workflow-level system prompt for this run.
+
+        Concatenates any prompt inherited from ancestor workflows (propagated via
+        ``WorkflowTriggerBlock`` — outermost first) with this workflow's own
+        ``workflow_system_prompt``. Jinja substitutions are rendered against this
+        run's values for both portions so ancestor templates can still reference
+        common variables like ``workflow_title``; placeholders that only exist in
+        the parent's context render empty under non-strict mode. Parts join with
+        a blank line so distinct rule sets stay readable to the LLM. Returns
+        ``None`` when nothing is configured at any level so callers can short-
+        circuit on a simple falsy check.
+
+        The resolved string is cached on first call and reused for the life of
+        the run so every block sees the same effective prompt — and the LLM
+        cache keys that derive from it stay stable across blocks. The cache is
+        invalidated in ``set_workflow`` for the late-hydration path.
+        """
+        if self._effective_workflow_system_prompt_resolved:
+            return self._effective_workflow_system_prompt_cache
+        own_raw: str | None = None
+        if self.workflow is not None and self.workflow.workflow_definition is not None:
+            candidate = self.workflow.workflow_definition.workflow_system_prompt
+            # ``isinstance`` guard: a malformed workflow definition (or a test
+            # MagicMock whose attribute access returns another mock) could
+            # hand us a non-string here. Jinja's ``from_string`` would then
+            # raise ``Can't compile non template nodes`` deep inside the
+            # render path. Narrowing to ``str`` keeps the fallback silent.
+            if isinstance(candidate, str):
+                own_raw = candidate
+        inherited = (
+            self.inherited_workflow_system_prompt if isinstance(self.inherited_workflow_system_prompt, str) else None
+        )
+        inherited_resolved = self.render_workflow_level_template(inherited) if inherited else None
+        own_resolved = self.render_workflow_level_template(own_raw) if own_raw else None
+        parts = [p for p in (inherited_resolved, own_resolved) if p]
+        resolved = "\n\n".join(parts) if parts else None
+        self._effective_workflow_system_prompt_cache = resolved
+        self._effective_workflow_system_prompt_resolved = True
+        return resolved
+
+    def render_workflow_level_template(self, raw_template: str) -> str:
+        """Render a Jinja template against workflow-scoped variables only.
+
+        Shared by every path that resolves the workflow-level workflow_system_prompt
+        (block execution, script-path ai_extract) so both produce the same string —
+        same cache key, same LLM output. Deliberately omits block-scoped context:
+        a workflow-wide prompt has no single "current block" to bind against.
+        """
+        if not raw_template:
+            return raw_template
+
+        template_data: dict[str, Any] = self.values.copy()
+        template_data.setdefault("workflow_title", self.workflow_title)
+        template_data.setdefault("workflow_id", self.workflow_id)
+        template_data.setdefault("workflow_permanent_id", self.workflow_permanent_id)
+        template_data.setdefault("workflow_run_id", self.workflow_run_id)
+        template_data.setdefault("browser_session_id", self.browser_session_id or "")
+        template_data.setdefault("current_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        template_data["workflow_run_outputs"] = self.workflow_run_outputs
+        template_data["workflow_run_summary"] = self.build_workflow_run_summary()
+
+        if missing_variables := get_missing_variables(raw_template, template_data):
+            if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+                raise MissingJinjaVariables(template=raw_template, variables=missing_variables)
+            # Non-strict mode silently renders undefined variables as empty strings,
+            # which makes typos like {{ persona }} invisible to the user. Emit a
+            # warning so the operator has a breadcrumb when a workflow_system_prompt
+            # isn't picking up the value they expected.
+            LOG.warning(
+                "Undefined Jinja variables in workflow-level template; rendering them as empty strings",
+                missing_variables=missing_variables,
+                workflow_run_id=self.workflow_run_id,
+                workflow_permanent_id=self.workflow_permanent_id,
+            )
+
+        return jinja_sandbox_env.from_string(raw_template).render(template_data)
 
     async def _should_include_secrets_in_templates(self) -> bool:
         """
@@ -378,12 +514,15 @@ class WorkflowRunContext:
         """
         # Check if it's in the format vault_id:item_id
         if ":" in credential_id:
-            LOG.info(f"Processing credential in vault_id:item_id format: {credential_id}")
+            LOG.info("Processing credential in vault_id:item_id format")
             vault_id, item_id = credential_id.split(":", 1)
             return vault_id, item_id
 
         # If we can't parse the credential_id, raise an error
-        raise ValueError(f"Invalid credential format: {credential_id}. Expected format: vault_id:item_id")
+        raise ValueError(
+            f"Invalid credential format: {sanitize_credential_for_error(credential_id)}."
+            " Expected format: vault_id:item_id"
+        )
 
     async def _register_credential_parameter_value(
         self,
@@ -391,7 +530,9 @@ class WorkflowRunContext:
         parameter: Parameter,
         organization: Organization,
     ) -> None:
-        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        db_credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=organization.organization_id
+        )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
@@ -447,13 +588,13 @@ class WorkflowRunContext:
                 f"Trying to register workflow parameter as a secret but it is not a string. Parameter key: {parameter.key}"
             )
 
-        LOG.info(f"Fetching credential parameter value for credential: {credential_id}")
+        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         # Handle regular credentials from the database
         try:
             await self._register_credential_parameter_value(credential_id, parameter, organization)
         except Exception as e:
-            LOG.error(f"Failed to get credential from database: {credential_id}. Error: {e}")
+            LOG.error("Failed to get credential from database", parameter_key=parameter.key, exc_info=True)
             raise e
 
     async def register_credential_parameter_value(
@@ -461,7 +602,7 @@ class WorkflowRunContext:
         parameter: CredentialParameter,
         organization: Organization,
     ) -> None:
-        LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
+        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         credential_id = None
         if parameter.credential_id:
@@ -471,7 +612,7 @@ class WorkflowRunContext:
                 credential_id = parameter.credential_id
 
         if credential_id is None:
-            LOG.error(f"Credential ID not found for credential: {parameter.credential_id}")
+            LOG.error("Credential ID not found", parameter_key=parameter.key)
             raise CredentialParameterNotFoundError(parameter.credential_id)
 
         await self._register_credential_parameter_value(credential_id, parameter, organization)
@@ -514,7 +655,7 @@ class WorkflowRunContext:
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization.organization_id,
             OrganizationAuthTokenType.onepassword_service_account.value,
         )
@@ -601,13 +742,13 @@ class WorkflowRunContext:
         if item.notes:
             self._add_secret_parameter_value(parameter, "notes", item.notes)
 
-    async def register_bitwarden_login_credential_parameter_value(
+    async def _get_global_bitwarden_credentials(
         self,
-        parameter: BitwardenLoginCredentialParameter,
-        organization: Organization,
-    ) -> None:
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+    ) -> BitwardenCredentials:
         try:
-            # Get the Bitwarden login credentials from AWS secrets
             client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
                 parameter.bitwarden_client_id_aws_secret_key
             )
@@ -621,13 +762,111 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id and not settings.BITWARDEN_EMAIL:
+        return client_id, client_secret, master_password, None
+
+    async def _get_bitwarden_credential_candidates(
+        self,
+        organization: Organization,
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+    ) -> list[BitwardenCredentials]:
+        org_bw_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+            organization_id=organization.organization_id,
+            token_type=OrganizationAuthTokenType.bitwarden_credential.value,
+        )
+
+        if not org_bw_token:
+            return [await self._get_global_bitwarden_credentials(parameter)]
+
+        candidates: list[BitwardenCredentials] = [
+            (
+                None,
+                None,
+                org_bw_token.credential.master_password,
+                org_bw_token.credential.email,
+            )
+        ]
+
+        try:
+            global_credentials = await self._get_global_bitwarden_credentials(parameter)
+        except Exception:
+            LOG.info(
+                "Global Bitwarden fallback credentials are unavailable",
+                organization_id=organization.organization_id,
+            )
+            global_credentials = None
+
+        if global_credentials and global_credentials not in candidates:
+            candidates.append(global_credentials)
+
+        return candidates
+
+    @staticmethod
+    def _validate_bitwarden_credentials(
+        client_id: str | None,
+        client_secret: str | None,
+        master_password: str | None,
+        email: str | None,
+    ) -> None:
+        if not client_id and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
+        if not client_secret and not email and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
 
+    @staticmethod
+    def _should_retry_bitwarden_with_global_credentials(error: BitwardenBaseError) -> bool:
+        error_message = str(error).lower()
+        return (
+            "timeouterror" in error_message
+            or "timed out" in error_message
+            or "new device verification" in error_message
+        )
+
+    async def _run_bitwarden_operation_with_fallback(
+        self,
+        organization: Organization,
+        parameter: BitwardenLoginCredentialParameter
+        | BitwardenSensitiveInformationParameter
+        | BitwardenCreditCardDataParameter,
+        operation: Callable[[str | None, str | None, str, str | None], Awaitable[Any]],
+    ) -> tuple[Any, BitwardenCredentials]:
+        candidates = await self._get_bitwarden_credential_candidates(organization, parameter)
+        last_error: BitwardenBaseError | None = None
+
+        for index, credentials in enumerate(candidates):
+            client_id, client_secret, master_password, email = credentials
+            self._validate_bitwarden_credentials(client_id, client_secret, master_password, email)
+            assert master_password
+
+            try:
+                result = await operation(client_id, client_secret, master_password, email)
+                return result, credentials
+            except BitwardenBaseError as error:
+                last_error = error
+                has_fallback = index + 1 < len(candidates)
+                if email and has_fallback and self._should_retry_bitwarden_with_global_credentials(error):
+                    LOG.warning(
+                        "Org-level Bitwarden email auth failed, retrying with global Bitwarden credentials",
+                        organization_id=organization.organization_id,
+                        workflow_id=parameter.workflow_id,
+                        parameter_key=parameter.key,
+                        error=str(error),
+                    )
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError("No Bitwarden credential candidates available")
+
+    async def register_bitwarden_login_credential_parameter_value(
+        self,
+        parameter: BitwardenLoginCredentialParameter,
+        organization: Organization,
+    ) -> None:
         url = self._resolve_parameter_value(parameter.url_parameter_key)
         if not url and not parameter.bitwarden_item_id:
             LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
@@ -636,8 +875,13 @@ class WorkflowRunContext:
         collection_id = self._resolve_parameter_value(parameter.bitwarden_collection_id)
         item_id = self._resolve_parameter_value(parameter.bitwarden_item_id)
 
-        try:
-            secret_credentials = await BitwardenService.get_secret_value_from_url(
+        async def fetch_secret_credentials(
+            client_id: str | None,
+            client_secret: str | None,
+            master_password: str,
+            email: str | None,
+        ) -> dict[str, str]:
+            return await BitwardenService.get_secret_value_from_url(
                 client_id,
                 client_secret,
                 master_password,
@@ -646,7 +890,16 @@ class WorkflowRunContext:
                 url,
                 collection_id=collection_id,
                 item_id=item_id,
+                email=email,
             )
+
+        try:
+            secret_credentials, credentials = await self._run_bitwarden_operation_with_fallback(
+                organization,
+                parameter,
+                fetch_secret_credentials,
+            )
+            client_id, client_secret, master_password, email = credentials
             if secret_credentials:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
@@ -736,28 +989,6 @@ class WorkflowRunContext:
         parameter: BitwardenSensitiveInformationParameter,
         organization: Organization,
     ) -> None:
-        try:
-            # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
-                parameter.bitwarden_client_id_aws_secret_key
-            )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
-                parameter.bitwarden_client_secret_aws_secret_key
-            )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
-                parameter.bitwarden_master_password_aws_secret_key
-            )
-        except Exception as e:
-            LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
-            raise e
-
-        if not client_id and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client secret not found")
-        if not master_password:
-            raise ValueError("Bitwarden master password not found")
-
         bitwarden_identity_key = parameter.bitwarden_identity_key
         if self.has_parameter(parameter.bitwarden_identity_key) and self.has_value(parameter.bitwarden_identity_key):
             bitwarden_identity_key = self.values[parameter.bitwarden_identity_key]
@@ -766,8 +997,13 @@ class WorkflowRunContext:
         if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(parameter.bitwarden_collection_id):
             collection_id = self.values[parameter.bitwarden_collection_id]
 
-        try:
-            sensitive_values = await BitwardenService.get_sensitive_information_from_identity(
+        async def fetch_sensitive_values(
+            client_id: str | None,
+            client_secret: str | None,
+            master_password: str,
+            email: str | None,
+        ) -> dict[str, str]:
+            return await BitwardenService.get_sensitive_information_from_identity(
                 client_id,
                 client_secret,
                 master_password,
@@ -776,7 +1012,16 @@ class WorkflowRunContext:
                 collection_id,
                 bitwarden_identity_key,
                 parameter.bitwarden_identity_fields,
+                email=email,
             )
+
+        try:
+            sensitive_values, credentials = await self._run_bitwarden_operation_with_fallback(
+                organization,
+                parameter,
+                fetch_sensitive_values,
+            )
+            client_id, client_secret, master_password, email = credentials
             if sensitive_values:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
@@ -805,28 +1050,6 @@ class WorkflowRunContext:
         parameter: BitwardenCreditCardDataParameter,
         organization: Organization,
     ) -> None:
-        try:
-            # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
-                parameter.bitwarden_client_id_aws_secret_key
-            )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
-                parameter.bitwarden_client_secret_aws_secret_key
-            )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
-                parameter.bitwarden_master_password_aws_secret_key
-            )
-        except Exception as e:
-            LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
-            raise e
-
-        if not client_id and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client ID not found")
-        if not client_secret and not settings.BITWARDEN_EMAIL:
-            raise ValueError("Bitwarden client secret not found")
-        if not master_password:
-            raise ValueError("Bitwarden master password not found")
-
         if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
             item_id = self.values[parameter.bitwarden_item_id]
         else:
@@ -837,8 +1060,13 @@ class WorkflowRunContext:
         else:
             collection_id = parameter.bitwarden_collection_id
 
-        try:
-            credit_card_data = await BitwardenService.get_credit_card_data(
+        async def fetch_credit_card_data(
+            client_id: str | None,
+            client_secret: str | None,
+            master_password: str,
+            email: str | None,
+        ) -> dict[str, str]:
+            return await BitwardenService.get_credit_card_data(
                 client_id,
                 client_secret,
                 master_password,
@@ -846,7 +1074,16 @@ class WorkflowRunContext:
                 organization.bw_collection_ids,
                 collection_id,
                 item_id,
+                email=email,
             )
+
+        try:
+            credit_card_data, credentials = await self._run_bitwarden_operation_with_fallback(
+                organization,
+                parameter,
+                fetch_credit_card_data,
+            )
+            client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
                 raise ValueError("Credit card data not found in Bitwarden")
 
@@ -959,7 +1196,10 @@ class WorkflowRunContext:
             current_value = self.values[block_label]
             # only able to merge the value when the current value and the pending value are both dicts
             if isinstance(current_value, dict) and isinstance(block_reference_value, dict):
-                block_reference_value.update(current_value)
+                # Merge old into new so that new values (e.g. from the latest loop
+                # iteration) take precedence over stale ones.
+                merged = {**current_value, **block_reference_value}
+                block_reference_value = merged
             else:
                 LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
@@ -1102,7 +1342,7 @@ class WorkflowRunContext:
 
     @staticmethod
     async def _get_azure_vault_client_for_organization(organization: Organization) -> AsyncAzureVaultClient:
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential.value
         )
         if org_auth_token:
@@ -1160,6 +1400,7 @@ class WorkflowContextManager:
         ],
         block_outputs: dict[str, Any] | None = None,
         workflow: "Workflow | None" = None,
+        inherited_workflow_system_prompt: str | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -1174,6 +1415,7 @@ class WorkflowContextManager:
             secret_parameters,
             block_outputs,
             workflow,
+            inherited_workflow_system_prompt=inherited_workflow_system_prompt,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

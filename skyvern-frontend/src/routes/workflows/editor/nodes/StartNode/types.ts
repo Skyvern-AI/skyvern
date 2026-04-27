@@ -12,12 +12,14 @@ export type WorkflowStartNodeData = {
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
   editable: boolean;
-  runWith: string | null;
+  runWith: string;
+  codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
   label: "__start_block__";
   showCode: boolean;
 };

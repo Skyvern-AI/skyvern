@@ -4,7 +4,7 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -47,7 +47,6 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -119,6 +118,7 @@ type Props = {
     cdpAddress: string | null;
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
+    runWith: string | null;
   };
 };
 
@@ -204,7 +204,7 @@ function getRunWorkflowRequestBody(
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
-    runWithCode,
+    runWith,
     aiFallback,
     ...parameters
   } = values;
@@ -221,7 +221,7 @@ function getRunWorkflowRequestBody(
     proxy_location: proxyLocation,
     browser_session_id: bsi,
     browser_address: cdpAddress,
-    run_with: runWithCode === true ? "code" : "agent",
+    run_with: runWith,
     ai_fallback: aiFallback ?? true,
   };
 
@@ -264,6 +264,19 @@ function transformToWorkflowRunRequest(
   return transformed;
 }
 
+const VALID_RUN_WITH = new Set(["agent", "code"]);
+
+function deriveRunWith(
+  workflow?: WorkflowApiResponse,
+  override?: string | null,
+): "agent" | "code" {
+  if (override && VALID_RUN_WITH.has(override))
+    return override as "agent" | "code";
+  if (workflow?.run_with === "agent") return "agent";
+  if (workflow?.run_with === "code") return "code";
+  return "agent";
+}
+
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
@@ -271,7 +284,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWithCode: boolean | null;
+  runWith: "agent" | "code";
   aiFallback: boolean | null;
 };
 
@@ -294,6 +307,14 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
 
+  const blockingParameterTypes = new Set([
+    "boolean",
+    "integer",
+    "float",
+    "file_url",
+    "json",
+  ]);
+
   const form = useForm<RunWorkflowFormType>({
     mode: "onTouched",
     reValidateMode: "onChange",
@@ -307,10 +328,17 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      runWithCode: workflow?.run_with === "code",
+      runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
+
+  const formErrors = form.formState.errors;
+  const hasBlockingParameterError = workflowParameters.some(
+    (param) =>
+      blockingParameterTypes.has(param.workflow_parameter_type) &&
+      formErrors[param.key],
+  );
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -381,7 +409,10 @@ function RunWorkflowForm({
   const [hasCode, setHasCode] = useState(false);
 
   useEffect(() => {
-    setHasCode(Object.keys(blockScripts ?? {}).length > 0);
+    setHasCode(
+      Object.keys(blockScripts?.blocks ?? {}).length > 0 ||
+        Boolean(blockScripts?.main_script),
+    );
   }, [blockScripts]);
 
   // Watch form changes and update run parameters without triggering validation
@@ -405,7 +436,7 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      runWithCode: workflow?.run_with === "code",
+      runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     });
     setIsFormReset(true);
@@ -437,7 +468,7 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
-      runWithCode,
+      runWith,
       aiFallback,
       ...parameters
     } = values;
@@ -454,7 +485,7 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
-      runWithCode,
+      runWith,
       aiFallback,
     });
   }
@@ -467,7 +498,7 @@ function RunWorkflowForm({
       "maxScreenshotScrolls",
       "extraHttpHeaders",
       "cdpAddress",
-      "runWithCode",
+      "runWith",
     ]);
 
     const parsedParameters = parseValuesForWorkflowRun(
@@ -481,11 +512,7 @@ function RunWorkflowForm({
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
     const hasBlockingErrors = workflowParameters.some(
       (param) =>
-        (param.workflow_parameter_type === "boolean" ||
-          param.workflow_parameter_type === "integer" ||
-          param.workflow_parameter_type === "float" ||
-          param.workflow_parameter_type === "file_url" ||
-          param.workflow_parameter_type === "json") &&
+        blockingParameterTypes.has(param.workflow_parameter_type) &&
         errors[param.key],
     );
 
@@ -535,7 +562,7 @@ function RunWorkflowForm({
 
                 return {
                   method: "POST",
-                  url: `${runsApiBaseUrl}/run/workflows`,
+                  url: `${env.runsApiBaseUrl}/run/workflows`,
                   body: transformedBody,
                   headers,
                 } satisfies ApiCommandOptions;
@@ -544,7 +571,9 @@ function RunWorkflowForm({
             <Button
               type="submit"
               disabled={
-                runWorkflowMutation.isPending || hasLoginBlockValidationError
+                runWorkflowMutation.isPending ||
+                hasLoginBlockValidationError ||
+                hasBlockingParameterError
               }
             >
               {runWorkflowMutation.isPending && (
@@ -842,10 +871,28 @@ function RunWorkflowForm({
             }}
           />
           <FormField
-            key="runWithCode"
+            key="runWith"
             control={form.control}
-            name="runWithCode"
+            name="runWith"
             render={({ field }) => {
+              const descriptions: Record<string, ReactNode> = {
+                agent: hasCode ? (
+                  <span>
+                    Run this workflow with AI. (Even though it has generated
+                    code.)
+                  </span>
+                ) : (
+                  <span>Run this workflow with AI.</span>
+                ),
+                code: hasCode ? (
+                  <span>Run this workflow with generated code.</span>
+                ) : (
+                  <span>
+                    Run this workflow with generated code (after it is first
+                    generated).
+                  </span>
+                ),
+              };
               return (
                 <FormItem>
                   <div className="flex gap-16">
@@ -855,41 +902,21 @@ function RunWorkflowForm({
                           Run With
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          {field.value ? (
-                            hasCode ? (
-                              <span>
-                                Run this workflow with generated code.
-                              </span>
-                            ) : (
-                              <span>
-                                Run this workflow with generated code (after it
-                                is first generated).
-                              </span>
-                            )
-                          ) : hasCode ? (
-                            <span>
-                              Run this workflow with AI. (Even though it has
-                              generated code.)
-                            </span>
-                          ) : (
-                            <span>Run this workflow with AI.</span>
-                          )}
+                          {descriptions[field.value] ?? descriptions.agent}
                         </h2>
                       </div>
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
                         <Select
-                          value={field.value ? "code" : "ai"}
-                          onValueChange={(v) =>
-                            field.onChange(v === "code" ? true : false)
-                          }
+                          value={field.value}
+                          onValueChange={(v) => field.onChange(v)}
                         >
                           <SelectTrigger className="w-48">
                             <SelectValue placeholder="Run Method" />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="ai">Skyvern Agent</SelectItem>
+                            <SelectItem value="agent">Skyvern Agent</SelectItem>
                             <SelectItem value="code">Code</SelectItem>
                           </SelectContent>
                         </Select>

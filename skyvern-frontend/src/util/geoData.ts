@@ -19,6 +19,7 @@ export const SUPPORTED_COUNTRY_CODES = [
   "NZ",
   "PH",
   "KR",
+  "SA",
   "TR",
   "ZA",
 ] as const;
@@ -44,6 +45,7 @@ export const COUNTRY_NAMES: Record<SupportedCountryCode, string> = {
   NZ: "New Zealand",
   PH: "Philippines",
   KR: "South Korea",
+  SA: "Saudi Arabia",
   TR: "Turkey",
   ZA: "South Africa",
 };
@@ -67,6 +69,7 @@ export const COUNTRY_FLAGS: Record<SupportedCountryCode, string> = {
   NZ: "🇳🇿",
   PH: "🇵🇭",
   KR: "🇰🇷",
+  SA: "🇸🇦",
   TR: "🇹🇷",
   ZA: "🇿🇦",
 };
@@ -92,6 +95,7 @@ const PROXY_LOCATION_TO_COUNTRY: Record<string, string> = {
   [ProxyLocation.ResidentialNZ]: "NZ",
   [ProxyLocation.ResidentialPH]: "PH",
   [ProxyLocation.ResidentialKR]: "KR",
+  [ProxyLocation.ResidentialSA]: "SA",
   [ProxyLocation.ResidentialTR]: "TR",
   [ProxyLocation.ResidentialZA]: "ZA",
 };
@@ -116,6 +120,7 @@ const COUNTRY_TO_PROXY_LOCATION: Record<string, ProxyLocation> = {
   NZ: ProxyLocation.ResidentialNZ,
   PH: ProxyLocation.ResidentialPH,
   KR: ProxyLocation.ResidentialKR,
+  SA: ProxyLocation.ResidentialSA,
   TR: ProxyLocation.ResidentialTR,
   ZA: ProxyLocation.ResidentialZA,
 };

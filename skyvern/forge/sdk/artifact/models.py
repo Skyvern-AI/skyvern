@@ -55,6 +55,15 @@ class ArtifactType(StrEnum):
     # PDF files
     PDF = "pdf"
 
+    # Step archive: one ZIP per step containing all step artifacts (text + screenshots)
+    STEP_ARCHIVE = "step_archive"
+
+    # Task archive: one ZIP per task containing task-level cleanup artifacts (HAR, console log, trace, final screenshot)
+    TASK_ARCHIVE = "task_archive"
+
+    # Files downloaded by the browser during a run (stored in the uploads bucket, not the artifacts bucket).
+    DOWNLOAD = "download"
+
 
 class Artifact(BaseModel):
     created_at: datetime = Field(
@@ -75,11 +84,14 @@ class Artifact(BaseModel):
     artifact_id: str
     artifact_type: ArtifactType
     uri: str
+    bundle_key: str | None = None
+    checksum: str | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
     run_id: str | None = None
+    browser_session_id: str | None = None
     observer_cruise_id: str | None = None
     observer_thought_id: str | None = None
     ai_suggestion_id: str | None = None

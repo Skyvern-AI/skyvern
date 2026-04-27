@@ -1,12 +1,50 @@
 from abc import ABC, abstractmethod
 from typing import BinaryIO
 
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+
+
+async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
+    """Build the API-shaped ``FileInfo`` list from DOWNLOAD artifact rows.
+
+    Filename is the URI basename (the save site writes ``{base_uri}/{file}``);
+    checksum and modified_at come straight from the row, so retrieval needs
+    zero S3 round-trips.
+
+    All artifacts in a single batch share the same organization (downloads are
+    scoped to a run, which is scoped to an org), so the per-org URL TTL is
+    resolved once and applied to every URL.
+    """
+    if not artifacts:
+        return []
+    organization_id = artifacts[0].organization_id
+    expiry_seconds = await app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id)
+    infos: list[FileInfo] = []
+    for artifact in artifacts:
+        filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+        url = app.ARTIFACT_MANAGER.build_signed_content_url(
+            artifact_id=artifact.artifact_id,
+            artifact_name=filename,
+            artifact_type=ArtifactType.DOWNLOAD.value,
+            expiry_seconds=expiry_seconds,
+        )
+        infos.append(
+            FileInfo(
+                url=url,
+                checksum=artifact.checksum,
+                filename=filename,
+                modified_at=artifact.created_at,
+                artifact_id=artifact.artifact_id,
+            )
+        )
+    return infos
+
 
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
@@ -35,6 +73,8 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     # DEPRECATED: we're using CSS selector map now
     ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP: "json",
     ArtifactType.PDF: "pdf",
+    ArtifactType.STEP_ARCHIVE: "zip",
+    ArtifactType.TASK_ARCHIVE: "zip",
 }
 
 
@@ -122,6 +162,10 @@ class BaseStorage(ABC):
 
     @abstractmethod
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
+        pass
+
+    @abstractmethod
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
         pass
 
     @abstractmethod
@@ -213,7 +257,11 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def download_uploaded_file(self, uri: str) -> bytes | None:
+    def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
         pass
 
     @abstractmethod

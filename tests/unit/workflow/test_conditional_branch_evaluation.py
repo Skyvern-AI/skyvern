@@ -49,10 +49,12 @@ def _extraction_result(output_parameter: OutputParameter, evaluations: list[dict
 
 
 @pytest.mark.asyncio
-async def test_jinja_rendered_prompt_condition_omits_browser_session() -> None:
-    """When all expressions are fully Jinja-rendered, ExtractionBlock should be used
-    but with browser_session_id=None to prevent the LLM from reinterpreting resolved
-    literal values as on-screen references (SKY-7985)."""
+async def test_jinja_rendered_prompt_condition_keeps_browser_session() -> None:
+    """When all expressions are fully Jinja-rendered, ExtractionBlock should still
+    receive the browser_session_id so that page-referencing conditions (e.g.
+    "the date on the page matches {{date}}") can see the screenshot.  The prompt
+    template instructs the LLM to only use page content when the condition
+    explicitly references the page (SKY-8465)."""
     block = _conditional_block()
     branch = BranchCondition(
         criteria=PromptBranchCriteria(expression='{{Single_or_Joint__c}} == "Joint"'),
@@ -89,9 +91,9 @@ async def test_jinja_rendered_prompt_condition_omits_browser_session() -> None:
 
     assert results == [True]
     assert rendered_expressions == ['Joint == "Joint"']
-    # ExtractionBlock should be called with browser_session_id=None (not "bs_test")
+    # ExtractionBlock should be called with the real browser_session_id
     mock_extraction.execute.assert_awaited_once()
-    assert mock_extraction.execute.call_args.kwargs["browser_session_id"] is None
+    assert mock_extraction.execute.call_args.kwargs["browser_session_id"] == "bs_test"
     # No context should be passed when all expressions are Jinja-rendered
     evaluation_context.build_llm_safe_context_snapshot.assert_not_called()  # type: ignore[attr-defined]
     assert mock_prompt.call_args.kwargs["context_json"] is None

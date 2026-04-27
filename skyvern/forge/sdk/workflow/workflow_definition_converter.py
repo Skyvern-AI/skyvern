@@ -5,6 +5,7 @@ from typing import Any, cast
 import structlog
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
+    WorkflowDefinitionHasDuplicateBlockLabels,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
     WorkflowDefinitionHasUndefinedParameters,
@@ -55,6 +57,10 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     WaitBlock,
     WorkflowTriggerBlock,
+)
+from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
+    GoogleSheetsReadBlock,
+    GoogleSheetsWriteBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -98,10 +104,17 @@ def convert_workflow_definition(
     if any(parameter.parameter_type == ParameterType.OUTPUT for parameter in workflow_definition_yaml.parameters):
         raise InvalidWorkflowDefinition(message="Cannot manually create output parameters")
 
+    # Collect all block labels recursively (including nested loop blocks) and check for duplicates
+    all_block_labels = _collect_all_block_labels(workflow_definition_yaml.blocks)
+    label_counts: dict[str, int] = {}
+    for label in all_block_labels:
+        label_counts[label] = label_counts.get(label, 0) + 1
+    duplicate_labels = {label for label, count in label_counts.items() if count > 1}
+    if duplicate_labels:
+        raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
+
     # Check if any parameter keys collide with automatically created output parameter keys
-    block_labels = [block.label for block in workflow_definition_yaml.blocks]
-    # TODO (kerem): Check if block labels are unique
-    output_parameter_keys = [f"{block_label}_output" for block_label in block_labels]
+    output_parameter_keys = [f"{label}_output" for label in all_block_labels]
     parameter_keys = [parameter.key for parameter in workflow_definition_yaml.parameters]
     if any(key in output_parameter_keys for key in parameter_keys):
         raise WorkflowDefinitionHasReservedParameterKeys(
@@ -313,6 +326,8 @@ def convert_workflow_definition(
         blocks=blocks,
         version=dag_version,
         finally_block_label=workflow_definition_yaml.finally_block_label,
+        error_code_mapping=workflow_definition_yaml.error_code_mapping,
+        workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
     )
 
     LOG.info(
@@ -323,6 +338,16 @@ def convert_workflow_definition(
     )
 
     return workflow_definition
+
+
+def _collect_all_block_labels(block_yamls: list[BLOCK_YAML_TYPES]) -> list[str]:
+    """Recursively collect all block labels including those inside for-loop blocks."""
+    labels = []
+    for block_yaml in block_yamls:
+        labels.append(block_yaml.label)
+        if isinstance(block_yaml, ForLoopBlockYAML) and block_yaml.loop_blocks:
+            labels.extend(_collect_all_block_labels(block_yaml.loop_blocks))
+    return labels
 
 
 def _create_all_output_parameters_for_workflow(
@@ -359,6 +384,7 @@ def _build_block_kwargs(
         "continue_on_failure": block_yaml.continue_on_failure,
         "next_loop_on_failure": block_yaml.next_loop_on_failure,
         "model": block_yaml.model,
+        "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
 
 
@@ -615,13 +641,20 @@ def block_yaml_to_block(
 
     elif block_yaml.block_type == BlockType.LOGIN:
         login_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        # Apply a default complete_criterion for login blocks when the user hasn't provided one.
+        # This guides the LLM to check for actual logged-in indicators (username in header,
+        # account menu, logout button) rather than relying on page location, which fails on sites
+        # that redirect to the homepage after successful login.
+        login_navigation_goal = block_yaml.navigation_goal
+        if not login_navigation_goal or not login_navigation_goal.strip():
+            login_navigation_goal = DEFAULT_LOGIN_PROMPT
         return LoginBlock(
             **base_kwargs,
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
             parameters=login_block_parameters,
-            navigation_goal=block_yaml.navigation_goal,
+            navigation_goal=login_navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
             max_steps_per_run=block_yaml.max_steps_per_run,
             max_retries=block_yaml.max_retries,
@@ -716,6 +749,31 @@ def block_yaml_to_block(
             browser_session_id=block_yaml.browser_session_id,
             use_parent_browser_session=block_yaml.use_parent_browser_session,
             parameters=workflow_trigger_block_parameters,
+        )
+    elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_READ:
+        google_sheets_read_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return GoogleSheetsReadBlock(
+            **base_kwargs,
+            spreadsheet_url=block_yaml.spreadsheet_url,
+            sheet_name=block_yaml.sheet_name,
+            range=block_yaml.range,
+            credential_id=block_yaml.credential_id,
+            has_header_row=block_yaml.has_header_row,
+            parameters=google_sheets_read_parameters,
+        )
+    elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:
+        google_sheets_write_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return GoogleSheetsWriteBlock(
+            **base_kwargs,
+            spreadsheet_url=block_yaml.spreadsheet_url,
+            sheet_name=block_yaml.sheet_name,
+            range=block_yaml.range,
+            credential_id=block_yaml.credential_id,
+            write_mode=block_yaml.write_mode,
+            values=block_yaml.values,
+            column_mapping=block_yaml.column_mapping,
+            create_sheet_if_missing=block_yaml.create_sheet_if_missing,
+            parameters=google_sheets_write_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

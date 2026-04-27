@@ -231,43 +231,18 @@ class TestGenerateWorkflowParametersSchemaWithExistingFields:
             # Action 3 has no existing field - needs new name
         }
 
-        # Mock the LLM response
-        mock_llm_response = {
-            "field_mappings": {
-                "action_index_1": "preserved_username",
-                "action_index_2": "preserved_password",
-                "action_index_3": "new_field_name",
-            },
-            "schema_fields": {
-                "preserved_username": {"type": "str", "description": "Username"},
-                "preserved_password": {"type": "str", "description": "Password"},
-                "new_field_name": {"type": "str", "description": "New field"},
-            },
-        }
-
-        captured_prompt = {}
-
-        async def mock_llm_handler(prompt, prompt_name):
-            captured_prompt["prompt"] = prompt
-            captured_prompt["prompt_name"] = prompt_name
-            return mock_llm_response
-
-        self.stub_app.SCRIPT_GENERATION_LLM_API_HANDLER = AsyncMock(side_effect=mock_llm_handler)
-
+        # SKY-8965 Phase 2: no LLM mock needed — deterministic picker handles
+        # field-name assignment. Existing field assignments are preserved by the
+        # picker's "existing_assignment" rule (highest priority).
         schema_code, field_mappings = await generate_workflow_parameters_schema(
             actions_by_task, existing_field_assignments
         )
 
-        # Verify the prompt contains the existing field names
-        prompt = captured_prompt["prompt"]
-        assert "preserved_username" in prompt
-        assert "preserved_password" in prompt
-        assert "MUST PRESERVE" in prompt or "EXISTING FIELD NAME" in prompt
-
-        # Verify the returned field mappings include preserved names
+        # Verify existing field names are preserved by the deterministic picker
         assert field_mappings["task_1:act_1"] == "preserved_username"
         assert field_mappings["task_1:act_2"] == "preserved_password"
-        assert field_mappings["task_2:act_3"] == "new_field_name"
+        # New action gets a deterministic name from its intention ("Enter new field")
+        assert field_mappings["task_2:act_3"] == "enter_new_field"
 
     @pytest.mark.asyncio
     async def test_no_existing_fields_works_normally(self):
@@ -279,34 +254,15 @@ class TestGenerateWorkflowParametersSchemaWithExistingFields:
         }
         existing_field_assignments: dict[int, str] = {}  # No existing fields
 
-        mock_llm_response = {
-            "field_mappings": {
-                "action_index_1": "username",
-            },
-            "schema_fields": {
-                "username": {"type": "str", "description": "Username field"},
-            },
-        }
-
-        captured_prompt = {}
-
-        async def mock_llm_handler(prompt, prompt_name):
-            captured_prompt["prompt"] = prompt
-            return mock_llm_response
-
-        self.stub_app.SCRIPT_GENERATION_LLM_API_HANDLER = AsyncMock(side_effect=mock_llm_handler)
-
+        # SKY-8965 Phase 2: no LLM call, no prompt to inspect. Deterministic
+        # picker falls through to Rule 3 (intention-derived).
         schema_code, field_mappings = await generate_workflow_parameters_schema(
             actions_by_task, existing_field_assignments
         )
 
-        # Should not contain preservation instructions when no existing fields
-        prompt = captured_prompt["prompt"]
-        # The CRITICAL rule only appears when has_existing_fields is True
-        assert "CRITICAL" not in prompt
-
-        # Should still return valid mappings
-        assert field_mappings["task_1:act_1"] == "username"
+        # Should return valid mappings with deterministic name from intention
+        assert "task_1:act_1" in field_mappings
+        assert field_mappings["task_1:act_1"] == "enter_username"
 
     @pytest.mark.asyncio
     async def test_schema_code_includes_preserved_field_names(self):
@@ -427,47 +383,23 @@ async def login_block(page: SkyvernPage, context: RunContext):
             # Action 3 has no existing field (new block)
         }
 
-        # Step 2: Mock LLM that respects the preservation instructions
-        mock_llm_response = {
-            "field_mappings": {
-                "action_index_1": "user_email",  # Preserved
-                "action_index_2": "user_password",  # Preserved
-                "action_index_3": "company_name",  # New field for new block
-            },
-            "schema_fields": {
-                "user_email": {"type": "str", "description": "User's email address"},
-                "user_password": {"type": "str", "description": "User's password"},
-                "company_name": {"type": "str", "description": "Company name"},
-            },
-        }
-
-        captured_prompt = {}
-
-        async def mock_llm_handler(prompt, prompt_name):
-            captured_prompt["prompt"] = prompt
-            return mock_llm_response
-
-        self.stub_app.SCRIPT_GENERATION_LLM_API_HANDLER = AsyncMock(side_effect=mock_llm_handler)
-
+        # Step 2: SKY-8965 Phase 2 — deterministic picker preserves existing
+        # field names and assigns new ones from intention.
         schema_code, field_mappings = await generate_workflow_parameters_schema(
             actions_by_task, existing_field_assignments
         )
 
-        # Verify the prompt contains preservation instructions
-        prompt = captured_prompt["prompt"]
-        assert "user_email" in prompt, "Prompt should contain existing field name 'user_email'"
-        assert "user_password" in prompt, "Prompt should contain existing field name 'user_password'"
-        assert "MUST PRESERVE" in prompt or "EXISTING FIELD NAME" in prompt
-
-        # Verify field mappings preserve the original names
+        # Verify field mappings preserve the original names via "existing_assignment" rule
         assert field_mappings["task_1:act_1"] == "user_email", "Login block email field should be preserved"
         assert field_mappings["task_1:act_2"] == "user_password", "Login block password field should be preserved"
-        assert field_mappings["task_2:act_3"] == "company_name", "New block should get new field name"
 
         # Verify schema code contains preserved field names
         assert "user_email" in schema_code
         assert "user_password" in schema_code
-        assert "company_name" in schema_code
+
+        # New block gets a deterministic name from its intention ("Enter company name")
+        assert field_mappings["task_2:act_3"] == "enter_company_name"
+        assert "enter_company_name" in schema_code
 
         # The cached login block code references context.parameters['user_email']
         # and context.parameters['user_password'], which now match the schema!

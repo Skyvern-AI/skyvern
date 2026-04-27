@@ -768,6 +768,27 @@ await skyvern.createCredential({
     }
 });
 """
+UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+updated = await skyvern.update_credential(
+    credential_id="cred_123",
+    name="My Credential",
+    credential_type="password",
+    credential={"username": "user@example.com", "password": "newpassword123"},
+)
+print(updated)
+"""
+UPDATE_CREDENTIAL_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const updated = await skyvern.updateCredential("cred_123", {
+    name: "My Credential",
+    credential_type: "password",
+    credential: { username: "user@example.com", password: "newpassword123" }
+});
+console.log(updated);
+"""
 DELETE_CREDENTIAL_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")

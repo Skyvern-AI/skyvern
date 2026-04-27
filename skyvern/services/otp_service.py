@@ -1,6 +1,5 @@
 import asyncio
 import re
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pyotp
@@ -14,29 +13,17 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
+
 _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
+# Keys that contain an MFA hint but are TOTP *metadata*, not actual OTP codes.
+# "totpidentifier" matches "otp" but carries a lookup key, not a 6-digit code.
+_MFA_METADATA_KEY_HINTS = ("identifier", "url", "secret", "seed", "key")
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
 
 MFANavigationPayload = dict | list | str | None
-
-
-@dataclass(slots=True)
-class OTPPollContext:
-    organization_id: str
-    task_id: str | None = None
-    workflow_id: str | None = None
-    workflow_run_id: str | None = None
-    workflow_permanent_id: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-
-    @property
-    def needs_manual_input(self) -> bool:
-        return not self.totp_verification_url
 
 
 class OTPValue(BaseModel):
@@ -59,62 +46,6 @@ class OTPResultParsedByLLM(BaseModel):
     otp_value: str | None = Field(None, description="The OTP value.")
 
 
-def _is_mfa_like_parameter_key(key: object) -> bool:
-    """Return True when a payload key appears to represent an MFA/OTP parameter."""
-    normalized_key = _NON_ALNUM_PATTERN.sub("", str(key).lower())
-    return any(hint in normalized_key for hint in _MFA_PARAMETER_KEY_HINTS)
-
-
-def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
-    """Extract TOTP from runtime navigation inputs.
-
-    Runtime inline OTP extraction is intentionally payload-only.
-    """
-    # Early return if payload is not a traversable container
-    if not isinstance(navigation_payload, (dict, list)):
-        return None
-
-    traversal_stack: list[dict | list | str] = [navigation_payload]
-    visited_container_ids: set[int] = set()
-
-    while traversal_stack:
-        current_item = traversal_stack.pop()
-
-        # Only save OTP if a string
-        if isinstance(current_item, str):
-            return OTPValue(value=current_item, type=OTPType.TOTP)
-
-        # Check if we've already visited this container to avoid cycles
-        current_id = id(current_item)
-        if current_id in visited_container_ids:
-            continue
-        visited_container_ids.add(current_id)
-
-        # For lists, add all nested containers to the stack for further traversal
-        if isinstance(current_item, list):
-            for item in reversed(current_item):
-                if isinstance(item, (dict, list)):
-                    traversal_stack.append(item)
-            continue
-
-        # For dictionaries, process key-value pairs
-        for key, value in reversed(list(current_item.items())):
-            # Add nested containers (dicts/lists) to the stack regardless of key name
-            if isinstance(value, (dict, list)):
-                traversal_stack.append(value)
-            # Only process string values if the key suggests it's MFA-related
-            if not _is_mfa_like_parameter_key(key):
-                continue
-            if not isinstance(value, str):
-                continue
-            # If the value is a non-empty string under an MFA-like key, add it for evaluation
-            candidate_value = value.strip()
-            if candidate_value:
-                traversal_stack.append(candidate_value)
-    # No OTP code found after traversing the entire payload
-    return None
-
-
 async def parse_otp_login(
     content: str,
     organization_id: str,
@@ -132,6 +63,60 @@ async def parse_otp_login(
     otp_result = OTPResultParsedByLLM.model_validate(resp)
     if otp_result.otp_value_found and otp_result.otp_value:
         return OTPValue(value=otp_result.otp_value, type=otp_result.otp_type)
+    return None
+
+
+def _is_mfa_like_parameter_key(key: object) -> bool:
+    """Return True when a payload key appears to represent an MFA/OTP code value.
+
+    Excludes TOTP metadata keys (identifier, url, secret, etc.) that contain an
+    MFA hint but carry lookup/config data rather than an actual verification code.
+    """
+    normalized_key = _NON_ALNUM_PATTERN.sub("", str(key).lower())
+    if any(meta in normalized_key for meta in _MFA_METADATA_KEY_HINTS):
+        return False
+    return any(hint in normalized_key for hint in _MFA_PARAMETER_KEY_HINTS)
+
+
+def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
+    """Extract TOTP from runtime navigation inputs.
+
+    Runtime inline OTP extraction is intentionally payload-only.
+    """
+    if not isinstance(navigation_payload, (dict, list)):
+        return None
+
+    traversal_stack: list[dict | list | str] = [navigation_payload]
+    visited_container_ids: set[int] = set()
+
+    while traversal_stack:
+        current_item = traversal_stack.pop()
+
+        if isinstance(current_item, str):
+            return OTPValue(value=current_item, type=OTPType.TOTP)
+
+        current_id = id(current_item)
+        if current_id in visited_container_ids:
+            continue
+        visited_container_ids.add(current_id)
+
+        if isinstance(current_item, list):
+            for item in reversed(current_item):
+                if isinstance(item, (dict, list)):
+                    traversal_stack.append(item)
+            continue
+
+        for key, value in reversed(list(current_item.items())):
+            if isinstance(value, (dict, list)):
+                traversal_stack.append(value)
+            if not _is_mfa_like_parameter_key(key):
+                continue
+            if not isinstance(value, str):
+                continue
+            candidate_value = value.strip()
+            if candidate_value:
+                traversal_stack.append(candidate_value)
+
     return None
 
 
@@ -185,194 +170,55 @@ async def poll_otp_value(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
 ) -> OTPValue | None:
-    ctx = OTPPollContext(
-        organization_id=organization_id,
+    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
+    start_datetime = datetime.utcnow()
+    timeout_datetime = start_datetime + timeout
+    org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id, OrganizationAuthTokenType.api.value
+    )
+    if not org_token:
+        LOG.error("Failed to get organization token when trying to get otp value")
+        return None
+    LOG.info(
+        "Polling otp value",
         task_id=task_id,
-        workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
     )
-    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
-    start_datetime = datetime.utcnow()
-    timeout_datetime = start_datetime + timeout
-    org_api_key: str | None = None
-    if ctx.totp_verification_url:
-        org_token = await app.DATABASE.get_valid_org_auth_token(
-            ctx.organization_id, OrganizationAuthTokenType.api.value
-        )
-        if not org_token:
-            LOG.error("Failed to get organization token when trying to get otp value")
-            return None
-        org_api_key = org_token.token
-    LOG.info(
-        "Polling otp value",
-        task_id=ctx.task_id,
-        workflow_run_id=ctx.workflow_run_id,
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        totp_verification_url=ctx.totp_verification_url,
-        totp_identifier=ctx.totp_identifier,
-    )
-
-    await _set_waiting_state(ctx, start_datetime)
-
-    try:
-        while True:
-            await asyncio.sleep(10)
-            # check timeout
-            if datetime.utcnow() > timeout_datetime:
-                LOG.warning("Polling otp value timed out")
-                raise NoTOTPVerificationCodeFound(
-                    task_id=ctx.task_id,
-                    workflow_run_id=ctx.workflow_run_id,
-                    workflow_id=ctx.workflow_permanent_id,
-                    totp_verification_url=ctx.totp_verification_url,
-                    totp_identifier=ctx.totp_identifier,
-                )
-            otp_value: OTPValue | None = None
-            if ctx.totp_verification_url:
-                assert org_api_key is not None
-                otp_value = await _get_otp_value_from_url(
-                    ctx.organization_id,
-                    ctx.totp_verification_url,
-                    org_api_key,
-                    task_id=ctx.task_id,
-                    workflow_run_id=ctx.workflow_run_id,
-                    workflow_permanent_id=ctx.workflow_permanent_id,
-                )
-            elif ctx.totp_identifier:
-                otp_value = await _get_otp_value_from_db(
-                    ctx.organization_id,
-                    ctx.totp_identifier,
-                    task_id=ctx.task_id,
-                    workflow_id=ctx.workflow_id,
-                    workflow_run_id=ctx.workflow_run_id,
-                )
-                if not otp_value:
-                    otp_value = await _get_otp_value_by_run(
-                        ctx.organization_id,
-                        task_id=ctx.task_id,
-                        workflow_run_id=ctx.workflow_run_id,
-                    )
-            else:
-                # No pre-configured TOTP — poll for manually submitted codes by run context
-                otp_value = await _get_otp_value_by_run(
-                    ctx.organization_id,
-                    task_id=ctx.task_id,
-                    workflow_run_id=ctx.workflow_run_id,
-                )
-            if otp_value:
-                LOG.info("Got otp value", otp_value=otp_value)
-                return otp_value
-    finally:
-        await _clear_waiting_state(ctx)
-
-
-async def _set_waiting_state(ctx: OTPPollContext, started_at: datetime) -> None:
-    if not ctx.needs_manual_input:
-        return
-
-    identifier_for_ui = ctx.totp_identifier
-    if ctx.workflow_run_id:
-        try:
-            await app.DATABASE.update_workflow_run(
-                workflow_run_id=ctx.workflow_run_id,
-                waiting_for_verification_code=True,
-                verification_code_identifier=identifier_for_ui,
-                verification_code_polling_started_at=started_at,
+    while True:
+        await asyncio.sleep(10)
+        # check timeout
+        if datetime.utcnow() > timeout_datetime:
+            LOG.warning("Polling otp value timed out")
+            raise NoTOTPVerificationCodeFound(
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow_permanent_id,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
             )
-            LOG.info(
-                "Set 2FA waiting state for workflow run",
-                workflow_run_id=ctx.workflow_run_id,
-                verification_code_identifier=identifier_for_ui,
+        otp_value: OTPValue | None = None
+        if totp_verification_url:
+            otp_value = await _get_otp_value_from_url(
+                organization_id,
+                totp_verification_url,
+                org_token.token,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
             )
-            try:
-                NotificationRegistryFactory.get_registry().publish(
-                    ctx.organization_id,
-                    {
-                        "type": "verification_code_required",
-                        "workflow_run_id": ctx.workflow_run_id,
-                        "task_id": ctx.task_id,
-                        "identifier": identifier_for_ui,
-                        "polling_started_at": started_at.isoformat(),
-                    },
-                )
-            except Exception:
-                LOG.warning("Failed to publish 2FA required notification for workflow run", exc_info=True)
-        except Exception:
-            LOG.warning("Failed to set 2FA waiting state for workflow run", exc_info=True)
-    elif ctx.task_id:
-        try:
-            await app.DATABASE.update_task_2fa_state(
-                task_id=ctx.task_id,
-                organization_id=ctx.organization_id,
-                waiting_for_verification_code=True,
-                verification_code_identifier=identifier_for_ui,
-                verification_code_polling_started_at=started_at,
+        elif totp_identifier:
+            otp_value = await _get_otp_value_from_db(
+                organization_id,
+                totp_identifier,
+                task_id=task_id,
+                workflow_id=workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
             )
-            LOG.info(
-                "Set 2FA waiting state for task",
-                task_id=ctx.task_id,
-                verification_code_identifier=identifier_for_ui,
-            )
-            try:
-                NotificationRegistryFactory.get_registry().publish(
-                    ctx.organization_id,
-                    {
-                        "type": "verification_code_required",
-                        "task_id": ctx.task_id,
-                        "identifier": identifier_for_ui,
-                        "polling_started_at": started_at.isoformat(),
-                    },
-                )
-            except Exception:
-                LOG.warning("Failed to publish 2FA required notification for task", exc_info=True)
-        except Exception:
-            LOG.warning("Failed to set 2FA waiting state for task", exc_info=True)
-
-
-async def _clear_waiting_state(ctx: OTPPollContext) -> None:
-    if not ctx.needs_manual_input:
-        return
-
-    if ctx.workflow_run_id:
-        try:
-            await app.DATABASE.update_workflow_run(
-                workflow_run_id=ctx.workflow_run_id,
-                waiting_for_verification_code=False,
-            )
-            LOG.info("Cleared 2FA waiting state for workflow run", workflow_run_id=ctx.workflow_run_id)
-            try:
-                NotificationRegistryFactory.get_registry().publish(
-                    ctx.organization_id,
-                    {
-                        "type": "verification_code_resolved",
-                        "workflow_run_id": ctx.workflow_run_id,
-                        "task_id": ctx.task_id,
-                    },
-                )
-            except Exception:
-                LOG.warning("Failed to publish 2FA resolved notification for workflow run", exc_info=True)
-        except Exception:
-            LOG.warning("Failed to clear 2FA waiting state for workflow run", exc_info=True)
-    elif ctx.task_id:
-        try:
-            await app.DATABASE.update_task_2fa_state(
-                task_id=ctx.task_id,
-                organization_id=ctx.organization_id,
-                waiting_for_verification_code=False,
-            )
-            LOG.info("Cleared 2FA waiting state for task", task_id=ctx.task_id)
-            try:
-                NotificationRegistryFactory.get_registry().publish(
-                    ctx.organization_id,
-                    {"type": "verification_code_resolved", "task_id": ctx.task_id},
-                )
-            except Exception:
-                LOG.warning("Failed to publish 2FA resolved notification for task", exc_info=True)
-        except Exception:
-            LOG.warning("Failed to clear 2FA waiting state for task", exc_info=True)
+        if otp_value:
+            LOG.info("Got otp value", otp_value=otp_value)
+            return otp_value
 
 
 async def _get_otp_value_from_url(
@@ -436,28 +282,6 @@ async def _get_otp_value_from_url(
     return otp_value
 
 
-async def _get_otp_value_by_run(
-    organization_id: str,
-    task_id: str | None = None,
-    workflow_run_id: str | None = None,
-) -> OTPValue | None:
-    """Look up OTP codes by task_id/workflow_run_id when no totp_identifier is configured.
-
-    Used for the manual 2FA input flow where users submit codes through the UI
-    without pre-configured TOTP credentials.
-    """
-    codes = await app.DATABASE.get_otp_codes_by_run(
-        organization_id=organization_id,
-        task_id=task_id,
-        workflow_run_id=workflow_run_id,
-        limit=1,
-    )
-    if codes:
-        code = codes[0]
-        return OTPValue(value=code.code, type=code.otp_type)
-    return None
-
-
 async def _get_otp_value_from_db(
     organization_id: str,
     totp_identifier: str,
@@ -465,7 +289,7 @@ async def _get_otp_value_from_db(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
 ) -> OTPValue | None:
-    totp_codes = await app.DATABASE.get_otp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
+    totp_codes = await app.DATABASE.otp.get_otp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
     for totp_code in totp_codes:
         if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:
             continue

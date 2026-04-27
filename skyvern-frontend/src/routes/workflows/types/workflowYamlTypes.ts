@@ -1,6 +1,5 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
-import { WorkflowBlockType } from "./workflowTypes";
-import { WorkflowModel } from "./workflowTypes";
+import { WorkflowBlockType, WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
@@ -19,6 +18,7 @@ export type WorkflowCreateYAMLRequest = {
   cache_key?: string | null;
   ai_fallback?: boolean;
   adaptive_caching?: boolean;
+  code_version?: number | null;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;
@@ -29,6 +29,7 @@ export type WorkflowDefinitionYAML = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
   finally_block_label?: string | null;
+  workflow_system_prompt?: string | null;
 };
 
 export type ParameterYAML =
@@ -144,7 +145,9 @@ export type BlockYAML =
   | URLBlockYAML
   | HttpRequestBlockYAML
   | PrintPageBlockYAML
-  | WorkflowTriggerBlockYAML;
+  | WorkflowTriggerBlockYAML
+  | GoogleSheetsReadBlockYAML
+  | GoogleSheetsWriteBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -152,6 +155,7 @@ export type BlockYAMLBase = {
   continue_on_failure?: boolean;
   next_loop_on_failure?: boolean;
   next_block_label?: string | null;
+  ignore_workflow_system_prompt?: boolean;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {
@@ -352,7 +356,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
   json_schema?: Record<string, unknown> | null;
 };
 
@@ -426,5 +430,28 @@ export type WorkflowTriggerBlockYAML = BlockYAMLBase & {
   wait_for_completion: boolean;
   browser_session_id?: string | null;
   use_parent_browser_session?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type GoogleSheetsReadBlockYAML = BlockYAMLBase & {
+  block_type: "google_sheets_read";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  has_header_row: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
+  block_type: "google_sheets_write";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  write_mode: "append" | "update";
+  values: string;
+  column_mapping: Record<string, string> | null;
+  create_sheet_if_missing?: boolean;
   parameter_keys?: Array<string> | null;
 };

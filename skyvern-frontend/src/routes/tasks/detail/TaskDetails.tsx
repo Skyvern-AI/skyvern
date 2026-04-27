@@ -7,6 +7,7 @@ import {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { Status404 } from "@/components/Status404";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
@@ -28,7 +29,6 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { runsApiBaseUrl } from "@/util/env";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
@@ -178,7 +178,10 @@ function TaskDetails() {
     task?.status === Status.TimedOut;
   const failureReason = showFailureReason ? (
     <div className="space-y-1">
-      <Label className="text-lg">Failure Reason</Label>
+      <div className="flex items-center gap-2">
+        <Label className="text-lg">Failure Reason</Label>
+        <FailureCategoryBadge failureCategory={task.failure_category ?? null} />
+      </div>
       <CodeEditor
         language="json"
         value={JSON.stringify(task.failure_reason, null, 2)}
@@ -243,7 +246,7 @@ function TaskDetails() {
 
                 return {
                   method: "POST",
-                  url: `${runsApiBaseUrl}/run/tasks`,
+                  url: `${env.runsApiBaseUrl}/run/tasks`,
                   body: buildTaskRunPayload(
                     createTaskRequestObject(task),
                     RunEngine.SkyvernV1,

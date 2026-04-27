@@ -5,7 +5,6 @@ import structlog
 from cachetools import TTLCache
 from pydantic import BaseModel
 
-from skyvern.core.script_generations.canonical_fields import CANONICAL_CATEGORIES
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage, script_run_context_manager
 from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage
 from skyvern.forge import app
@@ -23,6 +22,9 @@ _extraction_cache: TTLCache[str, dict[str, str | None]] = TTLCache(maxsize=256, 
 async def _extract_canonical_values(parameters: dict[str, Any]) -> dict[str, str | None]:
     """Extract canonical field values from ALL parameters — no magic names.
 
+    Canonical categories are provided by cloud via AgentFunction. In OSS builds
+    this returns an empty dict (no categories registered).
+
     Strategy:
     1. Direct mapping: if a parameter key matches a canonical category's param
        name (e.g., "email" → email category), use the value directly. No LLM needed.
@@ -32,7 +34,7 @@ async def _extract_canonical_values(parameters: dict[str, Any]) -> dict[str, str
     Returns a dict keyed by canonical category name -> extracted value (or None).
     """
     result: dict[str, str | None] = {}
-    param_to_category = {c.param: c.name for c in CANONICAL_CATEGORIES if c.param}
+    param_to_category = {c.param: c.name for c in app.AGENT_FUNCTION.get_canonical_categories() if c.param}
     text_blobs: list[str] = []
 
     for key, value in parameters.items():
@@ -50,7 +52,7 @@ async def _extract_canonical_values(parameters: dict[str, Any]) -> dict[str, str
 
     # LLM extraction for remaining categories
     if text_blobs:
-        remaining_cats = [c for c in CANONICAL_CATEGORIES if c.name not in result]
+        remaining_cats = [c for c in app.AGENT_FUNCTION.get_canonical_categories() if c.name not in result]
         if remaining_cats:
             combined_text = "\n\n".join(text_blobs)
             llm_result = await _llm_extract_from_text(combined_text, remaining_cats)

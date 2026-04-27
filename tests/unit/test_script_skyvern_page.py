@@ -1,18 +1,22 @@
 """
 Unit tests for ScriptSkyvernPage.
 
-Tests _wait_for_page_ready_before_action (regression test for self._page bug, PR #8425)
-and _ensure_element_ids_on_page (injects unique_id attrs after page navigation).
+Tests _wait_for_page_ready_before_action (regression test for self._page bug, PR #8425),
+_ensure_element_ids_on_page (injects unique_id attrs after page navigation),
+terminate() (raises ScriptTerminationException for Code 2.0 cached execution),
+and wait() (accepts both seconds= and timeout_ms= parameter styles).
 """
 
 import inspect
 import re
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.config import settings
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+from skyvern.exceptions import ScriptTerminationException
 
 
 def create_mock_page():
@@ -349,3 +353,508 @@ async def test_ensure_element_ids_catches_exceptions(mock_scraped_page, mock_ai)
 
         # Should NOT raise
         await script_page._ensure_element_ids_on_page()
+
+
+# =============================================================================
+# Tests for terminate()
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_terminate_raises_script_termination_exception_without_context(mock_scraped_page, mock_ai):
+    """
+    When there is no SkyvernContext, terminate() should raise ScriptTerminationException
+    with the error messages from the errors list.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        with patch(
+            "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+            return_value=None,
+        ):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: page not found"):
+                await script_page.terminate(errors=["page not found"])
+
+
+@pytest.mark.asyncio
+async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
+    """
+    When context, task, and step are available, terminate() should call
+    handle_terminate_action and then raise ScriptTerminationException.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
+                new_callable=AsyncMock,
+                return_value=[MagicMock(success=True)],
+            ) as mock_handler,
+        ):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2"):
+                await script_page.terminate(errors=["error1", "error2"])
+
+            # Verify handler was called with correct arguments
+            mock_handler.assert_called_once()
+            call_args = mock_handler.call_args
+            action = call_args[0][0]
+            assert action.organization_id == "org_123"
+            assert action.workflow_run_id == "wr_456"
+            assert action.task_id == "tsk_789"
+            assert action.step_id == "stp_012"
+            # Verify reasoning is set from errors for LLM extraction context
+            assert action.reasoning == "error1; error2"
+
+
+@pytest.mark.asyncio
+async def test_terminate_raises_even_when_task_not_found(mock_scraped_page, mock_ai):
+    """
+    When context exists but task/step are not found in the database,
+    terminate() should still raise ScriptTerminationException.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
+                new_callable=AsyncMock,
+            ) as mock_handler,
+        ):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: task failed"):
+                await script_page.terminate(errors=["task failed"])
+
+            # Handler should NOT be called when task/step not found
+            mock_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_ai):
+    """
+    When handle_terminate_action raises an exception (e.g., LLM call fails during
+    extract_user_defined_errors), terminate() should still raise ScriptTerminationException
+    so upstream workflow/service.py correctly marks the block as terminated.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
+                new_callable=AsyncMock,
+                side_effect=Exception("LLM call failed"),
+            ) as mock_handler,
+        ):
+            # Should raise ScriptTerminationException, NOT the handler's Exception
+            with pytest.raises(ScriptTerminationException, match="Terminate called: handler error"):
+                await script_page.terminate(errors=["handler error"])
+
+            mock_handler.assert_called_once()
+
+
+# =============================================================================
+# Tests for fill() proactive upgrade when value=None + prompt
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fill_value_none_with_prompt_upgrades_to_proactive(mock_scraped_page, mock_ai):
+    """
+    When fill() is called with value=None and a prompt but ai != 'proactive',
+    it should upgrade ai to 'proactive' and delegate to _input_text instead of
+    returning "" (the old silent no-op behavior).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        # Mock _input_text to capture the call
+        script_page._input_text = AsyncMock(return_value="filled_value")
+
+        result = await script_page.fill(
+            selector="#email",
+            value=None,
+            prompt="Fill the email address field",
+            ai="fallback",
+        )
+
+        # Should NOT return "" — should delegate to _input_text
+        assert result == "filled_value"
+        script_page._input_text.assert_called_once()
+        call_kwargs = script_page._input_text.call_args.kwargs
+        assert call_kwargs["ai"] == "proactive"
+
+
+@pytest.mark.asyncio
+async def test_fill_value_none_no_prompt_still_skips(mock_scraped_page, mock_ai):
+    """
+    When fill() is called with value=None and NO prompt and ai != 'proactive',
+    it should still return "" (skip the fill).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._input_text = AsyncMock(return_value="should_not_reach")
+
+        result = await script_page.fill(
+            selector="#email",
+            value=None,
+            ai="fallback",
+        )
+
+        assert result == ""
+        script_page._input_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_value_none_proactive_unchanged(mock_scraped_page, mock_ai):
+    """
+    When fill() is called with value=None and ai='proactive', it should
+    proceed as before (not return early, delegate to _input_text).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._input_text = AsyncMock(return_value="ai_value")
+
+        result = await script_page.fill(
+            selector="#email",
+            value=None,
+            prompt="Fill the email",
+            ai="proactive",
+        )
+
+        assert result == "ai_value"
+        script_page._input_text.assert_called_once()
+
+
+# =============================================================================
+# Tests for fill_autocomplete() proactive upgrade when value=None + prompt
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fill_autocomplete_value_none_with_prompt_upgrades_to_proactive(mock_scraped_page, mock_ai):
+    """
+    When fill_autocomplete() is called with value=None and a prompt but ai != 'proactive',
+    it should upgrade ai to 'proactive' and delegate to ai_input_text instead of
+    returning "" (the old silent no-op behavior).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._ai.ai_input_text = AsyncMock(return_value="filled_value")
+
+        result = await script_page.fill_autocomplete(
+            selector="#city",
+            value=None,
+            prompt="Fill the city field",
+            ai="fallback",
+        )
+
+        assert result == "filled_value"
+        script_page._ai.ai_input_text.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fill_autocomplete_value_none_no_prompt_still_skips(mock_scraped_page, mock_ai):
+    """
+    When fill_autocomplete() is called with value=None and NO prompt and ai != 'proactive',
+    it should still return "" (skip the fill).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._ai.ai_input_text = AsyncMock(return_value="should_not_reach")
+
+        result = await script_page.fill_autocomplete(
+            selector="#city",
+            value=None,
+            ai="fallback",
+        )
+
+        assert result == ""
+        script_page._ai.ai_input_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_autocomplete_value_none_proactive_unchanged(mock_scraped_page, mock_ai):
+    """
+    When fill_autocomplete() is called with value=None and ai='proactive', it should
+    proceed as before (delegate to ai_input_text).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._ai.ai_input_text = AsyncMock(return_value="ai_value")
+
+        result = await script_page.fill_autocomplete(
+            selector="#city",
+            value=None,
+            prompt="Fill the city",
+            ai="proactive",
+        )
+
+        assert result == "ai_value"
+        script_page._ai.ai_input_text.assert_called_once()
+
+
+# =============================================================================
+# Tests for wait() — timeout_ms support
+# =============================================================================
+
+
+def _get_wait_inner_fn():
+    """Extract the inner wait function from the action_wrap closure.
+
+    action_wrap replaces the method with a wrapper. The original function
+    is stored in the closure as the 'fn' free variable.
+    """
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+    wrapper = SkyvernPage.wait
+    # closure vars are ('action', 'fn') per action_wrap implementation
+    for var_name, cell in zip(wrapper.__code__.co_freevars, wrapper.__closure__):
+        if var_name == "fn":
+            return cell.cell_contents
+    raise RuntimeError("Could not extract inner wait function from action_wrap closure")
+
+
+class TestWaitMethod:
+    """Tests for SkyvernPage.wait() accepting both seconds= and timeout_ms=.
+
+    The script reviewer prompt documents the API as page.wait(timeout_ms=5000),
+    but the original implementation only accepted wait(seconds=5). This mismatch
+    caused every LLM-generated wait call to raise TypeError at runtime, silently
+    triggering agent fallback instead of actually waiting.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wait_with_seconds_kwarg(self):
+        """wait(seconds=0.05) should sleep for ~0.05 seconds."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, seconds=0.05)
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.04, f"Expected ~0.05s sleep, got {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_with_seconds_positional(self):
+        """wait(0.05) should sleep for ~0.05 seconds (positional arg)."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, 0.05)
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.04, f"Expected ~0.05s sleep, got {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_with_timeout_ms_kwarg(self):
+        """wait(timeout_ms=50) should sleep for ~0.05 seconds."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, timeout_ms=50)
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.04, f"Expected ~0.05s sleep, got {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_with_timeout_ms_converts_correctly(self):
+        """wait(timeout_ms=100) should sleep ~0.1s, not 100 seconds."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, timeout_ms=100)
+        elapsed = time.monotonic() - t0
+        assert 0.08 <= elapsed <= 0.5, f"Expected ~0.1s, got {elapsed:.3f}s — ms→s conversion may be wrong"
+
+    @pytest.mark.asyncio
+    async def test_wait_seconds_takes_precedence_over_timeout_ms(self):
+        """When both seconds= and timeout_ms= are provided, seconds= wins."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None, seconds=0.05, timeout_ms=10000)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, f"seconds= should take precedence, but waited {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_wait_no_args_returns_immediately(self):
+        """wait() with no args should return immediately (sleep 0)."""
+        fn = _get_wait_inner_fn()
+        t0 = time.monotonic()
+        await fn(None)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.1, f"Expected immediate return, got {elapsed:.3f}s"
+
+    def test_wait_signature_allows_timeout_ms(self):
+        """The inner wait function must accept timeout_ms via **kwargs without TypeError.
+
+        This is the core regression test: the old signature was wait(self, seconds: float, **kwargs)
+        where seconds was required. Calling wait(timeout_ms=5000) raised TypeError because
+        seconds had no default. The fix makes seconds optional (default None).
+        """
+        fn = _get_wait_inner_fn()
+        sig = inspect.signature(fn)
+        seconds_param = sig.parameters.get("seconds")
+        assert seconds_param is not None, "wait() should have a 'seconds' parameter"
+        assert seconds_param.default is None, (
+            f"seconds should default to None so timeout_ms can be used instead, got default={seconds_param.default}"
+        )

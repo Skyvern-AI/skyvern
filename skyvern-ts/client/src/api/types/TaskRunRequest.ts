@@ -12,7 +12,7 @@ export interface TaskRunRequest {
      */
     url?: string;
     /**
-     * The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+     * The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
      */
     engine?: Skyvern.RunEngine;
     /** The title for the task */
@@ -31,9 +31,16 @@ export interface TaskRunRequest {
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
+     * - RESIDENTIAL_KR: South Korea
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_BR: Brazil
+     * - RESIDENTIAL_TR: Turkey
+     * - RESIDENTIAL_CA: Canada
+     * - RESIDENTIAL_MX: Mexico
+     * - RESIDENTIAL_IT: Italy
+     * - RESIDENTIAL_NL: Netherlands
      * - RESIDENTIAL_ISP: ISP proxy
      * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
      * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -86,7 +93,7 @@ export interface TaskRunRequest {
     max_screenshot_scrolls?: number;
     /** The CDP address for the task. */
     browser_address?: string;
-    /** Whether to run the task with agent or code. */
+    /** Whether to run the task with agent or code. Null means use the default. */
     run_with?: string;
 }
 
@@ -106,9 +113,16 @@ export namespace TaskRunRequest {
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
+     * - RESIDENTIAL_KR: South Korea
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_BR: Brazil
+     * - RESIDENTIAL_TR: Turkey
+     * - RESIDENTIAL_CA: Canada
+     * - RESIDENTIAL_MX: Mexico
+     * - RESIDENTIAL_IT: Italy
+     * - RESIDENTIAL_NL: Netherlands
      * - RESIDENTIAL_ISP: ISP proxy
      * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
      * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)

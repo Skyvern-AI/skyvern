@@ -19,6 +19,14 @@ export const ArtifactType = {
 
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
 
+export const TriggerType = {
+  Manual: "manual",
+  Api: "api",
+  Scheduled: "scheduled",
+} as const;
+
+export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
+
 export const Status = {
   Created: "created",
   Running: "running",
@@ -55,6 +63,7 @@ export const ProxyLocation = {
   ResidentialNL: "RESIDENTIAL_NL",
   ResidentialPH: "RESIDENTIAL_PH",
   ResidentialKR: "RESIDENTIAL_KR",
+  ResidentialSA: "RESIDENTIAL_SA",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -115,6 +124,8 @@ export type Task = {
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
+  started_at: string | null; // ISO 8601
+  finished_at: string | null; // ISO 8601
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
@@ -136,6 +147,12 @@ export type Task = {
   application: string | null;
 };
 
+export type FailureCategory = {
+  category: string;
+  confidence_float: number;
+  reasoning: string;
+};
+
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -146,6 +163,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
@@ -242,6 +260,122 @@ export interface CreateAzureClientSecretCredentialRequest {
 
 export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
+}
+
+export interface GoogleOAuthCredential {
+  id: string;
+  organization_id: string;
+  credential_name: string;
+  scopes: string | null;
+  valid: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface GoogleOAuthCredentialResponse {
+  credential: GoogleOAuthCredential;
+  app_origin?: string | null;
+}
+
+export interface GoogleOAuthCredentialListResponse {
+  credentials: GoogleOAuthCredential[];
+}
+
+export interface CreateGoogleOAuthAuthorizeRequest {
+  redirect_uri: string;
+  credential_name?: string;
+  app_origin?: string;
+}
+
+export interface GoogleOAuthAuthorizeResponse {
+  authorize_url: string;
+  state: string;
+}
+
+export interface CreateGoogleOAuthCallbackRequest {
+  code: string;
+  state: string;
+}
+
+export interface GoogleSpreadsheetSummary {
+  id: string;
+  name: string;
+  modified_time: string | null;
+  web_view_link: string | null;
+}
+
+export interface PagedGoogleSpreadsheets {
+  spreadsheets: GoogleSpreadsheetSummary[];
+  next_page_token: string | null;
+}
+
+export interface GoogleSheetTab {
+  sheet_id: number;
+  title: string;
+  index: number;
+}
+
+export interface ListGoogleSheetTabsResponse {
+  tabs: GoogleSheetTab[];
+}
+
+export interface SheetHeader {
+  letter: string;
+  name: string;
+}
+
+export interface GetSheetHeadersResponse {
+  headers: SheetHeader[];
+}
+
+export interface GetSheetDimensionsResponse {
+  sheet_id: number;
+  title: string;
+  column_count: number;
+  row_count: number;
+  last_column_letter: string;
+  headers: SheetHeader[];
+}
+
+export interface CreateGoogleSpreadsheetResponse {
+  spreadsheet: GoogleSpreadsheetSummary;
+  first_sheet_name: string | null;
+}
+
+export interface CreateGoogleSheetTabResponse {
+  tab: GoogleSheetTab;
+}
+
+export interface GoogleSheetsReconnectRequiredError {
+  code: "reconnect_required";
+  missing_scope: string | null;
+}
+
+export interface BitwardenCredential {
+  email: string;
+  master_password: string;
+}
+
+export interface BitwardenCredentialSafe {
+  email: string;
+}
+
+export interface BitwardenOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  credential: BitwardenCredentialSafe;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateBitwardenCredentialRequest {
+  credential: BitwardenCredential;
+}
+
+export interface BitwardenCredentialResponse {
+  token: BitwardenOrganizationAuthToken;
 }
 
 export interface CustomCredentialServiceConfig {
@@ -385,16 +519,48 @@ export type DebugSessionApiResponse = {
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
+  started_at: string | null; // ISO 8601
+  finished_at: string | null; // ISO 8601
   modified_at: string;
   proxy_location: ProxyLocation | null;
   script_run: boolean | null;
   status: Status;
   title?: string;
+  trigger_type?: TriggerType | null;
+  schedule_id?: string | null;
+  schedule_name?: string | null;
+  schedule_cron?: string | null;
+  scheduled_for?: string | null;
   webhook_callback_url: string;
   workflow_id: string;
   workflow_permanent_id: string;
   workflow_run_id: string;
   workflow_title: string | null;
+};
+
+export const TaskRunType = {
+  TaskV1: "task_v1",
+  TaskV2: "task_v2",
+  WorkflowRun: "workflow_run",
+  OpenaiCua: "openai_cua",
+  AnthropicCua: "anthropic_cua",
+  UiTars: "ui_tars",
+} as const;
+
+export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
+
+export type TaskRunListItem = {
+  task_run_id: string;
+  task_run_type: TaskRunType;
+  run_id: string;
+  title: string | null;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  workflow_permanent_id: string | null;
+  script_run: boolean;
+  searchable_text: string | null;
 };
 
 export type WorkflowRunStatusApiResponse = {
@@ -405,13 +571,16 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  started_at: string | null;
   finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -420,6 +589,7 @@ export type WorkflowRunStatusApiResponse = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  run_with: string | null;
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
@@ -433,13 +603,16 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  started_at: string | null;
   finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -448,6 +621,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  run_with: string | null;
   workflow: WorkflowApiResponse;
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
@@ -533,6 +707,8 @@ export type CredentialApiResponse = {
   name: string;
   browser_profile_id?: string | null;
   tested_url?: string | null;
+  user_context?: string | null;
+  save_browser_session_intent?: boolean | null;
 };
 
 export function isPasswordCredential(
@@ -566,6 +742,7 @@ export type CreateCredentialRequest = {
   name: string;
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
+  vault_type?: "custom";
 };
 
 export type PasswordCredential = {

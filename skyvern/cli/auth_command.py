@@ -109,8 +109,11 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
 def run_signup(
     base_url: str = _DEFAULT_FRONTEND_URL,
     timeout: int = _CALLBACK_TIMEOUT,
-) -> None:
-    """Core signup logic. Called by both the Typer command and init_command."""
+) -> str | None:
+    """Core signup logic. Called by both the Typer command and init_command.
+
+    Returns the API key on success, or None if signup failed before saving.
+    """
     from .llm_setup import update_or_add_env_var
 
     bound_socket = _find_free_port()
@@ -161,8 +164,10 @@ def run_signup(
     console.print("API key saved to .env")
     console.print(f"Base URL: {api_base_url}")
 
+    return api_key
 
-def signup(
+
+def login(
     base_url: str = typer.Option(
         _DEFAULT_FRONTEND_URL,
         "--base-url",
@@ -171,8 +176,16 @@ def signup(
     timeout: int = typer.Option(
         _CALLBACK_TIMEOUT,
         "--timeout",
-        help="Timeout in seconds waiting for browser signup",
+        help="Timeout in seconds waiting for browser authentication",
     ),
 ) -> None:
-    """Sign up for Skyvern Cloud and save your API key."""
+    """Authenticate with Skyvern Cloud and save your API key.
+
+    Opens a browser to sign up or log in. Your API key is saved locally
+    so you only need to do this once.
+    """
     run_signup(base_url=base_url, timeout=timeout)
+
+
+# Backwards-compatible alias
+signup = login

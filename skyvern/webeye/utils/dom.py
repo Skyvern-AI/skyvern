@@ -11,7 +11,7 @@ import structlog
 from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
+from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
@@ -26,6 +26,7 @@ from skyvern.exceptions import (
     SkyvernException,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
@@ -158,12 +159,26 @@ class SkyvernElement:
             return True
 
         autocomplete: str | None = await self.get_attr("aria-autocomplete")
-        if autocomplete and autocomplete.lower() == "list":
+        if autocomplete and autocomplete.lower() in ("list", "both", "inline"):
             return True
 
         class_name: str | None = await self.get_attr("class")
         if class_name and "autocomplete-input" in class_name.lower():
             return True
+
+        # Combobox inputs (role="combobox") present a list of options — treat as
+        # auto-completion so the agent uses the dropdown-selection flow instead of
+        # the Tab hack.  This covers account-search fields in many apps that use
+        # role="combobox" without setting aria-autocomplete.
+        role: str | None = await self.get_attr("role")
+        if role and role.lower() == "combobox":
+            return True
+
+        # Tag inputs where typing surfaces a suggestion list to select from
+        if class_name:
+            cl = class_name.lower()
+            if "skillset" in cl or "tagsinput" in cl:
+                return True
 
         return False
 
@@ -702,8 +717,8 @@ class SkyvernElement:
         await self.get_locator().press(key=key, timeout=timeout)
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        for char in text:
-            await self.get_locator().type(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
+        locator = self.get_locator()
+        await EventStrategyFactory.type_text(locator.page, locator, text)
 
     async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:
@@ -715,7 +730,8 @@ class SkyvernElement:
         await self.get_locator().fill(text, timeout=timeout)
 
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.get_locator().clear(timeout=timeout)
+        locator = self.get_locator()
+        await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
 
     async def check(
         self,
@@ -819,7 +835,7 @@ class SkyvernElement:
         if dest_x < 0 or dest_y < 0:
             raise ElementOutOfCurrentViewport(element_id=self.get_id())
 
-        await page.mouse.move(dest_x, dest_y)
+        await EventStrategyFactory.move_cursor(page, dest_x, dest_y)
 
         return dest_x, dest_y
 
@@ -833,6 +849,7 @@ class SkyvernElement:
         if await self.is_disabled(dynamic=True):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
+        await EventStrategyFactory.move_to_element(page, self.get_locator())
         try:
             await self.get_locator().click(timeout=timeout)
             return
@@ -881,34 +898,49 @@ class SkyvernElement:
         if not await self.is_visible():
             return
 
+        # Step 1: Use native element.scrollIntoView() which handles both window scrolling
+        # AND nested scrollable containers (e.g., SPA app shells with overflow-y: auto).
+        # See SKY-8748 for the motivating case. Falls back to window-level scroll if the
+        # native call fails (e.g., detached elements).
         try:
-            target_x: int | None = None
-            target_y: int | None = None
-
-            rect = await self.get_rect(timeout=timeout)
-            element_x: int | None = None
-            element_y: int | None = None
-            if rect is not None:
-                element_x = rect["x"] if rect["x"] > 0 else None
-                element_y = rect["y"] if rect["y"] > 0 else None
-
-            # calculating y to move the element to the middle of the viewport
-            if element_y is not None:
-                target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
-
-            if element_x is not None:
-                target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
-
             skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-            if target_x is not None and target_y is not None:
-                await skyvern_frame.safe_scroll_to_x_y(target_x, target_y)
+            element_handler = await self.get_element_handler(timeout=timeout)
+            await skyvern_frame.scroll_into_view(element_handler)
         except Exception:
             LOG.info(
-                "Failed to calculate the y to move the element to the middle of the viewport, ignore it",
+                "Failed to scrollIntoView via native JS, falling back to window scroll",
                 exc_info=True,
                 element_id=self.get_id(),
             )
+            try:
+                target_x: int | None = None
+                target_y: int | None = None
 
+                rect = await self.get_rect(timeout=timeout)
+                element_x: int | None = None
+                element_y: int | None = None
+                if rect is not None:
+                    element_x = rect["x"] if rect["x"] > 0 else None
+                    element_y = rect["y"] if rect["y"] > 0 else None
+
+                if element_y is not None:
+                    target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
+
+                if element_x is not None:
+                    target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
+
+                skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+                if target_x is not None and target_y is not None:
+                    await skyvern_frame.safe_scroll_to_x_y(target_x, target_y)
+            except Exception:
+                LOG.info(
+                    "Fallback window scroll also failed, ignoring",
+                    exc_info=True,
+                    element_id=self.get_id(),
+                )
+
+        # Step 2: Playwright actionability confirmation. After Step 1, the element should
+        # already be in the viewport so this check passes quickly.
         try:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)

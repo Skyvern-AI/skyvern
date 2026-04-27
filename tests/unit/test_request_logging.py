@@ -11,8 +11,9 @@ from skyvern.forge.request_logging import (
     _REDACTED,
     _is_loggable_content_type,
     _is_sensitive_key,
-    _redact_sensitive_fields,
+    _sanitize_body,
     _sanitize_response_body,
+    redact_sensitive_fields,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,12 @@ class TestIsSensitiveKey:
             "auth",
             "authorization",
             "secret_key",
+            "totp",
+            "TOTP",
+            "otp",
+            "one_time_code",
+            "one_time_password",
+            "mfa_code",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
@@ -79,26 +86,26 @@ class TestIsSensitiveKey:
 
 
 # ---------------------------------------------------------------------------
-# _redact_sensitive_fields
+# redact_sensitive_fields
 # ---------------------------------------------------------------------------
 
 
 class TestRedactSensitiveFields:
     def test_redacts_password(self) -> None:
         data = {"username": "alice", "password": "secret123"}
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result["username"] == "alice"
         assert result["password"] == _REDACTED
 
     def test_redacts_nested_keys(self) -> None:
         data = {"user": {"api_key": "key123", "name": "bob"}}
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result["user"]["api_key"] == _REDACTED
         assert result["user"]["name"] == "bob"
 
     def test_redacts_in_lists(self) -> None:
         data = [{"token": "abc"}, {"name": "ok"}]
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result[0]["token"] == _REDACTED
         assert result[1]["name"] == "ok"
 
@@ -113,7 +120,19 @@ class TestRedactSensitiveFields:
             "api_key": "g",
             "Authorization": "h",
         }
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
+        for key in data:
+            assert result[key] == _REDACTED, f"Expected {key} to be redacted"
+
+    def test_redacts_totp_and_otp_fields(self) -> None:
+        data = {
+            "totp": "123456",
+            "otp": "999999",
+            "one_time_code": "abc123",
+            "one_time_password": "xyz789",
+            "mfa_code": "mfa42",
+        }
+        result = redact_sensitive_fields(data)
         for key in data:
             assert result[key] == _REDACTED, f"Expected {key} to be redacted"
 
@@ -126,7 +145,7 @@ class TestRedactSensitiveFields:
             "author": "alice",
             "token_count": 42,
         }
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result == data
 
     def test_depth_limit_prevents_crash(self) -> None:
@@ -137,7 +156,7 @@ class TestRedactSensitiveFields:
             current = current["nested"]
         current["password"] = "should_not_crash"
 
-        result = _redact_sensitive_fields(deep)
+        result = redact_sensitive_fields(deep)
         assert result is not None  # should not raise RecursionError
 
     def test_depth_limit_still_redacts_keys_at_boundary(self) -> None:
@@ -151,7 +170,7 @@ class TestRedactSensitiveFields:
         current["password"] = "leak_me"
         current["safe"] = "visible"
 
-        result = _redact_sensitive_fields(deep)
+        result = redact_sensitive_fields(deep)
         node = result["level"]
         for _ in range(19):
             node = node["next"]
@@ -160,13 +179,13 @@ class TestRedactSensitiveFields:
 
     def test_preserves_non_sensitive_values(self) -> None:
         data = {"status": "ok", "count": 42, "items": [1, 2, 3]}
-        result = _redact_sensitive_fields(data)
+        result = redact_sensitive_fields(data)
         assert result == data
 
     def test_handles_non_dict_non_list(self) -> None:
-        assert _redact_sensitive_fields("hello") == "hello"
-        assert _redact_sensitive_fields(42) == 42
-        assert _redact_sensitive_fields(None) is None
+        assert redact_sensitive_fields("hello") == "hello"
+        assert redact_sensitive_fields(42) == 42
+        assert redact_sensitive_fields(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -256,4 +275,50 @@ class TestSanitizeResponseBody:
     def test_sensitive_endpoint_trailing_slash(self) -> None:
         request = _make_request("POST", "/api/v1/credentials/")
         result = _sanitize_response_body(request, '{"data": "value"}', "application/json")
+        assert result == _REDACTED
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/v1/credentials/totp"),
+            ("POST", "/v1/credentials/totp/"),
+            ("POST", "/api/v1/totp"),
+            ("POST", "/api/v1/totp/"),
+            ("GET", "/v1/credentials/totp"),
+            ("GET", "/v1/credentials/totp/"),
+        ],
+    )
+    def test_totp_endpoints_response_redacted(self, method: str, path: str) -> None:
+        request = _make_request(method, path)
+        body = json.dumps({"code": "123456", "content": "Your code is 123456"})
+        result = _sanitize_response_body(request, body, "application/json")
+        assert result == _REDACTED
+
+
+class TestSanitizeBody:
+    def test_sensitive_endpoint_request_fully_redacted(self) -> None:
+        request = _make_request("POST", "/v1/credentials")
+        result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
+        assert result == _REDACTED
+
+    def test_non_sensitive_endpoint_request_preserved(self) -> None:
+        request = _make_request("GET", "/v1/tasks")
+        result = _sanitize_body(request, b'{"user": "alice"}', "application/json")
+        assert result == '{"user": "alice"}'
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/v1/credentials/totp"),
+            ("POST", "/v1/credentials/totp/"),
+            ("POST", "/api/v1/totp"),
+            ("POST", "/api/v1/totp/"),
+            ("GET", "/v1/credentials/totp"),
+            ("GET", "/v1/credentials/totp/"),
+        ],
+    )
+    def test_totp_endpoints_request_redacted(self, method: str, path: str) -> None:
+        request = _make_request(method, path)
+        body = b'{"totp_identifier": "x@y.com", "content": "Your code is 123456"}'
+        result = _sanitize_body(request, body, "application/json")
         assert result == _REDACTED

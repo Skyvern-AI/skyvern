@@ -16,14 +16,24 @@ type Props = {
   type: WorkflowParameterValueType;
   value: unknown;
   onChange: (value: unknown) => void;
+  required?: boolean;
+  disabled?: boolean;
 };
 
-function WorkflowParameterInput({ type, value, onChange }: Props) {
+function WorkflowParameterInput({
+  type,
+  value,
+  onChange,
+  required,
+  disabled,
+}: Props) {
   if (type === "json") {
     return (
       <CodeEditor
         className="w-full"
         language="json"
+        aria-required={required || undefined}
+        readOnly={disabled}
         onChange={(value) => onChange(value)}
         value={
           typeof value === "string" ? value : JSON.stringify(value, null, 2)
@@ -37,7 +47,9 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "string") {
     return (
       <AutoResizingTextarea
-        value={value as string}
+        aria-required={required || undefined}
+        disabled={disabled}
+        value={(value as string | null | undefined) ?? ""}
         onChange={(e) => onChange(e.target.value)}
       />
     );
@@ -46,6 +58,8 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "integer") {
     return (
       <Input
+        aria-required={required || undefined}
+        disabled={disabled}
         value={value === null ? "" : Number(value)}
         onChange={(e) => {
           const val = e.target.value;
@@ -60,6 +74,8 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "float") {
     return (
       <Input
+        aria-required={required || undefined}
+        disabled={disabled}
         value={value === null ? "" : Number(value)}
         onChange={(e) => {
           const val = e.target.value;
@@ -75,10 +91,11 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "boolean") {
     return (
       <Select
+        disabled={disabled}
         value={value === null ? "" : String(value)}
         onValueChange={(v) => onChange(v === "true")}
       >
-        <SelectTrigger className="w-48">
+        <SelectTrigger aria-required={required || undefined} className="w-48">
           <SelectValue placeholder="Select value..." />
         </SelectTrigger>
         <SelectContent>
@@ -92,6 +109,7 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "file_url") {
     return (
       <FileUpload
+        required={required}
         value={value as FileInputValue}
         onChange={(value) => onChange(value)}
       />
@@ -102,11 +120,14 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
     const credentialId = value as string | null;
     return (
       <CredentialSelector
+        required={required}
         value={credentialId ?? ""}
         onChange={(value) => onChange(value)}
       />
     );
   }
+
+  return null;
 }
 
 export { WorkflowParameterInput };

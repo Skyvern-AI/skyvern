@@ -1,13 +1,18 @@
-import RFB from "@novnc/novnc/lib/rfb.js";
+// @novnc/novnc is CJS with __esModule marker. Vite 8 (Rollup 5) changed
+// CJS interop so the default import may be the namespace object instead of
+// exports.default.  This guard works across bundler versions.
+import _RFB from "@novnc/novnc/lib/rfb.js";
+type RFB = _RFB;
+const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
 import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
-import { Status } from "@/api/types";
-import type {
-  TaskApiResponse,
-  WorkflowRunStatusApiResponse,
+import {
+  Status,
+  type TaskApiResponse,
+  type WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { Tip } from "@/components/Tip";
 import { Button } from "@/components/ui/button";
@@ -108,6 +113,7 @@ type Props = {
   };
   resizeTrigger?: number;
   isVisible?: boolean;
+  isExecuting?: boolean;
   // --
   onClose?: () => void;
 };
@@ -121,6 +127,7 @@ function BrowserStream({
   workflow = undefined,
   resizeTrigger,
   isVisible = true,
+  isExecuting = false,
   // --
   onClose,
 }: Props) {
@@ -237,7 +244,7 @@ function BrowserStream({
   useEffect(() => {
     settingsStore.setIsUsingABrowser(isReady);
     settingsStore.setBrowserSessionId(
-      isReady ? browserSessionId ?? null : null,
+      isReady ? (browserSessionId ?? null) : null,
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);
@@ -255,10 +262,9 @@ function BrowserStream({
   useEffect(() => {
     if (prevMessageConnectedRef.current && !isMessageConnected) {
       setMessagesDisconnectedTrigger((x) => x + 1);
-      onClose?.();
     }
     prevMessageConnectedRef.current = isMessageConnected;
-  }, [isMessageConnected, onClose]);
+  }, [isMessageConnected]);
 
   // vnc socket
   useEffect(
@@ -846,6 +852,15 @@ function BrowserStream({
               </div>
             </div>
           </>
+        )}
+        {isExecuting && !recordingStore.isRecording && (
+          <div className="pointer-events-none absolute flex aspect-video w-full animate-glow items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-yellow-500">
+            <div className="relative h-full w-full">
+              <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-yellow-500">
+                <div className="truncate">Agent is working</div>
+              </div>
+            </div>
+          </div>
         )}
         {!isReady && (
           <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">

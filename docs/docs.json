@@ -1,88 +1,52 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
+  "theme": "palm",
   "name": "Skyvern",
   "colors": {
-    "primary": "#6366F1",
-    "light": "#818CF8",
-    "dark": "#4F46E5"
+    "primary": "#4A6CF7",
+    "light": "#7B93FA",
+    "dark": "#1B2559"
+  },
+  "appearance": {
+    "default": "light"
+  },
+  "background": {
+    "color": {
+      "light": "#F8F5EF",
+      "dark": "#1C1917"
+    }
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg",
+    "light": "/images/skyvern_logo_blackbg.png",
+    "dark": "/logo/dark.png",
     "href": "https://skyvern.com"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
+  "search": {
+    "prompt": "Search Skyvern docs..."
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Documentation",
-        "groups": [
-          {
-            "group": "Getting Started",
-            "pages": [
-              "getting-started/quickstart",
-              "getting-started/core-concepts"
-            ]
-          },
-          {
-            "group": "Running Automations",
-            "pages": [
-              "running-automations/run-a-task",
-              "running-automations/task-parameters",
-              "running-automations/extract-structured-data"
-            ]
-          },
-          {
-            "group": "Multi-Step Automations",
-            "pages": [
-              "multi-step-automations/build-a-workflow",
-              "multi-step-automations/workflow-blocks-reference",
-              "multi-step-automations/file-operations",
-              "multi-step-automations/workflow-parameters"
-            ]
-          },
-          {
-            "group": "Optimization",
-            "pages": [
-              "optimization/browser-sessions",
-              "optimization/browser-profiles",
-              "optimization/cost-control"
-            ]
-          },
-          {
-            "group": "Going to Production",
-            "pages": [
-              "going-to-production/webhooks",
-              "going-to-production/proxy-geolocation",
-              "going-to-production/error-handling",
-              "going-to-production/reliability-tips",
-              "going-to-production/captcha-bot-detection",
-              "integrations/mcp",
-              "integrations/cli"
-            ]
-          },
-          {
-            "group": "Debugging",
-            "pages": [
-              "debugging/using-artifacts",
-              "debugging/troubleshooting-guide",
-              "debugging/faq"
-            ]
-          },
-          {
-            "group": "Self-Hosted Deployment",
-            "pages": [
-              "self-hosted/overview",
-              "self-hosted/docker",
-              "self-hosted/llm-configuration",
-              "self-hosted/browser",
-              "self-hosted/proxy",
-              "self-hosted/kubernetes",
-              "self-hosted/storage",
-              "integrations/local-llms"
-            ]
-          }
+        "tab": "Home",
+        "pages": [
+          "index",
+          "nav/cloud-ui",
+          "nav/developers",
+          "nav/cookbooks",
+          "nav/changelog",
+          "nav/api-reference",
+          "nav/sdk-reference"
         ]
       },
       {
@@ -91,10 +55,11 @@
           {
             "group": "Getting Started",
             "pages": [
+              "cloud/getting-started/introduction",
+              "cloud/getting-started/core-concepts",
+              "cloud/getting-started/ai-agents-quickstart",
               "cloud/getting-started/overview",
-              "cloud/getting-started/run-your-first-task",
-              "cloud/getting-started/run-a-task",
-              "cloud/getting-started/monitor-a-run"
+              "cloud/getting-started/mcp"
             ]
           },
           {
@@ -103,8 +68,29 @@
               "cloud/building-workflows/build-a-workflow",
               "cloud/building-workflows/manage-workflows",
               "cloud/building-workflows/add-parameters",
-              "cloud/building-workflows/configure-blocks",
-              "cloud/building-workflows/run-a-workflow"
+              "cloud/building-workflows/run-a-workflow",
+              "cloud/building-workflows/scheduling",
+              "cloud/building-workflows/run-from-code"
+            ]
+          },
+          {
+            "group": "Workflow Blocks",
+            "pages": ["cloud/building-workflows/configure-blocks"]
+          },
+          {
+            "group": "Running Tasks",
+            "pages": [
+              "cloud/getting-started/run-your-first-task",
+              "cloud/getting-started/run-a-task",
+              "cloud/getting-started/monitor-a-run",
+              "cloud/getting-started/run-from-code"
+            ]
+          },
+          {
+            "group": "Re-using Browsers",
+            "pages": [
+              "cloud/browser-management/browser-sessions",
+              "cloud/browser-management/browser-profiles"
             ]
           },
           {
@@ -126,15 +112,6 @@
             ]
           },
           {
-            "group": "Account & Settings",
-            "pages": [
-              "cloud/account-settings/api-keys",
-              "cloud/account-settings/billing-usage",
-              "cloud/account-settings/organization-settings",
-              "cloud/account-settings/profile-settings"
-            ]
-          },
-          {
             "group": "Integrations",
             "pages": [
               "integrations/zapier",
@@ -142,39 +119,100 @@
               "integrations/n8n",
               "integrations/workato"
             ]
+          },
+          {
+            "group": "Account & Settings",
+            "pages": [
+              "cloud/account-settings/api-keys",
+              "cloud/account-settings/billing-usage",
+              "cloud/account-settings/organization-settings",
+              "cloud/account-settings/profile-settings"
+            ]
           }
         ]
       },
       {
-        "tab": "SDKs",
+        "tab": "Developers",
         "groups": [
           {
-            "group": "Python SDK",
+            "group": "Getting Started",
             "pages": [
-              "sdk-reference/overview",
-              "sdk-reference/tasks",
-              "sdk-reference/workflows",
-              "sdk-reference/browser-sessions",
-              "sdk-reference/browser-profiles",
-              "sdk-reference/credentials",
-              "sdk-reference/helpers",
-              "sdk-reference/error-handling",
-              "sdk-reference/complete-reference"
+              "developers/getting-started/introduction",
+              "developers/getting-started/core-concepts",
+              "developers/getting-started/quickstart",
+              "developers/getting-started/ai-agents-quickstart",
+              "developers/getting-started/mcp",
+              "integrations/cli"
             ]
           },
           {
-            "group": "TypeScript SDK",
+            "group": "Core Features",
             "pages": [
-              "ts-sdk-reference/overview",
-              "ts-sdk-reference/tasks",
-              "ts-sdk-reference/workflows",
-              "ts-sdk-reference/browser-sessions",
-              "ts-sdk-reference/browser-profiles",
-              "ts-sdk-reference/credentials",
-              "ts-sdk-reference/helpers",
-              "ts-sdk-reference/browser-automation",
-              "ts-sdk-reference/error-handling",
-              "ts-sdk-reference/complete-reference"
+              "developers/features/captcha-and-bot-bypass",
+              "developers/features/browser-sessions",
+              "developers/features/proxy-and-geo-targeting",
+              "developers/features/authentication-and-2fa",
+              "developers/features/code-caching"
+            ]
+          },
+          {
+            "group": "Browser Automation",
+            "pages": [
+              "developers/browser-automations/overview",
+              "developers/browser-automations/extract-structured-data",
+              "developers/browser-automations/work-with-files",
+              "developers/browser-automations/handle-browsers"
+            ]
+          },
+          {
+            "group": "Workflow Blocks",
+            "pages": ["developers/browser-automations/actions-reference"]
+          },
+          {
+            "group": "Handling Authentication",
+            "pages": [
+              "developers/credentials/store-credentials",
+              "developers/credentials/handle-2fa",
+              "developers/credentials/troubleshooting-login"
+            ]
+          },
+          {
+            "group": "Optimization",
+            "pages": [
+              "developers/optimization/browser-sessions",
+              "developers/optimization/browser-profiles",
+              "developers/optimization/cost-control"
+            ]
+          },
+          {
+            "group": "Going to Production",
+            "pages": [
+              "developers/going-to-production/webhooks",
+              "developers/going-to-production/proxy-geolocation",
+              "developers/going-to-production/error-handling",
+              "developers/going-to-production/reliability-tips"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "developers/debugging/using-artifacts",
+              "developers/debugging/troubleshooting-guide",
+              "developers/debugging/observability-with-laminar",
+              "developers/debugging/faq"
+            ]
+          },
+          {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "developers/self-hosted/overview",
+              "developers/self-hosted/docker",
+              "developers/self-hosted/llm-configuration",
+              "developers/self-hosted/browser",
+              "developers/self-hosted/proxy",
+              "developers/self-hosted/kubernetes",
+              "developers/self-hosted/storage",
+              "integrations/local-llms"
             ]
           }
         ]
@@ -190,27 +228,156 @@
       },
       {
         "tab": "Changelog",
-        "pages": [
-          "changelog"
-        ]
+        "pages": ["changelog"]
       },
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
       },
+      {
+        "tab": "SDK Reference",
+        "groups": [
+          {
+            "group": "SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
+            ]
+          },
+          {
+            "group": "Browser Automation",
+            "pages": [
+              {
+                "group": "Page",
+                "pages": [
+                  "sdk-reference/browser-automation/act",
+                  "sdk-reference/browser-automation/extract",
+                  "sdk-reference/browser-automation/validate",
+                  "sdk-reference/browser-automation/prompt",
+                  "sdk-reference/browser-automation/locator",
+                  "sdk-reference/browser-automation/click",
+                  "sdk-reference/browser-automation/fill",
+                  "sdk-reference/browser-automation/select-option",
+                  "sdk-reference/browser-automation/type",
+                  "sdk-reference/browser-automation/hover",
+                  "sdk-reference/browser-automation/scroll",
+                  "sdk-reference/browser-automation/upload-file",
+                  "sdk-reference/browser-automation/fill-form",
+                  "sdk-reference/browser-automation/fill-multipage-form",
+                  "sdk-reference/browser-automation/fill-from-mapping",
+                  "sdk-reference/browser-automation/extract-form-fields",
+                  "sdk-reference/browser-automation/validate-mapping",
+                  "sdk-reference/browser-automation/fill-autocomplete",
+                  "sdk-reference/browser-automation/frame-switch",
+                  "sdk-reference/browser-automation/frame-main",
+                  "sdk-reference/browser-automation/frame-list"
+                ]
+              },
+              {
+                "group": "Agent",
+                "pages": [
+                  "sdk-reference/browser-automation/agent-run-task",
+                  "sdk-reference/browser-automation/agent-login",
+                  "sdk-reference/browser-automation/agent-download-files",
+                  "sdk-reference/browser-automation/agent-run-workflow"
+                ]
+              },
+              {
+                "group": "Browser",
+                "pages": [
+                  "sdk-reference/browser-automation/launch-cloud-browser",
+                  "sdk-reference/browser-automation/use-cloud-browser",
+                  "sdk-reference/browser-automation/connect-to-cloud-browser-session",
+                  "sdk-reference/browser-automation/connect-to-browser-over-cdp",
+                  "sdk-reference/browser-automation/launch-local-browser",
+                  "sdk-reference/browser-automation/get-working-page",
+                  "sdk-reference/browser-automation/new-page",
+                  "sdk-reference/browser-automation/get-page-for",
+                  "sdk-reference/browser-automation/close"
+                ]
+              },
+              "sdk-reference/browser-automation/complete-example"
+            ]
+          },
+          {
+            "group": "Tasks",
+            "pages": [
+              "sdk-reference/tasks/run-task",
+              "sdk-reference/tasks/get-run",
+              "sdk-reference/tasks/cancel-run",
+              "sdk-reference/tasks/get-run-timeline",
+              "sdk-reference/tasks/get-run-artifacts",
+              "sdk-reference/tasks/get-artifact",
+              "sdk-reference/tasks/get-runs-v2",
+              "sdk-reference/tasks/retry-run-webhook"
+            ]
+          },
+          {
+            "group": "Workflows",
+            "pages": [
+              "sdk-reference/workflows/run-workflow",
+              "sdk-reference/workflows/create-workflow",
+              "sdk-reference/workflows/get-workflow",
+              "sdk-reference/workflows/get-workflows",
+              "sdk-reference/workflows/get-workflow-versions",
+              "sdk-reference/workflows/update-workflow",
+              "sdk-reference/workflows/delete-workflow",
+              "sdk-reference/workflows/get-workflow-runs",
+              "sdk-reference/workflows/update-workflow-folder"
+            ]
+          },
+          {
+            "group": "Browser Sessions",
+            "pages": [
+              "sdk-reference/browser-sessions/create-browser-session",
+              "sdk-reference/browser-sessions/get-browser-session",
+              "sdk-reference/browser-sessions/get-browser-sessions",
+              "sdk-reference/browser-sessions/close-browser-session"
+            ]
+          },
+          {
+            "group": "Browser Profiles",
+            "pages": [
+              "sdk-reference/browser-profiles/create-browser-profile",
+              "sdk-reference/browser-profiles/list-browser-profiles",
+              "sdk-reference/browser-profiles/get-browser-profile",
+              "sdk-reference/browser-profiles/delete-browser-profile"
+            ]
+          },
+          {
+            "group": "Credentials",
+            "pages": [
+              "sdk-reference/credentials/create-credential",
+              "sdk-reference/credentials/get-credential",
+              "sdk-reference/credentials/get-credentials",
+              "sdk-reference/credentials/update-credential",
+              "sdk-reference/credentials/delete-credential",
+              "sdk-reference/credentials/send-totp-code"
+            ]
+          },
+          {
+            "group": "Helpers",
+            "pages": [
+              "sdk-reference/helpers/login",
+              "sdk-reference/helpers/download-files",
+              "sdk-reference/helpers/upload-file"
+            ]
+          }
+        ]
+      }
     ]
   },
   "navbar": {
     "links": [
       {
-        "label": "Dashboard",
-        "href": "https://app.skyvern.com"
+        "label": "Get API Key",
+        "href": "https://app.skyvern.com/settings"
       }
     ],
     "primary": {
-      "type": "button",
-      "label": "Get API Key",
-      "href": "https://app.skyvern.com/settings/api-keys"
+      "type": "github",
+      "href": "https://github.com/Skyvern-AI/skyvern"
     }
   },
   "footer": {
@@ -220,6 +387,13 @@
       "twitter": "https://twitter.com/skyvernai"
     }
   },
+  "contextual": {
+    "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode", "mcp"]
+  },
+  "seo": {
+    "indexing": "navigable"
+  },
+  "css": "/style.css",
   "api": {
     "baseUrl": "https://api.skyvern.com",
     "auth": {
@@ -229,5 +403,462 @@
     "playground": {
       "display": "interactive"
     }
-  }
+  },
+  "errors": {
+    "404": {
+      "redirect": false,
+      "title": "Page not found",
+      "description": "This page doesn't exist. Try the [documentation home](/) or use search to find what you need."
+    }
+  },
+  "redirects": [
+    {
+      "source": "/going-to-production/captcha-bot-detection",
+      "destination": "/developers/features/captcha-and-bot-bypass"
+    },
+    {
+      "source": "/sdk-reference/browser-automation/find",
+      "destination": "/sdk-reference/browser-automation/locator"
+    },
+    {
+      "source": "/sdk-reference/tasks",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/sdk-reference/workflows",
+      "destination": "/sdk-reference/workflows/run-workflow"
+    },
+    {
+      "source": "/sdk-reference/browser-sessions",
+      "destination": "/sdk-reference/browser-sessions/create-browser-session"
+    },
+    {
+      "source": "/sdk-reference/browser-profiles",
+      "destination": "/sdk-reference/browser-profiles/create-browser-profile"
+    },
+    {
+      "source": "/sdk-reference/credentials",
+      "destination": "/sdk-reference/credentials/create-credential"
+    },
+    {
+      "source": "/sdk-reference/helpers",
+      "destination": "/sdk-reference/helpers/login"
+    },
+    {
+      "source": "/sdk-reference/browser-automation",
+      "destination": "/sdk-reference/browser-automation/launch-cloud-browser"
+    },
+    {
+      "source": "/ts-sdk-reference/overview",
+      "destination": "/sdk-reference/overview"
+    },
+    {
+      "source": "/ts-sdk-reference/tasks",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/ts-sdk-reference/workflows",
+      "destination": "/sdk-reference/workflows/run-workflow"
+    },
+    {
+      "source": "/ts-sdk-reference/browser-sessions",
+      "destination": "/sdk-reference/browser-sessions/create-browser-session"
+    },
+    {
+      "source": "/ts-sdk-reference/browser-profiles",
+      "destination": "/sdk-reference/browser-profiles/create-browser-profile"
+    },
+    {
+      "source": "/ts-sdk-reference/credentials",
+      "destination": "/sdk-reference/credentials/create-credential"
+    },
+    {
+      "source": "/ts-sdk-reference/helpers",
+      "destination": "/sdk-reference/helpers/login"
+    },
+    {
+      "source": "/ts-sdk-reference/browser-automation",
+      "destination": "/sdk-reference/browser-automation/launch-cloud-browser"
+    },
+    {
+      "source": "/ts-sdk-reference/error-handling",
+      "destination": "/sdk-reference/error-handling"
+    },
+    {
+      "source": "/ts-sdk-reference/complete-reference",
+      "destination": "/sdk-reference/complete-reference"
+    },
+    {
+      "source": "/introduction",
+      "destination": "/developers/getting-started/quickstart"
+    },
+    {
+      "source": "/getting-started/skyvern-in-action",
+      "destination": "/developers/getting-started/core-concepts"
+    },
+    {
+      "source": "/getting-started/prompting-guide",
+      "destination": "/developers/debugging/troubleshooting-guide"
+    },
+    {
+      "source": "/running-tasks/run-tasks",
+      "destination": "/cloud/getting-started/run-from-code"
+    },
+    {
+      "source": "/running-tasks/visualizing-results",
+      "destination": "/developers/debugging/using-artifacts"
+    },
+    {
+      "source": "/running-tasks/cancel-runs",
+      "destination": "/cloud/getting-started/run-from-code"
+    },
+    {
+      "source": "/running-tasks/webhooks-faq",
+      "destination": "/developers/going-to-production/webhooks"
+    },
+    {
+      "source": "/running-tasks/connect-local-browser",
+      "destination": "/developers/self-hosted/browser"
+    },
+    {
+      "source": "/running-tasks/proxy-location",
+      "destination": "/developers/going-to-production/proxy-geolocation"
+    },
+    {
+      "source": "/running-tasks/advanced-features",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/running-tasks/api-spec",
+      "destination": "/cloud/getting-started/run-from-code"
+    },
+    {
+      "source": "/running-automations/run-a-task",
+      "destination": "/cloud/getting-started/run-from-code"
+    },
+    {
+      "source": "/running-automations/task-parameters",
+      "destination": "/sdk-reference/tasks/run-task"
+    },
+    {
+      "source": "/running-automations/extract-structured-data",
+      "destination": "/developers/browser-automations/extract-structured-data"
+    },
+    {
+      "source": "/workflows/manage-workflows",
+      "destination": "/cloud/building-workflows/manage-workflows"
+    },
+    {
+      "source": "/workflows/workflow-blocks-details",
+      "destination": "/cloud/building-workflows/configure-blocks"
+    },
+    {
+      "source": "/workflows/workflow-parameters",
+      "destination": "/cloud/building-workflows/add-parameters"
+    },
+    {
+      "source": "/workflows/run-workflows",
+      "destination": "/cloud/building-workflows/run-a-workflow"
+    },
+    {
+      "source": "/workflows/consistent-workflows",
+      "destination": "/developers/going-to-production/reliability-tips"
+    },
+    {
+      "source": "/workflows/running-workflows",
+      "destination": "/cloud/building-workflows/run-a-workflow"
+    },
+    {
+      "source": "/workflows/introduction",
+      "destination": "/cloud/building-workflows/build-a-workflow"
+    },
+    {
+      "source": "/workflows/workflow-blocks",
+      "destination": "/cloud/building-workflows/configure-blocks"
+    },
+    {
+      "source": "/workflows/creating-workflows",
+      "destination": "/cloud/building-workflows/build-a-workflow"
+    },
+    {
+      "source": "/workflows/getting-workflows",
+      "destination": "/cloud/building-workflows/run-a-workflow"
+    },
+    {
+      "source": "/workflows/what-is-a-parameter",
+      "destination": "/cloud/building-workflows/add-parameters"
+    },
+    {
+      "source": "/multi-step-automations/overview",
+      "destination": "/developers/browser-automations/overview"
+    },
+    {
+      "source": "/multi-step-automations/actions-reference",
+      "destination": "/developers/browser-automations/actions-reference"
+    },
+    {
+      "source": "/multi-step-automations/extract-structured-data",
+      "destination": "/developers/browser-automations/extract-structured-data"
+    },
+    {
+      "source": "/multi-step-automations/work-with-files",
+      "destination": "/developers/browser-automations/work-with-files"
+    },
+    {
+      "source": "/multi-step-automations/handle-browsers",
+      "destination": "/developers/browser-automations/handle-browsers"
+    },
+    {
+      "source": "/multi-step-automations/build-a-workflow",
+      "destination": "/developers/browser-automations/overview"
+    },
+    {
+      "source": "/multi-step-automations/workflow-blocks-reference",
+      "destination": "/developers/browser-automations/actions-reference"
+    },
+    {
+      "source": "/multi-step-automations/file-operations",
+      "destination": "/developers/browser-automations/work-with-files"
+    },
+    {
+      "source": "/multi-step-automations/workflow-parameters",
+      "destination": "/cloud/building-workflows/add-parameters"
+    },
+    {
+      "source": "/multi-step-automations/scheduling-workflows",
+      "destination": "/cloud/building-workflows/scheduling"
+    },
+    {
+      "source": "/credentials/introduction",
+      "destination": "/cloud/managing-credentials/credentials-overview"
+    },
+    {
+      "source": "/credentials/passwords",
+      "destination": "/cloud/managing-credentials/password-credentials"
+    },
+    {
+      "source": "/credentials/credit-cards",
+      "destination": "/cloud/managing-credentials/credit-card-credentials"
+    },
+    {
+      "source": "/credentials/totp",
+      "destination": "/cloud/managing-credentials/totp-setup"
+    },
+    {
+      "source": "/credentials/bitwarden",
+      "destination": "/cloud/managing-credentials/external-providers"
+    },
+    {
+      "source": "/credentials/custom-credential-service",
+      "destination": "/cloud/managing-credentials/external-providers"
+    },
+    {
+      "source": "/browser-sessions/introduction",
+      "destination": "/developers/optimization/browser-sessions"
+    },
+    {
+      "source": "/browser-sessions/browser-profiles",
+      "destination": "/developers/optimization/browser-profiles"
+    },
+    {
+      "source": "/observability/overview",
+      "destination": "/developers/debugging/using-artifacts"
+    },
+    {
+      "source": "/integrations/make.com",
+      "destination": "/integrations/make"
+    },
+    {
+      "source": "/integrations/ollama-litellm",
+      "destination": "/integrations/local-llms"
+    },
+    {
+      "source": "/integrations/mcp-server",
+      "destination": "/developers/getting-started/mcp"
+    },
+    {
+      "source": "/home/integrations/mcp-server",
+      "destination": "/developers/getting-started/mcp"
+    },
+    {
+      "source": "/integrations/mcp",
+      "destination": "/developers/getting-started/mcp"
+    },
+    {
+      "source": "/going-to-production/mcp",
+      "destination": "/developers/getting-started/mcp"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/run-task",
+      "destination": "/api-reference/agent/run-a-task"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/get-run",
+      "destination": "/api-reference/agent/get-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/cancel-run",
+      "destination": "/api-reference/agent/cancel-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/retry-run-webhook",
+      "destination": "/api-reference/agent/retry-run-webhook"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/login",
+      "destination": "/api-reference/agent/login-task"
+    },
+    {
+      "source": "/api-reference/api-reference/agent/get-run-timeline",
+      "destination": "/api-reference/agent/get-run-timeline"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/get-workflows",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/create-workflow",
+      "destination": "/api-reference/workflows/create-a-new-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/get-workflow",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/get-workflow-versions",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/update-workflow",
+      "destination": "/api-reference/workflows/update-a-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflows/delete-workflow",
+      "destination": "/api-reference/workflows/delete-a-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/run-workflow",
+      "destination": "/api-reference/workflows/run-a-workflow"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/get-workflow-runs",
+      "destination": "/api-reference/workflows/get-workflows"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/get-run",
+      "destination": "/api-reference/agent/get-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/cancel-run",
+      "destination": "/api-reference/agent/cancel-a-run-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/retry-run-webhook",
+      "destination": "/api-reference/agent/retry-run-webhook"
+    },
+    {
+      "source": "/api-reference/api-reference/workflow-runs/get-run-timeline",
+      "destination": "/api-reference/agent/get-run-timeline"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/create-browser-session",
+      "destination": "/api-reference/browser-sessions/create-a-session"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/get-browser-session",
+      "destination": "/api-reference/browser-sessions/get-a-session"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/close-browser-session",
+      "destination": "/api-reference/browser-sessions/close-a-session"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-sessions/get-browser-sessions",
+      "destination": "/api-reference/browser-sessions/get-active-browser-sessions"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/create-browser-profile",
+      "destination": "/api-reference/browser-profiles/create-a-browser-profile"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/list-browser-profiles",
+      "destination": "/api-reference/browser-profiles/list-browser-profiles"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/get-browser-profile",
+      "destination": "/api-reference/browser-profiles/get-browser-profile"
+    },
+    {
+      "source": "/api-reference/api-reference/browser-profiles/delete-browser-profile",
+      "destination": "/api-reference/browser-profiles/delete-browser-profile"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/create-credential",
+      "destination": "/api-reference/credentials/create-credential"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/get-credential",
+      "destination": "/api-reference/credentials/get-credential-by-id"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/update-credential",
+      "destination": "/api-reference/credentials/create-credential"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/delete-credential",
+      "destination": "/api-reference/credentials/delete-credential"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/get-credentials",
+      "destination": "/api-reference/credentials/get-all-credentials"
+    },
+    {
+      "source": "/api-reference/api-reference/credentials/send-totp-code",
+      "destination": "/api-reference/credentials/send-totp-code"
+    },
+    {
+      "source": "/api-reference/api-reference/artifacts/get-run-artifacts",
+      "destination": "/api-reference/artifacts/get-artifacts-for-a-run"
+    },
+    {
+      "source": "/api-reference/api-reference/artifacts/get-artifact-content-v-1-artifacts-artifact-id-content-get",
+      "destination": "/api-reference/artifacts/get-an-artifact"
+    },
+    {
+      "source": "/api-reference/api-reference/files/upload-file",
+      "destination": "/api-reference/files/upload-file"
+    },
+    {
+      "source": "/getting-started/:slug*",
+      "destination": "/developers/getting-started/:slug*"
+    },
+    {
+      "source": "/credentials/:slug*",
+      "destination": "/developers/credentials/:slug*"
+    },
+    {
+      "source": "/debugging/:slug*",
+      "destination": "/developers/debugging/:slug*"
+    },
+    {
+      "source": "/going-to-production/:slug*",
+      "destination": "/developers/going-to-production/:slug*"
+    },
+    {
+      "source": "/optimization/:slug*",
+      "destination": "/developers/optimization/:slug*"
+    },
+    {
+      "source": "/self-hosted/:slug*",
+      "destination": "/developers/self-hosted/:slug*"
+    },
+    {
+      "source": "/features/:slug*",
+      "destination": "/developers/features/:slug*"
+    },
+    {
+      "source": "/browser-automations/:slug*",
+      "destination": "/developers/browser-automations/:slug*"
+    }
+  ]
 }

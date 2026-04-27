@@ -1,6 +1,12 @@
 import { Textarea } from "@/components/ui/textarea";
-import type { ChangeEventHandler, HTMLAttributes } from "react";
-import { forwardRef, useRef, useCallback, useLayoutEffect } from "react";
+import {
+  type ChangeEventHandler,
+  type HTMLAttributes,
+  forwardRef,
+  useRef,
+  useCallback,
+  useLayoutEffect,
+} from "react";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -8,6 +14,7 @@ type Props = {
   onChange?: ChangeEventHandler<HTMLTextAreaElement>;
   className?: string;
   readOnly?: boolean;
+  disabled?: boolean;
   placeholder?: string;
   onClick?: React.MouseEventHandler<HTMLTextAreaElement>;
   onKeyUp?: React.KeyboardEventHandler<HTMLTextAreaElement>;
@@ -21,6 +28,7 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
       onChange,
       className,
       readOnly,
+      disabled,
       placeholder,
       onClick,
       onKeyUp,
@@ -70,6 +78,7 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
         value={value}
         onChange={onChange}
         readOnly={readOnly}
+        disabled={disabled}
         placeholder={placeholder}
         onClick={onClick}
         onKeyUp={onKeyUp}

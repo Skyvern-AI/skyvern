@@ -1,12 +1,42 @@
 import logging
 import platform
+from pathlib import Path
 from typing import Any
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
 from skyvern.utils.env_paths import resolve_backend_env_path
+
+
+def _default_database_string() -> str:
+    """Return the default DATABASE_STRING.
+
+    Uses a SQLite file at ~/.skyvern/data.db so that ``skyvern run server``
+    works out of the box without Docker or Postgres.  Users who set
+    DATABASE_STRING in .env or the environment get Postgres automatically
+    (pydantic-settings reads env before the default_factory runs).
+
+    This is a pure string computation — no filesystem side effects.
+    The parent directory is created by _ensure_sqlite_dir() at engine
+    build time (agent_db.py) or server bootstrap time (api_app.py).
+    """
+    db_path = Path.home() / ".skyvern" / "data.db"
+    return f"sqlite+aiosqlite:///{db_path}"
+
+
+def _ensure_sqlite_dir(database_string: str) -> None:
+    """Create the parent directory for a file-backed SQLite database URL.
+
+    No-op for in-memory SQLite (`:memory:`) or non-SQLite URLs.
+    """
+    if not database_string.startswith("sqlite") or ":memory:" in database_string:
+        return
+    db_file = database_string.split("///", 1)[-1]
+    Path(db_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
 
 # NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
 # the process has changed dir to the desired project root by this time.
@@ -28,6 +58,9 @@ class Settings(BaseSettings):
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
+
+    # Script reviewer settings
+    SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -61,22 +94,27 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = (
-        "postgresql+asyncpg://skyvern@localhost/skyvern"
-        if platform.system() == "Windows"
-        else "postgresql+psycopg://skyvern@localhost/skyvern"
-    )
+    DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
+    DATABASE_POOL_SIZE: int = 5
+    DATABASE_POOL_MAX_OVERFLOW: int = 10
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
+    BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
+    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 5.0
+    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
+    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
+    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
+    # Per-environment canary; default off until we are confident.
+    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -101,10 +139,6 @@ class Settings(BaseSettings):
     # Shared Redis URL (used by any service that needs Redis)
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Notification registry settings ("local" or "redis")
-    NOTIFICATION_REGISTRY_TYPE: str = "local"
-    NOTIFICATION_REDIS_URL: str | None = None  # Deprecated: falls back to REDIS_URL
-
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
@@ -125,6 +159,11 @@ class Settings(BaseSettings):
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
+    ANALYTICS_TEST_ID: str | None = None
+    POSTHOG_PROJECT_API_KEY: str = "phc_bVT2ugnZhMHRWqMvSRHPdeTjaPxQqT3QSsI3r5FlQR5"
+    POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
+    MCP_POSTHOG_PROJECT_API_KEY: str | None = "phc_m4epBbGS1Hf4NPRFNpR4WQ9Ob6yGy6SLbQckBxp3n0P"
+    MCP_POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
 
     # email settings
     SMTP_HOST: str = "localhost"
@@ -135,10 +174,16 @@ class Settings(BaseSettings):
     # browser settings
     BROWSER_LOCALE: str | None = None  # "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
+    # Directory containing pre-built default browser profiles ({dir}/chrome/ and {dir}/chromium/).
+    # When set, used as the default profile source for new browser sessions.
+    # Cloud workers download S3 profiles here at startup; self-hosted users can point this at a
+    # local profile directory. Leave empty to use the in-repo template.
+    DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
@@ -159,6 +204,7 @@ class Settings(BaseSettings):
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     BITWARDEN_MAX_RETRIES: int = 2
+    BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
 
     # task generation settings
     PROMPT_CACHE_WINDOW_HOURS: int = 24
@@ -318,6 +364,13 @@ class Settings(BaseSettings):
     AZURE_GPT5_2_API_BASE: str | None = None
     AZURE_GPT5_2_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.4
+    ENABLE_AZURE_GPT5_4: bool = False
+    AZURE_GPT5_4_DEPLOYMENT: str = "gpt-5.4"
+    AZURE_GPT5_4_API_KEY: str | None = None
+    AZURE_GPT5_4_API_BASE: str | None = None
+    AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -400,6 +453,7 @@ class Settings(BaseSettings):
 
     SVG_MAX_LENGTH: int = 100000
     SVG_MAX_PARSING_ELEMENT_CNT: int = 3000
+    ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = True
@@ -420,6 +474,32 @@ class Settings(BaseSettings):
     PYLON_IDENTITY_VERIFICATION_SECRET: str | None = None
     """
     The secret used to sign the email/identity of the user.
+    """
+
+    ARTIFACT_CONTENT_HMAC_KEYRING: str | None = None
+    """
+    JSON keyring for HMAC-SHA256 signing of bundled-artifact content URLs.
+
+    When set, /artifacts/{id}/content URLs generated for bundled artifacts carry
+    expiry/kid/sig query parameters and the endpoint validates them without requiring
+    an org-level API key.
+
+    Format::
+
+        {
+          "current_kid": "2026-03-12-v1",
+          "keys": {
+            "2026-03-12-v1": {
+              "secret": "my-hmac-secret",
+              "created_at": "2026-03-12"
+            }
+          }
+        }
+
+    current_kid must be present in keys.
+
+    Key rotation: add the new key to keys and point current_kid at it; keep the
+    old key in keys until all URLs it signed have expired (12 h), then remove it.
     """
 
     # Debug Session Settings
@@ -465,20 +545,28 @@ class Settings(BaseSettings):
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
         """
-        mapping: dict[str, dict[str, str]] = {
-            "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-            "gemini-2.5-flash": {
-                "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                "label": "Gemini 2.5 Flash",
-            },
-            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3_PRO", "label": "Gemini 3 Pro (Latest)"},
-            "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-            "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
-            "gemini-2.5-flash-lite": {
-                "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-                "label": "Gemini 2.5 Flash Lite",
-            },
+        mapping: dict[str, dict[str, str]] = {}
+
+        # Gemini models: prefer Vertex when enabled, fall back to direct Gemini API
+        gemini_models = [
+            ("gemini-2.5-pro-preview-05-06", "VERTEX_GEMINI_2.5_PRO", "GEMINI_2.5_PRO", "Gemini 2.5 Pro"),
+            ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
+            ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
+            ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
+        ]
+        for model_name, vertex_key, gemini_key, label in gemini_models:
+            mapping[model_name] = {
+                "llm_key": vertex_key if self.ENABLE_VERTEX_AI else gemini_key,
+                "label": label,
+            }
+
+        # Gemini Flash Lite: Vertex-only (no direct Gemini API config exists)
+        mapping["gemini-2.5-flash-lite"] = {
+            "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+            "label": "Gemini 2.5 Flash Lite",
         }
+
+        mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 
         # GPT models: prefer Azure when enabled, fall back to OpenAI
         gpt_models = [
@@ -492,6 +580,7 @@ class Settings(BaseSettings):
                 "GPT 5 Mini",
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
+            ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
             ("azure/o3", self.ENABLE_AZURE_O3, "AZURE_OPENAI_O3", "OPENAI_O3", "GPT O3"),
         ]
         for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:
@@ -521,6 +610,26 @@ class Settings(BaseSettings):
             "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
             "label": "Anthropic Claude 4.5 Haiku",
         }
+
+        # Anthropic Claude 4.5 Sonnet & Opus
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-sonnet-4-5-20250929"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.5 Sonnet",
+            }
+            mapping["claude-opus-4-5-20251101"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.5 Opus",
+            }
+        else:
+            mapping["claude-sonnet-4-5-20250929"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.5_SONNET",
+                "label": "Anthropic Claude 4.5 Sonnet",
+            }
+            mapping["claude-opus-4-5-20251101"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.5_OPUS",
+                "label": "Anthropic Claude 4.5 Opus",
+            }
 
         # Anthropic Claude 4.6 Opus: prefer Bedrock when enabled, fall back to direct API
         if self.ENABLE_BEDROCK_ANTHROPIC:
@@ -558,6 +667,9 @@ class Settings(BaseSettings):
             "for compatibility with the Proactor event loop policy."
         )
         object.__setattr__(self, "DATABASE_STRING", updated_string)
+
+    def is_sqlite(self) -> bool:
+        return self.DATABASE_STRING.startswith("sqlite")
 
     def is_cloud_environment(self) -> bool:
         """

@@ -38,6 +38,21 @@ def azure_storage() -> AzureStorageForTests:
     return AzureStorageForTests(container=TEST_CONTAINER)
 
 
+@pytest.fixture(autouse=True)
+def mock_browser_session_download_artifact_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub out the DB-side artifact-row insert for browser-session downloads.
+
+    Mirrors the s3 storage test fixture — see SKY-8861 follow-up. Patches
+    the module-level ``app`` reference in ``azure.py`` because the forge
+    app isn't initialized in these storage-only tests.
+    """
+    import skyvern.forge.sdk.artifact.storage.azure as azure_module
+
+    fake_app = MagicMock()
+    fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
+    monkeypatch.setattr(azure_module, "app", fake_app)
+
+
 @pytest.mark.asyncio
 class TestAzureStorageBrowserSessionFiles:
     """Test AzureStorage browser session file methods."""
@@ -142,27 +157,74 @@ class TestAzureStorageBrowserSessionFiles:
 
         assert exists is False
 
-    async def test_download_uploaded_file(self, azure_storage: AzureStorageForTests) -> None:
-        """Test downloading an uploaded file."""
+    async def test_assert_managed_file_access_accepts_org_scoped_uploads(
+        self, azure_storage: AzureStorageForTests
+    ) -> None:
+        legacy_uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/file.pdf"
+        )
+        downloads_uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/"
+            f"downloads/{settings.ENV}/{TEST_ORGANIZATION_ID}/wr_123/file.pdf"
+        )
+
+        azure_storage.assert_managed_file_access(legacy_uri, TEST_ORGANIZATION_ID)
+        azure_storage.assert_managed_file_access(downloads_uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_accepts_artifact_container(
+        self, azure_storage: AzureStorageForTests
+    ) -> None:
+        artifact_uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/"
+            "workflow_runs/wr_123/wrb_456/2026-03-23T17:57:58.370827_a_789_pdf.pdf"
+        )
+        azure_storage.assert_managed_file_access(artifact_uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org(self, azure_storage: AzureStorageForTests) -> None:
+        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_other/file.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            azure_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org_artifact_container(
+        self, azure_storage: AzureStorageForTests
+    ) -> None:
+        uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/o_other/"
+            "workflow_runs/wr_123/wrb_456/artifact.pdf"
+        )
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            azure_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_download_managed_file(self, azure_storage: AzureStorageForTests) -> None:
+        """Test downloading a managed file."""
         test_data = b"uploaded file content"
         azure_storage.async_client.download_file.return_value = test_data
-        uri = f"azure://{TEST_CONTAINER}/uploads/file.pdf"
+        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/file.pdf"
 
-        downloaded = await azure_storage.download_uploaded_file(uri)
+        downloaded = await azure_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
 
         assert downloaded == test_data
         azure_storage.async_client.download_file.assert_called_once_with(uri, log_exception=False)
 
-    async def test_download_uploaded_file_returns_none(self, azure_storage: AzureStorageForTests) -> None:
-        """Test downloading a non-existent file returns None."""
+    async def test_download_managed_file_returns_none(self, azure_storage: AzureStorageForTests) -> None:
+        """Test downloading a non-existent managed file returns None."""
         azure_storage.async_client.download_file.return_value = None
-        uri = f"azure://{TEST_CONTAINER}/nonexistent/file.txt"
+        uri = (
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/"
+            "nonexistent/file.txt"
+        )
 
-        downloaded = await azure_storage.download_uploaded_file(uri)
+        downloaded = await azure_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
 
         assert downloaded is None
 
-    def test_storage_type_property(self, azure_storage: AzureStorageForTests) -> None:
+    async def test_download_managed_file_rejects_other_org(self, azure_storage: AzureStorageForTests) -> None:
+        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_other/file.pdf"
+
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await azure_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+
+    async def test_storage_type_property(self, azure_storage: AzureStorageForTests) -> None:
         """Test storage_type returns 'azure'."""
         assert azure_storage.storage_type == "azure"
 

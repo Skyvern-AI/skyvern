@@ -5,6 +5,7 @@
 log.txt
 log-ingestion.txt
 logs
+log
 *.log
 current.json
 
@@ -160,6 +161,7 @@ ig_*
 .idea/
 
 # Skyvern ignores
+browser_sessions/
 videos/
 skyvern/artifacts/
 artifacts/

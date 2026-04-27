@@ -9,6 +9,12 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   WorkflowEditorParameterType,
   WorkflowEditorParameterTypes,
 } from "../../types/workflowTypes";
@@ -119,18 +125,27 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                 return (
                   <div
                     key={parameter.key}
-                    className="flex items-center justify-between gap-2 rounded-md bg-slate-elevation1 px-3 py-2"
+                    className="flex items-center justify-between gap-2 overflow-hidden rounded-md bg-slate-elevation1 px-3 py-2"
                   >
                     <div className="flex min-w-0 items-center gap-4">
-                      <span className="truncate text-sm" title={parameter.key}>
-                        {parameter.key}
-                      </span>
+                      <TooltipProvider delayDuration={300}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="min-w-0 max-w-[12rem] truncate text-sm">
+                              {parameter.key}
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            {parameter.key}
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
                       {parameter.parameterType === "workflow" ? (
-                        <span className="text-sm text-slate-400">
+                        <span className="shrink-0 text-sm text-slate-400">
                           {getLabelForWorkflowParameterType(parameter.dataType)}
                         </span>
                       ) : (
-                        <span className="text-sm text-slate-400">
+                        <span className="shrink-0 text-sm text-slate-400">
                           {parameter.parameterType === "onepassword" ||
                           parameter.parameterType === "secret" ||
                           parameter.parameterType === "creditCardData"
@@ -139,7 +154,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex shrink-0 items-center gap-2">
                       <MixerVerticalIcon
                         className="cursor-pointer"
                         onClick={() => {
@@ -159,6 +174,14 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                       <button
                         type="button"
                         onClick={() => {
+                          const affected = getAffectedBlocks(
+                            nodes,
+                            parameter.key,
+                          );
+                          if (affected.length === 0) {
+                            handleDeleteParameter(parameter.key);
+                            return;
+                          }
                           setDeleteDialogState({
                             open: true,
                             parameterKey: parameter.key,

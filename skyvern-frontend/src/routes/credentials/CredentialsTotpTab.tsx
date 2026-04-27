@@ -24,21 +24,11 @@ import {
 import { Badge } from "@/components/ui/badge";
 import type { OtpType, TotpCode } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 
 type OtpTypeFilter = "all" | OtpType;
 
 const LIMIT_OPTIONS = [25, 50, 100] as const;
-
-function formatDateTime(value: string | null): string {
-  if (!value) {
-    return "—";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  return date.toLocaleString();
-}
 
 function renderCodeContent(code: TotpCode): string {
   if (!code.code) {
@@ -230,11 +220,23 @@ function CredentialsTotpTab() {
                       <TableCell className="text-xs">
                         {code.workflow_run_id ?? "—"}
                       </TableCell>
-                      <TableCell className="text-xs">
-                        {formatDateTime(code.created_at)}
+                      <TableCell
+                        className="text-xs"
+                        title={basicTimeFormat(code.created_at)}
+                      >
+                        {basicLocalTimeFormat(code.created_at)}
                       </TableCell>
-                      <TableCell className="text-xs">
-                        {formatDateTime(code.expired_at)}
+                      <TableCell
+                        className="text-xs"
+                        title={
+                          code.expired_at
+                            ? basicTimeFormat(code.expired_at)
+                            : undefined
+                        }
+                      >
+                        {code.expired_at
+                          ? basicLocalTimeFormat(code.expired_at)
+                          : "—"}
                       </TableCell>
                     </TableRow>
                   ))}

@@ -19,6 +19,7 @@ interface BlockExecutionOptionsProps {
     nextLoopOnFailure?: boolean;
     includeActionHistoryInVerification?: boolean;
   };
+  hideTopSeparator?: boolean;
 }
 
 export function BlockExecutionOptions({
@@ -36,6 +37,7 @@ export function BlockExecutionOptions({
     nextLoopOnFailure: true,
     includeActionHistoryInVerification: false,
   },
+  hideTopSeparator = false,
 }: BlockExecutionOptionsProps) {
   const showContinueOnFailure = showOptions.continueOnFailure ?? true;
   const showNextLoopOnFailure = showOptions.nextLoopOnFailure ?? true;
@@ -44,7 +46,7 @@ export function BlockExecutionOptions({
 
   return (
     <>
-      <Separator />
+      {!hideTopSeparator && <Separator />}
       {showIncludeActionHistory &&
         onIncludeActionHistoryInVerificationChange && (
           <div className="flex items-center justify-between">

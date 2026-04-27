@@ -23,7 +23,9 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Determine Git credentials
         id: git-creds
         run: |
@@ -57,6 +59,26 @@ jobs:
               echo "GH_PAT=${{ secrets.CELAL_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=celal@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=celalzamanoglu" >> $GITHUB_OUTPUT
+              ;;
+            AronPerez)
+              echo "GH_PAT=${{ secrets.AARON_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=aaron@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=AronPerez" >> $GITHUB_OUTPUT
+              ;;
+            andrewneilson)
+              echo "GH_PAT=${{ secrets.ANDREW_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=andrew@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=andrewneilson" >> $GITHUB_OUTPUT
+              ;;
+            claude\[bot\])
+              echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=209825114+claude[bot]@users.noreply.github.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=claude[bot]" >> $GITHUB_OUTPUT
+              ;;
+            copilot-swe-agent\[bot\])
+              echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=198982749+copilot-swe-agent[bot]@users.noreply.github.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=copilot-swe-agent[bot]" >> $GITHUB_OUTPUT
               ;;
             *)
               echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
@@ -108,7 +130,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Run GitHub File Sync
         id: file-sync
-        uses: Skyvern-AI/repo-file-sync-action@main
+        uses: Skyvern-AI/repo-file-sync-action@590c4ddbe1d7b5c4ca1e4b4edc85c7f919b6c26a # main
         with:
           GH_PAT: ${{ steps.git-creds.outputs.GH_PAT }}
           GIT_EMAIL: ${{ steps.git-creds.outputs.GIT_EMAIL }}
@@ -124,11 +146,15 @@ jobs:
         if: >
           steps.check-migrations.outputs.has_migrations == 'true' && steps.file-sync.outputs.pull_request_urls
 
-        uses: actions/github-script@v6
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          PR_URLS_RAW: ${{ steps.file-sync.outputs.pull_request_urls }}
+          SOURCE_PR_URL: ${{ steps.pr_details.outputs.PR_URL }}
         with:
           github-token: ${{ steps.git-creds.outputs.GH_PAT }}
           script: |
-            const urlsRaw = `${{ steps.file-sync.outputs.pull_request_urls }}`;
+            const urlsRaw = process.env.PR_URLS_RAW;
+            const sourcePrUrl = process.env.SOURCE_PR_URL;
             let urls;
             try {
               urls = JSON.parse(urlsRaw);
@@ -151,7 +177,7 @@ jobs:
                     '',
                     'Please check if corresponding migrations need to be created in the cloud repo.',
                     '',
-                    `Source PR: ${{ steps.pr_details.outputs.PR_URL }}`
+                    `Source PR: ${sourcePrUrl}`
                   ].join('\n')
                 });
               }

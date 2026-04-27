@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import uuid
 
@@ -21,12 +22,8 @@ from .mcp import setup_local_organization, setup_mcp
 
 
 def init_env(
-    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-    database_string: str = typer.Option(
-        "",
-        "--database-string",
-        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
-    ),
+    no_postgres: bool = False,
+    database_string: str = "",
 ) -> bool:
     """Interactive initialization command for Skyvern."""
     console.print(
@@ -138,6 +135,14 @@ def init_env(
                     return False
             update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
+        console.print(
+            "\n[bold yellow]Tip:[/bold yellow] Want Skyvern Cloud to use your local browser "
+            "(with your existing cookies, logins, and extensions)?"
+        )
+        console.print("  Run: [reverse green] skyvern browser serve --tunnel [/reverse green]")
+        console.print("  This starts Chrome on your machine and creates a tunnel so Skyvern Cloud can control it.")
+        console.print("  Learn more: [link]https://www.skyvern.com/docs/optimization/browser-tunneling[/link]")
+
     analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
     analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
@@ -145,8 +150,16 @@ def init_env(
         update_or_add_env_var("SKYVERN_API_KEY", api_key)
     console.print(f"✅ [green]{resolve_backend_env_path()} file has been initialized.[/green]")
 
+    # Retrieve browser config for MCP setup (set during local init)
+    _mcp_browser_type = os.environ.get("BROWSER_TYPE") if run_local else None
+    _mcp_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if run_local else None
+
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
-        setup_mcp()
+        setup_mcp(
+            local=run_local,
+            browser_type=_mcp_browser_type,
+            browser_remote_debugging_url=_mcp_browser_url,
+        )
 
         if not run_local:
             console.print(
@@ -179,6 +192,40 @@ def init_env(
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
 
     return run_local
+
+
+def init_app_factory() -> typer.Typer:
+    """Build and return the ``init`` sub-app with its callback and browser sub-command.
+
+    This factory is called lazily by :class:`LazyTyperGroup` so that the heavy
+    imports in this module are deferred until the user actually runs
+    ``skyvern init``.
+    """
+    app = typer.Typer(
+        invoke_without_command=True,
+        help="Interactively configure Skyvern and its dependencies.",
+    )
+
+    @app.callback()
+    def _init_callback(
+        ctx: typer.Context,
+        no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+        database_string: str = typer.Option(
+            "",
+            "--database-string",
+            help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+        ),
+    ) -> None:
+        """Run full initialization when no subcommand is provided."""
+        if ctx.invoked_subcommand is None:
+            init_env(no_postgres=no_postgres, database_string=database_string)
+
+    @app.command(name="browser")
+    def _init_browser_command() -> None:
+        """Initialize only the browser configuration."""
+        init_browser()
+
+    return app
 
 
 def init_browser() -> None:

@@ -1,10 +1,20 @@
 ---
 title: CLI & Skills
 subtitle: Automate browsers and manage workflows from the command line
+description: Use the skyvern CLI to run browser automations, manage workflows, store credentials, and configure MCP servers from the terminal. Supports shell scripts, CI/CD pipelines, and one-off tasks.
 slug: going-to-production/cli
+keywords:
+  - CLI
+  - skyvern command
+  - terminal
+  - shell script
+  - CI/CD
+  - pipeline
+  - skills
+  - one-liner
 ---
 
-The `skyvern` CLI gives you direct access to browser automation, workflow management, credential storage, and more — all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
+The `skyvern` CLI gives you direct access to browser automation, workflow management, credential storage, and more, all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
 
 ## Install
 
@@ -83,6 +93,29 @@ skyvern browser login --url https://app.example.com --credential-id cred_xxx
 Every browser command supports `--json` for machine-readable output, and `--session` / `--cdp` to target a specific session. If omitted, the CLI uses the last active session automatically.
 </Tip>
 
+### Connect your local browser to Skyvern Cloud
+
+Expose your local Chrome to Skyvern Cloud so tasks can access localhost, internal tools, and your existing login sessions.
+
+```bash
+# Launch with ngrok tunnel and your Chrome profile's cookies/logins
+skyvern browser serve --tunnel --use-local-profile
+
+# Use a specific Chrome profile
+skyvern browser serve --tunnel --use-local-profile --chrome-profile-name "Profile 2"
+
+# Headless mode with JSON output (for scripting)
+skyvern browser serve --tunnel --headless --json
+```
+
+The `--use-local-profile` flag clones cookies and saved passwords from your Chrome profile into the served browser. Your original profile is never modified, and it works while Chrome is open.
+
+<Warning>
+Always pass `--api-key` when using `--tunnel`. Without it, anyone with the ngrok URL has full browser control.
+</Warning>
+
+See the [full guide](/developers/optimization/browser-tunneling) for all options, manual tunnel setup, and security details.
+
 ### Workflows
 
 ```bash
@@ -122,19 +155,29 @@ skyvern block validate --file block.json   # Validate a block definition
 Register Skyvern's MCP server with your AI coding tool in one command:
 
 ```bash
-skyvern setup claude-code        # Register with Claude Code (global)
-skyvern setup claude-code --project  # Register with Claude Code (project-level)
-skyvern setup claude-desktop     # Register with Claude Desktop
+skyvern setup claude-code             # Auto: .mcp.json in a project, ~/.claude.json otherwise
+skyvern setup claude-code --project   # Force project-local Claude Code config
+skyvern setup claude-code --global    # Force global Claude Code config
+skyvern setup claude                  # Register with Claude Desktop
 skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
-skyvern setup codex              # Register with Codex
+skyvern setup openclaw           # Register with OpenClaw
+skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
+skyvern mcp switch --dry-run          # Preview changes without writing files
+skyvern mcp profile list              # List saved switch sources
+skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
+
+For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the MCP connection fully local for localhost testing.
+
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, Codex, Hermes, and OpenClaw configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Other
 
 ```bash
 skyvern docs                     # Open documentation in your browser
 skyvern quickstart               # One-command setup + start
+skyvern init                     # Interactive setup without starting services
 skyvern init browser             # Initialize browser configuration only
 ```
 
@@ -154,7 +197,7 @@ The CLI and MCP server share the same underlying logic. The CLI is for humans an
 
 ## Skills
 
-Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools — they are documentation that an AI agent can load to learn the CLI and API.
+Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools; they are documentation that an AI agent can load to learn the CLI and API.
 
 ```bash
 skyvern skill list                  # List available skills
@@ -169,15 +212,58 @@ skyvern skill copy skyvern -o .     # Copy a single skill
 
 Skills are plain markdown files. You can load them into any AI coding tool that supports custom instructions:
 
-**Claude Code** — add the skill path as a custom instructions file or use `skyvern setup claude-code` which configures MCP (the richer integration path).
+**Claude Code**: the recommended local path is `skyvern quickstart` or `skyvern init`, then choose Claude Code during MCP setup. That writes `.mcp.json` and installs bundled skills like `/qa`. You can also run `skyvern setup claude-code` later if you are configuring MCP separately.
 
-**Codex** — copy the skill into your project's `.codex/skills/` directory:
+**Codex**: copy the skill into your project's `.codex/skills/` directory:
 
 ```bash
 skyvern skill copy skyvern -o .codex/skills/
 ```
 
-**Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
+**Hermes**: copy the skill to your active Hermes profile's skills directory. The skill needs Hermes-compatible frontmatter (`metadata.hermes.requires_tools` instead of `allowed-tools`):
+
+```bash
+# Create the skill directory
+mkdir -p ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation
+
+# Copy the skill body (you'll need to replace the frontmatter; see below)
+skyvern skill copy skyvern -o /tmp/skyvern-skill
+```
+
+Replace the frontmatter in the copied `SKILL.md` with:
+
+```yaml
+---
+name: skyvern-browser-automation
+description: "Browser automation via Skyvern: scrape pages, fill forms, extract data, run workflows."
+metadata:
+  hermes:
+    tags: [browser, automation, skyvern]
+    requires_tools: [terminal]
+---
+```
+
+Then move it into place: `cp /tmp/skyvern-skill/SKILL.md ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation/SKILL.md`
+
+Verify with `hermes skills list | grep skyvern`.
+
+<Tip>
+When both the Skyvern MCP server and the CLI skill are configured, Hermes prefers MCP tools over shelling out to the CLI, which is faster. The skill's judgment procedure (task classification, step ordering) works with either execution path.
+</Tip>
+
+**OpenClaw**: copy the skill into your OpenClaw workspace `skills/` directory. By default that workspace lives at `~/.openclaw/workspace/`, but if you've customized the workspace path, use that location instead.
+
+```bash
+mkdir -p ~/.openclaw/workspace/skills
+skyvern skill copy skyvern -o ~/.openclaw/workspace/skills/
+openclaw skills list | grep skyvern
+```
+
+<Tip>
+OpenClaw's MCP config provides the callable Skyvern tools; the workspace skill is optional guidance that teaches the agent when to use them.
+</Tip>
+
+**Any tool**: point your tool at the file path returned by `skyvern skill path skyvern`.
 
 </Accordion>
 
@@ -226,7 +312,7 @@ You can also pass it directly:
 skyvern credentials add --api-key YOUR_KEY
 ```
 
-Get an API key from [Settings](https://app.skyvern.com/settings/api-keys) in the Skyvern dashboard.
+Get an API key from [Settings](https://app.skyvern.com/settings/) in the Skyvern dashboard.
 </Accordion>
 
 <Accordion title="No active browser session">

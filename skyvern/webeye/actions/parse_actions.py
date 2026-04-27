@@ -4,6 +4,7 @@ from typing import Any, Dict, Match
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
+from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 
 from skyvern.constants import EXTRACT_ACTION_SCROLL_AMOUNT, SCROLL_AMOUNT_MULTIPLIER
@@ -14,6 +15,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
     extract_totp_from_navigation_inputs,
     poll_otp_value,
@@ -75,6 +77,13 @@ def parse_action(
     # When we start supporting click action, intention will be the reasoning for the click action (why take the action)
     intention = action["user_detail_query"] if "user_detail_query" in action else None
     response = action["user_detail_answer"] if "user_detail_answer" in action else None
+
+    # Inject the page URL into element data so the script reviewer can detect
+    # URL changes between consecutive actions (e.g. SSO redirects).
+    if skyvern_element_data is not None:
+        skyvern_element_data = {**skyvern_element_data, "page_url": scraped_page.url}
+    else:
+        skyvern_element_data = {"page_url": scraped_page.url}
 
     base_action_dict = {
         "element_id": element_id,
@@ -200,11 +209,13 @@ def parse_action(
         base_action_dict["skyvern_element_hash"] = None
         base_action_dict["skyvern_element_data"] = None
         # Support both "key" (single key from prompt) and "keys" (list, from code/legacy)
-        # Limited to navigation/submission keys to prevent misuse on regular form fields
+        # Navigation/submission keys are always allowed. Single digits and letters are allowed
+        # as a fallback for typing into hidden/overlay input components (e.g., 2FA digit boxes).
         allowed_keys = {"Enter", "Tab", "Escape", "ArrowDown", "ArrowUp"}
         key = action.get("key")
         if key:
-            if key not in allowed_keys:
+            is_single_char = len(key) == 1 and (key.isdigit() or key.isalpha())
+            if key not in allowed_keys and not is_single_char:
                 LOG.warning("KEYPRESS action has unsupported key, skipping action", key=key)
                 return NullAction(**base_action_dict)
             keys = [key]
@@ -235,10 +246,13 @@ def parse_action(
     raise UnsupportedActionType(action_type=action_type)
 
 
+@traced(name="skyvern.agent.parse_actions")
 def parse_actions(
     task: Task, step_id: str, step_order: int, scraped_page: ScrapedPage, json_response: list[Dict[str, Any]]
 ) -> list[Action]:
     actions: list[Action] = []
+    _span = otel_trace.get_current_span()
+    _span.set_attribute("raw_action_count", len(json_response))
     context = skyvern_context.ensure_context()
     totp_code = context.totp_codes.get(task.task_id)
     totp_code_required = bool(totp_code)
@@ -847,7 +861,7 @@ async def generate_cua_fallback_actions(
             assistant_message=assistant_message,
             reasoning=reasoning,
         )
-        await app.DATABASE.update_task(
+        await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             extracted_information=assistant_message,
@@ -923,7 +937,7 @@ async def generate_cua_fallback_actions(
         if not otp_value:
             otp_value = try_generate_totp_from_credential(task.workflow_run_id)
         # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
-        if not otp_value and task.organization_id:
+        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             LOG.info(
                 "Getting verification code for CUA",
                 task_id=task.task_id,
@@ -956,8 +970,8 @@ async def generate_cua_fallback_actions(
                 reasoning=reasoning,
                 intention=reasoning,
             )
-        # Terminate the task since OTP is necessary but wasn't found/generated
         else:
+            # Terminate the task since OTP is necessary but wasn't found/generated
             action = TerminateAction(
                 reasoning=reasoning,
                 intention=reasoning,
@@ -1129,12 +1143,8 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
         # Get arguments
         action_inputs = {}
         for kw in call.keywords:
-            if kw.arg and isinstance(kw.value, (ast.Constant, ast.Str)):
-                if isinstance(kw.value, ast.Constant):
-                    value = kw.value.value
-                else:  # ast.Str for older Python versions
-                    value = kw.value.s
-                action_inputs[kw.arg] = value
+            if kw.arg and isinstance(kw.value, ast.Constant):
+                action_inputs[kw.arg] = kw.value.value
 
         return {
             "action_type": func_name,

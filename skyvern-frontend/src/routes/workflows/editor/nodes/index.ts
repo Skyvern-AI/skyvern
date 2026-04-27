@@ -51,6 +51,10 @@ import { PrintPageNode } from "./PrintPageNode/types";
 import { PrintPageNode as PrintPageNodeComponent } from "./PrintPageNode/PrintPageNode";
 import { WorkflowTriggerNode } from "./WorkflowTriggerNode/types";
 import { WorkflowTriggerNode as WorkflowTriggerNodeComponent } from "./WorkflowTriggerNode/WorkflowTriggerNode";
+import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
+import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
+import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
+import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -78,7 +82,9 @@ export type WorkflowBlockNode =
   | URLNode
   | HttpRequestNode
   | PrintPageNode
-  | WorkflowTriggerNode;
+  | WorkflowTriggerNode
+  | GoogleSheetsReadNode
+  | GoogleSheetsWriteNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -117,4 +123,6 @@ export const nodeTypes = {
   http_request: memo(HttpRequestNodeComponent),
   printPage: memo(PrintPageNodeComponent),
   workflowTrigger: memo(WorkflowTriggerNodeComponent),
+  googleSheetsRead: memo(GoogleSheetsReadNodeComponent),
+  googleSheetsWrite: memo(GoogleSheetsWriteNodeComponent),
 } as const;

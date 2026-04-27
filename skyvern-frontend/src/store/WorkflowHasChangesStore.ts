@@ -3,19 +3,20 @@ import { useEffect } from "react";
 import { create } from "zustand";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import type {
-  BlockYAML,
-  ParameterYAML,
+import {
+  type BlockYAML,
+  type ParameterYAML,
+  WorkflowCreateYAMLRequest,
 } from "@/routes/workflows/types/workflowYamlTypes";
 import type {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
-import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 type SaveData = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
@@ -31,13 +32,16 @@ type WorkflowHasChangesStore = {
   saveIsPending: boolean;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
-  isInternalUpdate: boolean;
+  // Reference-counted flag: multiple concurrent internal updates won't
+  // accidentally clear each other. Gate on > 0 in consumers.
+  internalUpdateCount: number;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
-  setIsInternalUpdate: (isInternalUpdate: boolean) => void;
+  beginInternalUpdate: () => void;
+  endInternalUpdate: () => void;
 };
 
 interface WorkflowSaveOpts {
@@ -50,7 +54,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     saveIsPending: false,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
-    isInternalUpdate: false,
+    internalUpdateCount: 0,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -67,8 +71,13 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     setShowConfirmCodeCacheDeletion: (show: boolean) => {
       set({ showConfirmCodeCacheDeletion: show });
     },
-    setIsInternalUpdate: (isInternalUpdate: boolean) => {
-      set({ isInternalUpdate });
+    beginInternalUpdate: () => {
+      set((state) => ({ internalUpdateCount: state.internalUpdateCount + 1 }));
+    },
+    endInternalUpdate: () => {
+      set((state) => ({
+        internalUpdateCount: Math.max(0, state.internalUpdateCount - 1),
+      }));
     },
   };
 });
@@ -76,6 +85,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
 const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const {
     getSaveData,
     saidOkToCodeCacheDeletion,
@@ -142,18 +152,20 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        run_with:
-          saveData.settings.runWith === "code_v2"
-            ? "code"
-            : saveData.settings.runWith,
+        run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
-        adaptive_caching: saveData.settings.runWith === "code_v2",
+        code_version:
+          saveData.settings.runWith === "code"
+            ? (saveData.settings.codeVersion ?? 2)
+            : undefined,
         workflow_definition: {
           version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,
           blocks: saveData.blocks,
           finally_block_label: saveData.settings.finallyBlockLabel ?? undefined,
+          workflow_system_prompt:
+            saveData.settings.workflowSystemPrompt ?? undefined,
         },
         is_saved_task: saveData.workflow.is_saved_task,
         status: opts?.status ?? saveData.workflow.status,
@@ -184,6 +196,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       if (!saveData) {
         return;
       }
+
+      postHog.capture("builder.workflow.saved", {
+        org_id: saveData.workflow.organization_id,
+        workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        block_count: saveData.blocks.length,
+        block_types: saveData.blocks.map((b) => b.block_type),
+      });
 
       toast({
         title: "Changes saved",
@@ -238,7 +257,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             const loc = err.loc
               ?.filter((part) => part !== "body" && part !== "__root__")
               .join(" -> ");
-            return loc ? `${loc}: ${err.msg}` : err.msg ?? "Unknown error";
+            return loc ? `${loc}: ${err.msg}` : (err.msg ?? "Unknown error");
           })
           .join("; ");
       } else {

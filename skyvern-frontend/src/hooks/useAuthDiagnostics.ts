@@ -4,7 +4,7 @@ import axios from "axios";
 import { getClient } from "@/api/AxiosClient";
 
 export type AuthStatusValue =
-  | "missing_env"
+  | "missing_api_key"
   | "invalid_format"
   | "invalid"
   | "expired"
@@ -13,6 +13,8 @@ export type AuthStatusValue =
 
 export type AuthDiagnosticsResponse = {
   status: AuthStatusValue;
+  detail?: string;
+  next_step?: string;
   fingerprint?: string;
   organization_id?: string;
   expires_at?: number;

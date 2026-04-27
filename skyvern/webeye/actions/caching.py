@@ -24,14 +24,14 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
     # V0: use the previous action plan if there is a completed task with the same url and navigation goal
     # get completed task with the same url and navigation goal
     # TODO(kerem): don't use step_order, get all the previous actions instead
-    cached_actions = await app.DATABASE.retrieve_action_plan(task=task)
+    cached_actions = await app.DATABASE.workflow_params.retrieve_action_plan(task=task)
     if not cached_actions:
         LOG.info("No cached actions found for the task, fallback to no-cache mode")
         return []
 
     # Get the existing actions for this task from the database. Then find the actions that are already executed by looking at
     # the source_action_id field for this task's actions.
-    previous_actions = await app.DATABASE.get_previous_actions_for_task(task_id=task.task_id)
+    previous_actions = await app.DATABASE.tasks.get_previous_actions_for_task(task_id=task.task_id)
 
     executed_cached_actions = []
     remaining_cached_actions = []

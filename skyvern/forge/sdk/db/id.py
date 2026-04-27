@@ -51,6 +51,7 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+PROXY_USAGE_PREFIX = "pxu"
 SCRIPT_FILE_PREFIX = "sf"
 SCRIPT_REVISION_PREFIX = "sr"
 SCRIPT_PREFIX = "s"
@@ -72,6 +73,7 @@ ORGANIZATION_BILLING_PREFIX = "ob"
 WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
+WORKFLOW_SCHEDULE_PREFIX = "wfs"
 
 
 def generate_workflow_id() -> str:
@@ -209,6 +211,11 @@ def generate_persistent_browser_session_id() -> str:
     return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
 
 
+def generate_proxy_usage_id() -> str:
+    int_id = generate_id()
+    return f"{PROXY_USAGE_PREFIX}_{int_id}"
+
+
 def generate_browser_profile_id() -> str:
     int_id = generate_id()
     return f"{BROWSER_PROFILE_PREFIX}_{int_id}"
@@ -284,6 +291,11 @@ def generate_script_fallback_episode_id() -> str:
     return f"{SCRIPT_FALLBACK_EPISODE_PREFIX}_{int_id}"
 
 
+def generate_workflow_schedule_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_SCHEDULE_PREFIX}_{int_id}"
+
+
 ############# Helper functions below ##############
 def generate_id() -> int:
     """
@@ -344,4 +356,4 @@ def _get_worker_hash() -> int:
 
 def _generate_worker_hash() -> int:
     worker_identity = f"{platform.node()}:{os.getpid()}"
-    return int(hashlib.md5(worker_identity.encode()).hexdigest()[-15:], 16)
+    return int(hashlib.md5(worker_identity.encode(), usedforsecurity=False).hexdigest()[-15:], 16)

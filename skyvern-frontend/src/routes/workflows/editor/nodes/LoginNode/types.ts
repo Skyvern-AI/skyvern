@@ -39,6 +39,7 @@ export const loginNodeDefaultData: LoginNodeData = {
   terminateCriterion: "",
   engine: RunEngine.SkyvernV1,
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isLoginNode(node: Node): node is LoginNode {

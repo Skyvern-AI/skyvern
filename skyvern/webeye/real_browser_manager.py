@@ -15,6 +15,7 @@ from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.video_utils import finalize_webm
 
 LOG = structlog.get_logger()
 
@@ -61,6 +62,9 @@ class RealBrowserManager(BrowserManager):
             browser_artifacts=browser_artifacts,
             browser_cleanup=browser_cleanup,
         )
+
+    def evict_page(self, page_id: str) -> None:
+        self.pages.pop(page_id, None)
 
     def get_for_task(self, task_id: str, workflow_run_id: str | None = None) -> BrowserState | None:
         if task_id in self.pages:
@@ -276,6 +280,7 @@ class RealBrowserManager(BrowserManager):
         task_id: str = "",
         workflow_id: str = "",
         workflow_run_id: str = "",
+        finalize: bool = True,
     ) -> list[VideoArtifact]:
         if len(browser_state.browser_artifacts.video_artifacts) == 0:
             LOG.warning(
@@ -289,8 +294,15 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                with open(path, "rb") as f:
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                if finalize:
+                    # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
+                    # even when browser_context.close() was killed mid-finalization.
+                    browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
+                else:
+                    # Per-step snapshot while recording is still open — skip ffmpeg: the file is
+                    # partial, so remux would either fail or be thrown away by the final pass.
+                    with open(path, "rb") as f:
+                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
             else:
                 LOG.debug(
                     "Video path not found",
@@ -387,9 +399,22 @@ class RealBrowserManager(BrowserManager):
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
         organization_id: str | None = None,
+        child_workflow_run_ids: list[str] | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
-        browser_state_to_close = self.pages.pop(workflow_run_id, None)
+        browser_state_to_close = self.pages.get(workflow_run_id)
+
+        # Pop child workflow_run entries first — these are orphaned because child
+        # workflows skip clean_up_workflow. Must happen before the shared check
+        # so the task loop can correctly detect when the browser is no longer shared.
+        if child_workflow_run_ids:
+            for child_id in child_workflow_run_ids:
+                self.pages.pop(child_id, None)
+
+        from skyvern.forge.sdk.routes.streaming.registries import set_deferred_close_params, stream_ref_active
+
+        streams_active = stream_ref_active(workflow_run_id)
+
         if browser_state_to_close:
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
@@ -414,10 +439,21 @@ class RealBrowserManager(BrowserManager):
                 await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
-            await browser_state_to_close.close(close_browser_on_completion=effective_close)
+            if streams_active:
+                # Defer close until the last stream disconnects
+                LOG.info(
+                    "Deferring browser close — active CDP streams",
+                    workflow_run_id=workflow_run_id,
+                )
+                set_deferred_close_params(workflow_run_id, close_browser_on_completion)
+            else:
+                await browser_state_to_close.close(close_browser_on_completion=effective_close)
+
+        if not streams_active:
+            self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
-            if task_browser_state is None:
+            if task_browser_state is None or streams_active:
                 continue
             # Same shared-state check for task-level entries
             shared = any(bs is task_browser_state for bs in self.pages.values())

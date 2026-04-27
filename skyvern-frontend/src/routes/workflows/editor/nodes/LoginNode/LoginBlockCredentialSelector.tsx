@@ -2,6 +2,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -9,6 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import CloudContext from "@/store/CloudContext";
 import { useContext, useMemo } from "react";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
@@ -35,6 +37,10 @@ type Props = {
   onUrlAutoFill?: (url: string) => void;
   /** Current URL value of the login block — skip auto-fill if already set */
   currentUrl?: string;
+  /** Called when a credential with a totp_identifier is selected to auto-fill the 2FA identifier */
+  onTotpIdentifierAutoFill?: (totpIdentifier: string) => void;
+  /** Current totp_identifier value — skip auto-fill if already set */
+  currentTotpIdentifier?: string;
 };
 
 // Function to generate a unique credential parameter key
@@ -61,6 +67,8 @@ function LoginBlockCredentialSelector({
   onChange,
   onUrlAutoFill,
   currentUrl,
+  onTotpIdentifierAutoFill,
+  currentTotpIdentifier,
 }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
@@ -68,13 +76,16 @@ function LoginBlockCredentialSelector({
     parameters: workflowParameters,
     setParameters: setWorkflowParameters,
   } = useWorkflowParametersStore();
+  const setHasChanges = useWorkflowHasChangesStore(
+    (state) => state.setHasChanges,
+  );
   const credentialParameters = workflowParameters.filter(
     (parameter) =>
       parameter.parameterType === "credential" ||
       parameter.parameterType === "onepassword",
   );
   const isCloud = useContext(CloudContext);
-  const { data: credentials = [], isFetching } = useCredentialsQuery({
+  const { data: credentials = [], isLoading } = useCredentialsQuery({
     enabled: isCloud,
     page_size: 100,
   });
@@ -120,7 +131,7 @@ function LoginBlockCredentialSelector({
     return !credentialIdsInVault.has(selectedCredentialId);
   }, [selectedCredentialId, credentialIdsInVault]);
 
-  if (isCloud && isFetching) {
+  if (isCloud && isLoading) {
     return <Skeleton className="h-8 w-full" />;
   }
 
@@ -130,6 +141,11 @@ function LoginBlockCredentialSelector({
     type: "credential" as const,
     hasBrowserProfile: !!credential.browser_profile_id,
     browserProfileUrl: credential.tested_url ?? null,
+    totpIdentifier:
+      credential.credential_type === "password" &&
+      "totp_identifier" in credential.credential
+        ? (credential.credential.totp_identifier ?? null)
+        : null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
@@ -159,7 +175,9 @@ function LoginBlockCredentialSelector({
     <>
       <Select
         key={value ?? "no-credential"}
-        value={isCredentialMissing ? undefined : selectedCredentialId ?? value}
+        value={
+          isCredentialMissing ? undefined : (selectedCredentialId ?? value)
+        }
         onValueChange={(newValue) => {
           if (newValue === "new") {
             setIsOpen(true);
@@ -238,6 +256,8 @@ function LoginBlockCredentialSelector({
           // This ensures workflowParameters is updated before the parent re-renders
           // with the new value, so selectedCredentialId computes correctly
           setWorkflowParameters(newParameters);
+          // Zustand mutation is invisible to the node-change listener, so the unsaved-changes blocker would miss this edit.
+          setHasChanges(true);
           onChange?.(parameterKeyToUse);
 
           // Auto-fill the login block URL from the credential's tested_url
@@ -248,6 +268,16 @@ function LoginBlockCredentialSelector({
             selectedCredential.browserProfileUrl
           ) {
             onUrlAutoFill?.(selectedCredential.browserProfileUrl);
+          }
+
+          // Auto-fill the 2FA identifier from the credential's totp_identifier
+          // when the field is empty.
+          if (
+            selectedCredential &&
+            !currentTotpIdentifier?.trim() &&
+            selectedCredential.totpIdentifier
+          ) {
+            onTotpIdentifierAutoFill?.(selectedCredential.totpIdentifier);
           }
         }}
       >
@@ -268,6 +298,13 @@ function LoginBlockCredentialSelector({
           )}
         </SelectTrigger>
         <SelectContent>
+          <SelectItem value="new">
+            <div className="flex items-center gap-2">
+              <PlusIcon className="size-4" />
+              <span>Add new credential</span>
+            </div>
+          </SelectItem>
+          {options.length > 0 && <SelectSeparator />}
           {options.map((option) => (
             <SelectItem key={option.value} value={option.value}>
               <div className="flex items-center gap-2">
@@ -287,12 +324,6 @@ function LoginBlockCredentialSelector({
               </div>
             </SelectItem>
           ))}
-          <SelectItem value="new">
-            <div className="flex items-center gap-2">
-              <PlusIcon className="size-4" />
-              <span>Add new credential</span>
-            </div>
-          </SelectItem>
         </SelectContent>
       </Select>
       <CredentialsModal
@@ -309,6 +340,7 @@ function LoginBlockCredentialSelector({
               key: newKey,
             },
           ]);
+          setHasChanges(true);
           onChange?.(newKey);
         }}
       />

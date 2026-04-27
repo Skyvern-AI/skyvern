@@ -1,5 +1,7 @@
-import { WorkflowBlockType } from "../../types/workflowTypes";
-import type { WorkflowModel } from "../../types/workflowTypes";
+import {
+  WorkflowBlockType,
+  type WorkflowModel,
+} from "../../types/workflowTypes";
 
 export type NodeBaseData = {
   debuggable: boolean;
@@ -10,6 +12,7 @@ export type NodeBaseData = {
   model: WorkflowModel | null;
   showCode?: boolean;
   comparisonColor?: string;
+  ignoreWorkflowSystemPrompt?: boolean;
   /**
    * Optional metadata used for conditional branches.
    * These values are only set on nodes that live within a conditional block.
@@ -68,4 +71,6 @@ export const workflowBlockTitle: {
   http_request: "HTTP Request",
   print_page: "Print Page",
   workflow_trigger: "Workflow Trigger",
+  google_sheets_read: "Google Sheets Read",
+  google_sheets_write: "Google Sheets Write",
 };

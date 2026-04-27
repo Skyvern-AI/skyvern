@@ -1,0 +1,48 @@
+---
+title: locator
+slug: sdk-reference/browser-automation/locator
+---
+
+Locate an element using a CSS/XPath selector, an AI prompt, or both. When called with a `prompt` parameter, returns an `AILocator` - a lazy Playwright `Locator` that resolves the element's position via AI on first use.
+
+```python
+# AI-powered: pass a natural-language prompt
+locator = page.locator(prompt="the submit button")
+await locator.click()
+
+# Full Playwright chaining works
+text = await page.locator(prompt="the error message").text_content()
+```
+
+<Note>
+When called with only a `selector` (no `prompt`), `page.locator(selector)` behaves exactly like the standard Playwright `page.locator(selector)` - no AI is involved.
+</Note>
+
+```python
+# Standard Playwright selector - no AI, identical to vanilla Playwright
+locator = page.locator("#submit-btn")
+await locator.click()
+
+# Combine both: use the selector first, fall back to AI if it fails
+locator = page.locator("#submit-btn", prompt="the submit button")
+await locator.click()
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` | No | CSS or XPath selector passed to Playwright's built-in `locator()`. |
+| `prompt` | `str` | No | Natural-language description of the element. When provided, returns an `AILocator` that resolves via AI. |
+| `ai` | `str` | No | Controls AI behavior. Default `"fallback"` tries the selector first, then AI. |
+| `**kwargs` | | No | Additional keyword arguments forwarded to Playwright's `locator()`. |
+
+Returns `Locator` - standard Playwright `Locator` when only a selector is given, or `AILocator` when a prompt is provided.
+
+### AILocator
+
+When `prompt` is provided, the returned `AILocator` supports all standard Playwright `Locator` methods:
+
+- **Actions:** `click()`, `fill()`, `type()`, `select_option()`, `check()`, `uncheck()`, `clear()`, `hover()`, `focus()`, `press()`
+- **Queries:** `text_content()`, `inner_text()`, `inner_html()`, `get_attribute()`, `input_value()`, `count()`
+- **State:** `is_visible()`, `is_hidden()`, `is_enabled()`, `is_disabled()`, `is_editable()`, `is_checked()`
+- **Chaining:** `first()`, `last()`, `nth()`, `filter()`, `locator()`, `get_by_text()`, `get_by_role()`, `get_by_label()`, `get_by_placeholder()`
+- **Utilities:** `wait_for()`, `screenshot()`, `playwright_locator` (access raw `Locator`)

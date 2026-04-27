@@ -5,9 +5,11 @@ import {
   CrossCircledIcon,
   CubeIcon,
   ExternalLinkIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { useShimmerText } from "./useShimmerText";
 
 import { Status } from "@/api/types";
 import {
@@ -15,6 +17,12 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -48,6 +56,7 @@ type Props = {
   onActionClick: (action: ActionItem) => void;
   onThoughtCardClick: (thought: ObserverThought) => void;
   finallyBlockLabel?: string | null;
+  workflowRunIsFinalized?: boolean;
 };
 
 type LoopIterationGroup = {
@@ -55,6 +64,30 @@ type LoopIterationGroup = {
   currentValue: string | null;
   items: Array<WorkflowRunTimelineItem>;
 };
+
+const blockElevationByDepth = [
+  "bg-slate-elevation3",
+  "bg-slate-elevation4",
+  "bg-slate-elevation5",
+];
+
+const cardElevationByDepth = [
+  "bg-slate-elevation4",
+  "bg-slate-elevation5",
+  "bg-slate-elevation5",
+];
+
+function getBlockElevation(depth: number): string {
+  return blockElevationByDepth[
+    Math.min(depth, blockElevationByDepth.length - 1)
+  ]!;
+}
+
+function getCardElevation(depth: number): string {
+  return cardElevationByDepth[
+    Math.min(depth, cardElevationByDepth.length - 1)
+  ]!;
+}
 
 function stringifyTimelineValue(value: unknown): string {
   if (value === null || value === undefined) {
@@ -84,17 +117,68 @@ function truncateValue(value: string, maxLength = 120): string {
   return `${collapsed.slice(0, maxLength - 3)}...`;
 }
 
+/**
+ * Renders a loop value with line-clamp-2.  Shows a tooltip with the full
+ * value only when the CSS clamp actually truncates the visible text.
+ */
+function LoopValueCode({
+  collapsed,
+  fullValue,
+}: {
+  collapsed: string;
+  fullValue: string;
+}) {
+  const codeRef = useRef<HTMLElement>(null);
+  const [isClamped, setIsClamped] = useState(false);
+
+  useEffect(() => {
+    const el = codeRef.current;
+    if (el) {
+      setIsClamped(el.scrollHeight > el.clientHeight + 1);
+    }
+  }, [collapsed]);
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      <Tooltip open={isClamped ? undefined : false}>
+        <TooltipTrigger asChild>
+          <code
+            ref={codeRef}
+            className="line-clamp-2 block min-w-0 break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300"
+          >
+            {collapsed}
+          </code>
+        </TooltipTrigger>
+        {isClamped && (
+          <TooltipContent
+            side="top"
+            className="max-w-xs break-all font-mono text-[11px]"
+          >
+            {fullValue}
+          </TooltipContent>
+        )}
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 function getLoopIterationGroups(
   items: Array<WorkflowRunTimelineItem>,
 ): Array<LoopIterationGroup> {
   const groupsByKey = new Map<string, LoopIterationGroup>();
+  const unknownItems: Array<WorkflowRunTimelineItem> = [];
 
+  // First pass: group items with known indexes, collect unknown items separately
   items.forEach((item) => {
     const currentIndex = isBlockItem(item) ? item.block.current_index : null;
     const currentValue = isBlockItem(item) ? item.block.current_value : null;
-    const groupKey =
-      currentIndex === null ? "unknown" : `index-${currentIndex}`;
 
+    if (currentIndex === null) {
+      unknownItems.push(item);
+      return;
+    }
+
+    const groupKey = `index-${currentIndex}`;
     if (!groupsByKey.has(groupKey)) {
       groupsByKey.set(groupKey, {
         index: currentIndex,
@@ -109,6 +193,33 @@ function getLoopIterationGroups(
     }
     group.items.push(item);
   });
+
+  // Second pass: merge unknown items into the highest-index group.
+  // During streaming, these are blocks whose current_index hasn't been
+  // populated yet — they belong to the currently-executing iteration.
+  if (unknownItems.length > 0) {
+    if (groupsByKey.size > 0) {
+      let maxIndex = -1;
+      let maxGroup: LoopIterationGroup | null = null;
+      for (const group of groupsByKey.values()) {
+        if (group.index !== null && group.index > maxIndex) {
+          maxIndex = group.index;
+          maxGroup = group;
+        }
+      }
+      if (maxGroup) {
+        unknownItems.forEach((item) => maxGroup!.items.push(item));
+      }
+    } else {
+      // No known groups exist yet — all items are unknown.
+      // The first iteration must be running.
+      groupsByKey.set("index-0", {
+        index: 0,
+        currentValue: null,
+        items: unknownItems,
+      });
+    }
+  }
 
   return Array.from(groupsByKey.values()).sort((left, right) => {
     if (left.index === null && right.index === null) {
@@ -176,6 +287,7 @@ type TimelineSubItemsProps = {
   onActionClick: (action: ActionItem) => void;
   onThoughtCardClick: (thought: ObserverThought) => void;
   finallyBlockLabel?: string | null;
+  workflowRunIsFinalized?: boolean;
 };
 
 function TimelineSubItems({
@@ -186,6 +298,7 @@ function TimelineSubItems({
   onActionClick,
   onThoughtCardClick,
   finallyBlockLabel,
+  workflowRunIsFinalized,
 }: TimelineSubItemsProps) {
   return (
     <div className="space-y-3">
@@ -202,6 +315,7 @@ function TimelineSubItems({
               onBlockItemClick={onBlockItemClick}
               onThoughtCardClick={onThoughtCardClick}
               finallyBlockLabel={finallyBlockLabel}
+              workflowRunIsFinalized={workflowRunIsFinalized}
             />
           );
         }
@@ -216,6 +330,7 @@ function TimelineSubItems({
               }
               onClick={onThoughtCardClick}
               thought={item.thought}
+              cardClassName={getCardElevation(depth)}
             />
           );
         }
@@ -233,23 +348,15 @@ function WorkflowRunTimelineBlockItem({
   onActionClick,
   onThoughtCardClick,
   finallyBlockLabel,
+  workflowRunIsFinalized = false,
 }: Props) {
   const actions = block.actions ?? [];
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
 
-  const hasActiveAction =
-    isAction(activeItem) &&
-    Boolean(
-      block.actions?.find(
-        (action) => action.action_id === activeItem.action_id,
-      ),
-    );
-  const isActiveBlock =
-    isWorkflowRunBlock(activeItem) &&
-    activeItem.workflow_run_block_id === block.workflow_run_block_id;
-
   const showDiagnosticLink =
-    isTaskVariantBlock(block) && (hasActiveAction || isActiveBlock);
+    isTaskVariantBlock(block) &&
+    block.task_id !== null &&
+    block.task_id !== undefined;
 
   const refCallback = useCallback((element: HTMLDivElement | null) => {
     if (
@@ -266,6 +373,9 @@ function WorkflowRunTimelineBlockItem({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const isRunning = block.status === Status.Running && !workflowRunIsFinalized;
+  const shimmerTitleRef = useShimmerText<HTMLSpanElement>(isRunning);
+  const shimmerLabelRef = useShimmerText<HTMLSpanElement>(isRunning);
   const showStatusIndicator = block.status !== null;
 
   const showSuccessIndicator =
@@ -353,16 +463,18 @@ function WorkflowRunTimelineBlockItem({
 
   return (
     <div
-      className={cn({
+      className={cn("min-w-0", {
         "ml-3 pl-3": depth > 0,
-        "border-l border-slate-700": depth === 1,
+        "border-l border-slate-700": depth > 0,
       })}
     >
       <div
+        data-slot="block-item"
         className={cn(
-          "cursor-pointer space-y-4 rounded border border-slate-600 p-4",
+          "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
+          getBlockElevation(depth),
           {
-            "border-slate-50":
+            "ring-white/30":
               isWorkflowRunBlock(activeItem) &&
               activeItem.workflow_run_block_id === block.workflow_run_block_id,
           },
@@ -373,333 +485,386 @@ function WorkflowRunTimelineBlockItem({
         }}
         ref={refCallback}
       >
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <div className="flex gap-3">
-              <div className="rounded bg-slate-elevation5 p-2">
-                <WorkflowBlockIcon
-                  workflowBlockType={block.block_type}
-                  className="size-6"
-                />
-              </div>
-
-              <div className="flex flex-col gap-1">
-                <span className="text-sm">
-                  {workflowBlockTitle[block.block_type]}
-                </span>
-                <span className="flex gap-2 text-xs text-slate-400">
-                  {block.label}
-                </span>
-                {isFinallyBlock && (
-                  <span className="w-fit rounded bg-amber-500 px-1.5 py-0.5 text-[10px] font-medium text-black">
-                    Execute on any outcome
-                  </span>
-                )}
-              </div>
-            </div>
-            <div className="flex gap-2">
-              {showFailureIndicator && (
-                <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
-                  <CrossCircledIcon className="size-4 text-destructive" />
-                </div>
-              )}
-              {showSuccessIndicator && (
-                <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
-                  <CheckCircledIcon className="size-4 text-success" />
-                </div>
-              )}
-              <div className="flex flex-col items-end gap-[1px]">
-                <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
-                  {showDiagnosticLink ? (
-                    <Link
-                      to={`/tasks/${block.task_id}/diagnostics`}
-                      onClick={(event) => event.stopPropagation()}
-                    >
-                      <div className="flex gap-1">
-                        <ExternalLinkIcon className="size-4" />
-                        <span className="text-xs">Diagnostics</span>
-                      </div>
-                    </Link>
-                  ) : (
-                    <>
-                      <CubeIcon className="size-4" />
-                      <span className="text-xs">Block</span>
-                    </>
-                  )}
-                </div>
-                {duration && showDuration && (
-                  <div className="pr-[5px] text-xs text-[#00ecff]">
-                    {duration}
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-          {block.description ? (
-            <div className="text-xs text-slate-400">{block.description}</div>
-          ) : null}
-          {isLoopBlock && (
-            <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
-              <div className="text-slate-300">
-                Iterable values:{" "}
-                <span className="font-medium text-slate-200">
-                  {loopValues.length}
-                </span>
-              </div>
-              {loopValues.length > 0 && (
-                <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
-                  {loopValues.map((value, index) => (
-                    <div key={index} className="text-slate-400">
-                      <span className="mr-1 text-slate-500">[{index}]</span>
-                      <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
-                        {truncateValue(stringifyTimelineValue(value), 120)}
-                      </code>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-          {block.block_type === "conditional" && block.executed_branch_id && (
-            <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
-              {hasEvaluations(block.output) && block.output.evaluations ? (
-                // New format: show all branch evaluations
-                <div className="space-y-2">
-                  {block.output.evaluations.map((evaluation, index) => (
-                    <div
-                      key={evaluation.branch_id || index}
-                      className={cn(
-                        "rounded border px-2 py-1.5",
-                        evaluation.is_matched
-                          ? "border-success/50 bg-success/10"
-                          : "border-slate-600 bg-slate-elevation3",
-                      )}
-                    >
-                      {evaluation.is_default ? (
-                        <div className="text-slate-300">
-                          <span className="font-medium">Default branch</span>
-                          {evaluation.is_matched && (
-                            <span className="ml-2 text-success">✓ Matched</span>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="space-y-1">
-                          <div className="text-slate-400">
-                            <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
-                              {evaluation.original_expression}
-                            </code>
-                          </div>
-                          {evaluation.rendered_expression &&
-                            evaluation.rendered_expression !==
-                              evaluation.original_expression && (
-                              <div className="text-slate-400">
-                                → rendered to{" "}
-                                <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
-                                  {evaluation.rendered_expression}
-                                </code>
-                              </div>
-                            )}
-                          <div className="flex items-center gap-2">
-                            <span className="text-slate-400">evaluated to</span>
-                            <span
-                              className={cn(
-                                "font-medium",
-                                evaluation.result
-                                  ? "text-success"
-                                  : "text-red-400",
-                              )}
-                            >
-                              {evaluation.result ? "True" : "False"}
-                            </span>
-                            {evaluation.is_matched && (
-                              <span className="text-success">✓ Matched</span>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                      {evaluation.is_matched && evaluation.next_block_label && (
-                        <div className="mt-1 text-slate-400">
-                          → Executing next block:{" "}
-                          <span className="font-medium text-slate-300">
-                            {evaluation.next_block_label}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                // Fallback: old format without evaluations array
-                <>
-                  {block.executed_branch_expression !== null &&
-                  block.executed_branch_expression !== undefined ? (
-                    <div className="text-slate-300">
-                      Condition{" "}
-                      <code className="rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
-                        {block.executed_branch_expression}
-                      </code>{" "}
-                      evaluated to{" "}
-                      <span className="font-medium text-success">True</span>
-                    </div>
-                  ) : (
-                    <div className="text-slate-300">
-                      No conditions matched, executing default branch
-                    </div>
-                  )}
-                  {block.executed_branch_next_block && (
-                    <div className="text-slate-400">
-                      → Executing next block:{" "}
-                      <span className="font-medium text-slate-300">
-                        {block.executed_branch_next_block}
-                      </span>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
-        </div>
-
-        {block.block_type === "human_interaction" && (
-          <WorkflowRunHumanInteraction workflowRunBlock={block} />
-        )}
-
-        {actions.map((action, index) => {
-          return (
-            <ActionCard
-              key={action.action_id}
-              action={action}
-              active={
-                isAction(activeItem) &&
-                activeItem.action_id === action.action_id
-              }
-              index={actions.length - index}
-              onClick={(event) => {
-                event.stopPropagation();
-                const actionItem: ActionItem = {
-                  block,
-                  action,
-                };
-                onActionClick(actionItem);
-              }}
-            />
-          );
-        })}
-
-        {hasNestedChildren && isLoopBlock && (
+        <div className="min-w-0 space-y-4 p-4">
           <div className="space-y-2">
-            {loopIterationGroups.map((group, groupIndex) => {
-              const loopValueFromIterable =
-                group.index !== null ? loopValues[group.index] ?? null : null;
-              const iterationNumber =
-                group.index !== null
-                  ? group.index + 1
-                  : loopIterationGroups.length - groupIndex;
-              const currentValuePreview = truncateValue(
-                stringifyTimelineValue(
-                  loopValueFromIterable ?? group.currentValue,
-                ),
-                140,
-              );
+            <div className="flex justify-between">
+              <div className="flex gap-3">
+                <div className="relative rounded bg-slate-800 p-2">
+                  <WorkflowBlockIcon
+                    workflowBlockType={block.block_type}
+                    className="size-6"
+                  />
+                  {isRunning && (
+                    <div className="absolute -bottom-1 -left-1 rounded-full bg-slate-elevation3 p-0.5">
+                      <ReloadIcon className="size-3 animate-spin text-slate-400" />
+                    </div>
+                  )}
+                </div>
 
-              return (
-                <Collapsible
-                  key={`${group.index ?? "unknown"}-${groupIndex}`}
-                  open={openLoopGroups.has(groupIndex)}
-                  onOpenChange={(open) => {
-                    setOpenLoopGroups((prev) => {
-                      const next = new Set(prev);
-                      if (open) {
-                        next.add(groupIndex);
-                      } else {
-                        next.delete(groupIndex);
-                      }
-                      return next;
-                    });
-                  }}
-                >
-                  <div className="rounded border border-slate-700 bg-slate-elevation4">
-                    <CollapsibleTrigger asChild>
-                      <button
-                        className="group flex w-full items-center justify-between gap-2 px-2 py-1 text-left"
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <div className="flex items-center gap-1.5">
-                          <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
-                          <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
-                        </div>
-                        <code className="max-w-[70%] truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
-                          current_value: {currentValuePreview}
-                        </code>
-                      </button>
-                    </CollapsibleTrigger>
-                  </div>
-                  <CollapsibleContent className="px-2 pb-2 pt-2">
-                    <TimelineSubItems
-                      items={group.items}
-                      activeItem={activeItem}
-                      depth={depth + 1}
-                      onActionClick={onActionClick}
-                      onBlockItemClick={onBlockItemClick}
-                      onThoughtCardClick={onThoughtCardClick}
-                      finallyBlockLabel={finallyBlockLabel}
-                    />
-                  </CollapsibleContent>
-                </Collapsible>
-              );
-            })}
-          </div>
-        )}
-
-        {hasNestedChildren && isConditionalBlock && (
-          <Collapsible open={childrenOpen} onOpenChange={setChildrenOpen}>
-            <div className="rounded border border-slate-700 bg-slate-elevation4 px-2 py-1.5">
-              <CollapsibleTrigger asChild>
-                <button
-                  className="flex w-full items-center justify-between gap-2 text-left"
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <div className="flex items-center gap-1.5 text-xs text-slate-200">
-                    {childrenOpen ? (
-                      <ChevronDownIcon className="size-4" />
-                    ) : (
-                      <ChevronRightIcon className="size-4" />
-                    )}
-                    <span>{`Executed branch blocks (${subItems.length})`}</span>
-                  </div>
-                  {block.executed_branch_next_block && (
-                    <span className="text-[11px] text-slate-400">
-                      next: {block.executed_branch_next_block}
+                <div className="flex flex-col gap-1">
+                  <span ref={shimmerTitleRef} className="text-sm">
+                    {workflowBlockTitle[block.block_type]}
+                  </span>
+                  <span
+                    ref={shimmerLabelRef}
+                    className="flex gap-2 text-xs text-slate-400"
+                  >
+                    {block.label}
+                  </span>
+                  {isFinallyBlock && (
+                    <span className="w-fit rounded bg-amber-500 px-1.5 py-0.5 text-[10px] font-medium text-black">
+                      Execute on any outcome
                     </span>
                   )}
-                </button>
-              </CollapsibleTrigger>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {showFailureIndicator && (
+                  <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
+                    <CrossCircledIcon className="size-4 text-destructive" />
+                  </div>
+                )}
+                {showSuccessIndicator && (
+                  <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
+                    <CheckCircledIcon className="size-4 text-success" />
+                  </div>
+                )}
+                <div className="flex flex-col items-end gap-[1px]">
+                  <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
+                    {showDiagnosticLink ? (
+                      <Link
+                        to={`/tasks/${block.task_id}/diagnostics`}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <div className="flex gap-1">
+                          <ExternalLinkIcon className="size-4" />
+                          <span className="text-xs">Diagnostics</span>
+                        </div>
+                      </Link>
+                    ) : (
+                      <>
+                        <CubeIcon className="size-4" />
+                        <span className="text-xs">Block</span>
+                      </>
+                    )}
+                  </div>
+                  {duration && showDuration && (
+                    <div className="pr-[5px] text-xs text-[#00ecff]">
+                      {duration}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
-            <CollapsibleContent className="space-y-2 pt-2">
-              <TimelineSubItems
-                items={subItems}
-                activeItem={activeItem}
-                depth={depth + 1}
-                onActionClick={onActionClick}
-                onBlockItemClick={onBlockItemClick}
-                onThoughtCardClick={onThoughtCardClick}
-                finallyBlockLabel={finallyBlockLabel}
-              />
-            </CollapsibleContent>
-          </Collapsible>
-        )}
+            {block.description ? (
+              <div className="break-words text-xs text-slate-400">
+                {block.description}
+              </div>
+            ) : null}
+            {isLoopBlock && (
+              <div className="min-w-0 space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
+                <div className="text-slate-300">
+                  Iterable values:{" "}
+                  <span className="font-medium text-slate-200">
+                    {loopValues.length}
+                  </span>
+                </div>
+                {loopValues.length > 0 && (
+                  <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
+                    {loopValues.map((value, index) => {
+                      const fullValue = stringifyTimelineValue(value);
+                      const collapsed = fullValue.replace(/\s+/g, " ").trim();
+                      return (
+                        <div
+                          key={index}
+                          className="flex min-w-0 break-words text-slate-400"
+                        >
+                          <span className="mr-1 shrink-0 text-slate-500">
+                            [{index}]
+                          </span>
+                          <LoopValueCode
+                            collapsed={collapsed}
+                            fullValue={fullValue}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+            {block.block_type === "conditional" && block.executed_branch_id && (
+              <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
+                {hasEvaluations(block.output) && block.output.evaluations ? (
+                  // New format: show all branch evaluations
+                  <div className="space-y-2">
+                    {block.output.evaluations.map((evaluation, index) => (
+                      <div
+                        key={evaluation.branch_id || index}
+                        className={cn(
+                          "rounded border px-2 py-1.5",
+                          evaluation.is_matched
+                            ? "border-success/50 bg-success/10"
+                            : "border-slate-600 bg-slate-elevation3",
+                        )}
+                      >
+                        {evaluation.is_default ? (
+                          <div className="text-slate-300">
+                            <span className="font-medium">Default branch</span>
+                            {evaluation.is_matched && (
+                              <span className="ml-2 text-success">
+                                ✓ Matched
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="space-y-1">
+                            <div className="text-slate-400">
+                              <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
+                                {evaluation.original_expression}
+                              </code>
+                            </div>
+                            {evaluation.rendered_expression &&
+                              evaluation.rendered_expression !==
+                                evaluation.original_expression && (
+                                <div className="text-slate-400">
+                                  → rendered to{" "}
+                                  <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
+                                    {evaluation.rendered_expression}
+                                  </code>
+                                </div>
+                              )}
+                            <div className="flex items-center gap-2">
+                              <span className="text-slate-400">
+                                evaluated to
+                              </span>
+                              <span
+                                className={cn(
+                                  "font-medium",
+                                  evaluation.result
+                                    ? "text-success"
+                                    : "text-red-400",
+                                )}
+                              >
+                                {evaluation.result ? "True" : "False"}
+                              </span>
+                              {evaluation.is_matched && (
+                                <span className="text-success">✓ Matched</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                        {evaluation.is_matched &&
+                          evaluation.next_block_label && (
+                            <div className="mt-1 text-slate-400">
+                              → Executing next block:{" "}
+                              <span className="font-medium text-slate-300">
+                                {evaluation.next_block_label}
+                              </span>
+                            </div>
+                          )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  // Fallback: old format without evaluations array
+                  <>
+                    {block.executed_branch_expression !== null &&
+                    block.executed_branch_expression !== undefined ? (
+                      <div className="text-slate-300">
+                        Condition{" "}
+                        <code className="break-all rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
+                          {block.executed_branch_expression}
+                        </code>{" "}
+                        evaluated to{" "}
+                        <span className="font-medium text-success">True</span>
+                      </div>
+                    ) : (
+                      <div className="text-slate-300">
+                        No conditions matched, executing default branch
+                      </div>
+                    )}
+                    {block.executed_branch_next_block && (
+                      <div className="text-slate-400">
+                        → Executing next block:{" "}
+                        <span className="font-medium text-slate-300">
+                          {block.executed_branch_next_block}
+                        </span>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
 
-        {hasNestedChildren && !isLoopBlock && !isConditionalBlock && (
-          <TimelineSubItems
-            items={subItems}
-            activeItem={activeItem}
-            depth={depth + 1}
-            onActionClick={onActionClick}
-            onBlockItemClick={onBlockItemClick}
-            onThoughtCardClick={onThoughtCardClick}
-            finallyBlockLabel={finallyBlockLabel}
-          />
-        )}
+          {block.block_type === "human_interaction" && (
+            <WorkflowRunHumanInteraction workflowRunBlock={block} />
+          )}
+
+          {actions.map((action, index) => {
+            return (
+              <ActionCard
+                key={action.action_id}
+                action={action}
+                active={
+                  isAction(activeItem) &&
+                  activeItem.action_id === action.action_id
+                }
+                index={actions.length - index}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  const actionItem: ActionItem = {
+                    block,
+                    action,
+                  };
+                  onActionClick(actionItem);
+                }}
+                cardClassName={getCardElevation(depth)}
+              />
+            );
+          })}
+
+          {hasNestedChildren && isLoopBlock && (
+            <div className="space-y-2">
+              {loopIterationGroups.map((group, groupIndex) => {
+                const loopValueFromIterable =
+                  group.index !== null
+                    ? (loopValues[group.index] ?? null)
+                    : null;
+                const iterationNumber =
+                  group.index !== null ? group.index + 1 : groupIndex + 1;
+                const currentValueFull = stringifyTimelineValue(
+                  loopValueFromIterable ?? group.currentValue,
+                );
+                const currentValuePreview = truncateValue(
+                  currentValueFull,
+                  140,
+                );
+                const isValueTruncated =
+                  currentValuePreview !==
+                  currentValueFull.replace(/\s+/g, " ").trim();
+
+                return (
+                  <Collapsible
+                    key={`${group.index ?? "unknown"}-${groupIndex}`}
+                    open={openLoopGroups.has(groupIndex)}
+                    onOpenChange={(open) => {
+                      setOpenLoopGroups((prev) => {
+                        const next = new Set(prev);
+                        if (open) {
+                          next.add(groupIndex);
+                        } else {
+                          next.delete(groupIndex);
+                        }
+                        return next;
+                      });
+                    }}
+                  >
+                    <div className="rounded border border-slate-700 bg-slate-elevation4">
+                      <CollapsibleTrigger asChild>
+                        <button
+                          className="group flex w-full items-center justify-between gap-2 px-2 py-1 text-left"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
+                            <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
+                          </div>
+                          {isValueTruncated ? (
+                            <TooltipProvider delayDuration={300}>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                                    current_value: {currentValuePreview}
+                                  </code>
+                                </TooltipTrigger>
+                                <TooltipContent
+                                  side="top"
+                                  className="max-w-xs break-all font-mono text-[11px]"
+                                >
+                                  {currentValueFull}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          ) : (
+                            <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                              current_value: {currentValuePreview}
+                            </code>
+                          )}
+                        </button>
+                      </CollapsibleTrigger>
+                    </div>
+                    <CollapsibleContent className="min-w-0 px-2 pb-2 pt-2">
+                      <TimelineSubItems
+                        items={group.items}
+                        activeItem={activeItem}
+                        depth={depth + 1}
+                        onActionClick={onActionClick}
+                        onBlockItemClick={onBlockItemClick}
+                        onThoughtCardClick={onThoughtCardClick}
+                        finallyBlockLabel={finallyBlockLabel}
+                        workflowRunIsFinalized={workflowRunIsFinalized}
+                      />
+                    </CollapsibleContent>
+                  </Collapsible>
+                );
+              })}
+            </div>
+          )}
+
+          {hasNestedChildren && isConditionalBlock && (
+            <Collapsible open={childrenOpen} onOpenChange={setChildrenOpen}>
+              <div className="rounded border border-slate-700 bg-slate-elevation4 px-2 py-1.5">
+                <CollapsibleTrigger asChild>
+                  <button
+                    className="flex w-full items-center justify-between gap-2 text-left"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="flex items-center gap-1.5 text-xs text-slate-200">
+                      {childrenOpen ? (
+                        <ChevronDownIcon className="size-4" />
+                      ) : (
+                        <ChevronRightIcon className="size-4" />
+                      )}
+                      <span>{`Executed branch blocks (${subItems.length})`}</span>
+                    </div>
+                    {block.executed_branch_next_block && (
+                      <span className="text-[11px] text-slate-400">
+                        next: {block.executed_branch_next_block}
+                      </span>
+                    )}
+                  </button>
+                </CollapsibleTrigger>
+              </div>
+              <CollapsibleContent className="space-y-2 pt-2">
+                <TimelineSubItems
+                  items={subItems}
+                  activeItem={activeItem}
+                  depth={depth + 1}
+                  onActionClick={onActionClick}
+                  onBlockItemClick={onBlockItemClick}
+                  onThoughtCardClick={onThoughtCardClick}
+                  finallyBlockLabel={finallyBlockLabel}
+                  workflowRunIsFinalized={workflowRunIsFinalized}
+                />
+              </CollapsibleContent>
+            </Collapsible>
+          )}
+
+          {hasNestedChildren && !isLoopBlock && !isConditionalBlock && (
+            <TimelineSubItems
+              items={subItems}
+              activeItem={activeItem}
+              depth={depth + 1}
+              onActionClick={onActionClick}
+              onBlockItemClick={onBlockItemClick}
+              onThoughtCardClick={onThoughtCardClick}
+              finallyBlockLabel={finallyBlockLabel}
+              workflowRunIsFinalized={workflowRunIsFinalized}
+            />
+          )}
+        </div>
       </div>
     </div>
   );

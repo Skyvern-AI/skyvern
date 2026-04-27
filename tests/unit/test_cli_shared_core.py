@@ -175,7 +175,7 @@ async def test_do_extract_accepts_preparsed_dict() -> None:
 
     result = await do_extract(page, "get the title", schema=schema)
     assert result.extracted == {"title": "Example"}
-    page.extract.assert_awaited_once_with(prompt="get the title", schema=schema)
+    page.extract.assert_awaited_once_with(prompt="get the title", schema=schema, skip_refresh=False)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,71 @@
+{
+  "manifest_version": "0.3",
+  "name": "skyvern-claude-desktop",
+  "display_name": "Skyvern",
+  "version": "0.0.0-dev",
+  "description": "Connect Claude Desktop to Skyvern Cloud browser automation without installing Node.js.",
+  "long_description": "Install Skyvern into Claude Desktop as a single bundle. The bundle asks for your Skyvern API key, then bridges Claude Desktop to Skyvern Cloud over HTTPS so Claude can drive browsers, extract data, and run workflows.",
+  "author": {
+    "name": "Skyvern AI",
+    "email": "info@skyvern.com",
+    "url": "https://www.skyvern.com/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Skyvern-AI/skyvern.git"
+  },
+  "homepage": "https://www.skyvern.com/",
+  "documentation": "https://www.skyvern.com/docs",
+  "support": "https://github.com/Skyvern-AI/skyvern/issues",
+  "privacy_policies": [
+    "https://app.termly.io/policy-viewer/policy.html?policyUUID=1d7aaa1b-5565-415a-8984-7146d254f738"
+  ],
+  "icon": "icon.png",
+  "tools_generated": true,
+  "keywords": [
+    "automation",
+    "browser",
+    "claude",
+    "mcp",
+    "skyvern"
+  ],
+  "license": "Apache-2.0",
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=20.18.1"
+    }
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "node_modules/mcp-remote/dist/proxy.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/node_modules/mcp-remote/dist/proxy.js",
+        "${user_config.server_url}",
+        "--header",
+        "x-api-key:${user_config.api_key}"
+      ]
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "Skyvern API Key",
+      "description": "Create an API key in Skyvern Settings, then paste it here.",
+      "sensitive": true,
+      "required": true
+    },
+    "server_url": {
+      "type": "string",
+      "title": "Skyvern MCP URL",
+      "description": "Advanced: change this only if you are connecting Claude Desktop to a different Skyvern deployment.",
+      "required": false,
+      "default": "https://api.skyvern.com/mcp/"
+    }
+  }
+}

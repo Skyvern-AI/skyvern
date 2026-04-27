@@ -1,5 +1,6 @@
 import abc
-from dataclasses import dataclass
+import functools
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
@@ -7,7 +8,10 @@ import structlog
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.utils.templating import replace_jinja_reference
@@ -44,6 +48,26 @@ def sanitize_parameter_key(value: str) -> str:
     return sanitize_identifier(value, default="parameter")
 
 
+def _has_jinja_syntax(value: str) -> bool:
+    return "{{" in value or "{%" in value
+
+
+@functools.lru_cache(maxsize=1)
+def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
+    """Build a reverse mapping from internal llm_key to public model_name.
+
+    Cached because settings don't change at runtime.  Tests that monkeypatch
+    settings must call ``_get_text_prompt_model_name_by_llm_key.cache_clear()``
+    to avoid cross-test pollution.
+    """
+    reverse_mapping: dict[str, str] = {}
+    for model_name, metadata in SettingsManager.get_settings().get_model_name_to_llm_key().items():
+        llm_key = metadata.get("llm_key")
+        if llm_key and llm_key not in reverse_mapping:
+            reverse_mapping[llm_key] = model_name
+    return reverse_mapping
+
+
 def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
     """Recursively replaces Jinja references in a value (string, dict, or list)."""
     if isinstance(value, str):
@@ -53,6 +77,29 @@ def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
     elif isinstance(value, list):
         return [_replace_references_in_value(item, old_key, new_key) for item in value]
     return value
+
+
+def _rewrite_error_code_mapping_refs_atomic(mapping: Any, substitutions: list[tuple[str, str]]) -> Any:
+    """Atomically rewrites Jinja references (keys and values) in an error_code_mapping dict.
+
+    Uses unique sentinels so chained rewrites don't occur when one substitution's new
+    identifier matches another's old identifier (e.g. foo-bar -> foo_bar AND foo_bar -> foo_bar_2).
+    """
+    if not isinstance(mapping, dict) or not substitutions:
+        return mapping
+
+    sentinels = [(old, new, f"\x00SKY_SANITIZE_{i}\x00") for i, (old, new) in enumerate(substitutions)]
+
+    def _apply(text: str) -> str:
+        for old, _new, sentinel in sentinels:
+            text = replace_jinja_reference(text, old, sentinel)
+        for _old, new, sentinel in sentinels:
+            text = text.replace(sentinel, new)
+        return text
+
+    return {
+        (_apply(k) if isinstance(k, str) else k): (_apply(v) if isinstance(v, str) else v) for k, v in mapping.items()
+    }
 
 
 def _replace_direct_string_in_value(value: Any, old_key: str, new_key: str) -> Any:
@@ -274,6 +321,16 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
                 workflow_definition["parameters"], old_output_key, new_output_key
             )
 
+        # workflow_system_prompt is rendered through Jinja at execution time, so
+        # references inside it need the same rename treatment as block fields.
+        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_output_key, new_output_key
+            )
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_label, new_label
+            )
+
     # Step 4: Update all parameter key references
     for old_key, new_key in param_key_mapping.items():
         # Update Jinja references in blocks (e.g., {{ old_key }})
@@ -291,6 +348,25 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
             workflow_definition["parameters"] = _replace_direct_string_in_value(
                 workflow_definition["parameters"], old_key, new_key
             )
+
+        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_key, new_key
+            )
+
+    # Rewrite workflow-level error_code_mapping atomically so substitutions don't chain
+    # (e.g. foo-bar -> foo_bar and foo_bar -> foo_bar_2 must not combine into foo_bar_2).
+    if "error_code_mapping" in workflow_definition:
+        substitutions: list[tuple[str, str]] = []
+        for old_label, new_label in label_mapping.items():
+            # More specific output-key substitution must come before the bare label.
+            substitutions.append((f"{old_label}_output", f"{new_label}_output"))
+            substitutions.append((old_label, new_label))
+        for old_key, new_key in param_key_mapping.items():
+            substitutions.append((old_key, new_key))
+        workflow_definition["error_code_mapping"] = _rewrite_error_code_mapping_refs_atomic(
+            workflow_definition["error_code_mapping"], substitutions
+        )
 
     # Step 5: Update parameter_keys arrays in blocks
     if param_key_mapping and "blocks" in workflow_definition:
@@ -357,6 +433,8 @@ class BlockType(StrEnum):
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
+    GOOGLE_SHEETS_READ = "google_sheets_read"
+    GOOGLE_SHEETS_WRITE = "google_sheets_write"
 
 
 class BlockStatus(StrEnum):
@@ -376,10 +454,12 @@ class BlockResult:
     output_parameter_value: dict[str, Any] | list | str | None = None
     status: BlockStatus | None = None
     failure_reason: str | None = None
+    error_codes: list[str] = field(default_factory=list)
     workflow_run_block_id: str | None = None
 
 
 class FileType(StrEnum):
+    AUTO_DETECT = "auto_detect"
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
@@ -549,6 +629,10 @@ class BlockYAML(BaseModel, abc.ABC):
     )
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+    # Opt-out from workflow-level workflow_system_prompt inheritance (and, on a
+    # WorkflowTriggerBlock, from propagating the parent chain's prompt into the
+    # spawned child run). A no-op for deterministic blocks that don't call an LLM.
+    ignore_workflow_system_prompt: bool = False
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
@@ -631,12 +715,12 @@ class BranchConditionYAML(BaseModel):
     is_default: bool = False
 
     @model_validator(mode="after")
-    def validate_condition(cls, condition: "BranchConditionYAML") -> "BranchConditionYAML":
-        if condition.criteria is None and not condition.is_default:
+    def validate_condition(self) -> "BranchConditionYAML":
+        if self.criteria is None and not self.is_default:
             raise ValueError("Branches without criteria must be marked as default.")
-        if condition.criteria is not None and condition.is_default:
+        if self.criteria is not None and self.is_default:
             raise ValueError("Default branches may not define criteria.")
-        return condition
+        return self
 
 
 class ConditionalBlockYAML(BlockYAML):
@@ -645,15 +729,15 @@ class ConditionalBlockYAML(BlockYAML):
     branch_conditions: list[BranchConditionYAML] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_branches(cls, block: "ConditionalBlockYAML") -> "ConditionalBlockYAML":
-        if not block.branch_conditions:
+    def validate_branches(self) -> "ConditionalBlockYAML":
+        if not self.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        default_branches = [branch for branch in self.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
-        return block
+        return self
 
 
 class CodeBlockYAML(BlockYAML):
@@ -678,6 +762,42 @@ class TextPromptBlockYAML(BlockYAML):
     prompt: str
     parameter_keys: list[str] | None = None
     json_schema: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def normalize_llm_selection(self) -> "TextPromptBlockYAML":
+        raw_llm_key = self.llm_key.strip() if self.llm_key else None
+
+        if self.model:
+            # `model` is the stable public contract; ignore any raw llm_key override
+            # once a model has been selected.
+            self.llm_key = None
+            return self
+
+        if not raw_llm_key:
+            self.llm_key = None
+            return self
+
+        if _has_jinja_syntax(raw_llm_key):
+            self.llm_key = raw_llm_key
+            return self
+
+        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+        if model_name:
+            self.model = {"model_name": model_name}
+            self.llm_key = None
+            return self
+
+        if raw_llm_key in LLMConfigRegistry.get_model_names():
+            self.llm_key = raw_llm_key
+            return self
+
+        LOG.warning(
+            "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path",
+            label=self.label,
+            llm_key=raw_llm_key,
+        )
+        self.llm_key = None
+        return self
 
 
 class DownloadToS3BlockYAML(BlockYAML):
@@ -733,7 +853,7 @@ class FileParserBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
 
     file_url: str
-    file_type: FileType
+    file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
 
 
@@ -930,6 +1050,29 @@ class WorkflowTriggerBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class GoogleSheetsReadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOOGLE_SHEETS_READ] = BlockType.GOOGLE_SHEETS_READ  # type: ignore
+    spreadsheet_url: str
+    sheet_name: str | None = None
+    range: str | None = None
+    credential_id: str | None = None
+    has_header_row: bool = True
+    parameter_keys: list[str] | None = None
+
+
+class GoogleSheetsWriteBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOOGLE_SHEETS_WRITE] = BlockType.GOOGLE_SHEETS_WRITE  # type: ignore
+    spreadsheet_url: str
+    sheet_name: str | None = None
+    range: str | None = None
+    credential_id: str | None = None
+    write_mode: Literal["append", "update"] = "append"
+    values: str = ""
+    column_mapping: dict[str, str] | None = None
+    create_sheet_if_missing: bool = False
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -969,6 +1112,8 @@ BLOCK_YAML_SUBCLASSES = (
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | WorkflowTriggerBlockYAML
+    | GoogleSheetsReadBlockYAML
+    | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
@@ -978,10 +1123,12 @@ class WorkflowDefinitionYAML(BaseModel):
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
 
     @model_validator(mode="after")
-    def validate_unique_block_labels(cls, workflow: "WorkflowDefinitionYAML") -> "WorkflowDefinitionYAML":
-        labels = [block.label for block in workflow.blocks]
+    def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
+        labels = [block.label for block in self.blocks]
         duplicates = [label for label in labels if labels.count(label) > 1]
 
         if duplicates:
@@ -991,13 +1138,13 @@ class WorkflowDefinitionYAML(BaseModel):
                 f"Found duplicate label(s): {', '.join(unique_duplicates)}"
             )
 
-        if workflow.finally_block_label and workflow.finally_block_label not in labels:
+        if self.finally_block_label and self.finally_block_label not in labels:
             raise ValueError(
-                f"finally_block_label '{workflow.finally_block_label}' does not reference a valid block. "
+                f"finally_block_label '{self.finally_block_label}' does not reference a valid block. "
                 f"Available labels: {', '.join(labels) if labels else '(none)'}"
             )
 
-        return workflow
+        return self
 
 
 class WorkflowCreateYAMLRequest(BaseModel):
@@ -1014,14 +1161,20 @@ class WorkflowCreateYAMLRequest(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
-    run_with: str | None = None
-    ai_fallback: bool = False
+    run_with: str = "agent"
+    ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
+    code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
     run_sequentially: bool = False
     sequential_key: str | None = None
     folder_id: str | None = None
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str:
+        return normalize_run_with(v)
 
 
 class WorkflowRequest(BaseModel):

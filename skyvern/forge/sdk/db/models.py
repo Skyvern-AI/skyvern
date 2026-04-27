@@ -12,13 +12,16 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Text,
     UnicodeText,
     UniqueConstraint,
     desc,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
+from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
@@ -59,9 +62,11 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_id,
+    generate_workflow_schedule_id,
     generate_workflow_script_id,
     generate_workflow_template_id,
 )
+from skyvern.forge.sdk.schemas.runs import TERMINAL_STATUSES
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
 
@@ -98,10 +103,12 @@ class TaskModel(Base):
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
+    workflow_system_prompt = Column(UnicodeText, nullable=True)
     errors = Column(JSON, default=[], nullable=False)
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
     include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
+    include_extracted_text = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -120,6 +127,7 @@ class TaskModel(Base):
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
+    failure_category = Column(JSON, nullable=True)
 
 
 class StepModel(Base):
@@ -149,6 +157,7 @@ class StepModel(Base):
     reasoning_token_count = Column(Integer, default=0)
     cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
+    last_llm_model = Column(String, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_by = Column(String, nullable=True)
 
@@ -164,6 +173,7 @@ class OrganizationModel(Base):
     domain = Column(String, nullable=True, index=True)
     bw_organization_id = Column(String, nullable=True, default=None)
     bw_collection_ids = Column(JSON, nullable=True, default=None)
+    artifact_url_expiry_seconds = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -205,20 +215,48 @@ class ArtifactModel(Base):
     __table_args__ = (
         Index("org_task_step_index", "organization_id", "task_id", "step_id"),
         Index("artifacts_org_created_at_index", "organization_id", "created_at"),
+        Index(
+            "ix_artifacts_workflow_run_block_id_partial",
+            "workflow_run_block_id",
+            postgresql_where=text("workflow_run_block_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_thought_id_partial",
+            "observer_thought_id",
+            postgresql_where=text("observer_thought_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_cruise_id_partial",
+            "observer_cruise_id",
+            postgresql_where=text("observer_cruise_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_run_id_partial",
+            "run_id",
+            postgresql_where=text("run_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_browser_session_id_partial",
+            "browser_session_id",
+            postgresql_where=text("browser_session_id IS NOT NULL"),
+        ),
     )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     workflow_run_id = Column(String, index=True)
-    workflow_run_block_id = Column(String, index=True)
-    observer_cruise_id = Column(String, index=True)
-    observer_thought_id = Column(String, index=True)
+    workflow_run_block_id = Column(String)
+    observer_cruise_id = Column(String)
+    observer_thought_id = Column(String)
     ai_suggestion_id = Column(String)
     task_id = Column(String)
     step_id = Column(String, index=True)
     artifact_type = Column(String)
     uri = Column(String)
-    run_id = Column(String, nullable=True, index=True)
+    bundle_key = Column(String, nullable=True)
+    run_id = Column(String, nullable=True)
+    browser_session_id = Column(String, nullable=True)
+    checksum = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -250,7 +288,9 @@ class FolderModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
-class WorkflowModel(Base):
+# TODO: ~22 other models with manual deleted_at columns could inherit SoftDeleteMixin.
+# WorkflowModel is the proof of concept; remaining models will be migrated in a follow-up PR.
+class WorkflowModel(SoftDeleteMixin, Base):
     __tablename__ = "workflows"
     __table_args__ = (
         UniqueConstraint(
@@ -281,14 +321,53 @@ class WorkflowModel(Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
-    ai_fallback = Column(Boolean, default=False, nullable=False)
+    ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    code_version = Column(Integer, nullable=True, server_default=sqlalchemy.text("2"))
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
     import_error = Column(String, nullable=True)  # Error message if import failed
+    created_by = Column(String, nullable=True)
+    edited_by = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
+    version = Column(Integer, default=1, nullable=False)
+    is_saved_task = Column(Boolean, default=False, nullable=False)
+
+
+# TODO: Apply SoftDeleteMixin to WorkflowScheduleModel (requires migration + query audit)
+class WorkflowScheduleModel(Base):
+    __tablename__ = "workflow_schedules"
+    __table_args__ = (
+        Index(
+            "idx_workflow_schedules_org_workflow",
+            "organization_id",
+            "workflow_permanent_id",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index("idx_workflow_schedules_org_enabled", "organization_id", "enabled"),
+    )
+
+    workflow_schedule_id = Column(String, primary_key=True, default=generate_workflow_schedule_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+    cron_expression = Column(String, nullable=False)
+    timezone = Column(String, nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    parameters = Column(JSON, nullable=True)
+    backend_schedule_id = Column("temporal_schedule_id", String, nullable=True)
+    name = Column(String, nullable=True)
+    description = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -298,10 +377,6 @@ class WorkflowModel(Base):
         nullable=False,
     )
     deleted_at = Column(DateTime, nullable=True)
-
-    workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
-    version = Column(Integer, default=1, nullable=False)
-    is_saved_task = Column(Boolean, default=False, nullable=False)
 
 
 class WorkflowTemplateModel(Base):
@@ -347,18 +422,30 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
-    browser_address = Column(String, nullable=True)
+    browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
+    trigger_type = Column(String, nullable=True)
+    workflow_schedule_id = Column(String, nullable=True, index=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
+    failure_category = Column(JSON, nullable=True)
+    # When True, this run was spawned by a WorkflowTriggerBlock whose
+    # ignore_workflow_system_prompt flag was set, and the child must not
+    # inherit the parent chain's workflow_system_prompt. Set at spawn time so
+    # async (Temporal-dispatched) child runs can honor the flag even though
+    # they start in a separate worker without in-process context.
+    ignore_inherited_workflow_system_prompt = Column(
+        Boolean, nullable=False, default=False, server_default=sqlalchemy.false()
+    )
+    copilot_session_id = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -717,6 +804,7 @@ class WorkflowRunBlockModel(Base):
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+    error_codes = Column(JSON, nullable=True)
     engine = Column(String, nullable=True)
 
     # for loop block
@@ -756,6 +844,16 @@ class WorkflowRunBlockModel(Base):
     executed_branch_result = Column(Boolean, nullable=True)
     executed_branch_next_block = Column(String, nullable=True)
 
+    # Accumulates LLM cost for block-scoped calls (no step/thought attribution).
+    llm_cost = Column(Numeric, default=0, nullable=False)
+
+    # Per-block cached-script execution state. Written (via the writer bridge
+    # in `services/script_service.py::_update_workflow_block`) when a script
+    # block falls back to AI mid-execution. Always null for blocks that ran
+    # cleanly from cache or were always-agent. Mirrors the `script_run`
+    # column on `WorkflowRunModel` but at block granularity.
+    script_run = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -786,6 +884,7 @@ class TaskV2Model(Base):
     proxy_location = Column(String, nullable=True)
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
+    workflow_system_prompt = Column(UnicodeText, nullable=True)
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
@@ -800,6 +899,7 @@ class TaskV2Model(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     model = Column(JSON, nullable=True)
+    failure_category = Column(JSON, nullable=True)
 
 
 class ThoughtModel(Base):
@@ -825,6 +925,7 @@ class ThoughtModel(Base):
     reasoning_token_count = Column(Integer, nullable=True)
     cached_token_count = Column(Integer, nullable=True)
     thought_cost = Column(Numeric, nullable=True)
+    last_llm_model = Column(String, nullable=True)
 
     observer_thought_type = Column(String, nullable=True, default=ThoughtType.plan)
     observer_thought_scenario = Column(String, nullable=True)
@@ -901,6 +1002,35 @@ class TaskRunModel(Base):
         Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),
         Index("task_run_org_run_id_index", "organization_id", "run_id"),
         Index("ix_task_runs_org_created_at", "organization_id", "created_at"),
+        Index(
+            "ix_task_runs_org_toplevel_created",
+            "organization_id",
+            desc("created_at"),
+            postgresql_using="btree",
+            postgresql_where=text("parent_workflow_run_id IS NULL AND debug_session_id IS NULL AND status IS NOT NULL"),
+        ),
+        Index(
+            "ix_task_runs_org_status_created",
+            "organization_id",
+            "status",
+            desc("created_at"),
+            postgresql_using="btree",
+        ),
+        Index(
+            "ix_task_runs_searchable_text_gin",
+            "searchable_text",
+            postgresql_using="gin",
+            postgresql_ops={"searchable_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_task_runs_nonterminal",
+            "run_id",
+            "task_run_type",
+            postgresql_where=sqlalchemy.or_(
+                sqlalchemy.column("status").is_(None),
+                ~sqlalchemy.column("status").in_(TERMINAL_STATUSES),
+            ),
+        ),
     )
 
     task_run_id = Column(String, primary_key=True, default=generate_task_run_id)
@@ -911,6 +1041,17 @@ class TaskRunModel(Base):
     url = Column(String, nullable=True)
     url_hash = Column(String, nullable=True)
     cached = Column(Boolean, nullable=False, default=False)
+    # Run history fields
+    # status is an open-ended str (not an enum) because task_runs covers multiple
+    # run types (task, workflow, observer) each with its own status set.
+    status = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    workflow_permanent_id = Column(String, nullable=True)
+    script_run = Column(JSON, nullable=True)
+    parent_workflow_run_id = Column(String, nullable=True)
+    debug_session_id = Column(String, nullable=True)
+    searchable_text = Column(Text, nullable=True)
     # Compute cost tracking fields
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
@@ -954,6 +1095,8 @@ class CredentialModel(Base):
     secret_label = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True)
     tested_url = Column(String, nullable=True)
+    user_context = Column(String(1000), nullable=True)
+    save_browser_session_intent = Column(Boolean, nullable=True, default=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1024,6 +1167,7 @@ class ScriptFileModel(Base):
     __tablename__ = "script_files"
     __table_args__ = (
         Index("file_script_path_index", "script_revision_id", "file_path"),
+        Index("ix_script_files_dedup", "script_id", "organization_id", "content_hash"),
         UniqueConstraint("script_revision_id", "file_path", name="unique_script_file_path"),
     )
 
@@ -1056,6 +1200,7 @@ class WorkflowScriptModel(Base):
         Index(
             "idx_workflow_scripts_wpid_cache_key_value", "workflow_permanent_id", "cache_key_value", "workflow_run_id"
         ),
+        Index("idx_workflow_scripts_org_script_id", "organization_id", "script_id"),
     )
 
     workflow_script_id = Column(String, primary_key=True, default=generate_workflow_script_id)
@@ -1067,6 +1212,11 @@ class WorkflowScriptModel(Base):
     cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
     cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
     status = Column(String, nullable=True, default="published")
+
+    # Script pinning
+    is_pinned = Column(Boolean, default=False, nullable=False, server_default="false")
+    pinned_at = Column(DateTime, nullable=True)
+    pinned_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

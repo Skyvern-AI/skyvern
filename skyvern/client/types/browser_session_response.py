@@ -65,6 +65,11 @@ class BrowserSessionResponse(UniversalBaseModel):
     The type of browser used for the session.
     """
 
+    browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`.
+    """
+
     vnc_streaming_supported: typing.Optional[bool] = pydantic.Field(default=None)
     """
     Whether the browser session supports VNC streaming

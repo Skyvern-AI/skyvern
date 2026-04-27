@@ -1,9 +1,9 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { Status, Task, WorkflowRunApiResponse } from "@/api/types";
+import { Status, TaskRunListItem } from "@/api/types";
 
-type QueryReturnType = Array<Task | WorkflowRunApiResponse>;
+type QueryReturnType = Array<TaskRunListItem>;
 type UseQueryOptions = Omit<
   Parameters<typeof useQuery<QueryReturnType>>[0],
   "queryKey" | "queryFn"
@@ -21,12 +21,13 @@ function useRunsQuery({
   pageSize = 10,
   statusFilters,
   search,
+  ...queryOptions
 }: Props) {
   const credentialGetter = useCredentialGetter();
-  return useQuery<Array<Task | WorkflowRunApiResponse>>({
+  return useQuery<Array<TaskRunListItem>>({
     queryKey: ["runs", { statusFilters }, page, pageSize, search],
     queryFn: async () => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       const params = new URLSearchParams();
       params.append("page", String(page));
       params.append("page_size", String(pageSize));
@@ -40,6 +41,7 @@ function useRunsQuery({
       }
       return client.get("/runs", { params }).then((res) => res.data);
     },
+    ...queryOptions,
   });
 }
 

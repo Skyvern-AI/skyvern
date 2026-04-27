@@ -1,6 +1,6 @@
 import os
 import shutil
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -8,6 +8,7 @@ import aiofiles
 import structlog
 
 from skyvern.config import settings
+from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     get_download_dir,
@@ -163,10 +164,10 @@ class LocalStorage(BaseStorage):
             return None
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        return None
+        return artifact.uri if artifact.uri else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return None
+        return [artifact.uri for artifact in artifacts] or None
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         return
@@ -225,6 +226,29 @@ class LocalStorage(BaseStorage):
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
+
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to delete browser session outside storage base path",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        if not stored_folder_path.exists():
+            return
+        try:
+            shutil.rmtree(stored_folder_path)
+        except Exception:
+            LOG.exception(
+                "Failed to delete local browser session",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                path=str(stored_folder_path),
+            )
+            raise
 
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile locally."""
@@ -343,7 +367,9 @@ class LocalStorage(BaseStorage):
             if file_size == 0:
                 continue
 
-            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime)
+            # Return UTC-aware so consumers can safely compare against S3 LastModified
+            # (also UTC-aware) without hitting naive-vs-aware TypeErrors.
+            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime, tz=UTC)
             checksum = calculate_sha256_for_file(file_path)
             filename = path_obj.name
 
@@ -479,8 +505,28 @@ class LocalStorage(BaseStorage):
         )
         return target_path.exists()
 
-    async def download_uploaded_file(self, uri: str) -> bytes | None:
-        """Download a user-uploaded file from local filesystem."""
+    def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
+        if not uri.startswith("file://"):
+            raise PermissionError(f"No permission to access storage URI: {uri}")
+
+        try:
+            file_path = Path(parse_uri_to_path(uri)).resolve()
+        except Exception as e:
+            raise PermissionError(f"No permission to access storage URI: {uri}") from e
+
+        allowed_dirs = (
+            (Path(self.artifact_path) / settings.ENV / organization_id).resolve(),
+            (Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id).resolve(),
+        )
+        if not any(
+            os.path.commonpath([str(file_path), str(allowed_dir)]) == str(allowed_dir) for allowed_dir in allowed_dirs
+        ):
+            raise PermissionError(f"No permission to access storage URI: {uri}")
+
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
+        """Download a managed org-scoped file from local filesystem."""
+        self.assert_managed_file_access(uri, organization_id)
+
         try:
             file_path = parse_uri_to_path(uri)
             async with aiofiles.open(file_path, "rb") as f:

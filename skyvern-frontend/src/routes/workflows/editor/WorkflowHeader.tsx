@@ -3,12 +3,14 @@ import {
   BookmarkIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  ClockIcon,
   CodeIcon,
   CopyIcon,
   PlayIcon,
   ReloadIcon,
+  ResetIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { SaveIcon } from "@/components/icons/SaveIcon";
 import { BrowserIcon } from "@/components/icons/BrowserIcon";
@@ -36,6 +38,7 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { isMacPlatform } from "@/util/platform";
 import { cn } from "@/util/utils";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
 
@@ -47,9 +50,12 @@ type Props = {
   cacheKeyValue: string | null;
   cacheKeyValues: CacheKeyValuesResponse | undefined;
   cacheKeyValuesPanelOpen: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
   isGeneratingCode?: boolean;
   isTemplate?: boolean;
   parametersPanelOpen: boolean;
+  schedulesPanelOpen: boolean;
   saving: boolean;
   showAllCode: boolean;
   onCacheKeyValueAccept: (cacheKeyValue: string | null) => void;
@@ -57,9 +63,12 @@ type Props = {
   onCacheKeyValuesFilter: (cacheKeyValue: string) => void;
   onCacheKeyValuesKeydown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
   onParametersClick: () => void;
+  onScheduleClick: () => void;
   onShowAllCodeClick?: () => void;
   onCacheKeyValuesClick: () => void;
   onSave: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
   onRun?: () => void;
   onHistory?: () => void;
 };
@@ -68,9 +77,12 @@ function WorkflowHeader({
   cacheKeyValue,
   cacheKeyValues,
   cacheKeyValuesPanelOpen,
+  canUndo,
+  canRedo,
   isGeneratingCode,
   isTemplate,
   parametersPanelOpen,
+  schedulesPanelOpen,
   saving,
   showAllCode,
   onCacheKeyValueAccept,
@@ -78,12 +90,15 @@ function WorkflowHeader({
   onCacheKeyValuesFilter,
   onCacheKeyValuesKeydown,
   onParametersClick,
+  onScheduleClick,
   onShowAllCodeClick,
   onCacheKeyValuesClick,
   onSave,
+  onUndo,
+  onRedo,
   onRun,
   onHistory,
-}: Props) {
+}: Readonly<Props>) {
   const { title, setTitle } = useWorkflowTitleStore();
   const workflowChangesStore = useWorkflowHasChangesStore();
   const { workflowPermanentId } = useParams();
@@ -101,6 +116,17 @@ function WorkflowHeader({
 
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  // Keyboard shortcut labels shown in tooltips - keep them platform-aware
+  // so Windows/Linux users don't see the Mac Command glyph. Memoized so
+  // we don't re-sniff the platform on every render (it's stable for the
+  // session).
+  const { undoShortcutLabel, redoShortcutLabel } = useMemo(() => {
+    const mac = isMacPlatform();
+    return {
+      undoShortcutLabel: mac ? "⌘Z" : "Ctrl+Z",
+      redoShortcutLabel: mac ? "⌘⇧Z" : "Ctrl+Shift+Z",
+    };
+  }, []);
 
   const templateMutation = useMutation({
     mutationFn: async (newIsTemplate: boolean) => {
@@ -325,6 +351,40 @@ function WorkflowHeader({
                     size="icon"
                     variant="tertiary"
                     className="size-10 min-w-[2.5rem]"
+                    disabled={!canUndo || isRecording}
+                    onClick={onUndo}
+                    aria-label="Undo"
+                  >
+                    <ResetIcon className="size-6" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Undo ({undoShortcutLabel})</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant="tertiary"
+                    className="size-10 min-w-[2.5rem]"
+                    disabled={!canRedo || isRecording}
+                    onClick={onRedo}
+                    aria-label="Redo"
+                  >
+                    <ResetIcon className="size-6 -scale-x-100" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Redo ({redoShortcutLabel})</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant="tertiary"
+                    className="size-10 min-w-[2.5rem]"
                     disabled={isGlobalWorkflow || isRecording}
                     onClick={() => {
                       onSave();
@@ -393,6 +453,20 @@ function WorkflowHeader({
                 </Tooltip>
               </TooltipProvider>
             )}
+            <Button
+              disabled={isRecording}
+              variant="tertiary"
+              size="lg"
+              onClick={onScheduleClick}
+            >
+              <ClockIcon className="mr-2 h-5 w-5" />
+              <span className="mr-2">Schedule</span>
+              {schedulesPanelOpen ? (
+                <ChevronUpIcon className="h-6 w-6" />
+              ) : (
+                <ChevronDownIcon className="h-6 w-6" />
+              )}
+            </Button>
             <Button
               disabled={isRecording}
               variant="tertiary"

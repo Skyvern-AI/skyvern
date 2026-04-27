@@ -1,10 +1,17 @@
 import { LightningBoltIcon, MixerHorizontalIcon } from "@radix-ui/react-icons";
 
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tip } from "@/components/Tip";
 import {
   Status,
-  Task,
-  WorkflowRunApiResponse,
+  TaskRunListItem,
+  TaskRunType,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -27,14 +34,17 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import {
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  formatExecutionTime,
+} from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import * as env from "@/util/env";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import {
@@ -50,12 +60,27 @@ import { useParameterExpansion } from "@/routes/workflows/hooks/useParameterExpa
 import { ParameterDisplayInline } from "@/routes/workflows/components/ParameterDisplayInline";
 import { HighlightText } from "@/routes/workflows/components/HighlightText";
 
-function isTask(run: Task | WorkflowRunApiResponse): run is Task {
-  return "task_id" in run;
+const statusValues = new Set<string>(Object.values(Status));
+function isKnownStatus(value: string): value is Status {
+  return statusValues.has(value);
+}
+
+function getRunNavigationPath(run: TaskRunListItem): string {
+  switch (run.task_run_type) {
+    case TaskRunType.WorkflowRun:
+    case TaskRunType.TaskV2:
+      return `/runs/${run.run_id}`;
+    case TaskRunType.TaskV1:
+    case TaskRunType.OpenaiCua:
+    case TaskRunType.AnthropicCua:
+    case TaskRunType.UiTars:
+      return `/tasks/${run.run_id}/actions`;
+    default:
+      return `/runs/${run.run_id}`;
+  }
 }
 
 function RunHistory() {
-  const credentialGetter = useCredentialGetter();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -73,24 +98,13 @@ function RunHistory() {
   });
   const navigate = useNavigate();
 
-  const { data: nextPageRuns } = useQuery<Array<Task | WorkflowRunApiResponse>>(
-    {
-      queryKey: ["runs", { statusFilters }, page + 1, itemsPerPage],
-      queryFn: async () => {
-        const client = await getClient(credentialGetter);
-        const params = new URLSearchParams();
-        params.append("page", String(page + 1));
-        params.append("page_size", String(itemsPerPage));
-        if (statusFilters) {
-          statusFilters.forEach((status) => {
-            params.append("status", status);
-          });
-        }
-        return client.get("/runs", { params }).then((res) => res.data);
-      },
-      enabled: runs && runs.length === itemsPerPage,
-    },
-  );
+  const { data: nextPageRuns } = useRunsQuery({
+    page: page + 1,
+    pageSize: itemsPerPage,
+    statusFilters,
+    search: debouncedSearch,
+    enabled: runs?.length === itemsPerPage,
+  });
 
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
@@ -111,8 +125,8 @@ function RunHistory() {
 
     const workflowRunIds =
       runs
-        ?.filter((run): run is WorkflowRunApiResponse => !isTask(run))
-        .map((run) => run.workflow_run_id)
+        ?.filter((run) => run.task_run_type === TaskRunType.WorkflowRun)
+        .map((run) => run.run_id)
         .filter((id): id is string => Boolean(id)) ?? [];
 
     setAutoExpandedRows(workflowRunIds);
@@ -145,6 +159,131 @@ function RunHistory() {
     if (isNextDisabled) return;
     setParamPatch({ page: String(page + 1) });
   }
+
+  const displayTableBody = () => {
+    // Show loading skeleton
+    if (isFetching) {
+      return Array.from({ length: 10 }).map((_, index) => (
+        <TableRow key={`row-${index}`}>
+          <TableCell colSpan={6}>
+            <Skeleton className="h-4 w-full" />
+          </TableCell>
+        </TableRow>
+      ));
+    }
+
+    // No runs found
+    if (runs?.length === 0) {
+      return (
+        <TableRow>
+          <TableCell colSpan={6}>
+            <div className="text-center">No runs found</div>
+          </TableCell>
+        </TableRow>
+      );
+    }
+
+    return runs?.map((run) => {
+      const executionTime = formatExecutionTime(
+        run.started_at ?? run.created_at,
+        run.finished_at,
+      );
+      const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
+      const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
+      const navPath = getRunNavigationPath(run);
+
+      const titleContent = run.script_run ? (
+        <div className="flex items-center gap-2">
+          <Tip content="Ran with code">
+            <LightningBoltIcon className="text-[gold]" />
+          </Tip>
+          <span>{run.title ?? ""}</span>
+        </div>
+      ) : (
+        (run.title ?? "")
+      );
+
+      return (
+        <React.Fragment key={run.task_run_id}>
+          <TableRow
+            className="cursor-pointer"
+            onClick={(event) => {
+              handleNavigate(event, navPath);
+            }}
+          >
+            <TableCell className="max-w-0 truncate" title={run.run_id}>
+              <HighlightText text={run.run_id} query={debouncedSearch} />
+            </TableCell>
+            <TableCell
+              className="max-w-0 truncate"
+              title={run.title ?? undefined}
+            >
+              {titleContent}
+            </TableCell>
+            <TableCell>
+              {isKnownStatus(run.status) ? (
+                <StatusBadge status={run.status} />
+              ) : (
+                <span className="text-sm text-slate-400">{run.status}</span>
+              )}
+            </TableCell>
+            <TableCell
+              className="max-w-0 truncate"
+              title={basicTimeFormat(run.created_at)}
+            >
+              {basicLocalTimeFormat(run.created_at)}
+            </TableCell>
+            <TableCell className="text-slate-400">
+              {executionTime ?? "-"}
+            </TableCell>
+            <TableCell>
+              {isWorkflowRun ? (
+                <div className="flex justify-end">
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="icon"
+                          variant="outline"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleParametersExpanded(run.run_id);
+                          }}
+                          className={cn(isExpanded && "text-blue-400")}
+                        >
+                          <MixerHorizontalIcon className="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {isExpanded ? "Hide Parameters" : "Show Parameters"}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              ) : null}
+            </TableCell>
+          </TableRow>
+
+          {isExpanded && run.workflow_permanent_id && (
+            <TableRow key={`${run.run_id}-params`}>
+              <TableCell
+                colSpan={6}
+                className="bg-slate-50 dark:bg-slate-900/50"
+              >
+                <WorkflowRunParametersInline
+                  workflowPermanentId={run.workflow_permanent_id}
+                  workflowRunId={run.run_id}
+                  searchQuery={debouncedSearch}
+                  keywordMatchesParameter={matchesParameter}
+                />
+              </TableCell>
+            </TableRow>
+          )}
+        </React.Fragment>
+      );
+    });
+  };
+
   return (
     <div className="space-y-4">
       <header>
@@ -164,188 +303,54 @@ function RunHistory() {
         />
         <StatusFilterDropdown
           values={statusFilters}
-          onChange={setStatusFilters}
+          onChange={(filters) => {
+            setStatusFilters(filters);
+            const params = new URLSearchParams(searchParams);
+            params.set("page", "1");
+            setSearchParams(params, { replace: true });
+          }}
         />
       </div>
       <div className="rounded-lg border">
-        <Table>
+        <Table className="sm:table-fixed">
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
-              <TableHead className="w-1/5 rounded-tl-lg text-slate-400">
+              <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
                 Run ID
               </TableHead>
-              <TableHead className="w-1/5 text-slate-400">Detail</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Status</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Created At</TableHead>
-              <TableHead className="w-1/5 rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
+              <TableHead className="w-[16%] text-slate-400">Status</TableHead>
+              <TableHead className="w-[27%] text-slate-400">
+                Created At
+              </TableHead>
+              <TableHead className="w-[8%] text-slate-400">Duration</TableHead>
+              <TableHead className="w-[8%] rounded-tr-lg text-slate-400"></TableHead>
             </TableRow>
           </TableHeader>
-          <TableBody>
-            {isFetching ? (
-              Array.from({ length: 10 }).map((_, index) => (
-                <TableRow key={index}>
-                  <TableCell colSpan={4}>
-                    <Skeleton className="h-4 w-full" />
-                  </TableCell>
-                </TableRow>
-              ))
-            ) : runs?.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={4}>
-                  <div className="text-center">No runs found</div>
-                </TableCell>
-              </TableRow>
-            ) : (
-              runs?.map((run) => {
-                if (isTask(run)) {
-                  return (
-                    <TableRow
-                      key={run.task_id}
-                      className="cursor-pointer"
-                      onClick={(event) => {
-                        handleNavigate(event, `/tasks/${run.task_id}/actions`);
-                      }}
-                    >
-                      <TableCell className="max-w-0 truncate">
-                        {run.task_id}
-                      </TableCell>
-                      <TableCell className="max-w-0 truncate">
-                        {run.url}
-                      </TableCell>
-                      <TableCell>
-                        <StatusBadge status={run.status} />
-                      </TableCell>
-                      <TableCell
-                        title={basicTimeFormat(run.created_at)}
-                        className="max-w-0 truncate"
-                      >
-                        {basicLocalTimeFormat(run.created_at)}
-                      </TableCell>
-                    </TableRow>
-                  );
-                }
-
-                const workflowTitle =
-                  run.script_run === true ? (
-                    <div className="flex items-center gap-2">
-                      <Tip content="Ran with code">
-                        <LightningBoltIcon className="text-[gold]" />
-                      </Tip>
-                      <span>{run.workflow_title ?? ""}</span>
-                    </div>
-                  ) : (
-                    run.workflow_title ?? ""
-                  );
-
-                const isExpanded = expandedRows.has(run.workflow_run_id);
-
-                return (
-                  <React.Fragment key={run.workflow_run_id}>
-                    <TableRow
-                      className="cursor-pointer"
-                      onClick={(event) => {
-                        handleNavigate(
-                          event,
-                          env.useNewRunsUrl
-                            ? `/runs/${run.workflow_run_id}`
-                            : `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
-                        );
-                      }}
-                    >
-                      <TableCell
-                        className="max-w-0 truncate"
-                        title={run.workflow_run_id}
-                      >
-                        <HighlightText
-                          text={run.workflow_run_id}
-                          query={debouncedSearch}
-                        />
-                      </TableCell>
-                      <TableCell
-                        className="max-w-0 truncate"
-                        title={run.workflow_title ?? undefined}
-                      >
-                        {workflowTitle}
-                      </TableCell>
-                      <TableCell>
-                        <StatusBadge status={run.status} />
-                      </TableCell>
-                      <TableCell
-                        className="max-w-0 truncate"
-                        title={basicTimeFormat(run.created_at)}
-                      >
-                        {basicLocalTimeFormat(run.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex justify-end">
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    toggleParametersExpanded(
-                                      run.workflow_run_id,
-                                    );
-                                  }}
-                                  className={cn(isExpanded && "text-blue-400")}
-                                >
-                                  <MixerHorizontalIcon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>
-                                {isExpanded
-                                  ? "Hide Parameters"
-                                  : "Show Parameters"}
-                              </TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-
-                    {isExpanded && (
-                      <TableRow key={`${run.workflow_run_id}-params`}>
-                        <TableCell
-                          colSpan={5}
-                          className="bg-slate-50 dark:bg-slate-900/50"
-                        >
-                          <WorkflowRunParametersInline
-                            workflowPermanentId={run.workflow_permanent_id}
-                            workflowRunId={run.workflow_run_id}
-                            searchQuery={debouncedSearch}
-                            keywordMatchesParameter={matchesParameter}
-                          />
-                        </TableCell>
-                      </TableRow>
-                    )}
-                  </React.Fragment>
-                );
-              })
-            )}
-          </TableBody>
+          <TableBody>{displayTableBody()}</TableBody>
         </Table>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
             <span className="text-slate-400">Items per page</span>
-            <select
-              className="h-9 rounded-md border border-slate-300 bg-background px-3"
-              value={itemsPerPage}
-              onChange={(e) => {
-                const next = Number(e.target.value);
+            <Select
+              value={String(itemsPerPage)}
+              onValueChange={(size) => {
                 const params = new URLSearchParams(searchParams);
-                params.set("page_size", String(next));
+                params.set("page_size", size);
                 params.set("page", "1");
                 setSearchParams(params, { replace: true });
               }}
             >
-              <option value={5}>5</option>
-              <option value={10}>10</option>
-              <option value={20}>20</option>
-              <option value={50}>50</option>
-            </select>
+              <SelectTrigger className="w-[65px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="5">5</SelectItem>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
           <Pagination className="pt-0">
             <PaginationContent>
@@ -392,7 +397,7 @@ function WorkflowRunParametersInline({
   workflowRunId,
   searchQuery,
   keywordMatchesParameter,
-}: WorkflowRunParametersInlineProps) {
+}: Readonly<WorkflowRunParametersInlineProps>) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
 

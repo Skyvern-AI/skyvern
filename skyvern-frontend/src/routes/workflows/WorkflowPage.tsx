@@ -1,7 +1,13 @@
-import { LightningBoltIcon } from "@radix-ui/react-icons";
+import {
+  LightningBoltIcon,
+  CodeIcon,
+  MixerHorizontalIcon,
+  Pencil2Icon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
 
 import { Tip } from "@/components/Tip";
-import { Status } from "@/api/types";
+import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
@@ -13,6 +19,13 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -22,13 +35,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
-import { cn } from "@/util/utils";
 import {
-  MixerHorizontalIcon,
-  Pencil2Icon,
-  PlayIcon,
-} from "@radix-ui/react-icons";
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  formatExecutionTime,
+} from "@/util/timeFormat";
+import { cn } from "@/util/utils";
 import React, { useEffect, useState } from "react";
 import {
   Link,
@@ -49,7 +61,6 @@ import {
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
 import * as env from "@/util/env";
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
@@ -57,6 +68,7 @@ import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
+import { getOrderedRunParameters } from "./utils";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -65,7 +77,8 @@ function WorkflowPage() {
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
 
-  const PAGE_SIZE = 10;
+  const PAGE_SIZE_OPTIONS = ["10", "25", "50"];
+  const pageSize = Number(searchParams.get("page_size") || "10");
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const [openRunParams, setOpenRunParams] = useState<string | null>(null);
@@ -81,6 +94,7 @@ function WorkflowPage() {
     workflowPermanentId,
     statusFilters,
     page,
+    pageSize,
     search: debouncedSearch,
     refetchOnMount: "always",
   });
@@ -139,6 +153,12 @@ function WorkflowPage() {
             />
           )}
           <Button asChild variant="secondary">
+            <Link to={`/workflows/${workflowPermanentId}/scripts`}>
+              <CodeIcon className="mr-2 size-4" />
+              Scripts
+            </Link>
+          </Button>
+          <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/build`}>
               <Pencil2Icon className="mr-2 size-4" />
               Edit
@@ -177,20 +197,21 @@ function WorkflowPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-1/4">ID</TableHead>
-                <TableHead className="w-1/4">Status</TableHead>
-                <TableHead className="w-1/4">Created At</TableHead>
-                <TableHead className="w-1/4"></TableHead>
+                <TableHead className="w-1/5">ID</TableHead>
+                <TableHead className="w-1/5">Status</TableHead>
+                <TableHead className="w-1/5">Created At</TableHead>
+                <TableHead className="w-1/5">Duration</TableHead>
+                <TableHead className="w-1/5"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
                 <TableRow>
-                  <TableCell colSpan={4}>Loading...</TableCell>
+                  <TableCell colSpan={5}>Loading...</TableCell>
                 </TableRow>
               ) : workflowRuns?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={4}>No workflow runs found</TableCell>
+                  <TableCell colSpan={5}>No workflow runs found</TableCell>
                 </TableRow>
               ) : (
                 workflowRuns?.map((workflowRun) => {
@@ -203,7 +224,7 @@ function WorkflowPage() {
                         <span>{workflowRun.workflow_run_id ?? ""}</span>
                       </div>
                     ) : (
-                      workflowRun.workflow_run_id ?? ""
+                      (workflowRun.workflow_run_id ?? "")
                     );
 
                   const isExpanded = expandedRows.has(
@@ -239,6 +260,12 @@ function WorkflowPage() {
                           title={basicTimeFormat(workflowRun.created_at)}
                         >
                           {basicLocalTimeFormat(workflowRun.created_at)}
+                        </TableCell>
+                        <TableCell className="text-slate-400">
+                          {formatExecutionTime(
+                            workflowRun.started_at ?? workflowRun.created_at,
+                            workflowRun.finished_at,
+                          ) ?? "-"}
                         </TableCell>
                         <TableCell>
                           <div className="flex justify-end gap-2">
@@ -276,7 +303,7 @@ function WorkflowPage() {
                       {isExpanded && (
                         <TableRow key={`${workflowRun.workflow_run_id}-params`}>
                           <TableCell
-                            colSpan={4}
+                            colSpan={5}
                             className="bg-slate-50 dark:bg-slate-900/50"
                           >
                             <WorkflowRunParameters
@@ -303,43 +330,68 @@ function WorkflowPage() {
             workflowPermanentId={workflowPermanentId}
             workflowRunId={openRunParams}
           />
-          <Pagination className="pt-2">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({ "cursor-not-allowed": page === 1 })}
-                  onClick={() => {
-                    if (page === 1) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set("page", String(Math.max(1, page - 1)));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  className={cn({
-                    "cursor-not-allowed":
-                      workflowRuns !== undefined &&
-                      workflowRuns.length < PAGE_SIZE,
-                  })}
-                  onClick={() => {
-                    if (workflowRuns && workflowRuns.length < PAGE_SIZE) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set("page", String(page + 1));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
+          <div className="relative px-3 py-3">
+            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <span className="text-slate-400">Items per page</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(size) => {
+                  const params = new URLSearchParams(searchParams);
+                  params.set("page_size", size);
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              >
+                <SelectTrigger className="w-[65px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((size) => (
+                    <SelectItem key={size} value={size}>
+                      {size}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Pagination className="pt-0">
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    className={cn({ "cursor-not-allowed": page === 1 })}
+                    onClick={() => {
+                      if (page === 1) {
+                        return;
+                      }
+                      const params = new URLSearchParams(searchParams);
+                      params.set("page", String(Math.max(1, page - 1)));
+                      setSearchParams(params, { replace: true });
+                    }}
+                  />
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationLink>{page}</PaginationLink>
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationNext
+                    className={cn({
+                      "cursor-not-allowed":
+                        workflowRuns !== undefined &&
+                        workflowRuns.length < pageSize,
+                    })}
+                    onClick={() => {
+                      if (workflowRuns && workflowRuns.length < pageSize) {
+                        return;
+                      }
+                      const params = new URLSearchParams(searchParams);
+                      params.set("page", String(page + 1));
+                      setSearchParams(params, { replace: true });
+                    }}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
+          </div>
         </div>
       </div>
     </div>
@@ -417,7 +469,10 @@ function WorkflowRunParameters({
     (workflow?.workflow_definition.parameters ?? []).map((p) => [p.key, p]),
   );
 
-  const parameterItems = Object.entries(run.parameters).map(([key, value]) => {
+  const parameterItems = getOrderedRunParameters(
+    workflow?.workflow_definition.parameters,
+    run.parameters,
+  ).map(([key, value]) => {
     const def = defByKey.get(key);
     const description = def && "description" in def ? def.description : null;
     return {

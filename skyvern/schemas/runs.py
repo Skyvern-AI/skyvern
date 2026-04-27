@@ -5,9 +5,10 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
     ERROR_CODE_MAPPING_EXAMPLES,
@@ -59,6 +60,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_NL = "RESIDENTIAL_NL"
     RESIDENTIAL_PH = "RESIDENTIAL_PH"
     RESIDENTIAL_KR = "RESIDENTIAL_KR"
+    RESIDENTIAL_SA = "RESIDENTIAL_SA"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -99,6 +101,7 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_NL,
             cls.RESIDENTIAL_PH,
             cls.RESIDENTIAL_KR,
+            cls.RESIDENTIAL_SA,
         }
 
     @staticmethod
@@ -124,6 +127,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_NL: 2000,
             ProxyLocation.RESIDENTIAL_PH: 2000,
             ProxyLocation.RESIDENTIAL_KR: 2000,
+            ProxyLocation.RESIDENTIAL_SA: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -150,6 +154,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_NL: "NL",
             ProxyLocation.RESIDENTIAL_PH: "PH",
             ProxyLocation.RESIDENTIAL_KR: "KR",
+            ProxyLocation.RESIDENTIAL_SA: "SA",
         }
         return mapping.get(proxy_location, "US")
 
@@ -175,6 +180,7 @@ SUPPORTED_GEO_COUNTRIES = frozenset(
         "NZ",
         "PH",
         "KR",
+        "SA",
         "TR",
         "ZA",
     }
@@ -261,7 +267,7 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
         return ZoneInfo("America/New_York")
 
     if proxy_location == ProxyLocation.US_WA:
-        return ZoneInfo("America/New_York")
+        return ZoneInfo("America/Los_Angeles")
 
     if proxy_location == ProxyLocation.RESIDENTIAL:
         return ZoneInfo("America/New_York")
@@ -323,6 +329,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     if proxy_location == ProxyLocation.RESIDENTIAL_KR:
         return ZoneInfo("Asia/Seoul")
 
+    if proxy_location == ProxyLocation.RESIDENTIAL_SA:
+        return ZoneInfo("Asia/Riyadh")
+
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")
 
@@ -361,7 +370,13 @@ class RunStatus(StrEnum):
     canceled = "canceled"
 
     def is_final(self) -> bool:
-        return self in [self.failed, self.terminated, self.canceled, self.timed_out, self.completed]
+        return self.value in TERMINAL_STATUSES
+
+
+# Statuses that are final — once a row reaches one of these, it never changes.
+# Single source of truth: used by the sync cron, the partial index, and any
+# code that needs to know whether a run is "done".
+TERMINAL_STATUSES = ("completed", "failed", "terminated", "canceled", "timed_out")
 
 
 class TaskRunRequest(BaseModel):
@@ -375,7 +390,7 @@ class TaskRunRequest(BaseModel):
         examples=TASK_URL_EXAMPLES,
     )
     engine: RunEngine = Field(
-        default=RunEngine.skyvern_v2,
+        default=RunEngine.skyvern_v1,
         description=TASK_ENGINE_DOC_STRING,
     )
     title: str | None = Field(
@@ -447,9 +462,16 @@ class TaskRunRequest(BaseModel):
     )
     run_with: str | None = Field(
         default=None,
-        description="Whether to run the task with agent or code.",
+        description="Whether to run the task with agent or code. Null means use the default.",
         examples=["agent", "code"],
     )
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return normalize_run_with(v)
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod
@@ -467,6 +489,12 @@ class TaskRunRequest(BaseModel):
             return url
 
         return validate_url(url)
+
+    @model_validator(mode="after")
+    def _force_v2_for_publish_workflow(self) -> TaskRunRequest:
+        if self.publish_workflow and self.engine != RunEngine.skyvern_v2:
+            self.engine = RunEngine.skyvern_v2
+        return self
 
 
 class WorkflowRunRequest(BaseModel):
@@ -521,8 +549,16 @@ class WorkflowRunRequest(BaseModel):
     )
     run_with: str | None = Field(
         default=None,
-        description="Whether to run the workflow with agent or code.",
+        description="Whether to run the workflow with agent or code. Null inherits from the workflow setting.",
+        examples=["agent", "code"],
     )
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return normalize_run_with(v)
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
@@ -554,7 +590,33 @@ class BlockRunRequest(WorkflowRunRequest):
 
 
 class ScriptRunResponse(BaseModel):
+    # `extra="ignore"` is the Pydantic v2 default; making it explicit
+    # pins the forward-compat guarantee (unknown keys silently dropped).
+    model_config = ConfigDict(extra="ignore")
+
+    # True iff a fallback fired during this run, flipping at least one
+    # block's execution from cached script to the agent. Writers: the two
+    # `services/script_service.py` fallback paths (script-block failure +
+    # conditional-agent episode) and the `_execute_single_block` script-
+    # failure path. `False` here does NOT imply "no AI execution" — blocks
+    # that were ALWAYS-agent (via `requires_agent`, `disable_cache`, or
+    # non-cacheable block types) never create a fallback episode and don't
+    # flip this flag. For per-block routing ground truth, consult the
+    # `Block execution mode resolved` log emitted at per-block execution
+    # time in `skyvern/forge/sdk/workflow/service.py`.
     ai_fallback_triggered: bool = False
+
+    # Identity of the cached script that was loaded for this run at
+    # workflow setup time. Non-null iff a script was loaded. Does NOT
+    # imply that every (or any) block actually executed from that cache —
+    # per-block `block_labels` filtering, `requires_agent`, `disable_cache`,
+    # or non-cacheable block types can still route individual blocks to AI.
+    # Populated by the server-side execution path (workflow/service.py) and
+    # the local CLI entrypoint (services/script_service.run_script). None
+    # on rows written by older code paths that only recorded
+    # `ai_fallback_triggered`.
+    script_id: str | None = None
+    script_revision_id: str | None = None
 
 
 class UploadFileResponse(BaseModel):
@@ -631,11 +693,17 @@ class TaskRunResponse(BaseRunResponse):
 
 class WorkflowRunResponse(BaseRunResponse):
     run_type: Literal[RunType.workflow_run] = Field(description="Type of run - always workflow_run for workflow runs")
-    run_with: str | None = Field(
-        default=None,
+    run_with: str = Field(
+        default="agent",
         description="Whether the workflow run was executed with agent or code",
         examples=["agent", "code"],
     )
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str:
+        return normalize_run_with(v)
+
     ai_fallback: bool | None = Field(
         default=None,
         description="Whether to fallback to AI if code run fails.",
@@ -650,3 +718,31 @@ RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discr
 
 class BlockRunResponse(WorkflowRunResponse):
     block_labels: list[str] = Field(description="A whitelist of block labels; only these blocks will execute")
+
+
+class TaskRunListItem(BaseModel):
+    """Lightweight run-history item backed by the task_runs table."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    task_run_id: str
+    run_id: str
+    task_run_type: str
+    status: str
+    title: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+    workflow_permanent_id: str | None = None
+    script_run: bool = False
+    searchable_text: str | None = Field(default=None, exclude=True)
+
+    @field_validator("script_run", mode="before")
+    @classmethod
+    def coerce_script_run(cls, v: Any) -> bool:
+        """Intentionally lossy: collapse dict metadata / bool / None → bool for the list view.
+
+        The full script execution metadata (dict) is available via the detail
+        endpoint's Run.script_run field.  Do not rely on dict contents here.
+        """
+        return bool(v)

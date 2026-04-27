@@ -1,0 +1,72 @@
+---
+title: update_workflow_folder
+slug: sdk-reference/workflows/update-workflow-folder
+---
+
+Move a workflow to a different folder, or remove it from its current folder.
+
+<CodeGroup>
+```python Python
+workflow = await client.update_workflow_folder(
+    "wpid_abc123",
+    folder_id="folder_456",
+)
+```
+
+```typescript TypeScript
+const workflow = await skyvern.updateWorkflowFolder("wpid_abc123", {
+  folder_id: "folder_456",
+});
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_permanent_id` | `str` | Yes | The workflow permanent ID. |
+| `folder_id` | `str` | No | Folder ID to assign. Set to `None` / `null` to remove from folder. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `Workflow`
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

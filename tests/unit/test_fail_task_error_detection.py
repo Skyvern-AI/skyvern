@@ -72,7 +72,7 @@ async def test_fail_task_with_error_code_mapping_detects_errors(agent, mock_brow
                 mock_detect.return_value = detected_errors
 
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
 
@@ -87,8 +87,8 @@ async def test_fail_task_with_error_code_mapping_detects_errors(agent, mock_brow
                     )
 
                     # Verify task errors were updated in database
-                    mock_app.DATABASE.update_task.assert_called_once()
-                    call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                    mock_app.DATABASE.tasks.update_task.assert_called_once()
+                    call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                     assert call_kwargs["task_id"] == task.task_id
                     assert call_kwargs["organization_id"] == task.organization_id
                     assert len(call_kwargs["errors"]) == 1
@@ -112,7 +112,7 @@ async def test_fail_task_without_error_code_mapping(agent, mock_browser_state):
                 new_callable=AsyncMock,
             ) as mock_detect:
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
 
@@ -122,7 +122,7 @@ async def test_fail_task_without_error_code_mapping(agent, mock_browser_state):
                     mock_detect.assert_not_called()
 
                     # Verify database update was NOT called for errors
-                    mock_app.DATABASE.update_task.assert_not_called()
+                    mock_app.DATABASE.tasks.update_task.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,7 @@ async def test_fail_task_without_browser_state(agent):
                 mock_detect.return_value = []
 
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     # Call without browser_state
                     result = await agent.fail_task(task, step, "Task failed", browser_state=None)
@@ -188,7 +188,7 @@ async def test_fail_task_without_step(agent, mock_browser_state):
                 new_callable=AsyncMock,
             ) as mock_detect:
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     # Call without step
                     result = await agent.fail_task(task, None, "Task failed", mock_browser_state)
@@ -228,7 +228,7 @@ async def test_fail_task_error_detection_fails_gracefully(agent, mock_browser_st
                 mock_detect.side_effect = Exception("Detection failed")
 
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     # Should not raise exception
                     result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
@@ -270,14 +270,14 @@ async def test_fail_task_multiple_errors_detected(agent, mock_browser_state):
                 mock_detect.return_value = detected_errors
 
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
 
                     assert result is True
 
                     # Verify only new errors were passed (DB handles appending to existing errors)
-                    call_kwargs = mock_app.DATABASE.update_task.call_args[1]
+                    call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                     assert len(call_kwargs["errors"]) == 2
                     assert call_kwargs["errors"][0]["error_code"] == "payment_failed"
                     assert call_kwargs["errors"][1]["error_code"] == "address_invalid"
@@ -308,14 +308,14 @@ async def test_fail_task_no_errors_detected(agent, mock_browser_state):
                 mock_detect.return_value = []
 
                 with patch("skyvern.forge.agent.app") as mock_app:
-                    mock_app.DATABASE.update_task = AsyncMock()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
 
                     result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
 
                     assert result is True
 
                     # Database update for errors should not be called
-                    mock_app.DATABASE.update_task.assert_not_called()
+                    mock_app.DATABASE.tasks.update_task.assert_not_called()
 
 
 @pytest.mark.asyncio

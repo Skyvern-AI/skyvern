@@ -29,7 +29,9 @@ async def await_browser_session(
     try:
         async with asyncio.timeout(timeout):
             while True:
-                persistent_browser_session = await db.get_persistent_browser_session(session_id, organization_id)
+                persistent_browser_session = await db.browser_sessions.get_persistent_browser_session(
+                    session_id, organization_id
+                )
                 if persistent_browser_session is None:
                     raise Exception(f"Persistent browser session not found for {session_id}")
 

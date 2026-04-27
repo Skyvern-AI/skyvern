@@ -28,8 +28,9 @@ export const workflowTriggerNodeDefaultData: WorkflowTriggerNodeData = {
   payload: "{}",
   waitForCompletion: true,
   browserSessionId: "",
-  useParentBrowserSession: false,
+  useParentBrowserSession: true,
   parameterKeys: [],
+  ignoreWorkflowSystemPrompt: false,
 };
 
 export function isWorkflowTriggerNode(node: Node): node is WorkflowTriggerNode {

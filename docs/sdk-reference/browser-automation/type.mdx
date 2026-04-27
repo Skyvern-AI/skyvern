@@ -1,0 +1,31 @@
+---
+title: type
+slug: sdk-reference/browser-automation/type
+---
+
+Type text character-by-character into an input field. Unlike `fill`, this triggers keystroke events for each character - use it for fields that react to individual key presses (search autocomplete, OTP inputs). Python only.
+
+```python
+# Character-by-character input
+await page.type("#search", value="query text")
+
+# AI-powered type
+await page.type(prompt="Type 'hello' into the search box")
+
+# Selector with AI fallback
+await page.type("#search", value="query text", prompt="Type into the search field")
+
+# TOTP input
+await page.type("#otp", totp_identifier="my-app", totp_url="otpauth://totp/...")
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | `str` | No | CSS or XPath selector for the input field. |
+| `value` | `str` | No | Text to type character-by-character. |
+| `ai` | `str` | No | Controls AI behavior. Default `"fallback"` tries the selector first, then AI. |
+| `prompt` | `str` | No | Natural-language description of the target field. |
+| `totp_identifier` | `str` | No | Identifier for a stored TOTP secret. |
+| `totp_url` | `str` | No | `otpauth://` URI to generate a one-time password on the fly. |
+
+Returns `str` - the resolved selector used.

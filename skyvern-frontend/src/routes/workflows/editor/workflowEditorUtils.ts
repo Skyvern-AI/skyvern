@@ -1,6 +1,5 @@
 import Dagre from "@dagrejs/dagre";
-import type { Node } from "@xyflow/react";
-import { Edge } from "@xyflow/react";
+import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
@@ -48,6 +47,8 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  GoogleSheetsReadBlockYAML,
+  GoogleSheetsWriteBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -74,6 +75,7 @@ import {
   conditionalNodeDefaultData,
   createDefaultBranchConditions,
   ConditionalNode,
+  isConditionalNode,
 } from "./nodes/ConditionalNode/types";
 import {
   isLoopNode,
@@ -113,9 +115,12 @@ import {
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
-import { loginNodeDefaultData } from "./nodes/LoginNode/types";
+import { isLoginNode, loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
-import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
+import {
+  fileDownloadNodeDefaultData,
+  isFileDownloadNode,
+} from "./nodes/FileDownloadNode/types";
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   isPdfParserNode,
@@ -132,10 +137,21 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
+import {
+  googleSheetsReadNodeDefaultData,
+  isGoogleSheetsReadNode,
+} from "./nodes/GoogleSheetsReadNode/types";
+import { validateGoogleSheetsReadNode } from "./nodes/GoogleSheetsReadNode/validate";
+import {
+  googleSheetsWriteNodeDefaultData,
+  isGoogleSheetsWriteNode,
+} from "./nodes/GoogleSheetsWriteNode/types";
+import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -384,7 +400,7 @@ function layout(
       ...childNodes.map((child) =>
         child.type === "loop"
           ? getLoopNodeWidth(child, nodes)
-          : child.measured?.width ?? 0,
+          : (child.measured?.width ?? 0),
       ),
     );
     const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
@@ -400,7 +416,20 @@ function layout(
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
+    // Use measured header height when available, fall back to 225 for initial render.
+    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
+    const conditionalHeaderHeight = isConditionalNode(node)
+      ? node.data._headerHeight
+      : undefined;
+    const conditionalBaseMargin = conditionalHeaderHeight
+      ? conditionalHeaderHeight + 28
+      : 225;
+    // Only add extra margin for the status row when using the fallback height,
+    // since the measured height already includes the status row content.
+    const marginy =
+      isTargetted && !conditionalHeaderHeight
+        ? conditionalBaseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
+        : conditionalBaseMargin;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
@@ -519,6 +548,7 @@ function convertToNode(
     nextLoopOnFailure: block.next_loop_on_failure,
     editable,
     model: block.model,
+    ignoreWorkflowSystemPrompt: block.ignore_workflow_system_prompt ?? false,
   };
   switch (block.block_type) {
     case "conditional": {
@@ -668,9 +698,9 @@ function convertToNode(
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
           // When engine is SkyvernV2, use navigation_goal as the prompt
-          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          prompt: isV2Engine ? (block.navigation_goal ?? "") : "",
           maxSteps: isV2Engine
-            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            ? (block.max_steps_per_run ?? MAX_STEPS_DEFAULT)
             : MAX_STEPS_DEFAULT,
         },
       };
@@ -819,7 +849,7 @@ function convertToNode(
       const loopVariableReference =
         block.loop_variable_reference !== null
           ? block.loop_variable_reference
-          : block.loop_over?.key ?? "";
+          : (block.loop_over?.key ?? "");
       return {
         ...identifiers,
         ...common,
@@ -847,6 +877,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           model: block.model,
         },
@@ -975,6 +1006,43 @@ function convertToNode(
         },
       };
     }
+    case "google_sheets_read": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "google_sheets_write": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          writeMode: block.write_mode ?? "append",
+          values: block.values ?? "",
+          columnMapping: block.column_mapping
+            ? JSON.stringify(block.column_mapping, null, 2)
+            : "",
+          createSheetIfMissing: block.create_sheet_if_missing ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
   }
 }
 
@@ -1091,12 +1159,16 @@ function collectLabelsForBranch(
   startLabel: string | null,
   stopLabel: string | null,
   blocksByLabel: Map<string, WorkflowBlock>,
+  excludeLabels?: Set<string>,
 ): Array<string> {
   const labels: Array<string> = [];
   const visited = new Set<string>();
   let current = startLabel ?? null;
 
   while (current && current !== stopLabel && !visited.has(current)) {
+    if (excludeLabels?.has(current)) {
+      break;
+    }
     visited.add(current);
     labels.push(current);
     const block = blocksByLabel.get(current);
@@ -1142,7 +1214,7 @@ function reconstructConditionalStructure(
   });
 
   // Process each conditional block
-  blocks.forEach((block) => {
+  blocks.forEach((block, blockIndex) => {
     if (block.block_type !== "conditional") {
       if (block.block_type === "for_loop") {
         // Recursively handle conditionals inside loops
@@ -1169,6 +1241,16 @@ function reconstructConditionalStructure(
     const conditionalNode = labelToNodeMap.get(block.label);
     if (!conditionalNode) {
       return;
+    }
+
+    // Blocks at or before this conditional must not be collected as branch
+    // children. Without this guard, next_block_label chains that loop back
+    // to earlier blocks (e.g. reporting → fetch_token) would pull the
+    // conditional itself into its own branch, setting parentId to its own id
+    // and crashing React Flow with a stack overflow.
+    const excludeLabels = new Set<string>();
+    for (let i = 0; i <= blockIndex; i++) {
+      excludeLabels.add(blocks[i]!.label);
     }
 
     // Create START and NodeAdder nodes for this conditional
@@ -1201,6 +1283,7 @@ function reconstructConditionalStructure(
         branch.next_block_label,
         block.next_block_label ?? null,
         blocksByLabel,
+        excludeLabels,
       );
 
       // Set metadata and parentId for all nodes in this branch
@@ -1505,6 +1588,7 @@ function getElements(
       extraHttpHeaders: settings.extraHttpHeaders,
       editable,
       runWith: settings.runWith,
+      codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
       label: "__start_block__",
@@ -1512,6 +1596,7 @@ function getElements(
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
+      workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
     }),
   );
 
@@ -1558,13 +1643,20 @@ function getElements(
     // conditional's own edges).
     const branchLabels = new Set<string>();
     const collectBranchLabels = (loopChildren: Array<WorkflowBlock>) => {
-      loopChildren.forEach((child) => {
+      loopChildren.forEach((child, childIndex) => {
         if (child.block_type === "conditional") {
+          // Exclude labels at or before this conditional to prevent
+          // back-reference chains from pulling in earlier blocks
+          const loopExclude = new Set<string>();
+          for (let i = 0; i <= childIndex; i++) {
+            loopExclude.add(loopChildren[i]!.label);
+          }
           child.branch_conditions.forEach((branch) => {
             collectLabelsForBranch(
               branch.next_block_label,
               child.next_block_label ?? null,
               blocksByLabel,
+              loopExclude,
             ).forEach((label) => branchLabels.add(label));
           });
         }
@@ -1584,31 +1676,20 @@ function getElements(
     if (children.length === 0) {
       edges.push(defaultEdge(startNodeId, adderNodeId));
     } else {
-      const childById = new Map<string, (typeof children)[number]>();
-      children.forEach((c) => childById.set(c.id, c));
+      // Chain children using their array order (after branch-label filtering)
+      // rather than the previous/next pointers from getNodeData. Those pointers
+      // reflect the original unfiltered array and may reference blocks that were
+      // removed as conditional branch targets, breaking the chain and leaving
+      // subsequent blocks (including merge targets) as unreachable orphans.
+      edges.push(edgeWithAddButton(startNodeId, children[0]!.id));
 
-      const firstChild =
-        children.find(
-          (c) => c.previous === null || !childById.has(c.previous),
-        ) ?? children[0]!;
-      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
-
-      let current = firstChild;
-      let lastChild = firstChild;
-      while (current) {
-        const nextChild = current.next ? childById.get(current.next) : null;
-        if (!nextChild) {
-          break;
-        }
-        edges.push(edgeWithAddButton(current.id, nextChild.id));
-        lastChild = nextChild;
-        current = nextChild;
+      for (let i = 0; i < children.length - 1; i++) {
+        edges.push(edgeWithAddButton(children[i]!.id, children[i + 1]!.id));
       }
 
+      const lastChild = children[children.length - 1]!;
       nodes.push(nodeAdderNode(adderNodeId, block.id));
-      if (lastChild) {
-        edges.push(defaultEdge(lastChild.id, adderNodeId));
-      }
+      edges.push(defaultEdge(lastChild.id, adderNodeId));
       return;
     }
 
@@ -1628,6 +1709,27 @@ function getElements(
 
   // Create top-level edges based on next_block_label (not array order!)
   // We'll filter out conditional branch blocks below by checking conditionalNodeId
+  //
+  // Detect cycles by walking the next_block_label chain (not array order, since the
+  // two can differ). React Flow crashes when rendering cyclic edge graphs.
+  const cycleBackEdgeLabels = new Set<string>();
+  {
+    const visited = new Set<string>();
+    let current = blocks[0]?.label ?? null;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const block = blocksByLabel.get(current);
+      if (!block) break;
+      const next = block.next_block_label ?? null;
+      if (next && visited.has(next)) {
+        // This block's next_block_label closes a cycle — mark it
+        cycleBackEdgeLabels.add(current);
+        break;
+      }
+      current = next;
+    }
+  }
+
   blocks.forEach((block) => {
     const sourceNode = labelToNode.get(block.label);
     if (!sourceNode || !isWorkflowBlockNode(sourceNode)) {
@@ -1642,6 +1744,10 @@ function getElements(
     // Find target block using next_block_label
     const nextLabel = block.next_block_label;
     if (nextLabel) {
+      // Skip edges that close a cycle in the next_block_label chain
+      if (cycleBackEdgeLabels.has(block.label)) {
+        return;
+      }
       const targetNode = labelToNode.get(nextLabel);
       if (targetNode) {
         edges.push(edgeWithAddButton(sourceNode.id, targetNode.id));
@@ -1665,11 +1771,13 @@ function getElements(
   if (blocks.length === 0) {
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
-    // Find the last top-level block (one with next_block_label === null and not in a branch)
-    // There might be multiple blocks with next_block_label === null (e.g., last block in nested branches)
-    // We need the one that's NOT inside any conditional
+    // Find the last top-level block: one with next_block_label === null OR
+    // one whose back-edge was skipped (cycle broken), and not in a branch
     const lastBlock = blocks.find((block) => {
-      if (block.next_block_label !== null) {
+      if (
+        block.next_block_label !== null &&
+        !cycleBackEdgeLabels.has(block.label)
+      ) {
         return false;
       }
       const node = labelToNode.get(block.label);
@@ -1760,9 +1868,9 @@ function getElements(
     const branchHidden =
       Boolean(
         conditionalNodeId &&
-          conditionalBranchId &&
-          activeBranchId &&
-          conditionalBranchId !== activeBranchId,
+        conditionalBranchId &&
+        activeBranchId &&
+        conditionalBranchId !== activeBranchId,
       ) ?? false;
 
     const nodeHidden =
@@ -2039,6 +2147,28 @@ function createNode(
         },
       };
     }
+    case "googleSheetsRead": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...googleSheetsReadNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "googleSheetsWrite": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...googleSheetsWriteNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2090,9 +2220,14 @@ function findNextBlockLabel(
       return null;
     }
 
-    // If this node itself is a conditional, prefer its own merge label
+    // If this node itself is a conditional, compute merge label from edges
+    // (not node.data.mergeLabel which may be stale from deserialization)
     if (currentNode.type === "conditional") {
-      return currentNode.data.mergeLabel ?? null;
+      return findConditionalMergeLabel(
+        currentNode as ConditionalNode,
+        nodes,
+        edges,
+      );
     }
 
     const conditionalNodeId = currentNode.data.conditionalNodeId;
@@ -2177,6 +2312,8 @@ function getWorkflowBlock(
     next_loop_on_failure: node.data.nextLoopOnFailure,
     model: node.data.model,
     next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
   };
   switch (node.type) {
     case "task": {
@@ -2450,7 +2587,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv", // Backend will auto-detect based on file extension
+        file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
@@ -2536,6 +2673,41 @@ function getWorkflowBlock(
         wait_for_completion: node.data.waitForCompletion,
         browser_session_id: node.data.browserSessionId || null,
         use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsRead": {
+      return {
+        ...base,
+        block_type: "google_sheets_read",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsWrite": {
+      let parsedColumnMapping: Record<string, string> | null = null;
+      if (node.data.columnMapping) {
+        try {
+          parsedColumnMapping = JSON.parse(node.data.columnMapping);
+        } catch {
+          // ignore invalid JSON
+        }
+      }
+      return {
+        ...base,
+        block_type: "google_sheets_write",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        write_mode: node.data.writeMode,
+        values: node.data.values,
+        column_mapping: parsedColumnMapping,
+        create_sheet_if_missing: node.data.createSheetIfMissing,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -2650,11 +2822,13 @@ function getOrderedChildrenBlocks(
 
     if (node.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
+      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
       children.push({
         block_type: "for_loop",
         label: node.data.label,
         continue_on_failure: node.data.continueOnFailure,
         next_loop_on_failure: node.data.nextLoopOnFailure,
+        next_block_label: nextBlockLabel,
         loop_blocks: loopChildren,
         loop_variable_reference: node.data.loopVariableReference,
         complete_if_empty: node.data.completeIfEmpty,
@@ -2747,12 +2921,14 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
-    runWith: "agent",
+    runWith: "code",
+    codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
+    workflowSystemPrompt: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -2774,11 +2950,13 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
           ? JSON.stringify(data.extraHttpHeaders)
           : data.extraHttpHeaders,
       runWith: data.runWith,
+      codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
+      workflowSystemPrompt: data.workflowSystemPrompt ?? null,
     };
   }
   return defaultSettings;
@@ -3632,6 +3810,8 @@ function convertBlocksToBlockYAML(
       continue_on_failure: block.continue_on_failure,
       next_loop_on_failure: block.next_loop_on_failure,
       next_block_label: block.next_block_label,
+      ignore_workflow_system_prompt:
+        block.ignore_workflow_system_prompt ?? false,
     };
     switch (block.block_type) {
       case "task": {
@@ -3973,6 +4153,35 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "google_sheets_read": {
+        const blockYaml: GoogleSheetsReadBlockYAML = {
+          ...base,
+          block_type: "google_sheets_read",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          has_header_row: block.has_header_row,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "google_sheets_write": {
+        const blockYaml: GoogleSheetsWriteBlockYAML = {
+          ...base,
+          block_type: "google_sheets_write",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          write_mode: block.write_mode,
+          values: block.values,
+          column_mapping: block.column_mapping,
+          create_sheet_if_missing: block.create_sheet_if_missing,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -3997,11 +4206,14 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
       finally_block_label: workflow.workflow_definition.finally_block_label,
+      workflow_system_prompt:
+        workflow.workflow_definition.workflow_system_prompt,
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
-    run_with: workflow.run_with,
+    run_with: workflow.run_with ?? "agent",
     adaptive_caching: workflow.adaptive_caching ?? undefined,
+    code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
@@ -4028,11 +4240,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (node.data.navigationGoal.length === 0) {
       errors.push(`${node.data.label}: Action Instruction is required.`);
     }
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   // check loop node parameters
@@ -4049,11 +4259,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   // check task node json fields
   const taskNodes = nodes.filter(isTaskNode);
   taskNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     // Validate Task data schema JSON when enabled (value different from "null")
     if (node.data.dataSchema && node.data.dataSchema !== "null") {
       const result = TSON.parse(node.data.dataSchema);
@@ -4068,11 +4276,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const validationNodes = nodes.filter(isValidationNode);
   validationNodes.forEach((node) => {
-    try {
-      JSON.parse(node.data.errorCodeMapping);
-    } catch {
-      errors.push(`${node.data.label}: Error messages is not valid JSON`);
-    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
     if (
       node.data.completeCriterion.length === 0 &&
       node.data.terminateCriterion.length === 0
@@ -4102,6 +4308,23 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         errors.push(`${node.data.label}: Prompt is required.`);
       }
     }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const loginNodes = nodes.filter(isLoginNode);
+  loginNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+  });
+
+  const fileDownloadNodes = nodes.filter(isFileDownloadNode);
+  fileDownloadNodes.forEach((node) => {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
   });
 
   const conditionalNodes = nodes.filter((node) => node.type === "conditional");
@@ -4208,6 +4431,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(`${node.data.label}: Payload - ${payloadResult.message}`);
     }
   });
+
+  nodes
+    .filter(isGoogleSheetsReadNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+
+  nodes
+    .filter(isGoogleSheetsWriteNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
 
   return errors;
 }

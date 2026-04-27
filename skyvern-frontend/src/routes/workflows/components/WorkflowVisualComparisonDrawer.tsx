@@ -124,15 +124,15 @@ function getWorkflowElements(version: WorkflowVersion) {
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,
-    runWith:
-      version.adaptive_caching && version.run_with === "code"
-        ? "code_v2"
-        : version.run_with,
+    runWith: version.run_with ?? "agent",
+    codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      version.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   return getElements(

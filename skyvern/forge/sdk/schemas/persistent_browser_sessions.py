@@ -30,6 +30,7 @@ def is_final_status(status: str | None) -> bool:
 class PersistentBrowserType(StrEnum):
     MSEdge = "msedge"
     Chrome = "chrome"
+    StealthChromium = "stealth-chromium"
 
 
 class Extensions(StrEnum):

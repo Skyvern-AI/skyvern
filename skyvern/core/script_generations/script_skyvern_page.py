@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,7 +28,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -38,12 +39,14 @@ from skyvern.webeye.actions.actions import (
     ExtractAction,
     SelectOption,
     SolveCaptchaAction,
+    TerminateAction,
 )
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     generate_totp_value,
     get_actual_value_of_parameter_if_secret,
     handle_complete_action,
+    handle_terminate_action,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
@@ -79,7 +82,7 @@ class ScriptSkyvernPage(SkyvernPage):
     async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:
         context = skyvern_context.current()
         if context and context.workflow_run_id and context.organization_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
             )
             if workflow_run:
@@ -98,7 +101,7 @@ class ScriptSkyvernPage(SkyvernPage):
     async def _get_browser_state(cls) -> BrowserState | None:
         context = skyvern_context.current()
         if context and context.workflow_run_id and context.organization_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
             )
             if workflow_run:
@@ -150,7 +153,7 @@ class ScriptSkyvernPage(SkyvernPage):
         organization_id = context.organization_id
         download_timeout = BROWSER_DOWNLOAD_TIMEOUT
         if context.task_id:
-            task = await app.DATABASE.get_task(context.task_id, organization_id=organization_id)
+            task = await app.DATABASE.tasks.get_task(context.task_id, organization_id=organization_id)
             if task and task.download_timeout:
                 download_timeout = task.download_timeout
         await check_downloading_files_and_wait_for_download_to_complete(
@@ -258,13 +261,30 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception as e:
             call.error = e
             action_status = ActionStatus.failed
-            # Note: Action status would be updated to failed here if update method existed
 
-            # Print failure in script mode
-            if context and context.script_mode:
-                print(f"  ✗ Failed: {str(e)}")
+            # Build a readable representation of the failed call.
+            # Only log the first positional arg (selector) — the second arg
+            # is often a value that could contain passwords or PII.
+            call_parts = [f"page.{fn.__name__}("]
+            if args:
+                call_parts.append(repr(args[0]))
+            key_kwargs = {k: v for k, v in kwargs.items() if k in ("selector", "prompt", "mode") and v is not None}
+            if key_kwargs:
+                if args:
+                    call_parts.append(", ")
+                call_parts.append(", ".join(f"{k}={repr(v)}" for k, v in key_kwargs.items()))
+            call_parts.append(")")
+            call_repr = "".join(call_parts)
 
-            # LLM fallback hook could go here ...
+            LOG.warning(
+                "Script action failed",
+                action_type=action.value if hasattr(action, "value") else str(action),
+                call=call_repr,
+                error=str(e),
+                script_id=context.script_id if context else None,
+                workflow_run_id=context.workflow_run_id if context else None,
+            )
+
             raise
         finally:
             # Add a small buffer between cached actions to give slow pages time to settle
@@ -304,12 +324,19 @@ class ScriptSkyvernPage(SkyvernPage):
                     pass  # Don't block if download detection fails
 
             self._record(call)
+            # Ensure selector is in kwargs for action recording (it may be a positional arg).
+            # Copy kwargs to avoid mutating the caller's dict.
+            recording_kwargs = dict(kwargs)
+            if "selector" not in recording_kwargs and args:
+                first_arg = args[0]
+                if isinstance(first_arg, str):
+                    recording_kwargs["selector"] = first_arg
             # Auto-create action after execution and store result
             await self._create_action_and_result_after_execution(
                 action_type=action,
                 intention=prompt,
                 status=action_status,
-                kwargs=kwargs,
+                kwargs=recording_kwargs,
                 call_result=call.result,
                 call_error=call.error,
                 download_triggered=download_triggered,
@@ -318,6 +345,9 @@ class ScriptSkyvernPage(SkyvernPage):
 
             # Auto-create screenshot artifact after execution
             await self._create_screenshot_after_execution()
+
+            # Auto-create HTML artifact after execution
+            await self._create_html_action_after_execution()
 
     async def _update_action_reasoning(
         self,
@@ -362,7 +392,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         except Exception:
             LOG.warning("Failed to generate action reasoning, using fallback", action_type=action_type)
-        await app.DATABASE.update_action_reasoning(
+        await app.DATABASE.workflow_params.update_action_reasoning(
             organization_id=organization_id,
             action_id=action_id,
             reasoning=reasoning,
@@ -404,9 +434,16 @@ class ScriptSkyvernPage(SkyvernPage):
             select_option = None
             response: str | None = kwargs.get("response")
             file_url = kwargs.get("file_url")
+
+            # Mask sensitive values (passwords, etc.) by checking if the
+            # input value matches any registered sensitive value on the context.
+            selector = kwargs.get("selector", "")
+            sensitive = context.sensitive_values if context else set()
+            is_sensitive = bool(call_result and str(call_result) in sensitive)
+
             if not response:
                 if action_type == ActionType.INPUT_TEXT:
-                    text = str(call_result)
+                    text = "••••••••" if is_sensitive else str(call_result)
                     response = text
                 elif action_type == ActionType.SELECT_OPTION:
                     option_value = str(call_result) or ""
@@ -459,13 +496,35 @@ class ScriptSkyvernPage(SkyvernPage):
                     created_by="script",
                 )
 
-            created_action = await app.DATABASE.create_action(action)
-            # Skip LLM reasoning in script mode — use static string instead
+            created_action = await app.DATABASE.workflow_params.create_action(action)
+            # Skip LLM reasoning in script mode — use static string instead.
+            # Build a descriptive label from the selector for the timeline.
             if context and context.script_mode:
-                await app.DATABASE.update_action_reasoning(
+                label = intention[:80] if intention else ""
+                if not label and selector:
+                    # Extract a human-readable name from the selector
+
+                    name_match = re.search(r'name="([^"]+)"', selector)
+                    id_match = re.search(r'id="([^"]+)"', selector) if not name_match else None
+                    auto_match = (
+                        re.search(r'data-automation-id="([^"]+)"', selector)
+                        if not name_match and not id_match
+                        else None
+                    )
+                    match = name_match or id_match or auto_match
+                    if match:
+                        raw = match.group(1)
+                        # Convert camelCase/kebab-case to readable: "legalName--firstName" → "First Name"
+                        readable = re.sub(r"[-_]+", " ", raw).strip()
+                        readable = re.sub(r"([a-z])([A-Z])", r"\1 \2", readable).title()
+                        label = readable
+                    else:
+                        label = selector[:60]
+                reasoning = f"Script execution: {label}" if label else "Script execution"
+                await app.DATABASE.workflow_params.update_action_reasoning(
                     organization_id=str(context.organization_id),
                     action_id=str(created_action.action_id),
-                    reasoning=f"Script execution: {intention[:80]}",
+                    reasoning=reasoning,
                 )
             else:
                 asyncio.create_task(
@@ -527,23 +586,135 @@ class ScriptSkyvernPage(SkyvernPage):
             screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
 
             if screenshot:
-                # Create a minimal Step object for artifact creation
-                step = await app.DATABASE.get_step(
+                step = await app.DATABASE.tasks.get_step(
                     context.step_id,
                     organization_id=context.organization_id,
                 )
                 if not step:
                     return
 
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    data=screenshot,
-                )
+                if context.use_artifact_bundling:
+                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                        step=step,
+                        screenshots=[screenshot],
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        workflow_run_id=context.workflow_run_id,
+                        workflow_run_block_id=context.workflow_run_block_id,
+                        run_id=context.run_id,
+                    )
+                else:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        data=screenshot,
+                    )
 
         except Exception:
-            # If screenshot creation fails, don't block execution
-            pass
+            ctx = skyvern_context.current()
+            LOG.warning(
+                "Failed to create screenshot after action",
+                step_id=ctx.step_id if ctx else None,
+                exc_info=True,
+            )
+
+    @classmethod
+    async def _create_html_action_after_execution(cls) -> None:
+        """Create an HTML_ACTION artifact after action execution.
+
+        Mirrors Agent.record_artifacts_after_action() so that cached script runs
+        produce the same HTML artifacts that customers consume via the
+        /runs/{run_id}/artifacts API.
+        """
+        try:
+            context = skyvern_context.ensure_context()
+            if not context or not context.task_id or not context.step_id:
+                return
+
+            browser_state = await cls._get_browser_state()
+            if not browser_state:
+                return
+
+            working_page = await browser_state.get_working_page()
+            if not working_page:
+                return
+
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            html = await skyvern_frame.get_content()
+
+            if html:
+                step = await app.DATABASE.tasks.get_step(
+                    context.step_id,
+                    organization_id=context.organization_id,
+                )
+                if not step:
+                    return
+
+                html_bytes = html.encode("utf-8")
+                if context.use_artifact_bundling:
+                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(
+                        step=step,
+                        html_action=html_bytes,
+                        workflow_run_id=context.workflow_run_id,
+                        workflow_run_block_id=context.workflow_run_block_id,
+                        run_id=context.run_id,
+                    )
+                else:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.HTML_ACTION,
+                        data=html_bytes,
+                    )
+
+        except Exception:
+            LOG.warning("Failed to create HTML artifact after action", exc_info=True)
+
+    @classmethod
+    async def _create_final_screenshot(cls) -> None:
+        """Create a SCREENSHOT_FINAL artifact at block completion.
+
+        Mirrors the final screenshot in Agent.send_task_response() so that cached
+        script runs produce the same end-of-block screenshot.
+        """
+        try:
+            context = skyvern_context.ensure_context()
+            if not context or not context.task_id or not context.step_id:
+                return
+
+            browser_state = await cls._get_browser_state()
+            if not browser_state:
+                return
+
+            if await browser_state.get_working_page() is None:
+                return
+
+            screenshot = await browser_state.take_fullpage_screenshot()
+
+            if screenshot:
+                step = await app.DATABASE.tasks.get_step(
+                    context.step_id,
+                    organization_id=context.organization_id,
+                )
+                if not step:
+                    return
+
+                if context.use_artifact_bundling:
+                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                        step=step,
+                        screenshots=[screenshot],
+                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                        workflow_run_id=context.workflow_run_id,
+                        workflow_run_block_id=context.workflow_run_block_id,
+                        run_id=context.run_id,
+                    )
+                else:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                        data=screenshot,
+                    )
+
+        except Exception:
+            LOG.warning("Failed to create final screenshot", exc_info=True)
 
     async def _wait_for_page_ready_before_action(self) -> None:
         """
@@ -626,21 +797,21 @@ class ScriptSkyvernPage(SkyvernPage):
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
-                # Try credential TOTP first (higher priority than webhook/totp_identifier)
-                credential_totp = try_generate_totp_from_credential(workflow_run_id)
-                if credential_totp:
-                    value = credential_totp.value
-                else:
-                    totp_value = await poll_otp_value(
-                        organization_id=organization_id,
-                        task_id=task_id,
-                        workflow_run_id=workflow_run_id,
-                        totp_verification_url=totp_url,
-                        totp_identifier=totp_identifier,
-                    )
-                    if totp_value:
-                        # use the totp verification code
-                        value = totp_value.value
+                # Render Jinja templates (e.g. "{{identifier}}") to actual parameter values
+                if totp_identifier:
+                    totp_identifier = render_template(totp_identifier)
+                if totp_url:
+                    totp_url = render_template(totp_url)
+                totp_value = await poll_otp_value(
+                    organization_id=organization_id,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    totp_verification_url=totp_url,
+                    totp_identifier=totp_identifier,
+                )
+                if totp_value:
+                    # use the totp verification code
+                    value = totp_value.value
 
         return value
 
@@ -762,40 +933,6 @@ class ScriptSkyvernPage(SkyvernPage):
         )
         return ""
 
-    async def _auto_solve_captchas(self) -> bool:
-        """Proactively detect and solve captchas after page load.
-        Returns True if a captcha was detected and solved."""
-        context = skyvern_context.current()
-        is_script = context and context.script_mode
-        try:
-            from cloud.webeye.utils.captcha import cloudflare_detect_and_wait_for_resolve
-
-            # Wait for CapMonster extension to inject its addon div into the DOM.
-            # The extension needs a moment after page load to detect any Turnstile
-            # widget and inject its overlay. We use wait_for with a short timeout
-            # so non-captcha pages only add ~5s latency (acceptable since code mode
-            # saves minutes vs agent mode).
-            capmonster_div = self.page.locator('div[class~="cm-addon-turnstile"]')
-            try:
-                await capmonster_div.wait_for(state="attached", timeout=5_000)
-            except Exception:
-                # No CapMonster div appeared — no Cloudflare captcha on this page
-                return False
-
-            if is_script:
-                print("  🔓 Cloudflare captcha detected, solving...")
-
-            detected, solved = await cloudflare_detect_and_wait_for_resolve(self.page, timeout=90)
-            if detected and is_script:
-                print(f"  {'✓' if solved else '✗'} Cloudflare captcha {'solved' if solved else 'not solved'}")
-            return detected and solved
-        except ImportError:
-            # cloud module not available (open source)
-            return False
-        except Exception:
-            LOG.warning("Auto captcha solve failed", exc_info=True)
-            return False
-
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
         url = prepend_scheme_and_validate_url(url)
@@ -841,11 +978,11 @@ class ScriptSkyvernPage(SkyvernPage):
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             # Fallback: solve directly without DB context
-            await self._auto_solve_captchas()
+            await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
-        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
-        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
         if task and step:
             solve_captcha_handler = ActionHandler._handled_action_types[ActionType.SOLVE_CAPTCHA]
             action = SolveCaptchaAction(
@@ -877,15 +1014,25 @@ class ScriptSkyvernPage(SkyvernPage):
             if context.script_mode:
                 print("  ⏭ Skipping complete() verification (--no-verify)")
             return
-        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
-        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+
+        # In script mode, add a settle delay before verification. Scripts execute
+        # actions sequentially with no pause — page.complete() fires immediately
+        # after the last click/fill. The page may still be mid-redirect or
+        # rendering the post-action state. In agent mode, the step loop naturally
+        # introduces 5-15 seconds of latency (re-scrape + LLM processing) which
+        # gives the page time to settle. This delay bridges that gap.
+        if (context.code_version or 0) >= 2:
+            await asyncio.sleep(3)
+
+        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
         if task and step:
             # CRITICAL: Update step.output with actions_and_results BEFORE validation
             # This ensures complete_verify() can access action history (including download info)
             # when checking if the goal was achieved
             await self._update_step_output_before_complete(context)
             # Refresh step to get updated output for validation
-            step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+            step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
             if not step:
                 return
 
@@ -895,11 +1042,60 @@ class ScriptSkyvernPage(SkyvernPage):
                 step_id=context.step_id,
                 step_order=step.order,
                 action_order=context.action_order,
+                # Static (pinned) scripts verify page state themselves —
+                # skip LLM verification which can reject valid completions
+                # (e.g. sign-in page with pending email verification).
+                # AI-generated cached scripts still get LLM verification.
+                verified=bool(context.is_static_script),
             )
             # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise ScriptTerminationException(result[-1].exception_message)
+
+        # Capture final full-page screenshot at block completion
+        await self._create_final_screenshot()
+
+    @action_wrap(ActionType.TERMINATE)
+    async def terminate(self, errors: list[str], **kwargs: Any) -> None:
+        context = skyvern_context.current()
+        # Only run handler inside a full workflow context (DB lookups + LLM extraction)
+        if (
+            not context
+            or not context.organization_id
+            or not context.workflow_run_id
+            or not context.task_id
+            or not context.step_id
+        ):
+            msg = "Terminate called"
+            if errors:
+                msg += ": " + "; ".join(errors)
+            raise ScriptTerminationException(msg)
+
+        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
+        if task and step:
+            action = TerminateAction(
+                organization_id=context.organization_id,
+                workflow_run_id=context.workflow_run_id,
+                task_id=context.task_id,
+                step_id=context.step_id,
+                step_order=step.order,
+                action_order=context.action_order,
+                # errors=[] is list[UserDefinedError] for LLM-extracted error codes (populated by
+                # handle_terminate_action); errors param above is list[str] for exception messaging.
+                errors=[],
+                reasoning="; ".join(errors) if errors else None,
+            )
+            try:
+                await handle_terminate_action(action, self.page, self.scraped_page, task, step)
+            except Exception:
+                LOG.warning("handle_terminate_action failed during script terminate()", exc_info=True)
+
+        msg = "Terminate called"
+        if errors:
+            msg += ": " + "; ".join(errors)
+        raise ScriptTerminationException(msg)
 
     async def _update_step_output_before_complete(self, context: skyvern_context.SkyvernContext) -> None:
         """Update step.output with actions_and_results before complete validation.
@@ -930,7 +1126,7 @@ class ScriptSkyvernPage(SkyvernPage):
             errors=errors,
         )
 
-        await app.DATABASE.update_step(
+        await app.DATABASE.tasks.update_step(
             step_id=context.step_id,
             task_id=context.task_id,
             organization_id=context.organization_id,

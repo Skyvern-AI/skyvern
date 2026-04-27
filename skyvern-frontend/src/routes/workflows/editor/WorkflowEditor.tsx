@@ -74,16 +74,16 @@ function WorkflowEditor() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
-    runWith:
-      workflow.adaptive_caching && workflow.run_with === "code"
-        ? "code_v2"
-        : workflow.run_with,
+    runWith: workflow.run_with ?? "agent",
+    codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
     finallyBlockLabel:
       workflow.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      workflow.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);

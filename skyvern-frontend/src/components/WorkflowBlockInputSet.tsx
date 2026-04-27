@@ -1,9 +1,8 @@
-import { PlusIcon } from "@radix-ui/react-icons";
+import { PlusIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useState, useEffect } from "react";
-import { Cross2Icon } from "@radix-ui/react-icons";
 import "./workflow-block-input-set.css";
 type Props = {
   onChange: (parameterKeys: Set<string>) => void;
@@ -77,7 +76,7 @@ function WorkflowBlockInputSet(props: Props) {
               <PlusIcon className="size-4" />
             </div>
           </PopoverTrigger>
-          <PopoverContent className="w-[19rem]">
+          <PopoverContent className="w-fit max-w-sm">
             <WorkflowBlockParameterSelect
               nodeId={nodeId}
               onAdd={(parameterKey) => {

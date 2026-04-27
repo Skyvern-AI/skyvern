@@ -19,7 +19,7 @@ SKILLS_DIR = Path(__file__).parent / "skills"
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 
 
-def _get_skill_dirs() -> list[Path]:
+def get_skill_dirs() -> list[Path]:
     """Return sorted list of skill directories (those containing SKILL.md)."""
     if not SKILLS_DIR.exists():
         return []
@@ -60,7 +60,7 @@ def _extract_description(skill_md: Path) -> str:
 @skill_app.command("list")
 def skill_list() -> None:
     """List all bundled skills."""
-    dirs = _get_skill_dirs()
+    dirs = get_skill_dirs()
     if not dirs:
         console.print("[red]No skills found in package. Re-install skyvern.[/red]")
         raise typer.Exit(code=1)
@@ -120,7 +120,7 @@ def skill_copy(
         shutil.copytree(src, target, dirs_exist_ok=overwrite, ignore=_ignore)
         console.print(f"[green]Copied skill '{name}' to {target.resolve()}[/green]")
     else:
-        dirs = _get_skill_dirs()
+        dirs = get_skill_dirs()
         if not dirs:
             console.print("[red]No skills found in package. Re-install skyvern.[/red]")
             raise typer.Exit(code=1)

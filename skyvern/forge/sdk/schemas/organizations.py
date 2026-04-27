@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
@@ -16,6 +16,15 @@ class Organization(BaseModel):
     domain: str | None = None
     bw_organization_id: str | None = None
     bw_collection_ids: list[str] | None = None
+    artifact_url_expiry_seconds: int | None = Field(
+        None,
+        description=(
+            "Per-org override for the lifetime of signed /v1/artifacts/{id}/content URLs, "
+            "in seconds. None means use the global default (12 hours). When set, every signed "
+            "URL minted for artifacts owned by this org is valid for this many seconds. "
+            "Bounded between 1 hour (3600) and 7 days (604800)."
+        ),
+    )
 
     created_at: datetime
     modified_at: datetime
@@ -44,6 +53,48 @@ class AzureOrganizationAuthToken(OrganizationAuthTokenBase):
     """Represents OrganizationAuthToken for Azure; defined by 3 fields: tenant_id, client_id, and client_secret"""
 
     credential: AzureClientSecretCredential
+
+
+class BitwardenCredential(BaseModel):
+    email: EmailStr = Field(..., description="Bitwarden account email")
+    master_password: str = Field(..., min_length=1, description="Bitwarden master password")
+
+
+class BitwardenCredentialSafe(BaseModel):
+    """Response-safe view of BitwardenCredential — master_password is never returned."""
+
+    email: EmailStr
+
+
+class BitwardenOrganizationAuthToken(OrganizationAuthTokenBase):
+    """Represents OrganizationAuthToken for Bitwarden; defined by 2 fields: email and master_password"""
+
+    credential: BitwardenCredential
+
+
+class BitwardenOrganizationAuthTokenSafe(OrganizationAuthTokenBase):
+    """Response-safe view — omits master_password for security."""
+
+    credential: BitwardenCredentialSafe
+
+
+class CreateBitwardenCredentialRequest(BaseModel):
+    """Request model for creating or updating a Bitwarden credential."""
+
+    credential: BitwardenCredential
+
+
+class BitwardenCredentialResponse(BaseModel):
+    """Response model for Bitwarden credential operations.
+
+    The master_password is never returned in API responses for security.
+    To update credentials, submit a new POST request with the full credential.
+    """
+
+    token: BitwardenOrganizationAuthTokenSafe = Field(
+        ...,
+        description="The Bitwarden credential (master_password redacted for security)",
+    )
 
 
 class CreateOnePasswordTokenRequest(BaseModel):
@@ -104,6 +155,12 @@ class CustomCredentialServiceConfigResponse(BaseModel):
     )
 
 
+class TestConnectionResponse(BaseModel):
+    """Response model for the custom credential service connection test."""
+
+    success: bool
+
+
 class CreateCustomCredentialServiceConfigRequest(BaseModel):
     """Request model for creating or updating custom credential service configuration."""
 
@@ -120,3 +177,21 @@ class GetOrganizationAPIKeysResponse(BaseModel):
 
 class OrganizationUpdate(BaseModel):
     max_steps_per_run: int | None = None
+    artifact_url_expiry_seconds: int | None = Field(
+        None,
+        description=(
+            "Per-org override for the lifetime of signed /v1/artifacts/{id}/content URLs, "
+            "in seconds. Bounded between 1 hour (3600) and 7 days (604800). Pass null to "
+            "leave the current value unchanged. To explicitly clear the override (and fall "
+            "back to the global 12-hour default) set ``clear_artifact_url_expiry_seconds`` "
+            "to true."
+        ),
+    )
+    clear_artifact_url_expiry_seconds: bool = Field(
+        False,
+        description=(
+            "When true, resets ``artifact_url_expiry_seconds`` to NULL — the org will use "
+            "the global 12-hour default. Mutually exclusive with a non-null value in "
+            "``artifact_url_expiry_seconds`` (the clear flag wins)."
+        ),
+    )

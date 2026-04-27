@@ -56,6 +56,7 @@ class CompleteVerifyResult(BaseModel):
 
     thoughts: str
     page_info: str | None = None
+    failure_categories: list[dict] = []
 
     def __repr__(self) -> str:
         if self.status:
@@ -160,6 +161,16 @@ class Action(BaseModel):
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"action_type={self.action_type}, "
+            f"element_id={self.element_id}, "
+            f"action_id={self.action_id}, "
+            f"status={self.status}"
+            f")"
+        )
 
     def set_has_mini_agent(self) -> None:
         """
@@ -321,6 +332,7 @@ class HoverAction(WebAction):
 
 class TerminateAction(DecisiveAction):
     action_type: ActionType = ActionType.TERMINATE
+    failure_categories: list[dict] = []
 
 
 class CompleteAction(DecisiveAction):

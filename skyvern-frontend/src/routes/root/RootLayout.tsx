@@ -7,6 +7,7 @@ import { Sidebar } from "./Sidebar";
 import { useDebugStore } from "@/store/useDebugStore";
 import { GlobalNotificationListener } from "@/components/GlobalNotificationListener";
 import { SelfHealApiKeyBanner } from "@/components/SelfHealApiKeyBanner";
+import { enable2faNotifications } from "@/util/env.ts";
 
 function RootLayout() {
   const collapsed = useSidebarStore((state) => state.collapsed);
@@ -25,7 +26,7 @@ function RootLayout() {
       <div className="h-full w-full">
         <div className={horizontalPadding}>
           <SelfHealApiKeyBanner />
-          <GlobalNotificationListener />
+          {enable2faNotifications && <GlobalNotificationListener />}
         </div>
         <Header />
         <main

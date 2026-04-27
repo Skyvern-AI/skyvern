@@ -5,7 +5,13 @@ Make sure to ONLY return the JSON object in this format with no additional text 
 {
   "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
   "thoughts": str, // Think step by step. Explain your reasoning for the status you selected.
-  "status": str // Must be one of three values: "complete", "terminate", or "continue". Use "complete" ONLY if the user goal has been fully achieved{{ " according to the complete criterion" if complete_criterion else "" }}. Use "terminate" ONLY if the goal CANNOT ever be achieved (e.g., a file doesn't exist, an error modal blocks progress permanently, or an explicit termination condition is met in the user goal). Use "continue" if the goal is not yet achieved but more steps could potentially achieve it (this is the most common case - use this when you need to wait, navigate, or try different actions).
+  "status": str, // Must be one of three values: "complete", "terminate", or "continue". Use "complete" ONLY if the user goal has been fully achieved{{ " according to the complete criterion" if complete_criterion else "" }}. Use "terminate" ONLY if the goal CANNOT ever be achieved (e.g., a file doesn't exist, an error modal blocks progress permanently, or an explicit termination condition is met in the user goal). Use "continue" if the goal is not yet achieved but more steps could potentially achieve it (this is the most common case - use this when you need to wait, navigate, or try different actions).
+  "failure_categories": array // Only populate when status is "terminate". Classify the root cause. Categories: ANTI_BOT_DETECTION (CAPTCHA, Cloudflare, bot detection), BROWSER_ERROR (crash, page closed), NAVIGATION_FAILURE (404, redirect), PAGE_LOAD_TIMEOUT (timeout), AUTH_FAILURE (login failed, MFA), LLM_REASONING_ERROR (wrong element, wrong action), CREDENTIAL_ERROR (missing credentials), ELEMENT_NOT_FOUND (target missing), WRONG_PAGE_STATE (unexpected page), DATA_EXTRACTION_FAILURE (extraction failed), INFRASTRUCTURE_ERROR (network, OOM), UNKNOWN (cannot determine). Return one or more categories ordered by likelihood.
+    [{
+        "category": str, // The category from the list above
+        "confidence_float": float, // 0.0 to 1.0
+        "reasoning": str // Brief explanation
+    }]
 }
 ```
 

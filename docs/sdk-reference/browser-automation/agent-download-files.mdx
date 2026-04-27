@@ -1,0 +1,34 @@
+---
+title: agent.download_files
+slug: sdk-reference/browser-automation/agent-download-files
+---
+
+Download files in the context of the current page.
+
+<CodeGroup>
+```python Python
+result = await page.agent.download_files(
+    "Download the latest invoice PDF",
+    download_suffix=".pdf",
+    download_timeout=30,
+)
+```
+
+```typescript TypeScript
+const result = await page.agent.downloadFiles("Download the latest invoice PDF", {
+  downloadSuffix: ".pdf",
+  downloadTimeout: 30,
+});
+```
+</CodeGroup>
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `str` / `string` | Yes | What to download. |
+| `url` | `str` / `string` | No | URL to navigate to. Defaults to current page URL. |
+| `download_suffix` / `downloadSuffix` | `str` / `string` | No | Expected file extension. |
+| `download_timeout` / `downloadTimeout` | `float` / `number` | No | Download timeout in seconds. |
+| `max_steps_per_run` / `maxStepsPerRun` | `int` / `number` | No | Max AI steps. |
+| `timeout` | `float` / `number` | No | Max wait time in seconds. Default: `1800`. |
+
+Returns `WorkflowRunResponse`.

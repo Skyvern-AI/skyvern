@@ -5,7 +5,7 @@ import pydantic.json
 import structlog
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     ArtifactModel,
@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -35,6 +36,8 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
 )
@@ -42,6 +45,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -67,6 +71,7 @@ from skyvern.webeye.actions.actions import (
     ActionType,
     CheckboxAction,
     ClickAction,
+    ClosePageAction,
     CompleteAction,
     DownloadFileAction,
     DragAction,
@@ -89,6 +94,16 @@ from skyvern.webeye.actions.actions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
+    if not raw:
+        return None
+    try:
+        return WorkflowRunTriggerType(raw)
+    except ValueError:
+        LOG.warning("Unknown trigger_type in DB, defaulting to None", trigger_type=raw)
+        return None
 
 
 def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
@@ -134,6 +149,33 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         return None
 
 
+def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
+    """
+    Serialize proxy_location for database storage.
+
+    Converts GeoTarget objects or dicts to JSON strings, passes through
+    ProxyLocation enum values as-is, and returns None for None.
+    """
+    result: str | None = None
+    if proxy_location is None:
+        result = None
+    elif isinstance(proxy_location, GeoTarget):
+        result = json.dumps(proxy_location.model_dump())
+    elif isinstance(proxy_location, dict):
+        result = json.dumps(proxy_location)
+    else:
+        # ProxyLocation enum - return the string value
+        result = str(proxy_location)
+
+    LOG.debug(
+        "Serializing proxy_location for DB",
+        input_type=type(proxy_location).__name__,
+        input_value=str(proxy_location),
+        serialized_value=result,
+    )
+    return result
+
+
 # Mapping of action types to their corresponding action classes
 ACTION_TYPE_TO_CLASS = {
     ActionType.CLICK: ClickAction,
@@ -149,6 +191,7 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.HOVER: HoverAction,
     ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
     ActionType.RELOAD_PAGE: ReloadPageAction,
+    ActionType.CLOSE_PAGE: ClosePageAction,
     ActionType.EXTRACT: ExtractAction,
     ActionType.SCROLL: ScrollAction,
     ActionType.KEYPRESS: KeypressAction,
@@ -182,6 +225,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         complete_criterion=task_obj.complete_criterion,
         terminate_criterion=task_obj.terminate_criterion,
         include_action_history_in_verification=task_obj.include_action_history_in_verification,
+        include_extracted_text=task_obj.include_extracted_text,
         webhook_callback_url=task_obj.webhook_callback_url,
         webhook_failure_reason=task_obj.webhook_failure_reason,
         totp_verification_url=task_obj.totp_verification_url,
@@ -201,6 +245,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         retry=task_obj.retry,
         max_steps_per_run=task_obj.max_steps_per_run,
         error_code_mapping=task_obj.error_code_mapping,
+        workflow_system_prompt=task_obj.workflow_system_prompt,
         errors=task_obj.errors,
         application=task_obj.application,
         model=task_obj.model,
@@ -211,9 +256,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
-        waiting_for_verification_code=task_obj.waiting_for_verification_code or False,
-        verification_code_identifier=task_obj.verification_code_identifier,
-        verification_code_polling_started_at=task_obj.verification_code_polling_started_at,
+        failure_category=task_obj.failure_category,
     )
     return task
 
@@ -257,6 +300,7 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
         reasoning_token_count=step_model.reasoning_token_count,
         cached_token_count=step_model.cached_token_count,
         step_cost=step_model.step_cost,
+        last_llm_model=step_model.last_llm_model,
         created_by=step_model.created_by,
     )
 
@@ -271,6 +315,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         domain=org_model.domain,
         bw_organization_id=org_model.bw_organization_id,
         bw_collection_ids=org_model.bw_collection_ids,
+        artifact_url_expiry_seconds=org_model.artifact_url_expiry_seconds,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
@@ -278,7 +323,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -286,6 +331,17 @@ async def convert_to_organization_auth_token(
     if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
         credential = AzureClientSecretCredential.model_validate_json(token)
         return AzureOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.bitwarden_credential:
+        credential = BitwardenCredential.model_validate_json(token)
+        return BitwardenOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),
@@ -317,11 +373,14 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_id=artifact_model.artifact_id,
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
+        bundle_key=artifact_model.bundle_key,
+        checksum=artifact_model.checksum,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
         workflow_run_block_id=artifact_model.workflow_run_block_id,
         run_id=artifact_model.run_id,
+        browser_session_id=artifact_model.browser_session_id,
         observer_cruise_id=artifact_model.observer_cruise_id,
         observer_thought_id=artifact_model.observer_thought_id,
         created_at=artifact_model.created_at,
@@ -378,11 +437,14 @@ def convert_to_workflow(
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
+        code_version=workflow_model.code_version,
         generate_script_on_terminal=workflow_model.generate_script_on_terminal,
         run_sequentially=workflow_model.run_sequentially,
         sequential_key=workflow_model.sequential_key,
         folder_id=workflow_model.folder_id,
         import_error=workflow_model.import_error,
+        created_by=workflow_model.created_by,
+        edited_by=workflow_model.edited_by,
     )
 
 
@@ -429,9 +491,11 @@ def convert_to_workflow_run(
         run_with=workflow_run_model.run_with,
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
-        waiting_for_verification_code=workflow_run_model.waiting_for_verification_code or False,
-        verification_code_identifier=workflow_run_model.verification_code_identifier,
-        verification_code_polling_started_at=workflow_run_model.verification_code_polling_started_at,
+        trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
+        workflow_schedule_id=workflow_run_model.workflow_schedule_id,
+        failure_category=workflow_run_model.failure_category,
+        ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
+        copilot_session_id=workflow_run_model.copilot_session_id,
     )
 
 
@@ -611,6 +675,7 @@ def convert_to_workflow_run_block(
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
+        error_codes=workflow_run_block_model.error_codes or [],
         engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,
         loop_values=workflow_run_block_model.loop_values,
@@ -629,6 +694,9 @@ def convert_to_workflow_run_block(
         executed_branch_expression=workflow_run_block_model.executed_branch_expression,
         executed_branch_result=workflow_run_block_model.executed_branch_result,
         executed_branch_next_block=workflow_run_block_model.executed_branch_next_block,
+        script_run=ScriptRunResponse.model_validate(workflow_run_block_model.script_run)
+        if workflow_run_block_model.script_run
+        else None,
     )
     if task:
         if task.finished_at and task.started_at:
@@ -642,6 +710,7 @@ def convert_to_workflow_run_block(
         block.terminate_criterion = task.terminate_criterion
         block.complete_criterion = task.complete_criterion
         block.include_action_history_in_verification = task.include_action_history_in_verification
+        block.include_extracted_text = task.include_extracted_text
 
     return block
 
@@ -741,3 +810,14 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         raise ValueError(f"Unsupported action type: {action_model.action_type}")
 
     return action_class(**action_data)
+
+
+def convert_to_workflow_schedule(
+    workflow_schedule_model: WorkflowScheduleModel, debug_enabled: bool = False
+) -> WorkflowSchedule:
+    if debug_enabled:
+        LOG.debug(
+            "Converting WorkflowScheduleModel to WorkflowSchedule",
+            workflow_schedule_id=workflow_schedule_model.workflow_schedule_id,
+        )
+    return WorkflowSchedule.model_validate(workflow_schedule_model)

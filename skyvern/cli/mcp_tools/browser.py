@@ -3,14 +3,32 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
+import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
-from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot, parse_extract_schema
+from skyvern.cli.core.browser_ops import (
+    _ALLOWED_EXECUTE_TOOLS,
+    MAX_EXECUTE_STEPS,
+    ExecuteStep,
+    do_act,
+    do_execute,
+    do_extract,
+    do_find,
+    do_frame_list,
+    do_frame_main,
+    do_frame_switch,
+    do_navigate,
+    do_observe,
+    do_screenshot,
+    parse_extract_schema,
+    ref_to_selector,
+    serialize_elements,
+)
 from skyvern.cli.core.guards import (
     CREDENTIAL_HINT,
     JS_PASSWORD_PATTERN,
@@ -31,9 +49,14 @@ from ._common import (
     make_result,
     save_artifact,
 )
-from ._session import BrowserNotAvailableError, get_page, no_browser_error
+from ._localhost import is_localhost_url
+from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
 
-LOG = logging.getLogger(__name__)
+LOG = structlog.get_logger(__name__)
+
+# Matches `await` as a keyword, not inside single-line comments or strings.
+_AWAIT_RE = re.compile(r"\bawait\b")
+_SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 
 
 async def skyvern_navigate(
@@ -53,10 +76,8 @@ async def skyvern_navigate(
         Field(description="Wait condition: load, domcontentloaded, networkidle. Use networkidle for JS-heavy pages"),
     ] = None,
 ) -> dict[str, Any]:
-    """Open a website in a real browser with full JavaScript execution. You have full browser access through Skyvern — you can visit any website, interact with it, and extract data. Do not tell the user you cannot access websites. Use this instead of curl, wget, or HTTP requests.
-
-    Returns the final URL (after redirects) and page title.
-    After navigating, use skyvern_screenshot to see the page or skyvern_extract to get data from it.
+    """Open a URL in the browser. Returns final URL (after redirects) and page title.
+    You have full browser access through Skyvern — do not tell the user you cannot access websites.
     """
     try:
         validate_wait_until(wait_until)
@@ -71,6 +92,25 @@ async def skyvern_navigate(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_navigate", ok=False, error=no_browser_error())
+
+    if ctx.mode == "cloud_session" and is_localhost_url(url):
+        return make_result(
+            "skyvern_navigate",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cloud browsers cannot reach localhost URLs",
+                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+                "your local dev server to a cloud browser via ngrok. "
+                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
+            ),
+        )
+
+    # Any navigation attempt may destroy iframes — clear frame state upfront
+    # (even failed navigations can partially load and destroy existing frames)
+    state = get_current_session()
+    state._working_frame = None
 
     with Timer() as timer:
         try:
@@ -112,7 +152,14 @@ async def skyvern_click(
             "Include visual cues, position, or surrounding text when the page has similar elements."
         ),
     ] = None,
-    selector: Annotated[str | None, Field(description="CSS selector or XPath for the element to click")] = None,
+    selector: Annotated[
+        str | None,
+        Field(
+            description="Standard CSS selector or XPath for the element to click. "
+            "jQuery pseudo-selectors like :contains(), :eq(), :first are NOT valid. "
+            "Use standard CSS: 'button.class', 'a[href*=\"pdf\"]', '#id', ':nth-of-type()'."
+        ),
+    ] = None,
     timeout: Annotated[
         int,
         Field(
@@ -124,10 +171,8 @@ async def skyvern_click(
     button: Annotated[str | None, Field(description="Mouse button: left, right, middle")] = None,
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
 ) -> dict[str, Any]:
-    """Click an element on the page using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_click which requires a ref from a prior browser_snapshot, this tool finds elements using natural language — no snapshot step needed.
-
-    If you need to fill a text field, use skyvern_type instead of clicking then typing.
-    For dropdowns, use skyvern_select_option. For multiple actions in sequence, prefer skyvern_act.
+    """Click an element using AI intent, CSS/XPath selector, or both.
+    For text input use skyvern_type. For dropdowns use skyvern_select_option. For multiple actions prefer skyvern_act.
     """
     if button is not None and button not in ("left", "right", "middle"):
         return make_result(
@@ -215,6 +260,269 @@ async def skyvern_click(
     )
 
 
+async def skyvern_drag(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    source_intent: Annotated[
+        str | None,
+        Field(description="Natural language description of the element to drag"),
+    ] = None,
+    source_selector: Annotated[
+        str | None,
+        Field(description="CSS selector or XPath of the drag source element"),
+    ] = None,
+    target_intent: Annotated[
+        str | None,
+        Field(description="Natural language description of where to drop the element"),
+    ] = None,
+    target_selector: Annotated[
+        str | None,
+        Field(description="CSS selector or XPath of the drop target element"),
+    ] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for elements in ms. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
+) -> dict[str, Any]:
+    """Drag an element and drop it onto another. Supports AI intent, CSS/XPath selector, or both for source and target."""
+    if not source_intent and not source_selector:
+        return make_result(
+            "skyvern_drag",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide source_intent, source_selector, or both",
+                "Describe what to drag with source_intent or target it with source_selector",
+            ),
+        )
+    if not target_intent and not target_selector:
+        return make_result(
+            "skyvern_drag",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide target_intent, target_selector, or both",
+                "Describe where to drop with target_intent or target it with target_selector",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_drag", ok=False, error=no_browser_error())
+
+    use_selectors = source_selector and target_selector and not source_intent and not target_intent
+
+    with Timer() as timer:
+        try:
+            if use_selectors:
+                await page.page.drag_and_drop(
+                    source_selector,
+                    target_selector,
+                    timeout=timeout,  # type: ignore[arg-type]
+                )
+            else:
+                src = source_intent or source_selector
+                tgt = target_intent or target_selector
+                await do_act(page, f"Drag {src} and drop it onto {tgt}")
+            timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            return make_result(
+                "skyvern_drag",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SELECTOR_NOT_FOUND,
+                    str(e),
+                    "Verify source and target selectors match elements on the page",
+                ),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_drag",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The drag operation failed"),
+            )
+
+    return make_result(
+        "skyvern_drag",
+        browser_context=ctx,
+        data={
+            "source_selector": source_selector,
+            "source_intent": source_intent,
+            "target_selector": target_selector,
+            "target_intent": target_intent,
+            "mode": "selector" if use_selectors else "ai",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_file_upload(
+    file_paths: Annotated[
+        list[str],
+        Field(
+            description="List of file paths or URLs to upload. URLs are downloaded automatically. Max 50MB per file."
+        ),
+    ],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    intent: Annotated[
+        str | None,
+        Field(
+            description="Natural language description of the file input or upload button. "
+            "Be specific: 'the Choose File button' or 'the resume upload field'."
+        ),
+    ] = None,
+    selector: Annotated[
+        str | None,
+        Field(description="CSS selector or XPath of the file input or upload button"),
+    ] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for the element in ms. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
+) -> dict[str, Any]:
+    """Upload files to a file input element. Accepts local paths or URLs (auto-downloaded).
+    Supports AI intent, CSS/XPath selector, or both to find the input.
+    """
+    if not file_paths:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "file_paths must not be empty",
+                "Provide at least one file path or URL to upload",
+            ),
+        )
+
+    ai_mode, err = _resolve_ai_mode(selector, intent)
+    if err:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide intent, selector, or both to identify the file input element",
+                "Use intent='the file upload button' or selector='input[type=file]'",
+            ),
+        )
+
+    has_urls = any(fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
+    has_local = any(not fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
+
+    if has_urls and has_local:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot mix local file paths and URLs in a single upload",
+                "Upload local files and URLs in separate calls",
+            ),
+        )
+
+    if has_urls and len(file_paths) > 1:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Multiple URL uploads are not supported in a single call — each URL replaces the previous",
+                "Call skyvern_file_upload once per URL",
+            ),
+        )
+
+    if len(file_paths) > 1 and not selector:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Multiple file upload requires a selector — intent-only supports single file",
+                "Provide selector='input[type=file]' for multi-file uploads",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            if has_urls:
+                # URLs: SDK downloads the file then sets it on the input
+                fp = file_paths[0]
+                if ai_mode is not None:
+                    await page.upload_file(
+                        selector=selector,  # type: ignore[arg-type]
+                        files=fp,
+                        prompt=intent,
+                        ai=ai_mode,
+                        timeout=timeout,
+                    )
+                else:
+                    assert selector is not None
+                    await page.upload_file(selector=selector, files=fp, timeout=timeout)
+            elif ai_mode is not None and len(file_paths) == 1:
+                # Single local file + intent: use SDK for AI element resolution
+                await page.upload_file(
+                    selector=selector,  # type: ignore[arg-type]
+                    files=file_paths[0],
+                    prompt=intent,
+                    ai=ai_mode,
+                    timeout=timeout,
+                )
+            else:
+                # Local files + selector: set directly via Playwright
+                assert selector is not None
+                locator = page.page.locator(selector).first
+                await locator.set_input_files(file_paths, timeout=timeout)
+
+            timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            return make_result(
+                "skyvern_file_upload",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SELECTOR_NOT_FOUND,
+                    str(e),
+                    "Verify the selector matches the file input or upload button",
+                ),
+            )
+        except Exception as e:
+            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            return make_result(
+                "skyvern_file_upload",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(code, str(e), "File upload failed"),
+            )
+
+    return make_result(
+        "skyvern_file_upload",
+        browser_context=ctx,
+        data={"files_count": len(file_paths), "file_paths": file_paths},
+        timing_ms=timer.timing_ms,
+    )
+
+
 async def skyvern_hover(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
@@ -236,7 +544,7 @@ async def skyvern_hover(
         ),
     ] = 30000,
 ) -> dict[str, Any]:
-    """Hover over an element to reveal tooltips, dropdown menus, or hidden content. Uses AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_hover which requires a ref from a prior snapshot, this finds elements using natural language."""
+    """Hover over an element to reveal tooltips, menus, or hidden content. Uses AI intent, CSS/XPath selector, or both."""
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
         return make_result(
@@ -329,11 +637,8 @@ async def skyvern_type(
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
 ) -> dict[str, Any]:
-    """Type text into an input field using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_type which requires a ref from a prior snapshot, this tool finds input fields using natural language — no snapshot step needed.
-
-    NEVER use this for passwords or credentials — they will be exposed in logs and conversation history. Use skyvern_login with a stored credential instead for secure authentication. Create credentials via CLI: skyvern credentials add.
-    For dropdowns, use skyvern_select_option instead. For pressing keys (Enter, Tab), use skyvern_press_key.
-    Clears existing content by default (set clear=false to append).
+    """Type text into an input field using AI intent, CSS/XPath selector, or both. Clears field by default (set clear=false to append).
+    NEVER use for passwords — use skyvern_login instead. For dropdowns use skyvern_select_option.
     """
     # Block password entry — redirect to skyvern_login
     target_text = f"{intent or ''} {selector or ''}"
@@ -459,12 +764,9 @@ async def skyvern_screenshot(
     selector: Annotated[str | None, Field(description="CSS selector to screenshot specific element")] = None,
     inline: Annotated[bool, Field(description="Return base64 data instead of file path")] = False,
 ) -> dict[str, Any]:
-    """See what's currently on the page. Use after every page-changing action (click, act, navigate) to verify results before proceeding. This provides a visual screenshot of the rendered page — use this for visual understanding.
-
-    Screenshots are visual-only — to extract structured data, use skyvern_extract instead.
-    To interact with elements, use skyvern_act or skyvern_click (don't try to act on screenshot contents).
-    By default saves to ~/.skyvern/artifacts/ and returns the file path.
-    Set inline=true to get base64 data directly (increases token usage).
+    """Capture a visual screenshot of the current page. Use after page-changing actions to verify results.
+    For structured data extraction, use skyvern_extract instead. Set full_page=true for full-page capture.
+    Set inline=true to get base64 data directly (increases token usage — avoid in loops).
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -529,11 +831,7 @@ async def skyvern_scroll(
     ] = None,
     selector: Annotated[str | None, Field(description="CSS selector of scrollable element")] = None,
 ) -> dict[str, Any]:
-    """Scroll the page or use AI to scroll a specific element into view.
-
-    Use `intent` to scroll an AI-located element into view (with or without selector for hybrid fallback).
-    Without intent, scrolls the page or a selector-targeted container by pixel amount.
-    """
+    """Scroll the page or an element into view. Use intent for AI-powered scrolling, or pixel amount for manual control."""
     valid_directions = ("up", "down", "left", "right")
     if not intent and direction not in valid_directions:
         return make_result(
@@ -864,15 +1162,30 @@ async def skyvern_wait(
     )
 
 
+def _wrap_async_iife(expression: str) -> str:
+    """Wrap expressions containing ``await`` in an async IIFE so page.evaluate() can run them.
+
+    Single-line: ``(async () => { return <expr> })()`` — implicit return.
+    Multi-line:  ``(async () => { <expr> })()`` — caller must use explicit return.
+    Already-wrapped or no ``await``: returned unchanged.
+    """
+    if expression.lstrip().startswith("(async"):
+        return expression
+    stripped = _SINGLE_LINE_COMMENT_RE.sub("", expression)
+    if not _AWAIT_RE.search(stripped):
+        return expression
+    if "\n" in expression:
+        return f"(async () => {{ {expression} }})()"
+    return f"(async () => {{ return {expression} }})()"
+
+
 async def skyvern_evaluate(
     expression: Annotated[str, "JavaScript expression to evaluate"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Run JavaScript on the page to read DOM state, get URLs, check values, or discover CSS selectors for faster subsequent actions.
-
-    Security: This executes arbitrary JS in the page context. Only use with trusted expressions.
-    """
+    """Run JavaScript on the page. Supports await (auto-wrapped in async IIFE). For multi-line await, use explicit return.
+    Security: executes in page context — use only with trusted expressions."""
     # Block JS that sets password field values
     if JS_PASSWORD_PATTERN.search(expression):
         return make_result(
@@ -885,6 +1198,8 @@ async def skyvern_evaluate(
             ),
         )
 
+    js = _wrap_async_iife(expression)
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -892,7 +1207,7 @@ async def skyvern_evaluate(
 
     with Timer() as timer:
         try:
-            result = await page.evaluate(expression)
+            result = await page.evaluate(js)
             timer.mark("sdk")
         except Exception as e:
             return make_result(
@@ -919,11 +1234,8 @@ async def skyvern_extract(
         str | None, Field(description="JSON Schema string defining the expected output structure")
     ] = None,
 ) -> dict[str, Any]:
-    """Get structured data from any website — prices, listings, articles, tables, contact info, etc. Use this instead of writing scraping code, curl commands, or guessing API endpoints. Describe what you need in natural language and get JSON back.
-
-    Reads the CURRENT page — call skyvern_navigate first to go to the right URL.
-    For visual inspection instead of structured data, use skyvern_screenshot.
-    Optionally provide a JSON `schema` to enforce the output structure (pass as a JSON string).
+    """Extract structured data from the current page using AI with screenshots and a dedicated extraction LLM.
+    Navigate first. Optionally provide a JSON schema to enforce output structure. For visual-only inspection use skyvern_screenshot.
     """
     if schema is not None:
         try:
@@ -944,7 +1256,7 @@ async def skyvern_extract(
 
     with Timer() as timer:
         try:
-            result = await do_extract(page, prompt, schema=parsed_schema)
+            result = await do_extract(page, prompt, schema=parsed_schema, skip_refresh=True)
             timer.mark("sdk")
         except GuardError as e:
             return make_result(
@@ -979,10 +1291,8 @@ async def skyvern_validate(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Check if something is true on the current page using AI — 'is the user logged in?', 'does the cart have 3 items?', 'is the form submitted?'
-
-    Reads the CURRENT page — navigate first. Returns true/false.
-    To extract data (not just check a condition), use skyvern_extract instead.
+    """Check if a condition is true on the current page — cheapest AI option for yes/no questions.
+    Navigate first. Returns boolean. To extract data, use skyvern_extract instead.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -1015,13 +1325,9 @@ async def skyvern_act(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Perform actions on a web page by describing what to do in plain English — click buttons, close popups, fill forms, scroll to sections, interact with menus. Replaces multi-step snapshot→click→snapshot→click sequences with a single natural language instruction.
-
-    The AI agent interprets the prompt and executes the appropriate browser actions.
-    You can chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
-    NEVER include passwords or credentials in the prompt. Use skyvern_login with a stored credential instead. Create credentials via CLI: skyvern credentials add.
-    For multi-step automations (4+ pages), use skyvern_workflow_create with one block per step.
-    For quick one-off multi-page tasks, use skyvern_run_task.
+    """Perform actions on a page by describing what to do in plain English. No screenshots in reasoning — uses economy a11y tree.
+    Chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
+    For visually complex targets, use skyvern_observe + skyvern_click with refs. NEVER include passwords — use skyvern_login.
     """
     try:
         check_password_prompt(prompt)
@@ -1039,7 +1345,7 @@ async def skyvern_act(
 
     with Timer() as timer:
         try:
-            result = await do_act(page, prompt)
+            result = await do_act(page, prompt, skip_refresh=True, use_economy_tree=True)
             timer.mark("sdk")
         except GuardError as e:
             return make_result(
@@ -1085,13 +1391,8 @@ async def skyvern_run_task(
         int, Field(description="Timeout in seconds (default 180s = 3 minutes)", ge=10, le=1800)
     ] = 180,
 ) -> dict[str, Any]:
-    """Run a quick, one-off web task via an autonomous AI agent. Nothing is saved — use for throwaway tests and exploration only. Best for tasks describable in 2-3 sentences.
-
-    Always uses engine 2.0 (planning agent) — the engine cannot be changed. For simple single-goal
-    tasks, a workflow with engine 1.0 blocks is cheaper and more reliable.
-
-    For anything reusable, multi-step, or worth keeping, use skyvern_workflow_create instead — it produces a versioned, rerunnable workflow with per-step observability.
-    For simple single-step actions on the current page, use skyvern_act instead.
+    """Run a one-off exploratory task via autonomous AI agent. Nothing is saved — throwaway only.
+    For anything reusable, scheduled, or worth keeping, use skyvern_workflow_create instead. Always uses engine 2.0.
     """
     # Block password/credential actions — redirect to skyvern_login
     if PASSWORD_PATTERN.search(prompt):
@@ -1109,6 +1410,20 @@ async def skyvern_run_task(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_run_task", ok=False, error=no_browser_error())
+
+    if url and ctx.mode == "cloud_session" and is_localhost_url(url):
+        return make_result(
+            "skyvern_run_task",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cloud browsers cannot reach localhost URLs",
+                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+                "your local dev server to a cloud browser via ngrok. "
+                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
+            ),
+        )
 
     parsed_schema: dict[str, Any] | str | None = None
     if data_extraction_schema is not None:
@@ -1191,11 +1506,8 @@ async def skyvern_login(
     totp_url: Annotated[str | None, Field(description="URL to fetch TOTP codes")] = None,
     timeout_seconds: Annotated[int, Field(description="Timeout in seconds (default 180)", ge=10, le=600)] = 180,
 ) -> dict[str, Any]:
-    """Log into a website using stored credentials from Skyvern, Bitwarden, 1Password, or Azure Vault. Passwords are never exposed in prompts.
-
-    Requires a browser session. The AI agent handles the full login flow — finding fields, entering credentials, handling 2FA — so you don't need to write selectors.
-    After login, use skyvern_screenshot to verify success, then continue with other browser tools.
-    """
+    """Log into a website using stored credentials. AI handles the full login flow including 2FA. Passwords never exposed.
+    Create credentials via CLI: skyvern credentials add."""
     # Validate credential_type
     try:
         cred_type = CredentialType(credential_type)
@@ -1308,6 +1620,541 @@ async def skyvern_login(
             "recording_url": response.recording_url,
             "app_url": response.app_url,
             "sdk_equivalent": f"await page.agent.login(credential_type=CredentialType.{cred_type.name})",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_frame_switch(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    selector: Annotated[
+        str | None,
+        Field(description="CSS selector for the iframe element (e.g., '#payment-frame', 'iframe[name=checkout]')"),
+    ] = None,
+    name: Annotated[str | None, Field(description="Frame name attribute")] = None,
+    index: Annotated[
+        int | None, Field(description="Frame index (0 = main). Use skyvern_frame_list to find indices")
+    ] = None,
+) -> dict[str, Any]:
+    """Switch into an iframe so subsequent actions target elements inside it. Use skyvern_frame_main to switch back."""
+    params = sum(p is not None for p in (selector, name, index))
+    if params != 1:
+        return make_result(
+            "skyvern_frame_switch",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Exactly one of selector, name, or index is required",
+                "Use skyvern_frame_list to discover frames, then pass selector, name, or index",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_frame_switch", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            result = await do_frame_switch(page, selector=selector, name=name, index=index)
+            timer.mark("sdk")
+
+            # Persist frame on session state for subsequent MCP calls
+            state = get_current_session()
+            state._working_frame = page._working_frame
+        except ValueError as e:
+            return make_result(
+                "skyvern_frame_switch",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use skyvern_frame_list to find valid frames"),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_frame_switch",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The iframe may not be loaded yet — try waiting"),
+            )
+
+    return make_result(
+        "skyvern_frame_switch",
+        browser_context=ctx,
+        data={
+            "frame_name": result.name,
+            "frame_url": result.url,
+            "switched_by": "selector" if selector else ("name" if name else "index"),
+            "sdk_equivalent": (
+                f'await page.frame_switch(selector="{selector}")'
+                if selector
+                else f'await page.frame_switch(name="{name}")'
+                if name
+                else f"await page.frame_switch(index={index})"
+            ),
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_frame_main(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Switch back to the main page frame after working inside an iframe.
+
+    Call this after skyvern_frame_switch when you're done interacting with iframe content
+    and want subsequent actions to target the main page again.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_frame_main", ok=False, error=no_browser_error())
+
+    do_frame_main(page)
+
+    # Clear frame on session state
+    state = get_current_session()
+    state._working_frame = None
+
+    return make_result(
+        "skyvern_frame_main",
+        browser_context=ctx,
+        data={"status": "switched_to_main_frame", "sdk_equivalent": "page.frame_main()"},
+    )
+
+
+async def skyvern_frame_list(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """List all frames (including iframes) on the current page.
+
+    Returns each frame's index, name, URL, and whether it's the main frame.
+    Use the index, name, or a CSS selector with skyvern_frame_switch to enter an iframe.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_frame_list", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            frames = await do_frame_list(page)
+            timer.mark("sdk")
+        except Exception as e:
+            return make_result(
+                "skyvern_frame_list",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Ensure a page is loaded first"),
+            )
+
+    return make_result(
+        "skyvern_frame_list",
+        browser_context=ctx,
+        data={
+            "frames": [{"index": f.index, "name": f.name, "url": f.url, "is_main": f.is_main} for f in frames],
+            "count": len(frames),
+            "sdk_equivalent": "await page.frame_list()",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_find(
+    by: Annotated[
+        str,
+        Field(description="Locator type: role, text, label, placeholder, alt, testid"),
+    ],
+    value: Annotated[
+        str,
+        Field(description="The text, role, label, placeholder, alt text, or test ID to match"),
+    ],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+) -> dict[str, Any]:
+    """Find elements using a semantic locator API — by role, text, label, placeholder, alt text, or test ID.
+    Returns match count, text content, and visibility. Use to verify elements exist before interacting.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_find", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            result = await do_find(page, by=by, value=value)
+            timer.mark("find")
+        except GuardError as e:
+            return make_result(
+                "skyvern_find",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_find",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check the locator type and value"),
+            )
+
+    return make_result(
+        "skyvern_find",
+        browser_context=ctx,
+        data={
+            "selector": result.selector,
+            "count": result.count,
+            "first_text": result.first_text,
+            "first_visible": result.first_visible,
+            "sdk_equivalent": f"page.{result.selector}",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def _ensure_clipboard_permissions(page: Any) -> None:
+    """Grant clipboard permissions on the browser context (lazy, idempotent)."""
+    try:
+        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    except Exception:
+        LOG.debug("clipboard_permission_grant_skipped", exc_info=True)
+
+
+async def skyvern_clipboard_read(
+    session_id: Annotated[str | None, Field(description="Browser session ID.")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
+) -> dict[str, Any]:
+    """Read text from the browser clipboard (whatever was last copied via Ctrl+C or clipboard_write).
+
+    Returns the current clipboard text content. Requires secure context
+    (HTTPS or localhost). Clipboard permissions are granted automatically
+    on first use.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            await _ensure_clipboard_permissions(page)
+            text = await page.evaluate("() => navigator.clipboard.readText()")
+            timer.mark("clipboard_read")
+        except Exception as e:
+            return make_result(
+                "skyvern_clipboard_read",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)"
+                ),
+            )
+
+    return make_result(
+        "skyvern_clipboard_read",
+        browser_context=ctx,
+        data={"text": text},
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_clipboard_write(
+    text: Annotated[str, Field(description="Text to write to the clipboard.")],
+    session_id: Annotated[str | None, Field(description="Browser session ID.")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
+) -> dict[str, Any]:
+    """Copy text to the browser clipboard (as if the user pressed Ctrl+C).
+
+    The text can then be pasted into form fields or read back with
+    clipboard_read. Requires secure context (HTTPS or localhost).
+    Clipboard permissions are granted automatically on first use.
+    """
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            await _ensure_clipboard_permissions(page)
+            await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
+            timer.mark("clipboard_write")
+        except Exception as e:
+            return make_result(
+                "skyvern_clipboard_write",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)"
+                ),
+            )
+
+    return make_result(
+        "skyvern_clipboard_write",
+        browser_context=ctx,
+        data={"written": True, "length": len(text)},
+        timing_ms=timer.timing_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observe — scoped accessibility tree snapshot
+# ---------------------------------------------------------------------------
+
+
+async def skyvern_observe(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    selector: Annotated[
+        str | None,
+        Field(description="CSS selector to scope the snapshot (e.g., 'form#login'). Omit for full page."),
+    ] = None,
+    interactive_only: Annotated[
+        bool,
+        Field(description="Only return interactive elements (buttons, inputs, links). Default true."),
+    ] = True,
+    max_elements: Annotated[
+        int,
+        Field(description="Max elements to return. Default 50.", ge=1, le=200),
+    ] = 50,
+) -> dict[str, Any]:
+    """Snapshot interactive page elements with stable refs (e0, e1, ...) for use in skyvern_execute batches."""
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_observe", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            result = await do_observe(
+                page,
+                selector=selector,
+                interactive_only=interactive_only,
+                max_elements=max_elements,
+            )
+            timer.mark("sdk")
+        except Exception as e:
+            return make_result(
+                "skyvern_observe",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page is loaded"),
+            )
+
+    elements = serialize_elements(result.elements)
+    hint = (
+        f"Found {result.element_count} interactive elements"
+        f"{f' (of {result.total_on_page} total on page)' if result.total_on_page > result.element_count else ''}. "
+        "Use these refs in skyvern_execute steps, e.g.: "
+        '{tool: "click", params: {ref: "e0"}}'
+    )
+    return make_result(
+        "skyvern_observe",
+        browser_context=ctx,
+        data={
+            "url": result.url,
+            "title": result.title,
+            "elements": elements,
+            "element_count": result.element_count,
+            "total_on_page": result.total_on_page,
+            "hint": hint,
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Execute — batch multi-step execution
+# ---------------------------------------------------------------------------
+
+# DESIGN-1: Maps execute step tool names to existing MCP tool function names.
+# Dispatch through existing tools to inherit security guards.
+_TOOL_NAME_MAP: dict[str, str] = {
+    "navigate": "skyvern_navigate",
+    "click": "skyvern_click",
+    "type": "skyvern_type",
+    "press_key": "skyvern_press_key",
+    "select_option": "skyvern_select_option",
+    "hover": "skyvern_hover",
+    "scroll": "skyvern_scroll",
+    "wait": "skyvern_wait",
+    "screenshot": "skyvern_screenshot",
+    "evaluate": "skyvern_evaluate",
+}
+
+# Accepted user-facing params for each dispatched tool (excludes session_id/cdp_url).
+_TOOL_ACCEPTED_PARAMS: dict[str, frozenset[str]] = {
+    "navigate": frozenset({"url", "timeout", "wait_until"}),
+    "click": frozenset({"intent", "selector", "timeout", "click_count", "button"}),
+    "type": frozenset({"text", "intent", "selector", "clear_first", "press_enter", "timeout"}),
+    "press_key": frozenset({"key", "intent", "selector"}),
+    "select_option": frozenset({"value", "intent", "selector", "timeout", "by_label"}),
+    "hover": frozenset({"intent", "selector", "timeout"}),
+    "scroll": frozenset({"direction", "amount", "intent", "selector"}),
+    "wait": frozenset({"time_ms", "intent", "selector", "state", "timeout", "poll_interval_ms"}),
+    "screenshot": frozenset({"full_page", "selector", "inline"}),
+    "evaluate": frozenset({"expression"}),
+}
+
+
+async def _dispatch_step(
+    step: ExecuteStep,
+    ref_map: dict[str, dict[str, Any]],
+    session_id: str | None,
+    cdp_url: str | None,
+) -> dict[str, Any] | None:
+    """Route a step to the appropriate handler, resolving refs to selectors."""
+    params = dict(step.params)
+
+    # Resolve ref to selector if present
+    if ref := params.pop("ref", None):
+        elem = ref_map.get(ref)
+        if not elem:
+            raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
+        params["selector"] = ref_to_selector(elem)
+
+    # Observe is handled inline (not an existing MCP tool)
+    if step.tool == "observe":
+        from skyvern.cli.core.browser_ops import do_observe as _do_observe
+
+        page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
+        accepted = {"selector", "interactive_only", "max_elements"}
+        filtered = {k: v for k, v in params.items() if k in accepted}
+        result = await _do_observe(page, **filtered)
+        return {
+            "elements": serialize_elements(result.elements),
+            "element_count": result.element_count,
+            "total_on_page": result.total_on_page,
+        }
+
+    # DESIGN-1: Dispatch through existing MCP tool functions via module lookup
+    import skyvern.cli.mcp_tools.browser as _browser_mod
+
+    fn_name = _TOOL_NAME_MAP.get(step.tool)
+    if fn_name is None:
+        raise ValueError(f"Unknown tool '{step.tool}' — allowed: {sorted(_ALLOWED_EXECUTE_TOOLS)}")
+
+    tool_fn = getattr(_browser_mod, fn_name)
+
+    # Filter params to only those accepted by the target tool to prevent
+    # TypeError from unexpected keyword arguments.
+    accepted_params = _TOOL_ACCEPTED_PARAMS.get(step.tool, frozenset())
+    filtered_params = {k: v for k, v in params.items() if k in accepted_params}
+    filtered_params["session_id"] = session_id
+    filtered_params["cdp_url"] = cdp_url
+
+    tool_result = await tool_fn(**filtered_params)
+
+    if not tool_result.get("ok", False):
+        error = tool_result.get("error", {})
+        raise RuntimeError(error.get("message", "Tool execution failed"))
+
+    return tool_result.get("data")
+
+
+async def skyvern_execute(
+    steps: Annotated[
+        list[dict[str, Any]],
+        Field(description="Array of {tool, params} step objects to execute sequentially"),
+    ],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    stop_on_error: Annotated[
+        bool,
+        Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
+    ] = True,
+) -> dict[str, Any]:
+    """Execute multiple browser operations in a single batch. Each step is {tool, params} using refs from skyvern_observe.
+    Allowed tools: navigate, click, type, press_key, select_option, hover, scroll, wait, observe, screenshot, evaluate."""
+    if not steps:
+        return make_result(
+            "skyvern_execute",
+            data={
+                "steps_completed": 0,
+                "steps_total": 0,
+                "results": [],
+                "error_step": None,
+            },
+        )
+
+    if len(steps) > MAX_EXECUTE_STEPS:
+        return make_result(
+            "skyvern_execute",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Too many steps: {len(steps)} (max {MAX_EXECUTE_STEPS})",
+                f"Split into multiple skyvern_execute calls of {MAX_EXECUTE_STEPS} steps or fewer",
+            ),
+        )
+
+    # Validate step structure and tool names upfront
+    parsed_steps: list[ExecuteStep] = []
+    for i, raw in enumerate(steps):
+        tool = raw.get("tool")
+        if not tool:
+            return make_result(
+                "skyvern_execute",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Step {i} missing 'tool' field",
+                    "Each step must have {tool: 'name', params: {...}}",
+                ),
+            )
+        if tool not in _ALLOWED_EXECUTE_TOOLS:
+            return make_result(
+                "skyvern_execute",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Step {i}: unknown tool '{tool}'",
+                    f"Allowed tools: {sorted(_ALLOWED_EXECUTE_TOOLS)}",
+                ),
+            )
+        parsed_steps.append(ExecuteStep(tool=tool, params=raw.get("params", {})))
+
+    # Verify we can reach the browser before executing anything
+    try:
+        await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_execute", ok=False, error=no_browser_error())
+
+    async def dispatch(step: ExecuteStep, ref_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        return await _dispatch_step(step, ref_map, session_id=session_id, cdp_url=cdp_url)
+
+    with Timer() as timer:
+        result = await do_execute(dispatch, parsed_steps, stop_on_error=stop_on_error)
+        timer.mark("sdk")
+
+    step_results = []
+    for sr in result.results:
+        entry: dict[str, Any] = {"step": sr.step, "tool": sr.tool, "ok": sr.ok, "wall_ms": sr.wall_ms}
+        if sr.data:
+            entry["data"] = sr.data
+        if sr.error:
+            entry["error"] = sr.error
+        step_results.append(entry)
+
+    return make_result(
+        "skyvern_execute",
+        ok=result.error_step is None,
+        data={
+            "steps_completed": result.steps_completed,
+            "steps_total": result.steps_total,
+            "results": step_results,
+            "error_step": result.error_step,
         },
         timing_ms=timer.timing_ms,
     )

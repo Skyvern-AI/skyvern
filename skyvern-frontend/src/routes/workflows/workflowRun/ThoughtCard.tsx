@@ -8,14 +8,17 @@ type Props = {
   active: boolean;
   thought: ObserverThought;
   onClick: (thought: ObserverThought) => void;
+  cardClassName?: string;
 };
 
-function ThoughtCard({ thought, onClick, active }: Props) {
+function ThoughtCard({ thought, onClick, active, cardClassName }: Props) {
   return (
     <RunCard
       active={active}
       onClick={() => onClick(thought)}
-      className="space-y-3 p-4"
+      className={
+        cardClassName ? `space-y-3 p-4 ${cardClassName}` : "space-y-3 p-4"
+      }
     >
       <div className="flex justify-between">
         <div className="flex gap-3">
@@ -28,7 +31,7 @@ function ThoughtCard({ thought, onClick, active }: Props) {
         </StatusPill>
       </div>
       {(thought.answer || thought.thought) && (
-        <div className="text-xs text-slate-400">
+        <div className="break-words text-xs text-slate-400">
           {thought.answer || thought.thought}
         </div>
       )}

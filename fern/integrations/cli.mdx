@@ -12,34 +12,28 @@ The `skyvern` CLI gives you direct access to browser automation, workflow manage
 pip install skyvern
 ```
 
-Sign up and get your API key in one step:
+## Getting started
+
+Two commands to go from install to working MCP:
 
 ```bash
-skyvern signup
+skyvern login   # opens browser, authenticates, saves API key
+skyvern setup   # auto-detects your AI tools, configures MCP for all of them
 ```
 
-This opens a browser, walks you through account creation (or login), and saves your API key locally. No manual copy-paste needed.
+`login` handles both new signups and returning users. `setup` detects Claude Code, Cursor, Windsurf, and Claude Desktop, then writes the correct MCP config for each one. Pass `--api-key YOUR_KEY` to either command if you already have a key.
 
-Already have an API key? Set it directly:
-
-```bash
-export SKYVERN_API_KEY="YOUR_KEY"
-```
-
-Optionally run the interactive setup wizard to configure your full environment (LLM provider, database, browser mode):
-
-```bash
-skyvern init
-```
+<Tip>
+Don't want to install the CLI? You can also copy-paste the MCP config JSON directly — see [MCP Server](/integrations/mcp) for the zero-install path.
+</Tip>
 
 ## Command reference
 
 ### Onboarding
 
 ```bash
-skyvern signup                # Sign up / login via browser — saves API key automatically
-skyvern init                  # Interactive setup wizard (LLM, database, browser)
-skyvern quickstart            # One-command setup + start
+skyvern login                 # Authenticate via browser — saves API key locally
+skyvern setup                 # Auto-detect AI tools and configure MCP for all of them
 ```
 
 ### Services
@@ -156,22 +150,47 @@ skyvern block validate --file block.json   # Validate a block definition
 
 ### MCP setup
 
-Register Skyvern's MCP server with your AI coding tool in one command:
+Register Skyvern's MCP server with your AI coding tools:
 
 ```bash
-skyvern setup claude-code        # Register with Claude Code (global)
-skyvern setup claude-code --project  # Register with Claude Code (project-level)
-skyvern setup claude-desktop     # Register with Claude Desktop
-skyvern setup cursor             # Register with Cursor
-skyvern setup windsurf           # Register with Windsurf
-skyvern setup codex              # Register with Codex
+skyvern setup                        # Auto-detect all tools and configure at once
+skyvern setup claude-code            # Auto: .mcp.json in a project, ~/.claude.json otherwise
+skyvern setup claude-code --project  # Force project-local Claude Code config
+skyvern setup claude-code --global   # Force global Claude Code config
+skyvern setup claude-code --skip-skills  # MCP only, no skills
+skyvern setup claude                 # Configure Claude Desktop only
+skyvern setup cursor                 # Configure Cursor only
+skyvern setup windsurf               # Configure Windsurf only
+skyvern mcp switch                   # Interactively switch existing Skyvern MCP configs
+skyvern mcp switch --dry-run         # Preview changes without writing files
+skyvern mcp profile list             # List saved switch sources
+skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
+
+Use bare `skyvern setup` to configure everything at once. The per-tool subcommands are for when you only want to target one tool.
+
+`skyvern setup claude-code` writes the MCP config **and** copies bundled skills (including `/qa`) into your project's `.claude/skills/` directory. In a project, the default target is `.mcp.json`; use `--global` to override. Use `--skip-skills` to opt out.
+
+For Claude Desktop on macOS or Windows, the recommended no-Node path is the downloadable `.mcpb` bundle in [MCP Server](/integrations/mcp). `skyvern setup claude` still writes the manual `mcp-remote` JSON bridge, so remote mode requires Node.js unless you use the bundle.
+
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, and Codex configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
+
+### Self-hosted setup
+
+These commands are for running Skyvern on your own infrastructure. If you're using Skyvern Cloud, you don't need them — `skyvern login` + `skyvern setup` is all you need.
+
+```bash
+skyvern init                     # Full interactive wizard (PostgreSQL, LLM providers, browser, .env)
+skyvern init browser             # Initialize browser configuration only
+skyvern quickstart               # One-command init + start
+```
+
+For the local self-hosted Claude Code path, `skyvern quickstart` or `skyvern init` can also configure MCP during the interactive wizard. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the connection fully local for localhost testing.
 
 ### Other
 
 ```bash
 skyvern docs                     # Open documentation in your browser
-skyvern init browser             # Initialize browser configuration only
 ```
 
 ## CLI vs MCP: when to use which
@@ -190,30 +209,34 @@ The CLI and MCP server share the same underlying logic. The CLI is for humans an
 
 ## Skills
 
-Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools — they are documentation that an AI agent can load to learn the CLI and API.
+Skills are bundled markdown files that teach AI coding tools how to use Skyvern. They ship with `pip install skyvern` and are **automatically installed** when you run `skyvern setup claude-code` or choose Claude Code during `skyvern init` / `skyvern quickstart`.
+
+| Skill | What it does |
+|-------|-------------|
+| **qa** | Reads your `git diff`, generates browser tests, runs them against your dev server, reports pass/fail with screenshots. Invoke with `/qa` in Claude Code. |
+| **skyvern** | CLI reference covering all browser automation, workflow, and credential commands. |
+| **testing** | Smoke tests for verifying Skyvern deployments. |
 
 ```bash
 skyvern skill list                  # List available skills
-skyvern skill show skyvern          # Render a skill in the terminal
-skyvern skill path skyvern          # Print the absolute path to a skill file
-skyvern skill path                  # Print the skills directory
-skyvern skill copy --output ./docs  # Copy all skills to a local directory
-skyvern skill copy skyvern -o .     # Copy a single skill
+skyvern skill show qa               # Render a skill in the terminal
+skyvern skill copy --output .claude/skills  # Copy all skills manually
+skyvern skill copy qa -o .claude/skills     # Copy a single skill
 ```
 
 <Accordion title="Loading skills into AI tools">
 
-Skills are plain markdown files. You can load them into any AI coding tool that supports custom instructions:
+Skills are plain markdown files. Load them into any AI coding tool that supports custom instructions:
 
-**Claude Code** — add the skill path as a custom instructions file or use `skyvern setup claude-code` which configures MCP (the richer integration path).
+**Claude Code** — run `skyvern quickstart` or `skyvern init`, then choose Claude Code during MCP setup. You can also run `skyvern setup claude-code` later. Both paths register the MCP server and install skills into `.claude/skills/`. The `/qa` skill is immediately available.
 
-**Codex** — copy the skill into your project's `.codex/skills/` directory:
+**Codex** — copy skills into your project's `.codex/skills/` directory:
 
 ```bash
-skyvern skill copy skyvern -o .codex/skills/
+skyvern skill copy -o .codex/skills/
 ```
 
-**Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
+**Any tool** — point your tool at the file path returned by `skyvern skill path qa`.
 
 </Accordion>
 

@@ -1,0 +1,10 @@
+{
+  "name": "skyvern-claude-desktop-mcpb",
+  "version": "0.0.0-private",
+  "private": true,
+  "description": "Claude Desktop MCP bundle for Skyvern Cloud",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "mcp-remote": "0.1.38"
+  }
+}

@@ -1,0 +1,73 @@
+---
+title: "get_run_timeline"
+slug: sdk-reference/tasks/get-run-timeline
+---
+
+Get the step-by-step timeline of a run. Each entry represents one AI action with screenshots and reasoning.
+
+<CodeGroup>
+```python Python
+timeline = await client.get_run_timeline("tsk_v2_486305187432193504")
+for step in timeline:
+    print(f"Step {step.order}: {step.type} - {step.status}")
+```
+
+```typescript TypeScript
+const timeline = await skyvern.getRunTimeline("tsk_v2_486305187432193504");
+for (const step of timeline) {
+  console.log(`Step ${step.order}: ${step.type} - ${step.status}`);
+}
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `run_id` | `str` | Yes | The run ID. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `list[WorkflowRunTimeline]`
+
+Each timeline entry contains step details including type, status, order, and associated artifacts.
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

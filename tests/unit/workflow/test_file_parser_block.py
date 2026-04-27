@@ -64,9 +64,9 @@ def _create_docx(
 class TestDetectFileTypeFromUrl:
     """Tests for _detect_file_type_from_url with DOCX extensions."""
 
-    def _detect(self, url: str) -> FileType:
+    def _detect(self, url: str, file_path: str | None = None) -> FileType:
         block = _make_file_parser_block(url, FileType.CSV)
-        return block._detect_file_type_from_url(url)
+        return block._detect_file_type_from_url(url, file_path=file_path)
 
     def test_docx_extension(self) -> None:
         assert self._detect("https://example.com/file.docx") == FileType.DOCX
@@ -87,6 +87,27 @@ class TestDetectFileTypeFromUrl:
         assert self._detect("https://example.com/file.xlsx") == FileType.EXCEL
         assert self._detect("https://example.com/file.csv") == FileType.CSV
         assert self._detect("https://example.com/file.png") == FileType.IMAGE
+
+    def test_no_extension_without_file_path_falls_back_to_csv(self) -> None:
+        assert self._detect("https://example.com/34371136523") == FileType.CSV
+
+    def test_no_extension_with_pdf_file_detected_as_pdf(self, tmp_path: Path) -> None:
+        # Create a minimal valid PDF file
+        pdf_path = tmp_path / "no_ext_file"
+        pdf_path.write_bytes(b"%PDF-1.5\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF")
+        assert self._detect("https://example.com/34371136523", file_path=str(pdf_path)) == FileType.PDF
+
+    def test_no_extension_with_unknown_file_falls_back_to_csv(self, tmp_path: Path) -> None:
+        # Plain text file — filetype.guess returns None for text
+        txt_path = tmp_path / "unknown_file"
+        txt_path.write_text("just,some,csv,data\n1,2,3,4")
+        assert self._detect("https://example.com/some_file", file_path=str(txt_path)) == FileType.CSV
+
+    def test_query_params_only_url_with_pdf_file(self, tmp_path: Path) -> None:
+        # URL like /download?id=123 — no file extension visible
+        pdf_path = tmp_path / "downloaded"
+        pdf_path.write_bytes(b"%PDF-1.5\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF")
+        assert self._detect("https://example.com/download?id=123", file_path=str(pdf_path)) == FileType.PDF
 
 
 class TestValidateFileType:
