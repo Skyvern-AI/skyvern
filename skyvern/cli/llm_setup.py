@@ -141,7 +141,7 @@ def setup_llm_providers() -> None:
             enabled_providers.append("gemini")
             model_options.extend(
                 [
-                    "GEMINI_3_PRO",
+                    "GEMINI_3.1_PRO",
                     "GEMINI_3.0_FLASH",
                     "GEMINI_3.1_FLASH_LITE",
                     "GEMINI_2.5_PRO",
