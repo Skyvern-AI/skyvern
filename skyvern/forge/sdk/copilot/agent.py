@@ -321,8 +321,8 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
 ) -> AgentResult:
-    # Preflight feasibility classifier. Never raises (errors fall through to
-    # proceed). Off by default; enable via settings.ENABLE_COPILOT_FEASIBILITY_GATE.
+    # Preflight feasibility classifier — fires on every turn so mid-session pivots
+    # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
 
     feasibility_verdict = await run_feasibility_gate(

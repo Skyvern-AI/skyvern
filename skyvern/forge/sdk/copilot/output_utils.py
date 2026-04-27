@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -182,10 +183,52 @@ def _extract_failure_message(result: dict[str, Any]) -> str:
     return next(iter_failure_reasons(result), "Unknown error")
 
 
+_HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
+_LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
+
+
+def _sanitize_failure_text(text: str) -> str:
+    """Strip dict/HTTP-header dumps and cap a failure message for chat display.
+
+    The chat activity bullet is a fact, not a data dump — we never want raw
+    response headers or large JSON-looking blobs to flow into the SSE
+    payload. Short, capitalised technical tokens (``ERR_NAME_NOT_RESOLVED``)
+    must pass through unchanged."""
+    text = _HEADERS_BLOB_RE.sub(" ", text)
+    text = _LARGE_DICT_BLOB_RE.sub("{...}", text)
+    text = " ".join(text.split())
+    if not text:
+        return "(no details)"
+    if len(text) > 120:
+        text = text[:117] + "..."
+    return text
+
+
+def _describe_value_shape(value: Any) -> str:
+    """Describe the shape of a JS evaluation result without echoing values.
+
+    Distinct from ``_summarize_extracted_data``: that helper shapes data for
+    the LLM context (different verb, different audience). This one phrases
+    the shape for a chat activity bullet."""
+    if isinstance(value, list):
+        if not value:
+            return "empty list"
+        if isinstance(value[0], dict):
+            keys = sorted(value[0].keys())
+            return f"list of {len(value)} items, keys: {', '.join(keys)}"
+        return f"list of {len(value)} items"
+    if isinstance(value, dict):
+        keys = sorted(value.keys())
+        return f"object with keys: {', '.join(keys)}"
+    if isinstance(value, str):
+        return f"text ({len(value)} chars)"
+    return "value"
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     """Create a brief human-readable summary of a tool result."""
     if not result.get("ok", False):
-        return f"Failed: {_extract_failure_message(result)[:200]}"
+        return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
     data = result.get("data") or {}
 
@@ -213,14 +256,16 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
             return f"Run {', '.join(executed)}: {status}{suffix}"
         return f"Run {', '.join(executed)}: {status}"
     if tool_name == "get_browser_screenshot":
-        return f"Screenshot taken ({data.get('url', '?')[:80]})"
+        url = data.get("url")
+        return f"Screenshot taken ({url[:80]})" if url else "Screenshot taken"
     if tool_name == "navigate_browser":
         url = result.get("url") or data.get("url", "?")
         return f"Navigated to {url[:80]}"
     if tool_name == "evaluate":
         result_val = data.get("result")
-        preview = str(result_val)[:100] if result_val is not None else "undefined"
-        return f"JS result: {preview}"
+        if result_val is None:
+            return "Evaluated JavaScript"
+        return f"Evaluated JavaScript — returned {_describe_value_shape(result_val)}"
     if tool_name == "click":
         return f"Clicked '{data.get('selector', '?')}'"
     if tool_name == "type_text":
