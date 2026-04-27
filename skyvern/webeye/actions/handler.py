@@ -79,6 +79,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
@@ -121,6 +122,23 @@ from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElem
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+
+async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
+    """Take a screenshot with cursor overlay hidden so it doesn't interfere with LLM analysis."""
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
+        try:
+            return await page.screenshot(**kwargs)
+        finally:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
+    return await page.screenshot(**kwargs)
 
 
 class CustomSingleSelectResult:
@@ -3519,7 +3537,7 @@ async def sequentially_select_from_dropdown(
             )
             continue
 
-        screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        screenshot = await _screenshot_without_cursor(page, timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         mini_goal = (
             input_or_select_context.field
             if not input_or_select_context.intention

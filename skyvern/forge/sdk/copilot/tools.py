@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_sessi
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -49,6 +50,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -1321,7 +1323,19 @@ async def _run_blocks_and_collect_debug(
             )
             if browser_state:
                 page = await browser_state.get_or_create_page()
-                screenshot_bytes = await page.screenshot(type="png")
+                if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                    try:
+                        await SkyvernFrame.hide_cursor_overlay(page)
+                    except Exception:
+                        pass
+                try:
+                    screenshot_bytes = await page.screenshot(type="png")
+                finally:
+                    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                        try:
+                            await SkyvernFrame.show_cursor_overlay(page)
+                        except Exception:
+                            pass
                 screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
         except Exception:
             LOG.debug("Failed to capture post-run screenshot", exc_info=True)
