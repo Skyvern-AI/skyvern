@@ -120,7 +120,10 @@ IMPORTANT WORKFLOW RULES:
   - "validation" for completion checks.
   - "login" for authentication flows.
   - "wait" for explicit pauses between blocks.
-  - "goto_url" only when you need to navigate to a URL without any subsequent actions (prefer "navigation" when both URL visit + actions are needed).
+  - "goto_url" for direct URL navigation and grounded URL-state shortcuts.
+* Prefer a `goto_url` URL-parameter shortcut over a click-driven `navigation` block when requested state (dates, destination, filters, search terms) maps to a URL that is supplied by the user, observed on the site, present in a link/form/action URL, or follows a same-site pattern visible in context. Do NOT invent website-specific paths or query parameters from memory — when the URL shape is uncertain, use a narrow `navigation` block instead. Put any follow-up actions in subsequent blocks, and follow URL-state shortcuts with extraction or validation that checks the visible page state.
+* Keep `navigation_goal` narrow. The verifier checks every sub-condition after each step, so bundling 3+ sub-tasks (input + multi-step picker + filters + confirm) returns "continue" until the budget exhausts. When one request maps to several sub-tasks and no `goto_url` shortcut applies, decompose into one block per sub-task chained via `next_block_label`. The final stage of search → click → extract should be an `extraction` block, not another `navigation`.
+* Set `complete_criterion` on every decomposed `navigation` block to the observable post-action page state — without it, smaller blocks still return vague "continue" verdicts.
 * Use descriptive, unique labels for blocks (snake_case format).
 * Reference parameters using Jinja2 syntax: {% raw %}{{ parameters.param_key }}{% endraw %}
 * Inline literal values directly in block config when the value is non-sensitive, used once, and not meant to be a reusable runtime input. Example: hardcode a specific URL or a one-off search term in the block's navigation_goal or data_extraction_goal instead of creating a workflow parameter for it.
