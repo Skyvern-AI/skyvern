@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unicodedata
 from enum import Enum
 from typing import Annotated, Any
@@ -36,7 +37,13 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.artifact.signing import ARTIFACT_URL_EXPIRY_SECONDS, parse_keyring, verify_artifact_signature
+from skyvern.forge.sdk.artifact.signing import (
+    ARTIFACT_URL_EXPIRY_SECONDS,
+    ARTIFACT_URL_EXPIRY_SECONDS_MAX,
+    ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    parse_keyring,
+    verify_artifact_signature,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
@@ -1547,16 +1554,34 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     return media_type, "inline"
 
 
-def _artifact_content_response_headers(*, disposition: str, is_signed: bool) -> dict[str, str]:
+def _artifact_content_response_headers(
+    *,
+    disposition: str,
+    is_signed: bool,
+    signed_expiry_unix: int | None = None,
+) -> dict[str, str]:
     """Response headers for the artifact content endpoint.
+
+    For signed URLs, ``Cache-Control: max-age`` is set to the URL's remaining
+    lifetime — derived from the ``expiry`` query parameter rather than the
+    global default — so per-org TTL overrides flow through to caches. Caches
+    must not retain a body past the URL's own expiry.
 
     Includes ``X-Content-Type-Options: nosniff`` as defence-in-depth for
     SKY-8862: even if something upstream strips the attachment disposition,
     the browser will not sniff the octet-stream body back into HTML/PDF.
     """
+    if is_signed:
+        if signed_expiry_unix is not None:
+            remaining = max(0, signed_expiry_unix - int(time.time()))
+        else:
+            remaining = ARTIFACT_URL_EXPIRY_SECONDS
+        cache_control = f"private, max-age={remaining}"
+    else:
+        cache_control = "private, no-cache"
     return {
         "Content-Disposition": disposition,
-        "Cache-Control": f"private, max-age={ARTIFACT_URL_EXPIRY_SECONDS}" if is_signed else "private, no-cache",
+        "Cache-Control": cache_control,
         "X-Content-Type-Options": "nosniff",
     }
 
@@ -1629,12 +1654,19 @@ async def get_artifact_content(
         )
     media_type, content_disposition = _artifact_response_config(artifact)
     is_signed = sig is not None and expiry is not None and kid is not None
+    signed_expiry_unix: int | None = None
+    if is_signed and expiry is not None:
+        try:
+            signed_expiry_unix = int(expiry)
+        except ValueError:
+            signed_expiry_unix = None
     return Response(
         content=content,
         media_type=media_type,
         headers=_artifact_content_response_headers(
             disposition=content_disposition,
             is_signed=is_signed,
+            signed_expiry_unix=signed_expiry_unix,
         ),
     )
 
@@ -3212,9 +3244,36 @@ async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
+    # Validate the per-org artifact URL expiry against the same bounds the
+    # signing helper clamps to. Reject out-of-range values at the API edge so
+    # users see a clear 400 instead of a silently clamped value persisting in
+    # the DB. The clear flag and a non-null override are mutually exclusive —
+    # the repo prefers the clear flag, but reject the ambiguity here too.
+    if org_update.artifact_url_expiry_seconds is not None and not org_update.clear_artifact_url_expiry_seconds:
+        if (
+            org_update.artifact_url_expiry_seconds < ARTIFACT_URL_EXPIRY_SECONDS_MIN
+            or org_update.artifact_url_expiry_seconds > ARTIFACT_URL_EXPIRY_SECONDS_MAX
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"artifact_url_expiry_seconds must be between "
+                    f"{ARTIFACT_URL_EXPIRY_SECONDS_MIN} and {ARTIFACT_URL_EXPIRY_SECONDS_MAX} seconds"
+                ),
+            )
+    if org_update.clear_artifact_url_expiry_seconds and org_update.artifact_url_expiry_seconds is not None:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "clear_artifact_url_expiry_seconds cannot be combined with a non-null "
+                "artifact_url_expiry_seconds — pick one"
+            ),
+        )
     return await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
+        artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
+        clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
     )
 
 

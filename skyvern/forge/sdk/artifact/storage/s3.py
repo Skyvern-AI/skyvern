@@ -362,7 +362,7 @@ class S3Storage(BaseStorage):
             # rows so the agent can detect "still downloading" via DB query.
             artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
             if artifacts:
-                return _file_infos_from_download_artifacts(artifacts)
+                return await _file_infos_from_download_artifacts(artifacts)
 
         return await self._get_shared_downloaded_files_in_browser_session_via_listing(
             organization_id=organization_id, browser_session_id=browser_session_id
@@ -601,7 +601,7 @@ class S3Storage(BaseStorage):
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
             if artifacts:
-                return _file_infos_from_download_artifacts(artifacts)
+                return await _file_infos_from_download_artifacts(artifacts)
 
         # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
         # OSS-default deployments without HMAC signing both arrive here.

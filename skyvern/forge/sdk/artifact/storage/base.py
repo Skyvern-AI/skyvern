@@ -10,13 +10,21 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 
-def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
+async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
     """Build the API-shaped ``FileInfo`` list from DOWNLOAD artifact rows.
 
     Filename is the URI basename (the save site writes ``{base_uri}/{file}``);
     checksum and modified_at come straight from the row, so retrieval needs
     zero S3 round-trips.
+
+    All artifacts in a single batch share the same organization (downloads are
+    scoped to a run, which is scoped to an org), so the per-org URL TTL is
+    resolved once and applied to every URL.
     """
+    if not artifacts:
+        return []
+    organization_id = artifacts[0].organization_id
+    expiry_seconds = await app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id)
     infos: list[FileInfo] = []
     for artifact in artifacts:
         filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
@@ -24,6 +32,7 @@ def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileI
             artifact_id=artifact.artifact_id,
             artifact_name=filename,
             artifact_type=ArtifactType.DOWNLOAD.value,
+            expiry_seconds=expiry_seconds,
         )
         infos.append(
             FileInfo(

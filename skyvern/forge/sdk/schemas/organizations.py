@@ -16,6 +16,15 @@ class Organization(BaseModel):
     domain: str | None = None
     bw_organization_id: str | None = None
     bw_collection_ids: list[str] | None = None
+    artifact_url_expiry_seconds: int | None = Field(
+        None,
+        description=(
+            "Per-org override for the lifetime of signed /v1/artifacts/{id}/content URLs, "
+            "in seconds. None means use the global default (12 hours). When set, every signed "
+            "URL minted for artifacts owned by this org is valid for this many seconds. "
+            "Bounded between 1 hour (3600) and 7 days (604800)."
+        ),
+    )
 
     created_at: datetime
     modified_at: datetime
@@ -168,3 +177,21 @@ class GetOrganizationAPIKeysResponse(BaseModel):
 
 class OrganizationUpdate(BaseModel):
     max_steps_per_run: int | None = None
+    artifact_url_expiry_seconds: int | None = Field(
+        None,
+        description=(
+            "Per-org override for the lifetime of signed /v1/artifacts/{id}/content URLs, "
+            "in seconds. Bounded between 1 hour (3600) and 7 days (604800). Pass null to "
+            "leave the current value unchanged. To explicitly clear the override (and fall "
+            "back to the global 12-hour default) set ``clear_artifact_url_expiry_seconds`` "
+            "to true."
+        ),
+    )
+    clear_artifact_url_expiry_seconds: bool = Field(
+        False,
+        description=(
+            "When true, resets ``artifact_url_expiry_seconds`` to NULL — the org will use "
+            "the global 12-hour default. Mutually exclusive with a non-null value in "
+            "``artifact_url_expiry_seconds`` (the clear flag wins)."
+        ),
+    )

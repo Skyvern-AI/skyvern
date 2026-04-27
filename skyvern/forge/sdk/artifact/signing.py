@@ -31,8 +31,33 @@ from urllib.parse import urlencode
 
 from pydantic import BaseModel, model_validator
 
-ARTIFACT_URL_EXPIRY_SECONDS = 12 * 60 * 60  # 12 hours
+ARTIFACT_URL_EXPIRY_SECONDS = 12 * 60 * 60  # 12 hours — global default when no per-org override.
+
+# Bounds for the per-org override. 1 hour minimum keeps URLs useful for webhook
+# consumers that retry across short outages; 7 days maximum follows the AWS S3
+# presigned-URL cap so customers used to S3 don't get surprised. The route
+# validates inbound values against these and the helper below clamps to them
+# defensively in case a stray DB write puts garbage in the column.
+ARTIFACT_URL_EXPIRY_SECONDS_MIN = 60 * 60  # 1 hour
+ARTIFACT_URL_EXPIRY_SECONDS_MAX = 7 * 24 * 60 * 60  # 7 days
+
 _ARTIFACT_CONTENT_PATH_TEMPLATE = "/v1/artifacts/{artifact_id}/content"
+
+
+def effective_artifact_url_expiry_seconds(per_org_value: int | None) -> int:
+    """Return the TTL to mint a signed artifact URL with.
+
+    Falls back to ``ARTIFACT_URL_EXPIRY_SECONDS`` when ``per_org_value`` is
+    None. Clamps to ``[ARTIFACT_URL_EXPIRY_SECONDS_MIN, ARTIFACT_URL_EXPIRY_SECONDS_MAX]``
+    so an out-of-range stored value still produces a sane URL rather than
+    refusing to serve.
+    """
+    if per_org_value is None:
+        return ARTIFACT_URL_EXPIRY_SECONDS
+    return max(
+        ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+        min(ARTIFACT_URL_EXPIRY_SECONDS_MAX, per_org_value),
+    )
 
 
 class HmacKeyEntry(BaseModel):
@@ -90,23 +115,29 @@ def sign_artifact_url(
     keyring: ArtifactHmacKeyring,
     artifact_name: str | None = None,
     artifact_type: str | None = None,
+    expiry_seconds: int | None = None,
 ) -> str:
     """Return a fully-signed URL for the artifact content endpoint.
 
-    Signs with keyring.current_kid.  The URL is valid for
-    ARTIFACT_URL_EXPIRY_SECONDS (12 hours) from the time this function is called.
+    Signs with ``keyring.current_kid``. The URL is valid for ``expiry_seconds``
+    from the time this function is called. When ``expiry_seconds`` is None,
+    falls back to the global ``ARTIFACT_URL_EXPIRY_SECONDS`` (12 hours).
+    Callers wanting a per-org override should resolve it via
+    :func:`effective_artifact_url_expiry_seconds` before calling here.
 
     The signature is URL-safe base64 (no padding), 43 characters for SHA-256.
 
-    artifact_name and artifact_type are appended as informational query params
-    for client use only — they are not part of the canonical string or signature.
+    ``artifact_name`` and ``artifact_type`` are appended as informational query
+    params for client use only — they are not part of the canonical string or
+    signature.
     """
     kid = keyring.current_kid
     secret_bytes = keyring.get_secret_bytes(kid)
     if secret_bytes is None:
         raise ValueError(f"No secret found for kid '{kid}'")
 
-    expiry = int(time.time()) + ARTIFACT_URL_EXPIRY_SECONDS
+    ttl = expiry_seconds if expiry_seconds is not None else ARTIFACT_URL_EXPIRY_SECONDS
+    expiry = int(time.time()) + ttl
     path = _ARTIFACT_CONTENT_PATH_TEMPLATE.format(artifact_id=artifact_id)
     canonical = _canonical_string("GET", path, expiry, kid)
     sig = _hmac_b64(secret_bytes, canonical)

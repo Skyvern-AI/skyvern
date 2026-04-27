@@ -535,7 +535,7 @@ class WorkflowService:
         # Preserve the input order so block outputs render files in save order.
         by_id = {a.artifact_id: a for a in artifacts}
         ordered = [by_id[aid] for aid in artifact_ids if aid in by_id]
-        return _file_infos_from_download_artifacts(ordered)
+        return await _file_infos_from_download_artifacts(ordered)
 
     async def _file_infos_for_workflow_run_filtered_by_filenames(
         self,
@@ -582,7 +582,7 @@ class WorkflowService:
             if basename in filenames and basename not in seen:
                 matched.append(artifact)
                 seen.add(basename)
-        return _file_infos_from_download_artifacts(matched)
+        return await _file_infos_from_download_artifacts(matched)
 
     async def _refresh_output_urls(
         self,

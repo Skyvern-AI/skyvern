@@ -173,6 +173,7 @@ class OrganizationModel(Base):
     domain = Column(String, nullable=True, index=True)
     bw_organization_id = Column(String, nullable=True, default=None)
     bw_collection_ids = Column(JSON, nullable=True, default=None)
+    artifact_url_expiry_seconds = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

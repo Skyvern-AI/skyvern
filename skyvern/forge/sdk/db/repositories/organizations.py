@@ -154,6 +154,8 @@ class OrganizationsRepository(BaseRepository):
         webhook_callback_url: str | None = None,
         max_steps_per_run: int | None = None,
         max_retries_per_step: int | None = None,
+        artifact_url_expiry_seconds: int | None = None,
+        clear_artifact_url_expiry_seconds: bool = False,
     ) -> Organization:
         async with self.Session() as session:
             organization = (
@@ -169,6 +171,13 @@ class OrganizationsRepository(BaseRepository):
                 organization.max_steps_per_run = max_steps_per_run
             if max_retries_per_step:
                 organization.max_retries_per_step = max_retries_per_step
+            # ``clear_*`` decouples "don't update" (None) from "explicitly clear":
+            # callers pass ``clear_artifact_url_expiry_seconds=True`` to reset
+            # the value to NULL, falling back to the global default.
+            if clear_artifact_url_expiry_seconds:
+                organization.artifact_url_expiry_seconds = None
+            elif artifact_url_expiry_seconds is not None:
+                organization.artifact_url_expiry_seconds = artifact_url_expiry_seconds
             await session.commit()
             await session.refresh(organization)
             return Organization.model_validate(organization)
