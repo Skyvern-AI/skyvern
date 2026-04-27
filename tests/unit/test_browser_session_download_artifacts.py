@@ -181,15 +181,18 @@ async def test_sync_browser_session_file_registers_download_artifact():
 
 
 @pytest.mark.asyncio
-async def test_sync_browser_session_file_skips_artifact_for_non_download_types():
-    """We only register artifact rows for downloads — videos, browser profiles, etc. stay untouched."""
+async def test_sync_browser_session_file_skips_artifact_for_unhandled_types():
+    """Non-download / non-recording artifact_types (e.g. ``har``) don't create
+    artifact rows — they're served by the legacy LIST path."""
     storage = S3Storage()
     storage.async_client = MagicMock()
     storage.async_client.upload_file_from_path = AsyncMock()
 
-    mock_create = AsyncMock()
+    mock_download = AsyncMock()
+    mock_recording = AsyncMock()
     mock_artifact_manager = MagicMock()
-    mock_artifact_manager.create_browser_session_download_artifact = mock_create
+    mock_artifact_manager.create_browser_session_download_artifact = mock_download
+    mock_artifact_manager.create_browser_session_recording_artifact = mock_recording
 
     with (
         patch.object(storage, "_get_storage_class_for_org", new=AsyncMock(return_value=MagicMock())),
@@ -200,12 +203,13 @@ async def test_sync_browser_session_file_skips_artifact_for_non_download_types()
         await storage.sync_browser_session_file(
             organization_id="o_1",
             browser_session_id="pbs_1",
-            artifact_type="videos",
-            local_file_path="/tmp/recording.webm",
-            remote_path="recording.webm",
+            artifact_type="har",
+            local_file_path="/tmp/network.har",
+            remote_path="network.har",
         )
 
-    mock_create.assert_not_awaited()
+    mock_download.assert_not_awaited()
+    mock_recording.assert_not_awaited()
 
 
 @pytest.mark.asyncio
