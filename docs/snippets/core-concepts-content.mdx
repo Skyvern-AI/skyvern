@@ -107,7 +107,7 @@ await browser.close()
 Agents are useful when you want to mix precise Playwright control with open-ended AI goals. Log in with a direct call, then hand off "find and download the invoice" to the agent, then take back control to process the file.
 
 <Note>
-Full method reference: [Page](/sdk-reference/browser-automation/act), [Agent](/sdk-reference/browser-automation/agent-run-task), [Browser](/sdk-reference/browser-automation/launch-cloud-browser). Developer guide: [Multi-Step Automations](/browser-automations/overview).
+Full method reference: [Page](/sdk-reference/browser-automation/act), [Agent](/sdk-reference/browser-automation/agent-run-task), [Browser](/sdk-reference/browser-automation/launch-cloud-browser). Developer guide: [Multi-Step Automations](/developers/browser-automations/overview).
 </Note>
 
 ## Workflows
@@ -277,7 +277,7 @@ data = await page.extract("Extract the monthly report data")
 await browser.close()
 ```
 
-See [Browser Sessions](/optimization/browser-sessions) for details.
+See [Browser Sessions](/developers/optimization/browser-sessions) for details.
 
 ## Artifacts
 
@@ -334,7 +334,7 @@ result = await skyvern.run_task(
   </Card>
   <Card
     title="Build with the API"
-    href="/getting-started/quickstart"
+    href="/developers/getting-started/quickstart"
   >
     Integrate Skyvern into your product with Python, TypeScript, or REST.
   </Card>
@@ -343,13 +343,13 @@ result = await skyvern.run_task(
 <CardGroup cols={2}>
   <Card
     title="AI Agents Quickstart"
-    href="/getting-started/ai-agents-quickstart"
+    href="/developers/getting-started/ai-agents-quickstart"
   >
     Give Claude Code, Cursor, or Windsurf browser automation via MCP.
   </Card>
   <Card
     title="Self-host Skyvern"
-    href="/self-hosted/overview"
+    href="/developers/self-hosted/overview"
   >
     Deploy on your own infrastructure with your own LLM keys.
   </Card>
