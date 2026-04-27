@@ -511,6 +511,8 @@ class ForgeAgent:
         context = skyvern_context.ensure_context()
         context.step_id = step.step_id
         context.task_id = task.task_id
+        context.navigation_goal = task.navigation_goal
+        context.navigation_payload = task.navigation_payload
 
         # do not need to do complete verification when it's a CUA task
         # 1. CUA executes only one action step by step -- it's pretty less likely to have a hallucination for completion or forget to return a complete
@@ -1061,6 +1063,8 @@ class ForgeAgent:
             context = skyvern_context.ensure_context()
             context.step_id = None
             context.task_id = None
+            context.navigation_goal = None
+            context.navigation_payload = None
 
     async def fail_task(
         self,

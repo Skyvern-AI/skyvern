@@ -29,6 +29,8 @@ class SkyvernContext:
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
+    navigation_goal: str | None = None
+    navigation_payload: dict[str, Any] | list | str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)

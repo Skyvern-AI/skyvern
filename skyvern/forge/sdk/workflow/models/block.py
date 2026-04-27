@@ -50,6 +50,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
     MissingStarterUrl,
     PDFParsingError,
+    SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
     get_user_facing_exception_message,
@@ -433,7 +434,10 @@ class Block(BaseModel, abc.ABC):
             BlockType.HTTP_REQUEST,
         ]
 
-        template = (env or jinja_sandbox_env).from_string(potential_template)
+        try:
+            template = (env or jinja_sandbox_env).from_string(potential_template)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
@@ -528,7 +532,12 @@ class Block(BaseModel, abc.ABC):
                     variables=missing_variables,
                 )
 
-        return template.render(template_data)
+        try:
+            return template.render(template_data)
+        except SkyvernException:
+            raise
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
 
     def _apply_workflow_system_prompt(
         self,
