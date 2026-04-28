@@ -464,6 +464,18 @@ class AgentFunction:
         """
         return AgentDB(database_string, debug_enabled=debug_enabled)
 
+    def resolve_mcp_oauth_org_lookups(self, db: object) -> tuple[Any, Any] | None:
+        """Return ``(get_organization_entities, get_valid_org_auth_token)`` callables
+        bound to the cloud DB's nested organizations repository.
+
+        OSS no-op — the OSS path in ``_get_oauth_org_auth_methods`` probes the
+        flat shape directly. Cloud overrides this to expose the
+        ``CloudAgentDB.organizations`` repository's methods so the OSS-synced
+        ``mcp_http_auth`` module doesn't need to know about cloud-specific
+        DB layout.
+        """
+        return None
+
     async def validate_step_execution(
         self,
         task: Task,
