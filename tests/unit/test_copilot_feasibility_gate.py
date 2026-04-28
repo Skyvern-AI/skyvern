@@ -359,3 +359,33 @@ def test_feasibility_verdict_dataclass() -> None:
     assert v.verdict == "proceed"
     assert v.question is None
     assert v.rationale is None
+
+
+# ---------------------------------------------------------------------------
+# Rendered-prompt snapshot — guards against accidental prompt regressions.
+# ---------------------------------------------------------------------------
+
+
+def _render_feasibility_prompt() -> str:
+    from skyvern.forge.prompts import prompt_engine
+
+    return prompt_engine.load_prompt(
+        template="feasibility-gate",
+        user_message="I meant the other one",
+        workflow_yaml="name: example_workflow",
+        chat_history="USER: place an order\nAI: tested, no result",
+        global_llm_context="",
+    )
+
+
+def test_prompt_carries_context_aware_framing() -> None:
+    prompt = _render_feasibility_prompt()
+    assert "refinement, correction, or continuation" in prompt
+    assert "Refinements and corrections:" in prompt
+    assert "Mid-session pivots:" in prompt
+
+
+def test_prompt_does_not_revert_to_single_request_framing() -> None:
+    prompt = _render_feasibility_prompt()
+    assert "single user request" not in prompt
+    assert "before any navigation happens" not in prompt

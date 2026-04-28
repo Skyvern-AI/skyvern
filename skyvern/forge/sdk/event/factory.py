@@ -6,6 +6,8 @@ from playwright.async_api import Locator, Page
 
 from skyvern.forge.sdk.event.base import CursorEventStrategy, InputEventStrategy, ScrollEventStrategy
 from skyvern.forge.sdk.event.default import DefaultCursorStrategy, DefaultInputStrategy, DefaultScrollStrategy
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.webeye.cursor_visualization import VisualizingCursorStrategy
 
 LOG = structlog.get_logger(__name__)
 
@@ -49,6 +51,7 @@ class _EventMetrics:
 
 class EventStrategyFactory:
     __cursor: CursorEventStrategy | None = None
+    __cursor_vis_cache: CursorEventStrategy | None = None
     __input: InputEventStrategy | None = None
     __scroll: ScrollEventStrategy | None = None
     __metrics: _EventMetrics = _EventMetrics()
@@ -71,6 +74,7 @@ class EventStrategyFactory:
     def reset() -> None:
         """Clear all custom strategies, reverting to defaults."""
         EventStrategyFactory.__cursor = None
+        EventStrategyFactory.__cursor_vis_cache = None
         EventStrategyFactory.__input = None
         EventStrategyFactory.__scroll = None
         EventStrategyFactory.__metrics = _EventMetrics()
@@ -79,7 +83,16 @@ class EventStrategyFactory:
 
     @staticmethod
     def get_cursor_strategy() -> CursorEventStrategy:
-        return EventStrategyFactory.__cursor or _default_cursor
+        base = EventStrategyFactory.__cursor or _default_cursor
+        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+            # Cache the wrapper so we don't create a new one every call
+            cached = EventStrategyFactory.__cursor_vis_cache
+            if cached is not None and getattr(cached, "_inner", None) is base:
+                return cached
+            wrapped = VisualizingCursorStrategy(base)
+            EventStrategyFactory.__cursor_vis_cache = wrapped
+            return wrapped
+        return base
 
     @staticmethod
     def get_input_strategy() -> InputEventStrategy:

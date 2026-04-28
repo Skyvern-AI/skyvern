@@ -11,7 +11,8 @@ from playwright.async_api import Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
-from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
+from skyvern.exceptions import WorkflowRunContextNotInitialized
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -903,6 +904,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
         include_extracted_text: bool = True,
+        system_prompt: str | None | Any = SYSTEM_PROMPT_UNSET,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
@@ -914,6 +916,42 @@ class RealSkyvernPageAi(SkyvernPageAi):
             tz_info = context.tz_info
         prompt = _render_template_with_label(prompt, label=self.current_label)
         local_datetime_str = datetime.now(tz_info).isoformat()
+
+        # Resolve the effective workflow_system_prompt for this run. Order:
+        #   1. Caller-passed value wins (including None — "block opted out,
+        #      send no system prompt").
+        #   2. Block-recorded value from ``WorkflowRunContext``, populated by
+        #      ``Block._apply_workflow_system_prompt`` in both the agent path
+        #      (``format_potential_template_parameters``) and the script path
+        #      (``_execute_single_block`` before ``exec``). Using the recorded
+        #      value makes the block the single source of truth for the
+        #      opt-out + resolved-string decision — script-path extractions
+        #      hash to the same cache key and send the same LLM input the
+        #      agent path would. A recorded ``None`` is a real opt-out, not a
+        #      miss (SKY-9147).
+        #   3. Fall back to the run-wide effective prompt for non-block
+        #      callers (standalone scripts, sdk routes, etc.) that never set
+        #      ``current_label`` and never went through a Block.
+        workflow_system_prompt: str | None
+        if system_prompt is not SYSTEM_PROMPT_UNSET:
+            workflow_system_prompt = cast("str | None", system_prompt)
+        else:
+            workflow_system_prompt = None
+            workflow_run_context_for_prompt = None
+            if context and context.workflow_run_id:
+                try:
+                    workflow_run_context_for_prompt = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                        context.workflow_run_id
+                    )
+                except WorkflowRunContextNotInitialized:
+                    workflow_run_context_for_prompt = None
+
+            if workflow_run_context_for_prompt is not None:
+                recorded, value = workflow_run_context_for_prompt.get_block_workflow_system_prompt(self.current_label)
+                if recorded:
+                    workflow_system_prompt = value
+                else:
+                    workflow_system_prompt = workflow_run_context_for_prompt.resolve_effective_workflow_system_prompt()
 
         # Render the prompt FIRST so the cache key hashes the exact string
         # that will be sent to the LLM (captures economy-tree swaps and 2/3
@@ -981,6 +1019,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 extracted_information_schema=post_ceiling_kwargs["extracted_information_schema"],
                 error_code_mapping=error_code_mapping_str,
                 llm_key=None,
+                workflow_system_prompt=workflow_system_prompt,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
@@ -1042,6 +1081,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             screenshots=self.scraped_page.screenshots,
             prompt_name="extract-information",
             force_dict=False,
+            system_prompt=workflow_system_prompt,
         )
 
         # Validate and fill missing fields based on schema

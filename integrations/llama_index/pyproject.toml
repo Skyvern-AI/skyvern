@@ -37,9 +37,13 @@ override-dependencies = [
     # Cascading overrides needed to unblock the above security constraints:
     # fastmcp>=3.2.0 requires websockets>=15 (skyvern pins <13)
     "websockets>=15.0.1",
-    # litellm/skyvern requires openai>=2 but llama-index needs <2;
-    # keep openai in v1 range for llama-index compatibility
-    "openai>=1.40.0,<2",
+    # litellm 1.83.7+ pins openai==2.24.0 (security upgrade); override
+    # llama-index-llms-openai's openai<2 declaration so the integration can
+    # take the patched litellm.
+    "openai>=2.24.0",
+    # litellm 1.83.7+ also pins these exactly.
+    "jsonschema>=4.23.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [tool.uv.sources]

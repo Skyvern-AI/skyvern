@@ -29,6 +29,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
   const { editable, label } = data;
@@ -162,6 +163,17 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                     editable={editable}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
+                    }}
+                  />
+                  <IgnoreWorkflowSystemPrompt
+                    ignoreWorkflowSystemPrompt={
+                      data.ignoreWorkflowSystemPrompt ?? false
+                    }
+                    editable={editable}
+                    onIgnoreWorkflowSystemPromptChange={(
+                      ignoreWorkflowSystemPrompt,
+                    ) => {
+                      update({ ignoreWorkflowSystemPrompt });
                     }}
                   />
                   <Separator />

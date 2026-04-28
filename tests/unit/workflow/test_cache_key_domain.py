@@ -94,3 +94,72 @@ class TestExtractFirstBlockDomain:
         wf = _workflow(blocks)
         # Jinja renders undefined variables as empty string in SandboxedEnvironment
         assert _extract_first_block_domain(wf, {}) == ""
+
+    def test_resolves_parameter_key_reference(self) -> None:
+        """url field holding a bare parameter key resolves via the parameters dict.
+
+        Mirrors BaseTaskBlock.execute() which replaces self.url with the parameter
+        value when self.url matches a parameter key. Without this resolution the
+        cache key at run start renders to the literal parameter name (e.g.
+        ``default:website_url:v2``) and never matches any persisted script, while
+        mid-run gen — after block execution mutates self.url — renders the real
+        domain. Scripts get persisted under the correct key but are never loaded
+        at run start.
+        """
+        blocks = [_task_block("step1", url="website_url")]
+        wf = _workflow(blocks)
+        params = {"website_url": "https://secure.example.com/login"}
+        assert _extract_first_block_domain(wf, params) == "secure.example.com"
+
+    def test_parameter_key_reference_takes_precedence_over_jinja(self) -> None:
+        """When url is a bare key that matches a parameter, use the parameter value,
+        not Jinja rendering of the literal string."""
+        blocks = [_task_block("step1", url="target_site")]
+        wf = _workflow(blocks)
+        params = {"target_site": "https://portal.example.org/dashboard"}
+        # Without the fix this would return "target_site" (literal jinja render).
+        assert _extract_first_block_domain(wf, params) == "portal.example.org"
+
+    def test_bare_key_without_matching_parameter_falls_back_to_jinja(self) -> None:
+        """If url looks like a bare key but no parameter matches, Jinja renders
+        the literal (``unknown_key``), prepend_scheme_and_validate_url yields
+        ``https://unknown_key``, and the domain filter returns ``unknown_key``.
+        The broken workflow produces a meaningless cache segment, but that's
+        consistent with what runtime would produce via
+        format_block_parameter_template_from_workflow_run_context."""
+        blocks = [_task_block("step1", url="unknown_key")]
+        wf = _workflow(blocks)
+        assert _extract_first_block_domain(wf, {}) == "unknown_key"
+
+    def test_parameter_key_with_falsy_value_falls_back_to_jinja(self) -> None:
+        """Runtime's truthy-value guard (block.py:931 ``if task_url_parameter_value:``)
+        leaves self.url unchanged when the parameter value is None/empty. Mirror
+        that here — the falsy value causes a fall-through to the literal key
+        (``website_url``). Without the guard, ``str(None)`` would yield the
+        string ``None`` and cache-key segment ``default:None:v2``, which
+        diverges from runtime's behavior of keeping the literal."""
+        blocks = [_task_block("step1", url="website_url")]
+        wf = _workflow(blocks)
+        assert _extract_first_block_domain(wf, {"website_url": None}) == "website_url"
+        assert _extract_first_block_domain(wf, {"website_url": ""}) == "website_url"
+
+    def test_parameter_value_containing_jinja_is_rendered_too(self) -> None:
+        """Runtime renders Jinja on the substituted value (format_potential_template_parameters
+        at block.py:753). The fix mirrors this with a post-substitution Jinja render so
+        parameter values that themselves contain template expressions are fully expanded."""
+        blocks = [_task_block("step1", url="website_url")]
+        wf = _workflow(blocks)
+        params = {
+            "website_url": "{{ base_url }}/login",
+            "base_url": "https://nested.example.com",
+        }
+        assert _extract_first_block_domain(wf, params) == "nested.example.com"
+
+    def test_scheme_less_parameter_value_is_normalized(self) -> None:
+        """Runtime applies prepend_scheme_and_validate_url at block.py:754 so
+        scheme-less URLs get an ``https://`` prepended before navigation. Lock
+        the normalization branch against regression."""
+        blocks = [_task_block("step1", url="website_url")]
+        wf = _workflow(blocks)
+        params = {"website_url": "example.com/login"}
+        assert _extract_first_block_domain(wf, params) == "example.com"

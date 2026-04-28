@@ -1,0 +1,73 @@
+---
+title: Code Caching
+subtitle: Convert successful runs into cached code for faster, deterministic replays
+description: Skyvern records the actions an AI run takes and generates executable code from them. Subsequent runs execute the cached code directly, skipping LLM inference and screenshot analysis. Faster, cheaper, deterministic.
+slug: developers/features/code-caching
+icon: bolt
+keywords:
+  - code caching
+  - code generation
+  - run_with
+  - Skyvern 2.0 with Code
+  - deterministic runs
+  - script generation
+  - cost optimization
+  - progressive caching
+---
+
+When Skyvern's agent completes a task or workflow, it records the actions it took and generates reusable code from them. Later runs can execute that cached code directly, skipping LLM inference and screenshot analysis entirely. This makes cached runs faster, cheaper, and deterministic. If the cached code fails because a page changed, Skyvern falls back to the agent automatically and regenerates the cache.
+
+## How it works
+
+The first run uses the agent as normal. Set `engine="skyvern-2.0"` when creating the task or workflow, and Skyvern records the actions as generated code while the agent executes.
+
+On subsequent runs, pass `run_with="code"` to execute the cached code directly. No screenshots, no LLM reasoning, just the recorded action sequence replaying against the page.
+
+If the cached code hits something unexpected (a layout change, a new field, a missing element), Skyvern re-runs with the full agent and regenerates the cache. You don't need to handle this yourself.
+
+<Note>
+The SDK default engine is `skyvern-1.0`. To use code caching, explicitly set `engine="skyvern-2.0"`. In the Cloud UI, `skyvern-2.0` is the default.
+</Note>
+
+## What gets cached
+
+**Tasks** cache the full action sequence the agent took: clicks, form fills, extractions, and navigation.
+
+**Workflows** cache per block. Each block that successfully executes gets its own cached script, so a partially-cached workflow still saves time on the blocks that have been seen before.
+
+**Progressive caching** handles workflows with conditionals. Run 1 covers branch A, run 2 covers branch B, and so on. Previous caches are preserved, so coverage builds up over time.
+
+**Not cached:** conditional evaluation blocks, wait blocks, and code blocks always run live because their behavior depends on runtime state.
+
+<Tip>
+Pair cached code with [scheduled workflows](/cloud/building-workflows/scheduling) for cheap, reliable recurring runs. The first scheduled run builds the cache, and every subsequent run executes from it.
+</Tip>
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card
+    title="Cost control"
+    href="/developers/optimization/cost-control"
+  >
+    Use `run_with: code` plus `max_steps` and engine tiers to manage costs.
+  </Card>
+  <Card
+    title="Scheduling workflows"
+    href="/cloud/building-workflows/scheduling"
+  >
+    Run cached workflows on a cron schedule.
+  </Card>
+  <Card
+    title="Reliability tips"
+    href="/developers/going-to-production/reliability-tips"
+  >
+    Keep cached runs stable as target sites evolve.
+  </Card>
+  <Card
+    title="Run from code"
+    href="/cloud/building-workflows/run-from-code"
+  >
+    Trigger and monitor cached workflows from your own code.
+  </Card>
+</CardGroup>

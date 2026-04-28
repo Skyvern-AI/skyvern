@@ -74,6 +74,7 @@ interface StartSettings {
   maxScreenshotScrollingTimes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
 }
 
 function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
@@ -159,6 +160,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         : null,
       finallyBlockLabel: data.withWorkflowSettings
         ? data.finallyBlockLabel
+        : null,
+      workflowSystemPrompt: data.withWorkflowSettings
+        ? (data.workflowSystemPrompt ?? null)
         : null,
     };
   };
@@ -538,6 +542,23 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             ))}
                           </SelectContent>
                         </Select>
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Workflow System Prompt</Label>
+                          <HelpTooltip content="Applied to every LLM call in this workflow, including any sub-agents." />
+                        </div>
+                        <WorkflowBlockInputTextarea
+                          nodeId={id}
+                          onChange={(value) => {
+                            update({
+                              workflowSystemPrompt: value.length ? value : null,
+                            });
+                          }}
+                          value={data.workflowSystemPrompt ?? ""}
+                          placeholder="e.g. Format all dates as YYYY-MM-DD and all currency values as USD with two decimals."
+                          className="nopan text-xs"
+                        />
                       </div>
                     </div>
                   </AccordionContent>

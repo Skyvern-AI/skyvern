@@ -29,7 +29,7 @@ import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined
+from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
@@ -50,6 +50,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
     MissingStarterUrl,
     PDFParsingError,
+    SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
     get_user_facing_exception_message,
@@ -97,6 +98,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     MissingJinjaVariables,
     NoIterableValueFound,
     NoValidEmailRecipient,
+    PayloadTemplateRenderError,
+    PayloadTemplateSyntaxError,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     DOWNLOADED_FILE_SIGS_KEY,
@@ -238,6 +241,16 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
 
+
+def _format_payload_path_segment(key: str) -> str:
+    """Plain identifiers render as `.key`; anything else (dots, brackets, spaces,
+    quotes) renders as a bracketed JSON-escaped string so paths stay unambiguous
+    against keys that contain `.` or `[`."""
+    if key.isidentifier():
+        return f".{key}"
+    return f"[{json.dumps(key)}]"
+
+
 # ForLoop constants
 DEFAULT_MAX_LOOP_ITERATIONS = 100
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
@@ -261,6 +274,19 @@ class Block(BaseModel, abc.ABC):
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
     disable_cache: bool = False
+    # Opt-out from workflow-level workflow_system_prompt inheritance (and, on a
+    # WorkflowTriggerBlock, from propagating the parent chain's prompt into the
+    # spawned child run). A no-op for deterministic blocks that don't call an LLM.
+    ignore_workflow_system_prompt: bool = False
+    # Runtime cache populated by ``Block._apply_workflow_system_prompt`` — not
+    # user-settable. Excluded from serialization (``model_dump`` / JSON / API
+    # responses) so the resolved prompt doesn't leak into logs, workflow
+    # definition round-trips, or responses that weren't meant to carry it.
+    # Deliberately absent from the BlockYAML schema so it can never be set
+    # through YAML or the API. The user-facing opt-out is
+    # ``ignore_workflow_system_prompt``. Only consumed by block types that call
+    # an LLM; deterministic blocks ignore it.
+    workflow_system_prompt: str | None = Field(default=None, exclude=True)
 
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
@@ -420,7 +446,10 @@ class Block(BaseModel, abc.ABC):
             BlockType.HTTP_REQUEST,
         ]
 
-        template = (env or jinja_sandbox_env).from_string(potential_template)
+        try:
+            template = (env or jinja_sandbox_env).from_string(potential_template)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
@@ -515,7 +544,48 @@ class Block(BaseModel, abc.ABC):
                     variables=missing_variables,
                 )
 
-        return template.render(template_data)
+        try:
+            return template.render(template_data)
+        except SkyvernException:
+            raise
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
+
+    def _apply_workflow_system_prompt(
+        self,
+        workflow_run_context: WorkflowRunContext,
+    ) -> None:
+        """Resolve the workflow-level ``workflow_system_prompt`` for this block and
+        materialize it onto ``self.workflow_system_prompt``.
+
+        Concatenates any prompt inherited from ancestor workflows (propagated through
+        ``WorkflowTriggerBlock``) with this workflow's own ``workflow_system_prompt``.
+        Jinja substitutions on this workflow's own prompt are resolved against
+        ``workflow_run_context``; the inherited portion is already resolved at the
+        trigger boundary.
+
+        Shared by every block type that needs to inherit the workflow system prompt
+        into its own ``workflow_system_prompt`` runtime cache before dispatching an
+        LLM call. Callers invoke this inside ``format_potential_template_parameters``
+        so the value is available at execute time. ``workflow_system_prompt`` on each
+        block is a runtime cache — it's deliberately absent from the BlockYAML schema
+        and not user-settable.
+
+        When a block opts out via ``ignore_workflow_system_prompt``, this leaves
+        the block's own ``workflow_system_prompt`` untouched (falling back to the
+        system default if none is set). The opt-out covers both this workflow's
+        prompt and any inherited prompt from parent workflows.
+        """
+        if self.ignore_workflow_system_prompt:
+            # Record the opt-out so the script path (``ai_extract``) reads the
+            # same decision instead of re-resolving the flag from the
+            # definition. See ``WorkflowRunContext.record_block_workflow_system_prompt``.
+            workflow_run_context.record_block_workflow_system_prompt(self.label, None)
+            return
+        resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        if resolved is not None:
+            self.workflow_system_prompt = resolved
+        workflow_run_context.record_block_workflow_system_prompt(self.label, resolved)
 
     @classmethod
     def get_subclasses(cls) -> tuple[type[Block], ...]:
@@ -568,7 +638,10 @@ class Block(BaseModel, abc.ABC):
                 block=block_data,
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
+                prompt=description_generation_prompt,
+                prompt_name="generate-workflow-run-block-description",
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             description = json_response.get("summary")
             LOG.info(
@@ -805,6 +878,10 @@ class BaseTaskBlock(Block):
                 )
                 for error_code, error_description in merged_mapping.items()
             }
+
+        # Materialize the workflow-level workflow_system_prompt onto this block so
+        # ForgeAgent.create_task can hand it off to the Task row verbatim.
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     @staticmethod
     async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
@@ -2784,6 +2861,8 @@ class TextPromptBlock(Block):
         if self.json_schema:
             self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def send_prompt(
         self,
         prompt: str,
@@ -2833,7 +2912,13 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
+        response = await llm_api_handler(
+            prompt=prompt,
+            prompt_name="text-prompt",
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -3778,6 +3863,8 @@ class FileParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
         url_parsed = urlparse(file_url)
@@ -3980,7 +4067,12 @@ class FileParserBlock(Block):
                 file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse Excel file: {str(e)}"
             )
 
-    async def _parse_pdf_file(self, file_path: str) -> str:
+    async def _parse_pdf_file(
+        self,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         """Parse PDF file and return extracted text.
 
         Uses the shared PDF parsing utility that tries pypdf first,
@@ -4011,11 +4103,15 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key, default=app.LLM_API_HANDLER
             )
+            # OCR transcription intentionally skips system_prompt
+            # It still applies to the downstream extract-information-from-file-text call.
             llm_response = await llm_api_handler(
                 prompt=llm_prompt,
                 prompt_name="extract-text-from-image",
                 screenshots=page_images,
                 force_dict=True,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             return llm_response.get("extracted_text", "")
         except Exception:
@@ -4025,7 +4121,12 @@ class FileParserBlock(Block):
             )
             raise
 
-    async def _parse_image_file(self, file_path: str) -> str:
+    async def _parse_image_file(
+        self,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         """Parse image file using vision LLM for OCR."""
         try:
             with open(file_path, "rb") as f:
@@ -4035,11 +4136,15 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key, default=app.LLM_API_HANDLER
             )
+            # OCR transcription intentionally skips system_prompt — see
+            # _parse_pdf_file_with_vision_ocr for rationale.
             llm_response = await llm_api_handler(
                 prompt=llm_prompt,
                 prompt_name="extract-text-from-image",
                 screenshots=[image_bytes],
                 force_dict=True,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             return llm_response.get("extracted_text", "")
         except Exception:
@@ -4117,7 +4222,11 @@ class FileParserBlock(Block):
             )
 
     async def _extract_with_ai(
-        self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
+        self,
+        content: str | list[dict[str, Any]],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
     ) -> dict[str, Any]:
         """Extract structured data using AI based on json_schema."""
         # Use local variable to avoid mutating the instance
@@ -4146,7 +4255,12 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
 
         llm_response = await llm_api_handler(
-            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+            prompt=llm_prompt,
+            prompt_name="extract-information-from-file-text",
+            force_dict=False,
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
         return llm_response
 
@@ -4223,9 +4337,17 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.EXCEL:
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
-            parsed_data = await self._parse_pdf_file(file_path)
+            parsed_data = await self._parse_pdf_file(
+                file_path,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         elif self.file_type == FileType.IMAGE:
-            parsed_data = await self._parse_image_file(file_path)
+            parsed_data = await self._parse_image_file(
+                file_path,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         elif self.file_type == FileType.DOCX:
             parsed_data = await self._parse_docx_file(file_path)
         else:
@@ -4250,7 +4372,12 @@ class FileParserBlock(Block):
 
         if self.json_schema:
             try:
-                ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
+                ai_extracted_data = await self._extract_with_ai(
+                    parsed_data,
+                    workflow_run_context,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
                 final_data = ai_extracted_data
             except Exception as e:
                 return await self.build_block_result(
@@ -4304,6 +4431,8 @@ class PDFParserBlock(Block):
         self.file_url = self.format_block_parameter_template_from_workflow_run_context(
             self.file_url, workflow_run_context
         )
+
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     async def execute(
         self,
@@ -4370,7 +4499,12 @@ class PDFParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+            prompt=llm_prompt,
+            prompt_name="extract-information-from-file-text",
+            force_dict=False,
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
@@ -4790,6 +4924,10 @@ class TaskV2Block(Block):
             )
             self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
+        # Materialize the workflow-level workflow_system_prompt onto this block so
+        # execute() can hand it off to the TaskV2 row verbatim.
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4865,6 +5003,7 @@ class TaskV2Block(Block):
                 totp_identifier=resolved_totp_identifier,
                 totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
+                workflow_system_prompt=self.workflow_system_prompt,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -6878,20 +7017,37 @@ class WorkflowTriggerBlock(Block):
             )
         return rendered
 
+    def _render_scalar_with_path(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+        path: str,
+    ) -> Any:
+        # Wrap render errors with JSON-pointer-style payload path + template so
+        # the failure reason surfaces where to look in the workflow.
+        try:
+            return self._render_template_value(value, workflow_run_context)
+        except PayloadTemplateRenderError:
+            raise
+        except Exception as exc:
+            raise PayloadTemplateRenderError(path=path, template=value, original=exc) from exc
+
     def _render_templates_in_payload(
         self,
         payload: dict[str, Any],
         workflow_run_context: WorkflowRunContext,
+        _path: str = "payload",
     ) -> dict[str, Any]:
         """Recursively render Jinja2 templates in payload values."""
         resolved: dict[str, Any] = {}
         for key, value in payload.items():
+            current_path = f"{_path}{_format_payload_path_segment(key)}"
             if isinstance(value, str):
-                resolved[key] = self._render_template_value(value, workflow_run_context)
+                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path)
             elif isinstance(value, dict):
-                resolved[key] = self._render_templates_in_payload(value, workflow_run_context)
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path)
             elif isinstance(value, list):
-                resolved[key] = self._render_templates_in_list(value, workflow_run_context)
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path)
             else:
                 resolved[key] = value
         return resolved
@@ -6900,19 +7056,49 @@ class WorkflowTriggerBlock(Block):
         self,
         items: list[Any],
         workflow_run_context: WorkflowRunContext,
+        _path: str = "payload",
     ) -> list[Any]:
         """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
         result: list[Any] = []
-        for item in items:
+        for idx, item in enumerate(items):
+            current_path = f"{_path}[{idx}]"
             if isinstance(item, str):
-                result.append(self._render_template_value(item, workflow_run_context))
+                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path))
             elif isinstance(item, dict):
-                result.append(self._render_templates_in_payload(item, workflow_run_context))
+                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path))
             elif isinstance(item, list):
-                result.append(self._render_templates_in_list(item, workflow_run_context))
+                result.append(self._render_templates_in_list(item, workflow_run_context, current_path))
             else:
                 result.append(item)
         return result
+
+    def validate_payload_templates(self) -> None:
+        """Parse-check every Jinja2 template in self.payload at workflow save time.
+
+        Walks the payload mirroring _render_templates_in_payload so paths match the
+        runtime PayloadTemplateRenderError format. On TemplateSyntaxError raises
+        PayloadTemplateSyntaxError with block label, JSON-pointer key path, and
+        the offending template string.
+        """
+        if not self.payload:
+            return
+
+        def _walk(value: Any, path: str) -> None:
+            if isinstance(value, dict):
+                for key, sub in value.items():
+                    _walk(sub, f"{path}{_format_payload_path_segment(key)}")
+            elif isinstance(value, list):
+                for idx, sub in enumerate(value):
+                    _walk(sub, f"{path}[{idx}]")
+            elif isinstance(value, str):
+                try:
+                    jinja_sandbox_env.parse(value)
+                except TemplateSyntaxError as exc:
+                    raise PayloadTemplateSyntaxError(
+                        block_label=self.label, path=path, template=value, original=exc
+                    ) from exc
+
+        _walk(self.payload, "payload")
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
@@ -7035,6 +7221,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                 )
             ):
                 try:
@@ -7044,6 +7231,7 @@ class WorkflowTriggerBlock(Block):
                         workflow_permanent_id=resolved_workflow_permanent_id,
                         organization=organization,
                         parent_workflow_run_id=workflow_run_id,
+                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                     )
                 except Exception as e:
                     error_msg = get_user_facing_exception_message(e)
@@ -7059,6 +7247,9 @@ class WorkflowTriggerBlock(Block):
                 )
 
                 try:
+                    # The opt-out flag is persisted on the child's workflow_run row at
+                    # spawn time (setup_workflow_run above), so execute_workflow reads
+                    # it from the DB. This works identically for sync and async triggers.
                     final_run = await app.WORKFLOW_SERVICE.execute_workflow(
                         workflow_run_id=triggered_run_id,
                         api_key=None,
@@ -7126,6 +7317,12 @@ class WorkflowTriggerBlock(Block):
                 browser_session_id=resolved_browser_session_id,
             )
             try:
+                # ``run_workflow`` persists this flag to the child's
+                # workflow_run row via its internal setup_workflow_run call,
+                # then dispatches to Temporal without passing the flag
+                # separately; the worker reads it back from the DB inside
+                # ``execute_workflow``. Symmetric with the sync branch above
+                # — the flag is written once, at spawn time, for both paths.
                 triggered_workflow_run = await run_workflow(
                     workflow_id=resolved_workflow_permanent_id,
                     organization=organization,
@@ -7133,6 +7330,7 @@ class WorkflowTriggerBlock(Block):
                     request=None,
                     background_tasks=None,
                     parent_workflow_run_id=workflow_run_id,
+                    ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                 )
             except Exception as e:
                 error_msg = get_user_facing_exception_message(e)

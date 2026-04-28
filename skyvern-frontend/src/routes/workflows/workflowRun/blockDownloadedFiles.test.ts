@@ -1,5 +1,50 @@
 import { describe, expect, test } from "vitest";
-import { getBlockDownloadedFileUrls } from "./blockDownloadedFiles";
+import {
+  filenameForDownloadedFileUrl,
+  getBlockDownloadedFileUrls,
+} from "./blockDownloadedFiles";
+
+describe("filenameForDownloadedFileUrl", () => {
+  test("short signed URL: pulls filename from artifact_name query param", () => {
+    const url =
+      "https://api.skyvern.com/v1/artifacts/a_123/content" +
+      "?expiry=1&kid=k&sig=s&artifact_name=invoice-2026.pdf&artifact_type=download";
+    expect(filenameForDownloadedFileUrl(url)).toBe("invoice-2026.pdf");
+  });
+
+  test("short signed URL with non-ASCII filename: round-trips via URL decoding", () => {
+    const url =
+      "https://api.skyvern.com/v1/artifacts/a_123/content" +
+      "?expiry=1&kid=k&sig=s&artifact_name=" +
+      encodeURIComponent("\u62a5\u544a-2026.pdf");
+    expect(filenameForDownloadedFileUrl(url)).toBe("报告-2026.pdf");
+  });
+
+  test("legacy S3 presigned URL: pulls filename from path basename", () => {
+    const url =
+      "https://skyvern-uploads.s3.amazonaws.com/" +
+      "downloads/production/o_1/wr_1/legacy-report.pdf" +
+      "?AWSAccessKeyId=ASIA&Signature=sig&Expires=1234567890";
+    expect(filenameForDownloadedFileUrl(url)).toBe("legacy-report.pdf");
+  });
+
+  test("legacy S3 presigned URL with percent-encoded filename: decodes the basename", () => {
+    const url =
+      "https://skyvern-uploads.s3.amazonaws.com/" +
+      "downloads/production/o_1/wr_1/Q2%20report.pdf" +
+      "?AWSAccessKeyId=x&Signature=y";
+    expect(filenameForDownloadedFileUrl(url)).toBe("Q2 report.pdf");
+  });
+
+  test("short URL without artifact_name and trailing /content: returns 'download'", () => {
+    const url = "https://api.skyvern.com/v1/artifacts/a_123/content?sig=x";
+    expect(filenameForDownloadedFileUrl(url)).toBe("download");
+  });
+
+  test("malformed URL: returns 'download'", () => {
+    expect(filenameForDownloadedFileUrl("not a url")).toBe("download");
+  });
+});
 
 describe("getBlockDownloadedFileUrls", () => {
   test("returns [] when blockOutput is null/undefined/string/array", () => {

@@ -46,6 +46,7 @@ class TaskV2(BaseModel):
     webhook_failure_reason: str | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict | None = None
+    workflow_system_prompt: str | None = None
     model: dict[str, Any] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -203,6 +204,7 @@ class TaskV2Request(BaseModel):
     publish_workflow: bool = False
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None

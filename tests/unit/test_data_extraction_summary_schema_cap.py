@@ -18,7 +18,7 @@ def _run_create_extract_action(monkeypatch, extracted_information_schema):
             captured.update(kwargs)
         return original_load_prompt(template_name, **kwargs)
 
-    async def fake_handler(*, prompt, step, prompt_name):
+    async def fake_handler(*, prompt, step, prompt_name, **_ignored):
         captured["prompt"] = prompt
         return {"summary": "ok"}
 

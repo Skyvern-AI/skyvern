@@ -4,6 +4,12 @@ from typing import Any, Protocol
 
 from skyvern.config import settings
 
+# Sentinel for the optional ``system_prompt`` parameter on ``ai_extract``.
+# Distinguishes "caller omitted the argument" (resolve from workflow context,
+# honoring the current block's ``ignore_workflow_system_prompt`` flag) from
+# "caller passed None" (opt out, send no system prompt).
+SYSTEM_PROMPT_UNSET: Any = object()
+
 
 class SkyvernPageAi(Protocol):
     """Protocol defining the interface for AI-powered page interactions."""
@@ -67,6 +73,7 @@ class SkyvernPageAi(Protocol):
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
         include_extracted_text: bool = True,
+        system_prompt: str | None | Any = SYSTEM_PROMPT_UNSET,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
         ...

@@ -30,6 +30,7 @@ export const workflowTriggerNodeDefaultData: WorkflowTriggerNodeData = {
   browserSessionId: "",
   useParentBrowserSession: true,
   parameterKeys: [],
+  ignoreWorkflowSystemPrompt: false,
 };
 
 export function isWorkflowTriggerNode(node: Node): node is WorkflowTriggerNode {

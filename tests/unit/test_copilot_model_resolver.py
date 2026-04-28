@@ -9,7 +9,7 @@ import pytest
 
 
 class TestModelResolver:
-    def test_rejects_router_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_router_config_empty_model_list_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
         from skyvern.forge.sdk.api.llm.models import LLMRouterConfig
 
@@ -31,8 +31,94 @@ class TestModelResolver:
         handler = MagicMock()
         handler.llm_key = "ROUTER_KEY"
 
-        with pytest.raises(InvalidLLMConfigError, match="LLMRouterConfig"):
+        with pytest.raises(InvalidLLMConfigError, match="empty model_list"):
             resolve_model_config(handler)
+
+    def test_router_config_degrades_to_main_model_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Shim for SKY-9257: a router key resolves to its main_model_group entry as a direct
+        LLMConfig so copilot-v2 can run until SKY-9256 lands the real bridge.
+        """
+        from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
+
+        main = LLMRouterModelConfig(
+            model_name="vertex-gemini-2.5-flash",  # router group alias
+            litellm_params={
+                "model": "vertex_ai/gemini-2.5-flash",
+                "api_base": "https://vertex.example.com",
+                "timeout": 900.0,
+            },
+        )
+        fallback = LLMRouterModelConfig(
+            model_name="gpt-4-1-mini-fallback",
+            litellm_params={"model": "azure/gpt-4-1-mini"},
+        )
+        router_config = LLMRouterConfig(
+            model_name="gemini-2.5-flash-fallback-router",
+            model_list=[main, fallback],
+            required_env_vars=["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            main_model_group="vertex-gemini-2.5-flash",
+            fallback_model_group="gpt-4-1-mini-fallback",
+            temperature=0.3,
+            max_completion_tokens=8192,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
+            lambda key: router_config,
+        )
+
+        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+
+        handler = MagicMock()
+        handler.llm_key = "GEMINI_2_5_FLASH_WITH_FALLBACK"
+
+        model_name, run_config, llm_key, supports_vision = resolve_model_config(handler)
+
+        assert model_name == "vertex_ai/gemini-2.5-flash"
+        assert llm_key == "GEMINI_2_5_FLASH_WITH_FALLBACK"
+        assert supports_vision is True
+        assert run_config.model_settings is not None
+        assert run_config.model_settings.temperature == 0.3
+        assert run_config.model_settings.max_tokens == 8192
+        assert run_config.model_settings.extra_args is not None
+        assert run_config.model_settings.extra_args["timeout"] == 900.0
+
+    def test_router_config_no_main_group_match_falls_back_to_first_entry(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
+
+        entry = LLMRouterModelConfig(
+            model_name="some-group",
+            litellm_params={"model": "vertex_ai/gemini-2.5-flash"},
+        )
+        router_config = LLMRouterConfig(
+            model_name="misconfigured-router",
+            model_list=[entry],
+            required_env_vars=[],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            main_model_group="nonexistent-group",
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
+            lambda key: router_config,
+        )
+
+        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+
+        handler = MagicMock()
+        handler.llm_key = "MISCONFIGURED_ROUTER"
+
+        with caplog.at_level(logging.WARNING, logger="skyvern.forge.sdk.copilot.model_resolver"):
+            model_name, _, _, _ = resolve_model_config(handler)
+
+        assert model_name == "vertex_ai/gemini-2.5-flash"
+        joined = " ".join(record.getMessage() for record in caplog.records)
+        assert "main_model_group has no matching" in joined
 
     def test_maps_basic_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.models import LLMConfig

@@ -183,6 +183,7 @@ class Settings(BaseSettings):
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
@@ -419,6 +420,7 @@ class Settings(BaseSettings):
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
+    VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES: int = 3
 
     # Bitwarden Settings
     BITWARDEN_CLIENT_ID: str | None = None

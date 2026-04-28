@@ -196,7 +196,7 @@ def _capture_ai_extract_kwargs(monkeypatch, include_extracted_text: bool):
     async def fake_refresh(*_args, **_kwargs):
         return None
 
-    async def fake_handler(*, prompt, step, screenshots, prompt_name, force_dict):
+    async def fake_handler(*, prompt, step, screenshots, prompt_name, force_dict, **_ignored):
         return {}
 
     monkeypatch.setattr(module, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
@@ -258,7 +258,7 @@ def _capture_ai_extract_kwargs_with_schema(monkeypatch, schema):
     async def fake_refresh(*_args, **_kwargs):
         return None
 
-    async def fake_handler(*, prompt, step, screenshots, prompt_name, force_dict):
+    async def fake_handler(*, prompt, step, screenshots, prompt_name, force_dict, **_ignored):
         return {}
 
     monkeypatch.setattr(module, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)

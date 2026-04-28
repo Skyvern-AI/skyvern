@@ -31,6 +31,7 @@ from skyvern.core.script_generations.parameter_reference_guard import (
     validate_context_parameter_refs,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.models.parameter import is_sensitive_workflow_parameter
 from skyvern.schemas.workflows import FileStorageType
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
@@ -85,6 +86,29 @@ def _collect_declared_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
             continue
         key = param.get("key")
         if key:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_secret_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Return the set of parameter keys that carry credential/secret data.
+
+    Routes each declared parameter through ``is_sensitive_workflow_parameter`` —
+    the canonical filter that combines ``ParameterType.is_secret_or_credential``
+    (aws_secret, bitwarden_*, onepassword, azure_*, credential) with the
+    ``workflow_parameter_type=credential_id`` sub-check. Used by
+    ``_build_value_to_param_lookup`` to skip emitting ``context.parameters[key]``
+    references that would leak secret indirection into persisted prompts.
+    """
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if key and is_sensitive_workflow_parameter(param):
             keys.add(key)
     return frozenset(keys)
 
@@ -353,9 +377,17 @@ DOUBLE_INDENT = " " * 8
 # Short values (e.g. "1", "No", "CA") cause too many false-positive replacements.
 MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 
+# Maximum length. Prevents oversized values (multi-KB JSON payloads, long blobs)
+# from being scanned against every prompt; values longer than this would never
+# legitimately appear verbatim in a click prompt anyway.
+MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
+
 
 def _build_value_to_param_lookup(
     actions_by_task: dict[str, list[dict[str, Any]]],
+    workflow_parameters: dict[str, Any] | None = None,
+    declared_keys: frozenset[str] | None = None,
+    secret_param_keys: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Build a mapping from literal action values to their parameter field names.
 
@@ -365,10 +397,30 @@ def _build_value_to_param_lookup(
     that click-prompt generation can replace matching literals with
     ``context.parameters['field_name']`` f-string references.
 
-    The returned dict is sorted by *descending value length* so that callers who
-    iterate in order will replace longer matches first, avoiding partial collisions.
+    When ``workflow_parameters`` is provided (the run's workflow-level input params),
+    its values are also added to the lookup keyed by the parameter name. This catches
+    run-specific values that the agent embedded directly in click prompts (e.g.
+    ``"Should I download the invoice for account 51410020?"`` where ``51410020``
+    came from the ``account_number`` parameter, not from an input_text action).
+
+    ``secret_param_keys`` (sourced from ``ParameterType.is_secret_or_credential`` and
+    ``WorkflowParameterType.is_credential_type``) filters out credential/secret param
+    keys structurally — substituting ``context.parameters['password']`` into a click
+    prompt would leak the indirection. ``declared_keys`` restricts emitted keys to
+    those declared in the workflow definition; an undeclared key would crash the
+    cached script at runtime when ``context.parameters[...]`` raises ``KeyError``.
+
+    First-writer-wins on duplicate values: action-level field_names are added first
+    (more specific — tied to a page interaction); workflow-param keys only fill gaps.
+    The rare case of two distinct keys legitimately sharing one value silently picks
+    the first writer; downstream reviewer flow re-validates and can correct if the
+    pick is wrong.
+
+    The returned dict is sorted by *descending value length* so callers who iterate
+    in order replace longer matches first, avoiding partial collisions.
     """
     raw: dict[str, str] = {}
+
     for _task_id, actions in actions_by_task.items():
         for action in actions:
             field_name = action.get("field_name")
@@ -383,11 +435,36 @@ def _build_value_to_param_lookup(
                 value = action.get("option", "")
             else:
                 continue
-            if value and len(value) >= MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
-                # First writer wins — the field-level name is more specific than a
-                # workflow-level parameter that may happen to share the same value.
-                if value not in raw:
-                    raw[value] = field_name
+            if not value:
+                continue
+            if len(value) < MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB or len(value) > MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
+                continue
+            if value.startswith("cred_"):
+                continue
+            raw.setdefault(value, field_name)
+
+    if workflow_parameters:
+        for param_key, param_value in workflow_parameters.items():
+            # Distinguish "no value" (None / empty string) from legitimate falsy
+            # values that could appear verbatim in a click prompt — e.g. a
+            # boolean param ``auto_renew=False`` referenced in a prompt like
+            # ``"Confirm auto-renew is False"``. ``0`` is still skipped by the
+            # min-length floor below (``str(0)`` is 1 char).
+            if param_value is None or param_value == "":
+                continue
+            if secret_param_keys and param_key in secret_param_keys:
+                continue
+            if declared_keys is not None and param_key not in declared_keys:
+                continue
+            value_str = str(param_value)
+            if (
+                len(value_str) < MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB
+                or len(value_str) > MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB
+            ):
+                continue
+            if value_str.startswith("cred_"):
+                continue
+            raw.setdefault(value_str, param_key)
 
     # Sort by descending value length so longer matches are attempted first.
     return dict(sorted(raw.items(), key=lambda kv: len(kv[0]), reverse=True))
@@ -2933,6 +3010,7 @@ async def generate_workflow_script_python_code(
     # LLM inventing names.
     declared_keys = _collect_declared_param_keys(workflow)
     upstream_keys = _collect_upstream_schema_keys(blocks)
+    secret_param_keys = _collect_secret_param_keys(workflow)
     goal_template_by_task = _collect_goal_templates(blocks)
     generated_schema, field_mappings = await generate_workflow_parameters_schema(
         actions_by_task,
@@ -2945,7 +3023,15 @@ async def generate_workflow_script_python_code(
 
     # Build a lookup from literal parameter values to field names so that click
     # prompt strings can be parameterized (e.g. patient ID → context.parameters[...]).
-    value_to_param = _build_value_to_param_lookup(actions_by_task)
+    # Pass the run's workflow-level input parameters too so click-prompt literals
+    # like "for account 51410020" get substituted with context.parameters[...]
+    # references at generation time, not baked in run-specifically.
+    value_to_param = _build_value_to_param_lookup(
+        actions_by_task,
+        workflow_parameters=workflow_run_request.get("parameters") if workflow_run_request else None,
+        declared_keys=declared_keys,
+        secret_param_keys=secret_param_keys,
+    )
 
     # --- class + cached params -----------------------------------------
     model_cls = _build_model(workflow)

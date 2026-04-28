@@ -131,6 +131,8 @@ function getWorkflowElements(version: WorkflowVersion) {
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      version.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   return getElements(

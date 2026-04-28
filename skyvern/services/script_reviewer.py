@@ -9,12 +9,53 @@ from typing import Literal, Sequence
 import libcst as cst
 import structlog
 
+from skyvern.core.script_generations.generate_script import (
+    MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB,
+    MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
+from skyvern.forge.sdk.workflow.models.parameter import is_sensitive_workflow_parameter
 from skyvern.schemas.scripts import ScriptBranchHit, ScriptFallbackEpisode
 
 LOG = structlog.get_logger()
+
+# A literal qualifies for substring-match (vs exact-match) only if it has
+# whitespace AND is at least 8 characters long. Whitespace is the primary
+# discriminator (structural Python identifiers — dict keys, kwargs, status
+# enums — never contain whitespace); the length floor only suppresses
+# trivially-short whitespace-bearing strings.
+PROSE_LITERAL_MIN_LEN = 8
+
+
+async def load_filtered_run_param_values(workflow_run_id: str) -> dict[str, str]:
+    """Load run-parameter values for the reviewer's hardcoded-value detector.
+
+    Pipeline: fetch ``(WorkflowParameter, RunParameter)`` tuples from the DB,
+    drop secret/credential params via the unified ``is_sensitive_workflow_parameter``
+    helper, return ``{key -> value}``. Never raises (DB errors are logged and
+    swallowed so the reviewer flow continues).
+    """
+    try:
+        param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+            workflow_run_id=workflow_run_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to load run parameter values",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return {}
+    result: dict[str, str] = {}
+    for wf_param, run_param in param_tuples:
+        if run_param.value is None or not str(run_param.value).strip():
+            continue
+        if is_sensitive_workflow_parameter(wf_param):
+            continue
+        result[wf_param.key] = str(run_param.value)
+    return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -182,24 +223,10 @@ class ScriptReviewer:
         if historical_episodes:
             unique_run_ids = list({ep.workflow_run_id for ep in historical_episodes if ep.workflow_run_id})[:20]
 
-            async def _load_run_params(run_id: str) -> tuple[str, dict[str, str]]:
-                try:
-                    param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=run_id)
-                    params = {
-                        wf_param.key: str(run_param.value)
-                        for wf_param, run_param in param_tuples
-                        if run_param.value is not None
-                        and str(run_param.value).strip()
-                        and not wf_param.parameter_type.is_secret_or_credential()
-                    }
-                    return run_id, params
-                except Exception:
-                    LOG.warning(
-                        "Failed to load params for historical episode run", workflow_run_id=run_id, exc_info=True
-                    )
-                    return run_id, {}
+            async def _load(run_id: str) -> tuple[str, dict[str, str]]:
+                return run_id, await load_filtered_run_param_values(run_id)
 
-            results = await asyncio.gather(*[_load_run_params(rid) for rid in unique_run_ids])
+            results = await asyncio.gather(*[_load(rid) for rid in unique_run_ids])
             historical_run_params = {rid: params for rid, params in results if params}
 
         # Triage failed episodes — skip non-code-fixable failures.
@@ -1891,10 +1918,51 @@ class ScriptReviewer:
             and func.value.value == "page"
         )
 
-    # Regex to extract string literals (single or double quoted, excluding escaped quotes).
-    # Uses separate alternations for single- and double-quoted strings to avoid
-    # backtracking ambiguity (CodeQL py/redos).
-    _STRING_LITERAL_RE: re.Pattern[str] = re.compile(r""""([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'""")
+    @staticmethod
+    def _collect_code_literals(code: str) -> tuple[set[str], set[str]]:
+        """Walk ``code`` via libcst and return ``(exact_literals, prose_literals)``.
+
+        Handles single-, double-, and triple-quoted ``cst.SimpleString`` nodes via
+        ``evaluated_value``; for ``cst.FormattedString`` (f-strings) concatenates
+        the text segments and skips interpolation expressions (their values come
+        from ``context.parameters[...]`` at runtime, not from literals). Comments
+        are automatically excluded — libcst doesn't expose them as strings.
+
+        On parse failure (the LLM emitted broken Python), returns empty sets so
+        the validator skips silently rather than crashing the review pipeline.
+        """
+        exact: set[str] = set()
+        prose: set[str] = set()
+        try:
+            module = cst.parse_module(code)
+        except cst.ParserSyntaxError:
+            return exact, prose
+
+        def _add(value: str) -> None:
+            if not value:
+                return
+            exact.add(value)
+            if len(value) >= PROSE_LITERAL_MIN_LEN and any(c.isspace() for c in value):
+                prose.add(value)
+
+        class _Collector(cst.CSTVisitor):
+            def visit_SimpleString(self, node: cst.SimpleString) -> None:
+                try:
+                    value = node.evaluated_value
+                except Exception:
+                    return
+                if isinstance(value, str):
+                    _add(value)
+
+            def visit_FormattedString(self, node: cst.FormattedString) -> bool:
+                # Concatenate the f-string's text parts only. Interpolation
+                # expressions reference runtime values (``context.parameters[...]``),
+                # not literals, so we skip them by returning False (no recursion).
+                _add("".join(part.value for part in node.parts if isinstance(part, cst.FormattedStringText)))
+                return False
+
+        module.visit(_Collector())
+        return exact, prose
 
     def _validate_no_hardcoded_values(
         self,
@@ -1904,34 +1972,36 @@ class ScriptReviewer:
         """Detect hardcoded parameter values in generated code.
 
         Checks if any workflow parameter value from the current run appears as a
-        string literal in the code. This catches cases where the LLM copies a
-        run-specific value (e.g., a customer email) instead of referencing
-        context.parameters['key'].
+        string literal in the code. Catches cases where the LLM copies a run-
+        specific value (e.g., a customer email) instead of referencing
+        ``context.parameters['key']``.
 
-        Returns an error message or None if no hardcoded values are found.
+        Two match modes minimize false positives:
+        - **exact match** runs against every string literal — catches cases where
+          the value is the entire literal (``selector="invoice_12345"``).
+        - **substring match** runs only against *prose* literals (whitespace +
+          ≥ ``PROSE_LITERAL_MIN_LEN`` chars) — catches values embedded inside
+          longer click prompts (``"Should I download invoice 12345?"``) without
+          falsely flagging short structural tokens like ``"next_block_label"``.
+
+        Param values shorter than ``MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB`` or
+        longer than ``MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB`` are skipped so the
+        validator never flags values the generator wouldn't have parameterized.
+
+        Returns an error message, or None if no hardcoded values are found.
         """
         if not run_parameter_values:
             return None
 
-        # Extract all string literals from non-comment lines
-        code_literals: set[str] = set()
-        for line in code.split("\n"):
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                continue
-            for match in self._STRING_LITERAL_RE.finditer(line):
-                # group(1) = double-quoted content, group(2) = single-quoted content
-                literal_value = match.group(1) or match.group(2)
-                if literal_value:
-                    code_literals.add(literal_value)
+        exact_literals, prose_literals = self._collect_code_literals(code)
 
         hardcoded: list[tuple[str, str]] = []
         for param_key, param_value in run_parameter_values.items():
-            # Skip short values to avoid false positives (e.g., "yes", "true", "1")
-            if len(param_value) < 5:
+            if len(param_value) < MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
                 continue
-            # Check if the parameter value appears as a string literal
-            if param_value in code_literals:
+            if len(param_value) > MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
+                continue
+            if param_value in exact_literals or any(param_value in literal for literal in prose_literals):
                 hardcoded.append((param_key, param_value))
 
         if not hardcoded:

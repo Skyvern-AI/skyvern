@@ -49,6 +49,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   continueOnFailure: false,
   disableCache: false,
   includeActionHistoryInVerification: false,
+  ignoreWorkflowSystemPrompt: false,
   // V2-specific fields
   prompt: "",
   maxSteps: MAX_STEPS_DEFAULT,

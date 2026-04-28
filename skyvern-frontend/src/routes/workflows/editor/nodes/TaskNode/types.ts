@@ -47,6 +47,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   includeActionHistoryInVerification: false,
   engine: RunEngine.SkyvernV1,
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isTaskNode(node: Node): node is TaskNode {

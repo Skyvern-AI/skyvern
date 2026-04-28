@@ -20,7 +20,6 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
-    DEFAULT_LOGIN_COMPLETE_CRITERION,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
@@ -481,17 +480,12 @@ async def _create_workflow_block_run_and_task(
             # Include script parameters as navigation_payload so handlers
             # (e.g. file upload) can find URLs like resume_link in the payload.
             nav_payload = context.script_run_parameters or None
-            # Apply default complete_criterion for login blocks so cached scripts
-            # get the same rigorous LLM verification as the agent path (SKY-8540).
-            # Without this, the LLM only sees a generic navigation_goal and can
-            # falsely mark login as complete when credentials were never entered.
-            task_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION if block_type == BlockType.LOGIN else None
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
-                complete_criterion=task_complete_criterion,
+                complete_criterion=None,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
@@ -636,9 +630,14 @@ async def _update_workflow_block(
     label: str | None = None,
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
-    ai_fallback_triggered: bool = False,
+    ai_fallback_triggered: bool | None = None,
 ) -> None:
-    """Update the status of a workflow run block."""
+    """Update workflow_run_block status, optionally setting `script_run`.
+
+    `ai_fallback_triggered` is three-valued: `None` = no assertion (no
+    write); `True`/`False` = explicit fallback signal, written to
+    `workflow_run_blocks.script_run` as `{"ai_fallback_triggered": <bool>}`.
+    """
     try:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.workflow_run_id or not context.workflow_id:
@@ -727,7 +726,9 @@ async def _update_workflow_block(
                 )
             if step_for_billing:
                 try:
-                    if not ai_fallback_triggered:
+                    # Explicit `is not True` — `None` means "caller made no
+                    # assertion" and falls through to billing like False.
+                    if ai_fallback_triggered is not True:
                         await app.AGENT_FUNCTION.post_cache_step_execution(
                             updated_task,
                             step_for_billing,
@@ -754,6 +755,7 @@ async def _update_workflow_block(
             status=status,
             failure_reason=failure_reason,
             output=final_output,
+            ai_fallback_triggered=ai_fallback_triggered,
         )
 
         await _record_output_parameter_value(
@@ -1179,6 +1181,8 @@ async def _fallback_to_ai_run(
                 task_failure_reason = f"{task_failure_reason}. Detected errors: {', '.join(error_codes)}"
 
             if workflow_run_block_id:
+                # No `ai_fallback_triggered` here — the script step failed
+                # before the AI agent ran, so no fallback actually fired.
                 await _update_workflow_block(
                     workflow_run_block_id,
                     BlockStatus.failed,
@@ -1424,6 +1428,7 @@ async def _fallback_to_ai_run(
                 task_status=TaskStatus.failed,
                 label=cache_key,
                 failure_reason=str(e),
+                ai_fallback_triggered=True,
             )
         raise e
 

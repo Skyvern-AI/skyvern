@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.experimentation.llm_prompt_config import LLMAPIHandler
+    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 import structlog
@@ -26,7 +27,6 @@ from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
-from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
 )
@@ -321,8 +321,8 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
 ) -> AgentResult:
-    # Preflight feasibility classifier. Never raises (errors fall through to
-    # proceed). Off by default; enable via settings.ENABLE_COPILOT_FEASIBILITY_GATE.
+    # Preflight feasibility classifier — fires on every turn so mid-session pivots
+    # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
 
     feasibility_verdict = await run_feasibility_gate(
@@ -389,6 +389,7 @@ async def run_copilot_agent(
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
+        workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
     )
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(llm_api_handler)

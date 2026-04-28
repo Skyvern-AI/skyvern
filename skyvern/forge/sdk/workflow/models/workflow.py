@@ -56,6 +56,7 @@ class WorkflowDefinition(BaseModel):
     blocks: List[BlockTypeVar]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -114,6 +115,8 @@ class Workflow(BaseModel):
     sequential_key: str | None = None
     folder_id: str | None = None
     import_error: str | None = None
+    created_by: str | None = None
+    edited_by: str | None = None
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -199,6 +202,8 @@ class WorkflowRun(BaseModel):
     code_gen: bool | None = None
     trigger_type: WorkflowRunTriggerType | None = None
     workflow_schedule_id: str | None = None
+    ignore_inherited_workflow_system_prompt: bool = False
+    copilot_session_id: str | None = None
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -270,6 +275,7 @@ class WorkflowRunResponseBase(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
+    recording_urls: list[str] | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None

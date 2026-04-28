@@ -15,6 +15,8 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { ModelSelector } from "@/components/ModelSelector";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { Separator } from "@/components/ui/separator";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const { editable, label } = data;
@@ -101,6 +103,18 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
             value={data.model}
             onChange={(value) => {
               update({ model: value });
+            }}
+          />
+          <Separator />
+          <IgnoreWorkflowSystemPrompt
+            ignoreWorkflowSystemPrompt={
+              data.ignoreWorkflowSystemPrompt ?? false
+            }
+            editable={editable}
+            onIgnoreWorkflowSystemPromptChange={(
+              ignoreWorkflowSystemPrompt,
+            ) => {
+              update({ ignoreWorkflowSystemPrompt });
             }}
           />
         </div>

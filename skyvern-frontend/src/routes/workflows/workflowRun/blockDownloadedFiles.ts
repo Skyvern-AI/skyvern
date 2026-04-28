@@ -8,6 +8,44 @@ function urlKey(url: string): string {
   return url.split("?")[0] ?? url;
 }
 
+/**
+ * Best-effort filename for a downloaded-file URL.
+ *
+ * Two URL shapes are in the wild:
+ *   1. Short signed artifact URLs introduced in SKY-8861, of shape
+ *      ``/v1/artifacts/{id}/content?artifact_name=foo.pdf&...``. The path
+ *      basename is always ``content``; the real filename is in the query
+ *      parameter.
+ *   2. Legacy S3 presigned URLs, of shape
+ *      ``https://skyvern-uploads.s3.amazonaws.com/downloads/.../foo.pdf?...``.
+ *      The path basename *is* the filename, but it may be percent-encoded
+ *      for filenames containing spaces / unicode.
+ */
+function filenameForDownloadedFileUrl(url: string): string {
+  const fallback = "download";
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return fallback;
+  }
+  // searchParams.get auto-decodes percent-encoding, so non-ASCII
+  // artifact_name values round-trip without an explicit decodeURIComponent.
+  const fromQuery = parsed.searchParams.get("artifact_name");
+  if (fromQuery) {
+    return fromQuery;
+  }
+  const last = parsed.pathname.split("/").pop();
+  if (!last || last === "content") {
+    return fallback;
+  }
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+}
+
 function getBlockDownloadedFileUrls(
   blockOutput: object | Array<unknown> | string | null | undefined,
   freshFallbackUrls: ReadonlyArray<string>,
@@ -41,4 +79,4 @@ function getBlockDownloadedFileUrls(
   return blockUrls.map((url) => freshByPath.get(urlKey(url)) ?? url);
 }
 
-export { getBlockDownloadedFileUrls };
+export { filenameForDownloadedFileUrl, getBlockDownloadedFileUrls };

@@ -1323,6 +1323,9 @@ class SkyvernPage(Page):
         """
         data = kwargs.pop("data", None)
         skip_refresh = kwargs.pop("skip_refresh", False)
+        extra_kwargs: dict[str, Any] = {}
+        if "system_prompt" in kwargs:
+            extra_kwargs["system_prompt"] = kwargs.pop("system_prompt")
         return await self._ai.ai_extract(
             prompt=prompt,
             schema=schema,
@@ -1330,6 +1333,7 @@ class SkyvernPage(Page):
             intention=intention,
             data=data,
             skip_refresh=skip_refresh,
+            **extra_kwargs,
         )
 
     async def validate(

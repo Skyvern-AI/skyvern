@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
+_BROWSER_BOOT_WAIT_SECONDS = 15.0
+_BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 
 
 @dataclass
@@ -194,6 +196,19 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
                 timeout_minutes=30,
             )
         ctx.browser_session_id = session.persistent_browser_session_id
+
+        # DefaultPersistentSessionsManager schedules chromium in a background
+        # task and returns from create_session before browser_context is set,
+        # so the next mcp_browser_context lookup raises. Wait for it.
+        async with asyncio.timeout(_BROWSER_BOOT_WAIT_SECONDS):
+            while True:
+                state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    session_id=ctx.browser_session_id,
+                    organization_id=ctx.organization_id,
+                )
+                if state and state.browser_context:
+                    break
+                await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
 
         sc = skyvern_context.current()
         if sc:

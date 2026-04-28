@@ -1,12 +1,65 @@
 from abc import ABC, abstractmethod
 from typing import BinaryIO
 
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+
+
+async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type: ArtifactType) -> list[FileInfo]:
+    """Build the API-shaped ``FileInfo`` list from a homogeneous batch of
+    artifact rows (e.g. all DOWNLOAD or all RECORDING).
+
+    Filename is the URI basename (the save site writes ``{base_uri}/{file}``);
+    checksum and modified_at come straight from the row, so retrieval needs
+    zero S3 round-trips.
+
+    All artifacts in a single batch share the same organization (downloads /
+    recordings are scoped to a run or browser session, which is scoped to an
+    org), so the per-org URL TTL is resolved once and applied to every URL.
+
+    The ``artifact_type`` is only used for the URL's informational query
+    parameter — it does not affect the HMAC signature. Callers must pass rows
+    of a single type so the URL hint is correct.
+    """
+    if not artifacts:
+        return []
+    organization_id = artifacts[0].organization_id
+    expiry_seconds = await app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id)
+    infos: list[FileInfo] = []
+    for artifact in artifacts:
+        filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+        url = app.ARTIFACT_MANAGER.build_signed_content_url(
+            artifact_id=artifact.artifact_id,
+            artifact_name=filename,
+            artifact_type=artifact_type.value,
+            expiry_seconds=expiry_seconds,
+        )
+        infos.append(
+            FileInfo(
+                url=url,
+                checksum=artifact.checksum,
+                filename=filename,
+                modified_at=artifact.created_at,
+                artifact_id=artifact.artifact_id,
+            )
+        )
+    return infos
+
+
+async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
+    """Backward-compat alias for DOWNLOAD-typed callers.
+
+    Forwards to :func:`_file_infos_from_artifacts` with the DOWNLOAD type so
+    pre-existing import sites keep working without each having to thread the
+    artifact_type through.
+    """
+    return await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.DOWNLOAD)
+
 
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
@@ -154,10 +207,6 @@ class BaseStorage(ABC):
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        pass
-
-    @abstractmethod
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
         pass
 
     @abstractmethod

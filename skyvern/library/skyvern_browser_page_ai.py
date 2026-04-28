@@ -15,7 +15,7 @@ from skyvern.client import (
     RunSdkActionRequestAction_Validate,
 )
 from skyvern.config import settings
-from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -168,13 +168,15 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
         include_extracted_text: bool = True,
+        system_prompt: str | None | Any = SYSTEM_PROMPT_UNSET,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI via API call.
 
-        Note: skip_refresh and include_extracted_text are accepted for Protocol
-        compatibility but not forwarded to the API. The server-side controls
-        both via the Task record on the SDK HTTP path. The optimizations only
-        take effect on the direct RealSkyvernPageAI path (MCP local browser).
+        Note: skip_refresh, include_extracted_text, and system_prompt are
+        accepted for Protocol compatibility but not forwarded to the API. The
+        server-side controls them via the Task record on the SDK HTTP path.
+        The optimizations only take effect on the direct RealSkyvernPageAI
+        path (MCP local browser).
         """
 
         LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)

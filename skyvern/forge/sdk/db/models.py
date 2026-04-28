@@ -103,6 +103,7 @@ class TaskModel(Base):
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
+    workflow_system_prompt = Column(UnicodeText, nullable=True)
     errors = Column(JSON, default=[], nullable=False)
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
@@ -172,6 +173,7 @@ class OrganizationModel(Base):
     domain = Column(String, nullable=True, index=True)
     bw_organization_id = Column(String, nullable=True, default=None)
     bw_collection_ids = Column(JSON, nullable=True, default=None)
+    artifact_url_expiry_seconds = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -233,6 +235,11 @@ class ArtifactModel(Base):
             "run_id",
             postgresql_where=text("run_id IS NOT NULL"),
         ),
+        Index(
+            "ix_artifacts_browser_session_id_partial",
+            "browser_session_id",
+            postgresql_where=text("browser_session_id IS NOT NULL"),
+        ),
     )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
@@ -248,6 +255,8 @@ class ArtifactModel(Base):
     uri = Column(String)
     bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True)
+    browser_session_id = Column(String, nullable=True)
+    checksum = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -321,6 +330,8 @@ class WorkflowModel(SoftDeleteMixin, Base):
     sequential_key = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
     import_error = Column(String, nullable=True)  # Error message if import failed
+    created_by = Column(String, nullable=True)
+    edited_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -426,6 +437,15 @@ class WorkflowRunModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    # When True, this run was spawned by a WorkflowTriggerBlock whose
+    # ignore_workflow_system_prompt flag was set, and the child must not
+    # inherit the parent chain's workflow_system_prompt. Set at spawn time so
+    # async (Temporal-dispatched) child runs can honor the flag even though
+    # they start in a separate worker without in-process context.
+    ignore_inherited_workflow_system_prompt = Column(
+        Boolean, nullable=False, default=False, server_default=sqlalchemy.false()
+    )
+    copilot_session_id = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -824,6 +844,16 @@ class WorkflowRunBlockModel(Base):
     executed_branch_result = Column(Boolean, nullable=True)
     executed_branch_next_block = Column(String, nullable=True)
 
+    # Accumulates LLM cost for block-scoped calls (no step/thought attribution).
+    llm_cost = Column(Numeric, default=0, nullable=False)
+
+    # Per-block cached-script execution state. Written (via the writer bridge
+    # in `services/script_service.py::_update_workflow_block`) when a script
+    # block falls back to AI mid-execution. Always null for blocks that ran
+    # cleanly from cache or were always-agent. Mirrors the `script_run`
+    # column on `WorkflowRunModel` but at block granularity.
+    script_run = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -854,6 +884,7 @@ class TaskV2Model(Base):
     proxy_location = Column(String, nullable=True)
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
+    workflow_system_prompt = Column(UnicodeText, nullable=True)
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)

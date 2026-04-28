@@ -393,6 +393,7 @@ class ForgeAgent:
             retry=task_retry,
             max_steps_per_run=task_block.max_steps_per_run,
             error_code_mapping=task_block.error_code_mapping,
+            workflow_system_prompt=task_block.workflow_system_prompt,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
@@ -462,6 +463,7 @@ class ForgeAgent:
             proxy_location=task_request.proxy_location,
             extracted_information_schema=task_request.extracted_information_schema,
             error_code_mapping=task_request.error_code_mapping,
+            workflow_system_prompt=task_request.workflow_system_prompt,
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
@@ -509,6 +511,8 @@ class ForgeAgent:
         context = skyvern_context.ensure_context()
         context.step_id = step.step_id
         context.task_id = task.task_id
+        context.navigation_goal = task.navigation_goal
+        context.navigation_payload = task.navigation_payload
 
         # do not need to do complete verification when it's a CUA task
         # 1. CUA executes only one action step by step -- it's pretty less likely to have a hallucination for completion or forget to return a complete
@@ -1059,6 +1063,8 @@ class ForgeAgent:
             context = skyvern_context.ensure_context()
             context.step_id = None
             context.task_id = None
+            context.navigation_goal = None
+            context.navigation_payload = None
 
     async def fail_task(
         self,
@@ -1311,6 +1317,7 @@ class ForgeAgent:
                             prompt_name=prompt_name,
                             step=step,
                             screenshots=scraped_page.screenshots,
+                            system_prompt=task.workflow_system_prompt,
                         )
                     else:
                         LOG.debug(
@@ -1917,6 +1924,7 @@ class ForgeAgent:
                     prompt_name="cua-answer-question",
                     step=step,
                     screenshots=scraped_page.screenshots,
+                    system_prompt=task.workflow_system_prompt,
                 )
                 LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
                 resp_content = skyvern_response.get("answer")
@@ -2172,6 +2180,7 @@ class ForgeAgent:
                 prompt_name=prompt_name,
                 step=next_step,
                 screenshots=scraped_page.screenshots,
+                system_prompt=task.workflow_system_prompt,
             )
 
             LOG.info(
@@ -2499,6 +2508,7 @@ class ForgeAgent:
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name=prompt_name,
+            system_prompt=task.workflow_system_prompt,
         )
         result = CompleteVerifyResult.model_validate(verification_result)
         if result.is_complete:
@@ -3286,7 +3296,9 @@ class ForgeAgent:
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key, default=app.LLM_API_HANDLER
             )
-            json_response = await llm_api_handler(prompt=prompt, step=step, prompt_name="infer-action-type")
+            json_response = await llm_api_handler(
+                prompt=prompt, step=step, prompt_name="infer-action-type", system_prompt=task.workflow_system_prompt
+            )
             if json_response.get("error"):
                 raise FailedToParseActionInstruction(
                     reason=json_response.get("thought"), error_type=json_response.get("error")
@@ -3834,12 +3846,41 @@ class ForgeAgent:
                                 randomize_if_missing=False,
                             )
                         context = skyvern_context.current()
+                        finalization_run_id = (
+                            context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+                        )
                         await app.STORAGE.save_downloaded_files(
                             organization_id=task.organization_id,
-                            run_id=context.run_id
-                            if context and context.run_id
-                            else task.workflow_run_id or task.task_id,
+                            run_id=finalization_run_id,
                         )
+                        # Tag any session-scoped DOWNLOAD artifacts created during
+                        # this run with run_id, so GET /v1/runs/{id} surfaces them
+                        # (the watcher in browser_controller can't know the active
+                        # run at upload time — see
+                        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                        browser_session_id = context.browser_session_id if context else None
+                        if browser_session_id and task.organization_id and finalization_run_id:
+                            try:
+                                claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
+                                    run_id=finalization_run_id,
+                                    browser_session_id=browser_session_id,
+                                    organization_id=task.organization_id,
+                                    run_started_at=task.created_at,
+                                )
+                                if claimed:
+                                    LOG.debug(
+                                        "Claimed session-scoped download artifacts for run",
+                                        run_id=finalization_run_id,
+                                        browser_session_id=browser_session_id,
+                                        claimed=claimed,
+                                    )
+                            except Exception:
+                                LOG.warning(
+                                    "Failed to claim session-scoped download artifacts for run",
+                                    run_id=finalization_run_id,
+                                    browser_session_id=browser_session_id,
+                                    exc_info=True,
+                                )
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to save downloaded files",
@@ -4736,7 +4777,11 @@ class ForgeAgent:
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.LLM_API_HANDLER(
-                prompt=prompt, screenshots=screenshots, step=step, prompt_name="summarize-max-steps-reason"
+                prompt=prompt,
+                screenshots=screenshots,
+                step=step,
+                prompt_name="summarize-max-steps-reason",
+                system_prompt=task.workflow_system_prompt,
             )
             return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
@@ -4879,6 +4924,7 @@ class ForgeAgent:
                 screenshots=screenshots,
                 step=step,
                 prompt_name="summarize-max-retries-reason",
+                system_prompt=task.workflow_system_prompt,
             )
             return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
@@ -5256,6 +5302,7 @@ class ForgeAgent:
             step=step,
             screenshots=scraped_page.screenshots,
             prompt_name=prompt_name,
+            system_prompt=task.workflow_system_prompt,
         )
 
     @staticmethod
@@ -5323,6 +5370,7 @@ class ForgeAgent:
                 data_extraction_goal=task.data_extraction_goal,
                 extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
                 llm_key=None,
+                workflow_system_prompt=task.workflow_system_prompt,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
@@ -5375,7 +5423,10 @@ class ForgeAgent:
                     cache_path="agent",
                 )
             data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-                prompt=prompt, step=step, prompt_name="data-extraction-summary"
+                prompt=prompt,
+                step=step,
+                prompt_name="data-extraction-summary",
+                system_prompt=task.workflow_system_prompt,
             )
             if cache_key and isinstance(data_extraction_summary_resp, dict):
                 extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)

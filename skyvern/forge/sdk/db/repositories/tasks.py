@@ -57,6 +57,7 @@ class TasksRepository(BaseRepository):
         retry: int | None = None,
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
+        workflow_system_prompt: str | None = None,
         task_type: str = TaskType.general,
         application: str | None = None,
         include_action_history_in_verification: bool | None = None,
@@ -79,6 +80,7 @@ class TasksRepository(BaseRepository):
         url = sanitize_postgres_text(url)
         complete_criterion = _sanitize(complete_criterion)
         terminate_criterion = _sanitize(terminate_criterion)
+        workflow_system_prompt = _sanitize(workflow_system_prompt)
 
         async with self.Session() as session:
             new_task = TaskModel(
@@ -102,6 +104,7 @@ class TasksRepository(BaseRepository):
                 retry=retry,
                 max_steps_per_run=max_steps_per_run,
                 error_code_mapping=error_code_mapping,
+                workflow_system_prompt=workflow_system_prompt,
                 application=application,
                 include_action_history_in_verification=include_action_history_in_verification,
                 model=model,
@@ -228,6 +231,23 @@ class TasksRepository(BaseRepository):
             )
             row = (await session.execute(query)).one()
             return row.total, row.completed
+
+    @db_operation("get_step_cost_sum_by_task_ids")
+    async def get_step_cost_sum_by_task_ids(self, task_ids: list[str], organization_id: str) -> float:
+        """Sum `step_cost` across all steps belonging to the given task_ids.
+
+        Returns 0.0 for empty task_ids. Includes failed steps.
+        """
+        if not task_ids:
+            return 0.0
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(StepModel.step_cost), 0))
+                .where(StepModel.task_id.in_(task_ids))
+                .where(StepModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
 
     @db_operation("get_workflow_run_progress_timestamps")
     async def get_workflow_run_progress_timestamps(

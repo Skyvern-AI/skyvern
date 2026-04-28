@@ -1188,7 +1188,10 @@ function Workspace({
     }
   };
 
-  const applyWorkflowUpdate = (workflowData: WorkflowVersion) => {
+  const applyWorkflowUpdate = (
+    workflowData: WorkflowVersion,
+    options?: { persisted?: boolean },
+  ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
@@ -1206,6 +1209,8 @@ function Workspace({
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
         workflowData.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        workflowData.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -1220,7 +1225,17 @@ function Workspace({
     const initialParameters = getInitialParameters(workflowData);
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
-    workflowChangesStore.setHasChanges(true);
+    if (options?.persisted) {
+      // Atomic accept: server wrote a new version; treat as clean baseline and refresh cached workflow.
+      workflowChangesStore.setHasChanges(false);
+      if (workflowPermanentId) {
+        queryClient.invalidateQueries({
+          queryKey: ["workflow", workflowPermanentId],
+        });
+      }
+    } else {
+      workflowChangesStore.setHasChanges(true);
+    }
   };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
@@ -1254,6 +1269,8 @@ function Workspace({
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
         selectedVersion.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -2006,6 +2023,8 @@ function Workspace({
               blocks: saveData.blocks,
               finally_block_label:
                 saveData.settings.finallyBlockLabel ?? undefined,
+              workflow_system_prompt:
+                saveData.settings.workflowSystemPrompt ?? undefined,
             });
 
             // Convert current workflow definition YAML to blocks
@@ -2127,9 +2146,9 @@ function Workspace({
             });
           }
         }}
-        onWorkflowUpdate={(workflowData) => {
+        onWorkflowUpdate={(workflowData, options) => {
           try {
-            applyWorkflowUpdate(workflowData);
+            applyWorkflowUpdate(workflowData, options);
           } catch (error) {
             console.error(
               "Failed to parse and apply workflow",

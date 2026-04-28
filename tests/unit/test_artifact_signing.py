@@ -15,10 +15,13 @@ import pytest
 
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
+    ARTIFACT_URL_EXPIRY_SECONDS_MAX,
+    ARTIFACT_URL_EXPIRY_SECONDS_MIN,
     ArtifactHmacKeyring,
     HmacKeyEntry,
     _canonical_string,
     _hmac_b64,
+    effective_artifact_url_expiry_seconds,
     parse_keyring,
     sign_artifact_url,
     verify_artifact_signature,
@@ -181,6 +184,72 @@ class TestSignArtifactUrl:
         kr = _make_keyring()
         url = sign_artifact_url(_BASE_URL + "/", _ARTIFACT_ID, kr)
         assert "//" not in url.split("://", 1)[1]
+
+    def test_custom_expiry_seconds_used(self) -> None:
+        """A non-default expiry_seconds is reflected in the URL's expiry timestamp."""
+        from urllib.parse import parse_qs, urlparse
+
+        kr = _make_keyring()
+        custom_ttl = 24 * 60 * 60  # 24 hours
+        before = int(time.time())
+        url = sign_artifact_url(_BASE_URL, _ARTIFACT_ID, kr, expiry_seconds=custom_ttl)
+        after = int(time.time())
+
+        expiry = int(parse_qs(urlparse(url).query)["expiry"][0])
+        assert before + custom_ttl <= expiry <= after + custom_ttl
+
+    def test_custom_expiry_signature_verifies(self) -> None:
+        """A URL signed with a custom expiry still verifies correctly."""
+        from urllib.parse import parse_qs, urlparse
+
+        kr = _make_keyring()
+        url = sign_artifact_url(_BASE_URL, _ARTIFACT_ID, kr, expiry_seconds=3600)
+        qs = parse_qs(urlparse(url).query)
+        assert verify_artifact_signature(
+            _ARTIFACT_ID,
+            qs["expiry"][0],
+            qs["kid"][0],
+            qs["sig"][0],
+            kr,
+        )
+
+    def test_none_expiry_seconds_uses_default(self) -> None:
+        """expiry_seconds=None falls back to the global 12h default."""
+        from urllib.parse import parse_qs, urlparse
+
+        kr = _make_keyring()
+        before = int(time.time())
+        url = sign_artifact_url(_BASE_URL, _ARTIFACT_ID, kr, expiry_seconds=None)
+        after = int(time.time())
+        expiry = int(parse_qs(urlparse(url).query)["expiry"][0])
+        assert before + ARTIFACT_URL_EXPIRY_SECONDS <= expiry <= after + ARTIFACT_URL_EXPIRY_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# effective_artifact_url_expiry_seconds
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveArtifactUrlExpirySeconds:
+    def test_none_returns_global_default(self) -> None:
+        assert effective_artifact_url_expiry_seconds(None) == ARTIFACT_URL_EXPIRY_SECONDS
+
+    def test_value_within_bounds_passes_through(self) -> None:
+        # 4 hours
+        assert effective_artifact_url_expiry_seconds(4 * 3600) == 4 * 3600
+
+    def test_below_min_clamped_up(self) -> None:
+        assert effective_artifact_url_expiry_seconds(1) == ARTIFACT_URL_EXPIRY_SECONDS_MIN
+
+    def test_above_max_clamped_down(self) -> None:
+        # 30 days
+        assert effective_artifact_url_expiry_seconds(30 * 24 * 3600) == ARTIFACT_URL_EXPIRY_SECONDS_MAX
+
+    def test_exactly_min_passes(self) -> None:
+        assert effective_artifact_url_expiry_seconds(ARTIFACT_URL_EXPIRY_SECONDS_MIN) == ARTIFACT_URL_EXPIRY_SECONDS_MIN
+
+    def test_exactly_max_passes(self) -> None:
+        assert effective_artifact_url_expiry_seconds(ARTIFACT_URL_EXPIRY_SECONDS_MAX) == ARTIFACT_URL_EXPIRY_SECONDS_MAX
 
 
 # ---------------------------------------------------------------------------

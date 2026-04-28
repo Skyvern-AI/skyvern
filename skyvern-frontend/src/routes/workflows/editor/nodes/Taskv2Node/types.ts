@@ -30,6 +30,7 @@ export const taskv2NodeDefaultData: Taskv2NodeData = {
   disableCache: false,
   model: null,
   maxScreenshotScrolls: null,
+  ignoreWorkflowSystemPrompt: false,
 };
 
 export function isTaskV2Node(node: Node): node is Taskv2Node {

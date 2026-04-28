@@ -24,7 +24,7 @@ This cookbook extracts two datasets from [OpenEMR](https://www.open-emr.org/), a
 
 ## Prerequisites
 
-- A [Skyvern Cloud](https://app.skyvern.com) account or [self-hosted](/self-hosted/overview) deployment
+- A [Skyvern Cloud](https://app.skyvern.com) account or [self-hosted](/developers/self-hosted/overview) deployment
 - The Skyvern SDK (for API usage)
 
 <CodeGroup>
@@ -103,7 +103,7 @@ Route the browser through a residential IP to bypass WAF/bot detection. The demo
   </Tab>
 </Tabs>
 
-See [Proxy & Geolocation](/going-to-production/proxy-geolocation) for all available locations.
+See [Proxy & Geolocation](/developers/going-to-production/proxy-geolocation) for all available locations.
 
 ---
 
@@ -263,7 +263,7 @@ Log in once, save the browser state as a profile, and skip login on future runs.
 </Tabs>
 
 <Note>
-`persist_browser_session` is a workflow definition property. Set it when creating the workflow, not when running it. See [Browser Profiles](/optimization/browser-profiles) for the full lifecycle.
+`persist_browser_session` is a workflow definition property. Set it when creating the workflow, not when running it. See [Browser Profiles](/developers/optimization/browser-profiles) for the full lifecycle.
 </Note>
 
 ---
@@ -397,7 +397,7 @@ The demo resets daily and community users add test patients, so exact records ma
 </Note>
 
 <Note>
-Browser profiles cannot be used directly with standalone tasks. Create a [browser session](/optimization/browser-sessions) from the profile first, then pass the session ID. See [Pagination with browser sessions](#pagination-with-browser-sessions) below for the full pattern.
+Browser profiles cannot be used directly with standalone tasks. Create a [browser session](/developers/optimization/browser-sessions) from the profile first, then pass the session ID. See [Pagination with browser sessions](#pagination-with-browser-sessions) below for the full pattern.
 </Note>
 
 ---
@@ -510,7 +510,7 @@ Navigate to **Reports > Visits > Superbill**, set a date range, and extract the 
 
 ## Pagination with browser sessions
 
-A [Browser Profile](/optimization/browser-profiles) is a saved snapshot. A [Browser Session](/optimization/browser-sessions) is a live browser instance that persists between tasks. Use sessions to paginate: extract page 1, click Next, extract page 2.
+A [Browser Profile](/developers/optimization/browser-profiles) is a saved snapshot. A [Browser Session](/developers/optimization/browser-sessions) is a live browser instance that persists between tasks. Use sessions to paginate: extract page 1, click Next, extract page 2.
 
 <Tabs>
   <Tab title="Cloud UI">
@@ -786,7 +786,7 @@ OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on w
   </Tab>
 </Tabs>
 
-See [Error Handling](/going-to-production/error-handling) and [CAPTCHA & Bot Bypass](/features/captcha-and-bot-bypass) for more.
+See [Error Handling](/developers/going-to-production/error-handling) and [CAPTCHA & Bot Bypass](/developers/features/captcha-and-bot-bypass) for more.
 
 ---
 
@@ -1062,7 +1062,7 @@ This workflow combines everything: navigate to the Patient Finder, extract demog
 | Error mapping + retries | Recover from session timeouts |
 
 <Tip>
-The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In production, re-run your login workflow weekly or whenever extractions fail with auth errors. See [Browser Profiles](/optimization/browser-profiles) for the refresh pattern.
+The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In production, re-run your login workflow weekly or whenever extractions fail with auth errors. See [Browser Profiles](/developers/optimization/browser-profiles) for the refresh pattern.
 </Tip>
 
 ---
@@ -1073,14 +1073,14 @@ The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In p
   <Card
     title="Browser Profiles"
     icon="user"
-    href="/optimization/browser-profiles"
+    href="/developers/optimization/browser-profiles"
   >
     Full lifecycle: create, refresh, and delete saved browser state
   </Card>
   <Card
     title="Proxy & Geolocation"
     icon="globe"
-    href="/going-to-production/proxy-geolocation"
+    href="/developers/going-to-production/proxy-geolocation"
   >
     All proxy locations and country-specific routing options
   </Card>
@@ -1094,7 +1094,7 @@ The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In p
   <Card
     title="Error Handling"
     icon="triangle-exclamation"
-    href="/going-to-production/error-handling"
+    href="/developers/going-to-production/error-handling"
   >
     Error code mapping, failure classification, and retry strategies
   </Card>

@@ -17,7 +17,10 @@ import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResi
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
-import { getBlockDownloadedFileUrls } from "./blockDownloadedFiles";
+import {
+  filenameForDownloadedFileUrl,
+  getBlockDownloadedFileUrls,
+} from "./blockDownloadedFiles";
 
 function SummaryDisplay({
   summary,
@@ -344,9 +347,7 @@ function WorkflowRunOutput() {
           <div className="space-y-2">
             {fileUrls.length > 0 ? (
               fileUrls.map((url) => {
-                // Extract filename from URL path, stripping query params from signed URLs
-                const urlPath = url.split("?")[0] ?? url;
-                const filename = urlPath.split("/").pop() || "download";
+                const filename = filenameForDownloadedFileUrl(url);
                 return (
                   <div key={url} title={url} className="flex gap-2">
                     <FileIcon className="size-6" />
