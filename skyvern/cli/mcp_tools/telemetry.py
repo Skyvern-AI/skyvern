@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -76,6 +77,13 @@ def _resolve_client_id(context: MiddlewareContext[Any]) -> str | None:
     return None
 
 
+def _content_text_bytes(content_block: Any) -> int:
+    text = getattr(content_block, "text", None)
+    if not isinstance(text, str):
+        return 0
+    return len(text.encode("utf-8"))
+
+
 def _capture_mcp_event(
     event_name: str,
     *,
@@ -85,6 +93,8 @@ def _capture_mcp_event(
     tool_name: str | None = None,
     prompt_name: str | None = None,
     error: Exception | None = None,
+    duration_ms: float | None = None,
+    response_bytes: int | None = None,
 ) -> None:
     request = _resolve_http_request()
     organization_id = _resolve_organization_id(request)
@@ -112,6 +122,10 @@ def _capture_mcp_event(
         data["prompt"] = prompt_name
     if error is not None:
         data["error_type"] = type(error).__name__
+    if duration_ms is not None:
+        data["duration_ms"] = duration_ms
+    if response_bytes is not None:
+        data["response_bytes"] = response_bytes
 
     analytics.capture(
         event_name,
@@ -160,26 +174,36 @@ class MCPTelemetryMiddleware(Middleware):
         call_next: CallNext[Any, Any],
     ) -> Any:
         tool_name = getattr(context.message, "name", None)
+        start = time.perf_counter()
         try:
             result = await call_next(context)
         except Exception as exc:
+            duration_ms = (time.perf_counter() - start) * 1000
+            # Exceptions do not produce MCP content, so response_bytes is only emitted for returned results.
+            with suppress(Exception):
+                _capture_mcp_event(
+                    "mcp_tool_call",
+                    operation="tools/call",
+                    context=context,
+                    ok=False,
+                    tool_name=tool_name,
+                    error=exc,
+                    duration_ms=duration_ms,
+                )
+            raise
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        response_bytes = sum(_content_text_bytes(content) for content in (getattr(result, "content", None) or []))
+        with suppress(Exception):
             _capture_mcp_event(
                 "mcp_tool_call",
                 operation="tools/call",
                 context=context,
-                ok=False,
+                ok=_resolve_tool_call_ok(result),
                 tool_name=tool_name,
-                error=exc,
+                duration_ms=duration_ms,
+                response_bytes=response_bytes,
             )
-            raise
-
-        _capture_mcp_event(
-            "mcp_tool_call",
-            operation="tools/call",
-            context=context,
-            ok=_resolve_tool_call_ok(result),
-            tool_name=tool_name,
-        )
         return result
 
     async def on_list_tools(

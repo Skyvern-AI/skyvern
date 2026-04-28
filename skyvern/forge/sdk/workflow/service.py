@@ -6268,7 +6268,15 @@ class WorkflowService:
         historical_episodes: list | None = None,
     ) -> None:
         """Run the AI Script Reviewer and create a new script version if successful."""
-        from skyvern.services.script_reviewer import BlockReviewResult, ScriptReviewer, store_review_artifacts
+        # Imports are method-local to defer the script_reviewer module load to
+        # the rare path where the reviewer is actually triggered (most workflow
+        # runs never invoke it). Pre-existing convention in this method.
+        from skyvern.services.script_reviewer import (
+            BlockReviewResult,
+            ScriptReviewer,
+            load_filtered_run_param_values,
+            store_review_artifacts,
+        )
         from skyvern.services.workflow_script_service import create_script_version_from_review
 
         LOG.info(
@@ -6283,22 +6291,9 @@ class WorkflowService:
             reviewer = ScriptReviewer()
 
             # Load the workflow run's parameter values so the reviewer can detect
-            # hardcoded values in generated code (e.g., a customer email that should
-            # use context.parameters['recipient'] instead of a literal string).
-            run_parameter_values: dict[str, str] = {}
-            try:
-                run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-                for wf_param, run_param in run_param_tuples:
-                    if (
-                        run_param.value is not None
-                        and str(run_param.value).strip()
-                        and not wf_param.parameter_type.is_secret_or_credential()
-                    ):
-                        run_parameter_values[wf_param.key] = str(run_param.value)
-            except Exception:
-                LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
+            # hardcoded values in generated code. The shared loader filters
+            # secret/credential params before passing to the validator.
+            run_parameter_values = await load_filtered_run_param_values(workflow_run.workflow_run_id)
 
             # Split episodes by type: regular fallback vs conditional_agent
             regular_episodes = [ep for ep in episodes if ep.fallback_type != "conditional_agent"]
