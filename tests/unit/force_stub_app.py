@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from skyvern.forge import set_force_app_instance
 from skyvern.forge.forge_app import ForgeApp
@@ -21,6 +21,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION.validate_block_execution = AsyncMock()
     fake_app_module.AGENT_FUNCTION.validate_code_block = AsyncMock()
+    # Sync method — _LazyNamespace would auto-mock it as AsyncMock and break
+    # callers that unpack the return value. Match the real OSS default (None).
+    fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.agent = _LazyNamespace()
     fake_app_module.DATABASE.observer.update_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.observer.create_workflow_run_block = AsyncMock()

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,11 +49,12 @@ async def test_mark_canceled_if_not_final_returns_conditional_result(
     )
 
 
-def _make_updated_row() -> MagicMock:
+def _make_updated_row(now: datetime | None = None) -> MagicMock:
+    now = now or datetime.now(UTC)
     row = MagicMock()
     row.status = WorkflowRunStatus.canceled
-    row.created_at = datetime.now(UTC) - timedelta(seconds=30)
-    row.started_at = datetime.now(UTC) - timedelta(seconds=20)
+    row.created_at = now - timedelta(seconds=30)
+    row.started_at = now - timedelta(seconds=20)
     row.workflow_id = "wf_abc"
     row.organization_id = "org_abc"
     row.run_with = None
@@ -75,7 +76,17 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
     from skyvern.forge.sdk.workflow import service as service_module
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
-    updated_row = _make_updated_row()
+    fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
+    updated_row = _make_updated_row(fixed_now)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
         "update_workflow_run_if_not_final",
