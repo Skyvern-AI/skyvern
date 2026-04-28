@@ -476,6 +476,10 @@ class AgentFunction:
         """
         return None
 
+    async def resolve_org_api_key(self, organization_id: str) -> str | None:
+        """Return an org-scoped API key; returns None in the base implementation."""
+        return None
+
     async def validate_step_execution(
         self,
         task: Task,
