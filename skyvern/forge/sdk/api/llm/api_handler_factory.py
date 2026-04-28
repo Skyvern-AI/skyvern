@@ -685,6 +685,26 @@ class LLMAPIHandlerFactory:
                         )
 
                 llm_prompt_value = prompt
+                # Mask secrets before persisting LLM artifacts so that credentials,
+                # TOTP codes, and other sensitive values do not leak into stored
+                # prompt logs / S3 uploads.
+                _persist_prompt = llm_prompt_value
+                _ctx = skyvern_context.current()
+                if _ctx and _ctx.workflow_run_id:
+                    try:
+                        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                            _ctx.workflow_run_id
+                        )
+                        _persist_prompt = workflow_run_context.mask_secrets_in_data(_persist_prompt)
+                    except Exception:
+                        LOG.debug(
+                            "Failed to mask workflow secrets in LLM prompt artifact",
+                            workflow_run_id=_ctx.workflow_run_id,
+                        )
+                if _ctx and _ctx.sensitive_values:
+                    for sensitive in _ctx.sensitive_values:
+                        if sensitive and isinstance(_persist_prompt, str):
+                            _persist_prompt = _persist_prompt.replace(sensitive, "*****")
                 # Pre-request artifact persistence cluster. Covers prompt + screenshot
                 # staging before the LLM call. The hot cost is inside the non-bundled
                 # branch (prepare_llm_artifact → S3 upload).
@@ -695,7 +715,7 @@ class LLMAPIHandlerFactory:
                     _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
                     if should_persist_llm_artifacts:
                         if _should_bundle:
-                            _bundle_prompt = llm_prompt_value.encode("utf-8")
+                            _bundle_prompt = _persist_prompt.encode("utf-8")
                             if screenshots and step:
                                 app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
                                     step=step,
@@ -705,7 +725,7 @@ class LLMAPIHandlerFactory:
                         else:
                             artifacts.append(
                                 await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                    data=llm_prompt_value.encode("utf-8"),
+                                    data=_persist_prompt.encode("utf-8"),
                                     artifact_type=ArtifactType.LLM_PROMPT,
                                     screenshots=screenshots,
                                     **artifact_targets,

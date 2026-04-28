@@ -118,6 +118,7 @@ from skyvern.utils.prompt_engine import (
     MaxStepsReasonResponse,
     enforce_prompt_ceiling_tracked,
     load_prompt_with_elements,
+    sanitize_prompt_input,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
 from skyvern.utils.token_counter import count_tokens
@@ -3443,17 +3444,23 @@ class ForgeAgent:
             element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
             template_name=template,
-            navigation_goal=navigation_goal,
-            navigation_payload_str=navigation_payload_str,
+            navigation_goal=sanitize_prompt_input(navigation_goal),
+            navigation_payload_str=sanitize_prompt_input(navigation_payload_str),
             starting_url=starting_url,
             current_url=current_url,
-            data_extraction_goal=task.data_extraction_goal,
-            action_history=actions_and_results_str,
-            error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+            data_extraction_goal=sanitize_prompt_input(task.data_extraction_goal),
+            action_history=sanitize_prompt_input(actions_and_results_str),
+            error_code_mapping_str=sanitize_prompt_input(
+                json.dumps(task.error_code_mapping) if task.error_code_mapping else None
+            ),
             local_datetime=datetime.now(context.tz_info).isoformat(),
             verification_code_check=verification_code_check,
-            complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-            terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+            complete_criterion=sanitize_prompt_input(
+                task.complete_criterion.strip() if task.complete_criterion else None
+            ),
+            terminate_criterion=sanitize_prompt_input(
+                task.terminate_criterion.strip() if task.terminate_criterion else None
+            ),
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
             has_magic_link_page=context.has_magic_link_page(task.task_id),
         )
@@ -3669,6 +3676,8 @@ class ForgeAgent:
                     "Didn't add verification code to navigation payload",
                     final_navigation_payload=final_navigation_payload,
                 )
+            # Mark verification code as sensitive so it is masked in persisted artifacts
+            current_context.sensitive_values.add(verification_code)
             if expire_verification_code:
                 current_context.totp_codes.pop(task.task_id)
 
@@ -3693,6 +3702,7 @@ class ForgeAgent:
                             # Store TOTP secret for handler to use during execution
                             current_context = skyvern_context.ensure_context()
                             current_context.totp_codes[f"{task.task_id}_secret"] = totp_secret
+                            current_context.sensitive_values.add(totp_secret)
 
                             # Send a placeholder TOTP for the LLM to see the format
                             final_navigation_payload[key]["totp"] = "123456"

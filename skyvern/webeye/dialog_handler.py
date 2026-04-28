@@ -11,6 +11,7 @@ from skyvern.constants import DIALOG_LLM_TIMEOUT
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.utils.prompt_engine import sanitize_prompt_input
 
 LOG = structlog.get_logger()
 
@@ -62,10 +63,12 @@ async def _handle_dialog(dialog: Dialog) -> None:
         prompt = prompt_engine.load_prompt(
             "handle-dialog",
             dialog_type=dialog_type,
-            dialog_message=dialog_message,
-            default_value=default_value,
-            navigation_goal=navigation_goal,
-            navigation_payload=json.dumps(navigation_payload) if navigation_payload else None,
+            dialog_message=sanitize_prompt_input(dialog_message, escape_quotes=True),
+            default_value=sanitize_prompt_input(default_value, escape_quotes=True),
+            navigation_goal=sanitize_prompt_input(navigation_goal),
+            navigation_payload=sanitize_prompt_input(
+                json.dumps(navigation_payload) if navigation_payload else None
+            ),
         )
 
         # JS dialogs block the page's JS thread while open. We need a hard timeout
