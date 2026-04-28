@@ -3272,6 +3272,8 @@ async def update_organization(
     return await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
+        max_retries_per_step=org_update.max_retries_per_step,
+        webhook_callback_url=org_update.webhook_callback_url,
         artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
         clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
     )
@@ -3292,6 +3294,23 @@ async def get_organizations(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> GetOrganizationsResponse:
     return GetOrganizationsResponse(organizations=[current_org])
+
+
+@legacy_base_router.get(
+    "/organizations/me",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_current_organization",
+    },
+)
+@legacy_base_router.get(
+    "/organizations/me/",
+    include_in_schema=False,
+)
+async def get_current_organization(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Organization:
+    return current_org
 
 
 @legacy_base_router.get(
