@@ -50,6 +50,11 @@ export interface WorkflowCopilotClearProposedWorkflowRequest {
   auto_accept: boolean;
 }
 
+export interface WorkflowCopilotApplyProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
+}
+
 export type WorkflowCopilotStreamMessageType =
   | "processing_update"
   | "response"
