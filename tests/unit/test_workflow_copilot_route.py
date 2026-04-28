@@ -440,3 +440,75 @@ async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) 
     assert response is captured["sentinel"]
     new_copilot_mock.assert_not_awaited()
     mock_provider.is_feature_enabled_cached.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy V1 path stashes _copilot_yaml so /apply-proposed-workflow can re-create the version.
+
+    Regression for #10568 + SKY-9206: Accept on the frontend now hits
+    /apply-proposed-workflow, which 400s when _copilot_yaml is missing from the
+    proposal. V2 sets it (line 921); V1 must too or non-V2 users can never accept.
+    """
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    _install_mock_provider(monkeypatch, return_value=False)
+
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+
+    proposal = MagicMock(spec=["model_dump"])
+    proposal.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Updated"}
+
+    workflow_yaml = "title: Updated\nworkflow_definition:\n  blocks: []\n"
+
+    copilot_call_llm_mock = AsyncMock(return_value=("ok", proposal, None, workflow_yaml))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot.copilot_call_llm",
+        copilot_call_llm_mock,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._get_debug_run_info",
+        AsyncMock(return_value=None),
+    )
+
+    app.DATABASE.workflow_params = SimpleNamespace(
+        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
+        get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 28, tzinfo=timezone.utc))
+        ),
+    )
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    persist_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None]
+    assert len(persist_calls) == 1, f"expected exactly one proposed_workflow persist, got {update_calls!r}"
+
+    persisted = persist_calls[0].kwargs["proposed_workflow"]
+    assert isinstance(persisted, dict)
+    assert persisted.get("_copilot_yaml") == workflow_yaml, (
+        "legacy V1 path must stash the LLM-emitted YAML on the proposal so "
+        "/apply-proposed-workflow can re-create the workflow version"
+    )
