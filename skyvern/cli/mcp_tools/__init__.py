@@ -65,6 +65,10 @@ from .inspection import (
     skyvern_network_route,
     skyvern_network_unroute,
 )
+from .org import (
+    skyvern_org_get,
+    skyvern_org_update,
+)
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .response import size_capped
 from .scripts import (
@@ -347,6 +351,10 @@ mcp.tool(tags={"storage"}, annotations=_dest("Clear Local Storage"))(skyvern_cle
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
 
+# -- Organization settings (no browser needed) --
+mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
+mcp.tool(tags={"settings"}, annotations=_mut("Update Organization Settings"))(skyvern_org_update)
+
 # -- Credential lookup (no browser needed) --
 mcp.tool(tags={"credential"}, annotations=_ro("List Credentials"))(skyvern_credential_list)
 mcp.tool(tags={"credential"}, annotations=_ro("Get Credential"))(skyvern_credential_get)
@@ -448,6 +456,9 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    # Organization settings
+    "skyvern_org_get",
+    "skyvern_org_update",
     # Credential lookup
     "skyvern_credential_list",
     "skyvern_credential_get",

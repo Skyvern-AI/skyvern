@@ -3279,6 +3279,17 @@ class WorkflowService:
             if isinstance(block, ForLoopBlock):
                 block.validate_loop_blocks()
 
+    @staticmethod
+    def _validate_payload_templates(workflow_definition: WorkflowDefinition) -> None:
+        """Reject workflow_trigger blocks whose payload has malformed Jinja2 templates.
+
+        Surfaces the same JSON-pointer key path + raw template that the runtime
+        PayloadTemplateRenderError reports - shifted left from execute() to save().
+        """
+        for block in workflow_definition.blocks:
+            if isinstance(block, WorkflowTriggerBlock):
+                block.validate_payload_templates()
+
     async def create_workflow(
         self,
         organization_id: str,
@@ -5497,6 +5508,9 @@ class WorkflowService:
 
             # Validate the block graph before persisting (detects orphans, cycles, dangling references)
             self.validate_workflow_block_graph(workflow_definition)
+
+            # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
+            self._validate_payload_templates(workflow_definition)
 
             updated_workflow = await self.update_workflow_definition(
                 workflow_id=potential_workflow.workflow_id,

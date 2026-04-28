@@ -176,7 +176,10 @@ class GetOrganizationAPIKeysResponse(BaseModel):
 
 
 class OrganizationUpdate(BaseModel):
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, ge=1)
+    # 0 is a valid "disable retries" value — see ForgeAgent.execute_step.
+    max_retries_per_step: int | None = Field(default=None, ge=0)
+    webhook_callback_url: str | None = None
     artifact_url_expiry_seconds: int | None = Field(
         None,
         description=(

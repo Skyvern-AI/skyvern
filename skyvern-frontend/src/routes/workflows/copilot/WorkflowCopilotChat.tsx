@@ -21,6 +21,7 @@ import {
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
+  WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
 
 interface ChatMessage {
@@ -107,7 +108,11 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflow: WorkflowApiResponse) => void;
+  // `options.persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
+  onWorkflowUpdate?: (
+    workflow: WorkflowApiResponse,
+    options?: { persisted?: boolean },
+  ) => void;
   onReviewWorkflow?: (
     workflow: WorkflowApiResponse,
     clearPending: () => void,
@@ -246,12 +251,15 @@ export function WorkflowCopilotChat({
     hasScrolledOnLoad.current = false;
   };
 
-  const applyWorkflowUpdate = (workflow: WorkflowApiResponse): boolean => {
+  const applyWorkflowUpdate = (
+    workflow: WorkflowApiResponse,
+    options?: { persisted?: boolean },
+  ): boolean => {
     if (!onWorkflowUpdate) {
       return true;
     }
     try {
-      onWorkflowUpdate(workflow);
+      onWorkflowUpdate(workflow, options);
       return true;
     } catch (updateError) {
       console.error("Failed to update workflow:", updateError);
@@ -264,18 +272,60 @@ export function WorkflowCopilotChat({
     }
   };
 
-  const handleAcceptWorkflow = (
+  const handleAcceptWorkflow = async (
     workflow: WorkflowApiResponse,
     alwaysAccept: boolean = false,
   ) => {
-    if (!applyWorkflowUpdate(workflow)) {
+    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    if (!chatId) {
+      try {
+        chatId = await fetchLatestChatId();
+      } catch (resolveError) {
+        console.error(
+          "Failed to resolve chat ID before applying proposal:",
+          resolveError,
+        );
+      }
+    }
+
+    if (!chatId) {
+      // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
+      if (!applyWorkflowUpdate(workflow)) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
       return;
     }
-    setProposedWorkflow(null);
-    if (alwaysAccept) {
-      setAutoAccept(true);
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post<WorkflowApiResponse>(
+        "/workflow/copilot/apply-proposed-workflow",
+        {
+          workflow_copilot_chat_id: chatId,
+          auto_accept: alwaysAccept,
+        } as WorkflowCopilotApplyProposedWorkflowRequest,
+      );
+      // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
+      if (!applyWorkflowUpdate(response.data, { persisted: true })) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+    } catch (applyError) {
+      console.error("Failed to apply proposed workflow:", applyError);
+      toast({
+        title: "Accept failed",
+        description: "Could not apply the proposed workflow. Please try again.",
+        variant: "destructive",
+      });
     }
-    void clearProposedWorkflow(alwaysAccept);
   };
 
   const handleRejectWorkflow = () => {

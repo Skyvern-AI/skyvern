@@ -165,11 +165,12 @@ class OrganizationsRepository(BaseRepository):
                 raise NotFoundError
             if organization_name:
                 organization.organization_name = organization_name
-            if webhook_callback_url:
+            # ``is not None`` (not truthy): "" clears the webhook, 0 disables retries.
+            if webhook_callback_url is not None:
                 organization.webhook_callback_url = webhook_callback_url
-            if max_steps_per_run:
+            if max_steps_per_run is not None:
                 organization.max_steps_per_run = max_steps_per_run
-            if max_retries_per_step:
+            if max_retries_per_step is not None:
                 organization.max_retries_per_step = max_retries_per_step
             # ``clear_*`` decouples "don't update" (None) from "explicitly clear":
             # callers pass ``clear_artifact_url_expiry_seconds=True`` to reset

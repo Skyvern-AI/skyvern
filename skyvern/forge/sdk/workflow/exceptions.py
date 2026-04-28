@@ -172,6 +172,44 @@ class FailedToFormatJinjaStyleParameter(SkyvernException):
         )
 
 
+class PayloadTemplateRenderError(SkyvernException):
+    """Raised when a WorkflowTriggerBlock payload field has an invalid Jinja2 template.
+
+    Wraps the Jinja2 exception with the dotted/bracketed key path (e.g.
+    `payload.fields[1].notes` or `payload["user.name"]`) and the raw template
+    string so the run's failure reason tells the author where to look.
+    """
+
+    def __init__(self, path: str, template: str, original: BaseException) -> None:
+        self.path = path
+        self.template = template
+        self.original = original
+        lineno = getattr(original, "lineno", None)
+        lineno_suffix = f" (line {lineno})" if lineno is not None else ""
+        super().__init__(f"{original}{lineno_suffix} at {path}: {template!r}")
+
+
+class PayloadTemplateSyntaxError(WorkflowDefinitionValidationException):
+    """Raised at workflow save time when a workflow_trigger.payload field has invalid Jinja2.
+
+    Mirrors the runtime PayloadTemplateRenderError shape so save-time and run-time
+    diagnostics line up: same JSON-pointer key path format, same template echoed back.
+    """
+
+    def __init__(self, block_label: str, path: str, template: str, original: BaseException) -> None:
+        self.block_label = block_label
+        self.path = path
+        self.template = template
+        self.original = original
+        lineno = getattr(original, "lineno", None)
+        lineno_suffix = f" (line {lineno})" if lineno is not None else ""
+        super().__init__(
+            f"Invalid Jinja2 in workflow_trigger block '{block_label}': {original}{lineno_suffix} "
+            f"at {path}: {template!r}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class MissingJinjaVariables(SkyvernException):
     def __init__(self, template: str, variables: set[str]) -> None:
         self.variables = variables

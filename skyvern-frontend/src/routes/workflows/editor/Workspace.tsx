@@ -1188,7 +1188,10 @@ function Workspace({
     }
   };
 
-  const applyWorkflowUpdate = (workflowData: WorkflowVersion) => {
+  const applyWorkflowUpdate = (
+    workflowData: WorkflowVersion,
+    options?: { persisted?: boolean },
+  ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
@@ -1222,7 +1225,17 @@ function Workspace({
     const initialParameters = getInitialParameters(workflowData);
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
-    workflowChangesStore.setHasChanges(true);
+    if (options?.persisted) {
+      // Atomic accept: server wrote a new version; treat as clean baseline and refresh cached workflow.
+      workflowChangesStore.setHasChanges(false);
+      if (workflowPermanentId) {
+        queryClient.invalidateQueries({
+          queryKey: ["workflow", workflowPermanentId],
+        });
+      }
+    } else {
+      workflowChangesStore.setHasChanges(true);
+    }
   };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
@@ -2133,9 +2146,9 @@ function Workspace({
             });
           }
         }}
-        onWorkflowUpdate={(workflowData) => {
+        onWorkflowUpdate={(workflowData, options) => {
           try {
-            applyWorkflowUpdate(workflowData);
+            applyWorkflowUpdate(workflowData, options);
           } catch (error) {
             console.error(
               "Failed to parse and apply workflow",
