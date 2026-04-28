@@ -29,7 +29,7 @@ import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined
+from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
@@ -98,6 +98,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     MissingJinjaVariables,
     NoIterableValueFound,
     NoValidEmailRecipient,
+    PayloadTemplateRenderError,
+    PayloadTemplateSyntaxError,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     DOWNLOADED_FILE_SIGS_KEY,
@@ -238,6 +240,16 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
+
+
+def _format_payload_path_segment(key: str) -> str:
+    """Plain identifiers render as `.key`; anything else (dots, brackets, spaces,
+    quotes) renders as a bracketed JSON-escaped string so paths stay unambiguous
+    against keys that contain `.` or `[`."""
+    if key.isidentifier():
+        return f".{key}"
+    return f"[{json.dumps(key)}]"
+
 
 # ForLoop constants
 DEFAULT_MAX_LOOP_ITERATIONS = 100
@@ -7005,20 +7017,37 @@ class WorkflowTriggerBlock(Block):
             )
         return rendered
 
+    def _render_scalar_with_path(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+        path: str,
+    ) -> Any:
+        # Wrap render errors with JSON-pointer-style payload path + template so
+        # the failure reason surfaces where to look in the workflow.
+        try:
+            return self._render_template_value(value, workflow_run_context)
+        except PayloadTemplateRenderError:
+            raise
+        except Exception as exc:
+            raise PayloadTemplateRenderError(path=path, template=value, original=exc) from exc
+
     def _render_templates_in_payload(
         self,
         payload: dict[str, Any],
         workflow_run_context: WorkflowRunContext,
+        _path: str = "payload",
     ) -> dict[str, Any]:
         """Recursively render Jinja2 templates in payload values."""
         resolved: dict[str, Any] = {}
         for key, value in payload.items():
+            current_path = f"{_path}{_format_payload_path_segment(key)}"
             if isinstance(value, str):
-                resolved[key] = self._render_template_value(value, workflow_run_context)
+                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path)
             elif isinstance(value, dict):
-                resolved[key] = self._render_templates_in_payload(value, workflow_run_context)
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path)
             elif isinstance(value, list):
-                resolved[key] = self._render_templates_in_list(value, workflow_run_context)
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path)
             else:
                 resolved[key] = value
         return resolved
@@ -7027,19 +7056,49 @@ class WorkflowTriggerBlock(Block):
         self,
         items: list[Any],
         workflow_run_context: WorkflowRunContext,
+        _path: str = "payload",
     ) -> list[Any]:
         """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
         result: list[Any] = []
-        for item in items:
+        for idx, item in enumerate(items):
+            current_path = f"{_path}[{idx}]"
             if isinstance(item, str):
-                result.append(self._render_template_value(item, workflow_run_context))
+                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path))
             elif isinstance(item, dict):
-                result.append(self._render_templates_in_payload(item, workflow_run_context))
+                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path))
             elif isinstance(item, list):
-                result.append(self._render_templates_in_list(item, workflow_run_context))
+                result.append(self._render_templates_in_list(item, workflow_run_context, current_path))
             else:
                 result.append(item)
         return result
+
+    def validate_payload_templates(self) -> None:
+        """Parse-check every Jinja2 template in self.payload at workflow save time.
+
+        Walks the payload mirroring _render_templates_in_payload so paths match the
+        runtime PayloadTemplateRenderError format. On TemplateSyntaxError raises
+        PayloadTemplateSyntaxError with block label, JSON-pointer key path, and
+        the offending template string.
+        """
+        if not self.payload:
+            return
+
+        def _walk(value: Any, path: str) -> None:
+            if isinstance(value, dict):
+                for key, sub in value.items():
+                    _walk(sub, f"{path}{_format_payload_path_segment(key)}")
+            elif isinstance(value, list):
+                for idx, sub in enumerate(value):
+                    _walk(sub, f"{path}[{idx}]")
+            elif isinstance(value, str):
+                try:
+                    jinja_sandbox_env.parse(value)
+                except TemplateSyntaxError as exc:
+                    raise PayloadTemplateSyntaxError(
+                        block_label=self.label, path=path, template=value, original=exc
+                    ) from exc
+
+        _walk(self.payload, "payload")
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
