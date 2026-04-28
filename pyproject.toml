@@ -16,7 +16,7 @@ dependencies = [
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.35.0",
-    "litellm>=1.83.7",
+    "litellm>=1.83.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
@@ -181,13 +181,6 @@ include = [
 # Supply chain quarantine: block packages published less than 7 days ago.
 # Override for urgent cases: uv add <pkg> --exclude-newer ""
 # exclude-newer = "7 days"
-override-dependencies = [
-    # litellm 1.83.7+ pins these exactly; relax so they coexist with our deps
-    # (openai-agents needs openai>=2.26, fastmcp needs python-dotenv>=1.1).
-    "jsonschema>=4.23.0",
-    "python-dotenv>=1.0.0",
-    "openai>=2.24.0",
-]
 constraint-dependencies = [
     "authlib>=1.6.9",
     "flask>=3.1.3",
