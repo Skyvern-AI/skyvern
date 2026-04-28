@@ -319,12 +319,28 @@ export function WorkflowCopilotChat({
         setAutoAccept(true);
       }
     } catch (applyError) {
-      console.error("Failed to apply proposed workflow:", applyError);
-      toast({
-        title: "Accept failed",
-        description: "Could not apply the proposed workflow. Please try again.",
-        variant: "destructive",
-      });
+      // Atomic accept can fail if the server-side proposal is missing
+      // _copilot_yaml (SKY-9310 — V1 path didn't stash it). Fall back to the
+      // pre-#10568 client-side apply so users aren't blocked while a backend
+      // deploy catches up. Logged so we can still spot regressions.
+      console.error(
+        "Atomic apply failed; falling back to client-side apply:",
+        applyError,
+      );
+      if (!applyWorkflowUpdate(workflow)) {
+        toast({
+          title: "Accept failed",
+          description:
+            "Could not apply the proposed workflow. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
     }
   };
 
