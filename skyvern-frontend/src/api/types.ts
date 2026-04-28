@@ -205,6 +205,10 @@ export type OrganizationApiResponse = {
   modified_at: string;
   max_retries_per_step: number | null;
   max_steps_per_run: number | null;
+  // Optional because the field is added in a backend image rollout; until
+  // every API host has the new schema this property may be absent from the
+  // response payload.
+  artifact_url_expiry_seconds?: number | null;
   organization_id: string;
   organization_name: string;
   webhook_callback_url: string | null;
