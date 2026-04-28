@@ -122,6 +122,11 @@ class AgentResult:
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
     # silently passing as cheap.
     total_tokens: int | None = None
+    # Set when the agent absorbed an asyncio cancellation initiated by an
+    # explicit user Stop. Lets the route route to a cancel-specific
+    # persistence path (rollback + ``Cancelled by user.`` chat row) without
+    # losing ``workflow_was_persisted`` the way a re-raise would.
+    cancelled: bool = False
 
 
 @dataclass

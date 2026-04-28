@@ -160,7 +160,12 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     return None, None
 
 
-def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_context: str | None) -> AgentResult:
+def _build_exit_result(
+    ctx: CopilotContext,
+    user_response: str,
+    global_llm_context: str | None,
+    cancelled: bool = False,
+) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     return AgentResult(
@@ -170,6 +175,7 @@ def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_conte
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
+        cancelled=cancelled,
     )
 
 
@@ -479,8 +485,10 @@ async def run_copilot_agent(
                     organization_id,
                 )
             except asyncio.CancelledError:
-                LOG.info("Copilot run cancelled")
-                return _build_exit_result(ctx, "Request cancelled.", global_llm_context)
+                # Re-raising would leave the route with ``agent_result is None``
+                # and skip its ``workflow_was_persisted`` rollback decision.
+                LOG.info("Copilot run cancelled by user")
+                return _build_exit_result(ctx, "Cancelled by user.", global_llm_context, cancelled=True)
             except MaxTurnsExceeded:
                 return _build_exit_result(
                     ctx,
