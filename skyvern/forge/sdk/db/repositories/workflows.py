@@ -30,7 +30,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import convert_to_workflow, serialize_proxy_location
-from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock
+from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
@@ -41,8 +41,8 @@ LOG = structlog.get_logger()
 
 def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> None:
     """Rebind each block's ``output_parameter`` to the reconciled instance
-    from ``workflow_definition.parameters`` by key, recursing into
-    ``ForLoopBlock.loop_blocks``.
+    from ``workflow_definition.parameters`` by key, recursing into nested
+    loop block children.
 
     The reconcile helper mutates IDs on the top-level parameters list only.
     When a caller round-trips the definition through
@@ -62,7 +62,7 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
             canonical = key_to_output_parameter.get(block.output_parameter.key)
             if canonical is not None and canonical is not block.output_parameter:
                 block.output_parameter = canonical
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 _visit(block.loop_blocks)
 
     _visit(workflow_definition.blocks)

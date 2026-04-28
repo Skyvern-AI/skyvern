@@ -56,6 +56,7 @@ from skyvern.schemas.workflows import (
     ConditionalBlockYAML,
     ForLoopBlockYAML,
     LoginBlockYAML,
+    WhileLoopBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
@@ -833,13 +834,13 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
     1. Circular references — breaks cycles so the chain has a proper terminal block.
     2. Disconnected paths — stitches orphaned blocks onto the end of the reachable chain.
 
-    Recursively repairs nested ForLoopBlockYAML.loop_blocks at all depths.
+    Recursively repairs nested loop block ``loop_blocks`` at all depths.
     Mutates *blocks* in place.
     """
     if len(blocks) <= 1:
         # Still recurse into loop_blocks even for single-block lists
         for block in blocks:
-            if isinstance(block, ForLoopBlockYAML) and block.loop_blocks:
+            if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
                 _repair_next_block_label_chain(block.loop_blocks)
         return
 
@@ -877,9 +878,9 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
         if terminal_label and ordered_orphan_labels:
             label_to_block[terminal_label].next_block_label = ordered_orphan_labels[0]
 
-    # Phase 3: recursively repair nested ForLoopBlockYAML.loop_blocks.
+    # Phase 3: recursively repair nested loop block ``loop_blocks``.
     for block in blocks:
-        if isinstance(block, ForLoopBlockYAML) and block.loop_blocks:
+        if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
             _repair_next_block_label_chain(block.loop_blocks)
 
 

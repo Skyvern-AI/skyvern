@@ -13,7 +13,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NonTerminalFinallyBlock,
     WorkflowDefinitionHasDuplicateBlockLabels,
 )
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
@@ -68,7 +68,7 @@ class WorkflowDefinition(BaseModel):
                     duplicate_labels.add(block.label)
                 else:
                     all_labels.add(block.label)
-                if isinstance(block, ForLoopBlock) and block.loop_blocks:
+                if isinstance(block, (ForLoopBlock, WhileLoopBlock)) and block.loop_blocks:
                     _collect_labels(block.loop_blocks)
 
         _collect_labels(self.blocks)
