@@ -454,7 +454,13 @@ async def copilot_call_llm(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str | None,
     debug_run_info_text: str,
-) -> tuple[str, Workflow | None, str | None]:
+) -> tuple[str, Workflow | None, str | None, str | None]:
+    """Returns (user_response, updated_workflow, global_llm_context, workflow_yaml).
+
+    workflow_yaml is the raw YAML used to build updated_workflow — callers stash
+    it on the persisted proposal so /apply-proposed-workflow can re-create the
+    workflow version. Without it the V1 proposal can't be applied (SKY-9206).
+    """
     chat_history_text = _format_chat_history(chat_history)
 
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
@@ -544,6 +550,7 @@ async def copilot_call_llm(
 
     if action_type == "REPLACE_WORKFLOW":
         llm_workflow_yaml = action_data.get("workflow_yaml", "")
+        applied_workflow_yaml = llm_workflow_yaml
         try:
             updated_workflow = _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
@@ -575,19 +582,20 @@ async def copilot_call_llm(
                 organization_id=organization_id,
                 workflow_yaml=corrected_workflow_yaml,
             )
+            applied_workflow_yaml = corrected_workflow_yaml
 
-        return user_response, updated_workflow, global_llm_context
+        return user_response, updated_workflow, global_llm_context, applied_workflow_yaml
     elif action_type == "REPLY":
-        return user_response, None, global_llm_context
+        return user_response, None, global_llm_context, None
     elif action_type == "ASK_QUESTION":
-        return user_response, None, global_llm_context
+        return user_response, None, global_llm_context, None
     else:
         LOG.error(
             "Unknown action type from LLM",
             organization_id=organization_id,
             action_type=action_type,
         )
-        return "I received your request but I'm not sure how to help. Could you rephrase?", None, None
+        return "I received your request but I'm not sure how to help. Could you rephrase?", None, None, None
 
 
 async def _auto_correct_workflow_yaml(
@@ -1318,7 +1326,12 @@ async def workflow_copilot_chat_post(
             # call and the DB persistence below must complete so the reply
             # is in the chat history when the user reconnects.
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
-                user_response, updated_workflow, updated_global_llm_context = await copilot_call_llm(
+                (
+                    user_response,
+                    updated_workflow,
+                    updated_global_llm_context,
+                    updated_workflow_yaml,
+                ) = await copilot_call_llm(
                     stream,
                     organization.organization_id,
                     chat_request,
@@ -1328,10 +1341,15 @@ async def workflow_copilot_chat_post(
                 )
 
             if updated_workflow and chat.auto_accept is not True:
+                proposed_data = updated_workflow.model_dump(mode="json")
+                # _copilot_yaml is what /apply-proposed-workflow re-parses into
+                # WorkflowCreateYAMLRequest. Without it, Accept 400s.
+                if updated_workflow_yaml:
+                    proposed_data["_copilot_yaml"] = updated_workflow_yaml
                 await app.DATABASE.workflow_params.update_workflow_copilot_chat(
                     organization_id=chat.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    proposed_workflow=updated_workflow.model_dump(mode="json"),
+                    proposed_workflow=proposed_data,
                 )
 
             await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
