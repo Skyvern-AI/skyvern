@@ -2004,14 +2004,14 @@ class ForLoopBlock(Block):
         """Validate the loop_blocks graph for cycles, orphans, and dangling references.
 
         Skips sequential defaulting so that disconnected subgraphs are detected.
-        Also recursively validates any nested ForLoopBlock children.
+        Also recursively validates any nested loop block children.
         Raises InvalidWorkflowDefinition (422) on validation failure.
         """
         if not self.loop_blocks:
             return
         self._build_loop_graph(self.loop_blocks, skip_sequential_defaulting=True)
         for block in self.loop_blocks:
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 block.validate_loop_blocks()
 
     async def _persist_partial_loop_output(
@@ -2497,6 +2497,651 @@ class ForLoopBlock(Block):
         await self.record_output_parameter_value(
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
         )
+
+        block_status = BlockStatus.failed
+        success = False
+
+        if loop_executed_result.is_canceled():
+            block_status = BlockStatus.canceled
+        elif loop_executed_result.is_completed():
+            block_status = BlockStatus.completed
+            success = True
+        elif loop_executed_result.is_terminated():
+            block_status = BlockStatus.terminated
+        else:
+            block_status = BlockStatus.failed
+
+        return await self.build_block_result(
+            success=success,
+            failure_reason=loop_executed_result.get_failure_reason(),
+            output_parameter_value=loop_executed_result.outputs_with_loop_values,
+            status=block_status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
+class WhileLoopBlock(Block):
+    """Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.
+
+    Top-of-loop semantics: the condition is evaluated *before* each iteration (including the
+    first). If the condition is false on the first check, the body never runs and the block
+    returns success with an empty output list.
+
+    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is
+    treated as a failure so that a misbehaving condition can never spin forever.
+    """
+
+    block_type: Literal[BlockType.WHILE_LOOP] = BlockType.WHILE_LOOP  # type: ignore
+
+    loop_blocks: list[BlockTypeVar]
+    # The discriminated union on ``criteria_type`` handles dict→typed coercion. Pydantic
+    # rejects a dict missing ``criteria_type`` with ``union_tag_not_found`` before any
+    # model_validator runs, so no extra coercion validator is needed here.
+    condition: BranchCriteriaTypeVar
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        parameters: set[PARAMETER_TYPE] = set()
+        for loop_block in self.loop_blocks:
+            for parameter in loop_block.get_all_parameters(workflow_run_id):
+                parameters.add(parameter)
+        return list(parameters)
+
+    def _build_loop_graph(
+        self,
+        blocks: list[BlockTypeVar],
+        skip_sequential_defaulting: bool = False,
+    ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
+        # Duplicated from ForLoopBlock._build_loop_graph for PR 1; promotion to a shared
+        # helper is tracked in PR 7 (refactor).
+        label_to_block: dict[str, BlockTypeVar] = {}
+        default_next_map: dict[str, str | None] = {}
+
+        for block in blocks:
+            if block.label in label_to_block:
+                raise InvalidWorkflowDefinition(f"Duplicate block label detected in loop: {block.label}")
+            label_to_block[block.label] = block
+            default_next_map[block.label] = block.next_block_label
+
+        if not skip_sequential_defaulting:
+            has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
+            if not has_conditional_blocks:
+                for idx, block in enumerate(blocks[:-1]):
+                    if default_next_map.get(block.label) is None:
+                        default_next_map[block.label] = blocks[idx + 1].label
+
+        adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
+        incoming: dict[str, int] = {label: 0 for label in label_to_block}
+
+        def _add_edge(source: str, target: str | None) -> None:
+            if not target:
+                return
+            if target not in label_to_block:
+                raise InvalidWorkflowDefinition(
+                    f"Block {source} references unknown next_block_label {target} inside loop {self.label}"
+                )
+            if target not in adjacency[source]:
+                adjacency[source].add(target)
+                incoming[target] += 1
+
+        for label, block in label_to_block.items():
+            if block.block_type == BlockType.CONDITIONAL:
+                for branch in block.ordered_branches:
+                    _add_edge(label, branch.next_block_label)
+            else:
+                _add_edge(label, default_next_map.get(label))
+
+        roots = [label for label, count in incoming.items() if count == 0]
+        if not roots:
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: every block is the target of another"
+                " block's next_block_label, so there is no starting block."
+                " At least one block must not be the target of any next_block_label or branch condition."
+            )
+        if len(roots) > 1:
+            raise InvalidWorkflowDefinition(
+                f"Disconnected blocks detected inside loop {self.label}: blocks"
+                f" ({', '.join(sorted(roots))}) are not reachable from any other block."
+                " Every block must be reachable from the first block through next_block_label or"
+                " conditional branch references."
+                " Either connect them by setting another block's next_block_label to point to them, or remove them."
+            )
+
+        queue: deque[str] = deque([roots[0]])
+        visited_count = 0
+        in_degree = dict(incoming)
+        while queue:
+            node = queue.popleft()
+            visited_count += 1
+            for neighbor in adjacency[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if visited_count != len(label_to_block):
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: some blocks form a loop through their"
+                " next_block_label references, causing an infinite cycle."
+                " Ensure that following next_block_label from any block eventually reaches a block"
+                " with next_block_label set to null."
+            )
+
+        return roots[0], label_to_block, default_next_map
+
+    def validate_loop_blocks(self) -> None:
+        """Validate the loop_blocks graph and recurse into nested loop blocks."""
+        if not self.loop_blocks:
+            return
+        self._build_loop_graph(self.loop_blocks, skip_sequential_defaulting=True)
+        for block in self.loop_blocks:
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
+                block.validate_loop_blocks()
+
+    async def _persist_partial_loop_output(
+        self,
+        workflow_run_id: str,
+        outputs_with_loop_values: list[list[dict[str, Any]]],
+        loop_idx: int,
+    ) -> None:
+        """Persist partial while-loop output to DB so accumulated iteration data survives
+        Temporal activity timeouts. Mirrors ``ForLoopBlock._persist_partial_loop_output``.
+        """
+        if not self.output_parameter:
+            return
+        try:
+            await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                value=outputs_with_loop_values,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to incrementally persist while-loop output",
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                loop_idx=loop_idx,
+                exc_info=True,
+            )
+
+    async def _evaluate_condition(
+        self,
+        workflow_run_context: WorkflowRunContext,
+    ) -> bool:
+        """Evaluate the loop condition. Raises on rendering errors so the caller can convert
+        the failure into a block result with a clear message."""
+        evaluation_context = BranchEvaluationContext(
+            workflow_run_context=workflow_run_context,
+            block_label=self.label,
+            template_renderer=lambda potential_template: self.format_block_parameter_template_from_workflow_run_context(
+                potential_template,
+                workflow_run_context,
+            ),
+        )
+        return await self.condition.evaluate(evaluation_context)
+
+    async def _execute_while_loop_helper(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> LoopBlockExecutedResult:
+        outputs_with_loop_values: list[list[dict[str, Any]]] = []
+        block_outputs: list[BlockResult] = []
+        current_block: BlockTypeVar | None = None
+
+        start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+
+        loop_idx = 0
+        while True:
+            # Evaluate the condition at the top of every iteration (including the first).
+            # The cap check fires *after* the condition check so that a loop which would
+            # naturally exit on the (cap+1)-th check returns success rather than tripping
+            # the cap one iteration early.
+            #
+            # Condition rendering errors always terminate the loop, regardless of
+            # ``next_loop_on_failure``. The flag governs *body* failures (which can vary
+            # iteration to iteration), but a Jinja render error means the condition itself
+            # is malformed and will fail identically on the next iteration — there is no
+            # forward progress to be made by retrying.
+            try:
+                should_continue = await self._evaluate_condition(workflow_run_context)
+            except (FailedToFormatJinjaStyleParameter, MissingJinjaVariables) as exc:
+                LOG.error(
+                    "WhileLoopBlock condition evaluation failed",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    error=str(exc),
+                )
+                failure_block_result = await self.build_block_result(
+                    success=False,
+                    status=BlockStatus.failed,
+                    failure_reason=f"Failed to evaluate while-loop condition: {str(exc)}",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                block_outputs.append(failure_block_result)
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                return LoopBlockExecutedResult(
+                    outputs_with_loop_values=outputs_with_loop_values,
+                    block_outputs=block_outputs,
+                    last_block=current_block,
+                )
+
+            if not should_continue:
+                LOG.info(
+                    "WhileLoopBlock condition is false, exiting loop",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                )
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                break
+
+            # Check max_iterations limit: only fires when the condition is still true at
+            # iteration index ``cap``, i.e. the loop would have run a (cap+1)-th body.
+            if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
+                LOG.info(
+                    "WhileLoopBlock reached max_iterations limit, stopping loop",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                    max_iterations=DEFAULT_MAX_LOOP_ITERATIONS,
+                )
+                failure_block_result = await self.build_block_result(
+                    success=False,
+                    status=BlockStatus.failed,
+                    failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                block_outputs.append(failure_block_result)
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                return LoopBlockExecutedResult(
+                    outputs_with_loop_values=outputs_with_loop_values,
+                    block_outputs=block_outputs,
+                    last_block=current_block,
+                )
+
+            # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
+            loop_context = skyvern_context.current()
+            if loop_context:
+                downloaded_file_sigs_before: list[tuple[str | None, str | None, str | None]] = []
+                baseline_timed_out = False
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_file_sigs_before = [
+                            to_downloaded_file_signature(fi)
+                            for fi in await app.STORAGE.get_downloaded_files(
+                                organization_id=organization_id or "",
+                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                            )
+                        ]
+                except asyncio.TimeoutError:
+                    baseline_timed_out = True
+                    LOG.warning(
+                        "Timeout getting baseline downloaded files for loop iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                    )
+                if baseline_timed_out:
+                    loop_context.loop_internal_state = None
+                else:
+                    loop_context.loop_internal_state = {
+                        DOWNLOADED_FILE_SIGS_KEY: downloaded_file_sigs_before,
+                    }
+
+            each_loop_output_values: list[dict[str, Any]] = []
+
+            iteration_step_count = 0
+            LOG.debug(
+                "WhileLoopBlock starting iteration",
+                workflow_run_id=workflow_run_id,
+                loop_idx=loop_idx,
+                max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+            )
+
+            block_idx = 0
+            current_label: str | None = start_label
+            conditional_wrb_ids: dict[str, str] = {}
+            while current_label:
+                loop_block = label_to_block.get(current_label)
+                if not loop_block:
+                    LOG.error(
+                        "Unable to find loop block with label in loop graph",
+                        workflow_run_id=workflow_run_id,
+                        loop_label=self.label,
+                        current_label=current_label,
+                    )
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Unable to find block with label {current_label} inside loop {self.label}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    block_outputs.append(failure_block_result)
+                    outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                    return LoopBlockExecutedResult(
+                        outputs_with_loop_values=outputs_with_loop_values,
+                        block_outputs=block_outputs,
+                        last_block=current_block,
+                    )
+
+                # ``current_value`` and ``current_item`` are explicitly nulled to defend
+                # against the SKY-8835 leakage pattern: ``update_block_metadata`` merges
+                # rather than replaces, so an outer for_loop's per-iteration values would
+                # otherwise linger on this label's bag and bleed into child Jinja
+                # expressions. Setting them to None overwrites the stale entries cleanly,
+                # and child templates that reference ``current_value``/``current_item``
+                # will render None rather than leak the outer loop's data.
+                metadata: BlockMetadata = {
+                    "current_index": loop_idx,
+                    "current_value": None,
+                    "current_item": None,
+                }
+                workflow_run_context.update_block_metadata(self.label, metadata)
+                workflow_run_context.update_block_metadata(loop_block.label, metadata)
+
+                original_loop_block = loop_block
+                loop_block = loop_block.model_copy(deep=True)
+                current_block = loop_block
+
+                parent_wrb_id = workflow_run_block_id
+                if current_label in conditional_scopes:
+                    cond_label = conditional_scopes[current_label]
+                    if cond_label in conditional_wrb_ids:
+                        parent_wrb_id = conditional_wrb_ids[cond_label]
+
+                # ``current_value`` is intentionally None: while_loop has no per-iteration
+                # value to display in the timeline. ``current_index`` carries the iteration
+                # counter, which is the only meaningful per-iteration data.
+                block_output = await loop_block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    parent_workflow_run_block_id=parent_wrb_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    current_value=None,
+                    current_index=loop_idx,
+                )
+
+                if loop_block.block_type == BlockType.CONDITIONAL and block_output.workflow_run_block_id:
+                    conditional_wrb_ids[current_label] = block_output.workflow_run_block_id
+
+                output_value = (
+                    workflow_run_context.get_value(block_output.output_parameter.key)
+                    if workflow_run_context.has_value(block_output.output_parameter.key)
+                    else None
+                )
+
+                if block_output.output_parameter.key.endswith("_output"):
+                    LOG.debug("Block output", block_type=loop_block.block_type, output_value=output_value)
+
+                if loop_block.block_type == BlockType.GOTO_URL:
+                    LOG.info("Goto URL block executed", url=loop_block.url, loop_idx=loop_idx)
+
+                each_loop_output_values.append(
+                    {
+                        "output_parameter": block_output.output_parameter,
+                        "output_value": output_value,
+                    }
+                )
+
+                try:
+                    if block_output.workflow_run_block_id:
+                        await app.DATABASE.observer.update_workflow_run_block(
+                            workflow_run_block_id=block_output.workflow_run_block_id,
+                            organization_id=organization_id,
+                            current_value=None,
+                            current_index=loop_idx,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to update workflow run block",
+                        workflow_run_block_id=block_output.workflow_run_block_id,
+                        loop_idx=loop_idx,
+                    )
+                loop_block = original_loop_block
+                block_outputs.append(block_output)
+
+                iteration_step_count += 1
+                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
+                    LOG.info(
+                        "WhileLoopBlock reached max_steps_per_iteration limit, stopping iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+                        iteration_step_count=iteration_step_count,
+                    )
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    block_outputs.append(failure_block_result)
+                    if not self.next_loop_on_failure:
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+                    break
+
+                if block_output.status == BlockStatus.canceled:
+                    LOG.info(
+                        "WhileLoopBlock child block canceled, canceling while loop",
+                        block_type=loop_block.block_type,
+                        workflow_run_id=workflow_run_id,
+                        block_idx=block_idx,
+                        loop_idx=loop_idx,
+                        block_result=block_outputs,
+                    )
+                    outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                    return LoopBlockExecutedResult(
+                        outputs_with_loop_values=outputs_with_loop_values,
+                        block_outputs=block_outputs,
+                        last_block=current_block,
+                    )
+
+                if (
+                    not block_output.success
+                    and not loop_block.continue_on_failure
+                    and not loop_block.next_loop_on_failure
+                    and not self.next_loop_on_failure
+                ):
+                    LOG.info(
+                        "WhileLoopBlock encountered a failure processing block, terminating early",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_block_continue_on_failure=loop_block.continue_on_failure,
+                        failure_reason=block_output.failure_reason,
+                        next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
+                    )
+                    outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                    return LoopBlockExecutedResult(
+                        outputs_with_loop_values=outputs_with_loop_values,
+                        block_outputs=block_outputs,
+                        last_block=current_block,
+                    )
+
+                if block_output.success or loop_block.continue_on_failure:
+                    next_label: str | None = None
+                    if loop_block.block_type == BlockType.CONDITIONAL:
+                        branch_metadata = (
+                            block_output.output_parameter_value
+                            if isinstance(block_output.output_parameter_value, dict)
+                            else None
+                        )
+                        next_label = (branch_metadata or {}).get("next_block_label")
+                    else:
+                        next_label = default_next_map.get(loop_block.label)
+
+                    if not next_label:
+                        break
+
+                    if next_label not in label_to_block:
+                        failure_block_result = await self.build_block_result(
+                            success=False,
+                            status=BlockStatus.failed,
+                            failure_reason=f"Next block label {next_label} not found inside loop {self.label}",
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                        block_outputs.append(failure_block_result)
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+
+                    current_label = next_label
+                    block_idx += 1
+                    continue
+
+                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                    LOG.info(
+                        "WhileLoopBlock child block failed but will continue to next iteration",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_block_next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
+                    )
+                    break
+
+                break
+
+            outputs_with_loop_values.append(each_loop_output_values)
+            # We don't know "is_last_iteration" for a while-loop ahead of time, so persist
+            # every PERSIST_LOOP_OUTPUT_INTERVAL iterations and once again at the top of the
+            # next iteration when the condition is false (handled at the break above).
+            if loop_idx % PERSIST_LOOP_OUTPUT_INTERVAL == 0:
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+
+            loop_idx += 1
+
+        return LoopBlockExecutedResult(
+            outputs_with_loop_values=outputs_with_loop_values,
+            block_outputs=block_outputs,
+            last_block=current_block,
+        )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # Save the caller's loop_internal_state so we can restore it after this loop
+        # finishes. Mirrors ForLoopBlock.execute.
+        outer_context = skyvern_context.current()
+        outer_loop_state = outer_context.loop_internal_state if outer_context else None
+        try:
+            return await self._run_loop(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                **kwargs,
+            )
+        finally:
+            if outer_context:
+                outer_context.loop_internal_state = outer_loop_state
+
+    async def _run_loop(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        if isinstance(self.condition, PromptBranchCriteria):
+            # Prompt criteria support is deferred to a follow-up PR; the prompt evaluator
+            # is currently coupled to ConditionalBlock. Reject explicitly so the user gets
+            # a clear, actionable error rather than a silent fall-through.
+            return await self.build_block_result(
+                success=False,
+                failure_reason=(
+                    "Prompt criteria are not yet supported in while_loop blocks. "
+                    "Use a Jinja2 expression like '{{ should_continue }}' instead."
+                ),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        if not self.loop_blocks:
+            LOG.info(
+                "No defined blocks to loop, terminating block",
+                block_type=self.block_type,
+                workflow_run_id=workflow_run_id,
+                num_loop_blocks=len(self.loop_blocks),
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No defined blocks to loop",
+                status=BlockStatus.terminated,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        try:
+            loop_executed_result = await self._execute_while_loop_helper(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_context=workflow_run_context,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+        except InvalidWorkflowDefinition as exc:
+            LOG.error(
+                "While-loop graph validation failed",
+                error=str(exc),
+                workflow_run_id=workflow_run_id,
+                loop_label=self.label,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(exc),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        await self.record_output_parameter_value(
+            workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
+        )
+
+        # Special case: condition false on the very first check. The body never ran, so
+        # there are no block_outputs. Return success with an empty output list — this is
+        # the normal/expected "nothing to do" path for a while-loop.
+        if not loop_executed_result.block_outputs:
+            return await self.build_block_result(
+                success=True,
+                failure_reason=None,
+                output_parameter_value=loop_executed_result.outputs_with_loop_values,
+                status=BlockStatus.completed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
         block_status = BlockStatus.failed
         success = False
@@ -7367,8 +8012,8 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
 
-    At time of writing, blocks can be nested via the ForLoop block. This function
-    returns all blocks, flattened.
+    Blocks can be nested via ForLoop and WhileLoop blocks. This function returns
+    all blocks, flattened.
     """
 
     all_blocks: list[BlockTypeVar] = []
@@ -7376,7 +8021,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     for block in blocks:
         all_blocks.append(block)
 
-        if block.block_type == BlockType.FOR_LOOP:
+        if block.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
             nested_blocks = get_all_blocks(block.loop_blocks)
             all_blocks.extend(nested_blocks)
 
@@ -7392,6 +8037,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
 BlockSubclasses = Union[
     ConditionalBlock,
     ForLoopBlock,
+    WhileLoopBlock,
     TaskBlock,
     CodeBlock,
     TextPromptBlock,

@@ -42,6 +42,17 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    cancel_token: str | None = Field(
+        None,
+        description=(
+            "Client-generated UUID. POST it to /workflow/copilot/cancel to hard-cancel this turn. "
+            "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
+        ),
+    )
+
+
+class WorkflowCopilotCancelRequest(BaseModel):
+    cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):

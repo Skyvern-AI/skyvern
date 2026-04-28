@@ -23,7 +23,7 @@ You have three ways to connect a client to Skyvern:
 
 | | OAuth (sign in with browser) | API key | Local mode |
 |---|---|---|---|
-| **Best for** | Claude Code, Cursor, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Codex, Hermes, OpenClaw, or any client where you prefer a static key | Self-hosting Skyvern |
+| **Best for** | Claude Code, Codex CLI, Cursor, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern |
 | **Install required** | None | None | Python 3.11+ and `pip install skyvern` |
 | **Credential** | Browser sign-in with your Skyvern account | API key from [app.skyvern.com](https://app.skyvern.com) | API key from your self-hosted instance |
 | **Where it runs** | Directly against Skyvern Cloud over HTTPS | Directly against Skyvern Cloud over HTTPS | Local Python process talking to your Skyvern server |
@@ -32,7 +32,7 @@ If your client appears in the OAuth section below, start there. Otherwise use th
 
 ## Option A: Sign in with browser (OAuth)
 
-Supported clients today: **Claude Code**, **Cursor**, and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
+Supported clients today: **Claude Code**, **Codex CLI**, **Cursor**, and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
 
 There is **no install step**. You do not need `pip install skyvern`, Node.js, or an API key.
 
@@ -46,6 +46,23 @@ claude mcp add --transport http skyvern https://api.skyvern.com/mcp/ --scope use
 Then run `/mcp` in Claude Code and follow the authentication prompt. Claude Code opens your browser for Skyvern sign-in and stores the token for future sessions.
 
 No `--header`, no API key. If you previously configured Skyvern with `x-api-key`, run `claude mcp remove skyvern` first so Claude Code does not skip the OAuth handshake.
+
+</Tab>
+<Tab title="Codex CLI">
+
+```bash
+codex mcp add skyvern --url https://api.skyvern.com/mcp/
+```
+
+That single command is the entire flow. Codex prints `Detected OAuth support. Starting OAuth flow…`, opens your browser for Skyvern sign-in, stores the token in `~/.codex/`, and exits with `Successfully logged in.` Verify with:
+
+```bash
+codex mcp get skyvern
+```
+
+`http_headers` should be empty (`-`). Skyvern tools are now available in any `codex` session. Requires `codex --version` ≥ 0.125.0.
+
+If you previously configured Skyvern with an `x-api-key` header, run `codex mcp remove skyvern` first so Codex does not skip the OAuth handshake. You do not need to run `codex mcp login skyvern` after `add` — the OAuth flow runs inline. Use `codex mcp login skyvern` only to re-authenticate after a token expires or to request custom `--scopes`.
 
 </Tab>
 <Tab title="Cursor">
@@ -70,7 +87,7 @@ Use a current Cursor release. Restart Cursor, open MCP settings, and authenticat
 
 ## Option B: API key
 
-Use this path for Claude Desktop, Windsurf, Codex, Hermes, OpenClaw, and any client that does not yet support the MCP OAuth flow. You can also use it with Claude Code and Cursor if you prefer a static key.
+Use this path for Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, and any client that does not yet support the MCP OAuth flow. You can also use it with Claude Code, Codex CLI, or Cursor if you prefer a static key (for example, on a server with no browser available for the OAuth callback).
 
 Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard, then pick your client below.
 
@@ -160,7 +177,11 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 ```
 
 </Tab>
-<Tab title="Codex">
+<Tab title="Codex CLI">
+
+<Tip>
+Most Codex users should use the OAuth flow above (`codex mcp add skyvern --url https://api.skyvern.com/mcp/`). Use this manual TOML path only when you cannot complete a browser callback, for example on a headless server or in a CI runner.
+</Tip>
 
 Add to `~/.codex/config.toml`:
 

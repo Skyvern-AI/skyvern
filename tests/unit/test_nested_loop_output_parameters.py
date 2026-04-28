@@ -17,7 +17,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     OutputParameterKeyCollisionError,
     WorkflowDefinitionHasDuplicateBlockLabels,
 )
-from skyvern.forge.sdk.workflow.models.block import ForLoopBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.block import ForLoopBlock, JinjaBranchCriteria, TaskBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.workflow_definition_converter import (
@@ -26,8 +26,10 @@ from skyvern.forge.sdk.workflow.workflow_definition_converter import (
     convert_workflow_definition,
 )
 from skyvern.schemas.workflows import (
+    BranchCriteriaYAML,
     ForLoopBlockYAML,
     TaskBlockYAML,
+    WhileLoopBlockYAML,
     WorkflowDefinitionYAML,
 )
 
@@ -104,6 +106,25 @@ class TestCollectAllBlockLabels:
         labels = _collect_all_block_labels(blocks)
         assert labels.count("shared_label") == 2
 
+    def test_recurses_into_while_loop_blocks(self) -> None:
+        """SKY-8771: _collect_all_block_labels recurses into while_loop blocks."""
+        blocks = [
+            WhileLoopBlockYAML(
+                label="outer_while",
+                loop_blocks=[
+                    ForLoopBlockYAML(
+                        label="inner_for",
+                        loop_blocks=[
+                            TaskBlockYAML(label="deep_task", url="https://example.com"),
+                        ],
+                    ),
+                ],
+                condition=BranchCriteriaYAML(criteria_type="jinja2_template", expression="{{ x }}"),
+            ),
+        ]
+        labels = _collect_all_block_labels(blocks)
+        assert labels == ["outer_while", "inner_for", "deep_task"]
+
 
 class TestCreateAllOutputParametersForNestedLoops:
     """Tests for _create_all_output_parameters_for_workflow with nested loops."""
@@ -150,6 +171,25 @@ class TestCreateAllOutputParametersForNestedLoops:
         assert "outer_loop" in params
         assert "inner_loop" in params
         assert "deep_task" in params
+
+    def test_creates_parameters_for_while_loop_children(self) -> None:
+        """SKY-8771: output parameters are created for blocks nested inside a while_loop."""
+        blocks = [
+            WhileLoopBlockYAML(
+                label="outer_while",
+                loop_blocks=[
+                    TaskBlockYAML(label="inside_task", url="https://example.com"),
+                ],
+                condition=BranchCriteriaYAML(criteria_type="jinja2_template", expression="{{ x }}"),
+            ),
+        ]
+        params = _create_all_output_parameters_for_workflow(
+            workflow_id="test_wf",
+            block_yamls=blocks,
+        )
+        assert "outer_while" in params
+        assert "inside_task" in params
+        assert params["inside_task"].key == "inside_task_output"
 
 
 class TestConvertWorkflowDefinitionNestedLoopValidation:
@@ -274,6 +314,51 @@ class TestWorkflowDefinitionValidateNestedLabels:
             blocks=[outer_task, loop_block],
         )
         definition.validate()  # Should not raise
+
+    def test_validate_catches_duplicate_inside_while_loop(self) -> None:
+        """validate() recurses into while_loop blocks for label uniqueness checks (SKY-8771)."""
+        inner_task = TaskBlock(
+            label="shared_label",
+            output_parameter=self._make_output_param("shared_label_inner"),
+        )
+        outer_task = TaskBlock(
+            label="shared_label",
+            output_parameter=self._make_output_param("shared_label_outer"),
+        )
+        while_loop = WhileLoopBlock(
+            label="while_1",
+            output_parameter=self._make_output_param("while_1"),
+            loop_blocks=[inner_task],
+            condition=JinjaBranchCriteria(expression="{{ x }}"),
+        )
+        definition = WorkflowDefinition(
+            parameters=[],
+            blocks=[outer_task, while_loop],
+        )
+        with pytest.raises(WorkflowDefinitionHasDuplicateBlockLabels):
+            definition.validate()
+
+    def test_validate_catches_duplicate_for_inside_while(self) -> None:
+        """Mixed for-inside-while nesting still detects duplicate labels (SKY-8771)."""
+        deepest = TaskBlock(label="dup", output_parameter=self._make_output_param("dup_inner"))
+        for_loop = ForLoopBlock(
+            label="for_1",
+            output_parameter=self._make_output_param("for_1"),
+            loop_blocks=[deepest],
+        )
+        sibling = TaskBlock(label="dup", output_parameter=self._make_output_param("dup_sibling"))
+        while_loop = WhileLoopBlock(
+            label="while_1",
+            output_parameter=self._make_output_param("while_1"),
+            loop_blocks=[for_loop, sibling],
+            condition=JinjaBranchCriteria(expression="{{ x }}"),
+        )
+        definition = WorkflowDefinition(
+            parameters=[],
+            blocks=[while_loop],
+        )
+        with pytest.raises(WorkflowDefinitionHasDuplicateBlockLabels):
+            definition.validate()
 
 
 class TestWorkflowGetOutputParameterNested:

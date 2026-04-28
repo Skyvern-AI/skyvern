@@ -81,6 +81,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     NavigationBlock,
     TaskV2Block,
+    WhileLoopBlock,
     WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
@@ -176,13 +177,13 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 
 
 def _collect_uncached_loop_children(
-    block: ForLoopBlock,
+    block: ForLoopBlock | WhileLoopBlock,
     script_blocks_by_label: dict[str, object],
     blocks_to_update: set[str],
 ) -> None:
-    """Recursively collect uncached cacheable children from nested for-loops.
+    """Recursively collect uncached cacheable children from nested loop blocks.
 
-    ForLoopBlock children execute via block.py's execute_loop_helper(),
+    Loop block children execute via block.py's execute_*_loop_helper(),
     bypassing _execute_single_block() where blocks_to_update tracking lives.
     This function walks all nesting levels so the script generator produces
     cached functions for deeply nested blocks (e.g., file_download inside
@@ -195,9 +196,9 @@ def _collect_uncached_loop_children(
             and child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
         ):
             blocks_to_update.add(child.label)
-        # Recurse into nested for-loops regardless of whether the for-loop
+        # Recurse into nested loop blocks regardless of whether the loop
         # itself is cached — its children may not be.
-        if isinstance(child, ForLoopBlock):
+        if isinstance(child, (ForLoopBlock, WhileLoopBlock)):
             _collect_uncached_loop_children(child, script_blocks_by_label, blocks_to_update)
 
 
@@ -2767,13 +2768,13 @@ class WorkflowService:
             # recorded and the reviewer will patch the specific block that failed.
             # See _trigger_script_reviewer() for the capped reviewer flow.
 
-            # Track uncached for-loop child blocks for regeneration.
-            # ForLoopBlock children execute via block.py's execute_loop_helper(),
+            # Track uncached loop block children for regeneration.
+            # Loop block children execute via block.py's execute_*_loop_helper(),
             # bypassing _execute_single_block. Recursively walk all nesting levels
             # so deeply nested blocks (e.g., file_download inside a double-nested
-            # for-loop) get cached functions generated.
+            # loop) get cached functions generated.
             if (
-                isinstance(block, ForLoopBlock)
+                isinstance(block, (ForLoopBlock, WhileLoopBlock))
                 and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
                 and workflow_run_block_result.status in cacheable_statuses
             ):
@@ -2782,7 +2783,7 @@ class WorkflowService:
                 new_labels = sorted(blocks_to_update - previous_labels)
                 if new_labels:
                     LOG.info(
-                        "For-loop child blocks marked for caching",
+                        "Loop block child blocks marked for caching",
                         parent_label=block.label,
                         child_labels=new_labels,
                         child_count=len(new_labels),
@@ -3274,9 +3275,9 @@ class WorkflowService:
 
     @staticmethod
     def _validate_nested_blocks(blocks: list[BlockTypeVar]) -> None:
-        """Recursively validate ForLoopBlock graphs at all nesting depths."""
+        """Recursively validate loop block graphs at all nesting depths."""
         for block in blocks:
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 block.validate_loop_blocks()
 
     @staticmethod
