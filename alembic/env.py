@@ -84,6 +84,7 @@ async def run_migrations_online():
 if context.is_offline_mode():
     run_migrations_offline()
 else:
+
     async def async_main():
         await run_migrations_online()
 
