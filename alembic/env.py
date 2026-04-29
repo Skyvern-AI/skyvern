@@ -81,7 +81,6 @@ async def run_migrations_online():
     await connectable.dispose()
 
 
-print("Alembic mode: ", "offline" if context.is_offline_mode() else "online")
 if context.is_offline_mode():
     run_migrations_offline()
 else:
@@ -91,15 +90,10 @@ else:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No running loop -> safe to start one
-        print("Alembic: no running loop")
         asyncio.run(async_main())
     else:
-        # Already running loop -> schedule task and await it
-        print("Alembic: schedule task")
         import concurrent.futures
 
-        # Use a ThreadPoolExecutor to run the async function in a new thread
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(asyncio.run, async_main())
-            future.result()  # This blocks until completion
+            future.result()

@@ -10,6 +10,9 @@ from rich.prompt import Confirm
 from skyvern.analytics import capture_setup_event
 
 from .console import console
+from .llm_setup import update_or_add_env_var
+
+DOCKER_POSTGRES_DATABASE_STRING = "postgresql+psycopg://skyvern@localhost:5432/skyvern"
 
 
 def command_exists(command: str) -> bool:
@@ -122,6 +125,7 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database and user exist.[/green]")
         else:
             create_database_and_user()
+        update_or_add_env_var("DATABASE_STRING", "postgresql+psycopg://skyvern@localhost:5432/skyvern")
         capture_setup_event("database-complete", success=True, extra_data={"source": "local"})
         return
 
@@ -134,14 +138,26 @@ def setup_postgresql(no_postgres: bool = False) -> None:
         return
 
     if not is_docker_running():
+        docker_installed = command_exists("docker")
+        if docker_installed:
+            error_msg = "Docker is installed but not running"
+            console.print("[red]Docker is installed but the daemon is not running.[/red]")
+            console.print(
+                "[yellow]Please start Docker Desktop (or the Docker daemon) and re-run this command.[/yellow]"
+            )
+        else:
+            error_msg = "Docker is not installed"
+            console.print("[red]Docker is not installed.[/red]")
+            console.print(
+                "[yellow]Skyvern needs Docker to run PostgreSQL. Please either:[/yellow]\n"
+                "  1. Install Docker: [link]https://docs.docker.com/get-docker/[/link]\n"
+                "  2. Or provide your own Postgres via: [bold]skyvern init --database-string 'postgresql+psycopg://user:pass@host:5432/dbname'[/bold]"
+            )
         capture_setup_event(
             "database-fail",
             success=False,
             error_type="docker_not_running",
-            error_message="Docker is not running or not installed",
-        )
-        console.print(
-            "[red]Docker is not running or not installed. Please install or start Docker and try again.[/red]"
+            error_message=error_msg,
         )
         raise SystemExit(1)
 
@@ -234,4 +250,5 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             else:
                 console.print("✅ [green]Database and user created successfully.[/green]")
 
+    update_or_add_env_var("DATABASE_STRING", DOCKER_POSTGRES_DATABASE_STRING)
     capture_setup_event("database-complete", success=True, extra_data={"source": "docker"})
