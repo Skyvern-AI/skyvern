@@ -1262,6 +1262,7 @@ async def handle_input_text_action(
         element_id=skyvern_element.get_id(),
         option=SelectOption(label=text),
         intention=action.intention,
+        input_or_select_context=action.input_or_select_context,
     )
     if await skyvern_element.get_selectable():
         LOG.info(
@@ -1926,6 +1927,7 @@ async def handle_select_option_action(
                 element_id=selectable_child.get_id(),
                 option=action.option,
                 intention=action.intention,
+                input_or_select_context=action.input_or_select_context,
             )
             action = select_action
             skyvern_element = selectable_child
@@ -1990,6 +1992,7 @@ async def handle_select_option_action(
             element_id=blocking_element.get_id(),
             option=action.option,
             intention=action.intention,
+            input_or_select_context=action.input_or_select_context,
         )
         action = select_action
         skyvern_element = blocking_element

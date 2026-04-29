@@ -124,7 +124,13 @@ function PayloadParameterFields({
     );
   }
 
-  if (parameters.length === 0) {
+  const payloadValues = parsePayload(payload);
+  const declaredKeys = new Set(parameters.map((p) => p.key));
+  const staleKeys = Object.keys(payloadValues).filter(
+    (k) => !declaredKeys.has(k),
+  );
+
+  if (parameters.length === 0 && staleKeys.length === 0) {
     return (
       <p className="text-xs text-slate-500">
         This workflow has no input parameters.
@@ -132,10 +138,13 @@ function PayloadParameterFields({
     );
   }
 
-  const payloadValues = parsePayload(payload);
-
   return (
     <div className="space-y-3">
+      {parameters.length === 0 && (
+        <p className="text-xs text-slate-500">
+          This workflow has no input parameters.
+        </p>
+      )}
       {parameters.map((param) => {
         const isCredential = isCredentialParam(param);
         const isDynamic = dynamicCredentialKeys.has(param.key);
@@ -196,6 +205,39 @@ function PayloadParameterFields({
           </div>
         );
       })}
+
+      {staleKeys.length > 0 && (
+        <div className="space-y-1.5 rounded border border-amber-700/40 bg-amber-950/20 p-2">
+          <p className="text-[10px] font-medium uppercase text-amber-400">
+            Dormant payload entries
+          </p>
+          <p className="text-[10px] text-slate-400">
+            The target workflow no longer declares these parameters. They are
+            saved but never consumed at runtime, and any malformed Jinja2 here
+            will still fail the trigger at execute time. Delete or align the
+            target.
+          </p>
+          {staleKeys.map((key) => (
+            <div key={key} className="flex items-center gap-2">
+              <Label className="text-xs text-slate-300">{key}</Label>
+              <code
+                className="min-w-0 grow truncate text-[10px] text-slate-400"
+                title={payloadValues[key]}
+              >
+                {payloadValues[key]}
+              </code>
+              <button
+                type="button"
+                aria-label={`delete ${key}`}
+                className="text-xs text-red-400 hover:underline"
+                onClick={() => handleFieldChange(key, "")}
+              >
+                delete
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

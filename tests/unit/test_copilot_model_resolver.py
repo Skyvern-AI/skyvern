@@ -200,13 +200,13 @@ class TestModelResolver:
         _, _, _, supports_vision = resolve_model_config(handler)
         assert supports_vision is False
 
-    def test_routes_all_litellm_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """All LiteLLMParams fields land in the correct ModelSettings slot.
-
-        Guards against COMP-3: silently dropping Vertex/Azure provider fields
-        by routing them into the wrong bucket.
-        """
+    def test_routes_all_litellm_params(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig
+        from skyvern.forge.sdk.copilot import model_resolver as model_resolver_module
+
+        # Reset the per-process warn-once gate so the caplog assertion is
+        # deterministic regardless of test ordering.
+        model_resolver_module._WARNED_DROP_KEYS.clear()
 
         lp: LiteLLMParams = {
             "api_base": "https://vertex.example.com",
@@ -238,15 +238,28 @@ class TestModelResolver:
         handler = MagicMock()
         handler.llm_key = "VERTEX_KEY"
 
-        _, run_config, _, _ = resolve_model_config(handler)
+        with caplog.at_level("WARNING"):
+            _, run_config, _, _ = resolve_model_config(handler)
         ms = run_config.model_settings
         assert ms is not None
 
         assert ms.extra_headers == {"X-Skyvern-Route": "copilot"}
-        for field in ("thinking", "thinking_level", "service_tier"):
-            assert ms.extra_body is not None
-            assert ms.extra_body[field] == lp[field]
+
         assert ms.extra_args is not None
+        assert ms.extra_args["thinking"] == lp["thinking"]
+        assert ms.extra_args["service_tier"] == lp["service_tier"]
+        if ms.extra_body is not None:
+            assert "thinking" not in ms.extra_body
+            assert "service_tier" not in ms.extra_body
+
+        assert "thinking_level" not in ms.extra_args
+        if ms.extra_body is not None:
+            assert "thinking_level" not in ms.extra_body
+        assert any(
+            isinstance(record.msg, dict) and record.msg.get("dropped_key") == "thinking_level"
+            for record in caplog.records
+        )
+
         for field in ("api_version", "model_info", "vertex_credentials", "vertex_location", "timeout"):
             assert ms.extra_args[field] == lp[field]
 

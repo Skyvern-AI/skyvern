@@ -37,6 +37,12 @@ register_lazy_command(
     "Read and update organization settings (max_steps_per_run, webhook URL, retries, artifact URL expiry).",
 )
 register_lazy_command("workflow", "skyvern.cli.workflow", "workflow_app", "Workflow management commands.")
+register_lazy_command(
+    "schedule",
+    "skyvern.cli.schedule_command",
+    "schedule_app",
+    "Manage workflow schedules (list, create, update, enable/disable, delete).",
+)
 register_lazy_command("tasks", "skyvern.cli.tasks", "tasks_app", "Task management commands.")
 register_lazy_command(
     "credentials",
