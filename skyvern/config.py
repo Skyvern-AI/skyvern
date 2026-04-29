@@ -213,7 +213,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"  # This is the model name
+    LLM_KEY: str = "OPENAI_GPT5_5"  # This is the model name
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
@@ -252,7 +252,7 @@ class Settings(BaseSettings):
     GPT5_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
-    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
+    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False

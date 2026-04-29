@@ -232,32 +232,40 @@ print(task)
 ## Advanced Usage
 
 ### Control your own browser (Chrome)
-> [!WARNING]
-> Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.
 
-1. Just With Python Code
+Let Skyvern control your existing Chrome browser — with all your cookies, logins, and extensions.
+
+#### Step 1: Enable remote debugging in Chrome
+
+1. Open Chrome and navigate to `chrome://inspect/#remote-debugging`
+2. Click **Enable** to start the debugging server
+3. You should see: **Server running at: 127.0.0.1:9222**
+
+> [!TIP]
+> The `skyvern init browser` command can do this automatically — it opens `chrome://inspect/#remote-debugging`, waits for you to enable it, and saves the config.
+
+#### Step 2: Connect Skyvern
+
+**Option A — Python Code:**
 ```python
 from skyvern import Skyvern
 
-# The path to your Chrome browser. This example path is for Mac.
-browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 skyvern = Skyvern(
     base_url="http://localhost:8000",
     api_key="YOUR_API_KEY",
-    browser_path=browser_path,
+    browser_address="http://127.0.0.1:9222",
 )
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
 )
 ```
 
-2. With Skyvern Service
+**Option B — Skyvern Service:**
 
 Add two variables to your .env file:
 ```bash
-# The path to your Chrome browser. This example path is for Mac.
-CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 BROWSER_TYPE=cdp-connect
+BROWSER_REMOTE_DEBUGGING_URL=http://127.0.0.1:9222
 ```
 
 Restart Skyvern service `skyvern run all` and run the task through UI or code
@@ -436,7 +444,7 @@ Skyvern currently supports the following password manager integrations:
 
 Skyvern supports the Model Context Protocol (MCP) to allow you to use any LLM that supports MCP.
 
-See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/skyvern/cli/mcp_tools/README.md)
+See the MCP documentation [here](https://www.skyvern.com/docs/integrations/mcp#mcp-server)
 
 ## Zapier / Make.com / N8N Integration
 Skyvern supports Zapier, Make.com, and N8N to allow you to connect your Skyvern workflows to other apps.
@@ -516,124 +524,16 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 # Supported LLMs
 | Provider | Supported Models |
 | -------- | ------- |
-| OpenAI   | GPT-5, GPT-5.2, GPT-4.1, o3, o4-mini |
-| Anthropic | Claude 4 (Sonnet, Opus), Claude 4.5 (Haiku, Sonnet, Opus) |
-| Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
-| AWS Bedrock | Claude 3.5, Claude 3.7, Claude 4 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
-| Gemini | Gemini 3 Pro/Flash, Gemini 2.5 Pro/Flash |
+| OpenAI   | GPT-5.5, GPT-5.4, GPT-5, GPT-4.1, o3, o4-mini |
+| Anthropic | Claude 4.7 Opus, Claude 4.6 (Sonnet, Opus), Claude 4.5 (Haiku, Sonnet, Opus) |
+| Azure OpenAI | Any GPT models deployed to your Azure subscription |
+| AWS Bedrock | Claude 4.7, Claude 4.6 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
+| Gemini | Gemini 3.1 Pro, Gemini 3 Flash, Gemini 2.5 Pro/Flash |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
 
-#### Environment Variables
-
-##### OpenAI
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_OPENAI`| Register OpenAI models | Boolean | `true`, `false` |
-| `OPENAI_API_KEY` | OpenAI API Key | String | `sk-1234567890` |
-| `OPENAI_API_BASE` | OpenAI API Base, optional | String | `https://openai.api.base` |
-| `OPENAI_ORGANIZATION` | OpenAI Organization ID, optional | String | `your-org-id` |
-
-Recommended `LLM_KEY`: `OPENAI_GPT5`, `OPENAI_GPT5_2`, `OPENAI_GPT4_1`, `OPENAI_O3`, `OPENAI_O4_MINI`
-
-##### Anthropic
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_ANTHROPIC` | Register Anthropic models| Boolean | `true`, `false` |
-| `ANTHROPIC_API_KEY` | Anthropic API key| String | `sk-1234567890` |
-
-Recommended `LLM_KEY`: `ANTHROPIC_CLAUDE4.5_OPUS`, `ANTHROPIC_CLAUDE4.5_SONNET`, `ANTHROPIC_CLAUDE4_OPUS`, `ANTHROPIC_CLAUDE4_SONNET`
-
-##### Azure OpenAI
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_AZURE` | Register Azure OpenAI models | Boolean | `true`, `false` |
-| `AZURE_API_KEY` | Azure deployment API key | String | `sk-1234567890` |
-| `AZURE_DEPLOYMENT` | Azure OpenAI Deployment Name | String | `skyvern-deployment`|
-| `AZURE_API_BASE` | Azure deployment api base url| String | `https://skyvern-deployment.openai.azure.com/`|
-| `AZURE_API_VERSION` | Azure API Version| String | `2024-02-01`|
-
-Recommended `LLM_KEY`: `AZURE_OPENAI`
-
-##### AWS Bedrock
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_BEDROCK` | Register AWS Bedrock models. To use AWS Bedrock, you need to make sure your [AWS configurations](https://github.com/boto/boto3?tab=readme-ov-file#using-boto3) are set up correctly first. | Boolean | `true`, `false` |
-
-Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE`, `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE`, `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE`
-
-##### Gemini
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_GEMINI` | Register Gemini models| Boolean | `true`, `false` |
-| `GEMINI_API_KEY` | Gemini API Key| String | `your_google_gemini_api_key`|
-
-Recommended `LLM_KEY`: `GEMINI_3.0_FLASH`, `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`, `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
-
-##### Ollama
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_OLLAMA`| Register local models via Ollama | Boolean | `true`, `false` |
-| `OLLAMA_SERVER_URL` | URL for your Ollama server | String | `http://host.docker.internal:11434` |
-| `OLLAMA_MODEL` | Ollama model name to load | String | `qwen2.5:7b-instruct` |
-| `OLLAMA_SUPPORTS_VISION` | Enable vision support | Boolean | `true`, `false` |
-
-Recommended `LLM_KEY`: `OLLAMA`
-
-Note: Set `OLLAMA_SUPPORTS_VISION=true` for vision models like qwen3-vl, llava, etc.
-
-##### OpenRouter
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_OPENROUTER`| Register OpenRouter models | Boolean | `true`, `false` |
-| `OPENROUTER_API_KEY` | OpenRouter API key | String | `sk-1234567890` |
-| `OPENROUTER_MODEL` | OpenRouter model name | String | `mistralai/mistral-small-3.1-24b-instruct` |
-| `OPENROUTER_API_BASE` | OpenRouter API base URL | String | `https://api.openrouter.ai/v1` |
-
-Recommended `LLM_KEY`: `OPENROUTER`
-
-##### OpenAI-Compatible
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_OPENAI_COMPATIBLE`| Register a custom OpenAI-compatible API endpoint | Boolean | `true`, `false` |
-| `OPENAI_COMPATIBLE_MODEL_NAME` | Model name for OpenAI-compatible endpoint | String | `yi-34b`, `gpt-3.5-turbo`, `mistral-large`, etc.|
-| `OPENAI_COMPATIBLE_API_KEY` | API key for OpenAI-compatible endpoint | String | `sk-1234567890`|
-| `OPENAI_COMPATIBLE_API_BASE` | Base URL for OpenAI-compatible endpoint | String | `https://api.together.xyz/v1`, `http://localhost:8000/v1`, etc.|
-| `OPENAI_COMPATIBLE_API_VERSION` | API version for OpenAI-compatible endpoint, optional| String | `2023-05-15`|
-| `OPENAI_COMPATIBLE_MAX_TOKENS` | Maximum tokens for completion, optional| Integer | `4096`, `8192`, etc.|
-| `OPENAI_COMPATIBLE_TEMPERATURE` | Temperature setting, optional| Float | `0.0`, `0.5`, `0.7`, etc.|
-| `OPENAI_COMPATIBLE_SUPPORTS_VISION` | Whether model supports vision, optional| Boolean | `true`, `false`|
-
-Supported LLM Key: `OPENAI_COMPATIBLE`
-
-##### General LLM Configuration
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `LLM_KEY` | The name of the model you want to use | String | See supported LLM keys above |
-| `SECONDARY_LLM_KEY` | The name of the model for mini agents skyvern runs with | String | See supported LLM keys above |
-| `LLM_CONFIG_MAX_TOKENS` | Override the max tokens used by the LLM | Integer | `128000` |
-
-# Feature Roadmap
-This is our planned roadmap for the next few months. If you have any suggestions or would like to see a feature added, please don't hesitate to reach out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
-
-- [x] **Open Source** - Open Source Skyvern's core codebase
-- [x] **Workflow support** - Allow support to chain multiple Skyvern calls together
-- [x] **Improved context** - Improve Skyvern's ability to understand content around interactable elements by introducing feeding relevant label context through the text prompt
-- [x] **Cost Savings** - Improve Skyvern's stability and reduce the cost of running Skyvern by optimizing the context tree passed into Skyvern
-- [x] **Self-serve UI** - Deprecate the Streamlit UI in favour of a React-based UI component that allows users to kick off new jobs in Skyvern
-- [x] **Workflow UI Builder** - Introduce a UI to allow users to build and analyze workflows visually
-- [x] **Chrome Viewport streaming** - Introduce a way to live-stream the Chrome viewport to the user's browser (as a part of the self-serve UI)
-- [x] **Past Runs UI** - Deprecate the Streamlit UI in favour of a React-based UI that allows you to visualize past runs and their results
-- [X] **Auto workflow builder ("Observer") mode** - Allow Skyvern to auto-generate workflows as it's navigating the web to make it easier to build new workflows
-- [x] **Prompt Caching** - Introduce a caching layer to the LLM calls to dramatically reduce the cost of running Skyvern (memorize past actions and repeat them!)
-- [x] **Web Evaluation Dataset** - Integrate Skyvern with public benchmark tests to track the quality of our models over time
-- [ ] **Improved Debug mode** - Allow Skyvern to plan its actions and get "approval" before running them, allowing you to debug what it's doing and more easily iterate on the prompt
-- [ ] **Chrome Extension** - Allow users to interact with Skyvern through a Chrome extension (incl voice mode, saving tasks, etc.)
-- [ ] **Skyvern Action Recorder** - Allow Skyvern to watch a user complete a task and then automatically generate a workflow for it
-- [ ] **Interactable Livestream** - Allow users to interact with the livestream in real-time to intervene when necessary (such as manually submitting sensitive forms)
-- [ ] **Integrate LLM Observability tools** - Integrate LLM Observability tools to allow back-testing prompt changes with specific data sets + visualize the performance of Skyvern over time
-- [x] **Langchain Integration** - Create langchain integration in langchain_community to use Skyvern as a "tool".
+For detailed LLM configuration including all available model keys, environment variables, and multi-model setups, see the [LLM Configuration docs](https://www.skyvern.com/docs/self-hosted/llm-configuration).
 
 # Contributing
 

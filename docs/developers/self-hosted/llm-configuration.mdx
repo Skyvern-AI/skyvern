@@ -32,18 +32,14 @@ For most deployments, configure a single provider using `LLM_KEY`. Skyvern also 
 
 ## Quick Start Recommendations
 
-**Best models for production (2025):**
+**Best models for production (2026):**
 
 | Provider | Primary Model | Secondary Model | Notes |
 |----------|--------------|-----------------|-------|
-| **Anthropic** | `ANTHROPIC_CLAUDE4.5_OPUS` | `ANTHROPIC_CLAUDE4.5_SONNET` | Most capable |
-| **OpenAI** | `OPENAI_GPT5` | `OPENAI_GPT5_MINI` | Latest |
+| **Anthropic** | `ANTHROPIC_CLAUDE4.7_OPUS` | `ANTHROPIC_CLAUDE4.6_SONNET` | Most capable |
+| **OpenAI** | `OPENAI_GPT5_5` | `OPENAI_GPT5_4` | Latest |
 | **Google** | `GEMINI_3_PRO` | `GEMINI_3.0_FLASH` | Latest |
-| **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Latest Claude |
-
-<Tip>
-**New in 2025:** GPT-5 series, Claude 4.6 Opus, Gemini 3, Amazon Nova, and many new open-source models via Novita and VolcEngine.
-</Tip>
+| **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Latest Claude |
 
 ---
 
@@ -54,21 +50,23 @@ The most common choice. Requires an API key from [platform.openai.com](https://p
 ```bash .env
 ENABLE_OPENAI=true
 OPENAI_API_KEY=sk-...
-LLM_KEY=OPENAI_GPT4O
+LLM_KEY=OPENAI_GPT5_5
 ```
 
 ### Available models
 
 | LLM_KEY | Notes |
 |---------|-------|
+| **GPT-5.5** | |
+| `OPENAI_GPT5_5` | Latest flagship, recommended for complex tasks |
 | **GPT-5 Series** | |
-| `OPENAI_GPT5` | Recommended for most complex tasks |
+| `OPENAI_GPT5_4` | |
+| `OPENAI_GPT5` | |
 | `OPENAI_GPT5_MINI` | |
 | `OPENAI_GPT5_MINI_FLEX` | Flex service tier, 15min timeout |
 | `OPENAI_GPT5_NANO` | |
 | `OPENAI_GPT5_1` | |
 | `OPENAI_GPT5_2` | |
-| `OPENAI_GPT5_4` | |
 | **GPT-4 Series** | |
 | `OPENAI_GPT4O` | |
 | `OPENAI_GPT4O_MINI` | |
@@ -102,18 +100,21 @@ Claude models from [anthropic.com](https://www.anthropic.com/).
 ```bash .env
 ENABLE_ANTHROPIC=true
 ANTHROPIC_API_KEY=sk-ant-...
-LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 ```
 
 ### Available models
 
 | LLM_KEY | Notes |
 |---------|-------|
+| **Claude 4.7** | |
+| `ANTHROPIC_CLAUDE4.7_OPUS` | Latest, most capable |
 | **Claude 4.6** | |
-| `ANTHROPIC_CLAUDE4.6_OPUS` | Newest |
+| `ANTHROPIC_CLAUDE4.6_OPUS` | |
+| `ANTHROPIC_CLAUDE4.6_SONNET` | Recommended for secondary use |
 | **Claude 4.5** | |
-| `ANTHROPIC_CLAUDE4.5_OPUS` | Recommended for primary use |
-| `ANTHROPIC_CLAUDE4.5_SONNET` | Recommended for secondary use |
+| `ANTHROPIC_CLAUDE4.5_OPUS` | |
+| `ANTHROPIC_CLAUDE4.5_SONNET` | |
 | `ANTHROPIC_CLAUDE4.5_HAIKU` | Fastest |
 | **Claude 4** | |
 | `ANTHROPIC_CLAUDE4_OPUS` | |
@@ -179,6 +180,7 @@ LLM_KEY=GEMINI_2.5_PRO
 | **Gemini 3** | |
 | `GEMINI_3_PRO` | Recommended for primary use |
 | `GEMINI_3.0_FLASH` | Recommended for secondary use |
+| `GEMINI_3.1_FLASH_LITE` | Fastest, most cost-efficient |
 | **Gemini 2.5** | |
 | `GEMINI_2.5_PRO` | |
 | `GEMINI_2.5_PRO_PREVIEW` | |
@@ -227,6 +229,7 @@ For global endpoint access, set `VERTEX_LOCATION=global` and ensure `VERTEX_PROJ
 | **Gemini 3** | |
 | `VERTEX_GEMINI_3_PRO` | Recommended for primary use |
 | `VERTEX_GEMINI_3.0_FLASH` | Recommended for secondary use |
+| `VERTEX_GEMINI_3.1_FLASH_LITE` | Fastest, most cost-efficient |
 | **Gemini 2.5** | |
 | `VERTEX_GEMINI_2.5_PRO` | |
 | `VERTEX_GEMINI_2.5_PRO_PREVIEW` | |
@@ -247,7 +250,7 @@ Run Anthropic Claude through your AWS account.
 
 ```bash .env
 ENABLE_BEDROCK=true
-LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET
+LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE
 AWS_REGION=us-west-2
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
@@ -258,7 +261,7 @@ AWS_SECRET_ACCESS_KEY=...
 1. Create an IAM user with `AmazonBedrockFullAccess` policy
 2. Generate access keys for the IAM user
 3. In the [Bedrock console](https://console.aws.amazon.com/bedrock/), go to **Model Access**
-4. Enable access to Claude 3.5 Sonnet
+4. Enable access to Claude Opus 4.7
 
 ### Available models
 
@@ -267,8 +270,11 @@ AWS_SECRET_ACCESS_KEY=...
 | **Amazon Nova (AWS Native)** | |
 | `BEDROCK_AMAZON_NOVA_PRO` | |
 | `BEDROCK_AMAZON_NOVA_LITE` | |
+| **Claude 4.7** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | Cross-region, latest |
 | **Claude 4.6** | |
 | `BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Cross-region |
 | **Claude 4.5** | |
 | `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE` | Cross-region |
 | `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Cross-region |
@@ -436,7 +442,7 @@ Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, 
 ```bash .env
 ENABLE_OLLAMA=true
 LLM_KEY=OLLAMA
-OLLAMA_MODEL=llama3.1
+OLLAMA_MODEL=gemma4
 OLLAMA_SERVER_URL=http://host.docker.internal:11434
 OLLAMA_SUPPORTS_VISION=false
 ```
@@ -444,7 +450,7 @@ OLLAMA_SUPPORTS_VISION=false
 ### Setup steps
 
 1. [Install Ollama](https://ollama.ai/download)
-2. Pull a model: `ollama pull llama3.1`
+2. Pull a model: `ollama pull gemma4`
 3. Start Ollama: `ollama serve`
 4. Configure Skyvern to connect
 
@@ -469,7 +475,7 @@ Connect to any service that implements the OpenAI API format, including LiteLLM,
 
 ```bash .env
 ENABLE_OPENAI_COMPATIBLE=true
-OPENAI_COMPATIBLE_MODEL_NAME=llama3.1
+OPENAI_COMPATIBLE_MODEL_NAME=gemma4
 OPENAI_COMPATIBLE_API_KEY=sk-test
 OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
 LLM_KEY=OPENAI_COMPATIBLE
@@ -520,25 +526,25 @@ Configure a cheaper model for lightweight operations:
 
 ```bash .env
 # Main model for complex decisions
-LLM_KEY=ANTHROPIC_CLAUDE4.5_OPUS
-# or: OPENAI_GPT5
+LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
+# or: OPENAI_GPT5_5
 # or: GEMINI_3_PRO
 
 # Faster model for simple tasks like dropdown selection
-SECONDARY_LLM_KEY=ANTHROPIC_CLAUDE4.5_SONNET
-# or: OPENAI_GPT5_MINI
+SECONDARY_LLM_KEY=ANTHROPIC_CLAUDE4.6_SONNET
+# or: OPENAI_GPT5_4
 # or: GEMINI_3.0_FLASH
 ```
 
 <Tip>
 **Recommended primary models (latest):**
-- **Anthropic Claude 4.5 Opus** (`ANTHROPIC_CLAUDE4.5_OPUS`) - Most capable
-- **OpenAI GPT-5** (`OPENAI_GPT5`) - Latest
+- **Anthropic Claude 4.7 Opus** (`ANTHROPIC_CLAUDE4.7_OPUS`) - Most capable
+- **OpenAI GPT-5.5** (`OPENAI_GPT5_5`) - Latest
 - **Google Gemini 3 Pro** (`GEMINI_3_PRO`) - Latest
 
 **Recommended secondary models (latest):**
-- **Claude 4.5 Sonnet** (`ANTHROPIC_CLAUDE4.5_SONNET`) - Balanced
-- **GPT-5 Mini** (`OPENAI_GPT5_MINI`) - Faster GPT-5
+- **Claude 4.6 Sonnet** (`ANTHROPIC_CLAUDE4.6_SONNET`) - Balanced
+- **GPT-5.4** (`OPENAI_GPT5_4`) - Fast reasoning
 - **Gemini 3.0 Flash** (`GEMINI_3.0_FLASH`) - Faster Gemini 3
 </Tip>
 
@@ -565,13 +571,13 @@ Most deployments don't need task-specific models. Start with `LLM_KEY` and `SECO
 Some operations require a secondary model. Set `SECONDARY_LLM_KEY` in your environment:
 
 ```bash .env
-SECONDARY_LLM_KEY=OPENAI_GPT4O_MINI
+SECONDARY_LLM_KEY=OPENAI_GPT5_4
 ```
 
 ### "Context window exceeded"
 
 The page content is too large for the model's context window. Options:
-- Use a model with larger context support (GPT-5, Gemini 2.5 Pro, or Claude 4.5 Sonnet)
+- Use a model with larger context support (GPT-5.5, Gemini 2.5 Pro, or Claude 4.7 Opus)
 - Simplify your prompt to require less page analysis
 - Start from a more specific URL with less content
 
@@ -580,7 +586,7 @@ The page content is too large for the model's context window. Options:
 The configured `LLM_KEY` doesn't match any enabled provider. Verify:
 1. The provider is enabled (`ENABLE_OPENAI=true`, etc.)
 2. The `LLM_KEY` value matches a supported model name exactly
-3. Model names are case-sensitive: `OPENAI_GPT4O` not `openai_gpt4o`
+3. Model names are case-sensitive: `OPENAI_GPT5_5` not `openai_gpt5_5`
 
 ### Container logs show authentication errors
 

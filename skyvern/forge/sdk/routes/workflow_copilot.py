@@ -1073,6 +1073,26 @@ async def _new_copilot_chat_post(
             )
 
             api_key = request.headers.get("x-api-key")
+            if not api_key:
+                api_key = await app.AGENT_FUNCTION.resolve_org_api_key(organization.organization_id)
+
+            if not api_key:
+                LOG.warning(
+                    "Copilot V2 cannot resolve an org API token; refusing to start the agent",
+                    organization_id=organization.organization_id,
+                    workflow_permanent_id=chat.workflow_permanent_id,
+                )
+                # Mark the terminal frame before sending so a send failure cannot
+                # trigger a second terminal frame from the outer exception handler.
+                terminal_frame_emitted = True
+                await stream.send(
+                    WorkflowCopilotStreamErrorUpdate(
+                        type=WorkflowCopilotStreamMessageType.ERROR,
+                        error="Copilot is not configured for this organization. Contact support.",
+                    )
+                )
+                return
+
             security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
 
             # Spawn the cancel watcher only after the chat row exists; cancels

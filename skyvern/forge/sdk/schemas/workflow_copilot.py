@@ -40,6 +40,10 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
     workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
+    browser_session_id: str | None = Field(
+        None,
+        description="Optional persistent browser session ID to reuse instead of creating a new one.",
+    )
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
     cancel_token: str | None = Field(

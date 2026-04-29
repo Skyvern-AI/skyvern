@@ -22,11 +22,13 @@ import structlog
 import yaml
 from pydantic import ValidationError
 
+from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
 )
@@ -40,6 +42,69 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 )
 
 MAX_TURNS = 25
+
+
+async def _resolve_live_browser_session_id(
+    chat_request: WorkflowCopilotChatRequest,
+    organization_id: str,
+) -> str | None:
+    """Validate against a debug session for the same (org, workflow_permanent_id);
+    return None on any failure so the caller falls back to auto-create."""
+    requested = chat_request.browser_session_id
+    if not requested:
+        return None
+
+    try:
+        debug_session = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
+            browser_session_id=requested,
+            organization_id=organization_id,
+        )
+        if debug_session is None:
+            LOG.warning(
+                "Copilot received an unknown browser_session_id; ignoring",
+                organization_id=organization_id,
+                requested_session_id=requested,
+            )
+            return None
+        if debug_session.workflow_permanent_id != chat_request.workflow_permanent_id:
+            LOG.warning(
+                "Copilot browser_session_id is bound to a different workflow; ignoring",
+                organization_id=organization_id,
+                requested_session_id=requested,
+                expected_wpid=chat_request.workflow_permanent_id,
+                actual_wpid=debug_session.workflow_permanent_id,
+            )
+            return None
+
+        # Trust the DB row over a CDP probe here — get_browser_state opens a
+        # fresh Playwright connection. ensure_browser_session does the
+        # attachability probe right before use so stale rows still recover.
+        persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
+        if persistent is None or is_final_status(persistent.status) or not persistent.browser_address:
+            LOG.warning(
+                "Copilot live browser session is not yet usable; falling back to auto-create",
+                organization_id=organization_id,
+                requested_session_id=requested,
+                status=persistent.status if persistent else None,
+                has_browser_address=bool(persistent.browser_address) if persistent else False,
+            )
+            return None
+
+        LOG.info(
+            "Copilot reusing live browser session",
+            organization_id=organization_id,
+            session_id=requested,
+        )
+        return requested
+    except Exception as exc:
+        LOG.warning(
+            "Copilot live-session validation raised; falling back to auto-create",
+            organization_id=organization_id,
+            requested_session_id=requested,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return None
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -386,12 +451,14 @@ async def run_copilot_agent(
         get_skyvern_mcp_alias_map,
     )
 
+    validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
+
     ctx = CopilotContext(
         organization_id=organization_id,
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_yaml=chat_request.workflow_yaml or "",
-        browser_session_id=None,
+        browser_session_id=validated_browser_session_id,
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
