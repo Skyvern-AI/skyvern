@@ -10,9 +10,7 @@ from rich.prompt import Confirm
 from skyvern.analytics import capture_setup_event
 
 from .console import console
-from .llm_setup import update_or_add_env_var
-
-DOCKER_POSTGRES_DATABASE_STRING = "postgresql+psycopg://skyvern@localhost:5432/skyvern"
+from .llm_setup import DEFAULT_POSTGRES_DATABASE_STRING, update_or_add_env_var
 
 
 def command_exists(command: str) -> bool:
@@ -125,7 +123,7 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database and user exist.[/green]")
         else:
             create_database_and_user()
-        update_or_add_env_var("DATABASE_STRING", "postgresql+psycopg://skyvern@localhost:5432/skyvern")
+        update_or_add_env_var("DATABASE_STRING", DEFAULT_POSTGRES_DATABASE_STRING)
         capture_setup_event("database-complete", success=True, extra_data={"source": "local"})
         return
 
@@ -250,5 +248,5 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             else:
                 console.print("✅ [green]Database and user created successfully.[/green]")
 
-    update_or_add_env_var("DATABASE_STRING", DOCKER_POSTGRES_DATABASE_STRING)
+    update_or_add_env_var("DATABASE_STRING", DEFAULT_POSTGRES_DATABASE_STRING)
     capture_setup_event("database-complete", success=True, extra_data={"source": "docker"})
