@@ -22,12 +22,17 @@ async def test_every_tool_has_a_title() -> None:
 
 
 @pytest.mark.asyncio
-async def test_every_tool_has_read_only_hint() -> None:
+async def test_every_tool_has_required_apps_hints() -> None:
     tools = await mcp.list_tools()
     assert tools, "MCP server registered zero tools"
 
-    missing = [t.name for t in tools if t.annotations is None or t.annotations.readOnlyHint is None]
-    assert not missing, f"Tools missing readOnlyHint annotation: {missing}"
+    required_hint_names = ("readOnlyHint", "openWorldHint", "destructiveHint")
+    missing = [
+        t.name
+        for t in tools
+        if t.annotations is None or any(getattr(t.annotations, hint_name) is None for hint_name in required_hint_names)
+    ]
+    assert not missing, f"Tools missing Apps hint annotations: {missing}"
 
 
 @pytest.mark.asyncio
@@ -86,3 +91,53 @@ async def test_read_only_sampling_marked_read_only() -> None:
         assert tool is not None, f"Expected tool not registered: {name}"
         assert tool.annotations is not None, f"Tool missing annotations: {name}"
         assert tool.annotations.readOnlyHint is True, f"Tool {name} expected readOnlyHint=True"
+
+
+@pytest.mark.asyncio
+async def test_open_world_sampling_matches_policy() -> None:
+    """Sanity check arbitrary-web tools are open-world, including read-only inspection."""
+    tools = await mcp.list_tools()
+    by_name = {t.name: t for t in tools}
+
+    # Representative samples lock the taxonomy without duplicating the whole
+    # registry. Read-only page inspection is non-destructive, but still
+    # open-world because the target website set is unbounded.
+    expected_open_world = {
+        "skyvern_act",
+        "skyvern_run_task",
+        "skyvern_login",
+        "skyvern_browser_session_connect",
+        "skyvern_extract",
+        "skyvern_screenshot",
+        "skyvern_observe",
+        "skyvern_navigate",
+        "skyvern_tab_new",
+        "skyvern_click",
+        "skyvern_type",
+        "skyvern_scroll",
+        "skyvern_hover",
+        "skyvern_network_requests",
+        "skyvern_get_html",
+        "skyvern_get_session_storage",
+        "skyvern_workflow_run",
+    }
+    expected_closed_world = {
+        "skyvern_browser_session_list",
+        "skyvern_clipboard_read",
+        "skyvern_workflow_list",
+        "skyvern_folder_create",
+        "skyvern_credential_list",
+        "skyvern_script_get_code",
+    }
+
+    for name in expected_open_world:
+        tool = by_name.get(name)
+        assert tool is not None, f"Expected tool not registered: {name}"
+        assert tool.annotations is not None, f"Tool missing annotations: {name}"
+        assert tool.annotations.openWorldHint is True, f"Tool {name} expected openWorldHint=True"
+
+    for name in expected_closed_world:
+        tool = by_name.get(name)
+        assert tool is not None, f"Expected tool not registered: {name}"
+        assert tool.annotations is not None, f"Tool missing annotations: {name}"
+        assert tool.annotations.openWorldHint is False, f"Tool {name} expected openWorldHint=False"
