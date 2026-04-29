@@ -9,6 +9,8 @@ import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
+
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
@@ -38,15 +40,51 @@ def extract_final_text(result: RunResultStreaming) -> str:
     return ""
 
 
-def parse_final_response(text: str) -> dict[str, Any]:
-    """Parse the agent's final JSON envelope, stripping markdown code fences.
+_TYPE_ALTERNATION = "|".join(COPILOT_RESPONSE_TYPES)
+_LEADING_LABEL_RE = re.compile(rf"^\s*({_TYPE_ALTERNATION})\s*[:,]?\s+", re.IGNORECASE)
+_USER_RESPONSE_VALUE_RE = re.compile(r'"user_response"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_TYPE_VALUE_RE = re.compile(rf'"type"\s*:\s*"({_TYPE_ALTERNATION})"')
 
-    Tolerant of literal control characters (newlines/tabs/CR) inside string
-    values. Some model outputs wrap long `user_response` prose across real
-    newlines instead of `\\n` escapes; strict `json.loads` rejects those, and
-    without this fallback the frontend renders the full raw JSON object as
-    the user-visible reply (see SKY-9189 test-2 regression).
-    """
+
+def _try_loads_dict(text: str) -> dict[str, Any] | None:
+    # strict=False allows literal control characters in string values (SKY-9189)
+    try:
+        parsed = json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
+    if "user_response" in parsed:
+        return True
+    # bare {"type": "object"} (a JSON schema in prose) is not an envelope
+    type_value = parsed.get("type")
+    return isinstance(type_value, str) and type_value.upper() in COPILOT_RESPONSE_TYPES
+
+
+def _text_looks_envelope_shaped(text: str) -> bool:
+    # require leading `{` so prose that merely quotes the field names (e.g.,
+    # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
+    # through to the plain-text tier instead of degrading to "Done."
+    return text.startswith("{") and '"user_response"' in text and bool(_TYPE_VALUE_RE.search(text))
+
+
+def _sniff_response_type(text: str) -> str:
+    # REPLACE_WORKFLOW is demoted to REPLY: recovery cannot extract a usable
+    # workflow_yaml, and announcing an update without one is worse than silent.
+    match = _TYPE_VALUE_RE.search(text)
+    if match and match.group(1).upper() == "ASK_QUESTION":
+        return "ASK_QUESTION"
+    return "REPLY"
+
+
+def parse_final_response(text: str) -> dict[str, Any]:
+    """Parse the agent's final JSON envelope, tolerating markdown code fences,
+    leading action labels (``REPLY {...}``), prose preambles, and literal
+    control characters in string values. Falls back to regex-extracting
+    ``user_response`` from envelope-shaped text so a malformed envelope never
+    reaches the chat bubble."""
     cleaned = text.strip()
     for prefix in ("```json", "```"):
         if cleaned.startswith(prefix):
@@ -56,13 +94,35 @@ def parse_final_response(text: str) -> dict[str, Any]:
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
 
-    for strict in (True, False):
-        try:
-            parsed = json.loads(cleaned, strict=strict)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
+    parsed = _try_loads_dict(cleaned)
+    if parsed is not None:
+        return parsed
+
+    label_stripped = _LEADING_LABEL_RE.sub("", cleaned, count=1)
+    if label_stripped != cleaned:
+        parsed = _try_loads_dict(label_stripped)
+        if parsed is not None:
+            return parsed
+
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    # skip when the slice equals the full string — _try_loads_dict above already tried it
+    if first != -1 and last > first and not (first == 0 and last == len(cleaned) - 1):
+        parsed = _try_loads_dict(cleaned[first : last + 1])
+        if parsed is not None and _looks_like_envelope(parsed):
+            return parsed
+
+    if _text_looks_envelope_shaped(cleaned):
+        sniffed_type = _sniff_response_type(cleaned)
+        match = _USER_RESPONSE_VALUE_RE.search(cleaned)
+        if match:
+            try:
+                value = json.loads(f'"{match.group(1)}"', strict=False)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, str):
+                return {"type": sniffed_type, "user_response": value}
+        return {"type": sniffed_type, "user_response": "Done."}
 
     return {"type": "REPLY", "user_response": text}
 

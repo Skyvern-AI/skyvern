@@ -194,6 +194,8 @@ Note: The user works with a UI and is not aware of YAML. Avoid mentioning YAML i
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments.
 
+Do NOT prefix the JSON with the action name. The output must START with `{` — no leading `REPLY`, `ASK_QUESTION`, `REPLACE_WORKFLOW`, "Option 1", "Option 2", or any other label outside the JSON.
+
 Current datetime, ISO format:
 ```
 {{ current_datetime }}
