@@ -377,6 +377,15 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         trimmed_message = trimmed_message.split("Browser logs:")[0].strip()
         normalized_message = " ".join(trimmed_message.split())
 
+        if (
+            "launch_persistent_context" in normalized_message
+            and "target page, context or browser has been closed" in normalized_message.lower()
+        ):
+            return (
+                "The browser closed unexpectedly during launch. This is usually transient. "
+                f"{UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+            )
+
         timeout_match = re.search(r"Timeout\s+(\d+)ms\s+exceeded", normalized_message, flags=re.IGNORECASE)
         if timeout_match and "launch_persistent_context" in normalized_message:
             timeout_seconds = int(timeout_match.group(1)) // 1000
