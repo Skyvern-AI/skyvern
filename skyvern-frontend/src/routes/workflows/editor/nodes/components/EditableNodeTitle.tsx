@@ -6,7 +6,7 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 import { HorizontallyResizingInput } from "./HorizontallyResizingInput";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 type Props = {
   value: string;
@@ -24,6 +24,27 @@ function EditableNodeTitle({
   inputClassName,
 }: Props) {
   const [editing, setEditing] = useState(false);
+  const [isTruncated, setIsTruncated] = useState(false);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+
+  useLayoutEffect(() => {
+    if (editing) {
+      return;
+    }
+    const el = titleRef.current;
+    if (!el) {
+      return;
+    }
+    const measure = () => {
+      setIsTruncated(el.scrollWidth > el.clientWidth);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+    };
+  }, [value, editing]);
 
   if (!editing) {
     return (
@@ -31,7 +52,8 @@ function EditableNodeTitle({
         <Tooltip>
           <TooltipTrigger asChild>
             <h1
-              className={cn("cursor-text", titleClassName)}
+              ref={titleRef}
+              className={cn("min-w-0 cursor-text truncate", titleClassName)}
               onClick={() => {
                 setEditing(true);
               }}
@@ -39,7 +61,9 @@ function EditableNodeTitle({
               {value}
             </h1>
           </TooltipTrigger>
-          <TooltipContent>Click to edit</TooltipContent>
+          <TooltipContent>
+            {isTruncated ? value : "Click to edit"}
+          </TooltipContent>
         </Tooltip>
       </TooltipProvider>
     );

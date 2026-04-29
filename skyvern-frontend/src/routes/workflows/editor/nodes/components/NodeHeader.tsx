@@ -607,14 +607,14 @@ function NodeHeader({
 
       <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
-          className={cn("flex gap-2", {
+          className={cn("flex min-w-0 gap-2", {
             "opacity-50": thisBlockIsPlaying,
           })}
         >
           <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
-          <div className="flex flex-col gap-1">
+          <div className="flex min-w-0 flex-col gap-1">
             <EditableNodeTitle
               value={blockLabel}
               editable={editable}
