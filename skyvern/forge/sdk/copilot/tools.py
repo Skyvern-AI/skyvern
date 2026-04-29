@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -34,10 +35,11 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -48,6 +50,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -524,6 +527,9 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml,
         )
+
+        created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
+
         await app.WORKFLOW_SERVICE.update_workflow_definition(
             workflow_id=ctx.workflow_id,
             organization_id=ctx.organization_id,
@@ -541,6 +547,8 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             cache_key=workflow.cache_key,
             run_sequentially=workflow.run_sequentially,
             sequential_key=workflow.sequential_key,
+            created_by=created_by_stamp,
+            edited_by="copilot",
         )
         ctx.workflow_yaml = workflow_yaml
         return {
@@ -1098,6 +1106,12 @@ async def _run_blocks_and_collect_debug(
                     parameter_type=str(wp.workflow_parameter_type),
                 )
 
+    # Without a session, the workflow service launches the browser in-process,
+    # which only works in worker pods (cloakbrowser isn't in the API image).
+    session_err = await ensure_browser_session(ctx)
+    if session_err is not None:
+        return session_err
+
     workflow_request = WorkflowRequestBody(
         data=data if data else None,
         browser_session_id=ctx.browser_session_id,
@@ -1114,6 +1128,7 @@ async def _run_blocks_and_collect_debug(
         version=None,
         max_steps=None,
         request_id=None,
+        copilot_session_id=ctx.workflow_copilot_chat_id,
     )
 
     from skyvern.utils.files import initialize_skyvern_state_file
@@ -1308,7 +1323,19 @@ async def _run_blocks_and_collect_debug(
             )
             if browser_state:
                 page = await browser_state.get_or_create_page()
-                screenshot_bytes = await page.screenshot(type="png")
+                if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                    try:
+                        await SkyvernFrame.hide_cursor_overlay(page)
+                    except Exception:
+                        pass
+                try:
+                    screenshot_bytes = await page.screenshot(type="png")
+                finally:
+                    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                        try:
+                            await SkyvernFrame.show_cursor_overlay(page)
+                        except Exception:
+                            pass
                 screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
         except Exception:
             LOG.debug("Failed to capture post-run screenshot", exc_info=True)

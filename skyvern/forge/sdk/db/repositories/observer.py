@@ -28,7 +28,8 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.schemas.runs import ProxyLocationInput, RunEngine
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
+from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
@@ -196,12 +197,15 @@ class ObserverRepository(BaseRepository):
         webhook_callback_url: str | None = None,
         extracted_information_schema: dict | list | str | None = None,
         error_code_mapping: dict | None = None,
+        workflow_system_prompt: str | None = None,
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         run_with: str | None = None,
     ) -> TaskV2:
+        if isinstance(workflow_system_prompt, str):
+            workflow_system_prompt = sanitize_postgres_text(workflow_system_prompt)
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
                 workflow_run_id=workflow_run_id,
@@ -215,6 +219,7 @@ class ObserverRepository(BaseRepository):
                 webhook_callback_url=webhook_callback_url,
                 extracted_information_schema=extracted_information_schema,
                 error_code_mapping=error_code_mapping,
+                workflow_system_prompt=workflow_system_prompt,
                 organization_id=organization_id,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
@@ -550,7 +555,9 @@ class ObserverRepository(BaseRepository):
                 if http_request_follow_redirects is not None:
                     workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 if ai_fallback_triggered is not None:
-                    workflow_run_block.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                    workflow_run_block.script_run = ScriptRunResponse(
+                        ai_fallback_triggered=ai_fallback_triggered
+                    ).model_dump(mode="json")
                 if error_codes is not None:
                     workflow_run_block.error_codes = error_codes
                 # human interaction block fields

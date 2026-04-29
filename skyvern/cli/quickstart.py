@@ -12,6 +12,7 @@ from rich.prompt import Confirm
 from skyvern.analytics import capture_setup_error, capture_setup_event
 
 # Import console after skyvern.cli to ensure proper initialization
+from skyvern.cli.browser import _open_chrome_inspect
 from skyvern.cli.console import console
 from skyvern.cli.init_command import init_env  # init is used directly
 from skyvern.cli.llm_setup import setup_llm_providers
@@ -141,6 +142,37 @@ def run_docker_compose_setup() -> None:
             border_style="green",
         )
     )
+
+    # Offer to set up "Control your own browser"
+    use_own_browser = Confirm.ask(
+        "\nWould you like to [bold yellow]control your own Chrome browser[/bold yellow] (use your cookies, logins, and extensions)?",
+        default=False,
+    )
+    if use_own_browser:
+        console.print(
+            Panel(
+                "[bold]Enable Remote Debugging in Chrome[/bold]\n\n"
+                "1. We'll open [cyan]chrome://inspect/#remote-debugging[/cyan] in your browser\n"
+                "2. Click [bold]Enable[/bold] to start the debugging server\n"
+                "3. You should see: [green]Server running at: 127.0.0.1:9222[/green]",
+                border_style="cyan",
+            )
+        )
+        open_page = Confirm.ask("Open chrome://inspect/#remote-debugging now?", default=True)
+        if open_page:
+            _open_chrome_inspect()
+        confirmed = Confirm.ask("Have you enabled remote debugging in Chrome?", default=False)
+        if confirmed:
+            from skyvern.cli.llm_setup import update_or_add_env_var
+
+            update_or_add_env_var("BROWSER_TYPE", "cdp-connect")
+            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", "http://host.docker.internal:9222/")
+            console.print("✅ [green]Browser debugging configured in .env. Restart with:[/green]")
+            console.print("  [cyan]docker compose up -d[/cyan]")
+        else:
+            console.print(
+                "[yellow]No problem — you can enable it later by navigating to chrome://inspect/#remote-debugging in Chrome.[/yellow]"
+            )
 
 
 @quickstart_app.callback(invoke_without_command=True)

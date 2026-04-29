@@ -138,11 +138,7 @@ def test_mcp_to_copilot_error() -> None:
 
 
 class TestMcpBrowserContextBridge:
-    """Bridge-specific behavior of mcp_browser_context (not scoped_session).
-
-    Covers: copilot session registry, API-key override install/reset, and the
-    teardown guarantees that must hold under every failure mode.
-    """
+    """Bridge-specific behavior of mcp_browser_context."""
 
     def _install_happy_path_mocks(
         self, monkeypatch: pytest.MonkeyPatch
@@ -374,6 +370,7 @@ class TestUpdateWorkflowDirect:
 
         mock_wf_service = MagicMock()
         mock_wf_service.update_workflow_definition = AsyncMock()
+        mock_wf_service.get_workflow = AsyncMock(return_value=None)
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE", mock_wf_service)
 
         yaml_str = "title: Test\nworkflow_definition:\n  blocks: []"
@@ -405,6 +402,7 @@ class TestUpdateWorkflowDirect:
 
         mock_wf_service = MagicMock()
         mock_wf_service.update_workflow_definition = AsyncMock()
+        mock_wf_service.get_workflow = AsyncMock(return_value=None)
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE", mock_wf_service)
 
         result = await _update_workflow({"workflow_yaml": "title: Test"}, ctx)

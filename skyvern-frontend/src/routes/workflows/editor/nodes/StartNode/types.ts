@@ -19,6 +19,7 @@ export type WorkflowStartNodeData = {
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
   label: "__start_block__";
   showCode: boolean;
 };

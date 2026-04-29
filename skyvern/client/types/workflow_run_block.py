@@ -8,6 +8,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .action import Action
 from .block_type import BlockType
 from .run_engine import RunEngine
+from .script_run_response import ScriptRunResponse
 from .workflow_run_block_data_schema import WorkflowRunBlockDataSchema
 from .workflow_run_block_navigation_payload import WorkflowRunBlockNavigationPayload
 from .workflow_run_block_output import WorkflowRunBlockOutput
@@ -55,6 +56,7 @@ class WorkflowRunBlock(UniversalBaseModel):
     executed_branch_expression: typing.Optional[str] = None
     executed_branch_result: typing.Optional[bool] = None
     executed_branch_next_block: typing.Optional[str] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

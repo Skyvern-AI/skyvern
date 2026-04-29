@@ -22,11 +22,13 @@ import structlog
 import yaml
 from pydantic import ValidationError
 
+from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
 )
@@ -40,6 +42,69 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 )
 
 MAX_TURNS = 25
+
+
+async def _resolve_live_browser_session_id(
+    chat_request: WorkflowCopilotChatRequest,
+    organization_id: str,
+) -> str | None:
+    """Validate against a debug session for the same (org, workflow_permanent_id);
+    return None on any failure so the caller falls back to auto-create."""
+    requested = chat_request.browser_session_id
+    if not requested:
+        return None
+
+    try:
+        debug_session = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
+            browser_session_id=requested,
+            organization_id=organization_id,
+        )
+        if debug_session is None:
+            LOG.warning(
+                "Copilot received an unknown browser_session_id; ignoring",
+                organization_id=organization_id,
+                requested_session_id=requested,
+            )
+            return None
+        if debug_session.workflow_permanent_id != chat_request.workflow_permanent_id:
+            LOG.warning(
+                "Copilot browser_session_id is bound to a different workflow; ignoring",
+                organization_id=organization_id,
+                requested_session_id=requested,
+                expected_wpid=chat_request.workflow_permanent_id,
+                actual_wpid=debug_session.workflow_permanent_id,
+            )
+            return None
+
+        # Trust the DB row over a CDP probe here — get_browser_state opens a
+        # fresh Playwright connection. ensure_browser_session does the
+        # attachability probe right before use so stale rows still recover.
+        persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
+        if persistent is None or is_final_status(persistent.status) or not persistent.browser_address:
+            LOG.warning(
+                "Copilot live browser session is not yet usable; falling back to auto-create",
+                organization_id=organization_id,
+                requested_session_id=requested,
+                status=persistent.status if persistent else None,
+                has_browser_address=bool(persistent.browser_address) if persistent else False,
+            )
+            return None
+
+        LOG.info(
+            "Copilot reusing live browser session",
+            organization_id=organization_id,
+            session_id=requested,
+        )
+        return requested
+    except Exception as exc:
+        LOG.warning(
+            "Copilot live-session validation raised; falling back to auto-create",
+            organization_id=organization_id,
+            requested_session_id=requested,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return None
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -160,7 +225,12 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     return None, None
 
 
-def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_context: str | None) -> AgentResult:
+def _build_exit_result(
+    ctx: CopilotContext,
+    user_response: str,
+    global_llm_context: str | None,
+    cancelled: bool = False,
+) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     return AgentResult(
@@ -170,6 +240,7 @@ def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_conte
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
+        cancelled=cancelled,
     )
 
 
@@ -321,8 +392,8 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
 ) -> AgentResult:
-    # Preflight feasibility classifier. Never raises (errors fall through to
-    # proceed). Off by default; enable via settings.ENABLE_COPILOT_FEASIBILITY_GATE.
+    # Preflight feasibility classifier — fires on every turn so mid-session pivots
+    # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
 
     feasibility_verdict = await run_feasibility_gate(
@@ -380,15 +451,18 @@ async def run_copilot_agent(
         get_skyvern_mcp_alias_map,
     )
 
+    validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
+
     ctx = CopilotContext(
         organization_id=organization_id,
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_yaml=chat_request.workflow_yaml or "",
-        browser_session_id=None,
+        browser_session_id=validated_browser_session_id,
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
+        workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
     )
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(llm_api_handler)
@@ -478,8 +552,10 @@ async def run_copilot_agent(
                     organization_id,
                 )
             except asyncio.CancelledError:
-                LOG.info("Copilot run cancelled")
-                return _build_exit_result(ctx, "Request cancelled.", global_llm_context)
+                # Re-raising would leave the route with ``agent_result is None``
+                # and skip its ``workflow_was_persisted`` rollback decision.
+                LOG.info("Copilot run cancelled by user")
+                return _build_exit_result(ctx, "Cancelled by user.", global_llm_context, cancelled=True)
             except MaxTurnsExceeded:
                 return _build_exit_result(
                     ctx,

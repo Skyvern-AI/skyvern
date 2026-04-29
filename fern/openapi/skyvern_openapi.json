@@ -19487,7 +19487,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Script Run"
           },
           "job_id": {
             "anyOf": [
@@ -20054,6 +20055,17 @@
               }
             ],
             "title": "Executed Branch Next Block"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script Run"
           }
         },
         "type": "object",

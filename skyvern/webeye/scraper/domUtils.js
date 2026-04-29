@@ -1758,6 +1758,11 @@ async function buildElementTree(
       return;
     }
 
+    // skip cursor visualization overlay elements
+    if (element.hasAttribute && element.hasAttribute("data-pw-overlay")) {
+      return;
+    }
+
     // skip processing option element as they are already added to the select.options
     if (tagName === "option") {
       return;

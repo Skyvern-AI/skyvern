@@ -21,6 +21,7 @@ import {
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
+  WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
 
 interface ChatMessage {
@@ -48,15 +49,21 @@ interface ToolActivity {
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   update_workflow: "Updating workflow",
+  update_and_run_blocks: "Updating & running blocks",
   list_credentials: "Listing credentials",
   get_block_schema: "Looking up block schema",
   validate_block: "Validating block",
   run_blocks_and_collect_debug: "Running blocks",
+  get_run_results: "Getting run results",
   get_browser_screenshot: "Taking screenshot",
   navigate_browser: "Navigating browser",
   evaluate: "Evaluating JavaScript",
   click: "Clicking element",
   type_text: "Typing text",
+  scroll: "Scrolling",
+  console_messages: "Reading console",
+  select_option: "Selecting option",
+  press_key: "Pressing key",
 };
 
 const formatChatTimestamp = (value: string) => {
@@ -101,7 +108,11 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflow: WorkflowApiResponse) => void;
+  // `options.persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
+  onWorkflowUpdate?: (
+    workflow: WorkflowApiResponse,
+    options?: { persisted?: boolean },
+  ) => void;
   onReviewWorkflow?: (
     workflow: WorkflowApiResponse,
     clearPending: () => void,
@@ -110,6 +121,7 @@ interface WorkflowCopilotChatProps {
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
+  liveBrowserSessionId?: string | null;
 }
 
 const DEFAULT_WINDOW_WIDTH = 600;
@@ -161,6 +173,7 @@ export function WorkflowCopilotChat({
   onClose,
   onMessageCountChange,
   buttonRef,
+  liveBrowserSessionId,
 }: WorkflowCopilotChatProps = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
@@ -240,12 +253,15 @@ export function WorkflowCopilotChat({
     hasScrolledOnLoad.current = false;
   };
 
-  const applyWorkflowUpdate = (workflow: WorkflowApiResponse): boolean => {
+  const applyWorkflowUpdate = (
+    workflow: WorkflowApiResponse,
+    options?: { persisted?: boolean },
+  ): boolean => {
     if (!onWorkflowUpdate) {
       return true;
     }
     try {
-      onWorkflowUpdate(workflow);
+      onWorkflowUpdate(workflow, options);
       return true;
     } catch (updateError) {
       console.error("Failed to update workflow:", updateError);
@@ -258,18 +274,76 @@ export function WorkflowCopilotChat({
     }
   };
 
-  const handleAcceptWorkflow = (
+  const handleAcceptWorkflow = async (
     workflow: WorkflowApiResponse,
     alwaysAccept: boolean = false,
   ) => {
-    if (!applyWorkflowUpdate(workflow)) {
+    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    if (!chatId) {
+      try {
+        chatId = await fetchLatestChatId();
+      } catch (resolveError) {
+        console.error(
+          "Failed to resolve chat ID before applying proposal:",
+          resolveError,
+        );
+      }
+    }
+
+    if (!chatId) {
+      // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
+      if (!applyWorkflowUpdate(workflow)) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
       return;
     }
-    setProposedWorkflow(null);
-    if (alwaysAccept) {
-      setAutoAccept(true);
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post<WorkflowApiResponse>(
+        "/workflow/copilot/apply-proposed-workflow",
+        {
+          workflow_copilot_chat_id: chatId,
+          auto_accept: alwaysAccept,
+        } as WorkflowCopilotApplyProposedWorkflowRequest,
+      );
+      // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
+      if (!applyWorkflowUpdate(response.data, { persisted: true })) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+    } catch (applyError) {
+      // Atomic accept can fail if the server-side proposal is missing
+      // _copilot_yaml (SKY-9310 — V1 path didn't stash it). Fall back to the
+      // pre-#10568 client-side apply so users aren't blocked while a backend
+      // deploy catches up. Logged so we can still spot regressions.
+      console.error(
+        "Atomic apply failed; falling back to client-side apply:",
+        applyError,
+      );
+      if (!applyWorkflowUpdate(workflow)) {
+        toast({
+          title: "Accept failed",
+          description:
+            "Could not apply the proposed workflow. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
     }
-    void clearProposedWorkflow(alwaysAccept);
   };
 
   const handleRejectWorkflow = () => {
@@ -621,6 +695,7 @@ export function WorkflowCopilotChat({
           workflow_permanent_id: workflowPermanentId,
           workflow_copilot_chat_id: workflowCopilotChatId,
           workflow_run_id: workflowRunId,
+          browser_session_id: liveBrowserSessionId ?? null,
           message: messageContent,
           workflow_yaml: workflowYaml,
         } as WorkflowCopilotChatRequest,

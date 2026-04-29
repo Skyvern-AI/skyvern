@@ -187,6 +187,8 @@ async def poll_otp_value(
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
     )
+    max_consecutive_failures = settings.VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(10)
         # check timeout
@@ -200,22 +202,38 @@ async def poll_otp_value(
                 totp_identifier=totp_identifier,
             )
         otp_value: OTPValue | None = None
-        if totp_verification_url:
-            otp_value = await _get_otp_value_from_url(
-                organization_id,
-                totp_verification_url,
-                org_token.token,
+        try:
+            if totp_verification_url:
+                otp_value = await _get_otp_value_from_url(
+                    organization_id,
+                    totp_verification_url,
+                    org_token.token,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                )
+            elif totp_identifier:
+                otp_value = await _get_otp_value_from_db(
+                    organization_id,
+                    totp_identifier,
+                    task_id=task_id,
+                    workflow_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run_id,
+                )
+        except FailedToGetTOTPVerificationCode:
+            consecutive_failures += 1
+            LOG.warning(
+                "OTP fetch failed, will retry",
+                consecutive_failures=consecutive_failures,
+                max_consecutive_failures=max_consecutive_failures,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
             )
-        elif totp_identifier:
-            otp_value = await _get_otp_value_from_db(
-                organization_id,
-                totp_identifier,
-                task_id=task_id,
-                workflow_id=workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
-            )
+            if consecutive_failures >= max_consecutive_failures:
+                raise
+            continue
+        consecutive_failures = 0  # reset on any non-exception poll, even if otp_value is None
         if otp_value:
             LOG.info("Got otp value", otp_value=otp_value)
             return otp_value

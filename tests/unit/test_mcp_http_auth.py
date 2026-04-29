@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -441,6 +442,22 @@ def test_validate_oauth_token_contract_rejects_invalid_issuer() -> None:
         )
 
 
+def test_validate_oauth_token_contract_rejects_wrong_audience() -> None:
+    # Guards the `verify_aud=False` decode path: a token whose `aud` points at a
+    # different resource must still fail _validate_oauth_token_contract, since
+    # PyJWT's built-in audience check is intentionally skipped in favor of the
+    # slash-normalizing comparison here.
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_oauth_token_contract(
+            {
+                "iss": "https://clerk.example.com",
+                "aud": ["https://other-service.example.com"],
+            },
+            expected_resource="https://api.skyvern.com/mcp/",
+            expected_issuer="https://clerk.example.com",
+        )
+
+
 def test_validate_oauth_token_contract_rejects_mismatched_resource_claim() -> None:
     with pytest.raises(HTTPException, match="Token resource is not valid for this MCP resource"):
         mcp_http_auth._validate_oauth_token_contract(
@@ -464,6 +481,52 @@ def test_validate_oauth_token_contract_accepts_valid_jwt_claims() -> None:
         expected_resource="https://api.skyvern.com/mcp/",
         expected_issuer="https://clerk.example.com",
     )
+
+
+@pytest.mark.asyncio
+async def test_validate_mcp_oauth_token_rejects_wrong_audience_on_full_jwt_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from jwt.algorithms import RSAAlgorithm
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_jwk = json.loads(RSAAlgorithm.to_jwk(private_key.public_key()))
+    token = jwt.encode(
+        {
+            "iss": "https://clerk.example.com",
+            "aud": ["https://other-service.example.com"],
+            "resource": "https://api.skyvern.com/mcp/",
+            "sub": "user_123",
+            "org_id": "clerk_org_jwt",
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"typ": "JWT"},
+    )
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(),
+        get_valid_org_auth_token=AsyncMock(),
+    )
+    _stub_auth_db(monkeypatch, fake_db)
+    monkeypatch.setattr(mcp_http_auth, "_get_oauth_issuer_url", lambda: "https://clerk.example.com")
+    monkeypatch.setattr(mcp_http_auth.settings, "SKYVERN_BASE_URL", "https://api.skyvern.com")
+    monkeypatch.setattr(
+        mcp_http_auth,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(
+                get_mcp_oauth_jwt_key=AsyncMock(return_value=public_jwk),
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        await mcp_http_auth.validate_mcp_oauth_token(token)
+
+    fake_db.get_organization_entities.assert_not_awaited()
+    fake_db.get_valid_org_auth_token.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -639,6 +702,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
             "aud": ["https://api.skyvern.com/mcp/"],
             "resource": "https://api.skyvern.com/mcp/",
             "sub": "user_123",
+            "org_id": "clerk_org_jwt",
         }
 
     fake_db = SimpleNamespace(
@@ -665,7 +729,8 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
 
     assert resolution.api_key == "sk_live_from_jwt"
     assert captured["kwargs"]["leeway"] == mcp_http_auth._TOKEN_CLOCK_SKEW_SECONDS
-    assert "options" not in captured["kwargs"]
+    assert captured["kwargs"]["options"] == {"verify_aud": False}
+    fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_jwt", "organization")
 
 
 @pytest.mark.asyncio
@@ -804,6 +869,121 @@ async def test_resolve_oauth_subject_to_org_logs_missing_db_methods(monkeypatch:
         await mcp_http_auth._resolve_oauth_subject_to_org({"sub": "user_123"}, object())
 
     debug_log.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_org_123")]),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_org_123")),
+    )
+
+    resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
+        {"sub": "user_123", "org_id": "clerk_org_123"},
+        fake_db,
+    )
+
+    assert resolution.api_key == "sk_live_org_123"
+    assert resolution.validation.organization_id == "skyvern_org_123"
+    fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_123", "organization")
+    fake_db.get_valid_org_auth_token.assert_awaited_once_with(
+        "skyvern_org_123", mcp_http_auth.OrganizationAuthTokenType.api
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Cloud shape: lookups live on db.organizations rather than directly on db.
+    # The OSS code routes that case through AgentFunction.resolve_mcp_oauth_org_lookups,
+    # which the cloud build overrides. Simulate the override here so the test
+    # exercises the same delegation contract without importing cloud modules.
+    organizations_repo = SimpleNamespace(
+        get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_cloud_org")]),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_cloud_org")),
+    )
+    fake_db = SimpleNamespace(organizations=organizations_repo)
+
+    def fake_resolve(db: object) -> tuple[Any, Any] | None:
+        organizations = getattr(db, "organizations", None)
+        if organizations is None:
+            return None
+        return organizations.get_organization_entities, organizations.get_valid_org_auth_token
+
+    monkeypatch.setattr(
+        mcp_http_auth.app.AGENT_FUNCTION,
+        "resolve_mcp_oauth_org_lookups",
+        fake_resolve,
+    )
+
+    resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
+        {"sub": "user_123", "org_id": "clerk_org_cloud"},
+        fake_db,
+    )
+
+    assert resolution.api_key == "sk_live_cloud_org"
+    assert resolution.validation.organization_id == "skyvern_cloud_org"
+    organizations_repo.get_organization_entities.assert_awaited_once_with("clerk_org_cloud", "organization")
+    organizations_repo.get_valid_org_auth_token.assert_awaited_once_with(
+        "skyvern_cloud_org", mcp_http_auth.OrganizationAuthTokenType.api
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_oauth_subject_to_org_uses_compact_clerk_org_claim() -> None:
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_org_compact")]),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_compact")),
+    )
+
+    resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
+        {"sub": "user_123", "o": {"id": "clerk_org_compact"}},
+        fake_db,
+    )
+
+    assert resolution.api_key == "sk_live_compact"
+    assert resolution.validation.organization_id == "skyvern_org_compact"
+    fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_compact", "organization")
+
+
+@pytest.mark.asyncio
+async def test_resolve_oauth_subject_to_org_rejects_missing_explicit_org_context() -> None:
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="first_org")]),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_first")),
+    )
+
+    with pytest.raises(
+        mcp_http_auth.MissingOrgContextError,
+        match="Bearer token missing organization context",
+    ) as exc_info:
+        await mcp_http_auth._resolve_oauth_subject_to_org({"sub": "user_123"}, fake_db)
+
+    assert exc_info.value.status_code == 401
+    fake_db.get_organization_entities.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_oauth_subject_to_org_does_not_choose_first_user_membership() -> None:
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(
+            return_value=[
+                SimpleNamespace(organization_id="first_org"),
+                SimpleNamespace(organization_id="second_org"),
+            ]
+        ),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_first")),
+    )
+
+    with pytest.raises(
+        mcp_http_auth.MissingOrgContextError,
+        match="Bearer token missing organization context",
+    ):
+        await mcp_http_auth._resolve_oauth_subject_to_org({"sub": "user_with_many_orgs"}, fake_db)
+
+    fake_db.get_organization_entities.assert_not_awaited()
+    fake_db.get_valid_org_auth_token.assert_not_awaited()
 
 
 def test_get_auth_db_uses_agent_function_builder(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,0 +1,30 @@
+A JavaScript dialog has appeared in the browser during automated web navigation.
+
+Dialog type: {{ dialog_type }}
+Dialog message: "{{ dialog_message }}"
+{% if default_value %}Default value: "{{ default_value }}"{% endif %}
+{% if navigation_goal %}
+Current task goal: {{ navigation_goal }}
+{% endif %}
+{% if navigation_payload %}
+Task context/payload: {{ navigation_payload }}
+{% endif %}
+
+Based on the dialog message and the task goal, decide whether to ACCEPT or DISMISS this dialog.
+{% if dialog_type == "prompt" %}
+If you decide to accept, also provide the text to enter in the prompt field. If the default value is appropriate, you may use it.
+{% endif %}
+
+Guidelines:
+- For confirmation dialogs asking to proceed with an action (submit, save, continue), typically ACCEPT.
+- For dialogs warning about leaving the page or losing unsaved data, consider the task goal to decide.
+- When in doubt, prefer ACCEPT as it is more likely to advance the workflow.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments.
+
+Reply in JSON format:
+{
+    "reasoning": str,
+    "action": "accept" | "dismiss",
+    "prompt_text": str | null
+}

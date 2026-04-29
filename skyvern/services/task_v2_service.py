@@ -145,6 +145,7 @@ async def _summarize_max_steps_failure_reason(
             screenshots=screenshots,
             prompt_name="task_v2_summarize-max-steps-reason",
             thought=thought,
+            system_prompt=task_v2.workflow_system_prompt,
         )
         return json_response.get("reasoning", ""), json_response.get("failure_categories")
     except Exception:
@@ -252,6 +253,7 @@ async def initialize_task_v2(
     parent_workflow_run_id: str | None = None,
     extracted_information_schema: dict | list | str | None = None,
     error_code_mapping: dict | None = None,
+    workflow_system_prompt: str | None = None,
     create_task_run: bool = False,
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
@@ -270,6 +272,7 @@ async def initialize_task_v2(
         proxy_location=proxy_location,
         extracted_information_schema=extracted_information_schema,
         error_code_mapping=error_code_mapping,
+        workflow_system_prompt=workflow_system_prompt,
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
@@ -381,6 +384,7 @@ async def initialize_task_v2_metadata(
         prompt=metadata_prompt,
         thought=thought,
         prompt_name="task_v2_generate_metadata",
+        system_prompt=task_v2.workflow_system_prompt,
     )
 
     # validate
@@ -829,6 +833,7 @@ async def run_task_v2_helper(
                 screenshots=scraped_page.screenshots,
                 thought=thought,
                 prompt_name="task_v2",
+                system_prompt=task_v2.workflow_system_prompt,
             )
             LOG.info(
                 "Task v2 response",
@@ -1079,6 +1084,7 @@ async def run_task_v2_helper(
                 screenshots=completion_screenshots,
                 thought=thought,
                 prompt_name="task_v2_check_completion",
+                system_prompt=task_v2.workflow_system_prompt,
             )
             LOG.info(
                 "Task v2 completion check response",
@@ -1465,6 +1471,7 @@ async def _generate_loop_task(
         screenshots=scraped_page.screenshots,
         thought=thought_task_in_loop,
         prompt_name="task_v2_generate_task_block",
+        system_prompt=task_v2.workflow_system_prompt,
     )
     LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
@@ -1571,6 +1578,7 @@ async def _generate_extraction_task(
                 task_v2=task_v2,
                 prompt_name="task_v2_generate_extraction_task",
                 organization_id=task_v2.organization_id,
+                system_prompt=task_v2.workflow_system_prompt,
             )
             break
         except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
@@ -1971,6 +1979,7 @@ async def _summarize_task_v2(
         screenshots=screenshots,
         thought=thought,
         prompt_name="task_v2_summary",
+        system_prompt=task_v2.workflow_system_prompt,
     )
     LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
 

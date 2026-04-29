@@ -33,6 +33,7 @@ from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.dialog_handler import set_dialog_handler
 
 LOG = structlog.get_logger()
 
@@ -350,6 +351,7 @@ class BrowserContextFactory:
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
+            set_dialog_handler(browser_context=browser_context)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
             if proxy_location is not None:

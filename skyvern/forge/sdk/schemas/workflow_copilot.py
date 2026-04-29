@@ -40,13 +40,36 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
     workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
+    browser_session_id: str | None = Field(
+        None,
+        description="Optional persistent browser session ID to reuse instead of creating a new one.",
+    )
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    cancel_token: str | None = Field(
+        None,
+        description=(
+            "Client-generated UUID. POST it to /workflow/copilot/cancel to hard-cancel this turn. "
+            "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
+        ),
+    )
+
+
+class WorkflowCopilotCancelRequest(BaseModel):
+    cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="The chat ID to update")
     auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
+
+
+class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="The chat whose proposed workflow should be applied")
+    auto_accept: bool = Field(
+        False,
+        description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
+    )
 
 
 class WorkflowCopilotChatHistoryMessage(BaseModel):

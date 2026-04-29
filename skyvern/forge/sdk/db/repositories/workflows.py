@@ -30,7 +30,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import convert_to_workflow, serialize_proxy_location
-from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock
+from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
@@ -41,8 +41,8 @@ LOG = structlog.get_logger()
 
 def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> None:
     """Rebind each block's ``output_parameter`` to the reconciled instance
-    from ``workflow_definition.parameters`` by key, recursing into
-    ``ForLoopBlock.loop_blocks``.
+    from ``workflow_definition.parameters`` by key, recursing into nested
+    loop block children.
 
     The reconcile helper mutates IDs on the top-level parameters list only.
     When a caller round-trips the definition through
@@ -62,7 +62,7 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
             canonical = key_to_output_parameter.get(block.output_parameter.key)
             if canonical is not None and canonical is not block.output_parameter:
                 block.output_parameter = canonical
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 _visit(block.loop_blocks)
 
     _visit(workflow_definition.blocks)
@@ -99,6 +99,8 @@ class WorkflowsRepository(BaseRepository):
         run_sequentially: bool = False,
         sequential_key: str | None = None,
         folder_id: str | None = None,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -125,6 +127,8 @@ class WorkflowsRepository(BaseRepository):
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,
+                created_by=created_by,
+                edited_by=edited_by,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -593,6 +597,8 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -635,6 +641,10 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
                     workflow.sequential_key = sequential_key
+                if created_by is not _UNSET:
+                    workflow.created_by = cast(str | None, created_by)
+                if edited_by is not _UNSET:
+                    workflow.edited_by = cast(str | None, edited_by)
                 await session.commit()
                 await session.refresh(workflow)
                 is_template = (
@@ -675,6 +685,8 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -753,6 +765,10 @@ class WorkflowsRepository(BaseRepository):
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:
                 workflow.sequential_key = sequential_key
+            if created_by is not _UNSET:
+                workflow.created_by = cast(str | None, created_by)
+            if edited_by is not _UNSET:
+                workflow.edited_by = cast(str | None, edited_by)
 
             await session.commit()
             await session.refresh(workflow)

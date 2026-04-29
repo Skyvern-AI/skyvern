@@ -163,6 +163,8 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        ignore_inherited_workflow_system_prompt: bool = False,
+        copilot_session_id: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -190,6 +192,8 @@ class WorkflowRunsRepository(BaseRepository):
                 code_gen=code_gen,
                 trigger_type=trigger_type.value if trigger_type else None,
                 workflow_schedule_id=workflow_schedule_id,
+                ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+                copilot_session_id=copilot_session_id,
                 **kwargs,
             )
             session.add(workflow_run)

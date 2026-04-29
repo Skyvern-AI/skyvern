@@ -216,6 +216,18 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_5",
+        LLMConfig(
+            "gpt-5.5",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -471,7 +483,28 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
-
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.6_SONNET",
+        LLMConfig(
+            "anthropic/claude-sonnet-4-6",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=64000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.7_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-7",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
@@ -621,6 +654,28 @@ if settings.ENABLE_BEDROCK:
             add_assistant_prefix=False,  # Claude 4.6 does not support assistant message prefill
             max_completion_tokens=64000,
             temperature=1,  # Claude 4.6 only supports temperature=1
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-sonnet-4-6",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=64000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-4-7",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
         ),
     )
 
@@ -1208,6 +1263,19 @@ if settings.ENABLE_GEMINI:
         "GEMINI_3_PRO",
         LLMConfig(
             "gemini/gemini-3.1-pro-preview",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.1_FLASH_LITE",
+        LLMConfig(
+            "gemini/gemini-3.1-flash-lite-preview",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,

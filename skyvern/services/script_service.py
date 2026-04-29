@@ -630,9 +630,14 @@ async def _update_workflow_block(
     label: str | None = None,
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
-    ai_fallback_triggered: bool = False,
+    ai_fallback_triggered: bool | None = None,
 ) -> None:
-    """Update the status of a workflow run block."""
+    """Update workflow_run_block status, optionally setting `script_run`.
+
+    `ai_fallback_triggered` is three-valued: `None` = no assertion (no
+    write); `True`/`False` = explicit fallback signal, written to
+    `workflow_run_blocks.script_run` as `{"ai_fallback_triggered": <bool>}`.
+    """
     try:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.workflow_run_id or not context.workflow_id:
@@ -721,7 +726,9 @@ async def _update_workflow_block(
                 )
             if step_for_billing:
                 try:
-                    if not ai_fallback_triggered:
+                    # Explicit `is not True` — `None` means "caller made no
+                    # assertion" and falls through to billing like False.
+                    if ai_fallback_triggered is not True:
                         await app.AGENT_FUNCTION.post_cache_step_execution(
                             updated_task,
                             step_for_billing,
@@ -748,6 +755,7 @@ async def _update_workflow_block(
             status=status,
             failure_reason=failure_reason,
             output=final_output,
+            ai_fallback_triggered=ai_fallback_triggered,
         )
 
         await _record_output_parameter_value(
@@ -1173,6 +1181,8 @@ async def _fallback_to_ai_run(
                 task_failure_reason = f"{task_failure_reason}. Detected errors: {', '.join(error_codes)}"
 
             if workflow_run_block_id:
+                # No `ai_fallback_triggered` here — the script step failed
+                # before the AI agent ran, so no fallback actually fired.
                 await _update_workflow_block(
                     workflow_run_block_id,
                     BlockStatus.failed,
@@ -1418,6 +1428,7 @@ async def _fallback_to_ai_run(
                 task_status=TaskStatus.failed,
                 label=cache_key,
                 failure_reason=str(e),
+                ai_fallback_triggered=True,
             )
         raise e
 

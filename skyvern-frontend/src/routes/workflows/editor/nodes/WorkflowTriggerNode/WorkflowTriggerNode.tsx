@@ -34,6 +34,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BrowserSessionSelector } from "./BrowserSessionSelector";
 import {
   PARENT_SESSION_VALUE,
@@ -335,6 +336,17 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
                   parameters={data.parameterKeys}
                   onParametersChange={(parameterKeys) => {
                     update({ parameterKeys });
+                  }}
+                />
+                <IgnoreWorkflowSystemPrompt
+                  ignoreWorkflowSystemPrompt={
+                    data.ignoreWorkflowSystemPrompt ?? false
+                  }
+                  editable={editable}
+                  onIgnoreWorkflowSystemPromptChange={(
+                    ignoreWorkflowSystemPrompt,
+                  ) => {
+                    update({ ignoreWorkflowSystemPrompt });
                   }}
                 />
               </AccordionContent>

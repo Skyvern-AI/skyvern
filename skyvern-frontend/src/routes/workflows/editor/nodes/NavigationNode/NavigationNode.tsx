@@ -40,6 +40,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { RunEngine } from "@/api/types";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
@@ -198,6 +199,17 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 editable={editable}
                 onDisableCacheChange={(disableCache) => {
                   update({ disableCache });
+                }}
+              />
+              <IgnoreWorkflowSystemPrompt
+                ignoreWorkflowSystemPrompt={
+                  data.ignoreWorkflowSystemPrompt ?? false
+                }
+                editable={editable}
+                onIgnoreWorkflowSystemPromptChange={(
+                  ignoreWorkflowSystemPrompt,
+                ) => {
+                  update({ ignoreWorkflowSystemPrompt });
                 }}
               />
               <Separator />
@@ -463,6 +475,17 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 editable={editable}
                 onDisableCacheChange={(disableCache) => {
                   update({ disableCache });
+                }}
+              />
+              <IgnoreWorkflowSystemPrompt
+                ignoreWorkflowSystemPrompt={
+                  data.ignoreWorkflowSystemPrompt ?? false
+                }
+                editable={editable}
+                onIgnoreWorkflowSystemPromptChange={(
+                  ignoreWorkflowSystemPrompt,
+                ) => {
+                  update({ ignoreWorkflowSystemPrompt });
                 }}
               />
               <Separator />

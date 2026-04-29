@@ -245,6 +245,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         retry=task_obj.retry,
         max_steps_per_run=task_obj.max_steps_per_run,
         error_code_mapping=task_obj.error_code_mapping,
+        workflow_system_prompt=task_obj.workflow_system_prompt,
         errors=task_obj.errors,
         application=task_obj.application,
         model=task_obj.model,
@@ -314,6 +315,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         domain=org_model.domain,
         bw_organization_id=org_model.bw_organization_id,
         bw_collection_ids=org_model.bw_collection_ids,
+        artifact_url_expiry_seconds=org_model.artifact_url_expiry_seconds,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
@@ -372,11 +374,13 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
         bundle_key=artifact_model.bundle_key,
+        checksum=artifact_model.checksum,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
         workflow_run_block_id=artifact_model.workflow_run_block_id,
         run_id=artifact_model.run_id,
+        browser_session_id=artifact_model.browser_session_id,
         observer_cruise_id=artifact_model.observer_cruise_id,
         observer_thought_id=artifact_model.observer_thought_id,
         created_at=artifact_model.created_at,
@@ -439,6 +443,8 @@ def convert_to_workflow(
         sequential_key=workflow_model.sequential_key,
         folder_id=workflow_model.folder_id,
         import_error=workflow_model.import_error,
+        created_by=workflow_model.created_by,
+        edited_by=workflow_model.edited_by,
     )
 
 
@@ -488,6 +494,8 @@ def convert_to_workflow_run(
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
+        ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
+        copilot_session_id=workflow_run_model.copilot_session_id,
     )
 
 
@@ -686,6 +694,9 @@ def convert_to_workflow_run_block(
         executed_branch_expression=workflow_run_block_model.executed_branch_expression,
         executed_branch_result=workflow_run_block_model.executed_branch_result,
         executed_branch_next_block=workflow_run_block_model.executed_branch_next_block,
+        script_run=ScriptRunResponse.model_validate(workflow_run_block_model.script_run)
+        if workflow_run_block_model.script_run
+        else None,
     )
     if task:
         if task.finished_at and task.started_at:

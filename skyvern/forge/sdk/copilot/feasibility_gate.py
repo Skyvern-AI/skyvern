@@ -163,18 +163,18 @@ async def run_feasibility_gate(
             return _PROCEED
 
     verdict = _coerce_verdict(response)
+    # INFO not DEBUG so verdict-rate dashboards work without trace-bisection.
+    # `question` is UI-displayed so safe at INFO; `rationale` stays at DEBUG below
+    # because untrusted LLM output can echo back user content under prompt injection.
+    log_extras: dict[str, Any] = {
+        "verdict": verdict.verdict,
+        "user_message_len": len(user_message),
+        "chat_history_len": len(chat_history or ""),
+        "workflow_yaml_len": len(workflow_yaml or ""),
+    }
+    if verdict.question is not None:
+        log_extras["question"] = verdict.question
+    LOG.info("feasibility-gate verdict", **log_extras)
     if verdict.verdict == "ask_clarification":
-        # `question` is user-facing (displayed in the UI) so logging it at
-        # INFO is fine. `rationale` is the LLM's internal reasoning and can
-        # echo back user content under prompt injection -- drop it to DEBUG
-        # so untrusted model output doesn't ship to every log aggregator.
-        LOG.info(
-            "feasibility-gate classifier asked for clarification",
-            question=verdict.question,
-        )
         LOG.debug("feasibility-gate clarification rationale", rationale=verdict.rationale)
-    else:
-        # Debug-level so latency regressions and skip-rate anomalies are
-        # traceable without adding INFO noise on every copilot message.
-        LOG.debug("feasibility-gate classifier returned proceed")
     return verdict

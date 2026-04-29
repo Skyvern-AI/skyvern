@@ -122,6 +122,11 @@ class AgentResult:
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
     # silently passing as cheap.
     total_tokens: int | None = None
+    # Set when the agent absorbed an asyncio cancellation initiated by an
+    # explicit user Stop. Lets the route route to a cancel-specific
+    # persistence path (rollback + ``Cancelled by user.`` chat row) without
+    # losing ``workflow_was_persisted`` the way a re-raise would.
+    cancelled: bool = False
 
 
 @dataclass
@@ -142,6 +147,8 @@ class CopilotContext(AgentContext):
     avoid drift.
     """
 
+    workflow_copilot_chat_id: str | None = None
+
     # Enforcement state
     navigate_called: bool = False
     observation_after_navigate: bool = False
@@ -157,10 +164,8 @@ class CopilotContext(AgentContext):
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
 
-    # Token usage summed from raw_responses after each streamed run. None
-    # until the first response that carries a usage object — some providers
-    # (notably non-OpenAI streaming routes) omit usage entirely, and we want
-    # eval cost grading to see "no data" rather than "0 tokens".
+    # ``None`` until usage is observed; ``0`` only when a provider explicitly
+    # reported zero. Distinct values let cost grading flag missing telemetry.
     total_tokens_used: int | None = None
     input_tokens_used: int | None = None
     output_tokens_used: int | None = None

@@ -169,9 +169,12 @@ def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, boo
     if "timeout" not in extra_args:
         extra_args["timeout"] = settings.LLM_CONFIG_TIMEOUT
 
+    # ``include_usage=True`` gates ``stream_options={"include_usage": True}`` on
+    # streamed chat-completions; without it the final chunk omits token usage.
     model_settings = ModelSettings(
         temperature=config.temperature,
         max_tokens=config.max_completion_tokens or config.max_tokens,
+        include_usage=True,
         extra_body=extra_body or None,
         extra_args=extra_args or None,
         extra_headers=extra_headers,

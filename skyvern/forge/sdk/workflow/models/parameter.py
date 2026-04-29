@@ -241,6 +241,38 @@ class WorkflowParameterType(StrEnum):
             raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
 
 
+def is_sensitive_workflow_parameter(param: dict[str, Any] | Parameter) -> bool:
+    """Return True if a workflow parameter carries credential/secret data.
+
+    Accepts either a parameter dict (workflow-definition shape, used by the
+    script generator) or a typed ``Parameter`` object (loaded from DB tuples,
+    used by the reviewer). Single source of truth for sensitive-parameter
+    filtering across both paths — combines ``ParameterType.is_secret_or_credential``
+    with the ``workflow_parameter_type==credential_id`` sub-check.
+    """
+    if isinstance(param, dict):
+        ptype: Any = param.get("parameter_type")
+        sub: Any = param.get("workflow_parameter_type")
+    else:
+        ptype = getattr(param, "parameter_type", None)
+        sub = getattr(param, "workflow_parameter_type", None)
+
+    if ptype is not None:
+        try:
+            if ParameterType(ptype).is_secret_or_credential():
+                return True
+        except (ValueError, TypeError):
+            pass
+    if ptype == ParameterType.WORKFLOW.value or ptype == ParameterType.WORKFLOW:
+        if sub is not None:
+            try:
+                if WorkflowParameterType(sub).is_credential_type():
+                    return True
+            except (ValueError, TypeError):
+                pass
+    return False
+
+
 class WorkflowParameter(Parameter):
     parameter_type: Literal[ParameterType.WORKFLOW] = ParameterType.WORKFLOW
 

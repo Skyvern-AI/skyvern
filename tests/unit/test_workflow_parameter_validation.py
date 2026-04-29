@@ -625,3 +625,40 @@ class TestSanitizeWorkflowYamlWithReferences:
         goal = result["workflow_definition"]["blocks"][0]["navigation_goal"]
         assert "{{ block_1 }}" in goal
         assert "{{ block_1_output }}" in goal
+
+    def test_sanitize_updates_output_references_in_workflow_system_prompt(self) -> None:
+        """Output references inside the workflow-level workflow_system_prompt must
+        be rewritten when the referenced block label is sanitized. The global
+        prompt is resolved through Jinja at execution time, so its references
+        need the same renaming treatment as block-level fields."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [{"label": "my-block", "block_type": "task"}],
+                "workflow_system_prompt": "Honor {{ my-block_output }} for every downstream block.",
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        assert result["workflow_definition"]["blocks"][0]["label"] == "my_block"
+        assert "{{ my_block_output }}" in result["workflow_definition"]["workflow_system_prompt"]
+
+    def test_sanitize_parameter_key_updates_jinja_references_in_workflow_system_prompt(self) -> None:
+        """Parameter-key references inside the workflow-level workflow_system_prompt
+        must be rewritten when the parameter key is sanitized."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "key": "user-input",
+                        "parameter_type": "workflow",
+                    }
+                ],
+                "blocks": [],
+                "workflow_system_prompt": "Always respond in the style of {{ user-input }}.",
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        assert result["workflow_definition"]["parameters"][0]["key"] == "user_input"
+        assert "{{ user_input }}" in result["workflow_definition"]["workflow_system_prompt"]

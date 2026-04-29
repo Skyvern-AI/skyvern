@@ -104,6 +104,9 @@ def _enrich_llm_span(
     span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
     span.set_attribute("gen_ai.usage.cached_tokens", cached_tokens)
     span.set_attribute("gen_ai.usage.cost", llm_cost)
+    ctx = skyvern_context.current()
+    if ctx is not None and ctx.copilot_session_id is not None:
+        span.set_attribute("copilot.session_id", ctx.copilot_session_id)
     span.add_event(
         LLM_REQUEST_COMPLETED_EVENT,
         attributes={

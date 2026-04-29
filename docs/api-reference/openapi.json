@@ -13343,6 +13343,15 @@
             "type": "string",
             "nullable": true,
             "title": "Executed Branch Next Block"
+          },
+          "script_run": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              }
+            ],
+            "nullable": true,
+            "title": "Script Run"
           }
         },
         "type": "object",

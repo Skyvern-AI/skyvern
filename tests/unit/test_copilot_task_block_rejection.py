@@ -303,6 +303,7 @@ async def test_update_workflow_preserves_legacy_task_block_under_unchanged_label
         patch("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", return_value=fake_workflow),
         patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
     ):
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
@@ -343,6 +344,7 @@ async def test_update_workflow_allows_all_allowed_block_types() -> None:
         patch("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", return_value=fake_workflow),
         patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
     ):
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 

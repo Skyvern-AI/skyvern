@@ -548,6 +548,7 @@ function convertToNode(
     nextLoopOnFailure: block.next_loop_on_failure,
     editable,
     model: block.model,
+    ignoreWorkflowSystemPrompt: block.ignore_workflow_system_prompt ?? false,
   };
   switch (block.block_type) {
     case "conditional": {
@@ -1595,6 +1596,7 @@ function getElements(
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
+      workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
     }),
   );
 
@@ -2310,6 +2312,8 @@ function getWorkflowBlock(
     next_loop_on_failure: node.data.nextLoopOnFailure,
     model: node.data.model,
     next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
   };
   switch (node.type) {
     case "task": {
@@ -2924,6 +2928,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
+    workflowSystemPrompt: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -2951,6 +2956,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
+      workflowSystemPrompt: data.workflowSystemPrompt ?? null,
     };
   }
   return defaultSettings;
@@ -3804,6 +3810,8 @@ function convertBlocksToBlockYAML(
       continue_on_failure: block.continue_on_failure,
       next_loop_on_failure: block.next_loop_on_failure,
       next_block_label: block.next_block_label,
+      ignore_workflow_system_prompt:
+        block.ignore_workflow_system_prompt ?? false,
     };
     switch (block.block_type) {
       case "task": {
@@ -4198,6 +4206,8 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
       finally_block_label: workflow.workflow_definition.finally_block_label,
+      workflow_system_prompt:
+        workflow.workflow_definition.workflow_system_prompt,
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,

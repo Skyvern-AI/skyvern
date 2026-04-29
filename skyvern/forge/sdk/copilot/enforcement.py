@@ -959,28 +959,29 @@ class _SendTrackingStream:
 
 
 def _accumulate_usage(result: RunResultStreaming, ctx: Any) -> None:
-    """Sum actual token usage from raw_responses onto the context.
+    """Sum the SDK's per-iteration usage into ``ctx``.
 
-    Called per enforcement iteration in a ``finally:`` so pre-overflow
-    response tokens are still counted even when ``stream_to_sse`` raises.
-    First observed usage flips the counters from ``None`` to ``0``; if no
-    response on this stream carries a usage object the counters stay
-    ``None``, which the eval surfaces as "telemetry missing" rather than
-    "ran for free".
+    The SDK aggregates usage into ``context_wrapper.usage`` before tool execution,
+    so prior-turn tokens survive a mid-tool abort; each ``Runner.run_streamed``
+    call gets a fresh wrapper, so totals must accumulate on ``ctx`` across
+    iterations rather than overwrite.
     """
     if not hasattr(ctx, "total_tokens_used"):
         return
-    for resp in getattr(result, "raw_responses", []) or []:
-        usage = getattr(resp, "usage", None)
-        if usage is None:
-            continue
-        if ctx.total_tokens_used is None:
-            ctx.total_tokens_used = 0
-            ctx.input_tokens_used = 0
-            ctx.output_tokens_used = 0
-        ctx.total_tokens_used += getattr(usage, "total_tokens", 0) or 0
-        ctx.input_tokens_used += getattr(usage, "input_tokens", 0) or 0
-        ctx.output_tokens_used += getattr(usage, "output_tokens", 0) or 0
+    usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+    if usage is None:
+        return
+
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    total_tokens = getattr(usage, "total_tokens", 0) or 0
+
+    if not (input_tokens or output_tokens or total_tokens):
+        return
+
+    ctx.input_tokens_used = (ctx.input_tokens_used or 0) + input_tokens
+    ctx.output_tokens_used = (ctx.output_tokens_used or 0) + output_tokens
+    ctx.total_tokens_used = (ctx.total_tokens_used or 0) + total_tokens
 
 
 async def _run_streamed_with_deadline(
