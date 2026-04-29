@@ -28,6 +28,7 @@ export interface WorkflowCopilotChatRequest {
   workflow_id: string;
   workflow_copilot_chat_id?: string | null;
   workflow_run_id?: string | null;
+  browser_session_id?: string | null;
   message: string;
   workflow_yaml: string;
 }
