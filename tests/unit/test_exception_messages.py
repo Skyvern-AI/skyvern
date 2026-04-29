@@ -124,7 +124,9 @@ def test_unknown_error_strips_browser_logs_with_internal_path() -> None:
     assert "/opt/internal-browser" not in message
     assert "Browser logs:" not in message
     assert "--disable-field-trial-config" not in message
-    assert "Target page, context or browser has been closed" in message
+    # SKY-9319: TargetClosedError-style failures now return a friendly retry message
+    # instead of the raw Playwright string.
+    assert "The browser closed unexpectedly during launch" in message
     assert "support@skyvern.com" in message
 
 
