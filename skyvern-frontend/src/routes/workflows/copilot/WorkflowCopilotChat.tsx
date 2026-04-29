@@ -121,6 +121,7 @@ interface WorkflowCopilotChatProps {
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
+  liveBrowserSessionId?: string | null;
 }
 
 const DEFAULT_WINDOW_WIDTH = 600;
@@ -172,6 +173,7 @@ export function WorkflowCopilotChat({
   onClose,
   onMessageCountChange,
   buttonRef,
+  liveBrowserSessionId,
 }: WorkflowCopilotChatProps = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
@@ -693,6 +695,7 @@ export function WorkflowCopilotChat({
           workflow_permanent_id: workflowPermanentId,
           workflow_copilot_chat_id: workflowCopilotChatId,
           workflow_run_id: workflowRunId,
+          browser_session_id: liveBrowserSessionId ?? null,
           message: messageContent,
           workflow_yaml: workflowYaml,
         } as WorkflowCopilotChatRequest,
