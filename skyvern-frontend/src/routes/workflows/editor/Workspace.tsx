@@ -2011,6 +2011,7 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
+        liveBrowserSessionId={activeDebugSession?.browser_session_id ?? null}
         onReviewWorkflow={async (pendingWorkflow, clearPending) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;
