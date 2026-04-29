@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tracing_setup
 
 
@@ -96,6 +97,7 @@ def test_enabled_with_logfire(
     assert len(configure_calls) == 1
     assert configure_calls[0]["send_to_logfire"] == "if-token-present"
     assert configure_calls[0]["service_name"] == "skyvern-copilot"
+    assert configure_calls[0]["environment"] == settings.ENV
     assert instrument_calls == [None]
     assert patch_calls == [None]
     assert processors_calls == [[]]
@@ -176,7 +178,13 @@ class TestTracingSetup:
         tracing_setup.ensure_tracing_initialized()
         tracing_setup.ensure_tracing_initialized()
 
-        assert configure_calls == [{"send_to_logfire": "if-token-present", "service_name": "skyvern-copilot"}]
+        assert configure_calls == [
+            {
+                "send_to_logfire": "if-token-present",
+                "service_name": "skyvern-copilot",
+                "environment": settings.ENV,
+            }
+        ]
         assert instrument_calls == [None]
 
     def test_copilot_span_returns_nullcontext_when_disabled(
