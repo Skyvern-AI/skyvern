@@ -439,6 +439,19 @@ class AgentFunction:
     Cloud overrides this to True and provides the Temporal-backed implementations below.
     """
 
+    # Phrases that indicate a magic-link confirmation page meant to be closed.
+    # Keep lowercase; matching is case-insensitive.
+    MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (
+        "close this page",
+        "close this tab",
+        "close this window",
+        "you can close",
+        "you may now close",
+        "safe to close",
+        "return to the original page",
+        "return to the original tab",
+    )
+
     def get_mcp_oauth_issuer_url(self) -> str | None:
         """Return the cloud OAuth issuer URL when the build provides one.
 
@@ -537,7 +550,74 @@ class AgentFunction:
         return None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
-        return
+        if step.status == StepStatus.completed:
+            await self._maybe_close_magic_link_page(task)
+
+    async def _maybe_close_magic_link_page(self, task: Task) -> None:
+        """Close a magic-link confirmation page if it shows close/return signals.
+
+        Some magic-link flows open a new tab for verification.
+        After the user clicks "Allow", the page says "close this page and return
+        to the original page".  The LLM may miss the CLOSE_PAGE action, leaving
+        the tab open.  This fallback detects such confirmation pages and closes
+        them so subsequent workflow blocks see the original page.
+        """
+        context = skyvern_context.current()
+        if not context:
+            return
+
+        if not context.has_magic_link_page(task.task_id):
+            return
+
+        page = context.magic_link_pages[task.task_id]
+
+        try:
+            visible_text = (await page.inner_text("body", timeout=5000)).lower()
+        except Exception:
+            LOG.warning(
+                "Failed to read magic link page content, skipping auto-close",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+
+        matched_signal = next(
+            (signal for signal in self.MAGIC_LINK_CLOSE_SIGNALS if signal in visible_text),
+            None,
+        )
+        if matched_signal is None:
+            LOG.debug(
+                "Magic link page does not contain close signals, keeping open",
+                task_id=task.task_id,
+                page_url=page.url,
+            )
+            return
+
+        LOG.info(
+            "Magic link confirmation page detected, auto-closing",
+            task_id=task.task_id,
+            page_url=page.url,
+            matched_signal=matched_signal,
+        )
+        try:
+            async with asyncio.timeout(5):
+                await page.close()
+        except Exception:
+            # Intentionally keep the stale reference so the next completed step
+            # retries the close.  Eventually page.is_closed() will return True
+            # and the entry will be cleaned up at the top of this method.
+            LOG.warning(
+                "Failed to close magic link page, will retry on next step",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+
+        context.magic_link_pages.pop(task.task_id, None)
+        LOG.info(
+            "Magic link page closed successfully",
+            task_id=task.task_id,
+        )
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
