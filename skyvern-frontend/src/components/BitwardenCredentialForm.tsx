@@ -33,7 +33,11 @@ const formSchema = z
 
 type FormData = z.infer<typeof formSchema>;
 
-export function BitwardenCredentialForm() {
+type Props = {
+  onSuccess?: () => void;
+};
+
+export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
   const [showMasterPassword, setShowMasterPassword] = useState(false);
   const {
     bitwardenOrganizationAuthToken,
@@ -53,7 +57,9 @@ export function BitwardenCredentialForm() {
   });
 
   const onSubmit = (data: FormData) => {
-    createOrUpdateToken(data);
+    createOrUpdateToken(data, {
+      onSuccess: () => onSuccess?.(),
+    });
   };
 
   useEffect(() => {
