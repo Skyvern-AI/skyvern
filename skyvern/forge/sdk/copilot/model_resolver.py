@@ -42,6 +42,8 @@ _TOP_LEVEL_ROUTED_FIELDS = frozenset({"api_base", "api_key", "extra_headers"})
 
 # LiteLLMParams fields that LiteLLM consumes as call-level kwargs (splatted
 # via ``extra_args`` by the Agents SDK into ``litellm.acompletion(**kwargs)``).
+# These ride here so LiteLLM's per-provider translation runs; ``extra_body``
+# skips that step and lands the raw, untranslated key in the request body.
 _EXTRA_ARGS_FIELDS = frozenset(
     {
         "api_version",
@@ -49,12 +51,19 @@ _EXTRA_ARGS_FIELDS = frozenset(
         "vertex_credentials",
         "vertex_location",
         "timeout",
+        "thinking",
+        "service_tier",
     }
 )
 
-# LiteLLMParams fields that end up as provider-specific payload-body entries
-# (routed via ``ModelSettings.extra_body`` → request JSON body).
-_EXTRA_BODY_FIELDS = frozenset({"thinking", "thinking_level", "service_tier"})
+# Dropped at the resolver because the installed LiteLLM has no per-provider
+# translation for them; ``extra_args`` would silently no-op and ``extra_body``
+# would land the raw, untranslated key in the request body.
+_DROP_FIELDS = frozenset({"thinking_level"})
+
+# Track which dropped keys we've already warned about, per process. Avoids
+# logging the same warning on every chat-post turn.
+_WARNED_DROP_KEYS: set[str] = set()
 
 
 def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfig:
@@ -122,29 +131,32 @@ def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, boo
     if isinstance(config, LLMRouterConfig):
         config = _degrade_router_to_direct(llm_key, config)
 
-    extra_body: dict[str, Any] = {}
     extra_args: dict[str, Any] = {}
     extra_headers: dict[str, str] | None = None
     base_url: str | None = None
     api_key: str | None = None
 
     if config.reasoning_effort:
-        extra_body["reasoning_effort"] = config.reasoning_effort
+        extra_args["reasoning_effort"] = config.reasoning_effort
 
     if isinstance(config, LLMConfig) and config.litellm_params:
         lp = config.litellm_params
         base_url = lp.get("api_base")
         api_key = lp.get("api_key")
 
+        for key in _DROP_FIELDS:
+            if lp.get(key) is not None and key not in _WARNED_DROP_KEYS:
+                _WARNED_DROP_KEYS.add(key)
+                LOG.warning(
+                    "Copilot resolver dropped a litellm_params field with no LiteLLM translation in 1.83.7",
+                    llm_key=llm_key,
+                    dropped_key=key,
+                )
+
         for key in _EXTRA_ARGS_FIELDS:
             val = lp.get(key)
             if val is not None:
                 extra_args[key] = val
-
-        for key in _EXTRA_BODY_FIELDS:
-            val = lp.get(key)
-            if val is not None:
-                extra_body[key] = val
 
         headers = lp.get("extra_headers")
         if headers:
@@ -155,7 +167,7 @@ def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, boo
         # (typos, dynamically-injected values). Without this, such keys are
         # silently dropped and the call proceeds with a subset of the intended
         # config.
-        known_keys = _EXTRA_ARGS_FIELDS | _EXTRA_BODY_FIELDS | _TOP_LEVEL_ROUTED_FIELDS
+        known_keys = _EXTRA_ARGS_FIELDS | _TOP_LEVEL_ROUTED_FIELDS | _DROP_FIELDS
         unrouted = sorted(k for k in lp.keys() if k not in known_keys)
         if unrouted:
             LOG.warning(
@@ -175,7 +187,6 @@ def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, boo
         temperature=config.temperature,
         max_tokens=config.max_completion_tokens or config.max_tokens,
         include_usage=True,
-        extra_body=extra_body or None,
         extra_args=extra_args or None,
         extra_headers=extra_headers,
     )
