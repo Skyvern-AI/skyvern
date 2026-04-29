@@ -71,6 +71,16 @@ from .org import (
 )
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .response import size_capped
+from .schedule import (
+    skyvern_schedule_create,
+    skyvern_schedule_delete,
+    skyvern_schedule_disable,
+    skyvern_schedule_enable,
+    skyvern_schedule_get,
+    skyvern_schedule_list,
+    skyvern_schedule_list_for_workflow,
+    skyvern_schedule_update,
+)
 from .scripts import (
     skyvern_script_deploy,
     skyvern_script_fallback_episodes,
@@ -167,7 +177,8 @@ static JSON/XML fetches, or generic web search.
 | Multi-step (simple, fast) | "fill the form and submit" | skyvern_observe + skyvern_execute | 0 Skyvern LLM | A11y tree + YOUR LLM plans from refs + batched primitives. Fast, cheap. |
 | Throwaway autonomous trial | "try this once", "see if this works" | skyvern_run_task | Higher | One-off autonomous agent for exploratory work. Do not use for reusable or multi-page production automations. |
 | Multi-step (complex) | "navigate a multi-page wizard" | skyvern_workflow_create (multi-block) | N LLM + screenshots | Build a workflow with one navigation block per step. Each block gets visual reasoning + verification. |
-| Repeated/production | "automate this weekly", "run every Monday", "schedule", "recurring" | skyvern_workflow_create + run | Varies | Caching converts AI runs into deterministic scripts over time (10-100x faster on repeat). |
+| Reusable workflow | "automate this", "wizard", "multi-step", "production" | skyvern_workflow_create | Varies | Caching converts AI runs into deterministic scripts over time (10-100x faster on repeat). |
+| Recurring schedule | "every Monday", "weekly", "schedule", "recurring", "cron" | skyvern_schedule_create (after the workflow exists) | API call | Server-side cron registration; route returns 501 if schedules are disabled in this build. |
 
 ## Decision Rules (highest precedence)
 
@@ -175,7 +186,7 @@ static JSON/XML fetches, or generic web search.
 2. If you only need a yes/no answer, use skyvern_validate -- not skyvern_extract or skyvern_act.
 3. If the work stays on one page and the UI is standard, prefer skyvern_observe + skyvern_execute.
 4. If the user says "try this once", "see if this works", or clearly wants a one-off exploratory trial, use skyvern_run_task.
-5. If the task spans multiple pages and is meant to be reusable, scheduled, repeatable, or explicitly "set up" as automation, use skyvern_workflow_create.
+5. If the task spans multiple pages and is meant to be reusable/repeatable, use skyvern_workflow_create. To run it on a recurring cadence, follow up with skyvern_schedule_create against the resulting workflow_permanent_id.
 6. Never type passwords. Always use skyvern_login with stored credentials.
 
 ## Quick Reference (one example per classification)
@@ -211,6 +222,7 @@ file_upload, find, navigate, screenshot, evaluate
 **Tier 3 — Management** (no session needed):
 - **Sessions:** browser_session_create/close/list/get/connect
 - **Workflows:** workflow_create/run/status/get/list/update/delete/cancel/update_folder
+- **Schedules:** schedule_list/list_for_workflow/get/create/update/enable/disable/delete
 - **Scripts:** script_list_for_workflow, script_get_code, script_versions, script_fallback_episodes, script_deploy
 - **Credentials:** credential_list/get/delete
 - **Folders/Blocks:** folder_list/get/create/update/delete, block_schema, block_validate
@@ -222,7 +234,8 @@ Precision tools support intent (AI), selector (deterministic), or hybrid (both) 
 - login requires a session AND a credential_id from credential_list.
 - file_upload requires a navigated page with an upload element.
 - console_messages and network_requests capture events from session start — call anytime.
-- Workflow, credential, script, folder, and block tools do NOT need a browser session.
+- Workflow, schedule, credential, script, folder, and block tools do NOT need a browser session.
+- schedule_create requires an existing workflow_permanent_id — call workflow_list or workflow_create first.
 
 ## Session Lifecycle
 
@@ -392,6 +405,16 @@ mcp.tool(tags={"workflow"}, annotations=_web_dest("Run Workflow"))(skyvern_workf
 mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(skyvern_workflow_status)
 mcp.tool(tags={"workflow"}, annotations=_dest("Cancel Workflow Run"))(skyvern_workflow_cancel)
 
+# -- Schedule management (no browser needed) --
+mcp.tool(tags={"schedule"}, annotations=_ro("List Workflow Schedules"))(skyvern_schedule_list)
+mcp.tool(tags={"schedule"}, annotations=_ro("List Schedules for a Workflow"))(skyvern_schedule_list_for_workflow)
+mcp.tool(tags={"schedule"}, annotations=_ro("Get Workflow Schedule"))(skyvern_schedule_get)
+mcp.tool(tags={"schedule"}, annotations=_mut("Create Workflow Schedule"))(skyvern_schedule_create)
+mcp.tool(tags={"schedule"}, annotations=_mut("Update Workflow Schedule"))(skyvern_schedule_update)
+mcp.tool(tags={"schedule"}, annotations=_mut("Enable Workflow Schedule"))(skyvern_schedule_enable)
+mcp.tool(tags={"schedule"}, annotations=_mut("Disable Workflow Schedule"))(skyvern_schedule_disable)
+mcp.tool(tags={"schedule"}, annotations=_dest("Delete Workflow Schedule"))(skyvern_schedule_delete)
+
 # -- Script/caching tools (no browser needed) --
 mcp.tool(tags={"script"}, annotations=_ro("List Workflow Scripts"))(skyvern_script_list_for_workflow)
 mcp.tool(tags={"script"}, annotations=_ro("Get Script Code"))(size_capped(skyvern_script_get_code))
@@ -493,6 +516,15 @@ __all__ = [
     "skyvern_workflow_run",
     "skyvern_workflow_status",
     "skyvern_workflow_cancel",
+    # Schedule management
+    "skyvern_schedule_list",
+    "skyvern_schedule_list_for_workflow",
+    "skyvern_schedule_get",
+    "skyvern_schedule_create",
+    "skyvern_schedule_update",
+    "skyvern_schedule_enable",
+    "skyvern_schedule_disable",
+    "skyvern_schedule_delete",
     # Script/caching
     "skyvern_script_list_for_workflow",
     "skyvern_script_get_code",
