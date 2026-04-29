@@ -31,7 +31,13 @@ const formSchema = z
 
 type FormData = z.infer<typeof formSchema>;
 
-export function AzureClientSecretCredentialTokenForm() {
+type Props = {
+  onSuccess?: () => void;
+};
+
+export function AzureClientSecretCredentialTokenForm({
+  onSuccess,
+}: Props = {}) {
   const [showClientSecret, setShowClientSecret] = useState(false);
   const {
     azureOrganizationAuthToken,
@@ -52,7 +58,9 @@ export function AzureClientSecretCredentialTokenForm() {
   });
 
   const onSubmit = (data: FormData) => {
-    createOrUpdateToken(data);
+    createOrUpdateToken(data, {
+      onSuccess: () => onSuccess?.(),
+    });
   };
 
   const toggleClientSecretVisibility = () => {

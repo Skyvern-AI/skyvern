@@ -18,7 +18,12 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useParams, useSearchParams } from "react-router-dom";
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   useEdgesState,
   useNodesState,
@@ -236,6 +241,20 @@ function Workspace({
   workflow,
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const locationState = location.state as { copilotMessage?: unknown } | null;
+  const initialCopilotMessage =
+    typeof locationState?.copilotMessage === "string"
+      ? locationState.copilotMessage
+      : null;
+  const handleInitialCopilotMessageConsumed = useCallback(() => {
+    if (!initialCopilotMessage) return;
+    navigate(location.pathname + location.search, {
+      replace: true,
+      state: null,
+    });
+  }, [initialCopilotMessage, location.pathname, location.search, navigate]);
   const [searchParams, setSearchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const [timelineMode, setTimelineMode] = useState("wide");
@@ -263,7 +282,7 @@ function Workspace({
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
   const [isCopilotOpen, setIsCopilotOpen] = useState(
-    () => !initialNodes.some(isWorkflowBlockNode),
+    () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
   );
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
@@ -565,7 +584,10 @@ function Workspace({
     if (activeDebugSession) {
       const pbsId = activeDebugSession.browser_session_id;
       if (pbsId) {
-        window.open(`${location.origin}/browser-session/${pbsId}`, "_blank");
+        window.open(
+          `${window.location.origin}/browser-session/${pbsId}`,
+          "_blank",
+        );
       }
     }
   };
@@ -2012,6 +2034,8 @@ function Workspace({
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
         liveBrowserSessionId={activeDebugSession?.browser_session_id ?? null}
+        initialMessage={initialCopilotMessage ?? undefined}
+        onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onReviewWorkflow={async (pendingWorkflow, clearPending) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;

@@ -34,7 +34,11 @@ const formSchema = z
 
 type FormData = z.infer<typeof formSchema>;
 
-export function CustomCredentialServiceConfigForm() {
+type Props = {
+  onSuccess?: () => void;
+};
+
+export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
   const [showApiToken, setShowApiToken] = useState(false);
   const {
     customCredentialServiceAuthToken,
@@ -57,7 +61,9 @@ export function CustomCredentialServiceConfigForm() {
   });
 
   const onSubmit = (data: FormData) => {
-    createOrUpdateConfig(data);
+    createOrUpdateConfig(data, {
+      onSuccess: () => onSuccess?.(),
+    });
   };
 
   const onTestConnection = async () => {
