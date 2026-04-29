@@ -1,4 +1,11 @@
-import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+  memo,
+} from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
@@ -10,6 +17,7 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
   WorkflowCopilotProcessingUpdate,
   WorkflowCopilotStreamErrorUpdate,
@@ -193,6 +201,7 @@ export function WorkflowCopilotChat({
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   const pendingMessageId = useRef<string | null>(null);
+  const pendingCancelToken = useRef<string | null>(null);
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -531,6 +540,42 @@ export function WorkflowCopilotChat({
     };
   }, [credentialGetter, workflowPermanentId]);
 
+  const cancelSend = useCallback(async () => {
+    if (!streamingAbortController.current) return;
+
+    const cancelToken = pendingCancelToken.current;
+    pendingCancelToken.current = null;
+    if (!cancelToken) return;
+
+    // Backend persists the user message + a matching AI bubble on cancel,
+    // so chat history reload stays consistent. We don't remove the user's
+    // pending message either — reload would otherwise show only the AI
+    // cancellation reply with no prompt above it.
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-cancel`,
+        sender: "ai",
+        content: "Cancelled by user.",
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    streamingAbortController.current.abort();
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post<void>("/workflow/copilot/cancel", {
+        cancel_token: cancelToken,
+      } as WorkflowCopilotCancelRequest);
+    } catch (error) {
+      // 503 (Redis disabled) or network failure: client-side abort still
+      // gives the user immediate feedback; the backend will run to
+      // completion in that environment. Log so we can spot it in dev.
+      console.warn("Workflow copilot cancel POST failed", error);
+    }
+  }, [credentialGetter]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || !isOpen || !isLoading) {
@@ -543,20 +588,7 @@ export function WorkflowCopilotChat({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isLoading, isOpen]);
-
-  const cancelSend = async () => {
-    if (!streamingAbortController.current) return;
-
-    if (pendingMessageId.current) {
-      const messageId = pendingMessageId.current;
-      pendingMessageId.current = null;
-      setMessages((prev) => prev.filter((message) => message.id !== messageId));
-    }
-    setIsLoading(false);
-    setProcessingStatus("");
-    streamingAbortController.current?.abort();
-  };
+  }, [isLoading, isOpen, cancelSend]);
 
   const handleSend = async (messageOverride?: string) => {
     const candidate = messageOverride ?? inputValue;
@@ -576,6 +608,9 @@ export function WorkflowCopilotChat({
       sender: "user",
       content: candidate,
     };
+
+    const cancelToken = crypto.randomUUID();
+    pendingCancelToken.current = cancelToken;
 
     pendingMessageId.current = userMessageId;
     setMessages((prev) => [...prev, userMessage]);
@@ -689,6 +724,8 @@ export function WorkflowCopilotChat({
       const handleResponse = (
         response: WorkflowCopilotStreamResponseUpdate,
       ) => {
+        // Stream completed; a Cancel click after this point should no-op.
+        pendingCancelToken.current = null;
         setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
         const aiMessage: ChatMessage = {
@@ -707,6 +744,7 @@ export function WorkflowCopilotChat({
       };
 
       const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+        pendingCancelToken.current = null;
         const errorMessage: ChatMessage = {
           id: Date.now().toString(),
           sender: "ai",
@@ -726,6 +764,7 @@ export function WorkflowCopilotChat({
           browser_session_id: liveBrowserSessionId ?? null,
           message: messageContent,
           workflow_yaml: workflowYaml,
+          cancel_token: cancelToken,
         } as WorkflowCopilotChatRequest,
         (payload) => {
           switch (payload.type) {
@@ -797,6 +836,7 @@ export function WorkflowCopilotChat({
         streamingAbortController.current = null;
       }
       pendingMessageId.current = null;
+      pendingCancelToken.current = null;
       setIsLoading(false);
       setProcessingStatus("");
       setLatestNarration("");
@@ -1189,13 +1229,22 @@ export function WorkflowCopilotChat({
               overflow: "auto",
             }}
           />
-          <button
-            onClick={() => handleSend()}
-            disabled={isLoading}
-            className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Send
-          </button>
+          {isLoading ? (
+            <button
+              onClick={cancelSend}
+              title="Stop Copilot"
+              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              onClick={() => handleSend()}
+              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Send
+            </button>
+          )}
         </div>
       </div>
 
