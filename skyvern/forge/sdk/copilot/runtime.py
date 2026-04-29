@@ -186,7 +186,29 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
     """Create a browser session if needed. Returns None on success, error dict on failure."""
     if ctx.browser_session_id:
-        return None
+        # Probe attachability — a stale DB row demotes to auto-create here
+        # instead of bubbling up as a "No browser context" tool failure.
+        try:
+            state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+            if state and state.browser_context:
+                return None
+            LOG.warning(
+                "Supplied browser_session_id is no longer attachable; auto-creating",
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Browser state probe raised for supplied session; auto-creating",
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+        ctx.browser_session_id = None
 
     session = None
     try:
