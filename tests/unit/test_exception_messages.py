@@ -109,3 +109,34 @@ def test_unknown_error_display_server_no_display() -> None:
     error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
     message = str(error)
     assert "browser display/graphics stack" in message
+
+
+def test_unknown_error_strips_browser_logs_with_internal_path() -> None:
+    """SKY-8931: Browser logs section exposes internal browser binary path."""
+    inner_exception = Exception(
+        "BrowserType.launch_persistent_context: Target page, context or browser has been closed\n\n"
+        "Browser logs:\n"
+        "<launching> /opt/internal-browser/chromium/chrome "
+        "--disable-field-trial-config --disable-background-networking"
+    )
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
+    message = str(error)
+    assert "/opt/internal-browser" not in message
+    assert "Browser logs:" not in message
+    assert "--disable-field-trial-config" not in message
+    assert "Target page, context or browser has been closed" in message
+    assert "support@skyvern.com" in message
+
+
+def test_unknown_error_timeout_with_browser_logs_still_formats_structured() -> None:
+    """Timeout + Browser logs: the structured 'timed out after N seconds' path must win."""
+    inner_exception = Exception(
+        "BrowserType.launch_persistent_context: Timeout 180000ms exceeded.\n\n"
+        "Browser logs:\n"
+        "<launching> /opt/internal-browser/chromium/chrome --disable-field-trial-config"
+    )
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception)
+    message = str(error)
+    assert "timed out after 180 seconds" in message
+    assert "/opt/internal-browser" not in message
+    assert "Browser logs:" not in message
