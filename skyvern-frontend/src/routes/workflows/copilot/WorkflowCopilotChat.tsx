@@ -122,7 +122,11 @@ interface WorkflowCopilotChatProps {
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
+  initialMessage?: string;
+  onInitialMessageConsumed?: () => void;
 }
+
+const AUTO_SEND_TIMEOUT_MS = 5000;
 
 const DEFAULT_WINDOW_WIDTH = 600;
 const DEFAULT_WINDOW_HEIGHT = 400;
@@ -174,6 +178,8 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
   liveBrowserSessionId,
+  initialMessage,
+  onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
@@ -228,6 +234,19 @@ export function WorkflowCopilotChat({
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
   const hasScrolledOnLoad = useRef(false);
+  const hasAutoSentRef = useRef(false);
+  // Reset on initialMessage change so a re-arrival of the prop (without a
+  // remount) can fire auto-send again.
+  useEffect(() => {
+    hasAutoSentRef.current = false;
+  }, [initialMessage]);
+  const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
+  useEffect(() => {
+    onInitialMessageConsumedRef.current = onInitialMessageConsumed;
+  }, [onInitialMessageConsumed]);
+  // Pinned per workflow so dep-change re-fires can't clobber locally-pushed
+  // messages, and so auto-send has a synchronous "history loaded" gate.
+  const historyLoadedForRef = useRef<string | null>(null);
 
   const scrollToBottom = (behavior: ScrollBehavior) => {
     messagesEndRef.current?.scrollIntoView({ behavior });
@@ -459,6 +478,11 @@ export function WorkflowCopilotChat({
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
+      historyLoadedForRef.current = null;
+      return;
+    }
+
+    if (historyLoadedForRef.current === workflowPermanentId) {
       return;
     }
 
@@ -490,6 +514,7 @@ export function WorkflowCopilotChat({
         setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
         setProposedWorkflow(response.data.proposed_workflow ?? null);
         setAutoAccept(response.data.auto_accept ?? false);
+        historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
       } finally {
@@ -533,8 +558,9 @@ export function WorkflowCopilotChat({
     streamingAbortController.current?.abort();
   };
 
-  const handleSend = async () => {
-    if (!inputValue.trim() || isLoading) return;
+  const handleSend = async (messageOverride?: string) => {
+    const candidate = messageOverride ?? inputValue;
+    if (!candidate.trim() || isLoading) return;
     if (!workflowPermanentId) {
       toast({
         title: "Missing workflow",
@@ -548,14 +574,16 @@ export function WorkflowCopilotChat({
     const userMessage: ChatMessage = {
       id: userMessageId,
       sender: "user",
-      content: inputValue,
+      content: candidate,
     };
 
     pendingMessageId.current = userMessageId;
     setMessages((prev) => [...prev, userMessage]);
     setProposedWorkflow(null);
-    const messageContent = inputValue;
-    setInputValue("");
+    const messageContent = candidate;
+    if (messageOverride === undefined) {
+      setInputValue("");
+    }
     setIsLoading(true);
     setProcessingStatus("Starting...");
     setLatestNarration("");
@@ -782,6 +810,69 @@ export function WorkflowCopilotChat({
       handleSend();
     }
   };
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory || isLoading || !workflowPermanentId) {
+      return;
+    }
+    // Synchronous gate: isLoadingHistory state is stale in this effect's
+    // closure when both effects run in the same commit.
+    if (historyLoadedForRef.current !== workflowPermanentId) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (
+      !saveData?.workflow.workflow_id ||
+      saveData.workflow.workflow_permanent_id !== workflowPermanentId
+    ) {
+      return;
+    }
+    // Trip the guard before any await so the 5s timeout cannot toast over
+    // an in-flight send.
+    hasAutoSentRef.current = true;
+    onInitialMessageConsumedRef.current?.();
+    handleSend(initialMessage).catch((error) => {
+      console.error("Auto-send failed:", error);
+    });
+    // handleSend omitted: a new reference each render would re-fire the effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    initialMessage,
+    isLoadingHistory,
+    isLoading,
+    workflowPermanentId,
+    getSaveData,
+  ]);
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (!saveData?.workflow.workflow_id) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (hasAutoSentRef.current) return;
+      hasAutoSentRef.current = true;
+      onInitialMessageConsumedRef.current?.();
+      toast({
+        title: "Could not auto-send message",
+        description:
+          "The copilot was not ready in time — please retype your prompt.",
+        variant: "destructive",
+      });
+    }, AUTO_SEND_TIMEOUT_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [initialMessage, isLoadingHistory, getSaveData]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -1099,7 +1190,7 @@ export function WorkflowCopilotChat({
             }}
           />
           <button
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={isLoading}
             className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
           >
