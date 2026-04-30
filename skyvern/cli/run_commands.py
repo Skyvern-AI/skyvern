@@ -289,15 +289,29 @@ def run_docker() -> None:
         console.print(f"[bold red]Docker Compose failed: {e}[/bold red]")
         raise typer.Exit(1)
 
-    console.print(
-        Panel(
-            "[bold green]Skyvern is now running![/bold green]\n\n"
-            "🌐 [bold]UI:[/bold] [cyan]http://localhost:8080[/cyan]\n"
-            "🔌 [bold]API:[/bold] [cyan]http://localhost:8000[/cyan]\n\n"
-            "To stop: [cyan]skyvern stop docker[/cyan] or [cyan]docker compose down[/cyan]",
-            border_style="green",
+    from skyvern.cli.utils import wait_for_docker_services  # noqa: PLC0415
+
+    if wait_for_docker_services():
+        console.print(
+            Panel(
+                "[bold green]Skyvern is ready![/bold green]\n\n"
+                "🌐 [bold]UI:[/bold] [cyan]http://localhost:8080[/cyan]\n"
+                "🔌 [bold]API:[/bold] [cyan]http://localhost:8000[/cyan]\n\n"
+                "To stop: [cyan]skyvern stop docker[/cyan] or [cyan]docker compose down[/cyan]",
+                border_style="green",
+            )
         )
-    )
+    else:
+        console.print(
+            Panel(
+                "[yellow]Services are still starting up.[/yellow]\n\n"
+                "🌐 [bold]UI:[/bold] [cyan]http://localhost:8080[/cyan] (check back shortly)\n"
+                "🔌 [bold]API:[/bold] [cyan]http://localhost:8000[/cyan]\n\n"
+                "Run [cyan]docker compose logs -f[/cyan] to monitor progress.\n"
+                "To stop: [cyan]skyvern stop docker[/cyan] or [cyan]docker compose down[/cyan]",
+                border_style="yellow",
+            )
+        )
 
 
 @run_app.command(name="all")

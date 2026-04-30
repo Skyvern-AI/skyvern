@@ -134,14 +134,27 @@ def run_docker_compose_setup() -> None:
             console.print(f"[bold red]Error starting Docker Compose: {e.stderr}[/bold red]")
             raise typer.Exit(1)
 
-    console.print(
-        Panel(
-            "[bold green]Skyvern is now running![/bold green]\n\n"
-            "Navigate to [link]http://localhost:8080[/link] to start using the UI.\n\n"
-            "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
-            border_style="green",
+    from skyvern.cli.utils import wait_for_docker_services  # noqa: PLC0415
+
+    if wait_for_docker_services():
+        console.print(
+            Panel(
+                "[bold green]Skyvern is ready![/bold green]\n\n"
+                "Navigate to [link]http://localhost:8080[/link] to start using the UI.\n\n"
+                "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
+                border_style="green",
+            )
         )
-    )
+    else:
+        console.print(
+            Panel(
+                "[yellow]Services are still starting up.[/yellow]\n\n"
+                "Navigate to [link]http://localhost:8080[/link] once ready.\n"
+                "Run [cyan]docker compose logs -f[/cyan] to monitor progress.\n\n"
+                "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
+                border_style="yellow",
+            )
+        )
 
     # Offer to set up "Control your own browser"
     use_own_browser = Confirm.ask(
