@@ -258,6 +258,24 @@ class TestAgentTemplateSecurity:
         assert "DEBUGGER RUN INFORMATION:" not in rendered
 
 
+class TestAgentTemplateParameterizedRequestsRule:
+    def test_agent_template_has_parameterized_requests_section(self) -> None:
+        rendered = prompt_engine.load_prompt(
+            "workflow-copilot-agent",
+            **_AGENT_TEMPLATE_DEFAULTS,
+        )
+        assert "PARAMETERIZED REQUESTS WITHOUT A SAMPLE VALUE:" in rendered
+
+    def test_agent_template_keeps_sample_anchor_word(self) -> None:
+        # Eval cases with `clarification_must_mention=["sample"]` silently break
+        # if this word is dropped from the prompt; assertion surfaces it locally.
+        rendered = prompt_engine.load_prompt(
+            "workflow-copilot-agent",
+            **_AGENT_TEMPLATE_DEFAULTS,
+        )
+        assert "sample" in rendered.lower()
+
+
 class TestBuildSystemPromptSecurityRules:
     """Verify _build_system_prompt passes security_rules through to the rendered prompt."""
 
