@@ -47,6 +47,7 @@ def migrate_db() -> None:
         alembic_cfg = Config()
         path = f"{REPO_ROOT_DIR}/alembic"
         alembic_cfg.set_main_option("script_location", path)
+        alembic_cfg.set_main_option("sqlalchemy.url", refreshed.DATABASE_STRING)
         command.upgrade(alembic_cfg, "head")
         capture_setup_event("migration-complete", success=True)
     except Exception as e:

@@ -30,7 +30,8 @@ target_metadata = models.Base.metadata
 # ... etc.
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
-config.set_main_option("sqlalchemy.url", SettingsManager.get_settings().DATABASE_STRING)
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", SettingsManager.get_settings().DATABASE_STRING)
 
 
 def run_migrations_offline() -> None:
