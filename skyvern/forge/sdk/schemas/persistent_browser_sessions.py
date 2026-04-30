@@ -32,6 +32,13 @@ class PersistentBrowserType(StrEnum):
     Chrome = "chrome"
     StealthChromium = "stealth-chromium"
 
+    @classmethod
+    def from_source_browser_type(cls, value: str) -> "PersistentBrowserType | None":
+        try:
+            return cls(value)
+        except ValueError:
+            return None
+
 
 class Extensions(StrEnum):
     AdBlocker = "ad-blocker"

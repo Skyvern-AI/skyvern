@@ -25,7 +25,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
@@ -262,7 +262,7 @@ def _translate_to_agent_result(
     user_response = action_data.get("user_response") or "Done."
 
     resp_type = action_data.get("type", "REPLY")
-    if resp_type not in ("REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"):
+    if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
 
     last_workflow = ctx.last_workflow

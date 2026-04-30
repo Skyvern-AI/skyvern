@@ -10,6 +10,8 @@ Skyvern-AI/skyvern-cloud:
     dest: setup.sh
   - source: .env.example
     dest: .env.example
+  - source: .nvmrc
+    dest: .nvmrc
   - source: run_ui.sh
     dest: run_ui.sh
   - source: run_alembic_check.sh

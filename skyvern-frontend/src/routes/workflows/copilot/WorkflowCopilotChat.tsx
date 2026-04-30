@@ -1,4 +1,11 @@
-import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+  memo,
+} from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
@@ -10,6 +17,7 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
   WorkflowCopilotProcessingUpdate,
   WorkflowCopilotStreamErrorUpdate,
@@ -23,6 +31,12 @@ import {
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
+import {
+  ToolActivity,
+  applyToolCall,
+  applyToolResult,
+  getActivityDotClass,
+} from "./toolActivity";
 
 interface ChatMessage {
   id: string;
@@ -39,13 +53,6 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate;
-
-interface ToolActivity {
-  tool_name: string;
-  tool_call_id: string;
-  status: "running" | "success" | "error";
-  summary?: string;
-}
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   update_workflow: "Updating workflow",
@@ -122,7 +129,11 @@ interface WorkflowCopilotChatProps {
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
+  initialMessage?: string;
+  onInitialMessageConsumed?: () => void;
 }
+
+const AUTO_SEND_TIMEOUT_MS = 5000;
 
 const DEFAULT_WINDOW_WIDTH = 600;
 const DEFAULT_WINDOW_HEIGHT = 400;
@@ -174,6 +185,8 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
   liveBrowserSessionId,
+  initialMessage,
+  onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
@@ -187,6 +200,7 @@ export function WorkflowCopilotChat({
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   const pendingMessageId = useRef<string | null>(null);
+  const pendingCancelToken = useRef<string | null>(null);
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -228,6 +242,19 @@ export function WorkflowCopilotChat({
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
   const hasScrolledOnLoad = useRef(false);
+  const hasAutoSentRef = useRef(false);
+  // Reset on initialMessage change so a re-arrival of the prop (without a
+  // remount) can fire auto-send again.
+  useEffect(() => {
+    hasAutoSentRef.current = false;
+  }, [initialMessage]);
+  const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
+  useEffect(() => {
+    onInitialMessageConsumedRef.current = onInitialMessageConsumed;
+  }, [onInitialMessageConsumed]);
+  // Pinned per workflow so dep-change re-fires can't clobber locally-pushed
+  // messages, and so auto-send has a synchronous "history loaded" gate.
+  const historyLoadedForRef = useRef<string | null>(null);
 
   const scrollToBottom = (behavior: ScrollBehavior) => {
     messagesEndRef.current?.scrollIntoView({ behavior });
@@ -459,6 +486,11 @@ export function WorkflowCopilotChat({
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
+      historyLoadedForRef.current = null;
+      return;
+    }
+
+    if (historyLoadedForRef.current === workflowPermanentId) {
       return;
     }
 
@@ -490,6 +522,7 @@ export function WorkflowCopilotChat({
         setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
         setProposedWorkflow(response.data.proposed_workflow ?? null);
         setAutoAccept(response.data.auto_accept ?? false);
+        historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
       } finally {
@@ -506,6 +539,42 @@ export function WorkflowCopilotChat({
     };
   }, [credentialGetter, workflowPermanentId]);
 
+  const cancelSend = useCallback(async () => {
+    if (!streamingAbortController.current) return;
+
+    const cancelToken = pendingCancelToken.current;
+    pendingCancelToken.current = null;
+    if (!cancelToken) return;
+
+    // Backend persists the user message + a matching AI bubble on cancel,
+    // so chat history reload stays consistent. We don't remove the user's
+    // pending message either — reload would otherwise show only the AI
+    // cancellation reply with no prompt above it.
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-cancel`,
+        sender: "ai",
+        content: "Cancelled by user.",
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    streamingAbortController.current.abort();
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post<void>("/workflow/copilot/cancel", {
+        cancel_token: cancelToken,
+      } as WorkflowCopilotCancelRequest);
+    } catch (error) {
+      // 503 (Redis disabled) or network failure: client-side abort still
+      // gives the user immediate feedback; the backend will run to
+      // completion in that environment. Log so we can spot it in dev.
+      console.warn("Workflow copilot cancel POST failed", error);
+    }
+  }, [credentialGetter]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || !isOpen || !isLoading) {
@@ -518,23 +587,11 @@ export function WorkflowCopilotChat({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isLoading, isOpen]);
+  }, [isLoading, isOpen, cancelSend]);
 
-  const cancelSend = async () => {
-    if (!streamingAbortController.current) return;
-
-    if (pendingMessageId.current) {
-      const messageId = pendingMessageId.current;
-      pendingMessageId.current = null;
-      setMessages((prev) => prev.filter((message) => message.id !== messageId));
-    }
-    setIsLoading(false);
-    setProcessingStatus("");
-    streamingAbortController.current?.abort();
-  };
-
-  const handleSend = async () => {
-    if (!inputValue.trim() || isLoading) return;
+  const handleSend = async (messageOverride?: string) => {
+    const candidate = messageOverride ?? inputValue;
+    if (!candidate.trim() || isLoading) return;
     if (!workflowPermanentId) {
       toast({
         title: "Missing workflow",
@@ -548,14 +605,19 @@ export function WorkflowCopilotChat({
     const userMessage: ChatMessage = {
       id: userMessageId,
       sender: "user",
-      content: inputValue,
+      content: candidate,
     };
+
+    const cancelToken = crypto.randomUUID();
+    pendingCancelToken.current = cancelToken;
 
     pendingMessageId.current = userMessageId;
     setMessages((prev) => [...prev, userMessage]);
     setProposedWorkflow(null);
-    const messageContent = inputValue;
-    setInputValue("");
+    const messageContent = candidate;
+    if (messageOverride === undefined) {
+      setInputValue("");
+    }
     setIsLoading(true);
     setProcessingStatus("Starting...");
     setLatestNarration("");
@@ -661,6 +723,8 @@ export function WorkflowCopilotChat({
       const handleResponse = (
         response: WorkflowCopilotStreamResponseUpdate,
       ) => {
+        // Stream completed; a Cancel click after this point should no-op.
+        pendingCancelToken.current = null;
         setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
         const aiMessage: ChatMessage = {
@@ -679,6 +743,7 @@ export function WorkflowCopilotChat({
       };
 
       const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+        pendingCancelToken.current = null;
         const errorMessage: ChatMessage = {
           id: Date.now().toString(),
           sender: "ai",
@@ -698,6 +763,7 @@ export function WorkflowCopilotChat({
           browser_session_id: liveBrowserSessionId ?? null,
           message: messageContent,
           workflow_yaml: workflowYaml,
+          cancel_token: cancelToken,
         } as WorkflowCopilotChatRequest,
         (payload) => {
           switch (payload.type) {
@@ -709,27 +775,10 @@ export function WorkflowCopilotChat({
                 TOOL_DISPLAY_NAMES[payload.tool_name] ??
                   payload.tool_name + "...",
               );
-              setToolActivity((prev) => [
-                ...prev,
-                {
-                  tool_name: payload.tool_name,
-                  tool_call_id: payload.tool_call_id,
-                  status: "running",
-                },
-              ]);
+              setToolActivity((prev) => applyToolCall(prev, payload));
               return false;
             case "tool_result":
-              setToolActivity((prev) =>
-                prev.map((item) =>
-                  item.tool_call_id === payload.tool_call_id
-                    ? {
-                        ...item,
-                        status: payload.success ? "success" : "error",
-                        summary: payload.summary,
-                      }
-                    : item,
-                ),
-              );
+              setToolActivity((prev) => applyToolResult(prev, payload));
               return false;
             case "condensing":
               if (payload.status === "started") {
@@ -769,6 +818,7 @@ export function WorkflowCopilotChat({
         streamingAbortController.current = null;
       }
       pendingMessageId.current = null;
+      pendingCancelToken.current = null;
       setIsLoading(false);
       setProcessingStatus("");
       setLatestNarration("");
@@ -782,6 +832,69 @@ export function WorkflowCopilotChat({
       handleSend();
     }
   };
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory || isLoading || !workflowPermanentId) {
+      return;
+    }
+    // Synchronous gate: isLoadingHistory state is stale in this effect's
+    // closure when both effects run in the same commit.
+    if (historyLoadedForRef.current !== workflowPermanentId) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (
+      !saveData?.workflow.workflow_id ||
+      saveData.workflow.workflow_permanent_id !== workflowPermanentId
+    ) {
+      return;
+    }
+    // Trip the guard before any await so the 5s timeout cannot toast over
+    // an in-flight send.
+    hasAutoSentRef.current = true;
+    onInitialMessageConsumedRef.current?.();
+    handleSend(initialMessage).catch((error) => {
+      console.error("Auto-send failed:", error);
+    });
+    // handleSend omitted: a new reference each render would re-fire the effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    initialMessage,
+    isLoadingHistory,
+    isLoading,
+    workflowPermanentId,
+    getSaveData,
+  ]);
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (!saveData?.workflow.workflow_id) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (hasAutoSentRef.current) return;
+      hasAutoSentRef.current = true;
+      onInitialMessageConsumedRef.current?.();
+      toast({
+        title: "Could not auto-send message",
+        description:
+          "The copilot was not ready in time — please retype your prompt.",
+        variant: "destructive",
+      });
+    }, AUTO_SEND_TIMEOUT_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [initialMessage, isLoadingHistory, getSaveData]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -1050,27 +1163,38 @@ export function WorkflowCopilotChat({
                 </div>
                 {toolActivity.length > 0 && (
                   <div className="mt-2 space-y-1">
-                    {toolActivity.map((activity, index) => (
-                      <div
-                        key={index}
-                        className="flex items-start gap-1.5 text-xs text-slate-500"
-                      >
-                        <span
-                          className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${
-                            activity.status === "running"
-                              ? "animate-pulse bg-blue-400"
-                              : activity.status === "success"
-                                ? "bg-green-400"
-                                : "bg-red-400"
-                          }`}
-                        />
-                        <span className="line-clamp-2 min-w-0 flex-1">
-                          {TOOL_DISPLAY_NAMES[activity.tool_name] ??
-                            activity.tool_name}
-                          {activity.summary ? ` — ${activity.summary}` : ""}
-                        </span>
-                      </div>
-                    ))}
+                    {toolActivity.map((activity) => {
+                      const isRetrySuccess =
+                        activity.status === "success" &&
+                        activity.linkedRecovery === true;
+                      const tooltip = activity.detail ?? activity.summary;
+                      const displayName =
+                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
+                        activity.tool_name;
+                      const containerClass = `flex items-start gap-1.5 text-xs text-slate-500${
+                        activity.linkedRecovery
+                          ? " border-l border-amber-400/40 pl-2"
+                          : ""
+                      }`;
+                      return (
+                        <div
+                          key={activity.tool_call_id}
+                          className={containerClass}
+                        >
+                          <span
+                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
+                          />
+                          <span
+                            className="line-clamp-2 min-w-0 flex-1"
+                            title={tooltip}
+                          >
+                            {isRetrySuccess ? "↻ " : ""}
+                            {displayName}
+                            {activity.summary ? ` — ${activity.summary}` : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1098,13 +1222,22 @@ export function WorkflowCopilotChat({
               overflow: "auto",
             }}
           />
-          <button
-            onClick={handleSend}
-            disabled={isLoading}
-            className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Send
-          </button>
+          {isLoading ? (
+            <button
+              onClick={cancelSend}
+              title="Stop Copilot"
+              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              onClick={() => handleSend()}
+              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Send
+            </button>
+          )}
         </div>
       </div>
 

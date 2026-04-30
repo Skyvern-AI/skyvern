@@ -348,72 +348,6 @@ if settings.ENABLE_OPENAI:
     )
 
 if settings.ENABLE_ANTHROPIC:
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3",
-        LLMConfig(
-            "anthropic/claude-3-sonnet-20240229",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3_OPUS",
-        LLMConfig(
-            "anthropic/claude-3-opus-20240229",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3_SONNET",
-        LLMConfig(
-            "anthropic/claude-3-sonnet-20240229",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3_HAIKU",
-        LLMConfig(
-            "anthropic/claude-3-haiku-20240307",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3.5_SONNET",
-        LLMConfig(
-            "anthropic/claude-3-5-sonnet-latest",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=8192,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3.7_SONNET",
-        LLMConfig(
-            "anthropic/claude-3-7-sonnet-latest",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=64000,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3.5_HAIKU",
-        LLMConfig(
-            "anthropic/claude-3-5-haiku-latest",
-            ["ANTHROPIC_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=8192,
-        ),
-    )
     # All Claude 4+ models require temperature=1 when extended thinking is enabled.
     # The runtime applies thinking optimization to all Anthropic models, so temperature=1
     # must be set here to avoid "temperature must be 1" errors from the Anthropic API.
@@ -508,72 +442,6 @@ if settings.ENABLE_ANTHROPIC:
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3_OPUS",
-        LLMConfig(
-            "bedrock/anthropic.claude-3-opus-20240229-v1:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3_SONNET",
-        LLMConfig(
-            "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3_HAIKU",
-        LLMConfig(
-            "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3.5_HAIKU",
-        LLMConfig(
-            "bedrock/anthropic.claude-3-5-haiku-20241022-v1:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=8192,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET",
-        LLMConfig(
-            "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=8192,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE",
-        LLMConfig(
-            "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=8192,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1",
-        LLMConfig(
-            "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
         "BEDROCK_AMAZON_NOVA_PRO",
         LLMConfig(
             "bedrock/us.amazon.nova-pro-v1:0",
@@ -589,16 +457,6 @@ if settings.ENABLE_BEDROCK:
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
-        ),
-    )
-    LLMConfigRegistry.register_config(
-        "BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE",
-        LLMConfig(
-            "bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-            ["AWS_REGION"],
-            supports_vision=True,
-            add_assistant_prefix=True,
-            max_completion_tokens=64000,
         ),
     )
     LLMConfigRegistry.register_config(

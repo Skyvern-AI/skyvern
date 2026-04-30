@@ -9,6 +9,8 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
 
+DEFAULT_POSTGRES_DATABASE_STRING = "postgresql+psycopg://skyvern@localhost:5432/skyvern"
+
 
 def update_or_add_env_var(key: str, value: str) -> None:
     """Update or add environment variable in .env file."""
@@ -42,7 +44,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "MAX_STEPS_PER_RUN": "50",
             "LOG_LEVEL": "INFO",
             "LITELLM_LOG": "CRITICAL",
-            "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
+            "DATABASE_STRING": DEFAULT_POSTGRES_DATABASE_STRING,
             "PORT": "8000",
             "ANALYTICS_ID": "anonymous",
             "ENABLE_LOG_ARTIFACTS": "false",

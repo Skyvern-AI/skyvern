@@ -889,6 +889,8 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
 
     # Fixing trivial common LLM mistakes; non-dict YAML falls through to model_validate.
     if isinstance(parsed_yaml, dict):
+        # title is schema-required; coerce rather than force a self-healing round-trip.
+        parsed_yaml.setdefault("title", "")
         workflow_definition = parsed_yaml.get("workflow_definition", None)
         if workflow_definition:
             blocks = workflow_definition.get("blocks", []) or []

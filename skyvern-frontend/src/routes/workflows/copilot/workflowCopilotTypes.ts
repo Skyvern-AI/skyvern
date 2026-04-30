@@ -31,6 +31,11 @@ export interface WorkflowCopilotChatRequest {
   browser_session_id?: string | null;
   message: string;
   workflow_yaml: string;
+  cancel_token?: string;
+}
+
+export interface WorkflowCopilotCancelRequest {
+  cancel_token: string;
 }
 
 export interface WorkflowCopilotChatHistoryMessage {
@@ -99,6 +104,7 @@ export interface WorkflowCopilotToolResultUpdate {
   summary: string;
   iteration: number;
   tool_call_id: string;
+  detail?: string | null;
 }
 
 export interface WorkflowCopilotCondensingUpdate {

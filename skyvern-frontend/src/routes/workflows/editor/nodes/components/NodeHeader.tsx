@@ -32,6 +32,7 @@ import {
   type Parameter,
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
+import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -565,7 +566,16 @@ function NodeHeader({
     // If there are any workflow parameters, always prompt the user
     // The backend requires all params to be specified for each run
     if (workflowParameters.length > 0) {
-      const currentValues = getInitialValues(location, workflowParameters);
+      const lastRunValues = workflowPermanentId
+        ? useDebuggerLastRunValuesStore
+            .getState()
+            .getLastRunValues(workflowPermanentId)
+        : null;
+      const currentValues = getInitialValues(
+        location,
+        workflowParameters,
+        lastRunValues,
+      );
       setCurrentParamValues(currentValues);
       setParametersToPrompt(workflowParameters);
       setShowParamsDialog(true);
@@ -744,6 +754,11 @@ function NodeHeader({
             },
             {
               onSuccess: () => {
+                if (workflowPermanentId) {
+                  useDebuggerLastRunValuesStore
+                    .getState()
+                    .setLastRunValues(workflowPermanentId, values);
+                }
                 // Close dialog on success - navigation also happens in mutation's onSuccess
                 setShowParamsDialog(false);
               },

@@ -4,43 +4,73 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
 
+const getDefaultFormValueForParameter = (
+  parameter: WorkflowParameter,
+): unknown => {
+  const hasDefaultValue =
+    parameter.default_value !== null && parameter.default_value !== undefined;
+  if (!hasDefaultValue) {
+    return undefined;
+  }
+  if (parameter.workflow_parameter_type === "json") {
+    if (typeof parameter.default_value === "string") {
+      return parameter.default_value;
+    }
+    return JSON.stringify(parameter.default_value, null, 2);
+  }
+  if (parameter.workflow_parameter_type === "boolean") {
+    return (
+      parameter.default_value === "true" || parameter.default_value === true
+    );
+  }
+  return parameter.default_value;
+};
+
+const getDefaultsFromWorkflowParameters = (
+  workflowParameters: WorkflowParameter[],
+): Record<string, unknown> => {
+  return workflowParameters.reduce(
+    (acc, parameter) => {
+      const defaultValue = getDefaultFormValueForParameter(parameter);
+      acc[parameter.key] =
+        defaultValue !== undefined
+          ? defaultValue
+          : parameter.workflow_parameter_type === "string"
+            ? ""
+            : null;
+      return acc;
+    },
+    {} as Record<string, unknown>,
+  );
+};
+
 export const getInitialValues = (
   location: Location,
   workflowParameters: WorkflowParameter[],
-) => {
-  const iv = location.state?.data
-    ? location.state.data
-    : workflowParameters?.reduce(
-        (acc, curr) => {
-          const hasDefaultValue =
-            curr.default_value !== null && curr.default_value !== undefined;
-          if (hasDefaultValue) {
-            // Handle JSON parameters
-            if (curr.workflow_parameter_type === "json") {
-              if (typeof curr.default_value === "string") {
-                acc[curr.key] = curr.default_value;
-              } else {
-                acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
-              }
-              return acc;
-            }
-            if (curr.workflow_parameter_type === "boolean") {
-              // Backend stores as strings, convert to boolean for frontend
-              acc[curr.key] =
-                curr.default_value === "true" || curr.default_value === true;
-              return acc;
-            }
-            acc[curr.key] = curr.default_value;
-            return acc;
-          }
-          // For string parameters, keep empty string instead of null to match run form behavior
-          acc[curr.key] = curr.workflow_parameter_type === "string" ? "" : null;
-          return acc;
-        },
-        {} as Record<string, unknown>,
-      );
+  lastRunValues?: Record<string, unknown> | null,
+): Record<string, unknown> => {
+  if (location.state?.data) {
+    return location.state.data as Record<string, unknown>;
+  }
 
-  return iv as Record<string, unknown>;
+  const defaults = getDefaultsFromWorkflowParameters(workflowParameters);
+
+  if (!lastRunValues) {
+    return defaults;
+  }
+
+  return workflowParameters.reduce<Record<string, unknown>>(
+    (acc, parameter) => {
+      acc[parameter.key] = Object.prototype.hasOwnProperty.call(
+        lastRunValues,
+        parameter.key,
+      )
+        ? lastRunValues[parameter.key]
+        : defaults[parameter.key];
+      return acc;
+    },
+    {},
+  );
 };
 
 export interface Duration {

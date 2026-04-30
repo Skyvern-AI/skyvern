@@ -279,8 +279,6 @@ async def test_workflow_create_preserves_explicit_internal_text_prompt_llm_key(m
 @pytest.mark.parametrize(
     "hallucinated_key",
     [
-        "ANTHROPIC_CLAUDE_3_5_SONNET",  # exact key from the Slack thread
-        "ANTHROPIC_CLAUDE3.5_SONNET",  # the "correct" key Pedro mentioned — still not public
         "ANTHROPIC_CLAUDE_3_5_HAIKU",
         "OPENAI_GPT4_TURBO",
         "VERTEX_GEMINI_2_FLASH",
