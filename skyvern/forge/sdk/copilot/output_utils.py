@@ -247,7 +247,7 @@ _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 
 
-def _sanitize_failure_text(text: str) -> str:
+def _sanitize_failure_text(text: str, max_chars: int = 120) -> str:
     """Strip dict/HTTP-header dumps and cap a failure message for chat display.
 
     The chat activity bullet is a fact, not a data dump — we never want raw
@@ -259,8 +259,8 @@ def _sanitize_failure_text(text: str) -> str:
     text = " ".join(text.split())
     if not text:
         return "(no details)"
-    if len(text) > 120:
-        text = text[:117] + "..."
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
     return text
 
 
@@ -341,6 +341,21 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
     return "OK"
+
+
+def build_run_blocks_response(run_ok: bool, result_data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a run-blocks result, promoting the first failure reason to a top-level ``error``."""
+    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
+    if not run_ok:
+        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
+    return response
+
+
+def summarize_tool_result_detail(result: dict[str, Any], max_chars: int = 800) -> str | None:
+    """Tooltip-grade failure detail (longer cap than ``summarize_tool_result``); None on success."""
+    if result.get("ok", False):
+        return None
+    return _sanitize_failure_text(_extract_failure_message(result), max_chars=max_chars)
 
 
 def truncate_output(output: Any, max_chars: int = 2000) -> str | None:
