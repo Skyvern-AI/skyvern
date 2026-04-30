@@ -142,6 +142,13 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
     summary: str = Field(..., description="Brief human-readable summary of the result")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    detail: str | None = Field(
+        None,
+        description=(
+            "Longer-cap sanitized failure text for tooltip display. None on success. "
+            "Distinct from `summary`, which is capped tighter for the visible bullet."
+        ),
+    )
 
 
 class WorkflowCopilotCondensingUpdate(BaseModel):

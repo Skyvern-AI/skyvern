@@ -7,7 +7,7 @@ This document provides comprehensive information about Skyvern Workflow YAML str
 A Skyvern workflow is defined in YAML format with the following top-level structure
 for a workflow definition (embedded under workflow_definition in full specs):
 
-title: "<workflow title>"
+title: "<workflow title>" # Required
 description: "<optional description>"
 workflow_definition:
   version: 2 # IMPORTANT: Always use version 2

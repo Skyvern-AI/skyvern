@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.output_utils import (
+    build_run_blocks_response,
     iter_failure_reasons,
     sanitize_tool_result_for_llm,
     truncate_output,
@@ -1371,15 +1372,7 @@ async def _run_blocks_and_collect_debug(
                 existing_set.add(label)
         ctx.verified_prefix_labels = existing_prefix
 
-    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
-    if not run_ok:
-        # Promote the real failure message into a top-level ``error`` field so
-        # every downstream consumer (summarize_tool_result, SSE frames, logs,
-        # LLM context) sees it instead of defaulting to "Unknown error".
-        # Wording matches ExtractionBlock's "Unknown error (no failure reason
-        # provided)" fallback so error-message matching stays consistent.
-        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
-    return response
+    return build_run_blocks_response(run_ok, result_data)
 
 
 async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:

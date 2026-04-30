@@ -21,7 +21,7 @@ from skyvern.forge.sdk.copilot.narration import (
     schedule_narration,
     snapshot_ctx,
 )
-from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
+from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result, summarize_tool_result_detail
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotToolCallUpdate,
@@ -147,6 +147,7 @@ async def stream_to_sse(
                 # below also needs them, and the work is cheap (no I/O).
                 summary = summarize_tool_result(tool_name, parsed)
                 success = parsed.get("ok", True)
+                detail = summarize_tool_result_detail(parsed)
 
                 if not client_gone:
                     await stream.send(
@@ -157,6 +158,7 @@ async def stream_to_sse(
                             summary=summary,
                             iteration=iteration,
                             tool_call_id=call_id,
+                            detail=detail,
                         )
                     )
 
