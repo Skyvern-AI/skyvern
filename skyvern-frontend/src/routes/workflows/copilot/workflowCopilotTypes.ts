@@ -68,7 +68,8 @@ export type WorkflowCopilotStreamMessageType =
   | "tool_call"
   | "tool_result"
   | "condensing"
-  | "narration";
+  | "narration"
+  | "block_progress";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -115,6 +116,16 @@ export interface WorkflowCopilotCondensingUpdate {
 export interface WorkflowCopilotNarrationUpdate {
   type: "narration";
   narration: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export interface WorkflowCopilotBlockProgressUpdate {
+  type: "block_progress";
+  workflow_run_block_id: string;
+  block_label: string;
+  block_type: string;
+  status: string;
   iteration: number;
   timestamp: string;
 }
