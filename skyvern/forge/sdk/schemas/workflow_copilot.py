@@ -93,6 +93,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     TOOL_RESULT = "tool_result"
     CONDENSING = "condensing"
     NARRATION = "narration"
+    BLOCK_PROGRESS = "block_progress"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -169,6 +170,21 @@ class WorkflowCopilotNarrationUpdate(BaseModel):
     )
     narration: str = Field(..., description="One-sentence user-facing progress narration")
     iteration: int = Field(..., description="Agent loop iteration number this narration describes")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotBlockProgressUpdate(BaseModel):
+    # Per-block lifecycle event from inside long-running tool calls.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.BLOCK_PROGRESS, description="Message type"
+    )
+    workflow_run_block_id: str = Field(..., description="Stable per-block id; used as the row key in the activity pane")
+    block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
+    block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
+    status: str = Field(
+        ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
+    )
+    iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
