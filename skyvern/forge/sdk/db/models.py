@@ -991,6 +991,7 @@ class BrowserProfileModel(Base):
     organization_id = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
+    source_browser_type = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

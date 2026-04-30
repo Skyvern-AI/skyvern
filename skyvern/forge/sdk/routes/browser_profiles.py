@@ -319,11 +319,14 @@ async def _create_profile_from_session(
             ),
         )
 
+    source_browser_type = browser_session.browser_type.value if browser_session.browser_type else None
+
     try:
         profile = await app.DATABASE.browser_sessions.create_browser_profile(
             organization_id=organization_id,
             name=name,
             description=description,
+            source_browser_type=source_browser_type,
         )
     except IntegrityError as exc:
         _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)

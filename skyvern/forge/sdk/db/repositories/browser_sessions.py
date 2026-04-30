@@ -36,12 +36,14 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str,
         name: str,
         description: str | None = None,
+        source_browser_type: str | None = None,
     ) -> BrowserProfile:
         async with self.Session() as session:
             browser_profile = BrowserProfileModel(
                 organization_id=organization_id,
                 name=name,
                 description=description,
+                source_browser_type=source_browser_type,
             )
             session.add(browser_profile)
             await session.commit()
