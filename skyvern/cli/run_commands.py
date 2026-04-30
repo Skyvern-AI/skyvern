@@ -282,6 +282,15 @@ def run_docker() -> None:
         console.print("[bold red]Docker is not running.[/bold red] Please start Docker Desktop and try again.")
         raise typer.Exit(1)
 
+    # Ensure frontend .env exists (docker-compose.yml references it via env_file)
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        import shutil  # noqa: PLC0415
+
+        shutil.copy(frontend_example, frontend_env)
+        console.print("✅ [green]Created skyvern-frontend/.env from .env.example[/green]")
+
     console.print(Panel("[bold green]Starting Skyvern via Docker Compose...[/bold green]", border_style="green"))
     try:
         subprocess.run(["docker", "compose", "up", "-d"], check=True)

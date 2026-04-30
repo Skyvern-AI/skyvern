@@ -109,6 +109,15 @@ def run_docker_compose_setup() -> None:
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
     setup_llm_providers()
 
+    # Ensure frontend .env exists (docker-compose.yml references it via env_file)
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        import shutil
+
+        shutil.copy(frontend_example, frontend_env)
+        console.print("✅ [green]Created skyvern-frontend/.env from .env.example[/green]")
+
     # Run docker compose up
     console.print("\n[bold blue]Step 2: Starting Docker Compose...[/bold blue]")
     with Progress(
