@@ -20,6 +20,7 @@ import { helpTooltips, placeholders } from "../../helpContent";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -62,6 +63,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<ExtractionNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -228,6 +230,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                     nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
+                    parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                     blockType="extraction"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
