@@ -43,6 +43,7 @@ export async function fetchStreamingSse<T>(
     }
     externalSignal.addEventListener("abort", onExternalAbort, { once: true });
   }
+  let receivedTerminal = false;
   try {
     await new Promise<void>((resolve, reject) => {
       const safeResolve = () => {
@@ -77,6 +78,7 @@ export async function fetchStreamingSse<T>(
           try {
             const payload = JSON.parse(event.data) as T;
             if (onMessage(payload, event.event)) {
+              receivedTerminal = true;
               safeResolve();
             }
           } catch (error) {
@@ -92,7 +94,16 @@ export async function fetchStreamingSse<T>(
             safeReject(new Error(errorText || "Failed to send request."));
           }
         },
-      }).catch(safeReject);
+      }).then(() => {
+        // The library resolves cleanly on signal abort and on stream-close.
+        // Without an explicit handler the wrapper Promise hangs because
+        // safeResolve is only called from a terminal SSE event.
+        if (controller.signal.aborted || receivedTerminal) {
+          safeResolve();
+        } else {
+          safeReject(new Error("SSE stream ended without terminal event"));
+        }
+      }, safeReject);
     });
   } finally {
     if (externalSignal) {

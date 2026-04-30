@@ -4488,6 +4488,24 @@ function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
   return false;
 }
 
+function getParentLoopSkipsOnFail(
+  nodes: Array<AppNode>,
+  nodeId: string,
+): boolean {
+  const currentNode = nodes.find((n) => n.id === nodeId);
+  if (!currentNode) return false;
+  let current: AppNode | undefined = currentNode;
+  while (current?.parentId) {
+    const parent = nodes.find((n) => n.id === current!.parentId);
+    if (parent?.type === "loop") {
+      const data = parent.data as { nextLoopOnFailure?: boolean };
+      return data.nextLoopOnFailure === true;
+    }
+    current = parent;
+  }
+  return false;
+}
+
 export {
   containsJinjaReference,
   convert,
@@ -4515,6 +4533,7 @@ export {
   getWorkflowBlocks,
   getWorkflowErrors,
   isNodeInsideForLoop,
+  getParentLoopSkipsOnFail,
   isOutputParameterKey,
   layout,
   removeJinjaReferenceFromNodes,

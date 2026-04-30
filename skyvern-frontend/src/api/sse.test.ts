@@ -33,4 +33,39 @@ describe("fetchStreamingSse", () => {
       expect.objectContaining({ openWhenHidden: true }),
     );
   });
+
+  it("resolves wrapper when fetchEventSource exits cleanly under user abort", async () => {
+    const externalController = new AbortController();
+    mockFetchEventSource.mockImplementationOnce((_url, opts) => {
+      // Library forwards external abort to its internal signal then returns
+      // void — no onerror, no onmessage. Without the .then handler the
+      // wrapper Promise would hang.
+      opts.signal?.addEventListener("abort", () => {}, { once: true });
+      externalController.abort();
+      return Promise.resolve();
+    });
+
+    const settled = await Promise.race([
+      fetchStreamingSse(
+        "http://localhost/test",
+        { method: "POST", headers: {}, body: "{}" },
+        () => false,
+        { signal: externalController.signal },
+      ).then(() => "resolved" as const),
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 100)),
+    ]);
+    expect(settled).toBe("resolved");
+  });
+
+  it("rejects wrapper when stream closes cleanly without a terminal event", async () => {
+    mockFetchEventSource.mockImplementationOnce(() => Promise.resolve());
+
+    await expect(
+      fetchStreamingSse(
+        "http://localhost/test",
+        { method: "POST", headers: {}, body: "{}" },
+        () => false,
+      ),
+    ).rejects.toThrow(/terminal event/i);
+  });
 });

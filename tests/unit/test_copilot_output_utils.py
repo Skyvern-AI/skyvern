@@ -441,3 +441,94 @@ class TestParseFinalResponse:
         # A JSON array at top level is valid JSON but not a valid envelope.
         parsed = parse_final_response("[1, 2, 3]")
         assert parsed == {"type": "REPLY", "user_response": "[1, 2, 3]"}
+
+    def test_strips_leading_reply_label_before_parse(self) -> None:
+        envelope = 'REPLY\n{"type": "REPLY", "user_response": "ok"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "ok"
+
+    def test_strips_leading_ask_question_label_with_colon(self) -> None:
+        envelope = 'ASK_QUESTION:\n{"type": "ASK_QUESTION", "user_response": "what date?"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "what date?"
+
+    def test_strips_leading_replace_workflow_label(self) -> None:
+        envelope = (
+            'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}'
+        )
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLACE_WORKFLOW"
+        assert parsed["workflow_yaml"] == "title: x"
+
+    def test_extracts_json_after_prose_preamble(self) -> None:
+        envelope = 'Here\'s my response: {"type": "REPLY", "user_response": "ok"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "ok"
+
+    def test_pass_b_rejects_non_envelope_dict_in_prose(self) -> None:
+        text = 'I cannot help with {"foo": "bar"}'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_pass_b_rejects_dict_with_unrecognized_type(self) -> None:
+        text = 'I cannot help with {"type": "object"}'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovery_tier_skipped_when_text_only_mentions_user_response(self) -> None:
+        text = 'I cannot find the "user_response" field in your input.'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovery_tier_skipped_when_prose_quotes_both_markers(self) -> None:
+        # Prose discussing the envelope format (both quoted `"type": "REPLY"`
+        # and `"user_response"` substrings present, no leading `{`) must not
+        # degrade to "Done." — the user's actual prose has to survive.
+        text = 'I see "type": "REPLY" mentioned, but cannot find "user_response" anywhere.'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovers_user_response_when_global_llm_context_malformed(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "the real answer", "global_llm_context": {"user_goal": "x",}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "the real answer"
+        assert parsed["type"] == "REPLY"
+
+    def test_recovers_user_response_with_escaped_quotes(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "she said \\"hi\\"", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == 'she said "hi"'
+
+    def test_regex_recovery_tolerates_literal_newline_in_user_response_value(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "line one\nline two", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "line one\nline two"
+
+    def test_recovers_ask_question_type_when_recovering_user_response(self) -> None:
+        envelope = '{"type": "ASK_QUESTION", "user_response": "which account?", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "which account?"
+
+    def test_recovery_demotes_malformed_replace_workflow_to_reply(self) -> None:
+        # Recovery cannot extract workflow_yaml, so REPLACE_WORKFLOW would be
+        # unverified — demote to REPLY.
+        envelope = '{"type": "REPLACE_WORKFLOW", "user_response": "updated your workflow", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "updated your workflow"
+
+    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_done(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "broken'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "Done."
+        assert parsed["type"] == "REPLY"
+        assert "broken" not in parsed["user_response"]
+
+    def test_non_envelope_unparseable_text_still_falls_back_to_text(self) -> None:
+        text = "I'm not sure how to help with that."
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
