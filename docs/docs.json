@@ -371,7 +371,7 @@
   "navbar": {
     "links": [
       {
-        "label": "Get API Key",
+        "label": "Try it now",
         "href": "https://app.skyvern.com/settings"
       }
     ],
