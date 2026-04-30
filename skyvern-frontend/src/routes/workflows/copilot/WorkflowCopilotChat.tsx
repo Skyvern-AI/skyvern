@@ -31,6 +31,12 @@ import {
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
+import {
+  ToolActivity,
+  applyToolCall,
+  applyToolResult,
+  getActivityDotClass,
+} from "./toolActivity";
 
 interface ChatMessage {
   id: string;
@@ -47,13 +53,6 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate;
-
-interface ToolActivity {
-  tool_name: string;
-  tool_call_id: string;
-  status: "running" | "success" | "error";
-  summary?: string;
-}
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   update_workflow: "Updating workflow",
@@ -776,27 +775,10 @@ export function WorkflowCopilotChat({
                 TOOL_DISPLAY_NAMES[payload.tool_name] ??
                   payload.tool_name + "...",
               );
-              setToolActivity((prev) => [
-                ...prev,
-                {
-                  tool_name: payload.tool_name,
-                  tool_call_id: payload.tool_call_id,
-                  status: "running",
-                },
-              ]);
+              setToolActivity((prev) => applyToolCall(prev, payload));
               return false;
             case "tool_result":
-              setToolActivity((prev) =>
-                prev.map((item) =>
-                  item.tool_call_id === payload.tool_call_id
-                    ? {
-                        ...item,
-                        status: payload.success ? "success" : "error",
-                        summary: payload.summary,
-                      }
-                    : item,
-                ),
-              );
+              setToolActivity((prev) => applyToolResult(prev, payload));
               return false;
             case "condensing":
               if (payload.status === "started") {
@@ -1181,27 +1163,38 @@ export function WorkflowCopilotChat({
                 </div>
                 {toolActivity.length > 0 && (
                   <div className="mt-2 space-y-1">
-                    {toolActivity.map((activity, index) => (
-                      <div
-                        key={index}
-                        className="flex items-start gap-1.5 text-xs text-slate-500"
-                      >
-                        <span
-                          className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${
-                            activity.status === "running"
-                              ? "animate-pulse bg-blue-400"
-                              : activity.status === "success"
-                                ? "bg-green-400"
-                                : "bg-red-400"
-                          }`}
-                        />
-                        <span className="line-clamp-2 min-w-0 flex-1">
-                          {TOOL_DISPLAY_NAMES[activity.tool_name] ??
-                            activity.tool_name}
-                          {activity.summary ? ` — ${activity.summary}` : ""}
-                        </span>
-                      </div>
-                    ))}
+                    {toolActivity.map((activity) => {
+                      const isRetrySuccess =
+                        activity.status === "success" &&
+                        activity.linkedRecovery === true;
+                      const tooltip = activity.detail ?? activity.summary;
+                      const displayName =
+                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
+                        activity.tool_name;
+                      const containerClass = `flex items-start gap-1.5 text-xs text-slate-500${
+                        activity.linkedRecovery
+                          ? " border-l border-amber-400/40 pl-2"
+                          : ""
+                      }`;
+                      return (
+                        <div
+                          key={activity.tool_call_id}
+                          className={containerClass}
+                        >
+                          <span
+                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
+                          />
+                          <span
+                            className="line-clamp-2 min-w-0 flex-1"
+                            title={tooltip}
+                          >
+                            {isRetrySuccess ? "↻ " : ""}
+                            {displayName}
+                            {activity.summary ? ` — ${activity.summary}` : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

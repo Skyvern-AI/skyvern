@@ -104,6 +104,7 @@ export interface WorkflowCopilotToolResultUpdate {
   summary: string;
   iteration: number;
   tool_call_id: string;
+  detail?: string | null;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
