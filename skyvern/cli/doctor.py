@@ -287,6 +287,185 @@ def _check_mcp_config() -> CheckResult:
     )
 
 
+def _check_database() -> CheckResult:
+    from dotenv import load_dotenv
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    load_dotenv(resolve_backend_env_path(), override=False)
+    db_string = os.environ.get("DATABASE_STRING", "")
+    if not db_string:
+        return CheckResult(
+            name="Database",
+            status="warn",
+            detail="DATABASE_STRING not set",
+            hint="Run `skyvern init` or set DATABASE_STRING in .env",
+        )
+
+    if db_string.startswith("sqlite"):
+        db_path = db_string.split("///")[-1] if "///" in db_string else ""
+        if db_path and Path(db_path).exists():
+            return CheckResult(name="Database", status="ok", detail=f"SQLite: {db_path}")
+        if db_path:
+            return CheckResult(
+                name="Database",
+                status="error",
+                detail=f"SQLite file not found: {db_path}",
+                hint="Run `alembic upgrade head` to initialize the database",
+            )
+        return CheckResult(name="Database", status="ok", detail="SQLite (in-memory or relative)")
+
+    # PostgreSQL — try connecting
+    try:
+        result = subprocess.run(
+            ["python", "-c", f"import sqlalchemy; e = sqlalchemy.create_engine('{db_string}'); e.connect().close()"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return CheckResult(name="Database", status="ok", detail=f"Connected: {_redact_password(db_string)}")
+        stderr = result.stderr.strip()
+        if "does not exist" in stderr:
+            return CheckResult(
+                name="Database",
+                status="error",
+                detail=f"Database does not exist: {_redact_password(db_string)}",
+                hint="Run `skyvern doctor --fix` to create it, or: createdb <dbname>",
+            )
+        if "Connection refused" in stderr or "could not connect" in stderr:
+            return CheckResult(
+                name="Database",
+                status="error",
+                detail=f"Cannot connect: {_redact_password(db_string)}",
+                hint="Check that PostgreSQL is running (docker ps, pg_isready)",
+            )
+        return CheckResult(
+            name="Database",
+            status="error",
+            detail=f"Connection failed: {_redact_password(db_string)}",
+            hint=stderr[:200] if stderr else "Check DATABASE_STRING in .env",
+        )
+    except subprocess.TimeoutExpired:
+        return CheckResult(
+            name="Database",
+            status="error",
+            detail=f"Connection timed out: {_redact_password(db_string)}",
+            hint="Check that PostgreSQL is reachable",
+        )
+    except FileNotFoundError:
+        return CheckResult(
+            name="Database",
+            status="warn",
+            detail="Cannot verify (python not on PATH)",
+        )
+
+
+def _check_docker() -> CheckResult:
+    if not shutil.which("docker"):
+        return CheckResult(
+            name="Docker",
+            status="warn",
+            detail="not installed",
+            hint="Install from https://docs.docker.com/get-docker/",
+        )
+
+    result = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
+    if result.returncode != 0:
+        return CheckResult(
+            name="Docker",
+            status="warn",
+            detail="installed but not running",
+            hint="Start Docker Desktop",
+        )
+
+    # Check for postgres container
+    ps_result = subprocess.run(
+        ["docker", "ps", "--filter", "name=postgresql-container", "--format", "{{.Status}}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    standalone_pg = ps_result.stdout.strip()
+
+    compose_result = subprocess.run(
+        ["docker", "compose", "ps", "--format", "json"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    compose_running = compose_result.returncode == 0 and compose_result.stdout.strip()
+
+    parts = ["running"]
+    if standalone_pg:
+        parts.append(f"postgresql-container: {standalone_pg}")
+    if compose_running:
+        parts.append("compose services active")
+    if not standalone_pg and not compose_running:
+        parts.append("no Skyvern containers detected")
+
+    return CheckResult(name="Docker", status="ok", detail=", ".join(parts))
+
+
+def _check_llm_config() -> CheckResult:
+    from dotenv import load_dotenv
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    load_dotenv(resolve_backend_env_path(), override=False)
+
+    llm_key = os.environ.get("LLM_KEY", "")
+
+    providers = {
+        "OPENAI": {"enable": "ENABLE_OPENAI", "key": "OPENAI_API_KEY"},
+        "ANTHROPIC": {"enable": "ENABLE_ANTHROPIC", "key": "ANTHROPIC_API_KEY"},
+        "GEMINI": {"enable": "ENABLE_GEMINI", "key": "GEMINI_API_KEY"},
+        "AZURE": {"enable": "ENABLE_AZURE", "key": "AZURE_API_KEY"},
+        "BEDROCK": {"enable": "ENABLE_BEDROCK", "key": None},
+        "OLLAMA": {"enable": "ENABLE_OLLAMA", "key": None},
+        "OPENROUTER": {"enable": "ENABLE_OPENROUTER", "key": "OPENROUTER_API_KEY"},
+        "GROQ": {"enable": "ENABLE_GROQ", "key": "GROQ_API_KEY"},
+    }
+
+    enabled = []
+    missing_key = []
+    for name, cfg in providers.items():
+        if os.environ.get(cfg["enable"], "").lower() in ("true", "1", "yes"):
+            enabled.append(name)
+            api_key_var = cfg.get("key")
+            if api_key_var and not os.environ.get(api_key_var):
+                missing_key.append(f"{name} ({api_key_var})")
+
+    if not enabled:
+        return CheckResult(
+            name="LLM Provider",
+            status="error",
+            detail=f"LLM_KEY={llm_key} but no provider is enabled",
+            hint="Run `skyvern init llm` or set ENABLE_<PROVIDER>=true + API key in .env",
+        )
+
+    if missing_key:
+        return CheckResult(
+            name="LLM Provider",
+            status="error",
+            detail=f"Enabled: {', '.join(enabled)} — missing API keys: {', '.join(missing_key)}",
+            hint="Set the missing API keys in .env",
+        )
+
+    return CheckResult(
+        name="LLM Provider",
+        status="ok",
+        detail=f"LLM_KEY={llm_key}, enabled: {', '.join(enabled)}",
+    )
+
+
+def _redact_password(db_string: str) -> str:
+    """Replace password in a database URL with ***."""
+    import re
+
+    return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", db_string)
+
+
 def _check_importable(module_name: str) -> bool:
     try:
         return importlib.util.find_spec(module_name) is not None
@@ -340,6 +519,9 @@ def _check_dependency_groups() -> CheckResult:
 _CHECKS = [
     _check_python_version,
     _check_config,
+    _check_database,
+    _check_docker,
+    _check_llm_config,
     _check_playwright_browser,
     _check_port_8000,
     _check_api_connectivity,
@@ -354,8 +536,99 @@ _STATUS_STYLE = {
 }
 
 
+def _try_fix(result: CheckResult) -> bool:
+    """Attempt to auto-fix a failing check. Returns True if fixed."""
+    if result.status == "ok":
+        return False
+
+    if result.name == "Database" and "does not exist" in result.detail:
+        return _fix_create_database()
+    if result.name == "Database" and "Cannot connect" in result.detail:
+        return _fix_start_postgres()
+    if result.name == "Playwright Browser" and result.status == "error":
+        return _fix_install_playwright()
+    if result.name == "Docker" and "not running" in result.detail:
+        console.print("  [yellow]→ Please start Docker Desktop manually[/yellow]")
+        return False
+
+    return False
+
+
+def _fix_create_database() -> bool:
+    from dotenv import load_dotenv
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    load_dotenv(resolve_backend_env_path(), override=False)
+    db_string = os.environ.get("DATABASE_STRING", "")
+    if not db_string:
+        return False
+
+    import re
+
+    m = re.match(r".*://(?P<user>[^:]+):(?P<pass>[^@]+)@(?P<host>[^:]+):(?P<port>\d+)/(?P<db>[^?]+)", db_string)
+    if not m:
+        return False
+
+    console.print(f"  [cyan]Creating database '{m.group('db')}'...[/cyan]")
+    env = {
+        **os.environ,
+        "PGHOST": m.group("host"),
+        "PGPORT": m.group("port"),
+        "PGUSER": m.group("user"),
+        "PGPASSWORD": m.group("pass"),
+    }
+    result = subprocess.run(["createdb", m.group("db")], capture_output=True, text=True, env=env)
+    if result.returncode == 0 or "already exists" in (result.stderr or ""):
+        console.print(f"  [green]✅ Database '{m.group('db')}' created[/green]")
+        return True
+    # Try via docker if local createdb isn't available
+    docker_result = subprocess.run(
+        ["docker", "exec", "postgresql-container", "createdb", "-U", m.group("user"), m.group("db")],
+        capture_output=True,
+        text=True,
+    )
+    if docker_result.returncode == 0 or "already exists" in (docker_result.stderr or ""):
+        console.print(f"  [green]✅ Database '{m.group('db')}' created via Docker[/green]")
+        return True
+    console.print(f"  [red]Failed to create database: {result.stderr or docker_result.stderr}[/red]")
+    return False
+
+
+def _fix_start_postgres() -> bool:
+    # Try starting existing docker container
+    result = subprocess.run(
+        ["docker", "start", "postgresql-container"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        console.print("  [green]✅ Started postgresql-container[/green]")
+        return True
+    # Try docker compose
+    result = subprocess.run(["docker", "compose", "up", "-d", "postgres"], capture_output=True, text=True)
+    if result.returncode == 0:
+        console.print("  [green]✅ Started postgres via Docker Compose[/green]")
+        return True
+    console.print("  [yellow]→ Could not start PostgreSQL automatically. Start it manually.[/yellow]")
+    return False
+
+
+def _fix_install_playwright() -> bool:
+    console.print("  [cyan]Installing Chromium via Playwright...[/cyan]")
+    result = subprocess.run(["playwright", "install", "chromium"], capture_output=True, text=True)
+    if result.returncode == 0:
+        console.print("  [green]✅ Chromium installed[/green]")
+        return True
+    console.print(f"  [red]Failed: {result.stderr[:200]}[/red]")
+    return False
+
+
 @doctor_app.callback(invoke_without_command=True)
-def doctor(ctx: typer.Context) -> None:
+def doctor(
+    ctx: typer.Context,
+    fix: bool = typer.Option(False, "--fix", help="Attempt to auto-fix issues found"),
+) -> None:
     """Run diagnostic checks on the Skyvern installation."""
     if ctx.invoked_subcommand is not None:
         return
@@ -388,6 +661,21 @@ def doctor(ctx: typer.Context) -> None:
     n_warn = sum(1 for r in results if r.status == "warn")
     n_err = sum(1 for r in results if r.status == "error")
 
+    if fix and any(r.status in ("error", "warn") for r in results):
+        console.print("\n[bold blue]Attempting auto-fixes...[/bold blue]")
+        fixed = 0
+        for r in results:
+            if r.status in ("error", "warn"):
+                if _try_fix(r):
+                    fixed += 1
+        if fixed:
+            console.print(
+                f"\n[green]Fixed {fixed} issue{'s' if fixed > 1 else ''}. Re-run `skyvern doctor` to verify.[/green]"
+            )
+        else:
+            console.print("\n[yellow]No issues could be auto-fixed. See hints above.[/yellow]")
+        return
+
     if n_err > 0:
         parts = []
         if n_ok:
@@ -396,7 +684,9 @@ def doctor(ctx: typer.Context) -> None:
             parts.append(f"[yellow]{n_warn} warning{'s' if n_warn > 1 else ''}[/yellow]")
         parts.append(f"[red]{n_err} error{'s' if n_err > 1 else ''}[/red]")
         summary = ", ".join(parts)
-        console.print(Panel(summary, border_style="red"))
+        console.print(
+            Panel(summary + " — run [bold]skyvern doctor --fix[/bold] to attempt repairs", border_style="red")
+        )
         raise typer.Exit(code=1)
     elif n_warn > 0:
         parts = []
