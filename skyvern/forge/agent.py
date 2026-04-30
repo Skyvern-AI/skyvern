@@ -5355,6 +5355,8 @@ class ForgeAgent:
         # narrowed to just compute_cache_key + lookup so a downstream log
         # failure can't double-count as a lookup_error.
         workflow_run_id = context.workflow_run_id if context else None
+        # task.workflow_permanent_id is unset on most fetch paths — fall back to context.
+        wpid_for_cache = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
@@ -5423,14 +5425,80 @@ class ForgeAgent:
                     fallback_reason=lookup_result.fallback_reason,
                     cache_path="agent",
                 )
-            data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-                prompt=prompt,
-                step=step,
-                prompt_name="data-extraction-summary",
-                system_prompt=task.workflow_system_prompt,
-            )
-            if cache_key and isinstance(data_extraction_summary_resp, dict):
-                extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+
+            cross_run_value: dict[str, Any] | None = None
+            if cache_key is not None:
+                try:
+                    raw = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(wpid_for_cache, cache_key)
+                except Exception:
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache lookup raised",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        exc_info=True,
+                    )
+                    raw = None
+                if raw is not None and not isinstance(raw, dict):
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache hit returned non-dict value; falling through to LLM",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        value_type=type(raw).__name__,
+                        cache_path="agent",
+                    )
+                    raw = None
+                cross_run_value = raw if isinstance(raw, dict) else None
+
+            if cache_key is not None and cross_run_value is not None:
+                LOG.info(
+                    "data-extraction-summary cache hit — skipping LLM call (cross-run)",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_hit=True,
+                    cache_scope=extraction_cache.SCOPE_WPID,
+                    cache_age_seconds=None,
+                    fallback_reason=None,
+                    cache_path="agent",
+                )
+                try:
+                    extraction_cache.store(workflow_run_id, cache_key, cross_run_value)
+                except Exception:
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache backfill to in-run failed",
+                        exc_info=True,
+                    )
+                data_extraction_summary_resp = cross_run_value
+            else:
+                if cache_key is not None:
+                    LOG.info(
+                        "data-extraction-summary cache miss (cross-run)",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        cache_hit=False,
+                        cache_scope=extraction_cache.SCOPE_WPID,
+                        cache_age_seconds=None,
+                        fallback_reason="cross_run_miss",
+                        cache_path="agent",
+                    )
+                data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                    prompt=prompt,
+                    step=step,
+                    prompt_name="data-extraction-summary",
+                    system_prompt=task.workflow_system_prompt,
+                )
+                if cache_key and isinstance(data_extraction_summary_resp, dict):
+                    extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+                    try:
+                        await app.AGENT_FUNCTION.store_cross_run_extraction_cache(
+                            wpid_for_cache, cache_key, data_extraction_summary_resp
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "data-extraction-summary cross-run cache store raised; ignoring",
+                            workflow_run_id=workflow_run_id,
+                            cache_key=cache_key,
+                            exc_info=True,
+                        )
 
         if data_extraction_summary_resp is None:
             raise RuntimeError(
