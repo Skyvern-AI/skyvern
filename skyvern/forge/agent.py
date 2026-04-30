@@ -1841,10 +1841,11 @@ class ForgeAgent:
         previous_response: OpenAIResponse | None = None,
         engine: RunEngine = RunEngine.openai_cua,
     ) -> tuple[list[Action], OpenAIResponse | None]:
+        cua_model = app.OPENAI_CUA_MODEL
         if not previous_response:
             # this is the first step
             first_response: OpenAIResponse = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 tools=[
                     {
                         "type": "computer_use_preview",
@@ -1931,7 +1932,7 @@ class ForgeAgent:
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
             current_response = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 previous_response_id=previous_response.id,
                 tools=[
                     {
@@ -1963,7 +1964,7 @@ class ForgeAgent:
                 computer_call_input["acknowledged_safety_checks"] = pending_checks
 
             current_response = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 previous_response_id=previous_response.id,
                 tools=[
                     {
