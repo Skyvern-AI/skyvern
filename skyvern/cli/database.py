@@ -215,15 +215,23 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database user exists.[/green]")
         else:
             console.print("🚀 [bold green]Creating database user...[/bold green]")
-            output, user_code = run_command("docker exec postgresql-container createuser -U postgres skyvern")
-            if user_code != 0:
-                capture_setup_event(
-                    "database-user-create-fail",
-                    success=False,
-                    error_type="createuser_error",
-                    error_message=output or "Failed to create database user",
-                )
-                console.print("[red]Warning: Failed to create database user.[/red]")
+            result = subprocess.run(
+                "docker exec postgresql-container createuser -U postgres skyvern",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                if "already exists" in (result.stderr or ""):
+                    console.print("✅ [green]Database user already exists.[/green]")
+                else:
+                    capture_setup_event(
+                        "database-user-create-fail",
+                        success=False,
+                        error_type="createuser_error",
+                        error_message=result.stderr.strip() or "Failed to create database user",
+                    )
+                    console.print("[red]Warning: Failed to create database user.[/red]")
             else:
                 console.print("✅ [green]Database user created.[/green]")
 
@@ -236,15 +244,23 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database exists.[/green]")
         else:
             console.print("🚀 [bold green]Creating database...[/bold green]")
-            output, db_code = run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
-            if db_code != 0:
-                capture_setup_event(
-                    "database-create-fail",
-                    success=False,
-                    error_type="createdb_error",
-                    error_message=output or "Failed to create database",
-                )
-                console.print("[red]Warning: Failed to create database.[/red]")
+            result = subprocess.run(
+                "docker exec postgresql-container createdb -U postgres skyvern -O skyvern",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                if "already exists" in (result.stderr or ""):
+                    console.print("✅ [green]Database already exists.[/green]")
+                else:
+                    capture_setup_event(
+                        "database-create-fail",
+                        success=False,
+                        error_type="createdb_error",
+                        error_message=result.stderr.strip() or "Failed to create database",
+                    )
+                    console.print("[red]Warning: Failed to create database.[/red]")
             else:
                 console.print("✅ [green]Database and user created successfully.[/green]")
 
