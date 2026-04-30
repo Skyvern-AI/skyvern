@@ -2023,10 +2023,14 @@ class ForgeAgent:
         type = "computer_20250124"
         betas = ["computer-use-2025-01-24"]
         # according to https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool
-        # "computer-use-2025-11-24" for Claude Opus 4.6, Claude Opus 4.5
-        # "computer-use-2025-01-24" for Claude Sonnet 4.6, Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
+        # "computer-use-2025-11-24" for Claude Opus 4.7, Claude Opus 4.6, Claude Sonnet 4.6, Claude Opus 4.5
+        # "computer-use-2025-01-24" for Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
 
-        if "OPUS" in llm_caller.llm_key and ("4.6" in llm_caller.llm_key or "4.5" in llm_caller.llm_key):
+        key = llm_caller.llm_key
+        uses_new_computer_tool = ("OPUS" in key and any(v in key for v in ("4.5", "4.6", "4.7"))) or (
+            "SONNET" in key and "4.6" in key
+        )
+        if uses_new_computer_tool:
             type = "computer_20251124"
             betas = ["computer-use-2025-11-24"]
         tools = [
