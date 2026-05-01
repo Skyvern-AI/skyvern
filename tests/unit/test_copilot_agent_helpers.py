@@ -110,6 +110,21 @@ class TestFailedTestResponseNormalization:
         original = "Let me know what you want to build."
         assert _rewrite_failed_test_response(original, ctx) == original
 
+    def test_rewrite_appends_keep_draft_affordance_when_draft_on_hand(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=False,
+            last_test_failure_reason="A verification challenge is preventing submission.",
+        )
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "test failed" in rewritten.lower()
+        assert "keep the draft" in rewritten.lower()
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""
@@ -167,6 +182,7 @@ class TestShouldRestorePersistedWorkflow:
         r = MagicMock()
         r.workflow_was_persisted = persisted
         r.updated_workflow = updated_workflow
+        r.unvalidated = False
         return r
 
     def test_restores_when_no_proposal_even_under_auto_accept(self) -> None:
@@ -269,10 +285,10 @@ class TestTranslateToAgentResultGating:
         assert "validation error" in agent_result.user_response.lower()
 
     def test_ask_question_preserves_model_specific_question(self) -> None:
-        # The new prompt instructs the model to stop and ASK_QUESTION when it
-        # cannot test an edit. Row-3 of _rewrite_failed_test_response would
-        # clobber that specific unblocker with "Could you share more context";
-        # the resp_type==ASK_QUESTION guard must skip the rewrite.
+        # The rewrite guard for ASK_QUESTION must hold: the agent's specific
+        # clarifying question is not clobbered by the generic "share more
+        # context" rewrite. SKY-9420 also drops any workflow under
+        # ASK_QUESTION so an auto-accept user can't silently apply a partial.
         ctx = _ctx(
             last_update_block_count=1,
             last_test_ok=None,
@@ -286,14 +302,11 @@ class TestTranslateToAgentResultGating:
         )
 
         assert agent_result.user_response == specific_question
-        # Even ASK_QUESTION must obey the strict gate — no verified workflow this turn.
         assert agent_result.updated_workflow is None
+        assert agent_result.unvalidated is False
         assert agent_result.response_type == "ASK_QUESTION"
 
     def test_reply_still_rewrites_after_failed_test(self) -> None:
-        # Guard rail for the above: a plain REPLY after a failed test must
-        # still flow through the "test failed" rewrite so we don't regress
-        # the original SKY-9143 behavior.
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=False,
@@ -308,6 +321,44 @@ class TestTranslateToAgentResultGating:
         assert "test failed" in agent_result.user_response.lower()
         assert "All done" not in agent_result.user_response
         assert agent_result.updated_workflow is None
+        assert agent_result.unvalidated is False
+
+    def test_reply_after_failed_test_surfaces_unvalidated_wip_when_draft_on_hand(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=4,
+            last_test_ok=False,
+            last_test_failure_reason="A verification challenge is preventing submission.",
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+        assert "test failed" in agent_result.user_response.lower()
+        assert "keep the draft" in agent_result.user_response.lower()
+
+    def test_reply_after_suspicious_success_surfaces_unvalidated_wip(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is True
 
     def test_inline_replace_workflow_wraps_block_goals_with_user_message(self, monkeypatch) -> None:
         # SKY-9174 parity: update_and_run_blocks_tool wraps block goals with

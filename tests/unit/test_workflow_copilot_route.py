@@ -228,6 +228,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=False,
+        unvalidated=False,
     )
 
     restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -290,6 +291,10 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         # No prior proposal => no DB write even when the clear flag is set.
         (False, False, False, None, True, False),
         (True, False, False, None, True, False),
+        # auto_accept=True turn with a stale UNVALIDATED proposal clears it
+        # via the third elif (no clear flag, no restore needed).
+        (True, False, False, {"workflow_id": "stale", "_copilot_unvalidated": True}, False, True),
+        (True, True, True, {"workflow_id": "stale", "_copilot_unvalidated": True}, False, True),
     ],
 )
 async def test_proposed_workflow_cleared_on_restore(
@@ -328,6 +333,7 @@ async def test_proposed_workflow_cleared_on_restore(
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=clear_proposed_flag,
+        unvalidated=False,
     )
 
     _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -365,6 +371,79 @@ async def test_proposed_workflow_cleared_on_restore(
     assert len(response_frames) == 1, f"expected exactly one RESPONSE frame, got {response_frames!r}"
     expected_payload_workflow = proposal.model_dump.return_value if has_valid_proposal else None
     assert response_frames[0].updated_workflow == expected_payload_workflow
+
+
+@pytest.mark.asyncio
+async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    proposal = MagicMock(spec=["model_dump"])
+    proposal.model_dump.return_value = {"workflow_id": "wf-canonical"}
+    agent_result = SimpleNamespace(
+        user_response="I ran out of time before I could finish testing.",
+        updated_workflow=proposal,
+        global_llm_context=None,
+        workflow_yaml="title: WIP",
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        unvalidated=True,
+        total_tokens=42,
+        response_type="REPLY",
+    )
+
+    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    sent_frames: list[object] = []
+    stream = MagicMock()
+
+    async def capture_send(payload: object) -> bool:
+        sent_frames.append(payload)
+        return True
+
+    stream.send = capture_send
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    proposal_writes = [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None]
+    assert len(proposal_writes) == 1
+    proposed_data = proposal_writes[0].kwargs["proposed_workflow"]
+    assert proposed_data.get("_copilot_unvalidated") is True
+    assert proposed_data.get("_copilot_yaml") == "title: WIP"
+
+    response_frame = next(
+        (f for f in sent_frames if getattr(f, "type", None) and str(f.type).endswith("response")),
+        None,
+    )
+    assert response_frame is not None
+    assert getattr(response_frame, "unvalidated", False) is True
 
 
 @pytest.mark.asyncio
