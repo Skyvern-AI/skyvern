@@ -265,9 +265,17 @@ _MAX_TURNS_REPLY_UNVALIDATED = (
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
+_UNEXPECTED_ERROR_REPLY_DEFAULT = "An unexpected error occurred. Please try again."
+_UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
+    "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
+    "accept it to save (note: it hasn't been verified end-to-end), or discard."
+)
+_UNEXPECTED_ERROR_REPLY_TESTED = (
+    "I hit an unexpected issue, but I have a tested draft for you. Accept it to save, or discard."
+)
 
 
-def _build_capacity_exit_result(
+def _build_wip_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
     *,
@@ -275,8 +283,7 @@ def _build_capacity_exit_result(
     unvalidated_reply: str,
     tested_reply: str,
 ) -> AgentResult:
-    """Capacity-exhausted exits (timeout, max-turns) surface the most recent
-    successfully-parsed workflow rather than discard the WIP."""
+    """Selected non-success exits surface the most recent successfully parsed workflow."""
     # ``last_test_ok=None`` covers both "test never ran" and "test ran with
     # ambiguous output"; only the first case earns the carve-out (the REPLY
     # path is more permissive because its reply text carries the context).
@@ -301,7 +308,7 @@ def _build_capacity_exit_result(
 
 
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_capacity_exit_result(
+    return _build_wip_exit_result(
         ctx,
         global_llm_context,
         default_reply=_TIMEOUT_REPLY_DEFAULT,
@@ -311,12 +318,22 @@ def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | No
 
 
 def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_capacity_exit_result(
+    return _build_wip_exit_result(
         ctx,
         global_llm_context,
         default_reply=_MAX_TURNS_REPLY_DEFAULT,
         unvalidated_reply=_MAX_TURNS_REPLY_UNVALIDATED,
         tested_reply=_MAX_TURNS_REPLY_TESTED,
+    )
+
+
+def _build_unexpected_error_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_wip_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_UNEXPECTED_ERROR_REPLY_DEFAULT,
+        unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
+        tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
     )
 
 
@@ -678,7 +695,7 @@ async def run_copilot_agent(
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return _build_exit_result(ctx, "An unexpected error occurred. Please try again.", global_llm_context)
+        return _build_unexpected_error_exit_result(ctx, global_llm_context)
     finally:
         _copilot_model_name.reset(model_token)
         session.close()

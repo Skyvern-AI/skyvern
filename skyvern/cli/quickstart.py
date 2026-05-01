@@ -1,6 +1,7 @@
 """Quickstart command for Skyvern CLI."""
 
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -70,6 +71,73 @@ def check_postgres_container_conflict() -> bool:
         return False
 
 
+_COMPOSE_DATABASE_STRING = "postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern"
+
+
+def _bootstrap_compose_env_files() -> None:
+    """Copy `.env.example` and `skyvern-frontend/.env.example` into place when missing, and rewrite a localhost-pointing `DATABASE_STRING` to the compose-network value."""
+    bootstrapped: list[tuple[str, str]] = []
+
+    backend_env = Path(".env")
+    backend_example = Path(".env.example")
+    if not backend_env.exists() and backend_example.exists():
+        shutil.copyfile(backend_example, backend_env)
+        bootstrapped.append((str(backend_env), "edit it to set your LLM API keys before continuing"))
+
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        shutil.copyfile(frontend_example, frontend_env)
+        bootstrapped.append((str(frontend_env), "no edits required"))
+
+    if bootstrapped:
+        console.print(
+            Panel(
+                "[green]Created from .env.example:[/green]\n"
+                + "\n".join(f"  • [cyan]{path}[/cyan] — {note}" for path, note in bootstrapped),
+                border_style="green",
+            )
+        )
+
+    if not backend_env.exists():
+        return
+
+    content = backend_env.read_text()
+    if "DATABASE_STRING" not in content or "localhost" not in content:
+        return
+
+    bad_lines = [
+        line for line in content.splitlines() if line.strip().startswith("DATABASE_STRING") and "localhost" in line
+    ]
+    if not bad_lines:
+        return
+
+    console.print(
+        Panel(
+            "[bold yellow]Warning:[/bold yellow] Your [cyan].env[/cyan] sets [bold]DATABASE_STRING[/bold] to a "
+            "[yellow]localhost[/yellow] URL. Inside the docker compose network that points at the backend "
+            "container, not the postgres service. Update it to:\n"
+            f"  [green]{_COMPOSE_DATABASE_STRING}[/green]",
+            border_style="yellow",
+        )
+    )
+    if not Confirm.ask("Update DATABASE_STRING in .env now?", default=True):
+        return
+
+    replaced = False
+    new_lines: list[str] = []
+    for line in content.splitlines():
+        if line.strip().startswith("DATABASE_STRING") and "localhost" in line:
+            if not replaced:
+                new_lines.append(f'DATABASE_STRING="{_COMPOSE_DATABASE_STRING}"')
+                replaced = True
+            continue
+        new_lines.append(line)
+
+    backend_env.write_text("\n".join(new_lines) + "\n")
+    console.print("✅ [green]Updated DATABASE_STRING for the compose network.[/green]")
+
+
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
@@ -104,6 +172,8 @@ def run_docker_compose_setup() -> None:
                 error_message="User aborted due to port conflict",
             )
             raise typer.Exit(0)
+
+    _bootstrap_compose_env_files()
 
     # Configure LLM provider
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
