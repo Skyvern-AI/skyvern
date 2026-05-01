@@ -287,6 +287,84 @@ blocks:
         next_block_label: null
         navigation_goal: "Add {{ current_value.name }} to cart"
 
+** WHILE LOOP BLOCK (while_loop) **
+
+Purpose: Repeat a sequence of blocks while a runtime-evaluated condition stays true. Use for pagination, polling, or retry-until-success — any case where the iteration count depends on runtime state, not a known list.
+
+Structure:
+block_type: while_loop
+label: <unique_label>
+loop_blocks: []                          # Required: Blocks to run each iteration
+condition:                               # Required: BranchCriteriaYAML
+  criteria_type: jinja2_template         # Optional: inferred when omitted
+  expression: <jinja_expression>         # Required: Must evaluate to truthy to continue
+  description: <optional description>
+
+Important Notes:
+- The condition is evaluated at the TOP of each iteration (including the first). If it is false up front, loop_blocks never run and the block succeeds with empty output.
+- Termination: condition becomes falsy → success; reached the 100-iteration safety cap → failure with a clear failure_reason.
+- Outputs from blocks within an iteration are accessible to later blocks in the same iteration via templating; outputs from prior iterations are accessible the same way for_loop accumulates them.
+- The condition has access to {{ current_index }} — the 0-indexed iteration counter (same name and meaning as for_loop's). Use it to bootstrap iteration 0: e.g. "{{ current_index == 0 or <body_output_ref> }}". The OR short-circuits on the first check before the body output is consulted.
+- Strict templating caveat: that bootstrap pattern relies on default lax templating. With WORKFLOW_TEMPLATING_STRICTNESS=strict, missing-variable validation runs before Jinja short-circuiting, so seed any referenced prior-output variable before the loop or use a condition based only on variables already present.
+- No automatic per-iteration value variables. Unlike for_loop, there is NO {{ current_value }} / {{ current_item }} for while_loop — only {{ current_index }}.
+- criteria_type "prompt" is not yet supported in while_loop; use "jinja2_template" only. Supplying "prompt" fails fast with NotImplementedError.
+
+CRITICAL DISTINCTION (vs for_loop):
+* for_loop: known list to iterate over. Use when you have a parameter or extraction output containing all items up front.
+* while_loop: iteration count is unknown until runtime. Use for pagination ("keep going while a Next button exists"), polling ("keep checking until status is ready"), or retry-until-success patterns.
+
+Example 1 - Paginate until no Next button:
+blocks:
+  - block_type: while_loop
+    label: paginate_results
+    next_block_label: null
+    condition:
+      criteria_type: jinja2_template
+      # With default lax templating, current_index == 0 carries the first iteration
+      # before extract_page exists. From iteration 1 onward, the previous iteration's
+      # extracted has_next_page flag drives the loop.
+      expression: "{{ current_index == 0 or extract_page.has_next_page }}"
+    loop_blocks:
+      - block_type: extraction
+        label: extract_page
+        next_block_label: click_next
+        data_extraction_goal: "Extract all rows on the current page and whether a 'Next' button is enabled"
+        data_schema:
+          type: object
+          properties:
+            rows: {type: array, items: {type: object}}
+            has_next_page: {type: boolean}
+      - block_type: action
+        label: click_next
+        next_block_label: null
+        navigation_goal: "Click the 'Next' button to advance to the next page"
+
+Example 2 - Retry-until-success bounded by an attempt counter:
+parameters:
+  - parameter_type: workflow
+    key: max_attempts
+    workflow_parameter_type: integer
+    default_value: 5
+blocks:
+  - block_type: while_loop
+    label: retry_until_done
+    next_block_label: null
+    condition:
+      criteria_type: jinja2_template
+      # With default lax templating, current_index == 0 carries the first attempt
+      # before check_status exists. From attempt 1 onward, the previous attempt's
+      # is_ready flag controls termination.
+      expression: "{{ current_index < max_attempts and (current_index == 0 or not check_status.is_ready) }}"
+    loop_blocks:
+      - block_type: extraction
+        label: check_status
+        next_block_label: null
+        data_extraction_goal: "Determine whether the result is ready"
+        data_schema:
+          type: object
+          properties:
+            is_ready: {type: boolean}
+
 ** CONDITIONAL BLOCK (conditional) **
 
 Purpose: Branch to different blocks based on ordered conditions.

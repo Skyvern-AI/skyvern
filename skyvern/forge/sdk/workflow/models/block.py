@@ -2671,7 +2671,15 @@ class WhileLoopBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> bool:
         """Evaluate the loop condition. Raises on rendering errors so the caller can convert
-        the failure into a block result with a clear message."""
+        the failure into a block result with a clear message.
+
+        ``current_index`` (the 0-indexed iteration counter) is read from this block's own
+        metadata via the existing for_loop injection in
+        :meth:`format_block_parameter_template_from_workflow_run_context`. The caller is
+        responsible for writing it onto ``self.label`` before invoking this method, so
+        condition authors can bootstrap iteration 1 with
+        ``{{ current_index == 0 or <body_output_ref> }}``.
+        """
         evaluation_context = BranchEvaluationContext(
             workflow_run_context=workflow_run_context,
             block_label=self.label,
@@ -2709,6 +2717,19 @@ class WhileLoopBlock(Block):
             # iteration to iteration), but a Jinja render error means the condition itself
             # is malformed and will fail identically on the next iteration — there is no
             # forward progress to be made by retrying.
+            # Expose ``current_index`` to the condition's template scope before evaluation
+            # so authors can bootstrap iteration 0 with ``{{ current_index == 0 or ... }}``.
+            # The for_loop pattern at line 516-521 picks this up via ``get_block_metadata``.
+            # ``current_value`` and ``current_item`` are nulled for the same SKY-8835
+            # reason as the body-level write below — defend against an outer for_loop's
+            # values lingering on this label's bag and bleeding into the condition render.
+            condition_metadata: BlockMetadata = {
+                "current_index": loop_idx,
+                "current_value": None,
+                "current_item": None,
+            }
+            workflow_run_context.update_block_metadata(self.label, condition_metadata)
+
             try:
                 should_continue = await self._evaluate_condition(workflow_run_context)
             except (FailedToFormatJinjaStyleParameter, MissingJinjaVariables) as exc:
