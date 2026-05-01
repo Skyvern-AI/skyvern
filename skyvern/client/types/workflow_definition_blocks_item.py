@@ -304,6 +304,7 @@ class WorkflowDefinitionBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
 from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
 
 
@@ -755,34 +756,6 @@ class WorkflowDefinitionBlocksItem_Wait(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class WorkflowDefinitionBlocksItem_WhileLoop(UniversalBaseModel):
-    block_type: typing.Literal["while_loop"] = "while_loop"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    disable_cache: typing.Optional[bool] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
-    condition: WhileLoopBlockCondition
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
-from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
-from .while_loop_block_loop_blocks_item import WhileLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
-
-
 class WorkflowDefinitionBlocksItem_WorkflowTrigger(UniversalBaseModel):
     block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
     label: str
@@ -798,6 +771,28 @@ class WorkflowDefinitionBlocksItem_WorkflowTrigger(UniversalBaseModel):
     browser_session_id: typing.Optional[str] = None
     use_parent_browser_session: typing.Optional[bool] = None
     parameters: typing.Optional[typing.List[WorkflowTriggerBlockParametersItem]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionBlocksItem_WhileLoop(UniversalBaseModel):
+    block_type: typing.Literal["while_loop"] = "while_loop"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    loop_blocks: typing.List["WorkflowDefinitionBlocksItem"]
+    condition: WhileLoopBlockCondition
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

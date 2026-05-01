@@ -39,6 +39,18 @@ services:
       # - ./skyvern:/app/skyvern
       # - ./alembic:/app/alembic
     environment:
+      # ─────────────────────────────────────────────────────────────────
+      # Compose-network values live here. These are infrastructure values
+      # tied to the docker compose network (e.g. the `postgres` hostname
+      # only resolves inside this compose stack). DO NOT move these into
+      # .env — `.env.example` uses a `localhost` host that points at the
+      # backend container itself inside compose, which would break the DB
+      # connection.
+      #
+      # User secrets (LLM API keys, etc.) go in `.env` (loaded above via
+      # env_file). The split is intentional: compose owns infrastructure;
+      # .env owns secrets.
+      # ─────────────────────────────────────────────────────────────────
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
       - ENABLE_CODE_BLOCK=true
@@ -133,6 +145,8 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
+    # User secrets and frontend config live in skyvern-frontend/.env
+    # (loaded via env_file). No inline environment for the UI service.
     env_file:
       - skyvern-frontend/.env
     environment: {}
