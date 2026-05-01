@@ -15,9 +15,9 @@ import pytest
 from fastmcp import Client
 
 import skyvern.cli.mcp_tools.scripts as script_tools
-import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.types import ScriptFileCreate
+from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
 # ---------------------------------------------------------------------------
 # Fake API payloads
@@ -361,7 +361,7 @@ async def test_workflow_create_surfaces_caching_fields_via_mcp(monkeypatch):
     response = SimpleNamespace(status_code=200, json=lambda: payload, text="")
     request_mock = AsyncMock(return_value=response)
     fake_client = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     definition = json.dumps(
         {
@@ -417,7 +417,7 @@ async def test_workflow_status_shows_script_run_via_mcp(monkeypatch):
             httpx_client=SimpleNamespace(request=AsyncMock(return_value=fake_resp)),
         ),
     )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     async with Client(mcp) as client:
         result = await client.call_tool(

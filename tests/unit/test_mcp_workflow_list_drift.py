@@ -20,8 +20,10 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from skyvern.cli.mcp_tools import _workflow_http
 from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.client.core.client_wrapper import AsyncClientWrapper
+from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
 
 def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step1") -> dict[str, Any]:
@@ -73,7 +75,7 @@ def _patch_skyvern_list_response(
     client_wrapper = SimpleNamespace(httpx_client=httpx_client)
     fake_skyvern = SimpleNamespace(_client_wrapper=client_wrapper)
 
-    monkeypatch.setattr(mcp_workflow, "get_skyvern", lambda: fake_skyvern)
+    _patch_skyvern_client(monkeypatch, fake_skyvern)
     return request_mock
 
 
@@ -147,7 +149,7 @@ async def test_raw_list_uses_fern_http_wrapper_auth_headers(monkeypatch: pytest.
             httpx_client=base_client,
         )
         fake_skyvern = SimpleNamespace(_client_wrapper=client_wrapper)
-        monkeypatch.setattr(mcp_workflow, "get_skyvern", lambda: fake_skyvern)
+        _patch_skyvern_client(monkeypatch, fake_skyvern)
 
         result = await mcp_workflow.skyvern_workflow_list(only_workflows=True)
 
@@ -167,9 +169,29 @@ def test_extract_error_detail_truncates_non_json_response_text() -> None:
     response.json.side_effect = ValueError("not json")
     response.text = "x" * 600
 
-    detail = mcp_workflow._extract_error_detail(response)
+    detail = _workflow_http.extract_error_detail(response)
 
-    assert detail == "x" * 500
+    assert detail == "x" * _workflow_http._ERROR_DETAIL_LIMIT
+
+
+def test_extract_error_detail_truncates_long_json_detail() -> None:
+    """A verbose ``detail`` field (e.g., a backend stack trace) is truncated too."""
+    response = MagicMock()
+    response.json.return_value = {"detail": "x" * 600}
+
+    detail = _workflow_http.extract_error_detail(response)
+
+    assert detail == "x" * _workflow_http._ERROR_DETAIL_LIMIT
+
+
+def test_decode_success_payload_wraps_non_json_response() -> None:
+    """A non-JSON 2xx response should carry operation context, not a bare decoder error."""
+    response = MagicMock()
+    response.json.side_effect = ValueError("not json")
+    response.text = "<html>proxy response</html>"
+
+    with pytest.raises(RuntimeError, match="Unexpected workflows list response"):
+        _workflow_http._decode_success_payload(response, operation="workflows list")
 
 
 @pytest.mark.asyncio
@@ -182,7 +204,7 @@ async def test_list_surfaces_http_error(monkeypatch: pytest.MonkeyPatch) -> None
 
     request_mock = AsyncMock(return_value=response)
     fake_skyvern = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
-    monkeypatch.setattr(mcp_workflow, "get_skyvern", lambda: fake_skyvern)
+    _patch_skyvern_client(monkeypatch, fake_skyvern)
 
     result = await mcp_workflow.skyvern_workflow_list()
 
