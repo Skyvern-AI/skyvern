@@ -2,15 +2,15 @@
 
 import type * as Skyvern from "../index.js";
 
-export interface FileParserBlockYaml {
+export interface WhileLoopBlockYaml {
     /** Author-facing identifier; must be unique per workflow. */
     label: string;
     /** Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]. */
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
-    file_url: string;
-    file_type?: Skyvern.FileType;
-    json_schema?: Record<string, unknown>;
+    loop_blocks: Skyvern.WhileLoopBlockYamlLoopBlocksItem[];
+    condition: Skyvern.BranchCriteriaYaml;
 }

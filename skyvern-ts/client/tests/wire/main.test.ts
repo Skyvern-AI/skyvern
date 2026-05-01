@@ -28,7 +28,11 @@ describe("SkyvernClient", () => {
             browser_session_id: "browser_session_id",
             browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
-            script_run: { ai_fallback_triggered: true },
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
             errors: [{ key: "value" }],
             step_count: 1,
             run_request: {
@@ -97,6 +101,8 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
             },
             errors: [
                 {
@@ -205,7 +211,11 @@ describe("SkyvernClient", () => {
             browser_session_id: "browser_session_id",
             browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
-            script_run: { ai_fallback_triggered: true },
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
             errors: [{ key: "value" }],
             step_count: 1,
             run_with: "agent",
@@ -274,6 +284,8 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
             },
             errors: [
                 {
@@ -376,7 +388,11 @@ describe("SkyvernClient", () => {
             browser_session_id: "browser_session_id",
             browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
-            script_run: { ai_fallback_triggered: true },
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
             errors: [{ key: "value" }],
             step_count: 1,
             run_request: {
@@ -433,6 +449,8 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
             },
             errors: [
                 {
@@ -1731,6 +1749,7 @@ describe("SkyvernClient", () => {
                     executed_branch_expression: "executed_branch_expression",
                     executed_branch_result: true,
                     executed_branch_next_block: "executed_branch_next_block",
+                    script_run: {},
                 },
                 thought: {
                     thought_id: "thought_id",
@@ -1823,6 +1842,7 @@ describe("SkyvernClient", () => {
                     executed_branch_expression: "executed_branch_expression",
                     executed_branch_result: true,
                     executed_branch_next_block: "executed_branch_next_block",
+                    script_run: {},
                 },
                 thought: {
                     thought_id: "thought_id",
@@ -1989,7 +2009,11 @@ describe("SkyvernClient", () => {
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
                 run_with: "run_with",
-                script_run: { ai_fallback_triggered: true },
+                script_run: {
+                    ai_fallback_triggered: true,
+                    script_id: "script_id",
+                    script_revision_id: "script_revision_id",
+                },
                 job_id: "job_id",
                 depends_on_workflow_run_id: "depends_on_workflow_run_id",
                 sequential_key: "sequential_key",
@@ -2043,6 +2067,8 @@ describe("SkyvernClient", () => {
                 run_with: "run_with",
                 script_run: {
                     ai_fallback_triggered: true,
+                    script_id: "script_id",
+                    script_revision_id: "script_revision_id",
                 },
                 job_id: "job_id",
                 depends_on_workflow_run_id: "depends_on_workflow_run_id",
@@ -3517,7 +3543,11 @@ describe("SkyvernClient", () => {
             browser_session_id: "browser_session_id",
             browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
-            script_run: { ai_fallback_triggered: true },
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
             errors: [{ key: "value" }],
             step_count: 1,
             run_with: "agent",
@@ -3579,6 +3609,8 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
             },
             errors: [
                 {
@@ -3655,7 +3687,11 @@ describe("SkyvernClient", () => {
             browser_session_id: "browser_session_id",
             browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
-            script_run: { ai_fallback_triggered: true },
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
             errors: [{ key: "value" }],
             step_count: 1,
             run_with: "agent",
@@ -3717,6 +3753,8 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
             },
             errors: [
                 {

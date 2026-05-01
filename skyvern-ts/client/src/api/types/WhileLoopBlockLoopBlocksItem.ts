@@ -2,34 +2,34 @@
 
 import type * as Skyvern from "../index.js";
 
-export type WorkflowDefinitionBlocksItem =
-    | Skyvern.WorkflowDefinitionBlocksItem.Action
-    | Skyvern.WorkflowDefinitionBlocksItem.Code
-    | Skyvern.WorkflowDefinitionBlocksItem.Conditional
-    | Skyvern.WorkflowDefinitionBlocksItem.DownloadToS3
-    | Skyvern.WorkflowDefinitionBlocksItem.Extraction
-    | Skyvern.WorkflowDefinitionBlocksItem.FileDownload
-    | Skyvern.WorkflowDefinitionBlocksItem.FileUpload
-    | Skyvern.WorkflowDefinitionBlocksItem.FileUrlParser
-    | Skyvern.WorkflowDefinitionBlocksItem.ForLoop
-    | Skyvern.WorkflowDefinitionBlocksItem.GotoUrl
-    | Skyvern.WorkflowDefinitionBlocksItem.HttpRequest
-    | Skyvern.WorkflowDefinitionBlocksItem.HumanInteraction
-    | Skyvern.WorkflowDefinitionBlocksItem.Login
-    | Skyvern.WorkflowDefinitionBlocksItem.Navigation
-    | Skyvern.WorkflowDefinitionBlocksItem.PdfParser
-    | Skyvern.WorkflowDefinitionBlocksItem.PrintPage
-    | Skyvern.WorkflowDefinitionBlocksItem.SendEmail
-    | Skyvern.WorkflowDefinitionBlocksItem.Task
-    | Skyvern.WorkflowDefinitionBlocksItem.TaskV2
-    | Skyvern.WorkflowDefinitionBlocksItem.TextPrompt
-    | Skyvern.WorkflowDefinitionBlocksItem.UploadToS3
-    | Skyvern.WorkflowDefinitionBlocksItem.Validation
-    | Skyvern.WorkflowDefinitionBlocksItem.Wait
-    | Skyvern.WorkflowDefinitionBlocksItem.WhileLoop
-    | Skyvern.WorkflowDefinitionBlocksItem.WorkflowTrigger;
+export type WhileLoopBlockLoopBlocksItem =
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Action
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Code
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Conditional
+    | Skyvern.WhileLoopBlockLoopBlocksItem.DownloadToS3
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Extraction
+    | Skyvern.WhileLoopBlockLoopBlocksItem.FileDownload
+    | Skyvern.WhileLoopBlockLoopBlocksItem.FileUpload
+    | Skyvern.WhileLoopBlockLoopBlocksItem.FileUrlParser
+    | Skyvern.WhileLoopBlockLoopBlocksItem.ForLoop
+    | Skyvern.WhileLoopBlockLoopBlocksItem.GotoUrl
+    | Skyvern.WhileLoopBlockLoopBlocksItem.HttpRequest
+    | Skyvern.WhileLoopBlockLoopBlocksItem.HumanInteraction
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Login
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Navigation
+    | Skyvern.WhileLoopBlockLoopBlocksItem.PdfParser
+    | Skyvern.WhileLoopBlockLoopBlocksItem.PrintPage
+    | Skyvern.WhileLoopBlockLoopBlocksItem.SendEmail
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Task
+    | Skyvern.WhileLoopBlockLoopBlocksItem.TaskV2
+    | Skyvern.WhileLoopBlockLoopBlocksItem.TextPrompt
+    | Skyvern.WhileLoopBlockLoopBlocksItem.UploadToS3
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Validation
+    | Skyvern.WhileLoopBlockLoopBlocksItem.Wait
+    | Skyvern.WhileLoopBlockLoopBlocksItem.WhileLoop
+    | Skyvern.WhileLoopBlockLoopBlocksItem.WorkflowTrigger;
 
-export namespace WorkflowDefinitionBlocksItem {
+export namespace WhileLoopBlockLoopBlocksItem {
     export interface Action extends Skyvern.ActionBlock {
         block_type: "action";
     }
