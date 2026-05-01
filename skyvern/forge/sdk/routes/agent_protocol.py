@@ -2781,21 +2781,29 @@ async def get_workflow_and_run_from_workflow_run_id(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowRunWithWorkflowResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        filter_deleted=False,
     )
 
-    if not workflow:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow run not found {workflow_run_id}",
-        )
-
-    workflow_run_status_api_response = await get_workflow_run_with_workflow_id(
-        workflow_id=workflow.workflow_permanent_id,
+    workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+        workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_run_id=workflow_run_id,
-        current_org=current_org,
+        organization_id=current_org.organization_id,
+        include_cost=True,
+        allow_deleted=True,
+    )
+    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
+
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+    workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
+        "browser_session_id"
     )
 
     workflow_run_status_api_response["workflow"] = workflow
