@@ -8,6 +8,7 @@ enforcement to catch.
 from __future__ import annotations
 
 MAX_CONSECUTIVE_SAME_TOOL = 3
+LOOP_DETECTED_MARKER = "LOOP DETECTED:"
 
 
 def detect_tool_loop(
@@ -21,7 +22,7 @@ def detect_tool_loop(
     if len(tracker) >= threshold and len(set(tracker[-threshold:])) == 1:
         tracker.clear()
         return (
-            f"LOOP DETECTED: '{tool_name}' has been called "
+            f"{LOOP_DETECTED_MARKER} '{tool_name}' has been called "
             f"{threshold} times consecutively. "
             "This tool will not run again. Use a DIFFERENT tool "
             "to continue, or produce your final JSON response."

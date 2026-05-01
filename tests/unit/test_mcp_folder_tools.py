@@ -9,6 +9,7 @@ import pytest
 import skyvern.cli.mcp_tools.folder as folder_tools
 import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.client.raw_client import AsyncRawSkyvern, RawSkyvern
+from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
 
 def _fake_folder_response() -> SimpleNamespace:
@@ -124,7 +125,7 @@ async def test_workflow_update_folder_calls_sdk(monkeypatch: pytest.MonkeyPatch)
     response = SimpleNamespace(status_code=200, json=lambda: payload, text="")
     request_mock = AsyncMock(return_value=response)
     fake_client = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     result = await workflow_tools.skyvern_workflow_update_folder("wpid_test", "fld_test")
 
@@ -151,7 +152,7 @@ async def test_workflow_update_folder_surfaces_bad_request(monkeypatch: pytest.M
     response = SimpleNamespace(status_code=400, json=lambda: error_payload, text="Folder fld_missing not found")
     request_mock = AsyncMock(return_value=response)
     fake_client = SimpleNamespace(_client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)))
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     result = await workflow_tools.skyvern_workflow_update_folder("wpid_test", "fld_missing")
 

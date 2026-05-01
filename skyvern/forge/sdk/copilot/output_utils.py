@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
+from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -233,6 +234,9 @@ def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
                 yield reason
 
 
+_UNKNOWN_ERROR_SENTINEL = "Unknown error"
+
+
 def _extract_failure_message(result: dict[str, Any]) -> str:
     """Prefer top-level ``error`` over nested failure_reason fields. Defense
     in depth: _run_blocks_and_collect_debug now populates ``error`` on
@@ -240,7 +244,7 @@ def _extract_failure_message(result: dict[str, Any]) -> str:
     top = result.get("error")
     if isinstance(top, str) and top:
         return top
-    return next(iter_failure_reasons(result), "Unknown error")
+    return next(iter_failure_reasons(result), _UNKNOWN_ERROR_SENTINEL)
 
 
 _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
@@ -356,6 +360,54 @@ def summarize_tool_result_detail(result: dict[str, Any], max_chars: int = 800) -
     if result.get("ok", False):
         return None
     return _sanitize_failure_text(_extract_failure_message(result), max_chars=max_chars)
+
+
+_JINJA_ERROR_MARKERS: tuple[str, ...] = ("Failed to format jinja", "Jinja style parameter")
+# Markers are matched against a lower-cased copy of the error.
+_ENGINE_INSTRUCTION_MARKERS: tuple[str, ...] = (
+    "invalid selector:",
+    "do not use ",
+    "jquery pseudo-selectors",
+    "tool will not run again",
+    "locator(",
+    "call log:",
+    "waiting for locator",
+)
+_USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.IGNORECASE)
+
+_USER_FACING_LOOP_MESSAGE = "The agent got stuck retrying the same step — moving on."
+_USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
+_USER_FACING_GENERIC_FAILURE = "Couldn't complete that step."
+
+_USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset({"click", "type_text", "evaluate", "select_option"})
+
+
+def _translate_failure_for_user(error_text: str) -> str:
+    if LOOP_DETECTED_MARKER in error_text:
+        return _USER_FACING_LOOP_MESSAGE
+    if any(marker in error_text for marker in _JINJA_ERROR_MARKERS):
+        return _USER_FACING_JINJA_MESSAGE
+    lowered = error_text.lower()
+    if any(marker in lowered for marker in _ENGINE_INSTRUCTION_MARKERS):
+        return _USER_FACING_GENERIC_FAILURE
+    if _USE_TOOL_NAME_RE.search(error_text):
+        return _USER_FACING_GENERIC_FAILURE
+    if error_text.strip() == _UNKNOWN_ERROR_SENTINEL:
+        return _USER_FACING_GENERIC_FAILURE
+    return f"Failed: {_sanitize_failure_text(error_text)}"
+
+
+def format_tool_result_for_user(tool_name: str, result: dict[str, Any]) -> str:
+    """SSE-bound counterpart to summarize_tool_result; do not mix the two.
+
+    summarize_tool_result is parsed by context.merge_turn_summary for state
+    extraction — rewriting it would corrupt agent state.
+    """
+    if not result.get("ok", False):
+        return _translate_failure_for_user(_extract_failure_message(result))
+    if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
+        return ""
+    return summarize_tool_result(tool_name, result)
 
 
 def truncate_output(output: Any, max_chars: int = 2000) -> str | None:

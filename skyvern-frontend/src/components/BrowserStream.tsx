@@ -45,7 +45,10 @@ import "./browser-stream.css";
 
 interface BrowserSession {
   browser_session_id: string;
-  completed_at?: string;
+  status?: string | null;
+  browser_address?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
 }
 
 interface CommandBeginExfiltration {
@@ -114,6 +117,7 @@ type Props = {
   resizeTrigger?: number;
   isVisible?: boolean;
   isExecuting?: boolean;
+  onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
   // --
   onClose?: () => void;
 };
@@ -128,6 +132,7 @@ function BrowserStream({
   resizeTrigger,
   isVisible = true,
   isExecuting = false,
+  onReadyChange,
   // --
   onClose,
 }: Props) {
@@ -166,35 +171,28 @@ function BrowserStream({
 
         if (!browserSession || browserSession.completed_at) {
           setHasBrowserSession(false);
+          setIsBrowserSessionStarted(false);
           return false;
-
-          // NOTE(jdo:streaming-local-dev): remove above and use this instead
-          // if (browserSession && browserSession.completed_at) {
-          //   console.warn(
-          //     "Completed at:",
-          //     browserSession.completed_at,
-          //     "continuing anyway!",
-          //   );
-          //   setHasBrowserSession(true);
-          //   return true;
-          // } else {
-          //   setHasBrowserSession(false);
-          //   return false;
-          // }
         }
 
         setHasBrowserSession(true);
-        return true;
+        const sessionStarted = Boolean(
+          browserSession.started_at || browserSession.browser_address,
+        );
+        setIsBrowserSessionStarted(sessionStarted);
+        return sessionStarted;
       } catch (error) {
         setHasBrowserSession(false);
+        setIsBrowserSessionStarted(false);
         return false;
       }
     },
-    enabled: !!browserSessionId,
+    enabled: entity === "browserSession" && !!browserSessionId,
     refetchInterval: 5000,
   });
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
+  const [isBrowserSessionStarted, setIsBrowserSessionStarted] = useState(false);
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
@@ -218,6 +216,15 @@ function BrowserStream({
   const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
+  const isBrowserSessionAvailable =
+    entity !== "browserSession" || hasBrowserSession;
+  const isBrowserSessionBackendReady =
+    entity !== "browserSession" || isBrowserSessionStarted;
+
+  useEffect(() => {
+    setIsBrowserSessionStarted(false);
+    setIsReady(false);
+  }, [browserSessionId]);
 
   const getWebSocketParams = useCallback(async () => {
     const clientIdQueryParam = `client_id=${clientId}`;
@@ -237,8 +244,31 @@ function BrowserStream({
 
   // browser is ready
   useEffect(() => {
-    setIsReady(isVncConnected && isCanvasReady && hasBrowserSession);
-  }, [hasBrowserSession, isCanvasReady, isVncConnected]);
+    setIsReady(
+      isVncConnected &&
+        isCanvasReady &&
+        isBrowserSessionAvailable &&
+        isBrowserSessionBackendReady,
+    );
+  }, [
+    isBrowserSessionAvailable,
+    isBrowserSessionBackendReady,
+    isCanvasReady,
+    isVncConnected,
+  ]);
+
+  useEffect(() => {
+    // browserSessionId intentionally not a dep: re-firing on prop change
+    // before isReady resets would spuriously report (true, newSessionId).
+    onReadyChange?.(isReady, isReady ? (browserSessionId ?? null) : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, onReadyChange]);
+
+  useEffect(() => {
+    return () => {
+      onReadyChange?.(false, null);
+    };
+  }, [onReadyChange]);
 
   // update global settings store about browser usage
   useEffect(() => {
@@ -278,12 +308,17 @@ function BrowserStream({
         return;
       }
 
+      let cancelled = false;
+
       async function setupVnc() {
         if (rfbRef.current && isVncConnected) {
           return;
         }
 
         const wsParams = await getWebSocketParams();
+        if (cancelled) {
+          return;
+        }
         const vncUrl =
           entity === "browserSession"
             ? `${newWssBaseUrl}/stream/vnc/browser_session/${runId}?${wsParams}`
@@ -301,7 +336,7 @@ function BrowserStream({
           rfbRef.current.disconnect();
         }
 
-        if (!hasBrowserSession) {
+        if (!isBrowserSessionAvailable || !isBrowserSessionBackendReady) {
           setIsVncConnected(false);
           return;
         }
@@ -346,13 +381,12 @@ function BrowserStream({
           setIsVncConnected(false);
           setIsCanvasReady(false);
         });
-
-        setIsVncConnected(true); // be optimistic
       }
 
       setupVnc();
 
       return () => {
+        cancelled = true;
         if (observerRef.current) {
           observerRef.current.disconnect();
           observerRef.current = null;
@@ -371,7 +405,8 @@ function BrowserStream({
       browserSessionId,
       entity,
       canvasContainer,
-      hasBrowserSession,
+      isBrowserSessionAvailable,
+      isBrowserSessionBackendReady,
       runId,
       showStream,
       vncDisconnectedTrigger, // will re-run on disconnects
@@ -401,7 +436,7 @@ function BrowserStream({
         throw new Error("No message url");
       }
 
-      if (!hasBrowserSession) {
+      if (!isBrowserSessionAvailable || !isBrowserSessionBackendReady) {
         setIsMessageConnected(false);
         return;
       }
@@ -454,7 +489,8 @@ function BrowserStream({
     canvasContainer,
     messagesDisconnectedTrigger,
     entity,
-    hasBrowserSession,
+    isBrowserSessionAvailable,
+    isBrowserSessionBackendReady,
     runId,
     showStream,
   ]);
@@ -864,7 +900,9 @@ function BrowserStream({
         )}
         {!isReady && (
           <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
-            {browserSessionId && !hasBrowserSession ? (
+            {entity === "browserSession" &&
+            browserSessionId &&
+            !hasBrowserSession ? (
               <div>This live browser session is no longer streaming.</div>
             ) : (
               <>

@@ -360,6 +360,123 @@ class TestTranslateToAgentResultGating:
         assert agent_result.updated_workflow is wf
         assert agent_result.unvalidated is True
 
+    def test_goal_reached_false_flips_validated_proposal_to_unvalidated(self) -> None:
+        # Agent-emitted goal_reached=False must override last_test_ok=True so
+        # a draft the agent itself flagged as incomplete cannot auto-promote.
+        wf = SimpleNamespace(name="drafted-but-incomplete")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=8,
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "Cookie modal is blocking the form; the workflow needs to dismiss it first.",
+                "goal_reached": False,
+            }
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+
+    def test_goal_reached_default_true_keeps_verified_path(self) -> None:
+        # Backwards-compat: stale prompts that omit goal_reached must continue
+        # to surface a tested workflow as validated.
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=3,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is False
+
+    def test_goal_reached_true_explicit_keeps_verified_path(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=3,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is False
+
+    def test_goal_reached_string_false_is_coerced(self) -> None:
+        # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
+        # the gate the same as Python ``False``.
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=2,
+        )
+        result = _fake_run_result(
+            {"type": "REPLY", "user_response": "Cookie modal blocked the form.", "goal_reached": "false"}
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is True
+
+    def test_goal_reached_false_without_last_workflow_returns_no_proposal(self) -> None:
+        # The unvalidated WIP fallback only fires when ``ctx.last_workflow``
+        # exists. Self-reported failure on an empty context must not synthesize
+        # a proposal out of thin air.
+        ctx = _ctx(last_test_ok=None)
+        result = _fake_run_result(
+            {"type": "REPLY", "user_response": "I couldn't find the form.", "goal_reached": False}
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+        assert agent_result.unvalidated is False
+
+    def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
+        # Failed-test path already routes to unvalidated WIP. A redundant
+        # ``goal_reached: false`` from the agent must not change the outcome
+        # (no double-effect, no regression of the existing failed-test rewrite).
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=False,
+            last_test_failure_reason="A verification challenge is preventing submission.",
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Tried but blocked.", "goal_reached": False})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is True
+        assert "test failed" in agent_result.user_response.lower()
+        assert "keep the draft" in agent_result.user_response.lower()
+
     def test_inline_replace_workflow_wraps_block_goals_with_user_message(self, monkeypatch) -> None:
         # SKY-9174 parity: update_and_run_blocks_tool wraps block goals with
         # the user's chat message as big-goal context. The REPLACE_WORKFLOW

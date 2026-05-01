@@ -106,7 +106,11 @@ def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
         return None
 
 
-def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
+def deserialize_proxy_location(
+    value: str | None,
+    *,
+    raise_on_invalid_geo_target: bool = False,
+) -> ProxyLocationInput:
     """
     Deserialize proxy_location from database storage.
 
@@ -118,12 +122,16 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
     if value is None:
         return None
 
+    value = value.strip()
     result: ProxyLocationInput = None
 
     # Try to parse as JSON first (for GeoTarget)
     if value.startswith("{"):
         try:
             data = json.loads(value)
+            if not isinstance(data, dict):
+                raise ValueError("GeoTarget proxy_location JSON must be an object")
+
             # Handle malformed subdivision (e.g., boolean instead of string)
             subdivision = data.get("subdivision")
             if subdivision is not None and not isinstance(subdivision, str):
@@ -137,6 +145,8 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
             )
             return result
         except (json.JSONDecodeError, ValueError) as e:
+            if raise_on_invalid_geo_target:
+                raise
             LOG.warning("Failed to parse proxy_location as GeoTarget", db_value=value, error=str(e))
 
     # Try as ProxyLocation enum
@@ -163,9 +173,10 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
         result = json.dumps(proxy_location.model_dump())
     elif isinstance(proxy_location, dict):
         result = json.dumps(proxy_location)
+    elif isinstance(proxy_location, ProxyLocation):
+        result = proxy_location.value
     else:
-        # ProxyLocation enum - return the string value
-        result = str(proxy_location)
+        raise TypeError(f"Unsupported proxy_location type: {type(proxy_location).__name__}")
 
     LOG.debug(
         "Serializing proxy_location for DB",
@@ -236,7 +247,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         extracted_information=task_obj.extracted_information,
         failure_reason=task_obj.failure_reason,
         organization_id=task_obj.organization_id,
-        proxy_location=_deserialize_proxy_location(task_obj.proxy_location),
+        proxy_location=deserialize_proxy_location(task_obj.proxy_location),
         extracted_information_schema=task_obj.extracted_information_schema,
         extra_http_headers=task_obj.extra_http_headers,
         workflow_run_id=task_obj.workflow_run_id,
@@ -266,7 +277,7 @@ def convert_to_task_v2(task_v2_model: TaskV2Model, debug_enabled: bool = False) 
         LOG.debug("Converting TaskV2Model to TaskV2", observer_cruise_id=task_v2_model.observer_cruise_id)
     task_v2_data = {column.name: getattr(task_v2_model, column.name) for column in TaskV2Model.__table__.columns}
     #  Deserialize proxy_location FIRST (string → GeoTarget), otherwise model_validate will fail for city/state proxy selections
-    task_v2_data["proxy_location"] = _deserialize_proxy_location(task_v2_model.proxy_location)
+    task_v2_data["proxy_location"] = deserialize_proxy_location(task_v2_model.proxy_location)
     return TaskV2.model_validate(task_v2_data)
 
 
@@ -421,7 +432,7 @@ def convert_to_workflow(
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
         model=workflow_model.model,
-        proxy_location=_deserialize_proxy_location(workflow_model.proxy_location),
+        proxy_location=deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
@@ -468,7 +479,7 @@ def convert_to_workflow_run(
         browser_profile_id=workflow_run_model.browser_profile_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
-        proxy_location=_deserialize_proxy_location(workflow_run_model.proxy_location),
+        proxy_location=deserialize_proxy_location(workflow_run_model.proxy_location),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         webhook_failure_reason=workflow_run_model.webhook_failure_reason,
         totp_verification_url=workflow_run_model.totp_verification_url,

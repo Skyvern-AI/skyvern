@@ -371,13 +371,14 @@
   "navbar": {
     "links": [
       {
-        "label": "Try it now",
-        "href": "https://app.skyvern.com/settings"
+        "label": "Talk to us",
+        "href": "https://www.skyvern.com/contact"
       }
     ],
     "primary": {
-      "type": "github",
-      "href": "https://github.com/Skyvern-AI/skyvern"
+      "type": "button",
+      "label": "Get Started",
+      "href": "https://app.skyvern.com/"
     }
   },
   "footer": {

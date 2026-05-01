@@ -18,12 +18,14 @@ interface Props {
   browserSessionId: string;
   interactive?: boolean;
   showControlButtons?: boolean;
+  onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
 }
 
 function BrowserSessionStream({
   browserSessionId,
   interactive = false,
   showControlButtons = false,
+  onReadyChange,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
@@ -52,8 +54,18 @@ function BrowserSessionStream({
   });
 
   useEffect(() => {
+    let cancelled = false;
+    setStreamImgSrc("");
+    setStreamFormat("png");
+    setViewportWidth(1280);
+    setViewportHeight(720);
+    setCurrentUrl("");
+
     async function run() {
       const credentialParam = await getCredentialParam(credentialGetter);
+      if (cancelled) {
+        return;
+      }
 
       if (socketRef.current) {
         socketRef.current.close();
@@ -99,6 +111,7 @@ function BrowserSessionStream({
     run();
 
     return () => {
+      cancelled = true;
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
@@ -106,7 +119,22 @@ function BrowserSessionStream({
     };
   }, [credentialGetter, browserSessionId]);
 
-  if (streamImgSrc.length > 0) {
+  const isReady = streamImgSrc.length > 0;
+
+  useEffect(() => {
+    // browserSessionId intentionally not a dep: re-firing on prop change
+    // before isReady resets would spuriously report (true, newSessionId).
+    onReadyChange?.(isReady, isReady ? browserSessionId : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, onReadyChange]);
+
+  useEffect(() => {
+    return () => {
+      onReadyChange?.(false, null);
+    };
+  }, [onReadyChange]);
+
+  if (isReady) {
     return (
       <InteractiveStreamView
         streamImgSrc={streamImgSrc}

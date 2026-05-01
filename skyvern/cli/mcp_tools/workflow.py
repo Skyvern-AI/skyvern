@@ -26,6 +26,15 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id
+from ._workflow_http import (
+    coerce_timestamp,
+    create_workflow_raw,
+    get_workflow_by_id,
+    get_workflow_run_status,
+    list_workflows_raw,
+    update_workflow_folder_raw,
+    update_workflow_raw,
+)
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -33,25 +42,12 @@ _SUMMARY_SCALAR_PREVIEW_LIMIT = 3
 _SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
 _SUMMARY_STRING_PREVIEW_LIMIT = 120
 _SUMMARY_RECURSION_LIMIT = 10
-_ERROR_DETAIL_LIMIT = 500
 _SCREENSHOT_LIST_KEYS = frozenset({"task_screenshots", "workflow_screenshots", "screenshot_urls"})
 _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workflow_screenshot_artifact_ids"})
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _coerce_timestamp(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    isoformat = getattr(value, "isoformat", None)
-    if callable(isoformat):
-        return isoformat()
-    LOG.debug("Unexpected timestamp type in workflow response", value_type=type(value).__name__)
-    return str(value)
 
 
 def _serialize_workflow(wf: Any) -> dict[str, Any]:
@@ -71,8 +67,8 @@ def _serialize_workflow(wf: Any) -> dict[str, Any]:
         "description": _get_value(wf, "description"),
         "is_saved_task": _get_value(wf, "is_saved_task"),
         "folder_id": _get_value(wf, "folder_id"),
-        "created_at": _coerce_timestamp(_get_value(wf, "created_at")),
-        "modified_at": _coerce_timestamp(_get_value(wf, "modified_at")),
+        "created_at": coerce_timestamp(_get_value(wf, "created_at")),
+        "modified_at": coerce_timestamp(_get_value(wf, "modified_at")),
     }
     for caching_field in ("run_with", "code_version", "adaptive_caching"):
         val = _get_value(wf, caching_field)
@@ -391,193 +387,6 @@ def _serialize_run_full(run: Any) -> dict[str, Any]:
     return {key: value for key, value in data.items() if value is not None}
 
 
-async def _get_workflow_run_status(
-    workflow_run_id: str,
-    *,
-    include_output_details: bool,
-) -> dict[str, Any]:
-    skyvern = get_skyvern()
-    # The generated SDK only exposes get_run() for /v1/runs/{run_id}; wr_... IDs
-    # require the workflow-run detail route until a public SDK helper exists.
-    response = await skyvern._client_wrapper.httpx_client.request(
-        f"api/v1/workflows/runs/{workflow_run_id}",
-        method="GET",
-        params={"include_output_details": include_output_details},
-    )
-    if response.status_code == 404:
-        raise NotFoundError(body={"detail": f"Workflow run {workflow_run_id!r} not found"})
-    if response.status_code >= 400:
-        detail = ""
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
-    return response.json()
-
-
-async def _get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, Any]:
-    """Fetch a single workflow by ID via the Skyvern API.
-
-    The Fern-generated client has get_workflows() (list) but no get_workflow(id).
-    This helper isolates the private client access so the workaround is contained
-    in one place. Replace with ``skyvern.get_workflow(id)`` when the SDK adds it.
-
-    Raises NotFoundError on 404, or RuntimeError on other HTTP errors, so callers
-    can use the same ``except NotFoundError`` pattern as all other workflow tools.
-    """
-    skyvern = get_skyvern()
-    params: dict[str, Any] = {}
-    if version is not None:
-        params["version"] = version
-    # SKY-7807: Replace with skyvern.get_workflow() when the Fern client adds it.
-    response = await skyvern._client_wrapper.httpx_client.request(
-        f"api/v1/workflows/{workflow_id}",
-        method="GET",
-        params=params,
-    )
-    if response.status_code == 404:
-        raise NotFoundError(body={"detail": f"Workflow {workflow_id!r} not found"})
-    if response.status_code >= 400:
-        detail = ""
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
-    return response.json()
-
-
-# ---------------------------------------------------------------------------
-# Fern-bypass raw HTTP helpers
-#
-# The vendored Fern SDK ``skyvern/client`` validates Workflow requests and
-# responses through discriminated unions of block variants; any block_type that
-# the client hasn't been regenerated for (e.g. google_sheets_read) blows up the
-# MCP tool before the backend can accept it. These helpers call the backend
-# directly via the underlying httpx client, pass/return plain dicts, and
-# sidestep the drift entirely.
-#
-# The ``v1/workflows`` paths intentionally mirror the generated Fern raw client.
-# The ``api/v1`` workflow routes above are non-Fern/internal routes used only
-# where no public SDK equivalent exists yet.
-# ---------------------------------------------------------------------------
-
-
-def _extract_error_detail(response: Any) -> str:
-    try:
-        body = response.json()
-    except Exception:
-        text = str(getattr(response, "text", ""))
-        return text[:_ERROR_DETAIL_LIMIT] if len(text) > _ERROR_DETAIL_LIMIT else text
-    if isinstance(body, dict):
-        return str(body.get("detail") or body.get("error") or body)
-    return str(body)
-
-
-async def _list_workflows_raw(
-    *,
-    search: str | None,
-    page: int,
-    page_size: int,
-    only_workflows: bool,
-) -> list[dict[str, Any]]:
-    skyvern = get_skyvern()
-    params: dict[str, Any] = {
-        "page": page,
-        "page_size": page_size,
-        "only_workflows": only_workflows,
-    }
-    if search is not None:
-        params["search_key"] = search
-    response = await skyvern._client_wrapper.httpx_client.request(
-        "v1/workflows",
-        method="GET",
-        params=params,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"HTTP {response.status_code}: {_extract_error_detail(response)}")
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise RuntimeError(f"Unexpected workflows list payload: {type(payload).__name__}")
-    return payload
-
-
-async def _create_workflow_raw(
-    *,
-    json_definition: dict[str, Any] | None,
-    yaml_definition: str | None,
-    folder_id: str | None,
-) -> dict[str, Any]:
-    skyvern = get_skyvern()
-    body: dict[str, Any] = {}
-    if json_definition is not None:
-        body["json_definition"] = json_definition
-    if yaml_definition is not None:
-        body["yaml_definition"] = yaml_definition
-    params: dict[str, Any] = {}
-    if folder_id is not None:
-        params["folder_id"] = folder_id
-    response = await skyvern._client_wrapper.httpx_client.request(
-        "v1/workflows",
-        method="POST",
-        params=params,
-        json=body,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"HTTP {response.status_code}: {_extract_error_detail(response)}")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Unexpected create_workflow payload: {type(payload).__name__}")
-    return payload
-
-
-async def _update_workflow_raw(
-    workflow_id: str,
-    *,
-    json_definition: dict[str, Any] | None,
-    yaml_definition: str | None,
-) -> dict[str, Any]:
-    skyvern = get_skyvern()
-    body: dict[str, Any] = {}
-    if json_definition is not None:
-        body["json_definition"] = json_definition
-    if yaml_definition is not None:
-        body["yaml_definition"] = yaml_definition
-    response = await skyvern._client_wrapper.httpx_client.request(
-        f"v1/workflows/{workflow_id}",
-        method="POST",
-        json=body,
-    )
-    if response.status_code == 404:
-        raise NotFoundError(body={"detail": f"Workflow {workflow_id!r} not found"})
-    if response.status_code >= 400:
-        raise RuntimeError(f"HTTP {response.status_code}: {_extract_error_detail(response)}")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Unexpected update_workflow payload: {type(payload).__name__}")
-    return payload
-
-
-async def _update_workflow_folder_raw(workflow_id: str, *, folder_id: str | None) -> dict[str, Any]:
-    skyvern = get_skyvern()
-    response = await skyvern._client_wrapper.httpx_client.request(
-        f"v1/workflows/{workflow_id}/folder",
-        method="PUT",
-        json={"folder_id": folder_id},
-    )
-    if response.status_code == 404:
-        raise NotFoundError(body={"detail": f"Workflow {workflow_id!r} not found"})
-    if response.status_code == 400:
-        raise BadRequestError(body={"detail": _extract_error_detail(response)})
-    if response.status_code >= 400:
-        raise RuntimeError(f"HTTP {response.status_code}: {_extract_error_detail(response)}")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Unexpected update_workflow_folder payload: {type(payload).__name__}")
-    return payload
-
-
 def _validate_definition_structure(json_def: dict[str, Any] | None, action: str) -> dict[str, Any] | None:
     """Validate required fields in a JSON workflow definition.
 
@@ -777,7 +586,7 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
     if raw is None or parsed_format is None or "proxy_location" in raw:
         return definition
 
-    existing_workflow = await _get_workflow_by_id(workflow_id)
+    existing_workflow = await get_workflow_by_id(workflow_id)
     raw["proxy_location"] = existing_workflow.get("proxy_location") or _DEFAULT_MCP_PROXY_LOCATION
     return _dump_definition_dict(raw, parsed_format)
 
@@ -882,7 +691,7 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
 
     update_params: list[dict[str, Any]] = wf_def.get("parameters", [])
 
-    existing_workflow = await _get_workflow_by_id(workflow_id)
+    existing_workflow = await get_workflow_by_id(workflow_id)
     existing_wf_def = existing_workflow.get("workflow_definition")
     if not isinstance(existing_wf_def, dict):
         return definition
@@ -1014,7 +823,7 @@ async def skyvern_workflow_list(
     search for a workflow by name, or list all workflows for an organization."""
     with Timer() as timer:
         try:
-            workflows = await _list_workflows_raw(
+            workflows = await list_workflows_raw(
                 search=search,
                 page=page,
                 page_size=page_size,
@@ -1054,7 +863,7 @@ async def skyvern_workflow_get(
 
     with Timer() as timer:
         try:
-            wf_data = await _get_workflow_by_id(workflow_id, version)
+            wf_data = await get_workflow_by_id(workflow_id, version)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -1129,7 +938,7 @@ async def skyvern_workflow_create(
 
     with Timer() as timer:
         try:
-            workflow = await _create_workflow_raw(
+            workflow = await create_workflow_raw(
                 json_definition=json_def,
                 yaml_definition=yaml_def,
                 folder_id=folder_id,
@@ -1213,7 +1022,7 @@ async def skyvern_workflow_update(
 
     with Timer() as timer:
         try:
-            workflow = await _update_workflow_raw(
+            workflow = await update_workflow_raw(
                 workflow_id,
                 json_definition=json_def,
                 yaml_definition=yaml_def,
@@ -1321,7 +1130,7 @@ async def skyvern_workflow_update_folder(
 
     with Timer() as timer:
         try:
-            workflow = await _update_workflow_folder_raw(workflow_id, folder_id=folder_id)
+            workflow = await update_workflow_folder_raw(workflow_id, folder_id=folder_id)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -1502,7 +1311,7 @@ async def skyvern_workflow_status(
     with Timer() as timer:
         try:
             if run_id.startswith("wr_"):
-                run = await _get_workflow_run_status(
+                run = await get_workflow_run_status(
                     run_id,
                     include_output_details=verbosity == "full",
                 )
