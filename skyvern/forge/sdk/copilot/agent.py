@@ -484,8 +484,7 @@ async def run_copilot_agent(
         workflow_yaml=chat_request.workflow_yaml or "",
         chat_history=_format_chat_history(chat_history),
         global_llm_context=global_llm_context or "",
-        distinct_id=chat_request.workflow_permanent_id,
-        organization_id=organization_id,
+        handler=llm_api_handler,
     )
     if feasibility_verdict.verdict == "ask_clarification" and feasibility_verdict.question:
         return _build_feasibility_clarification_result(

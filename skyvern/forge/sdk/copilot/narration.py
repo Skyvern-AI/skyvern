@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.forge import app
+from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
     WorkflowCopilotNarrationUpdate,
@@ -101,6 +102,9 @@ class NarratorState:
     # the in-flight one.
     pending_tool_name: str | None = None
     current_iteration: int = 0
+    # Narrator handler resolved once per stream so per-emission calls
+    # don't re-hit PostHog.
+    resolved_handler: Any = None
 
     def record_tool(
         self,
@@ -244,9 +248,10 @@ async def _narration_task_body(
     prompt_ctx: _NarratorPromptContext,
 ) -> None:
     transition_value = prompt_ctx.transition.value
+    handler = state.resolved_handler or _get_narrator_handler()
     try:
         try:
-            narration = await _call_narrator_llm(prompt_ctx)
+            narration = await _call_narrator_llm(prompt_ctx, handler)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -281,13 +286,12 @@ async def _narration_task_body(
         state.in_flight_task = None
 
 
-async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext) -> str | None:
+async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -> str | None:
     """Invoke a small/fast LLM to produce one user-facing sentence.
 
     Returns None on timeout or when no handler is configured. Never raises;
     failures propagate as None so the narration is silently dropped.
     """
-    handler = _get_narrator_handler()
     if handler is None:
         return None
 
@@ -328,20 +332,40 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext) -> str | None:
 
 
 def _get_narrator_handler() -> Any:
-    # Reuse SECONDARY_LLM_API_HANDLER so deployments already wired for the
-    # feasibility gate get narration for free. Returns None when the app
-    # holder isn't initialized (unit tests, pre-startup).
+    # SECONDARY also serves the scraper and other non-copilot paths; prefer
+    # the copilot-scoped fast handler so narration tunes independently.
     try:
-        handler = app.SECONDARY_LLM_API_HANDLER
+        handler = app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
+    except (RuntimeError, AttributeError):
+        handler = None
+    if handler is not None:
+        return handler
+    try:
+        return app.SECONDARY_LLM_API_HANDLER
     except (RuntimeError, AttributeError):
         return None
-    return handler
+
+
+async def resolve_narrator_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any:
+    # Resolution order: PostHog LLM_CONFIG_BY_PROMPT_TYPE["workflow-copilot-narration"]
+    # → env-driven WORKFLOW_COPILOT_FAST_LLM_API_HANDLER → SECONDARY_LLM_API_HANDLER.
+    if workflow_permanent_id and organization_id:
+        try:
+            posthog_handler = await get_llm_handler_for_prompt_type(
+                "workflow-copilot-narration", workflow_permanent_id, organization_id
+            )
+        except Exception as exc:
+            LOG.warning("narrator PostHog lookup failed, falling back", error=str(exc))
+            posthog_handler = None
+        if posthog_handler is not None:
+            return posthog_handler
+    return _get_narrator_handler()
 
 
 def handler_available() -> bool:
-    """Cheap check callers can use to skip all narrator-side bookkeeping
-    (transition detection, tool-details extraction, state updates) when no
-    narrator LLM is configured. Resolved once per stream, not per event."""
+    # Sync env-driven check used by callers that haven't run async resolution
+    # (tests, legacy paths). Production stream setup should use
+    # resolve_narrator_handler instead.
     return _get_narrator_handler() is not None
 
 

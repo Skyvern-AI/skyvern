@@ -69,6 +69,28 @@ CHAT_HISTORY_CONTEXT_MESSAGES = 10
 LOG = structlog.get_logger()
 
 
+async def _resolve_copilot_agent_handler(
+    workflow_permanent_id: str,
+    organization_id: str,
+) -> LLMAPIHandler:
+    try:
+        posthog_handler = await get_llm_handler_for_prompt_type(
+            "workflow-copilot", workflow_permanent_id, organization_id
+        )
+    except Exception as exc:
+        LOG.warning("copilot agent PostHog lookup failed, falling back", error=str(exc))
+        posthog_handler = None
+    if posthog_handler is not None:
+        return posthog_handler
+    # AppHolder.__getattr__ raises bare RuntimeError (not AttributeError)
+    # pre-startup; getattr(...,default) would not catch it.
+    try:
+        dedicated = app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER
+    except (RuntimeError, AttributeError):
+        dedicated = None
+    return dedicated or app.LLM_API_HANDLER
+
+
 @contextmanager
 def bind_copilot_session_id(chat_id: str | None) -> Iterator[None]:
     # In-place mutation (not scoped()) preserves request-scoped fields the FastAPI middleware wrote.
@@ -1077,11 +1099,8 @@ async def _new_copilot_chat_post(
 
             chat_request.workflow_id = original_workflow.workflow_id
 
-            llm_api_handler = (
-                await get_llm_handler_for_prompt_type(
-                    "workflow-copilot", chat_request.workflow_permanent_id, organization.organization_id
-                )
-                or app.LLM_API_HANDLER
+            llm_api_handler = await _resolve_copilot_agent_handler(
+                chat_request.workflow_permanent_id, organization.organization_id
             )
 
             api_key = request.headers.get("x-api-key")
