@@ -21,7 +21,7 @@ from skyvern.forge.sdk.copilot.narration import (
     schedule_narration,
     snapshot_ctx,
 )
-from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result, summarize_tool_result_detail
+from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotToolCallUpdate,
@@ -144,9 +144,7 @@ async def stream_to_sse(
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
-                # Compute summary/success unconditionally: the narrator path
-                # below also needs them, and the work is cheap (no I/O).
-                summary = summarize_tool_result(tool_name, parsed)
+                summary = format_tool_result_for_user(tool_name, parsed)
                 success = parsed.get("ok", True)
                 detail = summarize_tool_result_detail(parsed)
 
