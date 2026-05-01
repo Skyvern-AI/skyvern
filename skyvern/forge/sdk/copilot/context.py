@@ -114,9 +114,8 @@ class AgentResult:
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
     workflow_was_persisted: bool = False
-    # Feasibility-gate fast-path sets this True so the route can null any
-    # previously-persisted proposed_workflow. Regular in-loop ASK_QUESTION
-    # responses leave it False, preserving in-progress drafts.
+    # Tells the route to null any persisted proposed_workflow. Set by the
+    # feasibility-gate fast-path and by ASK_QUESTION turns.
     clear_proposed_workflow: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from

@@ -263,31 +263,25 @@ async def _finalise_normal_turn(
     if restored:
         await _restore_workflow_definition(original_workflow, organization_id)
 
-    if chat.auto_accept is not True:
-        if updated_workflow:
-            proposed_data = updated_workflow.model_dump(mode="json")
-            if agent_result.workflow_yaml:
-                proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
-            await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-                organization_id=chat.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                proposed_workflow=proposed_data,
-            )
-        elif (
-            restored or getattr(agent_result, "clear_proposed_workflow", False)
-        ) and chat.proposed_workflow is not None:
-            # Null any previously-persisted proposed_workflow so a
-            # page reload does not resurrect a stale Accept/Reject
-            # card next to an assistant message that just explained
-            # why no verified proposal is available. Covers:
-            # * feasibility-gate fast-path clarifications, and
-            # * SKY-9143 strict-gate turns where a mid-turn draft was
-            #   rolled back (``restored=True``).
-            await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-                organization_id=chat.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                proposed_workflow=None,
-            )
+    if chat.auto_accept is not True and updated_workflow:
+        proposed_data = updated_workflow.model_dump(mode="json")
+        if agent_result.workflow_yaml:
+            proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+            organization_id=chat.organization_id,
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            proposed_workflow=proposed_data,
+        )
+    elif chat.proposed_workflow is not None and (restored or agent_result.clear_proposed_workflow):
+        # Null any persisted proposed_workflow the assistant just invalidated
+        # so a reload does not resurrect a stale Accept/Reject card. Runs
+        # under both auto_accept values — a stale proposal can survive an
+        # auto-accept toggle.
+        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+            organization_id=chat.organization_id,
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            proposed_workflow=None,
+        )
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
         organization_id=chat.organization_id,

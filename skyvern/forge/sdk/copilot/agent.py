@@ -326,6 +326,12 @@ def _translate_to_agent_result(
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     last_workflow, last_workflow_yaml = _verified_workflow_or_none(ctx)
 
+    # ASK_QUESTION blocks on user input — never surface a verified workflow
+    # under it; auto_accept would silently apply a stepping-stone partial.
+    if resp_type == "ASK_QUESTION":
+        last_workflow = None
+        last_workflow_yaml = None
+
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)
     if isinstance(llm_context_raw, dict):
@@ -346,6 +352,7 @@ def _translate_to_agent_result(
         workflow_yaml=last_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
+        clear_proposed_workflow=resp_type == "ASK_QUESTION",
     )
 
 
