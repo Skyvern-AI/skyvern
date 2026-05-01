@@ -100,14 +100,20 @@ function clearRuntimeApiKey(): void {
 async function getCredentialParam(
   credentialGetter: (() => Promise<string | null>) | null,
 ): Promise<string> {
+  const params = new URLSearchParams();
+  const apiKey = getRuntimeApiKey();
+  if (apiKey) {
+    params.set("apikey", apiKey);
+  }
+
   if (credentialGetter) {
     const token = await credentialGetter();
     if (token) {
-      return `token=Bearer ${token}`;
+      params.set("token", `Bearer ${token}`);
     }
   }
-  const apiKey = getRuntimeApiKey();
-  return apiKey ? `apikey=${apiKey}` : "";
+
+  return params.toString();
 }
 
 const useNewRunsUrl = true as const;
