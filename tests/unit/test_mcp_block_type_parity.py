@@ -35,8 +35,6 @@ _KNOWN_DRIFT_ALLOWLIST: frozenset[str] = frozenset(
     {
         "google_sheets_read",
         "google_sheets_write",
-        # SKY-8771: Fern SDK regeneration for the new while_loop block lands in PR 2.
-        "while_loop",
     }
 )
 
