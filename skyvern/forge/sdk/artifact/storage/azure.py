@@ -512,13 +512,6 @@ class AzureStorage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
-            LOG.info(
-                "Calculated checksum for file",
-                file=file,
-                checksum=checksum,
-                organization_id=organization_id,
-                storage_tier=tier,
-            )
             # Azure Blob metadata values must be ASCII; preserve the full
             # filename via the blob path / Artifact URI instead.
             metadata: dict[str, str] = {"sha256_checksum": checksum}

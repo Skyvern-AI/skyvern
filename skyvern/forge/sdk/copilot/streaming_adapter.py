@@ -130,6 +130,7 @@ async def stream_to_sse(
                 # than waiting for tool_output of a long tool.
                 if narrator_enabled:
                     narrator_state.pending_tool_name = tool_name
+                    narrator_state.current_iteration = iteration
                     narrator_state.record_transition(TransitionKind.TOOL_STARTED)
                     schedule_narration(narrator_state, stream, iteration)
 
@@ -179,6 +180,7 @@ async def stream_to_sse(
                     )
                     for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
                         narrator_state.record_transition(transition)
+                    narrator_state.current_iteration = iteration
                     schedule_narration(narrator_state, stream, iteration)
                 else:
                     _update_enforcement_from_tool(ctx, tool_name, parsed)

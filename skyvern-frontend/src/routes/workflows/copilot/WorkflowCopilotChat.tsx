@@ -26,6 +26,7 @@ import {
   WorkflowCopilotToolResultUpdate,
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
+  WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
@@ -33,6 +34,7 @@ import {
 } from "./workflowCopilotTypes";
 import {
   ToolActivity,
+  applyBlockProgress,
   applyToolCall,
   applyToolResult,
   getActivityDotClass,
@@ -52,7 +54,8 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
-  | WorkflowCopilotNarrationUpdate;
+  | WorkflowCopilotNarrationUpdate
+  | WorkflowCopilotBlockProgressUpdate;
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   update_workflow: "Updating workflow",
@@ -735,7 +738,7 @@ export function WorkflowCopilotChat({
         };
 
         setMessages((prev) => [...prev, aiMessage]);
-        if (response.updated_workflow && autoAccept) {
+        if (response.updated_workflow && autoAccept && !response.unvalidated) {
           applyWorkflowUpdate(response.updated_workflow);
         } else {
           setProposedWorkflow(response.updated_workflow ?? null);
@@ -789,6 +792,9 @@ export function WorkflowCopilotChat({
               if (payload.narration) {
                 setLatestNarration(payload.narration);
               }
+              return false;
+            case "block_progress":
+              setToolActivity((prev) => applyBlockProgress(prev, payload));
               return false;
             case "response":
               handleResponse(payload);

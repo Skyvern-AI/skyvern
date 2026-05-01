@@ -8,8 +8,8 @@ from pydantic import Field
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
-from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.cli.core.session_ops import coerce_proxy_location, do_session_close, do_session_create, do_session_list
+from skyvern.schemas.runs import proxy_location_to_request
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
 from ._session import (
@@ -39,7 +39,15 @@ def _should_default_to_cdp() -> tuple[bool, str | None]:
 
 async def skyvern_browser_session_create(
     timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
-    proxy_location: Annotated[str | None, Field(description="Proxy location: RESIDENTIAL, US, etc.")] = None,
+    proxy_location: Annotated[
+        str | dict[str, Any] | None,
+        Field(
+            description=(
+                "Proxy location as a legacy enum string like RESIDENTIAL, or a GeoTarget object like "
+                '{"country":"US","subdivision":"CA","city":"San Francisco"}.'
+            )
+        ),
+    ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
 ) -> dict[str, Any]:
@@ -91,7 +99,7 @@ async def skyvern_browser_session_create(
 
             skyvern = get_skyvern()
             if is_stateless_http_mode():
-                proxy = ProxyLocation(proxy_location) if proxy_location else None
+                proxy = proxy_location_to_request(coerce_proxy_location(proxy_location))
                 session = await skyvern.create_browser_session(timeout=timeout or 60, proxy_location=proxy)
                 timer.mark("sdk")
                 ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
@@ -108,7 +116,7 @@ async def skyvern_browser_session_create(
             browser, result = await do_session_create(
                 skyvern,
                 timeout=timeout or 60,
-                proxy_location=proxy_location,
+                proxy_location=coerce_proxy_location(proxy_location),
                 local=local,
                 headless=headless,
             )

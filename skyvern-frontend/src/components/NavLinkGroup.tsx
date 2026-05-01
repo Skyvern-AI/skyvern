@@ -6,21 +6,23 @@ import { Badge } from "./ui/badge";
 import { useIsMobile } from "@/hooks/useIsMobile.ts";
 import { ChevronDownIcon } from "@radix-ui/react-icons";
 
-type Props = {
-  title: string;
-  links: Array<{
-    label: string;
-    to: string;
-    newTab?: boolean;
-    disabled?: boolean;
-    beta?: boolean;
-    icon?: React.ReactNode;
-  }>;
-  collapsible?: boolean;
-  initialVisibleCount?: number;
+type LinkItem = {
+  label: string;
+  to: string;
+  newTab?: boolean;
+  disabled?: boolean;
+  beta?: boolean;
+  training?: boolean;
+  icon?: React.ReactNode;
 };
 
-type LinkItem = Props["links"][number];
+type Props = {
+  title: string;
+  links: Array<LinkItem>;
+  collapsible?: boolean;
+  initialVisibleCount?: number;
+  onItemClick?: (link: LinkItem) => void;
+};
 
 function NavLinkItem({
   link,
@@ -28,18 +30,21 @@ function NavLinkItem({
   sidebarCollapsed,
   groupIsActive,
   isPartiallyHidden,
+  onItemClick,
 }: {
   link: LinkItem;
   isMobile: boolean;
   sidebarCollapsed: boolean;
   groupIsActive: boolean;
   isPartiallyHidden?: boolean;
+  onItemClick?: (link: LinkItem) => void;
 }) {
   return (
     <NavLink
       to={link.to}
       target={link.newTab ? "_blank" : undefined}
       rel={link.newTab ? "noopener noreferrer" : undefined}
+      onClick={onItemClick ? () => onItemClick(link) : undefined}
       className={({ isActive }) => {
         return cn(
           "block rounded-lg py-2 pl-3 text-slate-400 hover:bg-muted hover:text-primary",
@@ -71,7 +76,7 @@ function NavLinkItem({
           {link.icon}
           {!sidebarCollapsed && link.label}
         </div>
-        {!sidebarCollapsed && link.disabled && (
+        {!sidebarCollapsed && (link.beta || link.training) && (
           <Badge
             className="rounded-[40px] px-2 py-1"
             style={{
@@ -92,6 +97,7 @@ function NavLinkGroup({
   links,
   collapsible = false,
   initialVisibleCount = 3,
+  onItemClick,
 }: Props) {
   const isMobile = useIsMobile();
   const { collapsed: sidebarCollapsed } = useSidebarStore();
@@ -142,6 +148,7 @@ function NavLinkGroup({
             isMobile={isMobile}
             sidebarCollapsed={sidebarCollapsed}
             groupIsActive={groupIsActive}
+            onItemClick={onItemClick}
           />
         ))}
 
@@ -165,6 +172,7 @@ function NavLinkGroup({
                   sidebarCollapsed={sidebarCollapsed}
                   groupIsActive={groupIsActive}
                   isPartiallyHidden={true}
+                  onItemClick={onItemClick}
                 />
               )}
             </div>
@@ -184,6 +192,7 @@ function NavLinkGroup({
                     isMobile={isMobile}
                     sidebarCollapsed={sidebarCollapsed}
                     groupIsActive={groupIsActive}
+                    onItemClick={onItemClick}
                   />
                 ))}
               </div>

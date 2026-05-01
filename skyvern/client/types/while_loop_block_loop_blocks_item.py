@@ -43,7 +43,7 @@ from .while_loop_block_condition import WhileLoopBlockCondition
 from .workflow_trigger_block_parameters_item import WorkflowTriggerBlockParametersItem
 
 
-class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     block_type: typing.Literal["action"] = "action"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -83,7 +83,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -105,7 +105,7 @@ class ForLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Conditional(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Conditional(UniversalBaseModel):
     block_type: typing.Literal["conditional"] = "conditional"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -126,7 +126,7 @@ class ForLoopBlockLoopBlocksItem_Conditional(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     block_type: typing.Literal["download_to_s3"] = "download_to_s3"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -147,7 +147,7 @@ class ForLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     block_type: typing.Literal["extraction"] = "extraction"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -187,7 +187,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     block_type: typing.Literal["file_download"] = "file_download"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -227,7 +227,7 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     block_type: typing.Literal["file_upload"] = "file_upload"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -256,7 +256,7 @@ class ForLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     block_type: typing.Literal["file_url_parser"] = "file_url_parser"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -279,7 +279,7 @@ class ForLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
     block_type: typing.Literal["for_loop"] = "for_loop"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -288,7 +288,7 @@ class ForLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
+    loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None
     complete_if_empty: typing.Optional[bool] = None
@@ -307,7 +307,7 @@ class ForLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
 from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
 
 
-class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     block_type: typing.Literal["goto_url"] = "goto_url"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -347,7 +347,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_HttpRequest(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_HttpRequest(UniversalBaseModel):
     block_type: typing.Literal["http_request"] = "http_request"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -377,7 +377,7 @@ class ForLoopBlockLoopBlocksItem_HttpRequest(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_HumanInteraction(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     block_type: typing.Literal["human_interaction"] = "human_interaction"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -425,7 +425,7 @@ class ForLoopBlockLoopBlocksItem_HumanInteraction(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     block_type: typing.Literal["login"] = "login"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -465,7 +465,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     block_type: typing.Literal["navigation"] = "navigation"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -505,7 +505,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -527,7 +527,7 @@ class ForLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_PrintPage(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_PrintPage(UniversalBaseModel):
     block_type: typing.Literal["print_page"] = "print_page"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -553,7 +553,7 @@ class ForLoopBlockLoopBlocksItem_PrintPage(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
     block_type: typing.Literal["send_email"] = "send_email"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -582,7 +582,7 @@ class ForLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     block_type: typing.Literal["task"] = "task"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -622,7 +622,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
     block_type: typing.Literal["task_v2"] = "task_v2"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -648,7 +648,7 @@ class ForLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
     block_type: typing.Literal["text_prompt"] = "text_prompt"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -672,7 +672,7 @@ class ForLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
     block_type: typing.Literal["upload_to_s3"] = "upload_to_s3"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -693,7 +693,7 @@ class ForLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     block_type: typing.Literal["validation"] = "validation"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -733,7 +733,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
     block_type: typing.Literal["wait"] = "wait"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -755,7 +755,7 @@ class ForLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
     block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -781,7 +781,7 @@ class ForLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ForLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
+class WhileLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
     block_type: typing.Literal["while_loop"] = "while_loop"
     label: str
     next_block_label: typing.Optional[str] = None
@@ -790,7 +790,7 @@ class ForLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
+    loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
     condition: WhileLoopBlockCondition
 
     if IS_PYDANTIC_V2:
@@ -805,47 +805,47 @@ class ForLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
 
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 
-ForLoopBlockLoopBlocksItem = typing.Union[
-    ForLoopBlockLoopBlocksItem_Action,
-    ForLoopBlockLoopBlocksItem_Code,
-    ForLoopBlockLoopBlocksItem_Conditional,
-    ForLoopBlockLoopBlocksItem_DownloadToS3,
-    ForLoopBlockLoopBlocksItem_Extraction,
-    ForLoopBlockLoopBlocksItem_FileDownload,
-    ForLoopBlockLoopBlocksItem_FileUpload,
-    ForLoopBlockLoopBlocksItem_FileUrlParser,
-    ForLoopBlockLoopBlocksItem_ForLoop,
-    ForLoopBlockLoopBlocksItem_GotoUrl,
-    ForLoopBlockLoopBlocksItem_HttpRequest,
-    ForLoopBlockLoopBlocksItem_HumanInteraction,
-    ForLoopBlockLoopBlocksItem_Login,
-    ForLoopBlockLoopBlocksItem_Navigation,
-    ForLoopBlockLoopBlocksItem_PdfParser,
-    ForLoopBlockLoopBlocksItem_PrintPage,
-    ForLoopBlockLoopBlocksItem_SendEmail,
-    ForLoopBlockLoopBlocksItem_Task,
-    ForLoopBlockLoopBlocksItem_TaskV2,
-    ForLoopBlockLoopBlocksItem_TextPrompt,
-    ForLoopBlockLoopBlocksItem_UploadToS3,
-    ForLoopBlockLoopBlocksItem_Validation,
-    ForLoopBlockLoopBlocksItem_Wait,
-    ForLoopBlockLoopBlocksItem_WhileLoop,
-    ForLoopBlockLoopBlocksItem_WorkflowTrigger,
+WhileLoopBlockLoopBlocksItem = typing.Union[
+    WhileLoopBlockLoopBlocksItem_Action,
+    WhileLoopBlockLoopBlocksItem_Code,
+    WhileLoopBlockLoopBlocksItem_Conditional,
+    WhileLoopBlockLoopBlocksItem_DownloadToS3,
+    WhileLoopBlockLoopBlocksItem_Extraction,
+    WhileLoopBlockLoopBlocksItem_FileDownload,
+    WhileLoopBlockLoopBlocksItem_FileUpload,
+    WhileLoopBlockLoopBlocksItem_FileUrlParser,
+    WhileLoopBlockLoopBlocksItem_ForLoop,
+    WhileLoopBlockLoopBlocksItem_GotoUrl,
+    WhileLoopBlockLoopBlocksItem_HttpRequest,
+    WhileLoopBlockLoopBlocksItem_HumanInteraction,
+    WhileLoopBlockLoopBlocksItem_Login,
+    WhileLoopBlockLoopBlocksItem_Navigation,
+    WhileLoopBlockLoopBlocksItem_PdfParser,
+    WhileLoopBlockLoopBlocksItem_PrintPage,
+    WhileLoopBlockLoopBlocksItem_SendEmail,
+    WhileLoopBlockLoopBlocksItem_Task,
+    WhileLoopBlockLoopBlocksItem_TaskV2,
+    WhileLoopBlockLoopBlocksItem_TextPrompt,
+    WhileLoopBlockLoopBlocksItem_UploadToS3,
+    WhileLoopBlockLoopBlocksItem_Validation,
+    WhileLoopBlockLoopBlocksItem_Wait,
+    WhileLoopBlockLoopBlocksItem_WhileLoop,
+    WhileLoopBlockLoopBlocksItem_WorkflowTrigger,
 ]
-update_forward_refs(ForLoopBlockLoopBlocksItem_Action)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Code)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Extraction)
-update_forward_refs(ForLoopBlockLoopBlocksItem_FileDownload)
-update_forward_refs(ForLoopBlockLoopBlocksItem_ForLoop)
-update_forward_refs(ForLoopBlockLoopBlocksItem_GotoUrl)
-update_forward_refs(ForLoopBlockLoopBlocksItem_HttpRequest)
-update_forward_refs(ForLoopBlockLoopBlocksItem_HumanInteraction)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Login)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Navigation)
-update_forward_refs(ForLoopBlockLoopBlocksItem_PrintPage)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Task)
-update_forward_refs(ForLoopBlockLoopBlocksItem_TextPrompt)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Validation)
-update_forward_refs(ForLoopBlockLoopBlocksItem_Wait)
-update_forward_refs(ForLoopBlockLoopBlocksItem_WhileLoop)
-update_forward_refs(ForLoopBlockLoopBlocksItem_WorkflowTrigger)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Action)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Code)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Extraction)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_FileDownload)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_ForLoop)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_GotoUrl)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_HttpRequest)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_HumanInteraction)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Login)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Navigation)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_PrintPage)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Task)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_TextPrompt)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Validation)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Wait)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_WhileLoop)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_WorkflowTrigger)

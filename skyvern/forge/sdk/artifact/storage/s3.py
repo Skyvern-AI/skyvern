@@ -577,13 +577,6 @@ class S3Storage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
-            LOG.info(
-                "Calculated checksum for file",
-                file=file,
-                checksum=checksum,
-                organization_id=organization_id,
-                storage_class=storage_class,
-            )
             # S3 object metadata only allows ASCII; non-ASCII filenames (CJK,
             # emoji) would otherwise raise ParamValidationError at upload time.
             # The full filename is still preserved in the S3 key and on the
