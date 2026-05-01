@@ -79,9 +79,6 @@ class WhileLoopBlockYamlLoopBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
-
-
 class WhileLoopBlockYamlLoopBlocksItem_WhileLoop(UniversalBaseModel):
     block_type: typing.Literal["while_loop"] = "while_loop"
     label: str
@@ -101,10 +98,6 @@ class WhileLoopBlockYamlLoopBlocksItem_WhileLoop(UniversalBaseModel):
             frozen = True
             smart_union = True
             extra = pydantic.Extra.allow
-
-
-from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
-from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
 
 
 class WhileLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
@@ -672,5 +665,9 @@ WhileLoopBlockYamlLoopBlocksItem = typing.Union[
     WhileLoopBlockYamlLoopBlocksItem_PrintPage,
     WhileLoopBlockYamlLoopBlocksItem_WorkflowTrigger,
 ]
+from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
+from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
+from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
+
 update_forward_refs(WhileLoopBlockYamlLoopBlocksItem_ForLoop)
 update_forward_refs(WhileLoopBlockYamlLoopBlocksItem_WhileLoop)

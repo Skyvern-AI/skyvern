@@ -775,10 +775,6 @@ class ForLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
-from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
-
-
 class ForLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
     block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
     label: str
@@ -804,8 +800,6 @@ class ForLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
             smart_union = True
             extra = pydantic.Extra.allow
 
-
-from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 
 ForLoopBlockLoopBlocksItem = typing.Union[
     ForLoopBlockLoopBlocksItem_Action,
@@ -834,6 +828,9 @@ ForLoopBlockLoopBlocksItem = typing.Union[
     ForLoopBlockLoopBlocksItem_WhileLoop,
     ForLoopBlockLoopBlocksItem_WorkflowTrigger,
 ]
+from .context_parameter import ContextParameter  # noqa: E402, F401, I001
+from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
+from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
 from .while_loop_block_loop_blocks_item import WhileLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
 
 update_forward_refs(ForLoopBlockLoopBlocksItem_Action)
