@@ -117,6 +117,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         description="Total tokens consumed by the agent during this turn; None when no provider reported usage",
     )
     response_type: ResponseType = Field("REPLY", description="Agent response classification")
+    unvalidated: bool = Field(
+        False,
+        description="When true, clients must not auto-apply; render Accept/Reject explicitly.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):

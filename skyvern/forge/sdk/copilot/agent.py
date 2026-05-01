@@ -186,8 +186,9 @@ _FAILURE_FOLLOW_UP = {
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
-    # Reshape replies when we cannot ship a proposal this turn so the user
-    # sees why nothing is being offered rather than an un-grounded claim.
+    has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
+    keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
+
     if ctx.last_test_ok is False and ctx.last_update_block_count is not None:
         if ctx.last_update_block_count <= 0:
             draft_phrase = "a draft workflow"
@@ -197,12 +198,17 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
 
         failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
         follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
-        return f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}.{follow_up}"
+        return (
+            f"I created {draft_phrase} and tested it, but the test failed. "
+            f"Failure: {failure_summary}.{follow_up}{keep_draft_affordance}"
+        )
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
-        # Agent edited the YAML but didn't verify it this turn; don't promise
-        # a re-run we can't durably execute (the restore helper rolls the
-        # mid-turn DB write back and there's no durable draft to re-test).
+        if has_keepable_draft:
+            return (
+                "I drafted an update but wasn't able to verify it this turn. "
+                "Keep the draft to iterate on it manually, or discard."
+            )
         return (
             "I drafted an update but wasn't able to verify it this turn. "
             "Could you share more context about what you'd like me to do?"
@@ -212,15 +218,8 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
 
 
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
-    """Only surface a workflow proposal when it passed a test this turn.
-
-    SKY-9143: the Accept/Reject UI must never reflect a workflow we haven't
-    proven works. Every agent exit path that builds an AgentResult directly
-    (cancel, max-turns, timeout, non-retriable nav error, catch-all Exception)
-    funnels through this so the strict invariant holds regardless of which
-    branch the run took.
-    """
-    if ctx.last_workflow is not None and ctx.last_test_ok is True:
+    """Surface a proposal only when it passed a test this turn AND yaml is on hand."""
+    if ctx.last_workflow is not None and ctx.last_workflow_yaml and ctx.last_test_ok is True:
         return ctx.last_workflow, ctx.last_workflow_yaml
     return None, None
 
@@ -241,6 +240,76 @@ def _build_exit_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         cancelled=cancelled,
+    )
+
+
+_TIMEOUT_REPLY_DEFAULT = "I ran out of time processing your request. Here's what I have so far."
+_TIMEOUT_REPLY_UNVALIDATED = (
+    "I ran out of time before I could finish testing. I have a draft workflow you can keep — "
+    "accept it to save (note: it hasn't been verified end-to-end), or discard."
+)
+_TIMEOUT_REPLY_TESTED = "I ran out of time, but I have a tested draft for you. Accept it to save, or discard."
+
+_MAX_TURNS_REPLY_DEFAULT = "I've reached the maximum number of steps. Here's what I have so far."
+_MAX_TURNS_REPLY_UNVALIDATED = (
+    "I've reached the maximum number of steps before I could finish testing. I have a draft "
+    "workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard."
+)
+_MAX_TURNS_REPLY_TESTED = (
+    "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
+)
+
+
+def _build_capacity_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    *,
+    default_reply: str,
+    unvalidated_reply: str,
+    tested_reply: str,
+) -> AgentResult:
+    """Capacity-exhausted exits (timeout, max-turns) surface the most recent
+    successfully-parsed workflow rather than discard the WIP."""
+    # ``last_test_ok=None`` covers both "test never ran" and "test ran with
+    # ambiguous output"; only the first case earns the carve-out (the REPLY
+    # path is more permissive because its reply text carries the context).
+    if (
+        ctx.last_workflow is not None
+        and ctx.last_workflow_yaml
+        and ctx.last_test_ok is not False
+        and not ctx.last_test_suspicious_success
+    ):
+        unvalidated = ctx.last_test_ok is not True
+        reply = unvalidated_reply if unvalidated else tested_reply
+        return AgentResult(
+            user_response=reply,
+            updated_workflow=ctx.last_workflow,
+            global_llm_context=global_llm_context,
+            workflow_yaml=ctx.last_workflow_yaml,
+            workflow_was_persisted=ctx.workflow_persisted,
+            total_tokens=ctx.total_tokens_used,
+            unvalidated=unvalidated,
+        )
+    return _build_exit_result(ctx, default_reply, global_llm_context)
+
+
+def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_capacity_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_TIMEOUT_REPLY_DEFAULT,
+        unvalidated_reply=_TIMEOUT_REPLY_UNVALIDATED,
+        tested_reply=_TIMEOUT_REPLY_TESTED,
+    )
+
+
+def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_capacity_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_MAX_TURNS_REPLY_DEFAULT,
+        unvalidated_reply=_MAX_TURNS_REPLY_UNVALIDATED,
+        tested_reply=_MAX_TURNS_REPLY_TESTED,
     )
 
 
@@ -325,6 +394,12 @@ def _translate_to_agent_result(
     if resp_type != "ASK_QUESTION":
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     last_workflow, last_workflow_yaml = _verified_workflow_or_none(ctx)
+    unvalidated = False
+    if last_workflow is None and resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml:
+        # Failures are often environmental (captcha, transient block); surface the draft so the user can keep iterating.
+        last_workflow = ctx.last_workflow
+        last_workflow_yaml = ctx.last_workflow_yaml
+        unvalidated = True
 
     # ASK_QUESTION blocks on user input — never surface a verified workflow
     # under it; auto_accept would silently apply a stepping-stone partial.
@@ -353,6 +428,7 @@ def _translate_to_agent_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
+        unvalidated=unvalidated,
     )
 
 
@@ -564,17 +640,9 @@ async def run_copilot_agent(
                 LOG.info("Copilot run cancelled by user")
                 return _build_exit_result(ctx, "Cancelled by user.", global_llm_context, cancelled=True)
             except MaxTurnsExceeded:
-                return _build_exit_result(
-                    ctx,
-                    "I've reached the maximum number of steps. Here's what I have so far.",
-                    global_llm_context,
-                )
+                return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
-                return _build_exit_result(
-                    ctx,
-                    "I ran out of time processing your request. Here's what I have so far.",
-                    global_llm_context,
-                )
+                return _build_timeout_exit_result(ctx, global_llm_context)
             except CopilotNonRetriableNavError as exc:
                 LOG.warning(
                     "Copilot run halted on non-retriable navigation error",

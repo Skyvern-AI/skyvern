@@ -170,20 +170,28 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
         pass
 
 
-def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """Return True when a persisted draft should be rolled back.
+def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
+    """``unvalidated`` overrides ``auto_accept=True`` to force explicit Accept/Reject."""
+    if bool(getattr(agent_result, "unvalidated", False)):
+        return False
+    return auto_accept is True
 
-    SKY-9143: when the agent decided not to ship a proposal this turn
-    (``updated_workflow is None``) but ``_update_workflow`` already committed
-    a YAML to ``workflow_definition``, we must restore the original even under
-    ``auto_accept=True`` — otherwise an unverified edit becomes the live
-    workflow silently.
-    """
+
+def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
+    """Restore when a mid-turn ``_update_workflow`` commit isn't covered by an accepted proposal."""
     if not bool(getattr(agent_result, "workflow_was_persisted", False)):
         return False
     if getattr(agent_result, "updated_workflow", None) is None:
         return True
-    return auto_accept is not True
+    return not _effective_auto_accept(auto_accept, agent_result)
+
+
+async def _clear_proposed_workflow(chat: Any) -> None:
+    await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        proposed_workflow=None,
+    )
 
 
 async def _persist_cancel_turn(
@@ -263,10 +271,13 @@ async def _finalise_normal_turn(
     if restored:
         await _restore_workflow_definition(original_workflow, organization_id)
 
-    if chat.auto_accept is not True and updated_workflow:
+    auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
+    if not auto_accept_effective and updated_workflow:
         proposed_data = updated_workflow.model_dump(mode="json")
         if agent_result.workflow_yaml:
             proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+        if agent_result.unvalidated:
+            proposed_data["_copilot_unvalidated"] = True
         await app.DATABASE.workflow_params.update_workflow_copilot_chat(
             organization_id=chat.organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -277,11 +288,15 @@ async def _finalise_normal_turn(
         # so a reload does not resurrect a stale Accept/Reject card. Runs
         # under both auto_accept values — a stale proposal can survive an
         # auto-accept toggle.
-        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-            organization_id=chat.organization_id,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            proposed_workflow=None,
-        )
+        await _clear_proposed_workflow(chat)
+    elif (
+        auto_accept_effective
+        and chat.proposed_workflow is not None
+        and chat.proposed_workflow.get("_copilot_unvalidated") is True
+    ):
+        # The leftover unvalidated proposal is no longer attached to the chat
+        # tail; clear it so reload doesn't resurrect a stale Accept/Reject card.
+        await _clear_proposed_workflow(chat)
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
         organization_id=chat.organization_id,
@@ -307,6 +322,7 @@ async def _finalise_normal_turn(
             response_time=assistant_message.created_at,
             total_tokens=getattr(agent_result, "total_tokens", None),
             response_type=getattr(agent_result, "response_type", "REPLY"),
+            unvalidated=bool(getattr(agent_result, "unvalidated", False)),
         )
     )
 

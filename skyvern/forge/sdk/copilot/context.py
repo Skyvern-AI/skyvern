@@ -127,6 +127,8 @@ class AgentResult:
     # persistence path (rollback + ``Cancelled by user.`` chat row) without
     # losing ``workflow_was_persisted`` the way a re-raise would.
     cancelled: bool = False
+    # The route forces Accept/Reject regardless of ``auto_accept`` when this is True.
+    unvalidated: bool = False
 
 
 @dataclass
