@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
-    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 5.0
+    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
@@ -229,6 +229,8 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096

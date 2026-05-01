@@ -164,6 +164,13 @@ def _build_tool_usage_guide(tool_names_and_descriptions: list[tuple[str, str]]) 
     )
 
 
+def _is_explicit_false(value: Any) -> bool:
+    # LLMs occasionally serialise JSON booleans as strings; coerce the common spellings.
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().lower() in {"false", "no", "0"}
+
+
 def _normalize_failure_reason(failure_reason: str | None) -> str:
     if not failure_reason:
         return "The workflow test run failed."
@@ -393,9 +400,16 @@ def _translate_to_agent_result(
     # "Could you share more context", so skip it for ASK_QUESTION.
     if resp_type != "ASK_QUESTION":
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
-    last_workflow, last_workflow_yaml = _verified_workflow_or_none(ctx)
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    # Default-true preserves backwards-compat with stale prompts and missing fields.
+    agent_admits_incomplete = _is_explicit_false(action_data.get("goal_reached"))
+
+    last_workflow = None
+    last_workflow_yaml = None
     unvalidated = False
-    if last_workflow is None and resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml:
+    if verified_workflow is not None and not agent_admits_incomplete:
+        last_workflow, last_workflow_yaml = verified_workflow, verified_yaml
+    elif resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml:
         # Failures are often environmental (captcha, transient block); surface the draft so the user can keep iterating.
         last_workflow = ctx.last_workflow
         last_workflow_yaml = ctx.last_workflow_yaml
@@ -484,8 +498,7 @@ async def run_copilot_agent(
         workflow_yaml=chat_request.workflow_yaml or "",
         chat_history=_format_chat_history(chat_history),
         global_llm_context=global_llm_context or "",
-        distinct_id=chat_request.workflow_permanent_id,
-        organization_id=organization_id,
+        handler=llm_api_handler,
     )
     if feasibility_verdict.verdict == "ask_clarification" and feasibility_verdict.question:
         return _build_feasibility_clarification_result(

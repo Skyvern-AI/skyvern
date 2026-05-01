@@ -17,11 +17,11 @@ from skyvern.forge.sdk.copilot.narration import (
     cancel_in_flight,
     detect_transitions,
     extract_tool_details,
-    handler_available,
+    resolve_narrator_handler,
     schedule_narration,
     snapshot_ctx,
 )
-from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result, summarize_tool_result_detail
+from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotToolCallUpdate,
@@ -80,10 +80,16 @@ async def stream_to_sse(
 
     # Narrator state persists across enforcement iterations via ctx so
     # cadence (last_emitted_at, min-gap) survives run_with_enforcement retries.
-    # Resolve handler availability once so per-event narrator bookkeeping
-    # (snapshot, detect, extract) is skipped when no narrator LLM is configured.
-    narrator_enabled = handler_available()
+    # Resolve the handler once (PostHog override → env-driven fallback) so
+    # per-emission calls don't re-hit PostHog and so per-event bookkeeping
+    # (snapshot, detect, extract) is skipped when no narrator LLM is wired.
     narrator_state: NarratorState = getattr(ctx, "narrator_state", None) or NarratorState()
+    if narrator_state.resolved_handler is None:
+        narrator_state.resolved_handler = await resolve_narrator_handler(
+            getattr(ctx, "workflow_permanent_id", None),
+            getattr(ctx, "organization_id", None),
+        )
+    narrator_enabled = narrator_state.resolved_handler is not None
     ctx.narrator_state = narrator_state
     user_message = getattr(ctx, "user_message", "") or ""
     if user_message and not narrator_state.user_goal:
@@ -144,9 +150,7 @@ async def stream_to_sse(
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
-                # Compute summary/success unconditionally: the narrator path
-                # below also needs them, and the work is cheap (no I/O).
-                summary = summarize_tool_result(tool_name, parsed)
+                summary = format_tool_result_for_user(tool_name, parsed)
                 success = parsed.get("ok", True)
                 detail = summarize_tool_result_detail(parsed)
 
