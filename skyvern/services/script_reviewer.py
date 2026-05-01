@@ -6,6 +6,7 @@ import json
 import re
 from typing import Literal, Sequence
 
+import json_repair
 import libcst as cst
 import structlog
 
@@ -464,14 +465,20 @@ class ScriptReviewer:
                     prompt_name="script-reviewer-conditional",
                     step=None,
                     organization_id=organization_id,
+                    raw_response=True,
                 )
 
-                code = self._extract_code_from_response(llm_response)
+                code = self._extract_code_from_response(
+                    llm_response,
+                    block_label=block_label,
+                    prompt_name="script-reviewer-conditional",
+                )
                 if not code:
                     LOG.warning(
                         "ScriptReviewer: no code extracted for conditional",
                         block_label=block_label,
                         attempt=attempt,
+                        prompt_name="script-reviewer-conditional",
                     )
                     if attempt >= max_attempts:
                         return None
@@ -493,6 +500,7 @@ class ScriptReviewer:
                         block_label=block_label,
                         attempt=attempt,
                         error=compile_error,
+                        prompt_name="script-reviewer-conditional",
                     )
                     if attempt < max_attempts:
                         current_prompt = self._build_retry_prompt(code, compile_error, function_signature)
@@ -793,22 +801,29 @@ class ScriptReviewer:
                     prompt_name=template,
                     step=None,
                     organization_id=organization_id,
+                    raw_response=True,
                 )
 
                 LOG.info(
                     "ScriptReviewer: LLM response received",
                     block_label=block_label,
                     attempt=attempt,
+                    prompt_name=template,
                     response_type=type(llm_response).__name__,
                     response_snippet=str(llm_response)[:200],
                 )
 
-                updated_code = self._extract_code_from_response(llm_response)
+                updated_code = self._extract_code_from_response(
+                    llm_response,
+                    block_label=block_label,
+                    prompt_name=template,
+                )
                 if not updated_code:
                     LOG.warning(
                         "ScriptReviewer: no code extracted from response",
                         block_label=block_label,
                         attempt=attempt,
+                        prompt_name=template,
                         response_snippet=str(llm_response)[:500],
                     )
                     if attempt >= max_attempts:
@@ -822,6 +837,7 @@ class ScriptReviewer:
                         "ScriptReviewer: compile error, retrying",
                         block_label=block_label,
                         attempt=attempt,
+                        prompt_name=template,
                         error=compile_error,
                         code_snippet=updated_code[:300],
                     )
@@ -1212,83 +1228,113 @@ class ScriptReviewer:
                 return stripped
         return "async def block_fn(page, context):"
 
-    def _extract_code_from_response(self, response: dict | str | list | None) -> str | None:
-        """Extract Python code from the LLM response.
-
-        Strict parsing: expects either a JSON dict with a "code" key, or a markdown
-        code block. Does NOT attempt to salvage malformed responses (lists, raw
-        str() coercion) — those should fail and trigger a retry.
-        """
-        if not response:
-            return None
-
-        # Step 1: Get the text content from the response
-        text = ""
-        if isinstance(response, dict):
-            # Direct "code" key (expected JSON format)
-            code_value = response.get("code")
-            if isinstance(code_value, str) and code_value.strip():
-                return code_value.strip()
-            # llm_response or updated_code keys
-            text = response.get("updated_code", "") or response.get("llm_response", "")
-        elif isinstance(response, str):
-            text = response
-        elif isinstance(response, list):
-            # LLM returned a list — this is malformed. Do NOT salvage with str().
+    def _response_to_text(self, response: object) -> str:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, list):
             LOG.warning(
-                "ScriptReviewer: LLM returned a list instead of dict/str, rejecting",
-                response_type="list",
+                "ScriptReviewer: LLM returned a list, rejecting",
                 response_length=len(response),
             )
-            return None
-        else:
-            LOG.warning(
-                "ScriptReviewer: unexpected response type, rejecting",
-                response_type=type(response).__name__,
-            )
-            return None
+            return ""
+        if isinstance(response, dict):
+            choices = response.get("choices") or []
+            if choices:
+                content = choices[0].get("message", {}).get("content") if isinstance(choices[0], dict) else None
+                if isinstance(content, str):
+                    return content
+            try:
+                return json.dumps(response)
+            except (TypeError, ValueError):
+                return ""
+        return ""
 
+    def _extract_code_from_response(
+        self,
+        response: object,
+        block_label: str | None = None,
+        prompt_name: str | None = None,
+    ) -> str | None:
+        if not response:
+            return None
+        text = self._response_to_text(response).strip()
         if not text:
             return None
 
-        # Step 2: Try to parse text as JSON with a "code" key
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                code_value = parsed.get("code")
-                if isinstance(code_value, str) and code_value.strip():
-                    return code_value.strip()
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Step 3: Extract from markdown code blocks
-        if "```python" in text:
-            start = text.index("```python") + len("```python")
-            remaining = text[start:]
-            end = remaining.find("```")
-            if end != -1:
-                code = remaining[:end].strip()
-            else:
-                code = remaining.strip()
-            if "async def " in code:
-                return code
-            return None
+        if text == "CANNOT_CONVERT":
+            return text
 
         if "```" in text:
             start = text.index("```") + 3
             remaining = text[start:]
             end = remaining.find("```")
-            if end != -1:
-                code = remaining[:end].strip()
-            else:
-                code = remaining.strip()
-            if "async def " in code:
+            code = remaining[:end] if end != -1 else remaining
+            for tag in ("python", "py", "json"):
+                if code.startswith(tag) and len(code) > len(tag) and code[len(tag)] in (" ", "\n", "\r"):
+                    code = code[len(tag) :]
+                    break
+            code = code.strip()
+            if code.startswith("{"):
+                # Fenced content is a JSON object — let json_repair handle it
+                # below so well-formed and malformed-Mode-A shapes both extract.
+                text = code
+            elif "async def " in code:
                 return code
-            return None
+            else:
+                return None
 
-        # Step 4: If text itself looks like a complete Python function, accept it
-        if text.strip().startswith("async def "):
-            return text.strip()
+        if text.startswith("async def "):
+            return text
+
+        try:
+            parsed = json_repair.loads(text)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            code_value = parsed.get("code")
+            if isinstance(code_value, str) and code_value.strip():
+                code_str = code_value.strip()
+                if self._get_compile_error(code_str) is None:
+                    return code_str
+                if code_str.startswith("async def ") and code_str.count("(") > code_str.count(")") and len(parsed) > 1:
+                    # When the LLM emits a Python type annotation inside a JSON string with
+                    # unescaped quotes — e.g. `{"code": "async def fn(page: T", "ctx": "U):..."}` —
+                    # json_repair splits each `<param>: <Type>` pair into its own dict entry.
+                    # Re-joining as `, key: value` reverses the split for the type-annotation
+                    # pattern. compile-checked below; falls back to the truncated code on miss.
+                    pieces = [code_str]
+                    bail = False
+                    for k, v in parsed.items():
+                        if k == "code":
+                            continue
+                        if not isinstance(v, str):
+                            bail = True
+                            break
+                        pieces.append(f", {k}: {v}")
+                    if not bail:
+                        reconstructed = "".join(pieces)
+                        log_preview = [str(k)[:50] for k in list(parsed.keys())[:5]]
+                        if self._get_compile_error(reconstructed) is None:
+                            LOG.info(
+                                "ScriptReviewer: malformed-dict recovery applied",
+                                block_label=block_label,
+                                prompt_name=prompt_name,
+                                dict_key_count=len(parsed),
+                                dict_key_preview=log_preview,
+                            )
+                            return reconstructed
+                        LOG.warning(
+                            "ScriptReviewer: malformed-dict recovery failed compile",
+                            block_label=block_label,
+                            prompt_name=prompt_name,
+                            dict_key_count=len(parsed),
+                            dict_key_preview=log_preview,
+                        )
+                return code_str
+            for v in parsed.values():
+                if isinstance(v, str) and v.strip().startswith("async def "):
+                    return v.strip()
 
         return None
 
