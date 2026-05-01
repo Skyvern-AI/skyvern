@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
+COPILOT_RESPONSE_TYPES: tuple[str, ...] = get_args(ResponseType)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
@@ -113,15 +114,21 @@ class AgentResult:
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
     workflow_was_persisted: bool = False
-    # Feasibility-gate fast-path sets this True so the route can null any
-    # previously-persisted proposed_workflow. Regular in-loop ASK_QUESTION
-    # responses leave it False, preserving in-progress drafts.
+    # Tells the route to null any persisted proposed_workflow. Set by the
+    # feasibility-gate fast-path and by ASK_QUESTION turns.
     clear_proposed_workflow: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
     # silently passing as cheap.
     total_tokens: int | None = None
+    # Set when the agent absorbed an asyncio cancellation initiated by an
+    # explicit user Stop. Lets the route route to a cancel-specific
+    # persistence path (rollback + ``Cancelled by user.`` chat row) without
+    # losing ``workflow_was_persisted`` the way a re-raise would.
+    cancelled: bool = False
+    # The route forces Accept/Reject regardless of ``auto_accept`` when this is True.
+    unvalidated: bool = False
 
 
 @dataclass

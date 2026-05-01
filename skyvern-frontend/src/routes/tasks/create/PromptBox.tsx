@@ -1,5 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
+import { stringify as convertToYAML } from "yaml";
+import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -34,7 +36,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   generatePhoneNumber,
@@ -111,7 +113,35 @@ const exampleCases = [
   },
 ];
 
-function PromptBox() {
+type PromptBoxProps = {
+  enableCopilotHandoff?: boolean;
+};
+
+const HANDOFF_TITLE_MAX_LEN = 80;
+
+function deriveHandoffTitle(prompt: string): string {
+  const collapsed = prompt.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "New Workflow";
+  if (collapsed.length <= HANDOFF_TITLE_MAX_LEN) return collapsed;
+  return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
+}
+
+function buildBlankWorkflowRequest(title: string): WorkflowCreateYAMLRequest {
+  return {
+    title,
+    description: "",
+    ai_fallback: true,
+    code_version: 2,
+    run_with: "code",
+    workflow_definition: {
+      version: 2,
+      blocks: [],
+      parameters: [],
+    },
+  };
+}
+
+function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
   const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">(
@@ -139,6 +169,9 @@ function PromptBox() {
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
   const { setAutoplay } = useAutoplayStore();
   const [promptImprovalIsPending, setPromptImprovalIsPending] = useState(false);
+  // react-query isPending only flips on the next render, so a same-frame
+  // double-click can slip past it; the ref is the synchronous guard.
+  const submitInFlightRef = useRef(false);
 
   const generateWorkflowMutation = useMutation({
     mutationFn: async ({
@@ -228,7 +261,67 @@ function PromptBox() {
         description: error.message,
       });
     },
+    onSettled: () => {
+      submitInFlightRef.current = false;
+    },
   });
+
+  const handoffWorkflowMutation = useMutation({
+    mutationFn: async ({ prompt }: { prompt: string }) => {
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(
+        buildBlankWorkflowRequest(deriveHandoffTitle(prompt)),
+      );
+      const result = await client.post<string, { data: WorkflowApiResponse }>(
+        "/workflows",
+        yaml,
+        {
+          headers: {
+            "Content-Type": "text/plain",
+          },
+        },
+      );
+      return { data: result.data, prompt };
+    },
+    onSuccess: ({ data: workflow, prompt }) => {
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      navigate(`/workflows/${workflow.workflow_permanent_id}/build`, {
+        state: { copilotMessage: prompt },
+      });
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Error creating workflow",
+        description: error.message,
+      });
+    },
+    onSettled: () => {
+      submitInFlightRef.current = false;
+    },
+  });
+
+  const isSubmitting =
+    generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
+
+  const submitPrompt = ({
+    prompt,
+    legacyVersion,
+  }: {
+    prompt: string;
+    legacyVersion: "v1" | "v2" | "v2-code";
+  }) => {
+    if (submitInFlightRef.current || isSubmitting) {
+      return;
+    }
+    submitInFlightRef.current = true;
+    if (enableCopilotHandoff) {
+      handoffWorkflowMutation.mutate({ prompt });
+      return;
+    }
+    generateWorkflowMutation.mutate({ prompt, version: legacyVersion });
+  };
 
   return (
     <div>
@@ -335,29 +428,28 @@ function PromptBox() {
                 size="large"
                 useCase="new_workflow"
               />
-              <div className="flex items-center">
-                <GearIcon
-                  className="size-6 cursor-pointer"
-                  onClick={() => {
-                    setShowAdvancedSettings((value) => !value);
-                  }}
-                />
-              </div>
+              {!enableCopilotHandoff ? (
+                <div className="flex items-center">
+                  <GearIcon
+                    className="size-6 cursor-pointer"
+                    onClick={() => {
+                      setShowAdvancedSettings((value) => !value);
+                    }}
+                  />
+                </div>
+              ) : null}
               <div
                 className={cn("flex items-center", {
                   "pointer-events-none opacity-20": !prompt.trim(),
                 })}
               >
-                {generateWorkflowMutation.isPending ? (
+                {isSubmitting ? (
                   <ReloadIcon className="size-6 animate-spin" />
                 ) : (
                   <PaperPlaneIcon
                     className="size-6 cursor-pointer"
-                    onClick={async () => {
-                      generateWorkflowMutation.mutate({
-                        prompt,
-                        version: selectValue,
-                      });
+                    onClick={() => {
+                      submitPrompt({ prompt, legacyVersion: selectValue });
                     }}
                   />
                 )}
@@ -574,9 +666,9 @@ function PromptBox() {
               icon={example.icon}
               label={example.label}
               onClick={() => {
-                generateWorkflowMutation.mutate({
+                submitPrompt({
                   prompt: example.prompt,
-                  version: "v2",
+                  legacyVersion: "v2",
                 });
               }}
             />

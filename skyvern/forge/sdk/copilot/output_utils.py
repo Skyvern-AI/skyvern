@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
+
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -37,15 +40,51 @@ def extract_final_text(result: RunResultStreaming) -> str:
     return ""
 
 
-def parse_final_response(text: str) -> dict[str, Any]:
-    """Parse the agent's final JSON envelope, stripping markdown code fences.
+_TYPE_ALTERNATION = "|".join(COPILOT_RESPONSE_TYPES)
+_LEADING_LABEL_RE = re.compile(rf"^\s*({_TYPE_ALTERNATION})\s*[:,]?\s+", re.IGNORECASE)
+_USER_RESPONSE_VALUE_RE = re.compile(r'"user_response"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_TYPE_VALUE_RE = re.compile(rf'"type"\s*:\s*"({_TYPE_ALTERNATION})"')
 
-    Tolerant of literal control characters (newlines/tabs/CR) inside string
-    values. Some model outputs wrap long `user_response` prose across real
-    newlines instead of `\\n` escapes; strict `json.loads` rejects those, and
-    without this fallback the frontend renders the full raw JSON object as
-    the user-visible reply (see SKY-9189 test-2 regression).
-    """
+
+def _try_loads_dict(text: str) -> dict[str, Any] | None:
+    # strict=False allows literal control characters in string values (SKY-9189)
+    try:
+        parsed = json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
+    if "user_response" in parsed:
+        return True
+    # bare {"type": "object"} (a JSON schema in prose) is not an envelope
+    type_value = parsed.get("type")
+    return isinstance(type_value, str) and type_value.upper() in COPILOT_RESPONSE_TYPES
+
+
+def _text_looks_envelope_shaped(text: str) -> bool:
+    # require leading `{` so prose that merely quotes the field names (e.g.,
+    # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
+    # through to the plain-text tier instead of degrading to "Done."
+    return text.startswith("{") and '"user_response"' in text and bool(_TYPE_VALUE_RE.search(text))
+
+
+def _sniff_response_type(text: str) -> str:
+    # REPLACE_WORKFLOW is demoted to REPLY: recovery cannot extract a usable
+    # workflow_yaml, and announcing an update without one is worse than silent.
+    match = _TYPE_VALUE_RE.search(text)
+    if match and match.group(1).upper() == "ASK_QUESTION":
+        return "ASK_QUESTION"
+    return "REPLY"
+
+
+def parse_final_response(text: str) -> dict[str, Any]:
+    """Parse the agent's final JSON envelope, tolerating markdown code fences,
+    leading action labels (``REPLY {...}``), prose preambles, and literal
+    control characters in string values. Falls back to regex-extracting
+    ``user_response`` from envelope-shaped text so a malformed envelope never
+    reaches the chat bubble."""
     cleaned = text.strip()
     for prefix in ("```json", "```"):
         if cleaned.startswith(prefix):
@@ -55,13 +94,35 @@ def parse_final_response(text: str) -> dict[str, Any]:
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
 
-    for strict in (True, False):
-        try:
-            parsed = json.loads(cleaned, strict=strict)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
+    parsed = _try_loads_dict(cleaned)
+    if parsed is not None:
+        return parsed
+
+    label_stripped = _LEADING_LABEL_RE.sub("", cleaned, count=1)
+    if label_stripped != cleaned:
+        parsed = _try_loads_dict(label_stripped)
+        if parsed is not None:
+            return parsed
+
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    # skip when the slice equals the full string — _try_loads_dict above already tried it
+    if first != -1 and last > first and not (first == 0 and last == len(cleaned) - 1):
+        parsed = _try_loads_dict(cleaned[first : last + 1])
+        if parsed is not None and _looks_like_envelope(parsed):
+            return parsed
+
+    if _text_looks_envelope_shaped(cleaned):
+        sniffed_type = _sniff_response_type(cleaned)
+        match = _USER_RESPONSE_VALUE_RE.search(cleaned)
+        if match:
+            try:
+                value = json.loads(f'"{match.group(1)}"', strict=False)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, str):
+                return {"type": sniffed_type, "user_response": value}
+        return {"type": sniffed_type, "user_response": "Done."}
 
     return {"type": "REPLY", "user_response": text}
 
@@ -182,10 +243,52 @@ def _extract_failure_message(result: dict[str, Any]) -> str:
     return next(iter_failure_reasons(result), "Unknown error")
 
 
+_HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
+_LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
+
+
+def _sanitize_failure_text(text: str, max_chars: int = 120) -> str:
+    """Strip dict/HTTP-header dumps and cap a failure message for chat display.
+
+    The chat activity bullet is a fact, not a data dump — we never want raw
+    response headers or large JSON-looking blobs to flow into the SSE
+    payload. Short, capitalised technical tokens (``ERR_NAME_NOT_RESOLVED``)
+    must pass through unchanged."""
+    text = _HEADERS_BLOB_RE.sub(" ", text)
+    text = _LARGE_DICT_BLOB_RE.sub("{...}", text)
+    text = " ".join(text.split())
+    if not text:
+        return "(no details)"
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    return text
+
+
+def _describe_value_shape(value: Any) -> str:
+    """Describe the shape of a JS evaluation result without echoing values.
+
+    Distinct from ``_summarize_extracted_data``: that helper shapes data for
+    the LLM context (different verb, different audience). This one phrases
+    the shape for a chat activity bullet."""
+    if isinstance(value, list):
+        if not value:
+            return "empty list"
+        if isinstance(value[0], dict):
+            keys = sorted(value[0].keys())
+            return f"list of {len(value)} items, keys: {', '.join(keys)}"
+        return f"list of {len(value)} items"
+    if isinstance(value, dict):
+        keys = sorted(value.keys())
+        return f"object with keys: {', '.join(keys)}"
+    if isinstance(value, str):
+        return f"text ({len(value)} chars)"
+    return "value"
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     """Create a brief human-readable summary of a tool result."""
     if not result.get("ok", False):
-        return f"Failed: {_extract_failure_message(result)[:200]}"
+        return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
     data = result.get("data") or {}
 
@@ -213,14 +316,16 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
             return f"Run {', '.join(executed)}: {status}{suffix}"
         return f"Run {', '.join(executed)}: {status}"
     if tool_name == "get_browser_screenshot":
-        return f"Screenshot taken ({data.get('url', '?')[:80]})"
+        url = data.get("url")
+        return f"Screenshot taken ({url[:80]})" if url else "Screenshot taken"
     if tool_name == "navigate_browser":
         url = result.get("url") or data.get("url", "?")
         return f"Navigated to {url[:80]}"
     if tool_name == "evaluate":
         result_val = data.get("result")
-        preview = str(result_val)[:100] if result_val is not None else "undefined"
-        return f"JS result: {preview}"
+        if result_val is None:
+            return "Evaluated JavaScript"
+        return f"Evaluated JavaScript — returned {_describe_value_shape(result_val)}"
     if tool_name == "click":
         return f"Clicked '{data.get('selector', '?')}'"
     if tool_name == "type_text":
@@ -236,6 +341,21 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
     return "OK"
+
+
+def build_run_blocks_response(run_ok: bool, result_data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a run-blocks result, promoting the first failure reason to a top-level ``error``."""
+    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
+    if not run_ok:
+        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
+    return response
+
+
+def summarize_tool_result_detail(result: dict[str, Any], max_chars: int = 800) -> str | None:
+    """Tooltip-grade failure detail (longer cap than ``summarize_tool_result``); None on success."""
+    if result.get("ok", False):
+        return None
+    return _sanitize_failure_text(_extract_failure_message(result), max_chars=max_chars)
 
 
 def truncate_output(output: Any, max_chars: int = 2000) -> str | None:

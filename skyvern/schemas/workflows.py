@@ -412,6 +412,7 @@ class BlockType(StrEnum):
     TASK = "task"
     TaskV2 = "task_v2"
     FOR_LOOP = "for_loop"
+    WHILE_LOOP = "while_loop"
     CONDITIONAL = "conditional"
     CODE = "code"
     TEXT_PROMPT = "text_prompt"
@@ -706,6 +707,13 @@ class BranchCriteriaYAML(BaseModel):
     criteria_type: Literal["jinja2_template", "prompt"] = "jinja2_template"
     expression: str
     description: str | None = None
+
+
+class WhileLoopBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WHILE_LOOP] = BlockType.WHILE_LOOP  # type: ignore
+
+    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    condition: BranchCriteriaYAML
 
 
 class BranchConditionYAML(BaseModel):
@@ -1090,6 +1098,7 @@ PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator=
 BLOCK_YAML_SUBCLASSES = (
     TaskBlockYAML
     | ForLoopBlockYAML
+    | WhileLoopBlockYAML
     | CodeBlockYAML
     | TextPromptBlockYAML
     | DownloadToS3BlockYAML

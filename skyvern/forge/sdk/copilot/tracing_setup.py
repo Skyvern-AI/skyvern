@@ -15,6 +15,8 @@ from typing import Any
 
 import structlog
 
+from skyvern.config import settings
+
 # Reuse the HTTP-logging redactor so trace-side and SSE-side redaction share
 # one exact-match sensitive-key policy.
 from skyvern.forge.request_logging import redact_sensitive_fields
@@ -93,7 +95,11 @@ def ensure_tracing_initialized() -> None:
             _TRACING_INITIALIZED = True
             return
 
-        logfire.configure(send_to_logfire="if-token-present", service_name="skyvern-copilot")
+        logfire.configure(
+            send_to_logfire="if-token-present",
+            service_name="skyvern-copilot",
+            environment=settings.ENV,
+        )
         logfire.instrument_openai_agents()
         _patch_agent_span_attributes()
         # Logfire instruments via OpenTelemetry independently of the SDK's

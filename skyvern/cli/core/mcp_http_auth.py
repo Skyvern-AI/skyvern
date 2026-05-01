@@ -7,8 +7,10 @@ import json
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from threading import RLock
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
@@ -56,10 +58,14 @@ _MAX_VALIDATION_RETRIES = 2
 _RETRY_DELAY_SECONDS = 0.25
 _OAUTH_UNAVAILABLE_MSG = "OAuth authentication requires cloud deployment"
 _OAUTH_SERVICE_UNAVAILABLE_MSG = "Authentication service temporarily unavailable"
+_OAUTH_MISSING_ORG_CONTEXT_MSG = "Bearer token missing organization context"
 _DEFAULT_REMOTE_BASE_URL = "https://api.skyvern.com"
 _MCP_REALM = "mcp"
 _RESOURCE_CLAIM_KEYS = ("resource",)
 _TOKEN_CLOCK_SKEW_SECONDS = 60.0
+
+_OrgEntitiesGetter = Callable[[str, str], Awaitable[list[Any]]]
+_OrgAuthTokenGetter = Callable[[str, OrganizationAuthTokenType], Awaitable[Any | None]]
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,13 @@ class _OAuthResolution:
 
     api_key: str
     validation: MCPAPIKeyValidation
+
+
+class MissingOrgContextError(HTTPException):
+    """Raised when an MCP OAuth bearer token lacks an explicit org claim."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=401, detail=_OAUTH_MISSING_ORG_CONTEXT_MSG)
 
 
 def _canonical_mcp_url(base_url: str | None = None) -> str:
@@ -229,12 +242,48 @@ async def _fetch_oauth_userinfo(bearer_token: str, issuer_url: str) -> dict[str,
     return response_body
 
 
+def _get_oauth_org_auth_methods(db: object) -> tuple[_OrgEntitiesGetter | None, _OrgAuthTokenGetter | None]:
+    # OSS shape: methods sit directly on the DB instance (or unit-test mock).
+    get_entities = getattr(db, "get_organization_entities", None)
+    get_auth_token = getattr(db, "get_valid_org_auth_token", None)
+    if callable(get_entities) and callable(get_auth_token):
+        return cast(_OrgEntitiesGetter, get_entities), cast(_OrgAuthTokenGetter, get_auth_token)
+
+    # Cloud shape: methods live on a nested ``organizations`` repository.
+    # Delegated to ``AgentFunction.resolve_mcp_oauth_org_lookups`` so this
+    # OSS-synced module doesn't encode knowledge of CloudAgentDB's layout.
+    cloud_lookups = app.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups(db)
+    if cloud_lookups is not None:
+        get_entities, get_auth_token = cloud_lookups
+        return cast(_OrgEntitiesGetter, get_entities), cast(_OrgAuthTokenGetter, get_auth_token)
+
+    return None, None
+
+
+def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:
+    """Return the Clerk org id from supported org-scoped JWT claim shapes.
+
+    Our Clerk template uses `org_id`; Clerk's org-scoped session JWTs can also
+    expose the active organization as compact claim `o.id`.
+    """
+    org_id_claim = payload.get("org_id")
+    if isinstance(org_id_claim, str) and org_id_claim:
+        return org_id_claim
+
+    compact_org_claim = payload.get("o")
+    if isinstance(compact_org_claim, dict):
+        compact_org_id = compact_org_claim.get("id")
+        if isinstance(compact_org_id, str) and compact_org_id:
+            return compact_org_id
+
+    raise MissingOrgContextError()
+
+
 async def _resolve_oauth_subject_to_org(
     payload: dict[str, object],
     db: object,
 ) -> _OAuthResolution:
-    get_entities = getattr(db, "get_organization_entities", None)
-    get_auth_token = getattr(db, "get_valid_org_auth_token", None)
+    get_entities, get_auth_token = _get_oauth_org_auth_methods(db)
     if not callable(get_entities) or not callable(get_auth_token):
         LOG.debug(
             "MCP OAuth DB object is missing required auth methods",
@@ -244,19 +293,15 @@ async def _resolve_oauth_subject_to_org(
         )
         raise HTTPException(status_code=401, detail=_OAUTH_UNAVAILABLE_MSG)
 
-    entity_id = payload.get("sub")
-    if not isinstance(entity_id, str) or not entity_id:
+    subject = payload.get("sub")
+    if not isinstance(subject, str) or not subject:
         raise HTTPException(status_code=401, detail="Bearer token missing subject claim")
 
-    entity_type = "user"
-    org_id_claim = payload.get("org_id")
-    if isinstance(org_id_claim, str) and org_id_claim:
-        entity_type = "organization"
-        entity_id = org_id_claim
+    clerk_org_id = _extract_explicit_oauth_org_id(payload)
 
-    org_entities = await get_entities(entity_id, entity_type)
+    org_entities = await get_entities(clerk_org_id, "organization")
     if not org_entities:
-        LOG.info("MCP OAuth: no org mapping for entity", entity_id=entity_id, entity_type=entity_type)
+        LOG.info("MCP OAuth: no org mapping for entity", entity_id=clerk_org_id, entity_type="organization")
         raise HTTPException(status_code=401, detail="No organization found for this user")
 
     org_id = org_entities[0].organization_id
@@ -451,9 +496,22 @@ async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
                     signing_key,
                     algorithms=["RS256"],
                     leeway=_TOKEN_CLOCK_SKEW_SECONDS,
+                    # PyJWT's built-in `aud` check is intentionally skipped here.
+                    # `_validate_oauth_token_contract` below calls
+                    # `_validate_token_audience`, which compares the token's
+                    # `aud` against the canonical MCP resource URI after
+                    # normalizing trailing slashes on both sides — PyJWT does
+                    # exact string match and would reject `.../mcp/` tokens
+                    # against `.../mcp` (or vice versa). The audience check
+                    # is NOT being skipped, only relocated.
+                    options={"verify_aud": False},
                 )
-            except (InvalidKeyError, PyJWTError):
-                LOG.info("MCP OAuth Bearer token failed JWT verification")
+            except (InvalidKeyError, PyJWTError) as exc:
+                LOG.info(
+                    "MCP OAuth Bearer token failed JWT verification",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
                 raise HTTPException(status_code=401, detail="Invalid Bearer token")
 
             _validate_oauth_token_contract(

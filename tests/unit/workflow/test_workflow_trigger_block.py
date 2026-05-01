@@ -11,11 +11,16 @@ import pytest
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation import providers as providers_module
-from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
+from skyvern.forge.sdk.workflow.exceptions import (
+    InvalidWorkflowDefinition,
+    PayloadTemplateRenderError,
+    PayloadTemplateSyntaxError,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     _JSON_TYPE_MARKER,
     FailedToFormatJinjaStyleParameter,
     WorkflowTriggerBlock,
+    jinja_sandbox_env,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -149,6 +154,93 @@ class TestRenderTemplatesInPayload:
         block = _make_block()
         result = self._render_payload(block, {"items": ["str", 42, True, None, {"nested": "dict"}]})
         assert result == {"items": ["str", 42, True, None, {"nested": "dict"}]}
+
+
+class TestPayloadTemplateRenderError:
+    """SKY-9259: broken Jinja2 in payload must surface the key path + template."""
+
+    def _render_payload_live(self, block: WorkflowTriggerBlock, payload: dict[str, Any]) -> dict[str, Any]:
+        ctx = MagicMock()
+        ctx.values = {}
+        ctx.secrets = {}
+        ctx.include_secrets_in_templates = False
+        ctx.get_block_metadata = MagicMock(return_value={})
+        return block._render_templates_in_payload(payload, ctx)
+
+    def test_flat_bad_template_reports_key_and_template(self) -> None:
+        block = _make_block()
+        bad = "{{ response.data. }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {"notes": bad})
+        err = excinfo.value
+        assert err.path == "payload.notes"
+        assert err.template == bad
+        msg = str(err)
+        assert "expected name or number" in msg
+        # nosemgrep: incomplete-url-substring-sanitization
+        assert "payload.notes" in msg
+        assert bad in msg
+
+    def test_nested_dict_path_is_dot_joined(self) -> None:
+        block = _make_block()
+        bad = "{{ foo..bar }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {"outer": {"inner": bad}})
+        assert excinfo.value.path == "payload.outer.inner"
+
+    def test_list_index_is_bracketed(self) -> None:
+        block = _make_block()
+        bad = "{{ x.[y] }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {"items": ["ok", bad, "also_ok"]})
+        assert excinfo.value.path == "payload.items[1]"
+
+    def test_deeply_nested_list_and_dict_path(self) -> None:
+        block = _make_block()
+        bad = "{{ extract.field. }}"
+        payload = {"fields": [{"ok": "a"}, {"notes": bad}]}
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, payload)
+        assert excinfo.value.path == "payload.fields[1].notes"
+        assert excinfo.value.template == bad
+
+    def test_error_is_not_double_wrapped(self) -> None:
+        block = _make_block()
+        bad = "{{ foo. }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {"a": {"b": [{"c": bad}]}})
+        assert excinfo.value.path == "payload.a.b[0].c"
+        assert not isinstance(excinfo.value.original, PayloadTemplateRenderError)
+
+    def test_key_with_dot_is_bracketed(self) -> None:
+        block = _make_block()
+        bad = "{{ foo. }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {"user.name": bad})
+        assert excinfo.value.path == 'payload["user.name"]'
+
+    def test_key_with_bracket_is_bracketed(self) -> None:
+        block = _make_block()
+        bad = "{{ foo..bar }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {"items[0]": bad})
+        assert excinfo.value.path == 'payload["items[0]"]'
+
+    def test_key_with_quote_is_json_escaped(self) -> None:
+        block = _make_block()
+        bad = "{{ foo. }}"
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, {'weird"key': bad})
+        assert excinfo.value.path == 'payload["weird\\"key"]'
+
+    def test_good_templates_render_normally(self) -> None:
+        # Sanity: live Jinja2 env renders a valid template referencing nothing.
+        block = _make_block()
+        result = self._render_payload_live(block, {"static": "hello"})
+        assert result == {"static": "hello"}
+        # And our live render path is actually using Jinja2, not the mocked stub
+        # from TestRenderTemplatesInPayload above.
+        assert jinja_sandbox_env is not None
 
 
 class TestCheckTriggerDepth:
@@ -323,3 +415,71 @@ class TestBlockMetadata:
     def test_get_all_parameters_empty(self) -> None:
         block = _make_block()
         assert block.get_all_parameters("wr_test") == []
+
+
+class TestValidatePayloadTemplates:
+    """Save-time Jinja2 parse check for workflow_trigger.payload."""
+
+    def test_valid_templates_pass(self) -> None:
+        block = _make_block(payload={"a": "{{ ok }}", "b": "{{ x.y[0] }}", "c": "literal"})
+        block.validate_payload_templates()
+
+    def test_double_dot_raises_with_path_and_template(self) -> None:
+        block = _make_block(payload={"file_url": "{{ x..y }}"})
+        with pytest.raises(PayloadTemplateSyntaxError) as excinfo:
+            block.validate_payload_templates()
+        assert excinfo.value.path == "payload.file_url"
+        assert excinfo.value.template == "{{ x..y }}"
+        assert excinfo.value.block_label == "test_trigger"
+
+    def test_trailing_dot_raises(self) -> None:
+        block = _make_block(payload={"k": "{{ x. }}"})
+        with pytest.raises(PayloadTemplateSyntaxError):
+            block.validate_payload_templates()
+
+    def test_nested_dict_path_is_dot_joined(self) -> None:
+        block = _make_block(payload={"outer": {"inner": "{{ x..y }}"}})
+        with pytest.raises(PayloadTemplateSyntaxError) as excinfo:
+            block.validate_payload_templates()
+        assert excinfo.value.path == "payload.outer.inner"
+
+    def test_list_index_is_bracketed(self) -> None:
+        block = _make_block(payload={"fields": [{"notes": "{{ x..y }}"}]})
+        with pytest.raises(PayloadTemplateSyntaxError) as excinfo:
+            block.validate_payload_templates()
+        assert excinfo.value.path == "payload.fields[0].notes"
+
+    def test_non_string_values_passthrough(self) -> None:
+        block = _make_block(payload={"n": 42, "b": True, "none": None, "list": [1, 2]})
+        block.validate_payload_templates()
+
+    def test_none_payload_is_noop(self) -> None:
+        block = _make_block(payload=None)
+        block.validate_payload_templates()
+
+
+class TestServiceWiresValidatePayloadTemplates:
+    """The save-path validator must reject a workflow whose trigger payload has bad Jinja.
+
+    Calls WorkflowService._validate_payload_templates directly: it's a static method
+    that takes a WorkflowDefinition - no DB / org fixtures needed.
+    """
+
+    def _definition(self, payload: Any) -> Any:
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+
+        block = _make_block(label="trigger_test", payload=payload)
+        return WorkflowDefinition(parameters=[], blocks=[block])
+
+    def test_static_validator_raises_on_double_dot_payload(self) -> None:
+        from skyvern.forge.sdk.workflow.service import WorkflowService
+
+        with pytest.raises(PayloadTemplateSyntaxError) as excinfo:
+            WorkflowService._validate_payload_templates(self._definition({"file_url": "{{ x..y }}"}))
+        assert excinfo.value.path == "payload.file_url"
+        assert excinfo.value.block_label == "trigger_test"
+
+    def test_static_validator_passes_on_valid_payload(self) -> None:
+        from skyvern.forge.sdk.workflow.service import WorkflowService
+
+        WorkflowService._validate_payload_templates(self._definition({"file_url": "{{ x.y }}"}))

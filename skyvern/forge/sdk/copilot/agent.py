@@ -22,11 +22,13 @@ import structlog
 import yaml
 from pydantic import ValidationError
 
+from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
 )
@@ -40,6 +42,69 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 )
 
 MAX_TURNS = 25
+
+
+async def _resolve_live_browser_session_id(
+    chat_request: WorkflowCopilotChatRequest,
+    organization_id: str,
+) -> str | None:
+    """Validate against a debug session for the same (org, workflow_permanent_id);
+    return None on any failure so the caller falls back to auto-create."""
+    requested = chat_request.browser_session_id
+    if not requested:
+        return None
+
+    try:
+        debug_session = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
+            browser_session_id=requested,
+            organization_id=organization_id,
+        )
+        if debug_session is None:
+            LOG.warning(
+                "Copilot received an unknown browser_session_id; ignoring",
+                organization_id=organization_id,
+                requested_session_id=requested,
+            )
+            return None
+        if debug_session.workflow_permanent_id != chat_request.workflow_permanent_id:
+            LOG.warning(
+                "Copilot browser_session_id is bound to a different workflow; ignoring",
+                organization_id=organization_id,
+                requested_session_id=requested,
+                expected_wpid=chat_request.workflow_permanent_id,
+                actual_wpid=debug_session.workflow_permanent_id,
+            )
+            return None
+
+        # Trust the DB row over a CDP probe here — get_browser_state opens a
+        # fresh Playwright connection. ensure_browser_session does the
+        # attachability probe right before use so stale rows still recover.
+        persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
+        if persistent is None or is_final_status(persistent.status) or not persistent.browser_address:
+            LOG.warning(
+                "Copilot live browser session is not yet usable; falling back to auto-create",
+                organization_id=organization_id,
+                requested_session_id=requested,
+                status=persistent.status if persistent else None,
+                has_browser_address=bool(persistent.browser_address) if persistent else False,
+            )
+            return None
+
+        LOG.info(
+            "Copilot reusing live browser session",
+            organization_id=organization_id,
+            session_id=requested,
+        )
+        return requested
+    except Exception as exc:
+        LOG.warning(
+            "Copilot live-session validation raised; falling back to auto-create",
+            organization_id=organization_id,
+            requested_session_id=requested,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return None
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -121,8 +186,9 @@ _FAILURE_FOLLOW_UP = {
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
-    # Reshape replies when we cannot ship a proposal this turn so the user
-    # sees why nothing is being offered rather than an un-grounded claim.
+    has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
+    keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
+
     if ctx.last_test_ok is False and ctx.last_update_block_count is not None:
         if ctx.last_update_block_count <= 0:
             draft_phrase = "a draft workflow"
@@ -132,12 +198,17 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
 
         failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
         follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
-        return f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}.{follow_up}"
+        return (
+            f"I created {draft_phrase} and tested it, but the test failed. "
+            f"Failure: {failure_summary}.{follow_up}{keep_draft_affordance}"
+        )
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
-        # Agent edited the YAML but didn't verify it this turn; don't promise
-        # a re-run we can't durably execute (the restore helper rolls the
-        # mid-turn DB write back and there's no durable draft to re-test).
+        if has_keepable_draft:
+            return (
+                "I drafted an update but wasn't able to verify it this turn. "
+                "Keep the draft to iterate on it manually, or discard."
+            )
         return (
             "I drafted an update but wasn't able to verify it this turn. "
             "Could you share more context about what you'd like me to do?"
@@ -147,20 +218,18 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
 
 
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
-    """Only surface a workflow proposal when it passed a test this turn.
-
-    SKY-9143: the Accept/Reject UI must never reflect a workflow we haven't
-    proven works. Every agent exit path that builds an AgentResult directly
-    (cancel, max-turns, timeout, non-retriable nav error, catch-all Exception)
-    funnels through this so the strict invariant holds regardless of which
-    branch the run took.
-    """
-    if ctx.last_workflow is not None and ctx.last_test_ok is True:
+    """Surface a proposal only when it passed a test this turn AND yaml is on hand."""
+    if ctx.last_workflow is not None and ctx.last_workflow_yaml and ctx.last_test_ok is True:
         return ctx.last_workflow, ctx.last_workflow_yaml
     return None, None
 
 
-def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_context: str | None) -> AgentResult:
+def _build_exit_result(
+    ctx: CopilotContext,
+    user_response: str,
+    global_llm_context: str | None,
+    cancelled: bool = False,
+) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     return AgentResult(
@@ -170,6 +239,77 @@ def _build_exit_result(ctx: CopilotContext, user_response: str, global_llm_conte
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
+        cancelled=cancelled,
+    )
+
+
+_TIMEOUT_REPLY_DEFAULT = "I ran out of time processing your request. Here's what I have so far."
+_TIMEOUT_REPLY_UNVALIDATED = (
+    "I ran out of time before I could finish testing. I have a draft workflow you can keep — "
+    "accept it to save (note: it hasn't been verified end-to-end), or discard."
+)
+_TIMEOUT_REPLY_TESTED = "I ran out of time, but I have a tested draft for you. Accept it to save, or discard."
+
+_MAX_TURNS_REPLY_DEFAULT = "I've reached the maximum number of steps. Here's what I have so far."
+_MAX_TURNS_REPLY_UNVALIDATED = (
+    "I've reached the maximum number of steps before I could finish testing. I have a draft "
+    "workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard."
+)
+_MAX_TURNS_REPLY_TESTED = (
+    "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
+)
+
+
+def _build_capacity_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    *,
+    default_reply: str,
+    unvalidated_reply: str,
+    tested_reply: str,
+) -> AgentResult:
+    """Capacity-exhausted exits (timeout, max-turns) surface the most recent
+    successfully-parsed workflow rather than discard the WIP."""
+    # ``last_test_ok=None`` covers both "test never ran" and "test ran with
+    # ambiguous output"; only the first case earns the carve-out (the REPLY
+    # path is more permissive because its reply text carries the context).
+    if (
+        ctx.last_workflow is not None
+        and ctx.last_workflow_yaml
+        and ctx.last_test_ok is not False
+        and not ctx.last_test_suspicious_success
+    ):
+        unvalidated = ctx.last_test_ok is not True
+        reply = unvalidated_reply if unvalidated else tested_reply
+        return AgentResult(
+            user_response=reply,
+            updated_workflow=ctx.last_workflow,
+            global_llm_context=global_llm_context,
+            workflow_yaml=ctx.last_workflow_yaml,
+            workflow_was_persisted=ctx.workflow_persisted,
+            total_tokens=ctx.total_tokens_used,
+            unvalidated=unvalidated,
+        )
+    return _build_exit_result(ctx, default_reply, global_llm_context)
+
+
+def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_capacity_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_TIMEOUT_REPLY_DEFAULT,
+        unvalidated_reply=_TIMEOUT_REPLY_UNVALIDATED,
+        tested_reply=_TIMEOUT_REPLY_TESTED,
+    )
+
+
+def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_capacity_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_MAX_TURNS_REPLY_DEFAULT,
+        unvalidated_reply=_MAX_TURNS_REPLY_UNVALIDATED,
+        tested_reply=_MAX_TURNS_REPLY_TESTED,
     )
 
 
@@ -191,7 +331,7 @@ def _translate_to_agent_result(
     user_response = action_data.get("user_response") or "Done."
 
     resp_type = action_data.get("type", "REPLY")
-    if resp_type not in ("REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"):
+    if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
 
     last_workflow = ctx.last_workflow
@@ -254,6 +394,18 @@ def _translate_to_agent_result(
     if resp_type != "ASK_QUESTION":
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     last_workflow, last_workflow_yaml = _verified_workflow_or_none(ctx)
+    unvalidated = False
+    if last_workflow is None and resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml:
+        # Failures are often environmental (captcha, transient block); surface the draft so the user can keep iterating.
+        last_workflow = ctx.last_workflow
+        last_workflow_yaml = ctx.last_workflow_yaml
+        unvalidated = True
+
+    # ASK_QUESTION blocks on user input — never surface a verified workflow
+    # under it; auto_accept would silently apply a stepping-stone partial.
+    if resp_type == "ASK_QUESTION":
+        last_workflow = None
+        last_workflow_yaml = None
 
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)
@@ -275,6 +427,8 @@ def _translate_to_agent_result(
         workflow_yaml=last_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
+        clear_proposed_workflow=resp_type == "ASK_QUESTION",
+        unvalidated=unvalidated,
     )
 
 
@@ -321,8 +475,8 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
 ) -> AgentResult:
-    # Preflight feasibility classifier. Never raises (errors fall through to
-    # proceed). Off by default; enable via settings.ENABLE_COPILOT_FEASIBILITY_GATE.
+    # Preflight feasibility classifier — fires on every turn so mid-session pivots
+    # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
 
     feasibility_verdict = await run_feasibility_gate(
@@ -380,12 +534,14 @@ async def run_copilot_agent(
         get_skyvern_mcp_alias_map,
     )
 
+    validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
+
     ctx = CopilotContext(
         organization_id=organization_id,
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_yaml=chat_request.workflow_yaml or "",
-        browser_session_id=None,
+        browser_session_id=validated_browser_session_id,
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
@@ -479,20 +635,14 @@ async def run_copilot_agent(
                     organization_id,
                 )
             except asyncio.CancelledError:
-                LOG.info("Copilot run cancelled")
-                return _build_exit_result(ctx, "Request cancelled.", global_llm_context)
+                # Re-raising would leave the route with ``agent_result is None``
+                # and skip its ``workflow_was_persisted`` rollback decision.
+                LOG.info("Copilot run cancelled by user")
+                return _build_exit_result(ctx, "Cancelled by user.", global_llm_context, cancelled=True)
             except MaxTurnsExceeded:
-                return _build_exit_result(
-                    ctx,
-                    "I've reached the maximum number of steps. Here's what I have so far.",
-                    global_llm_context,
-                )
+                return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
-                return _build_exit_result(
-                    ctx,
-                    "I ran out of time processing your request. Here's what I have so far.",
-                    global_llm_context,
-                )
+                return _build_timeout_exit_result(ctx, global_llm_context)
             except CopilotNonRetriableNavError as exc:
                 LOG.warning(
                     "Copilot run halted on non-retriable navigation error",

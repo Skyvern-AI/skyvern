@@ -56,6 +56,7 @@ class ForgeApp:
     RATE_LIMITER: RateLimiter
     LLM_API_HANDLER: LLMAPIHandler
     OPENAI_CLIENT: AsyncOpenAI | AsyncAzureOpenAI
+    OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
@@ -119,6 +120,7 @@ def create_forge_app() -> ForgeApp:
     app.RATE_LIMITER = NoopRateLimiter()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
+    app.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     app.OPENAI_CLIENT = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY or "",
         http_client=ForgeAsyncHttpxClientWrapper(),

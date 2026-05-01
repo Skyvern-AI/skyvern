@@ -79,6 +79,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
@@ -121,6 +122,23 @@ from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElem
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+
+async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
+    """Take a screenshot with cursor overlay hidden so it doesn't interfere with LLM analysis."""
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
+        try:
+            return await page.screenshot(**kwargs)
+        finally:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
+    return await page.screenshot(**kwargs)
 
 
 class CustomSingleSelectResult:
@@ -614,30 +632,10 @@ class ActionHandler:
             action_type=action.action_type,
             action_id=action.action_id,
             status=action.status,
-            source_action_id=action.source_action_id,
             step_order=action.step_order,
             action_order=action.action_order,
-            confidence_float=action.confidence_float,
-            description=action.description,
-            reasoning=action.reasoning,
-            intention=action.intention,
-            response=action.response,
             element_id=action.element_id,
             errors=action.errors,
-            file_name=action.file_name,
-            file_url=action.file_url,
-            download=action.download,
-            download_triggered=action.download_triggered,
-            is_upload_file_tag=action.is_upload_file_tag,
-            text=action.text,
-            input_or_select_context=action.input_or_select_context,
-            option=action.option,
-            is_checked=action.is_checked,
-            verified=action.verified,
-            click_context=action.click_context,
-            totp_timing_info=action.totp_timing_info,
-            has_mini_agent=action.has_mini_agent,
-            skip_auto_complete_tab=action.skip_auto_complete_tab,
         )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
@@ -1244,6 +1242,7 @@ async def handle_input_text_action(
         element_id=skyvern_element.get_id(),
         option=SelectOption(label=text),
         intention=action.intention,
+        input_or_select_context=action.input_or_select_context,
     )
     if await skyvern_element.get_selectable():
         LOG.info(
@@ -1908,6 +1907,7 @@ async def handle_select_option_action(
                 element_id=selectable_child.get_id(),
                 option=action.option,
                 intention=action.intention,
+                input_or_select_context=action.input_or_select_context,
             )
             action = select_action
             skyvern_element = selectable_child
@@ -1972,6 +1972,7 @@ async def handle_select_option_action(
             element_id=blocking_element.get_id(),
             option=action.option,
             intention=action.intention,
+            input_or_select_context=action.input_or_select_context,
         )
         action = select_action
         skyvern_element = blocking_element
@@ -3519,7 +3520,7 @@ async def sequentially_select_from_dropdown(
             )
             continue
 
-        screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        screenshot = await _screenshot_without_cursor(page, timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         mini_goal = (
             input_or_select_context.field
             if not input_or_select_context.intention

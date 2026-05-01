@@ -41,7 +41,7 @@ from skyvern.schemas.scripts import (
     WorkflowScriptSummary,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.services.script_reviewer import ScriptReviewer, store_review_artifacts
+from skyvern.services.script_reviewer import ScriptReviewer, load_filtered_run_param_values, store_review_artifacts
 from skyvern.services.workflow_script_service import (
     create_script_version_from_review,
     extract_cached_blocks_from_source,
@@ -1343,19 +1343,7 @@ async def review_script_with_instructions(
             page=1,
             page_size=50,
         )
-        try:
-            run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-                workflow_run_id=data.workflow_run_id,
-            )
-            for wf_param, run_param in run_param_tuples:
-                if (
-                    run_param.value is not None
-                    and str(run_param.value).strip()
-                    and not wf_param.parameter_type.is_secret_or_credential()
-                ):
-                    run_parameter_values[wf_param.key] = str(run_param.value)
-        except Exception:
-            LOG.warning("Failed to load run parameter values", exc_info=True)
+        run_parameter_values = await load_filtered_run_param_values(data.workflow_run_id)
 
     # Fall back to any published script if run-specific lookup didn't find one
     if not latest_script:

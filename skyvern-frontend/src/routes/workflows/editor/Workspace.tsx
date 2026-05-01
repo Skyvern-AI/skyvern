@@ -18,7 +18,12 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useParams, useSearchParams } from "react-router-dom";
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   useEdgesState,
   useNodesState,
@@ -236,6 +241,20 @@ function Workspace({
   workflow,
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const locationState = location.state as { copilotMessage?: unknown } | null;
+  const initialCopilotMessage =
+    typeof locationState?.copilotMessage === "string"
+      ? locationState.copilotMessage
+      : null;
+  const handleInitialCopilotMessageConsumed = useCallback(() => {
+    if (!initialCopilotMessage) return;
+    navigate(location.pathname + location.search, {
+      replace: true,
+      state: null,
+    });
+  }, [initialCopilotMessage, location.pathname, location.search, navigate]);
   const [searchParams, setSearchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const [timelineMode, setTimelineMode] = useState("wide");
@@ -263,7 +282,7 @@ function Workspace({
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
   const [isCopilotOpen, setIsCopilotOpen] = useState(
-    () => !initialNodes.some(isWorkflowBlockNode),
+    () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
   );
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
@@ -565,7 +584,10 @@ function Workspace({
     if (activeDebugSession) {
       const pbsId = activeDebugSession.browser_session_id;
       if (pbsId) {
-        window.open(`${location.origin}/browser-session/${pbsId}`, "_blank");
+        window.open(
+          `${window.location.origin}/browser-session/${pbsId}`,
+          "_blank",
+        );
       }
     }
   };
@@ -1188,7 +1210,10 @@ function Workspace({
     }
   };
 
-  const applyWorkflowUpdate = (workflowData: WorkflowVersion) => {
+  const applyWorkflowUpdate = (
+    workflowData: WorkflowVersion,
+    options?: { persisted?: boolean },
+  ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
@@ -1222,7 +1247,17 @@ function Workspace({
     const initialParameters = getInitialParameters(workflowData);
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
-    workflowChangesStore.setHasChanges(true);
+    if (options?.persisted) {
+      // Atomic accept: server wrote a new version; treat as clean baseline and refresh cached workflow.
+      workflowChangesStore.setHasChanges(false);
+      if (workflowPermanentId) {
+        queryClient.invalidateQueries({
+          queryKey: ["workflow", workflowPermanentId],
+        });
+      }
+    } else {
+      workflowChangesStore.setHasChanges(true);
+    }
   };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
@@ -1998,6 +2033,9 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
+        liveBrowserSessionId={activeDebugSession?.browser_session_id ?? null}
+        initialMessage={initialCopilotMessage ?? undefined}
+        onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onReviewWorkflow={async (pendingWorkflow, clearPending) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;
@@ -2133,9 +2171,9 @@ function Workspace({
             });
           }
         }}
-        onWorkflowUpdate={(workflowData) => {
+        onWorkflowUpdate={(workflowData, options) => {
           try {
-            applyWorkflowUpdate(workflowData);
+            applyWorkflowUpdate(workflowData, options);
           } catch (error) {
             console.error(
               "Failed to parse and apply workflow",

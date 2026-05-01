@@ -1,6 +1,8 @@
+import atexit
 import functools
 import importlib.metadata
 import platform
+import threading
 import traceback
 from typing import Any, Dict, Optional
 
@@ -13,12 +15,19 @@ from skyvern.config import settings
 
 LOG = structlog.get_logger(__name__)
 
-
-def _build_posthog_client(api_key: str, host: str) -> Posthog:
-    return Posthog(api_key, host=host, disable_geoip=False, timeout=2)
+_FLUSH_TIMEOUT_SECONDS = 2
 
 
-posthog = _build_posthog_client(
+def _build_posthog_client(api_key: str, host: str) -> Posthog | None:
+    try:
+        client = Posthog(api_key, host=host, disable_geoip=False, timeout=2, max_retries=1)
+        atexit.unregister(client.join)
+        return client
+    except Exception:
+        return None
+
+
+posthog: Posthog | None = _build_posthog_client(
     settings.POSTHOG_PROJECT_API_KEY,
     settings.POSTHOG_PROJECT_HOST,
 )
@@ -72,7 +81,7 @@ def reconfigure_posthog_client(
 def _resolve_posthog_client(
     api_key: str | None = None,
     host: str | None = None,
-) -> Posthog:
+) -> Posthog | None:
     if api_key is None and host is None:
         return posthog
 
@@ -82,7 +91,8 @@ def _resolve_posthog_client(
     client = _custom_posthog_clients.get(cache_key)
     if client is None:
         client = _build_posthog_client(resolved_api_key, resolved_host)
-        _custom_posthog_clients[cache_key] = client
+        if client is not None:
+            _custom_posthog_clients[cache_key] = client
     return client
 
 
@@ -90,7 +100,12 @@ def flush(
     api_key: str | None = None,
     host: str | None = None,
 ) -> None:
-    _resolve_posthog_client(api_key=api_key, host=host).flush()
+    client = _resolve_posthog_client(api_key=api_key, host=host)
+    if client is None:
+        return
+    t = threading.Thread(target=client.flush, daemon=True)
+    t.start()
+    t.join(timeout=_FLUSH_TIMEOUT_SECONDS)
 
 
 def capture(
@@ -104,9 +119,11 @@ def capture(
         return
 
     try:
+        client = _resolve_posthog_client(api_key=api_key, host=host)
+        if client is None:
+            return
         resolved_distinct_id = distinct_id or settings.ANALYTICS_ID
         payload: dict[str, Any] = {**dynamic_analytics_metadata(), **(data or {})}
-        client = _resolve_posthog_client(api_key=api_key, host=host)
         client.capture(distinct_id=resolved_distinct_id, event=event, properties=payload)
     except Exception:
         LOG.debug("analytics capture failed", event=event, exc_info=True)

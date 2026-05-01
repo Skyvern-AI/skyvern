@@ -22,6 +22,7 @@ import { helpTooltips, placeholders } from "../../helpContent";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
@@ -63,6 +64,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<TaskNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -331,6 +333,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     }
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
+                    parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                     blockType="task"
                     showOptions={{
                       continueOnFailure: true,

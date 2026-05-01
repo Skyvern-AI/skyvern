@@ -315,6 +315,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         domain=org_model.domain,
         bw_organization_id=org_model.bw_organization_id,
         bw_collection_ids=org_model.bw_collection_ids,
+        artifact_url_expiry_seconds=org_model.artifact_url_expiry_seconds,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )

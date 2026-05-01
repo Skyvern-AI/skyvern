@@ -373,7 +373,18 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
         # Patchright timeout errors include a verbose "Call log" section with launch args.
         trimmed_message = raw_message.split("Call log:")[0].strip()
+        # Browser launch errors include a "Browser logs" section with the binary path and flags.
+        trimmed_message = trimmed_message.split("Browser logs:")[0].strip()
         normalized_message = " ".join(trimmed_message.split())
+
+        if (
+            "launch_persistent_context" in normalized_message
+            and "target page, context or browser has been closed" in normalized_message.lower()
+        ):
+            return (
+                "The browser closed unexpectedly during launch. This is usually transient. "
+                f"{UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+            )
 
         timeout_match = re.search(r"Timeout\s+(\d+)ms\s+exceeded", normalized_message, flags=re.IGNORECASE)
         if timeout_match and "launch_persistent_context" in normalized_message:
@@ -544,6 +555,36 @@ class BitwardenAccessDeniedError(BitwardenBaseError):
             "Contact Skyvern support to enable access. This is a security layer on top of Bitwarden, "
             "Skyvern team needs to let your Skyvern account access the Bitwarden collection."
         )
+
+
+class OnePasswordBaseError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"1Password error: {message}")
+
+
+class OnePasswordServiceUnavailableError(OnePasswordBaseError):
+    def __init__(self, status_code: int | None = None) -> None:
+        suffix = f" (HTTP {status_code})" if status_code else ""
+        super().__init__(
+            f"1Password is currently unavailable{suffix}. "
+            "This is an upstream outage on 1Password's side, not a Skyvern issue. "
+            "Please retry in a few minutes."
+        )
+
+
+class OnePasswordRateLimitError(OnePasswordBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"1Password rate limit exceeded: {message}. Please retry in a few minutes.")
+
+
+class OnePasswordSessionExpiredError(OnePasswordBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"1Password service account session expired: {message}.")
+
+
+class OnePasswordGetItemError(OnePasswordBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error getting item from 1Password: {message}")
 
 
 class CredentialParameterParsingError(SkyvernException):

@@ -32,6 +32,7 @@ import {
   type Parameter,
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
+import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -565,7 +566,16 @@ function NodeHeader({
     // If there are any workflow parameters, always prompt the user
     // The backend requires all params to be specified for each run
     if (workflowParameters.length > 0) {
-      const currentValues = getInitialValues(location, workflowParameters);
+      const lastRunValues = workflowPermanentId
+        ? useDebuggerLastRunValuesStore
+            .getState()
+            .getLastRunValues(workflowPermanentId)
+        : null;
+      const currentValues = getInitialValues(
+        location,
+        workflowParameters,
+        lastRunValues,
+      );
       setCurrentParamValues(currentValues);
       setParametersToPrompt(workflowParameters);
       setShowParamsDialog(true);
@@ -607,14 +617,14 @@ function NodeHeader({
 
       <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
-          className={cn("flex gap-2", {
+          className={cn("flex min-w-0 gap-2", {
             "opacity-50": thisBlockIsPlaying,
           })}
         >
           <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
-          <div className="flex flex-col gap-1">
+          <div className="flex min-w-0 flex-col gap-1">
             <EditableNodeTitle
               value={blockLabel}
               editable={editable}
@@ -744,6 +754,11 @@ function NodeHeader({
             },
             {
               onSuccess: () => {
+                if (workflowPermanentId) {
+                  useDebuggerLastRunValuesStore
+                    .getState()
+                    .setLastRunValues(workflowPermanentId, values);
+                }
                 // Close dialog on success - navigation also happens in mutation's onSuccess
                 setShowParamsDialog(false);
               },

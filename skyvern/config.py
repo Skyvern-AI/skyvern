@@ -183,6 +183,7 @@ class Settings(BaseSettings):
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
@@ -212,7 +213,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"  # This is the model name
+    LLM_KEY: str = "OPENAI_GPT5_5"  # This is the model name
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
@@ -249,9 +250,10 @@ class Settings(BaseSettings):
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
+    OPENAI_CUA_MODEL: str = "computer-use-preview"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
-    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
+    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -419,6 +421,7 @@ class Settings(BaseSettings):
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
+    VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES: int = 3
 
     # Bitwarden Settings
     BITWARDEN_CLIENT_ID: str | None = None

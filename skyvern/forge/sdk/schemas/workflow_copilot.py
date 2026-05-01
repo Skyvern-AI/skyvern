@@ -40,8 +40,23 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
     workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
+    browser_session_id: str | None = Field(
+        None,
+        description="Optional persistent browser session ID to reuse instead of creating a new one.",
+    )
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    cancel_token: str | None = Field(
+        None,
+        description=(
+            "Client-generated UUID. POST it to /workflow/copilot/cancel to hard-cancel this turn. "
+            "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
+        ),
+    )
+
+
+class WorkflowCopilotCancelRequest(BaseModel):
+    cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
@@ -78,6 +93,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     TOOL_RESULT = "tool_result"
     CONDENSING = "condensing"
     NARRATION = "narration"
+    BLOCK_PROGRESS = "block_progress"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -101,6 +117,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         description="Total tokens consumed by the agent during this turn; None when no provider reported usage",
     )
     response_type: ResponseType = Field("REPLY", description="Agent response classification")
+    unvalidated: bool = Field(
+        False,
+        description="When true, clients must not auto-apply; render Accept/Reject explicitly.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):
@@ -127,6 +147,13 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
     summary: str = Field(..., description="Brief human-readable summary of the result")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    detail: str | None = Field(
+        None,
+        description=(
+            "Longer-cap sanitized failure text for tooltip display. None on success. "
+            "Distinct from `summary`, which is capped tighter for the visible bullet."
+        ),
+    )
 
 
 class WorkflowCopilotCondensingUpdate(BaseModel):
@@ -147,6 +174,21 @@ class WorkflowCopilotNarrationUpdate(BaseModel):
     )
     narration: str = Field(..., description="One-sentence user-facing progress narration")
     iteration: int = Field(..., description="Agent loop iteration number this narration describes")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotBlockProgressUpdate(BaseModel):
+    # Per-block lifecycle event from inside long-running tool calls.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.BLOCK_PROGRESS, description="Message type"
+    )
+    workflow_run_block_id: str = Field(..., description="Stable per-block id; used as the row key in the activity pane")
+    block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
+    block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
+    status: str = Field(
+        ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
+    )
+    iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

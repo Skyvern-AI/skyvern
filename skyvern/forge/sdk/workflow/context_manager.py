@@ -1,4 +1,5 @@
 import copy
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
@@ -6,6 +7,7 @@ import structlog
 from jinja2.sandbox import SandboxedEnvironment
 from onepassword import ItemFieldType
 from onepassword.client import Client as OnePasswordClient
+from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -14,6 +16,10 @@ from skyvern.exceptions import (
     CredentialParameterNotFoundError,
     CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
+    OnePasswordGetItemError,
+    OnePasswordRateLimitError,
+    OnePasswordServiceUnavailableError,
+    OnePasswordSessionExpiredError,
     SkyvernException,
     WorkflowRunContextNotInitialized,
     sanitize_credential_for_error,
@@ -59,6 +65,15 @@ BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
 jinja_sandbox_env = SandboxedEnvironment()
 
 RANDOM_SECRET_ID_PREFIX = "placeholder_"
+
+# 1Password's Python SDK forwards generic 5xx upstream failures as plain Exceptions
+# whose stringified message embeds the HTTP status.
+_ONEPASSWORD_5XX_PATTERN = re.compile(
+    r"(?i)"
+    r"(?:\b(?:HTTP|status(?:\s+code)?|code|response)\s*[:=]?\s*(5\d{2})\b)"
+    r"|"
+    r"(?:\b(5\d{2})\s+(?:service\s+unavailable|bad\s+gateway|gateway\s+timeout|internal\s+server\s+error)\b)"
+)
 
 
 class WorkflowRunContext:
@@ -667,14 +682,26 @@ class WorkflowRunContext:
                 "OP_SERVICE_ACCOUNT_TOKEN environment variable not set and no valid 1Password service account token found. Please go to the settings and add your 1Password service account token."
             )
 
-        client = await OnePasswordClient.authenticate(
-            auth=token,
-            integration_name="Skyvern",
-            integration_version="v1.0.0",
-        )
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
-        item = await client.items.get(vault_id, item_id)
+        try:
+            client = await OnePasswordClient.authenticate(
+                auth=token,
+                integration_name="Skyvern",
+                integration_version="v1.0.0",
+            )
+            item = await client.items.get(vault_id, item_id)
+        except RateLimitExceededException as e:
+            raise OnePasswordRateLimitError(str(e)) from e
+        except DesktopSessionExpiredException as e:
+            raise OnePasswordSessionExpiredError(str(e)) from e
+        except Exception as e:
+            raw = str(e)
+            match = _ONEPASSWORD_5XX_PATTERN.search(raw)
+            if match:
+                status_digits = match.group(1) or match.group(2)
+                raise OnePasswordServiceUnavailableError(status_code=int(status_digits)) from e
+            raise OnePasswordGetItemError(raw) from e
 
         # Check if item is None
         if item is None:

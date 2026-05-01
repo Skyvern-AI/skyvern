@@ -325,6 +325,83 @@ class TestSummarizeToolResult:
         summary = self._summarize("unknown_tool", {"ok": True})
         assert summary == "OK"
 
+    def test_evaluate_does_not_dump_raw_list(self) -> None:
+        # The activity bullet must describe shape only — JS return values
+        # (which are page-controlled) must never reach the SSE payload.
+        summary = self._summarize(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {
+                    "result": [
+                        {"text": "Tickets", "href": "https://example.com/tickets/"},
+                        {"text": "Hospitality", "href": "https://example.com/hospitality/"},
+                    ]
+                },
+            },
+        )
+        assert "Tickets" not in summary
+        assert "Hospitality" not in summary
+        assert "example.com" not in summary
+        assert "list" in summary
+        assert "2" in summary
+
+    def test_evaluate_dict_returns_structural_summary(self) -> None:
+        summary = self._summarize(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {"result": {"title": "Official Site", "url": "https://example.com/"}},
+            },
+        )
+        assert "Official Site" not in summary
+        assert "example.com" not in summary
+        assert "title" in summary  # key names describe shape, not values
+        assert "url" in summary
+
+    def test_evaluate_none_returns_plain_label(self) -> None:
+        summary = self._summarize(
+            "evaluate",
+            {"ok": True, "data": {"result": None}},
+        )
+        assert summary == "Evaluated JavaScript"
+
+    def test_failure_strips_http_headers_blob(self) -> None:
+        # Failure summaries must never embed an HTTP-response-headers dict.
+        summary = self._summarize(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "headers: {'date': 'Mon, 27 Apr 2026 05:03:27 GMT', "
+                    "'content-type': 'application/json', 'content-length': '43', "
+                    "'connection': 'keep-alive'}"
+                ),
+            },
+        )
+        assert "'date'" not in summary
+        assert "'content-type'" not in summary
+        assert "keep-alive" not in summary
+        assert summary.startswith("Failed:")
+        assert len(summary) <= 128  # "Failed: " + ≤120 sanitized body
+
+    def test_failure_caps_at_120_chars(self) -> None:
+        long_message = "An unexpected error happened while doing the thing. " * 10
+        assert len(long_message) > 200
+        summary = self._summarize(
+            "click",
+            {"ok": False, "error": long_message},
+        )
+        body = summary[len("Failed: ") :]
+        assert len(body) <= 120
+
+    def test_screenshot_without_url_no_empty_parens(self) -> None:
+        summary = self._summarize(
+            "get_browser_screenshot",
+            {"ok": True, "data": {}},
+        )
+        assert summary == "Screenshot taken"
+
 
 class TestParseFinalResponse:
     """parse_final_response is the last mile between model output and the frontend.
@@ -364,3 +441,94 @@ class TestParseFinalResponse:
         # A JSON array at top level is valid JSON but not a valid envelope.
         parsed = parse_final_response("[1, 2, 3]")
         assert parsed == {"type": "REPLY", "user_response": "[1, 2, 3]"}
+
+    def test_strips_leading_reply_label_before_parse(self) -> None:
+        envelope = 'REPLY\n{"type": "REPLY", "user_response": "ok"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "ok"
+
+    def test_strips_leading_ask_question_label_with_colon(self) -> None:
+        envelope = 'ASK_QUESTION:\n{"type": "ASK_QUESTION", "user_response": "what date?"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "what date?"
+
+    def test_strips_leading_replace_workflow_label(self) -> None:
+        envelope = (
+            'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}'
+        )
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLACE_WORKFLOW"
+        assert parsed["workflow_yaml"] == "title: x"
+
+    def test_extracts_json_after_prose_preamble(self) -> None:
+        envelope = 'Here\'s my response: {"type": "REPLY", "user_response": "ok"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "ok"
+
+    def test_pass_b_rejects_non_envelope_dict_in_prose(self) -> None:
+        text = 'I cannot help with {"foo": "bar"}'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_pass_b_rejects_dict_with_unrecognized_type(self) -> None:
+        text = 'I cannot help with {"type": "object"}'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovery_tier_skipped_when_text_only_mentions_user_response(self) -> None:
+        text = 'I cannot find the "user_response" field in your input.'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovery_tier_skipped_when_prose_quotes_both_markers(self) -> None:
+        # Prose discussing the envelope format (both quoted `"type": "REPLY"`
+        # and `"user_response"` substrings present, no leading `{`) must not
+        # degrade to "Done." — the user's actual prose has to survive.
+        text = 'I see "type": "REPLY" mentioned, but cannot find "user_response" anywhere.'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovers_user_response_when_global_llm_context_malformed(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "the real answer", "global_llm_context": {"user_goal": "x",}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "the real answer"
+        assert parsed["type"] == "REPLY"
+
+    def test_recovers_user_response_with_escaped_quotes(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "she said \\"hi\\"", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == 'she said "hi"'
+
+    def test_regex_recovery_tolerates_literal_newline_in_user_response_value(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "line one\nline two", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "line one\nline two"
+
+    def test_recovers_ask_question_type_when_recovering_user_response(self) -> None:
+        envelope = '{"type": "ASK_QUESTION", "user_response": "which account?", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "which account?"
+
+    def test_recovery_demotes_malformed_replace_workflow_to_reply(self) -> None:
+        # Recovery cannot extract workflow_yaml, so REPLACE_WORKFLOW would be
+        # unverified — demote to REPLY.
+        envelope = '{"type": "REPLACE_WORKFLOW", "user_response": "updated your workflow", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "updated your workflow"
+
+    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_done(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "broken'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "Done."
+        assert parsed["type"] == "REPLY"
+        assert "broken" not in parsed["user_response"]
+
+    def test_non_envelope_unparseable_text_still_falls_back_to_text(self) -> None:
+        text = "I'm not sure how to help with that."
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}

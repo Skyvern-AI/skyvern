@@ -12,7 +12,12 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
-from skyvern.forge.sdk.artifact.signing import parse_keyring, sign_artifact_url
+from skyvern.forge.sdk.artifact.signing import (
+    ARTIFACT_URL_EXPIRY_SECONDS,
+    effective_artifact_url_expiry_seconds,
+    parse_keyring,
+    sign_artifact_url,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import ArtifactModel
@@ -345,11 +350,57 @@ class ArtifactManager:
         ``claim_session_download_artifacts_for_run`` UPDATE to tag rows
         whose ``created_at`` falls inside the run's window.
         """
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.DOWNLOAD,
+            checksum=checksum,
+        )
+
+    async def create_browser_session_recording_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        checksum: str | None = None,
+    ) -> str:
+        """Register a session-scoped recording (video) as a RECORDING Artifact row.
+
+        Mirrors :meth:`create_browser_session_download_artifact`. Called from
+        ``S3Storage.sync_browser_session_file(artifact_type="videos")`` once
+        Playwright finalizes the recording at session close. Idempotent on
+        ``(organization_id, browser_session_id, uri)`` — re-runs of the
+        end-of-session sync are safe.
+        """
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.RECORDING,
+            checksum=checksum,
+        )
+
+    async def _create_browser_session_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        artifact_type: ArtifactType,
+        checksum: str | None = None,
+    ) -> str:
+        """Shared idempotent insert keyed on ``(browser_session_id, uri, artifact_type)``."""
         existing = await app.DATABASE.artifacts.find_artifact_for_browser_session(
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             uri=uri,
-            artifact_type=ArtifactType.DOWNLOAD,
+            artifact_type=artifact_type,
         )
         if existing is not None:
             return existing.artifact_id
@@ -357,17 +408,18 @@ class ArtifactManager:
         artifact_id = generate_artifact_id()
         await app.DATABASE.artifacts.create_artifact(
             artifact_id=artifact_id,
-            artifact_type=ArtifactType.DOWNLOAD,
+            artifact_type=artifact_type,
             uri=uri,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             checksum=checksum,
         )
         LOG.debug(
-            "Registered session-scoped downloaded file as artifact",
+            "Registered session-scoped artifact",
             artifact_id=artifact_id,
             browser_session_id=browser_session_id,
             filename=filename,
+            artifact_type=artifact_type.value,
         )
         return artifact_id
 
@@ -940,6 +992,7 @@ class ArtifactManager:
         artifact_id: str,
         artifact_name: str | None = None,
         artifact_type: str | None = None,
+        expiry_seconds: int | None = None,
     ) -> str:
         """Return a signed ``/v1/artifacts/{id}/content`` URL for any artifact.
 
@@ -947,18 +1000,37 @@ class ArtifactManager:
         ``STORAGE.get_share_link``. This method always builds the Skyvern-origin
         signed URL regardless of ``bundle_key`` — used for DOWNLOAD artifacts
         so webhook payloads stay short and clients hit our origin.
+
+        ``expiry_seconds`` overrides the URL's TTL; when None, the global
+        default applies. Callers with an organization in scope should resolve
+        the per-org override via :meth:`resolve_artifact_url_expiry_seconds`
+        once and pass the result here.
         """
         return self._bundle_content_url(
             artifact_id=artifact_id,
             artifact_name=artifact_name,
             artifact_type=artifact_type,
+            expiry_seconds=expiry_seconds,
         )
+
+    async def resolve_artifact_url_expiry_seconds(self, organization_id: str | None) -> int:
+        """Look up the org's artifact-URL TTL override; fall back to the global default.
+
+        One DB hit per call — typically resolved once per batch of URLs (e.g.
+        all downloads for a run) and passed into ``build_signed_content_url``.
+        """
+        if organization_id is None:
+            return ARTIFACT_URL_EXPIRY_SECONDS
+        org = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+        per_org = org.artifact_url_expiry_seconds if org else None
+        return effective_artifact_url_expiry_seconds(per_org)
 
     def _bundle_content_url(
         self,
         artifact_id: str,
         artifact_name: str | None = None,
         artifact_type: str | None = None,
+        expiry_seconds: int | None = None,
     ) -> str:
         """Return an absolute URL for a bundled artifact served via the content endpoint.
 
@@ -978,6 +1050,7 @@ class ArtifactManager:
                 keyring=keyring,
                 artifact_name=artifact_name,
                 artifact_type=artifact_type,
+                expiry_seconds=expiry_seconds,
             )
         path = f"{base}/v1/artifacts/{artifact_id}/content"
         extra: dict[str, str] = {}
@@ -989,10 +1062,12 @@ class ArtifactManager:
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
         if artifact.bundle_key:
+            expiry_seconds = await self.resolve_artifact_url_expiry_seconds(artifact.organization_id)
             return self._bundle_content_url(
                 artifact.artifact_id,
                 artifact_name=artifact.bundle_key,
                 artifact_type=artifact.artifact_type,
+                expiry_seconds=expiry_seconds,
             )
         return await app.STORAGE.get_share_link(artifact)
 
@@ -1011,12 +1086,19 @@ class ArtifactManager:
         non_bundle_indices: list[int] = []
         non_bundle_artifacts: list[Artifact] = []
 
+        # Resolve the per-org TTL once. All artifacts in a single batch share an
+        # org (callers always look up by run/workflow scope), so one DB hit
+        # covers every bundled URL we mint below.
+        organization_id = artifacts[0].organization_id if artifacts else None
+        bundled_expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
+
         for i, artifact in enumerate(artifacts):
             if artifact.bundle_key:
                 result[i] = self._bundle_content_url(
                     artifact.artifact_id,
                     artifact_name=artifact.bundle_key,
                     artifact_type=artifact.artifact_type,
+                    expiry_seconds=bundled_expiry_seconds,
                 )
             else:
                 non_bundle_indices.append(i)

@@ -25,6 +25,8 @@ export const baseHelpTooltipContent = {
     "If this block fails, skip the failure and continue to the next block in the current iteration. The remaining blocks in the same iteration will still run.",
   nextLoopOnFailure:
     "If this block fails, skip the remaining blocks in the current iteration and jump to the next loop iteration.",
+  onBlockFailure:
+    "Choose what happens when this block fails. 'Continue to next block in this iteration' swallows the failure and runs the rest of the iteration. 'Skip to next iteration' abandons the iteration and starts the next one.",
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
@@ -105,7 +107,9 @@ export const helpTooltips = {
     loopValue:
       "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
     nextLoopOnFailure:
-      "If any block inside the loop fails, skip the remaining blocks in the current iteration and jump to the next loop iteration instead of stopping the entire loop.",
+      "When an iteration fails, skip its remaining blocks and start the next iteration instead of stopping the entire loop.",
+    continueOnFailure:
+      "If this loop ends in failure, let the rest of the workflow continue running instead of stopping. Does not affect iteration behavior — use 'Skip Iterations that Fail' for that.",
   },
   sendEmail: {
     ...baseHelpTooltipContent,

@@ -46,20 +46,31 @@ def prepend_scheme_and_validate_url(url: str) -> str:
 
 
 def is_blocked_host(host: str) -> bool:
-    if host.lower() in (h.lower() for h in settings.ALLOWED_HOSTS):
-        return False
+    # RFC 3986 wraps IPv6 literals in [...]; ip_address() only accepts the bare form.
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:
-        ip = ipaddress.ip_address(host)
-        # Check if the IP is private, link-local, loopback, or reserved
-        return ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved
+        ip = ipaddress.ip_address(bare)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
     except ValueError:
-        # If the host is not a valid IP address (e.g., it's a domain name like localhost), handle it here
-        for blocked_host in settings.BLOCKED_HOSTS:
-            if blocked_host == host:
-                return True
-        return False
+        ip = None
     except Exception:
         return False
+
+    candidate_forms = {host.lower(), bare.lower()}
+    if ip is not None:
+        candidate_forms.add(str(ip).lower())
+
+    allowed = {h.lower() for h in settings.ALLOWED_HOSTS}
+    if candidate_forms & allowed:
+        return False
+
+    if ip is not None:
+        return ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved
+
+    blocked = {b.lower() for b in settings.BLOCKED_HOSTS}
+    return host.lower() in blocked
 
 
 def validate_url(url: str) -> str | None:
