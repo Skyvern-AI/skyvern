@@ -170,6 +170,22 @@ Docker Compose mounts several directories for persistent storage:
 
 The `.env` file controls the Skyvern server. Here are the most important variables grouped by purpose.
 
+### Environment files
+
+`docker-compose.yml` uses TWO sources for service environment:
+
+1. **Inline `environment:` block** — compose-network values that depend on the docker network topology. Examples: `DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern` (the `postgres` hostname only resolves inside the compose network), `BROWSER_TYPE`, `ENABLE_CODE_BLOCK`.
+
+2. **`env_file: .env`** — user secrets (LLM API keys, etc.).
+
+**Do not move `DATABASE_STRING` from compose into `.env`.** The `.env.example` shipped with the repo uses a `localhost` host that points at the backend container itself when used inside compose — moving that value into `.env` will break the database connection.
+
+If you have an existing `.env` from a pre-1.0.32 `skyvern quickstart` run, it may contain a leftover `DATABASE_STRING=postgresql+psycopg://skyvern@localhost/skyvern` line. Remove it:
+
+```bash
+sed -i.bak '/^DATABASE_STRING.*localhost/d' .env
+```
+
 ### LLM Configuration
 
 Configure at least one LLM provider. See [LLM Configuration](/developers/self-hosted/llm-configuration) for all providers.
