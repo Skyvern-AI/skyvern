@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import litellm  # type: ignore[import-not-found]
 import pytest  # type: ignore[import-not-found]
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -323,3 +324,9 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
 
     # The persisted model should be the bare response.model, not the router group key
     assert captured_kwargs.get("last_llm_model") == "gemini-2.5-flash"
+
+
+def test_aiohttp_transport_disabled_for_per_request_timeouts() -> None:
+    """Importing the LLM package disables litellm's aiohttp transport so per-request `timeout` is honored."""
+    assert litellm.disable_aiohttp_transport is True
+    assert api_handler_factory.litellm.disable_aiohttp_transport is True
