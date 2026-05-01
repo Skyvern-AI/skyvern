@@ -24,7 +24,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.workflow_copilot import COPILOT_V2_FLAG_KEY, workflow_copilot_chat_post
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotStreamResponseUpdate
 
 
 def _make_chat_request() -> WorkflowCopilotChatRequest:
@@ -257,22 +257,39 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("auto_accept", "workflow_was_persisted", "has_valid_proposal", "prior_proposal", "expect_clear_call"),
+    (
+        "auto_accept",
+        "workflow_was_persisted",
+        "has_valid_proposal",
+        "prior_proposal",
+        "clear_proposed_flag",
+        "expect_clear_call",
+    ),
     [
-        # SKY-9143: auto_accept=False + gated-out turn (no proposal) + mid-turn
-        # persisted draft => we restore AND clear the stale proposed_workflow
-        # card so reload doesn't resurrect a card the assistant just invalidated.
-        (False, True, False, {"workflow_id": "stale"}, True),
-        # Restore fires but there's nothing stale to clear: skip the no-op DB write.
-        (False, True, False, None, False),
-        # auto_accept=False chat-only turn (no persisted draft, no proposal)
-        # must NOT clear a prior turn's proposed_workflow.
-        (False, False, False, {"workflow_id": "stale"}, False),
-        # auto_accept=False turn with a valid proposal sets the new card (not clear).
-        (False, True, True, {"workflow_id": "stale"}, False),
-        # auto_accept=True never writes proposed_workflow at all.
-        (True, True, False, {"workflow_id": "stale"}, False),
-        (True, True, True, {"workflow_id": "stale"}, False),
+        # Restore-and-clear: persisted draft, no proposal, stale prior.
+        (False, True, False, {"workflow_id": "stale"}, False, True),
+        # Restore fires but nothing stale to clear.
+        (False, True, False, None, False, False),
+        # Chat-only turn with no clear flag must not touch a prior proposal.
+        (False, False, False, {"workflow_id": "stale"}, False, False),
+        # New valid proposal stores via the if-branch, not the clear-branch.
+        (False, True, True, {"workflow_id": "stale"}, False, False),
+        # auto_accept=True default paths: nothing to write.
+        (True, True, False, None, False, False),
+        (True, True, True, {"workflow_id": "stale"}, False, False),
+        # Agent ran run_blocks (persisted=True) then ASK_QUESTIONed with the
+        # clear flag set: restore AND clear fire in the same turn.
+        (False, True, False, {"workflow_id": "stale"}, True, True),
+        # auto_accept=True restore-driven clear: a stale proposal that survived
+        # an auto-accept toggle gets nulled when the assistant invalidates it.
+        (True, True, False, {"workflow_id": "stale"}, False, True),
+        # The clear flag nulls the stale proposal under both auto_accept values
+        # even when nothing was persisted this turn.
+        (False, False, False, {"workflow_id": "stale"}, True, True),
+        (True, False, False, {"workflow_id": "stale"}, True, True),
+        # No prior proposal => no DB write even when the clear flag is set.
+        (False, False, False, None, True, False),
+        (True, False, False, None, True, False),
     ],
 )
 async def test_proposed_workflow_cleared_on_restore(
@@ -281,6 +298,7 @@ async def test_proposed_workflow_cleared_on_restore(
     workflow_was_persisted: bool,
     has_valid_proposal: bool,
     prior_proposal: dict | None,
+    clear_proposed_flag: bool,
     expect_clear_call: bool,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
@@ -309,7 +327,7 @@ async def test_proposed_workflow_cleared_on_restore(
         global_llm_context=None,
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
-        clear_proposed_workflow=False,
+        clear_proposed_workflow=clear_proposed_flag,
     )
 
     _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -336,6 +354,17 @@ async def test_proposed_workflow_cleared_on_restore(
         assert len(clear_calls) == 1, f"expected a proposed_workflow=None clear, got {update_calls!r}"
     else:
         assert not clear_calls, f"did not expect a clear call, got {update_calls!r}"
+
+    # The FE's auto_accept code path reads the SSE payload, not
+    # chat.proposed_workflow, so the payload must mirror agent_result.
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1, f"expected exactly one RESPONSE frame, got {response_frames!r}"
+    expected_payload_workflow = proposal.model_dump.return_value if has_valid_proposal else None
+    assert response_frames[0].updated_workflow == expected_payload_workflow
 
 
 @pytest.mark.asyncio

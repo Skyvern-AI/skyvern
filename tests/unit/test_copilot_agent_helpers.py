@@ -6,6 +6,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from skyvern.forge.sdk.copilot import agent as agent_module
+
 
 def _ctx(**overrides):
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -214,8 +216,6 @@ class TestTranslateToAgentResultGating:
         # ctx.last_workflow=old_wf). The agent then emits inline REPLACE_WORKFLOW
         # with a different yaml. The translate helper must invalidate the prior
         # test result so _verified_workflow_or_none rejects the untested REPLACE.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         old_wf = SimpleNamespace(name="old")
         new_wf = SimpleNamespace(name="new-from-replace")
         monkeypatch.setattr(
@@ -247,8 +247,6 @@ class TestTranslateToAgentResultGating:
         # so a prior tested workflow remains available.
         import yaml as yaml_mod
 
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         tested_wf = SimpleNamespace(name="tested")
 
         def boom(**kwargs):
@@ -275,8 +273,6 @@ class TestTranslateToAgentResultGating:
         # cannot test an edit. Row-3 of _rewrite_failed_test_response would
         # clobber that specific unblocker with "Could you share more context";
         # the resp_type==ASK_QUESTION guard must skip the rewrite.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         ctx = _ctx(
             last_update_block_count=1,
             last_test_ok=None,
@@ -298,8 +294,6 @@ class TestTranslateToAgentResultGating:
         # Guard rail for the above: a plain REPLY after a failed test must
         # still flow through the "test failed" rewrite so we don't regress
         # the original SKY-9143 behavior.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=False,
@@ -321,8 +315,6 @@ class TestTranslateToAgentResultGating:
         # inline path must do the same, otherwise the untested yaml latches
         # onto ctx without user-intent framing and any downstream block run
         # hits the verifier-on-confirmation-surface bug this PR fixes.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         captured: dict[str, str] = {}
 
         def fake_process(**kwargs):
@@ -345,6 +337,48 @@ class TestTranslateToAgentResultGating:
 
         assert captured["yaml"] == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
         assert ctx.last_workflow_yaml == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+
+    def test_ask_question_with_verified_workflow_suppresses_and_clears(self) -> None:
+        # A verified-but-non-terminal workflow built this turn must not surface
+        # alongside the question; the clear flag also nulls any stale prior ghost.
+        verified_wf = SimpleNamespace(name="verified-partial")
+        ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="verified: yaml", last_test_ok=True)
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Need credentials before I can continue."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.clear_proposed_workflow is True
+
+    def test_ask_question_without_workflow_still_sets_clear_flag(self) -> None:
+        # An ASK_QUESTION turn with no draft this turn must still null any
+        # prior persisted proposal so reload stays coherent.
+        ctx = _ctx()
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which site?"})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is None
+        assert agent_result.clear_proposed_workflow is True
+
+    def test_reply_does_not_set_clear_proposed_flag(self) -> None:
+        # Differential: a REPLY turn surfaces the verified workflow and leaves
+        # any prior persisted proposal untouched.
+        verified_wf = SimpleNamespace(name="final")
+        ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="final: yaml", last_test_ok=True)
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here you go."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is verified_wf
+        assert agent_result.workflow_yaml == "final: yaml"
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.clear_proposed_workflow is False
 
 
 class TestCredentialRefusalReachesAgent:
