@@ -4,6 +4,7 @@ export const BlockType = {
     Task: "task",
     TaskV2: "task_v2",
     ForLoop: "for_loop",
+    WhileLoop: "while_loop",
     Conditional: "conditional",
     Code: "code",
     TextPrompt: "text_prompt",

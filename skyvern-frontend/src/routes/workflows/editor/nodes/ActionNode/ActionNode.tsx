@@ -23,6 +23,7 @@ import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -68,6 +69,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const update = useUpdate<ActionNode["data"]>({ id, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -256,6 +258,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                     nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
+                    parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                     blockType="action"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });

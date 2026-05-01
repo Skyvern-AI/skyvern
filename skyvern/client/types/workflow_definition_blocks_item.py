@@ -39,6 +39,7 @@ from .url_block_parameters_item import UrlBlockParametersItem
 from .validation_block_data_schema import ValidationBlockDataSchema
 from .validation_block_parameters_item import ValidationBlockParametersItem
 from .wait_block_parameters_item import WaitBlockParametersItem
+from .while_loop_block_condition import WhileLoopBlockCondition
 from .workflow_trigger_block_parameters_item import WorkflowTriggerBlockParametersItem
 
 
@@ -303,7 +304,6 @@ class WorkflowDefinitionBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
 from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
 
 
@@ -755,6 +755,34 @@ class WorkflowDefinitionBlocksItem_Wait(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class WorkflowDefinitionBlocksItem_WhileLoop(UniversalBaseModel):
+    block_type: typing.Literal["while_loop"] = "while_loop"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
+    condition: WhileLoopBlockCondition
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
+from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
+from .while_loop_block_loop_blocks_item import WhileLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
+
+
 class WorkflowDefinitionBlocksItem_WorkflowTrigger(UniversalBaseModel):
     block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
     label: str
@@ -807,6 +835,7 @@ WorkflowDefinitionBlocksItem = typing.Union[
     WorkflowDefinitionBlocksItem_UploadToS3,
     WorkflowDefinitionBlocksItem_Validation,
     WorkflowDefinitionBlocksItem_Wait,
+    WorkflowDefinitionBlocksItem_WhileLoop,
     WorkflowDefinitionBlocksItem_WorkflowTrigger,
 ]
 update_forward_refs(WorkflowDefinitionBlocksItem_Action)
@@ -824,4 +853,5 @@ update_forward_refs(WorkflowDefinitionBlocksItem_Task)
 update_forward_refs(WorkflowDefinitionBlocksItem_TextPrompt)
 update_forward_refs(WorkflowDefinitionBlocksItem_Validation)
 update_forward_refs(WorkflowDefinitionBlocksItem_Wait)
+update_forward_refs(WorkflowDefinitionBlocksItem_WhileLoop)
 update_forward_refs(WorkflowDefinitionBlocksItem_WorkflowTrigger)

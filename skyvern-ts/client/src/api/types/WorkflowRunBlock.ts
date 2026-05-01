@@ -44,6 +44,7 @@ export interface WorkflowRunBlock {
     executed_branch_expression?: string;
     executed_branch_result?: boolean;
     executed_branch_next_block?: string;
+    script_run?: Skyvern.ScriptRunResponse;
 }
 
 export namespace WorkflowRunBlock {

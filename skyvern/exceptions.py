@@ -557,6 +557,36 @@ class BitwardenAccessDeniedError(BitwardenBaseError):
         )
 
 
+class OnePasswordBaseError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"1Password error: {message}")
+
+
+class OnePasswordServiceUnavailableError(OnePasswordBaseError):
+    def __init__(self, status_code: int | None = None) -> None:
+        suffix = f" (HTTP {status_code})" if status_code else ""
+        super().__init__(
+            f"1Password is currently unavailable{suffix}. "
+            "This is an upstream outage on 1Password's side, not a Skyvern issue. "
+            "Please retry in a few minutes."
+        )
+
+
+class OnePasswordRateLimitError(OnePasswordBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"1Password rate limit exceeded: {message}. Please retry in a few minutes.")
+
+
+class OnePasswordSessionExpiredError(OnePasswordBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"1Password service account session expired: {message}.")
+
+
+class OnePasswordGetItemError(OnePasswordBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error getting item from 1Password: {message}")
+
+
 class CredentialParameterParsingError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error parsing credential parameter: {message}")

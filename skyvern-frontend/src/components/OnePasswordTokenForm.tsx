@@ -21,7 +21,11 @@ const formSchema = z.object({
 
 type FormData = z.infer<typeof formSchema>;
 
-export function OnePasswordTokenForm() {
+type Props = {
+  onSuccess?: () => void;
+};
+
+export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
   const [showToken, setShowToken] = useState(false);
   const { onePasswordToken, isLoading, createOrUpdateToken, isUpdating } =
     useOnePasswordToken();
@@ -34,7 +38,9 @@ export function OnePasswordTokenForm() {
   });
 
   const onSubmit = (data: FormData) => {
-    createOrUpdateToken(data);
+    createOrUpdateToken(data, {
+      onSuccess: () => onSuccess?.(),
+    });
   };
 
   const toggleTokenVisibility = () => {

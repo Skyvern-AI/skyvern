@@ -37,6 +37,7 @@ from skyvern.errors.errors import (
     ReachMaxStepsError,
     TimeoutGetTOTPVerificationCodeError,
     UserDefinedError,
+    filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
     BrowserSessionNotFound,
@@ -1841,10 +1842,11 @@ class ForgeAgent:
         previous_response: OpenAIResponse | None = None,
         engine: RunEngine = RunEngine.openai_cua,
     ) -> tuple[list[Action], OpenAIResponse | None]:
+        cua_model = app.OPENAI_CUA_MODEL
         if not previous_response:
             # this is the first step
             first_response: OpenAIResponse = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 tools=[
                     {
                         "type": "computer_use_preview",
@@ -1931,7 +1933,7 @@ class ForgeAgent:
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
             current_response = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 previous_response_id=previous_response.id,
                 tools=[
                     {
@@ -1963,7 +1965,7 @@ class ForgeAgent:
                 computer_call_input["acknowledged_safety_checks"] = pending_checks
 
             current_response = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 previous_response_id=previous_response.id,
                 tools=[
                     {
@@ -2022,10 +2024,14 @@ class ForgeAgent:
         type = "computer_20250124"
         betas = ["computer-use-2025-01-24"]
         # according to https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool
-        # "computer-use-2025-11-24" for Claude Opus 4.6, Claude Opus 4.5
-        # "computer-use-2025-01-24" for Claude Sonnet 4.6, Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
+        # "computer-use-2025-11-24" for Claude Opus 4.7, Claude Opus 4.6, Claude Sonnet 4.6, Claude Opus 4.5
+        # "computer-use-2025-01-24" for Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
 
-        if "OPUS" in llm_caller.llm_key and ("4.6" in llm_caller.llm_key or "4.5" in llm_caller.llm_key):
+        key = llm_caller.llm_key
+        uses_new_computer_tool = ("OPUS" in key and any(v in key for v in ("4.5", "4.6", "4.7"))) or (
+            "SONNET" in key and "4.6" in key
+        )
+        if uses_new_computer_tool:
             type = "computer_20251124"
             betas = ["computer-use-2025-11-24"]
         tools = [
@@ -4692,6 +4698,18 @@ class ForgeAgent:
             )
             return next_step
 
+    def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
+        kept, dropped = filter_to_user_defined_codes(errors, task.error_code_mapping)
+        if dropped:
+            LOG.warning(
+                "Dropped LLM-returned error codes not in user error_code_mapping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                dropped_codes=dropped,
+                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            )
+        return kept
+
     async def summary_failure_reason_for_max_steps(
         self,
         organization: Organization,
@@ -4706,26 +4724,26 @@ class ForgeAgent:
             steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
-            for step_cnt, step in enumerate(steps):
-                if step.output is None:
+            for step_cnt, cur_step in enumerate(steps):
+                if cur_step.output is None:
                     continue
 
-                if len(step.output.errors) > 0:
-                    failure_reason = ";".join([repr(err) for err in step.output.errors])
+                if len(cur_step.output.errors) > 0:
+                    failure_reason = ";".join([repr(err) for err in cur_step.output.errors])
                     return MaxStepsReasonResponse(
                         page_info="",
                         reasoning=failure_reason,
-                        errors=step.output.errors,
+                        errors=cur_step.output.errors,
                     )
 
-                if step.output.actions_and_results is None:
+                if cur_step.output.actions_and_results is None:
                     continue
 
                 action_result_summary: list[str] = []
                 step_result: dict[str, Any] = {
                     "order": step_cnt,
                 }
-                for action, action_results in step.output.actions_and_results:
+                for action, action_results in cur_step.output.actions_and_results:
                     if len(action_results) == 0:
                         continue
                     last_result = action_results[-1]
@@ -4783,7 +4801,9 @@ class ForgeAgent:
                 prompt_name="summarize-max-steps-reason",
                 system_prompt=task.workflow_system_prompt,
             )
-            return MaxStepsReasonResponse.model_validate(json_response)
+            response = MaxStepsReasonResponse.model_validate(json_response)
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            return response
         except Exception:
             LOG.warning("Failed to summary the failure reason")
             # Check if we have LLM errors even if the summarization failed
@@ -4926,7 +4946,9 @@ class ForgeAgent:
                 prompt_name="summarize-max-retries-reason",
                 system_prompt=task.workflow_system_prompt,
             )
-            return MaxStepsReasonResponse.model_validate(json_response)
+            response = MaxStepsReasonResponse.model_validate(json_response)
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            return response
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
             # Check if we have LLM errors even if the summarization failed
@@ -5354,6 +5376,8 @@ class ForgeAgent:
         # narrowed to just compute_cache_key + lookup so a downstream log
         # failure can't double-count as a lookup_error.
         workflow_run_id = context.workflow_run_id if context else None
+        # task.workflow_permanent_id is unset on most fetch paths — fall back to context.
+        wpid_for_cache = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
@@ -5422,14 +5446,80 @@ class ForgeAgent:
                     fallback_reason=lookup_result.fallback_reason,
                     cache_path="agent",
                 )
-            data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-                prompt=prompt,
-                step=step,
-                prompt_name="data-extraction-summary",
-                system_prompt=task.workflow_system_prompt,
-            )
-            if cache_key and isinstance(data_extraction_summary_resp, dict):
-                extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+
+            cross_run_value: dict[str, Any] | None = None
+            if cache_key is not None:
+                try:
+                    raw = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(wpid_for_cache, cache_key)
+                except Exception:
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache lookup raised",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        exc_info=True,
+                    )
+                    raw = None
+                if raw is not None and not isinstance(raw, dict):
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache hit returned non-dict value; falling through to LLM",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        value_type=type(raw).__name__,
+                        cache_path="agent",
+                    )
+                    raw = None
+                cross_run_value = raw if isinstance(raw, dict) else None
+
+            if cache_key is not None and cross_run_value is not None:
+                LOG.info(
+                    "data-extraction-summary cache hit — skipping LLM call (cross-run)",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_hit=True,
+                    cache_scope=extraction_cache.SCOPE_WPID,
+                    cache_age_seconds=None,
+                    fallback_reason=None,
+                    cache_path="agent",
+                )
+                try:
+                    extraction_cache.store(workflow_run_id, cache_key, cross_run_value)
+                except Exception:
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache backfill to in-run failed",
+                        exc_info=True,
+                    )
+                data_extraction_summary_resp = cross_run_value
+            else:
+                if cache_key is not None:
+                    LOG.info(
+                        "data-extraction-summary cache miss (cross-run)",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        cache_hit=False,
+                        cache_scope=extraction_cache.SCOPE_WPID,
+                        cache_age_seconds=None,
+                        fallback_reason="cross_run_miss",
+                        cache_path="agent",
+                    )
+                data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                    prompt=prompt,
+                    step=step,
+                    prompt_name="data-extraction-summary",
+                    system_prompt=task.workflow_system_prompt,
+                )
+                if cache_key and isinstance(data_extraction_summary_resp, dict):
+                    extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+                    try:
+                        await app.AGENT_FUNCTION.store_cross_run_extraction_cache(
+                            wpid_for_cache, cache_key, data_extraction_summary_resp
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "data-extraction-summary cross-run cache store raised; ignoring",
+                            workflow_run_id=workflow_run_id,
+                            cache_key=cache_key,
+                            exc_info=True,
+                        )
 
         if data_extraction_summary_resp is None:
             raise RuntimeError(

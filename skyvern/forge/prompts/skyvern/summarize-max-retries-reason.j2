@@ -23,7 +23,7 @@ Make sure to ONLY return the JSON object in this format with no additional text 
 User Goal:
 {{ navigation_goal }}
 {% if error_code_mapping_str %}
-Use the error codes and their descriptions to surface user-defined errors. Do not return any error that's not defined by the user. User defined errors:
+Use the error codes and their descriptions to surface user-defined errors. The `errors` array is ONLY for codes whose keys appear in the JSON below. The `failure_categories` taxonomy (LLM_REASONING_ERROR, ELEMENT_NOT_FOUND, etc.) is separate and must never appear in `errors`. If no user-defined code applies, return an empty `errors` array. User defined errors:
 {{ error_code_mapping_str }}
 {% endif %}
 

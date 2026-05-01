@@ -17,7 +17,7 @@ from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.run_blocks import CredentialType
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunStatus
+from skyvern.schemas.runs import ProxyLocationInput, RunEngine, RunStatus, proxy_location_to_request
 
 LOG = structlog.get_logger()
 
@@ -284,7 +284,7 @@ class Skyvern(AsyncSkyvern):
         title: str | None = None,
         error_code_mapping: dict[str, str] | None = None,
         data_extraction_schema: dict[str, Any] | str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_steps: int | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
@@ -308,7 +308,7 @@ class Skyvern(AsyncSkyvern):
             title=title,
             error_code_mapping=error_code_mapping,
             data_extraction_schema=data_extraction_schema,
-            proxy_location=proxy_location,
+            proxy_location=proxy_location_to_request(proxy_location),
             max_steps=max_steps,
             browser_session_id=browser_session_id,
             user_agent=user_agent,
@@ -335,7 +335,7 @@ class Skyvern(AsyncSkyvern):
         parameters: dict[str, Any] | None = None,
         template: bool | None = None,
         title: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_url: str | None = None,
         totp_url: str | None = None,
         totp_identifier: str | None = None,
@@ -357,7 +357,7 @@ class Skyvern(AsyncSkyvern):
             parameters=parameters,
             template=template,
             title=title,
-            proxy_location=proxy_location,
+            proxy_location=proxy_location_to_request(proxy_location),
             webhook_url=webhook_url,
             totp_url=totp_url,
             totp_identifier=totp_identifier,
@@ -393,7 +393,7 @@ class Skyvern(AsyncSkyvern):
         onepassword_item_id: str | None = None,
         prompt: str | None = None,
         webhook_url: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         browser_session_id: str | None = None,
@@ -418,7 +418,7 @@ class Skyvern(AsyncSkyvern):
             onepassword_item_id=onepassword_item_id,
             prompt=prompt,
             webhook_url=webhook_url,
-            proxy_location=proxy_location,
+            proxy_location=proxy_location_to_request(proxy_location),
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             browser_session_id=browser_session_id,
@@ -527,7 +527,7 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         timeout: int | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -545,7 +545,7 @@ class Skyvern(AsyncSkyvern):
         self._ensure_cloud_environment()
         browser_session = await self.create_browser_session(
             timeout=timeout,
-            proxy_location=proxy_location,
+            proxy_location=proxy_location_to_request(proxy_location),
         )
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(
@@ -560,7 +560,7 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         timeout: int | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
     ) -> SkyvernBrowser:
         """Get or create a cloud browser session.
 
@@ -589,7 +589,7 @@ class Skyvern(AsyncSkyvern):
             LOG.info("No existing cloud browser session found, launching a new session")
             browser_session = await self.create_browser_session(
                 timeout=timeout,
-                proxy_location=proxy_location,
+                proxy_location=proxy_location_to_request(proxy_location),
             )
             if self._environment == SkyvernEnvironment.CLOUD:
                 LOG.info(

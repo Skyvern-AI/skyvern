@@ -21,6 +21,7 @@ import type { ValidationNode } from "./types";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -58,6 +59,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<ValidationNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -204,6 +206,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                     nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
+                    parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                     blockType="validation"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
