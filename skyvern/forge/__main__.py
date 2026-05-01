@@ -37,6 +37,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         log_level="info",
+        access_log=False,
         reload=reload,
         reload_excludes=[
             f"{temp_path_for_excludes}/**/*.py",

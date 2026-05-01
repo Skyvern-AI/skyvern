@@ -119,6 +119,38 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def compact_action_objects(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Compact verbose Action / ActionResult kwargs to a few key fields.
+
+    LOG.info(..., action=action, ...) was emitting ~3 KB per line because the
+    Action dataclass dumps 25+ attributes including LLM-generated reasoning /
+    intention / response strings. Full action data is persisted to the DB and
+    queryable there; logs only need enough to correlate.
+    """
+    action = event_dict.get("action")
+    if action is not None and not isinstance(action, (str, int, float, bool, dict, list, type(None))):
+        try:
+            event_dict["action"] = {
+                "id": getattr(action, "action_id", None),
+                "type": str(getattr(action, "action_type", type(action).__name__)),
+                "element_id": getattr(action, "element_id", None),
+            }
+        except Exception:
+            pass
+
+    action_result = event_dict.get("action_result")
+    if isinstance(action_result, list) and action_result:
+        try:
+            event_dict["action_result"] = {
+                "count": len(action_result),
+                "success": all(getattr(r, "success", False) for r in action_result),
+            }
+        except Exception:
+            pass
+
+    return event_dict
+
+
 def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """
     A custom processor to add skyvern logs to the context
@@ -324,6 +356,7 @@ def setup_logger() -> None:
     renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else CustomConsoleRenderer()
     additional_processors = (
         [
+            compact_action_objects,
             structlog.processors.EventRenamer("msg"),
             add_kv_pairs_to_msg,
             structlog.processors.CallsiteParameterAdder(
@@ -338,6 +371,7 @@ def setup_logger() -> None:
         ]
         if settings.JSON_LOGGING
         else [
+            compact_action_objects,
             structlog.processors.CallsiteParameterAdder(
                 {
                     structlog.processors.CallsiteParameter.FILENAME,

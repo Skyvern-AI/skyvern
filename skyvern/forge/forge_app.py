@@ -56,6 +56,7 @@ class ForgeApp:
     RATE_LIMITER: RateLimiter
     LLM_API_HANDLER: LLMAPIHandler
     OPENAI_CLIENT: AsyncOpenAI | AsyncAzureOpenAI
+    OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
@@ -73,6 +74,8 @@ class ForgeApp:
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
     SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
     ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_FAST_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -119,6 +122,7 @@ def create_forge_app() -> ForgeApp:
     app.RATE_LIMITER = NoopRateLimiter()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
+    app.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     app.OPENAI_CLIENT = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY or "",
         http_client=ForgeAsyncHttpxClientWrapper(),
@@ -200,6 +204,16 @@ def create_forge_app() -> ForgeApp:
         LLMAPIHandlerFactory.get_llm_api_handler(settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY)
         if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
         else app.LLM_API_HANDLER
+    )
+    app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_AGENT_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_AGENT_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
+    app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_FAST_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_FAST_LLM_KEY
+        else app.SECONDARY_LLM_API_HANDLER
     )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()

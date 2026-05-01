@@ -11,6 +11,6 @@ export interface FileParserBlockYaml {
     model?: Record<string, unknown>;
     next_loop_on_failure?: boolean;
     file_url: string;
-    file_type: Skyvern.FileType;
+    file_type?: Skyvern.FileType;
     json_schema?: Record<string, unknown>;
 }

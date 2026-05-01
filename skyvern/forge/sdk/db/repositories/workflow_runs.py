@@ -410,6 +410,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
             if not include_debugger_runs:
@@ -519,6 +520,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(TaskRunModel.status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
                 .filter(TaskRunModel.debug_session_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
             if status:
@@ -799,6 +801,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
             query = self._apply_search_key_filter(query, search_key)
@@ -916,6 +919,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
             query = self._apply_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)

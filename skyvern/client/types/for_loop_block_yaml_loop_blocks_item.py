@@ -78,9 +78,6 @@ class ForLoopBlockYamlLoopBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
-
-
 class ForLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
@@ -645,4 +642,6 @@ ForLoopBlockYamlLoopBlocksItem = typing.Union[
     ForLoopBlockYamlLoopBlocksItem_PrintPage,
     ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger,
 ]
+from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
+
 update_forward_refs(ForLoopBlockYamlLoopBlocksItem_ForLoop)

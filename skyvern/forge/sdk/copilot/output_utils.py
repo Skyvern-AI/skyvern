@@ -9,6 +9,9 @@ import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
+from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
+
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
@@ -38,15 +41,51 @@ def extract_final_text(result: RunResultStreaming) -> str:
     return ""
 
 
-def parse_final_response(text: str) -> dict[str, Any]:
-    """Parse the agent's final JSON envelope, stripping markdown code fences.
+_TYPE_ALTERNATION = "|".join(COPILOT_RESPONSE_TYPES)
+_LEADING_LABEL_RE = re.compile(rf"^\s*({_TYPE_ALTERNATION})\s*[:,]?\s+", re.IGNORECASE)
+_USER_RESPONSE_VALUE_RE = re.compile(r'"user_response"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_TYPE_VALUE_RE = re.compile(rf'"type"\s*:\s*"({_TYPE_ALTERNATION})"')
 
-    Tolerant of literal control characters (newlines/tabs/CR) inside string
-    values. Some model outputs wrap long `user_response` prose across real
-    newlines instead of `\\n` escapes; strict `json.loads` rejects those, and
-    without this fallback the frontend renders the full raw JSON object as
-    the user-visible reply (see SKY-9189 test-2 regression).
-    """
+
+def _try_loads_dict(text: str) -> dict[str, Any] | None:
+    # strict=False allows literal control characters in string values (SKY-9189)
+    try:
+        parsed = json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
+    if "user_response" in parsed:
+        return True
+    # bare {"type": "object"} (a JSON schema in prose) is not an envelope
+    type_value = parsed.get("type")
+    return isinstance(type_value, str) and type_value.upper() in COPILOT_RESPONSE_TYPES
+
+
+def _text_looks_envelope_shaped(text: str) -> bool:
+    # require leading `{` so prose that merely quotes the field names (e.g.,
+    # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
+    # through to the plain-text tier instead of degrading to "Done."
+    return text.startswith("{") and '"user_response"' in text and bool(_TYPE_VALUE_RE.search(text))
+
+
+def _sniff_response_type(text: str) -> str:
+    # REPLACE_WORKFLOW is demoted to REPLY: recovery cannot extract a usable
+    # workflow_yaml, and announcing an update without one is worse than silent.
+    match = _TYPE_VALUE_RE.search(text)
+    if match and match.group(1).upper() == "ASK_QUESTION":
+        return "ASK_QUESTION"
+    return "REPLY"
+
+
+def parse_final_response(text: str) -> dict[str, Any]:
+    """Parse the agent's final JSON envelope, tolerating markdown code fences,
+    leading action labels (``REPLY {...}``), prose preambles, and literal
+    control characters in string values. Falls back to regex-extracting
+    ``user_response`` from envelope-shaped text so a malformed envelope never
+    reaches the chat bubble."""
     cleaned = text.strip()
     for prefix in ("```json", "```"):
         if cleaned.startswith(prefix):
@@ -56,13 +95,35 @@ def parse_final_response(text: str) -> dict[str, Any]:
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
 
-    for strict in (True, False):
-        try:
-            parsed = json.loads(cleaned, strict=strict)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
+    parsed = _try_loads_dict(cleaned)
+    if parsed is not None:
+        return parsed
+
+    label_stripped = _LEADING_LABEL_RE.sub("", cleaned, count=1)
+    if label_stripped != cleaned:
+        parsed = _try_loads_dict(label_stripped)
+        if parsed is not None:
+            return parsed
+
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    # skip when the slice equals the full string — _try_loads_dict above already tried it
+    if first != -1 and last > first and not (first == 0 and last == len(cleaned) - 1):
+        parsed = _try_loads_dict(cleaned[first : last + 1])
+        if parsed is not None and _looks_like_envelope(parsed):
+            return parsed
+
+    if _text_looks_envelope_shaped(cleaned):
+        sniffed_type = _sniff_response_type(cleaned)
+        match = _USER_RESPONSE_VALUE_RE.search(cleaned)
+        if match:
+            try:
+                value = json.loads(f'"{match.group(1)}"', strict=False)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, str):
+                return {"type": sniffed_type, "user_response": value}
+        return {"type": sniffed_type, "user_response": "Done."}
 
     return {"type": "REPLY", "user_response": text}
 
@@ -173,6 +234,9 @@ def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
                 yield reason
 
 
+_UNKNOWN_ERROR_SENTINEL = "Unknown error"
+
+
 def _extract_failure_message(result: dict[str, Any]) -> str:
     """Prefer top-level ``error`` over nested failure_reason fields. Defense
     in depth: _run_blocks_and_collect_debug now populates ``error`` on
@@ -180,14 +244,14 @@ def _extract_failure_message(result: dict[str, Any]) -> str:
     top = result.get("error")
     if isinstance(top, str) and top:
         return top
-    return next(iter_failure_reasons(result), "Unknown error")
+    return next(iter_failure_reasons(result), _UNKNOWN_ERROR_SENTINEL)
 
 
 _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 
 
-def _sanitize_failure_text(text: str) -> str:
+def _sanitize_failure_text(text: str, max_chars: int = 120) -> str:
     """Strip dict/HTTP-header dumps and cap a failure message for chat display.
 
     The chat activity bullet is a fact, not a data dump — we never want raw
@@ -199,8 +263,8 @@ def _sanitize_failure_text(text: str) -> str:
     text = " ".join(text.split())
     if not text:
         return "(no details)"
-    if len(text) > 120:
-        text = text[:117] + "..."
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
     return text
 
 
@@ -281,6 +345,69 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
     return "OK"
+
+
+def build_run_blocks_response(run_ok: bool, result_data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a run-blocks result, promoting the first failure reason to a top-level ``error``."""
+    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
+    if not run_ok:
+        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
+    return response
+
+
+def summarize_tool_result_detail(result: dict[str, Any], max_chars: int = 800) -> str | None:
+    """Tooltip-grade failure detail (longer cap than ``summarize_tool_result``); None on success."""
+    if result.get("ok", False):
+        return None
+    return _sanitize_failure_text(_extract_failure_message(result), max_chars=max_chars)
+
+
+_JINJA_ERROR_MARKERS: tuple[str, ...] = ("Failed to format jinja", "Jinja style parameter")
+# Markers are matched against a lower-cased copy of the error.
+_ENGINE_INSTRUCTION_MARKERS: tuple[str, ...] = (
+    "invalid selector:",
+    "do not use ",
+    "jquery pseudo-selectors",
+    "tool will not run again",
+    "locator(",
+    "call log:",
+    "waiting for locator",
+)
+_USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.IGNORECASE)
+
+_USER_FACING_LOOP_MESSAGE = "The agent got stuck retrying the same step — moving on."
+_USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
+_USER_FACING_GENERIC_FAILURE = "Couldn't complete that step."
+
+_USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset({"click", "type_text", "evaluate", "select_option"})
+
+
+def _translate_failure_for_user(error_text: str) -> str:
+    if LOOP_DETECTED_MARKER in error_text:
+        return _USER_FACING_LOOP_MESSAGE
+    if any(marker in error_text for marker in _JINJA_ERROR_MARKERS):
+        return _USER_FACING_JINJA_MESSAGE
+    lowered = error_text.lower()
+    if any(marker in lowered for marker in _ENGINE_INSTRUCTION_MARKERS):
+        return _USER_FACING_GENERIC_FAILURE
+    if _USE_TOOL_NAME_RE.search(error_text):
+        return _USER_FACING_GENERIC_FAILURE
+    if error_text.strip() == _UNKNOWN_ERROR_SENTINEL:
+        return _USER_FACING_GENERIC_FAILURE
+    return f"Failed: {_sanitize_failure_text(error_text)}"
+
+
+def format_tool_result_for_user(tool_name: str, result: dict[str, Any]) -> str:
+    """SSE-bound counterpart to summarize_tool_result; do not mix the two.
+
+    summarize_tool_result is parsed by context.merge_turn_summary for state
+    extraction — rewriting it would corrupt agent state.
+    """
+    if not result.get("ok", False):
+        return _translate_failure_for_user(_extract_failure_message(result))
+    if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
+        return ""
+    return summarize_tool_result(tool_name, result)
 
 
 def truncate_output(output: Any, max_chars: int = 2000) -> str | None:

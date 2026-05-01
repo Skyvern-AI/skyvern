@@ -2,4 +2,6 @@
 
 export interface ScriptRunResponse {
     ai_fallback_triggered?: boolean;
+    script_id?: string;
+    script_revision_id?: string;
 }

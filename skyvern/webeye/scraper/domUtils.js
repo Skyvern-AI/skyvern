@@ -1863,14 +1863,30 @@ async function buildElementTree(
         // under it
         if (parentId === null) {
           resultArray.push(elementObj);
-        }
-        // If the element is interactable and has an interactable parent,
-        // then add it to the children of the parent
-        else {
-          // TODO: use dict/object so that we access these in O(1) instead
-          elements
-            .find((element) => element.id === parentId)
-            .children.push(elementObj);
+        } else {
+          const parentElement = elements.find(
+            (element) => element.id === parentId,
+          );
+          if (parentElement) {
+            if (!parentElement.children) {
+              _jsConsoleWarn(
+                "parent element missing children array, reinitializing",
+                "parentId=" + parentId,
+                "parentTag=" + parentElement.tagName,
+                "childId=" + elementObj.id,
+              );
+              parentElement.children = [];
+            }
+            parentElement.children.push(elementObj);
+          } else {
+            _jsConsoleWarn(
+              "parent element not found in elements array, treating as root",
+              "parentId=" + parentId,
+              "childId=" + elementObj.id,
+              "childTag=" + elementObj.tagName,
+            );
+            resultArray.push(elementObj);
+          }
         }
         parentId = elementObj.id;
       }

@@ -44,6 +44,7 @@ from skyvern.schemas.workflows import (
     UrlBlockYAML,
     ValidationBlockYAML,
     WaitBlockYAML,
+    WhileLoopBlockYAML,
     WorkflowTriggerBlockYAML,
 )
 
@@ -59,6 +60,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.TASK.value: TaskBlockYAML,
     BlockType.TaskV2.value: TaskV2BlockYAML,
     BlockType.FOR_LOOP.value: ForLoopBlockYAML,
+    BlockType.WHILE_LOOP.value: WhileLoopBlockYAML,
     BlockType.CONDITIONAL.value: ConditionalBlockYAML,
     BlockType.CODE.value: CodeBlockYAML,
     BlockType.TEXT_PROMPT.value: TextPromptBlockYAML,
@@ -92,6 +94,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "navigation": "Take actions on a page: fill forms, click buttons, navigate multi-step flows (most common)",
     "extraction": "Extract structured data from the current page",
     "for_loop": "Iterate over a list, executing nested blocks for each item",
+    "while_loop": "Repeat a sequence of blocks while a condition stays true (pagination, polling, retry-until)",
     "conditional": "Branch based on Jinja2 expressions or AI prompts",
     "code": "Run Python code for data transformation",
     "text_prompt": "LLM text generation without a browser",
@@ -156,6 +159,36 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
                 "label": "open_url",
                 "url": "{{ current_value }}",
             }
+        ],
+    },
+    "while_loop": {
+        "block_type": "while_loop",
+        "label": "paginate_results",
+        # Bootstrap idiom: ``current_index == 0`` short-circuits the OR on the first
+        # iteration, before ``extract_page`` exists. From iteration 1 onward, the previous
+        # extraction's ``has_next_page`` flag drives the loop.
+        "condition": {
+            "criteria_type": "jinja2_template",
+            "expression": "{{ current_index == 0 or extract_page.has_next_page }}",
+        },
+        "loop_blocks": [
+            {
+                "block_type": "extraction",
+                "label": "extract_page",
+                "data_extraction_goal": "Extract all rows on the current page and whether a 'Next' button is enabled",
+                "data_schema": {
+                    "type": "object",
+                    "properties": {
+                        "rows": {"type": "array", "items": {"type": "object"}},
+                        "has_next_page": {"type": "boolean"},
+                    },
+                },
+            },
+            {
+                "block_type": "action",
+                "label": "click_next",
+                "navigation_goal": "Click the 'Next' button to advance to the next page",
+            },
         ],
     },
     "conditional": {

@@ -30,7 +30,11 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 )
 from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.narration import NarratorState
+from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
+from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
 from skyvern.forge.sdk.copilot.output_utils import (
+    build_run_blocks_response,
     iter_failure_reasons,
     sanitize_tool_result_for_llm,
     truncate_output,
@@ -1171,11 +1175,41 @@ async def _run_blocks_and_collect_debug(
     # one. Safety ceiling still applies.
     stagnation_enabled = not _any_quiet_block_requested(ctx, labels_to_execute)
 
+    # Mid-tool narrator bridge: feed block-status changes and step-level
+    # heartbeats into NarratorState so the narration ticker keeps emitting
+    # while a long workflow run is in flight.
+    narrator_state: NarratorState | None = getattr(ctx, "narrator_state", None)
+    narrator_enabled = narrator_state is not None and narration_handler_available()
+    seen_block_states: dict[str, str] = {}
+    prior_block_ts: datetime | None = initial_block_ts
+    prior_step_ts: datetime | None = initial_step_ts
+    last_block_fetch_monotonic = 0.0
+
     try:
         while True:
             await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
 
             run, step_ts, block_ts = await _read_progress_sources(ctx, workflow_run.workflow_run_id)
+
+            if narrator_enabled:
+                assert narrator_state is not None  # narrator_enabled implies non-None
+                tick_result = await narrator_poll_tick(
+                    narrator_state,
+                    current_block_ts=block_ts,
+                    current_step_ts=step_ts,
+                    prior_block_ts=prior_block_ts,
+                    prior_step_ts=prior_step_ts,
+                    last_block_fetch_monotonic=last_block_fetch_monotonic,
+                    seen_block_states=seen_block_states,
+                    fetch_block_statuses=lambda: app.DATABASE.observer.get_workflow_run_blocks(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=ctx.organization_id,
+                    ),
+                    stream=ctx.stream,
+                )
+                prior_block_ts = tick_result.prior_block_ts
+                prior_step_ts = tick_result.prior_step_ts
+                last_block_fetch_monotonic = tick_result.last_block_fetch_monotonic
 
             if run and WorkflowRunStatus(run.status).is_final():
                 final_status = run.status
@@ -1371,15 +1405,7 @@ async def _run_blocks_and_collect_debug(
                 existing_set.add(label)
         ctx.verified_prefix_labels = existing_prefix
 
-    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
-    if not run_ok:
-        # Promote the real failure message into a top-level ``error`` field so
-        # every downstream consumer (summarize_tool_result, SSE frames, logs,
-        # LLM context) sees it instead of defaulting to "Unknown error".
-        # Wording matches ExtractionBlock's "Unknown error (no failure reason
-        # provided)" fallback so error-message matching stays consistent.
-        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
-    return response
+    return build_run_blocks_response(run_ok, result_data)
 
 
 async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:

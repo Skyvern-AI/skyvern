@@ -197,9 +197,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       }}
                     />
                     <Label className="text-xs text-slate-300">
-                      Continue on Failure
+                      Continue Workflow if Loop Fails
                     </Label>
-                    <HelpTooltip content="When checked, the loop will continue executing even if one of its iterations fails" />
+                    <HelpTooltip
+                      content={helpTooltips["loop"]["continueOnFailure"]}
+                    />
                   </div>
                 </div>
                 <div className="flex justify-between">
@@ -215,7 +217,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       }}
                     />
                     <Label className="text-xs text-slate-300">
-                      Next Loop on Failure
+                      Skip Iterations that Fail
                     </Label>
                     <HelpTooltip
                       content={helpTooltips["loop"]["nextLoopOnFailure"]}

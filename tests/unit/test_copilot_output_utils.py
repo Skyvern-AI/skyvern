@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.copilot.output_utils import (
+    format_tool_result_for_user,
     parse_final_response,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
@@ -403,6 +404,211 @@ class TestSummarizeToolResult:
         assert summary == "Screenshot taken"
 
 
+class TestFormatToolResultForUser:
+    @staticmethod
+    def _format(tool_name: str, result: dict) -> str:
+        return format_tool_result_for_user(tool_name, result)
+
+    def test_loop_detected_failure_drops_use_a_different_tool_tail(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "LOOP DETECTED: 'click' has been called 3 times consecutively. "
+                    "This tool will not run again. Use a DIFFERENT tool to continue."
+                ),
+            },
+        )
+        assert summary == "The agent got stuck retrying the same step — moving on."
+        assert "DIFFERENT tool" not in summary
+        assert "click" not in summary
+
+    def test_jinja_template_failure_translates_to_parameter_phrasing(self) -> None:
+        summary = self._format(
+            "update_and_run_blocks",
+            {
+                "ok": False,
+                "error": (
+                    "navigation block failed. failure reason: Failed to format jinja "
+                    "template: Failed to format Jinja style parameter 'AchievementType'."
+                ),
+            },
+        )
+        assert summary == "A workflow parameter could not be filled in."
+        assert "AchievementType" not in summary
+        assert "Jinja" not in summary
+
+    def test_jinja_style_parameter_marker_alone_is_enough(self) -> None:
+        summary = self._format(
+            "update_and_run_blocks",
+            {"ok": False, "error": "Jinja style parameter 'foo' could not be resolved"},
+        )
+        assert summary == "A workflow parameter could not be filled in."
+
+    def test_invalid_selector_failure_replaces_engine_instruction_text(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "Invalid selector: 'div:contains(Submit)'. jQuery pseudo-selectors "
+                    "like :contains(), :eq(), :first, :visible are NOT valid CSS. "
+                    "Use standard CSS selectors instead."
+                ),
+            },
+        )
+        assert summary == "Couldn't complete that step."
+        assert "div:contains" not in summary
+        assert "jQuery" not in summary
+        assert "CSS" not in summary
+
+    def test_use_the_x_tool_failure_replaces_engine_instruction_text(self) -> None:
+        summary = self._format(
+            "evaluate",
+            {
+                "ok": False,
+                "error": "Do not use evaluate to click elements. Use the 'click' tool with a CSS selector instead.",
+            },
+        )
+        assert summary == "Couldn't complete that step."
+        assert "click" not in summary
+        assert "evaluate" not in summary
+
+    def test_use_the_tool_with_double_quotes_is_caught(self) -> None:
+        summary = self._format(
+            "click",
+            {"ok": False, "error": 'Do not click via JS. Use the "evaluate" tool instead.'},
+        )
+        assert summary == "Couldn't complete that step."
+
+    def test_use_the_tool_unquoted_is_caught(self) -> None:
+        summary = self._format(
+            "click",
+            {"ok": False, "error": "Use the click tool with a CSS selector."},
+        )
+        assert summary == "Couldn't complete that step."
+
+    def test_loop_detected_marker_in_middle_of_message_is_caught(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "Tool execution failed. LOOP DETECTED: 'click' has been called 3 times "
+                    "consecutively. This tool will not run again."
+                ),
+            },
+        )
+        assert summary == "The agent got stuck retrying the same step — moving on."
+
+    def test_playwright_locator_timeout_failure_replaces_selector_dump(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "Locator.click: Timeout 30000ms exceeded. "
+                    'Call log: - waiting for locator("#btnSubmit").first - locator resolved to <input ...>'
+                ),
+            },
+        )
+        assert summary == "Couldn't complete that step."
+        assert "btnSubmit" not in summary
+        assert "Locator" not in summary
+        assert "Call log" not in summary
+
+    def test_unknown_error_sentinel_replaced_with_generic_phrasing(self) -> None:
+        summary = self._format(
+            "run_blocks_and_collect_debug",
+            {"ok": False, "data": {"blocks": []}},
+        )
+        assert summary == "Couldn't complete that step."
+        assert "Unknown error" not in summary
+        assert "Failed:" not in summary
+
+    def test_genuinely_user_relevant_failure_preserves_short_technical_token(self) -> None:
+        summary = self._format(
+            "navigate_browser",
+            {
+                "ok": False,
+                "error": (
+                    "Failed to navigate to url https://example.invalid. Error message: net::ERR_NAME_NOT_RESOLVED"
+                ),
+            },
+        )
+        assert summary.startswith("Failed:")
+        assert "ERR_NAME_NOT_RESOLVED" in summary
+
+    def test_click_success_returns_empty_summary(self) -> None:
+        summary = self._format(
+            "click",
+            {"ok": True, "data": {"selector": "input[name='ackStatus']"}},
+        )
+        assert summary == ""
+
+    def test_type_text_success_returns_empty_summary(self) -> None:
+        summary = self._format(
+            "type_text",
+            {"ok": True, "data": {"selector": "#last_name", "typed_length": 5}},
+        )
+        assert summary == ""
+
+    def test_evaluate_success_returns_empty_summary_dropping_shape_suffix(self) -> None:
+        summary = self._format(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "bodyText": "...",
+                        "rows": [],
+                        "tableText": "",
+                        "title": "Page",
+                        "url": "https://example.com/",
+                    },
+                },
+            },
+        )
+        assert summary == ""
+        assert "object with keys" not in summary
+
+    def test_select_option_success_returns_empty_summary(self) -> None:
+        summary = self._format(
+            "select_option",
+            {"ok": True, "data": {"value": "option-1"}},
+        )
+        assert summary == ""
+
+    def test_navigate_browser_success_falls_through_to_summarize(self) -> None:
+        summary = self._format(
+            "navigate_browser",
+            {"ok": True, "url": "https://example.com"},
+        )
+        assert summary == "Navigated to https://example.com"
+
+    def test_update_workflow_success_falls_through_to_summarize(self) -> None:
+        summary = self._format(
+            "update_workflow",
+            {"ok": True, "data": {"block_count": 3}},
+        )
+        assert "3" in summary
+
+    def test_press_key_success_falls_through_to_summarize(self) -> None:
+        summary = self._format(
+            "press_key",
+            {"ok": True, "data": {"key": "Enter"}},
+        )
+        assert summary == "Pressed 'Enter'"
+
+    def test_summarize_tool_result_unchanged_for_click_success(self) -> None:
+        agent_summary = summarize_tool_result(
+            "click",
+            {"ok": True, "data": {"selector": "#submit"}},
+        )
+        assert agent_summary == "Clicked '#submit'"
+
+
 class TestParseFinalResponse:
     """parse_final_response is the last mile between model output and the frontend.
 
@@ -441,3 +647,94 @@ class TestParseFinalResponse:
         # A JSON array at top level is valid JSON but not a valid envelope.
         parsed = parse_final_response("[1, 2, 3]")
         assert parsed == {"type": "REPLY", "user_response": "[1, 2, 3]"}
+
+    def test_strips_leading_reply_label_before_parse(self) -> None:
+        envelope = 'REPLY\n{"type": "REPLY", "user_response": "ok"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "ok"
+
+    def test_strips_leading_ask_question_label_with_colon(self) -> None:
+        envelope = 'ASK_QUESTION:\n{"type": "ASK_QUESTION", "user_response": "what date?"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "what date?"
+
+    def test_strips_leading_replace_workflow_label(self) -> None:
+        envelope = (
+            'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}'
+        )
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLACE_WORKFLOW"
+        assert parsed["workflow_yaml"] == "title: x"
+
+    def test_extracts_json_after_prose_preamble(self) -> None:
+        envelope = 'Here\'s my response: {"type": "REPLY", "user_response": "ok"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "ok"
+
+    def test_pass_b_rejects_non_envelope_dict_in_prose(self) -> None:
+        text = 'I cannot help with {"foo": "bar"}'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_pass_b_rejects_dict_with_unrecognized_type(self) -> None:
+        text = 'I cannot help with {"type": "object"}'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovery_tier_skipped_when_text_only_mentions_user_response(self) -> None:
+        text = 'I cannot find the "user_response" field in your input.'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovery_tier_skipped_when_prose_quotes_both_markers(self) -> None:
+        # Prose discussing the envelope format (both quoted `"type": "REPLY"`
+        # and `"user_response"` substrings present, no leading `{`) must not
+        # degrade to "Done." — the user's actual prose has to survive.
+        text = 'I see "type": "REPLY" mentioned, but cannot find "user_response" anywhere.'
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_recovers_user_response_when_global_llm_context_malformed(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "the real answer", "global_llm_context": {"user_goal": "x",}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "the real answer"
+        assert parsed["type"] == "REPLY"
+
+    def test_recovers_user_response_with_escaped_quotes(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "she said \\"hi\\"", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == 'she said "hi"'
+
+    def test_regex_recovery_tolerates_literal_newline_in_user_response_value(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "line one\nline two", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "line one\nline two"
+
+    def test_recovers_ask_question_type_when_recovering_user_response(self) -> None:
+        envelope = '{"type": "ASK_QUESTION", "user_response": "which account?", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "which account?"
+
+    def test_recovery_demotes_malformed_replace_workflow_to_reply(self) -> None:
+        # Recovery cannot extract workflow_yaml, so REPLACE_WORKFLOW would be
+        # unverified — demote to REPLY.
+        envelope = '{"type": "REPLACE_WORKFLOW", "user_response": "updated your workflow", "global_llm_context": {bad}}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLY"
+        assert parsed["user_response"] == "updated your workflow"
+
+    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_done(self) -> None:
+        envelope = '{"type": "REPLY", "user_response": "broken'
+        parsed = parse_final_response(envelope)
+        assert parsed["user_response"] == "Done."
+        assert parsed["type"] == "REPLY"
+        assert "broken" not in parsed["user_response"]
+
+    def test_non_envelope_unparseable_text_still_falls_back_to_text(self) -> None:
+        text = "I'm not sure how to help with that."
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}

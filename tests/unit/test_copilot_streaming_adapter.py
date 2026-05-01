@@ -236,6 +236,108 @@ async def test_stream_to_sse_emits_narration_on_workflow_updated_transition(
     assert WorkflowCopilotStreamMessageType.TOOL_RESULT in tool_types
 
 
+@pytest.mark.asyncio
+async def test_tool_result_sse_summary_translates_loop_detected_failure() -> None:
+    """SSE TOOL_RESULT carries the user-facing translation; summarize_tool_result
+    on the same payload still yields the un-translated agent-facing text."""
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    raw_call = {"call_id": "c1", "name": "click", "arguments": "{}"}
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = raw_call
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    error_payload = {
+        "ok": False,
+        "error": (
+            "LOOP DETECTED: 'click' has been called 3 times consecutively. "
+            "This tool will not run again. Use a DIFFERENT tool to continue."
+        ),
+    }
+    output_text = '{"ok": false, "error": "LOOP DETECTED: \'click\' has been called 3 times consecutively. This tool will not run again. Use a DIFFERENT tool to continue."}'
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": "click"}
+    out_item.output = [{"type": "text", "text": output_text}]
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    ctx = SimpleNamespace()
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    sse_summary = tool_results[0].summary
+    assert sse_summary == "The agent got stuck retrying the same step — moving on."
+    assert "DIFFERENT tool" not in sse_summary
+
+    agent_summary = summarize_tool_result("click", error_payload)
+    assert agent_summary.startswith("Failed:")
+    assert "LOOP DETECTED" in agent_summary
+
+
+@pytest.mark.asyncio
+async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None:
+    """A successful click emits an empty SSE summary; the call_id → tool_name
+    lookup must resolve to 'click' for the success-redaction branch to fire."""
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    raw_call = {"call_id": "c-click", "name": "click", "arguments": '{"selector": "#btn-submit"}'}
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = raw_call
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    output_text = '{"ok": true, "data": {"selector": "#btn-submit"}}'
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c-click", "name": "click"}
+    out_item.output = [{"type": "text", "text": output_text}]
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    ctx = SimpleNamespace()
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    assert tool_results[0].tool_name == "click"
+    assert tool_results[0].success is True
+    assert tool_results[0].summary == ""
+
+
 class TestParseToolOutput:
     @staticmethod
     def _parse(output: Any) -> dict[str, Any]:

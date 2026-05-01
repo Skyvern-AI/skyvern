@@ -26,7 +26,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
-from skyvern.errors.errors import UserDefinedError
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
     ScriptNotFound,
@@ -1040,6 +1040,16 @@ async def _detect_user_defined_errors(
                     "Failed to validate user-defined error",
                     error_dict=error_dict,
                 )
+
+        user_defined_errors, dropped = filter_to_user_defined_codes(user_defined_errors, error_code_mapping)
+        if dropped:
+            LOG.warning(
+                "Dropped LLM-returned error codes not in user error_code_mapping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                dropped_codes=dropped,
+                allowed_codes=sorted((error_code_mapping or {}).keys()),
+            )
 
         LOG.info(
             "Detected user-defined errors",

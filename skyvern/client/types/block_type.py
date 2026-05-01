@@ -7,6 +7,7 @@ BlockType = typing.Union[
         "task",
         "task_v2",
         "for_loop",
+        "while_loop",
         "conditional",
         "code",
         "text_prompt",
