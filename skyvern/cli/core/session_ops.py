@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
 
 @dataclass
@@ -32,10 +33,34 @@ class SessionInfo:
     available: bool = False
 
 
+def coerce_proxy_location(proxy_location: ProxyLocationInput | str | None) -> ProxyLocationInput:
+    if proxy_location is None or isinstance(proxy_location, (GeoTarget, ProxyLocation)):
+        return proxy_location
+    if isinstance(proxy_location, dict):
+        return GeoTarget.model_validate(proxy_location)
+
+    stripped = proxy_location.strip()
+    try:
+        parsed_proxy_location = json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(parsed_proxy_location, dict):
+            return GeoTarget.model_validate(parsed_proxy_location)
+        raise ValueError("Proxy location JSON must be a GeoTarget object.")
+
+    try:
+        return ProxyLocation(stripped)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unknown proxy location: {stripped!r}. Expected a valid enum value or a GeoTarget JSON object."
+        ) from exc
+
+
 async def do_session_create(
     skyvern: Any,
     timeout: int = 60,
-    proxy_location: str | None = None,
+    proxy_location: ProxyLocationInput | str | None = None,
     local: bool = False,
     headless: bool = False,
 ) -> tuple[Any, SessionCreateResult]:
@@ -44,7 +69,7 @@ async def do_session_create(
         browser = await skyvern.launch_local_browser(headless=headless)
         return browser, SessionCreateResult(session_id=None, local=True, headless=headless)
 
-    proxy = ProxyLocation(proxy_location) if proxy_location else None
+    proxy = coerce_proxy_location(proxy_location)
     browser = await skyvern.launch_cloud_browser(timeout=timeout, proxy_location=proxy)
     return browser, SessionCreateResult(
         session_id=browser.browser_session_id,
