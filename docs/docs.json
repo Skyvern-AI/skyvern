@@ -364,14 +364,14 @@
   "navbar": {
     "links": [
       {
-        "label": "Dashboard",
-        "href": "https://app.skyvern.com"
+        "label": "Talk to us",
+        "href": "https://www.skyvern.com/contact"
       }
     ],
     "primary": {
       "type": "button",
-      "label": "Get API Key",
-      "href": "https://app.skyvern.com/settings/"
+      "label": "Get started",
+      "href": "https://app.skyvern.com/"
     }
   },
   "footer": {
