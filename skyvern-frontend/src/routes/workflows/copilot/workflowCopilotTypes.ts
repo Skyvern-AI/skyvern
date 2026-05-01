@@ -83,6 +83,8 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
+  // Clients must NOT auto-apply when true; render Accept/Reject explicitly.
+  unvalidated?: boolean;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {

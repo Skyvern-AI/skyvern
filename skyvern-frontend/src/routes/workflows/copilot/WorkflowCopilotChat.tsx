@@ -738,7 +738,7 @@ export function WorkflowCopilotChat({
         };
 
         setMessages((prev) => [...prev, aiMessage]);
-        if (response.updated_workflow && autoAccept) {
+        if (response.updated_workflow && autoAccept && !response.unvalidated) {
           applyWorkflowUpdate(response.updated_workflow);
         } else {
           setProposedWorkflow(response.updated_workflow ?? null);
