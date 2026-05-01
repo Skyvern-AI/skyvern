@@ -320,6 +320,40 @@ async def test_error_detection_with_workflow_task(agent, mock_browser_state):
                     assert "workflow_run_id" not in call_kwargs
 
 
+def test_response_error_filter_drops_hallucinated_failure_category_codes(agent):
+    """SKY-9425: LLM summarization can mix failure_categories codes (LLM_REASONING_ERROR)
+    into the user-defined errors array. _filter_response_errors must drop any code that
+    isn't a key in error_code_mapping so only customer-declared codes leak to the user.
+    """
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        error_code_mapping={
+            "DATA_UNAVAILABLE": "if the required month and year is not present in the dropdown, terminate"
+        },
+    )
+    step = make_step(now, task, step_id="step-9425", status=StepStatus.failed, order=1, output=None)
+
+    hallucinated = [
+        UserDefinedError(
+            error_code="LLM_REASONING_ERROR",
+            reasoning="The LLM misinterpreted the action type",
+            confidence_float=0.8,
+        ),
+        UserDefinedError(
+            error_code="DATA_UNAVAILABLE",
+            reasoning="April 2026 not in dropdown",
+            confidence_float=0.9,
+        ),
+    ]
+
+    kept = agent._filter_response_errors(task=task, step=step, errors=hallucinated)
+
+    assert [e.error_code for e in kept] == ["DATA_UNAVAILABLE"]
+
+
 @pytest.mark.asyncio
 async def test_error_detection_performance_doesnt_block_failure(agent, mock_browser_state):
     """Test that slow error detection doesn't significantly delay task failure."""

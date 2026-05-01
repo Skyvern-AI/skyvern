@@ -37,6 +37,7 @@ from skyvern.errors.errors import (
     ReachMaxStepsError,
     TimeoutGetTOTPVerificationCodeError,
     UserDefinedError,
+    filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
     BrowserSessionNotFound,
@@ -4697,6 +4698,18 @@ class ForgeAgent:
             )
             return next_step
 
+    def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
+        kept, dropped = filter_to_user_defined_codes(errors, task.error_code_mapping)
+        if dropped:
+            LOG.warning(
+                "Dropped LLM-returned error codes not in user error_code_mapping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                dropped_codes=dropped,
+                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            )
+        return kept
+
     async def summary_failure_reason_for_max_steps(
         self,
         organization: Organization,
@@ -4711,26 +4724,26 @@ class ForgeAgent:
             steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
-            for step_cnt, step in enumerate(steps):
-                if step.output is None:
+            for step_cnt, cur_step in enumerate(steps):
+                if cur_step.output is None:
                     continue
 
-                if len(step.output.errors) > 0:
-                    failure_reason = ";".join([repr(err) for err in step.output.errors])
+                if len(cur_step.output.errors) > 0:
+                    failure_reason = ";".join([repr(err) for err in cur_step.output.errors])
                     return MaxStepsReasonResponse(
                         page_info="",
                         reasoning=failure_reason,
-                        errors=step.output.errors,
+                        errors=cur_step.output.errors,
                     )
 
-                if step.output.actions_and_results is None:
+                if cur_step.output.actions_and_results is None:
                     continue
 
                 action_result_summary: list[str] = []
                 step_result: dict[str, Any] = {
                     "order": step_cnt,
                 }
-                for action, action_results in step.output.actions_and_results:
+                for action, action_results in cur_step.output.actions_and_results:
                     if len(action_results) == 0:
                         continue
                     last_result = action_results[-1]
@@ -4788,7 +4801,9 @@ class ForgeAgent:
                 prompt_name="summarize-max-steps-reason",
                 system_prompt=task.workflow_system_prompt,
             )
-            return MaxStepsReasonResponse.model_validate(json_response)
+            response = MaxStepsReasonResponse.model_validate(json_response)
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            return response
         except Exception:
             LOG.warning("Failed to summary the failure reason")
             # Check if we have LLM errors even if the summarization failed
@@ -4931,7 +4946,9 @@ class ForgeAgent:
                 prompt_name="summarize-max-retries-reason",
                 system_prompt=task.workflow_system_prompt,
             )
-            return MaxStepsReasonResponse.model_validate(json_response)
+            response = MaxStepsReasonResponse.model_validate(json_response)
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            return response
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
             # Check if we have LLM errors even if the summarization failed

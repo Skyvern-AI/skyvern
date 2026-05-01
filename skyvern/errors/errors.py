@@ -10,6 +10,30 @@ class UserDefinedError(BaseModel):
         return f"{self.reasoning}(error_code={self.error_code}, confidence_float={self.confidence_float})"
 
 
+def filter_to_user_defined_codes(
+    errors: list[UserDefinedError],
+    error_code_mapping: dict[str, str] | None,
+) -> tuple[list[UserDefinedError], list[str]]:
+    """Drop LLM-returned errors whose code is not a key in error_code_mapping.
+
+    LLM-based error surfacing prompts occasionally hallucinate codes from the
+    failure_categories taxonomy (e.g. LLM_REASONING_ERROR) and place them in
+    the user-defined errors field. Returns (kept, dropped_codes) so callers
+    can log the drop with their own task/step context.
+    """
+    if not error_code_mapping:
+        return [], [error.error_code for error in errors]
+    allowed = set(error_code_mapping.keys())
+    kept: list[UserDefinedError] = []
+    dropped: list[str] = []
+    for error in errors:
+        if error.error_code in allowed:
+            kept.append(error)
+        else:
+            dropped.append(error.error_code)
+    return kept, dropped
+
+
 class SkyvernDefinedError(BaseModel):
     error_code: str
     reasoning: str

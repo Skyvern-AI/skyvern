@@ -25,7 +25,7 @@ from skyvern.constants import (
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
-from skyvern.errors.errors import TOTPExpiredError
+from skyvern.errors.errors import TOTPExpiredError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -4918,4 +4918,14 @@ async def extract_user_defined_errors(
         step=step,
         prompt_name="surface-user-defined-errors",
     )
-    return [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    parsed = [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    kept, dropped = filter_to_user_defined_codes(parsed, task.error_code_mapping)
+    if dropped:
+        LOG.warning(
+            "Dropped LLM-returned error codes not in user error_code_mapping",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            dropped_codes=dropped,
+            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+        )
+    return kept
