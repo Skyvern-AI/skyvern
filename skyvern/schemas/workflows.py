@@ -457,6 +457,10 @@ class BlockResult:
     failure_reason: str | None = None
     error_codes: list[str] = field(default_factory=list)
     workflow_run_block_id: str | None = None
+    # True for synthetic loop-level failures (max iterations, max steps per iter,
+    # missing block label) so callers can distinguish them from real child-block
+    # results. Set explicitly at the synthetic construction sites in loop helpers.
+    is_synthetic_loop_failure: bool = False
 
 
 class FileType(StrEnum):
