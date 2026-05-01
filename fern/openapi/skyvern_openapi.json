@@ -6562,6 +6562,7 @@
           "task",
           "task_v2",
           "for_loop",
+          "while_loop",
           "conditional",
           "code",
           "text_prompt",
@@ -10300,6 +10301,9 @@
                   "$ref": "#/components/schemas/ForLoopBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/WhileLoopBlock"
+                },
+                {
                   "$ref": "#/components/schemas/TaskBlock"
                 },
                 {
@@ -10392,6 +10396,7 @@
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
                   "wait": "#/components/schemas/WaitBlock",
+                  "while_loop": "#/components/schemas/WhileLoopBlock",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
               }
@@ -18221,6 +18226,355 @@
         ],
         "title": "WaitBlockYAML"
       },
+      "WhileLoopBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "while_loop",
+            "title": "Block Type",
+            "default": "while_loop"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "loop_blocks": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ConditionalBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/ForLoopBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WhileLoopBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/TaskBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/CodeBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/TextPromptBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DownloadToS3Block"
+                },
+                {
+                  "$ref": "#/components/schemas/UploadToS3Block"
+                },
+                {
+                  "$ref": "#/components/schemas/SendEmailBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/FileParserBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PDFParserBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/ValidationBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/ActionBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/NavigationBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/ExtractionBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/LoginBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WaitBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/HumanInteractionBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/FileDownloadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/UrlBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/TaskV2Block"
+                },
+                {
+                  "$ref": "#/components/schemas/FileUploadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/HttpRequestBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlock"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "block_type",
+                "mapping": {
+                  "action": "#/components/schemas/ActionBlock",
+                  "code": "#/components/schemas/CodeBlock",
+                  "conditional": "#/components/schemas/ConditionalBlock",
+                  "download_to_s3": "#/components/schemas/DownloadToS3Block",
+                  "extraction": "#/components/schemas/ExtractionBlock",
+                  "file_download": "#/components/schemas/FileDownloadBlock",
+                  "file_upload": "#/components/schemas/FileUploadBlock",
+                  "file_url_parser": "#/components/schemas/FileParserBlock",
+                  "for_loop": "#/components/schemas/ForLoopBlock",
+                  "goto_url": "#/components/schemas/UrlBlock",
+                  "http_request": "#/components/schemas/HttpRequestBlock",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlock",
+                  "login": "#/components/schemas/LoginBlock",
+                  "navigation": "#/components/schemas/NavigationBlock",
+                  "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "print_page": "#/components/schemas/PrintPageBlock",
+                  "send_email": "#/components/schemas/SendEmailBlock",
+                  "task": "#/components/schemas/TaskBlock",
+                  "task_v2": "#/components/schemas/TaskV2Block",
+                  "text_prompt": "#/components/schemas/TextPromptBlock",
+                  "upload_to_s3": "#/components/schemas/UploadToS3Block",
+                  "validation": "#/components/schemas/ValidationBlock",
+                  "wait": "#/components/schemas/WaitBlock",
+                  "while_loop": "#/components/schemas/WhileLoopBlock",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Loop Blocks"
+          },
+          "condition": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/JinjaBranchCriteria"
+              },
+              {
+                "$ref": "#/components/schemas/PromptBranchCriteria"
+              }
+            ],
+            "title": "Condition",
+            "discriminator": {
+              "propertyName": "criteria_type",
+              "mapping": {
+                "jinja2_template": "#/components/schemas/JinjaBranchCriteria",
+                "prompt": "#/components/schemas/PromptBranchCriteria"
+              }
+            }
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "loop_blocks",
+          "condition"
+        ],
+        "title": "WhileLoopBlock",
+        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
+      },
+      "WhileLoopBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "while_loop",
+            "title": "Block Type",
+            "default": "while_loop"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "loop_blocks": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ForLoopBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WhileLoopBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/CodeBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/TextPromptBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DownloadToS3BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/UploadToS3BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileUploadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/SendEmailBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileParserBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ValidationBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ActionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/NavigationBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ExtractionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/LoginBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WaitBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/HumanInteractionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/UrlBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PDFParserBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/TaskV2BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Loop Blocks"
+          },
+          "condition": {
+            "$ref": "#/components/schemas/BranchCriteriaYAML"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "loop_blocks",
+          "condition"
+        ],
+        "title": "WhileLoopBlockYAML"
+      },
       "Workflow": {
         "properties": {
           "workflow_id": {
@@ -18762,6 +19116,9 @@
                   "$ref": "#/components/schemas/ForLoopBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/WhileLoopBlock"
+                },
+                {
                   "$ref": "#/components/schemas/TaskBlock"
                 },
                 {
@@ -18854,6 +19211,7 @@
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
                   "wait": "#/components/schemas/WaitBlock",
+                  "while_loop": "#/components/schemas/WhileLoopBlock",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
               }
@@ -18950,6 +19308,9 @@
                   "$ref": "#/components/schemas/ForLoopBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/WhileLoopBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/CodeBlockYAML"
                 },
                 {
@@ -19042,6 +19403,7 @@
                   "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
                   "validation": "#/components/schemas/ValidationBlockYAML",
                   "wait": "#/components/schemas/WaitBlockYAML",
+                  "while_loop": "#/components/schemas/WhileLoopBlockYAML",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               }
