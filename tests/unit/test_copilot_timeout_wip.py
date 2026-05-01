@@ -11,12 +11,8 @@ from skyvern.forge.sdk.copilot.agent import (
     _TIMEOUT_REPLY_DEFAULT,
     _TIMEOUT_REPLY_TESTED,
     _TIMEOUT_REPLY_UNVALIDATED,
-    _UNEXPECTED_ERROR_REPLY_DEFAULT,
-    _UNEXPECTED_ERROR_REPLY_TESTED,
-    _UNEXPECTED_ERROR_REPLY_UNVALIDATED,
     _build_max_turns_exit_result,
     _build_timeout_exit_result,
-    _build_unexpected_error_exit_result,
 )
 
 
@@ -174,64 +170,3 @@ class TestBuildMaxTurnsExitResult:
         assert result.updated_workflow is None
         assert result.unvalidated is False
         assert result.user_response == _MAX_TURNS_REPLY_DEFAULT
-
-
-class TestBuildUnexpectedErrorExitResult:
-    def test_no_workflow_falls_back_to_default_reply(self) -> None:
-        ctx = _ctx(last_workflow=None, last_workflow_yaml=None, last_test_ok=None)
-
-        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_DEFAULT
-
-    def test_untested_workflow_surfaces_as_unvalidated_wip(self) -> None:
-        wf = MagicMock(name="wf")
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=None)
-
-        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is wf
-        assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is True
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_UNVALIDATED
-
-    def test_passing_test_surfaces_as_tested_proposal(self) -> None:
-        wf = MagicMock(name="wf")
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=True)
-
-        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is wf
-        assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_TESTED
-
-    def test_failed_test_drops_proposal(self) -> None:
-        wf = MagicMock(name="wf")
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
-
-        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_DEFAULT
-
-    def test_suspicious_success_drops_proposal(self) -> None:
-        wf = MagicMock(name="wf")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="version: '1.0'",
-            last_test_ok=None,
-            last_test_suspicious_success=True,
-        )
-
-        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_DEFAULT

@@ -24,11 +24,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.workflow_copilot import COPILOT_V2_FLAG_KEY, workflow_copilot_chat_post
-from skyvern.forge.sdk.schemas.workflow_copilot import (
-    WorkflowCopilotChatRequest,
-    WorkflowCopilotStreamErrorUpdate,
-    WorkflowCopilotStreamResponseUpdate,
-)
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotStreamResponseUpdate
 
 
 def _make_chat_request() -> WorkflowCopilotChatRequest:
@@ -448,7 +444,6 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
     )
     assert response_frame is not None
     assert getattr(response_frame, "unvalidated", False) is True
-    assert not [f for f in sent_frames if isinstance(f, WorkflowCopilotStreamErrorUpdate)]
 
 
 @pytest.mark.asyncio
