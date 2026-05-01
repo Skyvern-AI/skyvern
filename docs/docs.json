@@ -370,7 +370,7 @@
     ],
     "primary": {
       "type": "button",
-      "label": "Get started",
+      "label": "Get Started",
       "href": "https://app.skyvern.com/"
     }
   },
