@@ -459,6 +459,58 @@ def _check_llm_config() -> CheckResult:
     )
 
 
+def _check_api_key_consistency() -> CheckResult:
+    """Check that API keys are consistent across backend .env, frontend .env, and secrets.toml."""
+    import re
+
+    from dotenv import dotenv_values
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    frontend_env = Path("skyvern-frontend/.env")
+    secrets_toml = Path(".streamlit/secrets.toml")
+
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    frontend_raw = dotenv_values(frontend_env).get("VITE_SKYVERN_API_KEY", "") if frontend_env.exists() else ""
+    frontend_key = "" if frontend_raw in ("", "YOUR_API_KEY") else frontend_raw
+
+    secrets_key = ""
+    if secrets_toml.exists():
+        m = re.search(r'cred\s*=\s*"([^"]*)"', secrets_toml.read_text())
+        if m:
+            secrets_key = m.group(1)
+
+    canonical = secrets_key or backend_key
+    if not canonical:
+        return CheckResult(
+            name="API Key Consistency",
+            status="warn",
+            detail="No API key found in backend .env or .streamlit/secrets.toml",
+            hint="Run `skyvern init` or `skyvern quickstart` to generate an API key",
+        )
+
+    mismatches: list[str] = []
+    if backend_key and backend_key != canonical:
+        mismatches.append("backend .env differs from secrets.toml")
+    if not frontend_env.exists():
+        mismatches.append("skyvern-frontend/.env missing")
+    elif not frontend_key:
+        mismatches.append("VITE_SKYVERN_API_KEY not set in frontend .env")
+    elif frontend_key != canonical:
+        mismatches.append("frontend .env differs from backend")
+
+    if mismatches:
+        return CheckResult(
+            name="API Key Consistency",
+            status="error",
+            detail="; ".join(mismatches),
+            hint="Run `skyvern doctor --fix` to sync API keys",
+        )
+
+    return CheckResult(name="API Key Consistency", status="ok", detail="Keys consistent across all config files")
+
+
 def _redact_password(db_string: str) -> str:
     """Replace password in a database URL with ***."""
     import re
@@ -522,6 +574,7 @@ _CHECKS = [
     _check_database,
     _check_docker,
     _check_llm_config,
+    _check_api_key_consistency,
     _check_playwright_browser,
     _check_port_8000,
     _check_api_connectivity,
@@ -547,6 +600,8 @@ def _try_fix(result: CheckResult) -> bool:
         return _fix_start_postgres()
     if result.name == "Playwright Browser" and result.status == "error":
         return _fix_install_playwright()
+    if result.name == "API Key Consistency" and result.status == "error":
+        return _fix_api_key_consistency()
     if result.name == "Docker" and "not running" in result.detail:
         console.print("  [yellow]→ Please start Docker Desktop manually[/yellow]")
         return False
@@ -612,6 +667,52 @@ def _fix_start_postgres() -> bool:
         return True
     console.print("  [yellow]→ Could not start PostgreSQL automatically. Start it manually.[/yellow]")
     return False
+
+
+def _fix_api_key_consistency() -> bool:
+    import re
+
+    from dotenv import dotenv_values
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    secrets_toml = Path(".streamlit/secrets.toml")
+
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    secrets_key = ""
+    if secrets_toml.exists():
+        m = re.search(r'cred\s*=\s*"([^"]*)"', secrets_toml.read_text())
+        if m:
+            secrets_key = m.group(1)
+
+    canonical = secrets_key or backend_key
+    if not canonical:
+        console.print("  [yellow]→ No source API key found to sync from[/yellow]")
+        return False
+
+    if not frontend_env.exists() and frontend_example.exists():
+        import shutil
+
+        shutil.copy(frontend_example, frontend_env)
+        console.print("  [cyan]Created skyvern-frontend/.env from .env.example[/cyan]")
+
+    if not frontend_env.exists():
+        console.print("  [yellow]→ skyvern-frontend/.env not found and no .env.example to copy[/yellow]")
+        return False
+
+    content = frontend_env.read_text()
+    if re.search(r"^VITE_SKYVERN_API_KEY=", content, re.MULTILINE):
+        content = re.sub(r"^VITE_SKYVERN_API_KEY=.*$", f"VITE_SKYVERN_API_KEY={canonical}", content, flags=re.MULTILINE)
+    else:
+        content += f"\nVITE_SKYVERN_API_KEY={canonical}\n"
+    frontend_env.write_text(content)
+    console.print(
+        f"  [green]✅ Synced VITE_SKYVERN_API_KEY in skyvern-frontend/.env (from {'secrets.toml' if secrets_key else 'backend .env'})[/green]"
+    )
+    return True
 
 
 def _fix_install_playwright() -> bool:
