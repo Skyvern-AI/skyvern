@@ -193,8 +193,8 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
 
 
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """``unvalidated`` overrides ``auto_accept=True`` to force explicit Accept/Reject."""
-    if bool(getattr(agent_result, "unvalidated", False)):
+    """``unvalidated`` and ``cancelled`` override ``auto_accept=True`` to force explicit Accept/Reject."""
+    if bool(getattr(agent_result, "unvalidated", False)) or bool(getattr(agent_result, "cancelled", False)):
         return False
     return auto_accept is True
 
@@ -216,6 +216,40 @@ async def _clear_proposed_workflow(chat: Any) -> None:
     )
 
 
+def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
+    proposed_data = dict(updated_workflow.model_dump(mode="json"))
+    if agent_result.workflow_yaml:
+        proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+    if agent_result.unvalidated:
+        proposed_data["_copilot_unvalidated"] = True
+    return proposed_data
+
+
+async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult, restored: bool) -> None:
+    updated_workflow = agent_result.updated_workflow
+    auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
+    if not auto_accept_effective and updated_workflow:
+        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+            organization_id=chat.organization_id,
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            proposed_workflow=_build_proposed_workflow_data(updated_workflow, agent_result),
+        )
+    elif chat.proposed_workflow is not None and (restored or agent_result.clear_proposed_workflow):
+        # Null any persisted proposed_workflow the assistant just invalidated
+        # so a reload does not resurrect a stale Accept/Reject card. Runs
+        # under both auto_accept values — a stale proposal can survive an
+        # auto-accept toggle.
+        await _clear_proposed_workflow(chat)
+    elif (
+        auto_accept_effective
+        and chat.proposed_workflow is not None
+        and chat.proposed_workflow.get("_copilot_unvalidated") is True
+    ):
+        # The leftover unvalidated proposal is no longer attached to the chat
+        # tail; clear it so reload doesn't resurrect a stale Accept/Reject card.
+        await _clear_proposed_workflow(chat)
+
+
 async def _persist_cancel_turn(
     stream: EventSourceStream,
     chat: Any,
@@ -224,14 +258,36 @@ async def _persist_cancel_turn(
     user_message: str,
     agent_result: AgentResult | None,
 ) -> None:
-    """Persist a cancelled turn and emit a terminal SSE error frame.
+    """Persist a cancelled turn and emit a terminal SSE response frame.
 
     Pass the agent's ``AgentResult`` for cancels during the agent run so
     rollback uses the same ``workflow_was_persisted`` source of truth as
     the success path; pass ``None`` for pre-agent cancels.
     """
-    if agent_result is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
-        await asyncio.shield(_restore_workflow_definition(original_workflow, organization_id))
+    if agent_result is None:
+        user_response = "Cancelled by user."
+        updated_workflow = None
+        updated_global_llm_context = None
+        total_tokens = None
+        response_type = "REPLY"
+        unvalidated = False
+        if chat.proposed_workflow is not None:
+            await asyncio.shield(_clear_proposed_workflow(chat))
+    else:
+        restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+        if restored:
+            await asyncio.shield(_restore_workflow_definition(original_workflow, organization_id))
+        if agent_result.updated_workflow is None and chat.proposed_workflow is not None:
+            await asyncio.shield(_clear_proposed_workflow(chat))
+        else:
+            await asyncio.shield(_persist_proposed_workflow_state(chat, agent_result, restored))
+        user_response = agent_result.user_response
+        updated_workflow = agent_result.updated_workflow
+        updated_global_llm_context = agent_result.global_llm_context
+        total_tokens = getattr(agent_result, "total_tokens", None)
+        response_type = getattr(agent_result, "response_type", "REPLY")
+        unvalidated = bool(getattr(agent_result, "unvalidated", False))
+
     await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
             organization_id=chat.organization_id,
@@ -240,22 +296,36 @@ async def _persist_cancel_turn(
             content=user_message,
         )
     )
-    await asyncio.shield(
+    assistant_message = await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
             organization_id=chat.organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             sender=WorkflowCopilotChatSender.AI,
-            content="Cancelled by user.",
+            content=user_response,
+            global_llm_context=updated_global_llm_context,
         )
     )
-    # Best-effort: client may have already aborted, in which case stream.send
-    # silently drops. The optimistic FE bubble already shows the cancellation.
-    with contextlib.suppress(Exception):
-        await stream.send(
-            WorkflowCopilotStreamErrorUpdate(
-                type=WorkflowCopilotStreamMessageType.ERROR,
-                error="Cancelled by user.",
+    try:
+        await asyncio.shield(
+            stream.send(
+                WorkflowCopilotStreamResponseUpdate(
+                    type=WorkflowCopilotStreamMessageType.RESPONSE,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    message=user_response,
+                    updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
+                    response_time=assistant_message.created_at,
+                    total_tokens=total_tokens,
+                    response_type=response_type,
+                    unvalidated=unvalidated,
+                    cancelled=True,
+                )
             )
+        )
+    except BaseException:
+        LOG.warning(
+            "Failed to send cancel RESPONSE frame; persistence already committed",
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            exc_info=True,
         )
 
 
@@ -293,32 +363,7 @@ async def _finalise_normal_turn(
     if restored:
         await _restore_workflow_definition(original_workflow, organization_id)
 
-    auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
-    if not auto_accept_effective and updated_workflow:
-        proposed_data = updated_workflow.model_dump(mode="json")
-        if agent_result.workflow_yaml:
-            proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
-        if agent_result.unvalidated:
-            proposed_data["_copilot_unvalidated"] = True
-        await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-            organization_id=chat.organization_id,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            proposed_workflow=proposed_data,
-        )
-    elif chat.proposed_workflow is not None and (restored or agent_result.clear_proposed_workflow):
-        # Null any persisted proposed_workflow the assistant just invalidated
-        # so a reload does not resurrect a stale Accept/Reject card. Runs
-        # under both auto_accept values — a stale proposal can survive an
-        # auto-accept toggle.
-        await _clear_proposed_workflow(chat)
-    elif (
-        auto_accept_effective
-        and chat.proposed_workflow is not None
-        and chat.proposed_workflow.get("_copilot_unvalidated") is True
-    ):
-        # The leftover unvalidated proposal is no longer attached to the chat
-        # tail; clear it so reload doesn't resurrect a stale Accept/Reject card.
-        await _clear_proposed_workflow(chat)
+    await _persist_proposed_workflow_state(chat, agent_result, restored)
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
         organization_id=chat.organization_id,
@@ -1237,6 +1282,7 @@ async def _new_copilot_chat_post(
                     "Workflow copilot v2 cancelled by user during pre-agent setup",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                 )
+                return
             else:
                 # Operational cancel (worker shutdown, deploy drain) or a
                 # cancel that arrived after _finalise_normal_turn started
@@ -1248,7 +1294,7 @@ async def _new_copilot_chat_post(
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     user_cancel_observed=user_cancel_observed[0],
                 )
-            raise
+                raise
         except Exception as exc:
             if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
                 await _restore_workflow_definition(original_workflow, organization.organization_id)

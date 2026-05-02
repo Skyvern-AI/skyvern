@@ -273,6 +273,12 @@ _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
 _UNEXPECTED_ERROR_REPLY_TESTED = (
     "I hit an unexpected issue, but I have a tested draft for you. Accept it to save, or discard."
 )
+_CANCEL_REPLY_DEFAULT = "Cancelled by user."
+_CANCEL_REPLY_UNVALIDATED = (
+    "Cancelled. I have a draft workflow you can keep — accept it to save "
+    "(note: it hasn't been verified end-to-end), or discard."
+)
+_CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
 
 
 def _build_wip_exit_result(
@@ -282,6 +288,7 @@ def _build_wip_exit_result(
     default_reply: str,
     unvalidated_reply: str,
     tested_reply: str,
+    cancelled: bool = False,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
     # ``last_test_ok=None`` covers both "test never ran" and "test ran with
@@ -303,8 +310,9 @@ def _build_wip_exit_result(
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
             unvalidated=unvalidated,
+            cancelled=cancelled,
         )
-    return _build_exit_result(ctx, default_reply, global_llm_context)
+    return _build_exit_result(ctx, default_reply, global_llm_context, cancelled=cancelled)
 
 
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
@@ -334,6 +342,17 @@ def _build_unexpected_error_exit_result(ctx: CopilotContext, global_llm_context:
         default_reply=_UNEXPECTED_ERROR_REPLY_DEFAULT,
         unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
         tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
+    )
+
+
+def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_wip_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_CANCEL_REPLY_DEFAULT,
+        unvalidated_reply=_CANCEL_REPLY_UNVALIDATED,
+        tested_reply=_CANCEL_REPLY_TESTED,
+        cancelled=True,
     )
 
 
@@ -668,7 +687,7 @@ async def run_copilot_agent(
                 # Re-raising would leave the route with ``agent_result is None``
                 # and skip its ``workflow_was_persisted`` rollback decision.
                 LOG.info("Copilot run cancelled by user")
-                return _build_exit_result(ctx, "Cancelled by user.", global_llm_context, cancelled=True)
+                return _build_cancel_exit_result(ctx, global_llm_context)
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
