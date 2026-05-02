@@ -253,7 +253,7 @@ def _format_payload_path_segment(key: str) -> str:
 
 
 # ForLoop constants
-DEFAULT_MAX_LOOP_ITERATIONS = 100
+DEFAULT_MAX_LOOP_ITERATIONS = 500
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
 PERSIST_LOOP_OUTPUT_INTERVAL = 10
@@ -2571,7 +2571,7 @@ class WhileLoopBlock(Block):
     first). If the condition is false on the first check, the body never runs and the block
     returns success with an empty output list.
 
-    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is
+    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is
     treated as a failure so that a misbehaving condition can never spin forever.
     """
 
