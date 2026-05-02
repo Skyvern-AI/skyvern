@@ -46,6 +46,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
     )
 
     ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
     with pytest.raises(CopilotTotalTimeoutError):
         await run_with_enforcement(
             agent=MagicMock(),
@@ -53,6 +54,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
             ctx=ctx,
             stream=stream,
         )
+    assert ctx.copilot_total_timeout_exceeded is True
 
 
 @pytest.mark.asyncio
@@ -94,6 +96,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
     )
 
     ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
     with pytest.raises(CopilotTotalTimeoutError):
         await run_with_enforcement(
             agent=MagicMock(),
@@ -102,6 +105,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
             stream=stream,
         )
     assert call_count["n"] == 2, "recovery path should have triggered a second Runner call"
+    assert ctx.copilot_total_timeout_exceeded is True
 
 
 @pytest.mark.asyncio
@@ -129,6 +133,7 @@ async def test_runner_deadline_does_not_fire_when_tool_completes_in_time(
     )
 
     ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
     returned = await run_with_enforcement(
         agent=MagicMock(),
         initial_input="hello",
@@ -136,3 +141,4 @@ async def test_runner_deadline_does_not_fire_when_tool_completes_in_time(
         stream=stream,
     )
     assert returned is fake
+    assert ctx.copilot_total_timeout_exceeded is False

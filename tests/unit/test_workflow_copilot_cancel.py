@@ -524,6 +524,83 @@ async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
     assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
 
 
+@pytest.mark.asyncio
+async def test_timeout_wip_result_streams_normal_response_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout WIP rescue must use normal finalisation, not the cancel ERROR path."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.side_effect = lambda mode="json": {"workflow_id": "wf-draft", "title": "Draft"}
+    agent_result = SimpleNamespace(
+        user_response="I ran out of time before I could finish testing. I have a draft workflow you can keep.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml="version: '1.0'",
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=False,
+        total_tokens=123,
+        response_type="REPLY",
+        unvalidated=True,
+    )
+    restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    sent_payloads: list[Any] = []
+    stream = MagicMock()
+
+    async def _send(payload: Any) -> bool:
+        sent_payloads.append(payload)
+        return True
+
+    stream.send = _send
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+    proposal = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposal["_copilot_yaml"] == "version: '1.0'"
+    assert proposal["_copilot_unvalidated"] is True
+
+    response_frames = [
+        p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].updated_workflow == {"workflow_id": "wf-draft", "title": "Draft"}
+    assert response_frames[0].unvalidated is True
+    assert response_frames[0].total_tokens == 123
+
+    error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
+    assert error_frames == []
+    contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
+    assert "Cancelled by user." not in contents
+
+
 # ---------------------------------------------------------------------------
 # /workflow/copilot/cancel endpoint
 # ---------------------------------------------------------------------------

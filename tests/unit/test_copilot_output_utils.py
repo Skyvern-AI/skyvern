@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.copilot.output_utils import (
+    _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     format_tool_result_for_user,
     parse_final_response,
     sanitize_tool_result_for_llm,
@@ -125,6 +126,19 @@ def test_sanitize_other_tools_do_not_touch_block_screenshot_b64() -> None:
     }
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
     assert sanitized["data"]["blocks"][0]["screenshot_b64"] == "stays_here"
+
+
+def test_sanitize_strips_internal_watchdog_cancel_marker() -> None:
+    result = {
+        "ok": False,
+        "error": "Run ID: wr_timeout. Outcome is uncertain.",
+        _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY: True,
+    }
+
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+
+    assert _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY not in sanitized
+    assert sanitized["error"] == "Run ID: wr_timeout. Outcome is uncertain."
 
 
 class TestSanitization:

@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _UNEXPECTED_ERROR_REPLY_TESTED,
     _UNEXPECTED_ERROR_REPLY_UNVALIDATED,
     _build_cancel_exit_result,
+    _build_cancelled_exit_result,
     _build_max_turns_exit_result,
     _build_timeout_exit_result,
     _build_unexpected_error_exit_result,
@@ -36,6 +37,7 @@ def _ctx(
     ctx.last_workflow_yaml = last_workflow_yaml
     ctx.last_test_ok = last_test_ok
     ctx.last_test_suspicious_success = last_test_suspicious_success
+    ctx.copilot_total_timeout_exceeded = False
     ctx.workflow_persisted = last_workflow is not None
     ctx.total_tokens_used = None
     return ctx
@@ -178,6 +180,33 @@ class TestBuildMaxTurnsExitResult:
         assert result.updated_workflow is None
         assert result.unvalidated is False
         assert result.user_response == _MAX_TURNS_REPLY_DEFAULT
+
+
+class TestBuildCancelledExitResult:
+    def test_total_timeout_latch_routes_cancel_to_timeout_wip(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=None)
+        ctx.copilot_total_timeout_exceeded = True
+
+        result = _build_cancelled_exit_result(ctx, global_llm_context=None)
+
+        assert result.cancelled is False
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.unvalidated is True
+        assert result.user_response == _TIMEOUT_REPLY_UNVALIDATED
+
+    def test_regular_cancel_uses_cancel_wip_path(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=None)
+
+        result = _build_cancelled_exit_result(ctx, global_llm_context=None)
+
+        assert result.cancelled is True
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.unvalidated is True
+        assert result.user_response == _CANCEL_REPLY_UNVALIDATED
 
 
 class TestBuildUnexpectedErrorExitResult:
