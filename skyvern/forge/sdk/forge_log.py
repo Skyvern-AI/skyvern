@@ -1,4 +1,5 @@
 import logging
+import re
 import sys
 from pathlib import Path
 from types import TracebackType
@@ -9,6 +10,11 @@ from structlog.typing import EventDict
 from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
+
+# Bearer JWTs occasionally leak into log messages via WebSocket connection
+# URLs that pass `?token=Bearer%20<jwt>` as a query string. Redact before
+# anything ships to Datadog. Matches both raw and URL-encoded forms.
+_BEARER_TOKEN_RE = re.compile(r"(?i)(token=)(?:Bearer(?:%20|\s+))?[A-Za-z0-9._%-]+")
 
 LOGGING_LEVEL_MAP: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -116,6 +122,18 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
 
     event_dict["msg"] = msg_field
 
+    return event_dict
+
+
+def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Redact Bearer JWTs from any string value in the event dict.
+
+    Defense-in-depth for log lines that interpolate URLs containing
+    `?token=Bearer%20<jwt>` (e.g. WebSocket connection URLs).
+    """
+    for key, value in list(event_dict.items()):
+        if isinstance(value, str) and "token=" in value:
+            event_dict[key] = _BEARER_TOKEN_RE.sub(r"\1<redacted>", value)
     return event_dict
 
 
@@ -356,6 +374,7 @@ def setup_logger() -> None:
     renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else CustomConsoleRenderer()
     additional_processors = (
         [
+            redact_bearer_tokens,
             compact_action_objects,
             structlog.processors.EventRenamer("msg"),
             add_kv_pairs_to_msg,
@@ -371,6 +390,7 @@ def setup_logger() -> None:
         ]
         if settings.JSON_LOGGING
         else [
+            redact_bearer_tokens,
             compact_action_objects,
             structlog.processors.CallsiteParameterAdder(
                 {
@@ -417,10 +437,13 @@ def setup_logger() -> None:
     for name in ("skyvern", "cloud", "workers", "scripts", "browser_controller"):
         logging.getLogger(name).setLevel(LOG_LEVEL_VAL)
 
-    uvicorn_error = logging.getLogger("uvicorn.error")
-    uvicorn_error.disabled = True
-    uvicorn_access = logging.getLogger("uvicorn.access")
-    uvicorn_access.disabled = True
+    # uvicorn calls logging.config.dictConfig(LOGGING_CONFIG) during its own
+    # startup, which RESETS the disabled flag on these loggers back to False.
+    # setLevel() survives because uvicorn's default config sets level=INFO,
+    # which is below WARNING/CRITICAL — our higher levels stay in effect when
+    # __main__.py also passes a no-op log_config to uvicorn.run().
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 
     # Suppress noisy websockets library INFO logs ("connection open", "connection closed")
     # These are high-volume and not useful for debugging

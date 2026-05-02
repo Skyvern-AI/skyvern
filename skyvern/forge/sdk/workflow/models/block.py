@@ -41,6 +41,7 @@ from skyvern.constants import (
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_UPLOAD_FILE_COUNT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
@@ -6396,6 +6397,53 @@ class PrintPageBlock(Block):
 
         return artifact_uri, artifact_url
 
+    async def _register_pdf_as_downloaded_file(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+    ) -> list[FileInfo]:
+        # Workflow finalization eventually runs save_downloaded_files, but the block
+        # output snapshot is recorded now and the UI keys off downloaded_file_urls
+        # on the block — so we register up front and let finalization re-run safely.
+        if not organization_id:
+            return []
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock failed to register PDF as downloaded file; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout getting downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -6405,6 +6453,11 @@ class PrintPageBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Scope downloaded files to this block only.
+        block_context = skyvern_context.current()
+        if block_context:
+            await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
@@ -6473,12 +6526,27 @@ class PrintPageBlock(Block):
             organization_id=organization_id,
         )
 
+        artifact_org_id = organization_id or workflow_run_context.organization_id
+        downloaded_files = await self._register_pdf_as_downloaded_file(
+            organization_id=artifact_org_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+        current_context = skyvern_context.current()
+        downloaded_files = filter_downloaded_files_for_current_iteration(
+            downloaded_files,
+            current_context.loop_internal_state if current_context else None,
+        )
         output = {
             "filename": filename,
             "file_path": file_path,
             "size_bytes": len(pdf_bytes),
             "artifact_uri": artifact_uri,
             "artifact_url": artifact_url,
+            "downloaded_files": [fi.model_dump() for fi in downloaded_files],
+            "downloaded_file_urls": [fi.url for fi in downloaded_files],
+            "downloaded_file_artifact_ids": [fi.artifact_id for fi in downloaded_files if fi.artifact_id],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
 
