@@ -91,6 +91,10 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 
+# Max wait for any download signal after a cached click; downstream
+# .crdownload polling handles in-progress completion separately. (SKY-9431)
+CACHED_DOWNLOAD_NO_FILE_GRACE_SECONDS = 60
+
 
 class SkyvernLoopItem:
     def __init__(
@@ -1926,16 +1930,17 @@ async def download(
             #   - Check immediately (catches fast CDP atomic writes).
             #   - If a .crdownload is detected, a browser-native download is in
             #     progress — keep polling until it completes or times out.
-            #   - If nothing appears within a short grace period, the cached click
+            #   - If nothing appears within the grace period, the cached click
             #     likely did nothing (e.g. download_selector() returned None).
-            # Shorter than agent-path constants (BROWSER_DOWNLOAD_TIMEOUT=600,
-            # BROWSER_DOWNLOAD_MAX_WAIT_TIME=120) — cached fallback to AI is cheap.
+            # Grace accommodates slow report-generation backends; in-progress
+            # timeout is anchored at first detection so the grace doesn't eat
+            # the download budget. (SKY-9431)
             _POLL_INTERVAL = 2  # seconds between filesystem checks
-            _GRACE_PERIOD = 6  # seconds to wait when no download activity detected
             _DOWNLOAD_TIMEOUT = 300  # max seconds to wait for an in-progress download
             _DISAPPEARED_TIMEOUT = 30  # seconds to wait after .crdownload vanishes without completion
             _download_detected = False
             _disappeared_at: float | None = None
+            _first_detected_at: float | None = None
             _loop = asyncio.get_running_loop()
             _poll_start = _loop.time()
 
@@ -1959,9 +1964,10 @@ async def download(
                             workflow_run_id=run_id,
                             downloading_files=len(_new_downloading),
                         )
+                        _first_detected_at = _now
                     _download_detected = True
                     _disappeared_at = None  # reset — file is (still) present
-                    if _elapsed > _DOWNLOAD_TIMEOUT:
+                    if _first_detected_at is not None and (_now - _first_detected_at) > _DOWNLOAD_TIMEOUT:
                         raise CachedDownloadError(
                             ".crdownload file never completed. "
                             f"Files before: {len(local_files_before)}, after: {len(_local_files_now)}"
@@ -1984,7 +1990,7 @@ async def download(
                     continue
 
                 # Nothing new at all — wait a grace period then give up
-                if _elapsed >= _GRACE_PERIOD:
+                if _elapsed >= CACHED_DOWNLOAD_NO_FILE_GRACE_SECONDS:
                     LOG.warning(
                         "Cached download produced no file after grace period",
                         workflow_run_id=run_id,
