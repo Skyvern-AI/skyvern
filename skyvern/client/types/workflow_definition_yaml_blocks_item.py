@@ -237,6 +237,7 @@ class WorkflowDefinitionYamlBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
 from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
 
 
@@ -596,32 +597,6 @@ class WorkflowDefinitionYamlBlocksItem_Wait(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class WorkflowDefinitionYamlBlocksItem_WhileLoop(UniversalBaseModel):
-    block_type: typing.Literal["while_loop"] = "while_loop"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["WhileLoopBlockYamlLoopBlocksItem"]
-    condition: BranchCriteriaYaml
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
-from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
-from .while_loop_block_yaml_loop_blocks_item import WhileLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
-
-
 class WorkflowDefinitionYamlBlocksItem_WorkflowTrigger(UniversalBaseModel):
     block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
     label: str
@@ -635,6 +610,26 @@ class WorkflowDefinitionYamlBlocksItem_WorkflowTrigger(UniversalBaseModel):
     browser_session_id: typing.Optional[str] = None
     use_parent_browser_session: typing.Optional[bool] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionYamlBlocksItem_WhileLoop(UniversalBaseModel):
+    block_type: typing.Literal["while_loop"] = "while_loop"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    loop_blocks: typing.List["WorkflowDefinitionYamlBlocksItem"]
+    condition: BranchCriteriaYaml
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
