@@ -65,6 +65,8 @@ If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.c
 
 Choose your preferred setup method:
 
+> **Database default**: As of skyvern 1.0.31+, `skyvern run server` defaults to a SQLite database at `~/.skyvern/data.db` so it works out of the box with no Postgres setup. To use Postgres instead, set `DATABASE_STRING` in `.env` or pass `--database-string` to `skyvern quickstart`. Docker Compose always uses the bundled Postgres service.
+
 ### Option A: pip install (Recommended)
 
 Dependencies needed:
@@ -89,17 +91,41 @@ skyvern quickstart
 
 ### Option B: Docker Compose
 
+Use this option if you want everything containerized (Postgres, API, UI) and don't want to install Python/Node locally.
+
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 2. Clone the repository:
    ```bash
    git clone https://github.com/skyvern-ai/skyvern.git && cd skyvern
    ```
-3. Run quickstart with Docker Compose:
+3. Configure your LLM provider in `.env` (the `quickstart --docker-compose` command below will create it from `.env.example` if missing):
    ```bash
-   pip install skyvern && skyvern quickstart
+   cp .env.example .env  # if not already created
+   # edit .env to add your LLM API key
    ```
-   When prompted, choose "Docker Compose" for the full containerized setup.
-4. Navigate to http://localhost:8080
+4. Start everything:
+   ```bash
+   docker compose up -d
+   ```
+5. Open http://localhost:8080
+
+### Troubleshooting
+
+**`(sqlite3.OperationalError) table organizations already exists`** — You hit a known bug in `pip install skyvern==1.0.31`. Fix:
+
+```bash
+rm ~/.skyvern/data.db   # remove the leftover SQLite file
+pip install --upgrade skyvern   # 1.0.32+ contains the fix
+skyvern quickstart
+```
+
+If you are still on 1.0.31 and cannot upgrade, install via uv instead:
+
+```bash
+uv pip install skyvern
+```
+
+**`pip install skyvern` fails with ResolutionImpossible (litellm / fastmcp)** — You hit a dependency-resolution conflict in 1.0.31. Either upgrade to 1.0.32+ or use uv: `uv pip install skyvern`.
 
 ## SDK
 

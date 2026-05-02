@@ -6,6 +6,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from skyvern.forge.sdk.copilot import agent as agent_module
+
 
 def _ctx(**overrides):
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -108,6 +110,21 @@ class TestFailedTestResponseNormalization:
         original = "Let me know what you want to build."
         assert _rewrite_failed_test_response(original, ctx) == original
 
+    def test_rewrite_appends_keep_draft_affordance_when_draft_on_hand(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=False,
+            last_test_failure_reason="A verification challenge is preventing submission.",
+        )
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "test failed" in rewritten.lower()
+        assert "keep the draft" in rewritten.lower()
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""
@@ -165,6 +182,8 @@ class TestShouldRestorePersistedWorkflow:
         r = MagicMock()
         r.workflow_was_persisted = persisted
         r.updated_workflow = updated_workflow
+        r.unvalidated = False
+        r.cancelled = False
         return r
 
     def test_restores_when_no_proposal_even_under_auto_accept(self) -> None:
@@ -214,8 +233,6 @@ class TestTranslateToAgentResultGating:
         # ctx.last_workflow=old_wf). The agent then emits inline REPLACE_WORKFLOW
         # with a different yaml. The translate helper must invalidate the prior
         # test result so _verified_workflow_or_none rejects the untested REPLACE.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         old_wf = SimpleNamespace(name="old")
         new_wf = SimpleNamespace(name="new-from-replace")
         monkeypatch.setattr(
@@ -247,8 +264,6 @@ class TestTranslateToAgentResultGating:
         # so a prior tested workflow remains available.
         import yaml as yaml_mod
 
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         tested_wf = SimpleNamespace(name="tested")
 
         def boom(**kwargs):
@@ -271,12 +286,10 @@ class TestTranslateToAgentResultGating:
         assert "validation error" in agent_result.user_response.lower()
 
     def test_ask_question_preserves_model_specific_question(self) -> None:
-        # The new prompt instructs the model to stop and ASK_QUESTION when it
-        # cannot test an edit. Row-3 of _rewrite_failed_test_response would
-        # clobber that specific unblocker with "Could you share more context";
-        # the resp_type==ASK_QUESTION guard must skip the rewrite.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
+        # The rewrite guard for ASK_QUESTION must hold: the agent's specific
+        # clarifying question is not clobbered by the generic "share more
+        # context" rewrite. SKY-9420 also drops any workflow under
+        # ASK_QUESTION so an auto-accept user can't silently apply a partial.
         ctx = _ctx(
             last_update_block_count=1,
             last_test_ok=None,
@@ -290,16 +303,11 @@ class TestTranslateToAgentResultGating:
         )
 
         assert agent_result.user_response == specific_question
-        # Even ASK_QUESTION must obey the strict gate — no verified workflow this turn.
         assert agent_result.updated_workflow is None
+        assert agent_result.unvalidated is False
         assert agent_result.response_type == "ASK_QUESTION"
 
     def test_reply_still_rewrites_after_failed_test(self) -> None:
-        # Guard rail for the above: a plain REPLY after a failed test must
-        # still flow through the "test failed" rewrite so we don't regress
-        # the original SKY-9143 behavior.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=False,
@@ -314,6 +322,161 @@ class TestTranslateToAgentResultGating:
         assert "test failed" in agent_result.user_response.lower()
         assert "All done" not in agent_result.user_response
         assert agent_result.updated_workflow is None
+        assert agent_result.unvalidated is False
+
+    def test_reply_after_failed_test_surfaces_unvalidated_wip_when_draft_on_hand(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=4,
+            last_test_ok=False,
+            last_test_failure_reason="A verification challenge is preventing submission.",
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+        assert "test failed" in agent_result.user_response.lower()
+        assert "keep the draft" in agent_result.user_response.lower()
+
+    def test_reply_after_suspicious_success_surfaces_unvalidated_wip(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is True
+
+    def test_goal_reached_false_flips_validated_proposal_to_unvalidated(self) -> None:
+        # Agent-emitted goal_reached=False must override last_test_ok=True so
+        # a draft the agent itself flagged as incomplete cannot auto-promote.
+        wf = SimpleNamespace(name="drafted-but-incomplete")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=8,
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "Cookie modal is blocking the form; the workflow needs to dismiss it first.",
+                "goal_reached": False,
+            }
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+
+    def test_goal_reached_default_true_keeps_verified_path(self) -> None:
+        # Backwards-compat: stale prompts that omit goal_reached must continue
+        # to surface a tested workflow as validated.
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=3,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is False
+
+    def test_goal_reached_true_explicit_keeps_verified_path(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=3,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is False
+
+    def test_goal_reached_string_false_is_coerced(self) -> None:
+        # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
+        # the gate the same as Python ``False``.
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_update_block_count=2,
+        )
+        result = _fake_run_result(
+            {"type": "REPLY", "user_response": "Cookie modal blocked the form.", "goal_reached": "false"}
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is True
+
+    def test_goal_reached_false_without_last_workflow_returns_no_proposal(self) -> None:
+        # The unvalidated WIP fallback only fires when ``ctx.last_workflow``
+        # exists. Self-reported failure on an empty context must not synthesize
+        # a proposal out of thin air.
+        ctx = _ctx(last_test_ok=None)
+        result = _fake_run_result(
+            {"type": "REPLY", "user_response": "I couldn't find the form.", "goal_reached": False}
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+        assert agent_result.unvalidated is False
+
+    def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
+        # Failed-test path already routes to unvalidated WIP. A redundant
+        # ``goal_reached: false`` from the agent must not change the outcome
+        # (no double-effect, no regression of the existing failed-test rewrite).
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=False,
+            last_test_failure_reason="A verification challenge is preventing submission.",
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Tried but blocked.", "goal_reached": False})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.unvalidated is True
+        assert "test failed" in agent_result.user_response.lower()
+        assert "keep the draft" in agent_result.user_response.lower()
 
     def test_inline_replace_workflow_wraps_block_goals_with_user_message(self, monkeypatch) -> None:
         # SKY-9174 parity: update_and_run_blocks_tool wraps block goals with
@@ -321,8 +484,6 @@ class TestTranslateToAgentResultGating:
         # inline path must do the same, otherwise the untested yaml latches
         # onto ctx without user-intent framing and any downstream block run
         # hits the verifier-on-confirmation-surface bug this PR fixes.
-        from skyvern.forge.sdk.copilot import agent as agent_module
-
         captured: dict[str, str] = {}
 
         def fake_process(**kwargs):
@@ -345,6 +506,48 @@ class TestTranslateToAgentResultGating:
 
         assert captured["yaml"] == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
         assert ctx.last_workflow_yaml == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+
+    def test_ask_question_with_verified_workflow_suppresses_and_clears(self) -> None:
+        # A verified-but-non-terminal workflow built this turn must not surface
+        # alongside the question; the clear flag also nulls any stale prior ghost.
+        verified_wf = SimpleNamespace(name="verified-partial")
+        ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="verified: yaml", last_test_ok=True)
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Need credentials before I can continue."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.clear_proposed_workflow is True
+
+    def test_ask_question_without_workflow_still_sets_clear_flag(self) -> None:
+        # An ASK_QUESTION turn with no draft this turn must still null any
+        # prior persisted proposal so reload stays coherent.
+        ctx = _ctx()
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which site?"})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is None
+        assert agent_result.clear_proposed_workflow is True
+
+    def test_reply_does_not_set_clear_proposed_flag(self) -> None:
+        # Differential: a REPLY turn surfaces the verified workflow and leaves
+        # any prior persisted proposal untouched.
+        verified_wf = SimpleNamespace(name="final")
+        ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="final: yaml", last_test_ok=True)
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here you go."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is verified_wf
+        assert agent_result.workflow_yaml == "final: yaml"
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.clear_proposed_workflow is False
 
 
 class TestCredentialRefusalReachesAgent:

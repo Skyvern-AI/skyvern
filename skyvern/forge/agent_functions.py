@@ -854,9 +854,7 @@ class AgentFunction:
 
                 element_cnt += 1
                 if element_cnt == MAX_ELEMENT_CNT:
-                    LOG.warning(
-                        f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element."
-                    )
+                    LOG.debug(f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element.")
                 disable_conversion = element_cnt > MAX_ELEMENT_CNT
                 if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None or not settings.ENABLE_CSS_SVG_PARSING:
                     disable_conversion = True

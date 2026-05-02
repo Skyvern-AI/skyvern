@@ -25,7 +25,7 @@ from skyvern.constants import (
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
-from skyvern.errors.errors import TOTPExpiredError
+from skyvern.errors.errors import TOTPExpiredError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -632,30 +632,10 @@ class ActionHandler:
             action_type=action.action_type,
             action_id=action.action_id,
             status=action.status,
-            source_action_id=action.source_action_id,
             step_order=action.step_order,
             action_order=action.action_order,
-            confidence_float=action.confidence_float,
-            description=action.description,
-            reasoning=action.reasoning,
-            intention=action.intention,
-            response=action.response,
             element_id=action.element_id,
             errors=action.errors,
-            file_name=action.file_name,
-            file_url=action.file_url,
-            download=action.download,
-            download_triggered=action.download_triggered,
-            is_upload_file_tag=action.is_upload_file_tag,
-            text=action.text,
-            input_or_select_context=action.input_or_select_context,
-            option=action.option,
-            is_checked=action.is_checked,
-            verified=action.verified,
-            click_context=action.click_context,
-            totp_timing_info=action.totp_timing_info,
-            has_mini_agent=action.has_mini_agent,
-            skip_auto_complete_tab=action.skip_auto_complete_tab,
         )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
@@ -4938,4 +4918,14 @@ async def extract_user_defined_errors(
         step=step,
         prompt_name="surface-user-defined-errors",
     )
-    return [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    parsed = [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    kept, dropped = filter_to_user_defined_codes(parsed, task.error_code_mapping)
+    if dropped:
+        LOG.warning(
+            "Dropped LLM-returned error codes not in user error_code_mapping",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            dropped_codes=dropped,
+            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+        )
+    return kept

@@ -11,7 +11,7 @@ Covers:
   the same source of truth on cancel as it does on success).
 - The route's success-path branch on ``agent_result.cancelled`` runs the
   cancel-specific persistence (rollback + user msg + ``Cancelled by user.``
-  AI msg + ERROR frame) and skips the normal RESPONSE finalisation.
+  AI msg + RESPONSE frame) and skips proposal persistence when there is no WIP.
 - ``/workflow/copilot/cancel`` returns 503 when the Redis cache is absent and
   204 + the expected key/TTL when it is present.
 - An operational cancel (``task.cancel()`` without ``user_cancel_observed[0]``
@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
     _copilot_cancel_key,
+    _persist_cancel_turn,
     _watch_for_cancel,
     workflow_copilot_cancel,
     workflow_copilot_chat_post,
@@ -228,38 +229,34 @@ def _setup_route_mocks(
     return restore_mock, workflow_params
 
 
-@pytest.mark.asyncio
-async def test_route_cancel_branch_persists_user_and_cancelled_messages(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``agent_result.cancelled=True`` -> rollback + USER msg + ``Cancelled by user.`` AI msg + ERROR frame."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
-
-    chat = SimpleNamespace(
+def _make_chat(*, proposed_workflow: Any = None, auto_accept: bool) -> SimpleNamespace:
+    return SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
         workflow_permanent_id="wpid-1",
         organization_id="org-1",
-        proposed_workflow=None,
-        auto_accept=False,
+        proposed_workflow=proposed_workflow,
+        auto_accept=auto_accept,
     )
-    original_workflow = SimpleNamespace(
+
+
+def _make_original_workflow() -> SimpleNamespace:
+    return SimpleNamespace(
         workflow_id="wf-canonical",
         title="Original",
         description="Original description",
         workflow_definition=None,
     )
-    agent_result = SimpleNamespace(
-        user_response="Cancelled by user.",
-        updated_workflow=None,
-        global_llm_context=None,
-        workflow_yaml=None,
-        workflow_was_persisted=True,
-        clear_proposed_workflow=False,
-        cancelled=True,
-        total_tokens=None,
-        response_type="REPLY",
-    )
+
+
+async def _drive_cancel_route(
+    monkeypatch: pytest.MonkeyPatch,
+    chat: SimpleNamespace,
+    original_workflow: SimpleNamespace,
+    agent_result: SimpleNamespace,
+) -> tuple[AsyncMock, SimpleNamespace, list[Any]]:
+    """Run a single chat-post + handler turn and return (restore_mock, workflow_params, sent_payloads)."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = _install_fake_create(monkeypatch)
     restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
@@ -282,8 +279,34 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
     handler = captured["handler"]
     assert callable(handler)
     await handler(stream)
+    # Cancel turn always emits exactly two chat rows: the user prompt and the
+    # AI cancellation reply. Guard against a future regression that double-inserts.
+    assert workflow_params.create_workflow_copilot_chat_message.await_count == 2
+    return restore_mock, workflow_params, sent_payloads
 
-    # Rollback fired (workflow_was_persisted=True, auto_accept=False, no proposal).
+
+@pytest.mark.asyncio
+async def test_route_cancel_branch_persists_user_and_cancelled_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``agent_result.cancelled=True`` with no WIP -> rollback + cancellation RESPONSE."""
+    chat = _make_chat(auto_accept=False)
+    original_workflow = _make_original_workflow()
+    agent_result = SimpleNamespace(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+    )
+    restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result
+    )
+
     restore_mock.assert_awaited_once()
 
     # Two chat-message inserts: user msg + Cancelled by user. AI msg.
@@ -295,14 +318,210 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
     assert "please update" in contents
     assert "Cancelled by user." in contents
 
-    # Normal RESPONSE finalisation did NOT run: no proposed_workflow update,
-    # no RESPONSE frame.
+    # No proposed_workflow update when the cancelled result has no WIP.
     workflow_params.update_workflow_copilot_chat.assert_not_awaited()
-    response_types = [getattr(p, "type", None) for p in sent_payloads]
-    assert WorkflowCopilotStreamMessageType.RESPONSE not in response_types
-    # An ERROR frame carrying "Cancelled by user." was emitted.
+    response_frames = [
+        p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].message == "Cancelled by user."
+    assert response_frames[0].updated_workflow is None
+    assert response_frames[0].cancelled is True
+
     error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
-    assert any(getattr(f, "error", "") == "Cancelled by user." for f in error_frames)
+    assert error_frames == []
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_branch_persists_wip_proposal_and_response_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelled WIP -> proposed_workflow + normal RESPONSE so Review/Accept/Reject can render."""
+    chat = _make_chat(auto_accept=True)
+    original_workflow = _make_original_workflow()
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Draft"}
+    agent_result = SimpleNamespace(
+        user_response="Cancelled. I have a draft workflow you can keep.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml="title: Draft",
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=123,
+        response_type="REPLY",
+        unvalidated=True,
+    )
+    restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result
+    )
+
+    restore_mock.assert_awaited_once()
+
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    proposed_workflow = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposed_workflow == {
+        "workflow_id": "wf-canonical",
+        "title": "Draft",
+        "_copilot_yaml": "title: Draft",
+        "_copilot_unvalidated": True,
+    }
+
+    insert_calls = workflow_params.create_workflow_copilot_chat_message.await_args_list
+    contents = [c.kwargs.get("content") for c in insert_calls]
+    assert "please update" in contents
+    assert "Cancelled. I have a draft workflow you can keep." in contents
+
+    response_frames = [
+        p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
+    ]
+    assert len(response_frames) == 1
+    frame = response_frames[0]
+    assert frame.message == "Cancelled. I have a draft workflow you can keep."
+    assert frame.updated_workflow == {"workflow_id": "wf-canonical", "title": "Draft"}
+    assert frame.unvalidated is True
+    assert frame.cancelled is True
+
+    error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
+    assert error_frames == []
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_tested_wip_with_auto_accept_still_persists_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel + tested WIP + auto_accept=True must not auto-apply: cancel always forces review."""
+    chat = _make_chat(auto_accept=True)
+    original_workflow = _make_original_workflow()
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Tested Draft"}
+    agent_result = SimpleNamespace(
+        user_response="Cancelled. I have a tested draft for you. Accept it to save, or discard.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml="title: Tested Draft",
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=123,
+        response_type="REPLY",
+        unvalidated=False,
+    )
+    restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result
+    )
+
+    restore_mock.assert_awaited_once()
+
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    proposed_workflow = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposed_workflow == {
+        "workflow_id": "wf-canonical",
+        "title": "Tested Draft",
+        "_copilot_yaml": "title: Tested Draft",
+    }
+
+    response_frames = [
+        p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].unvalidated is False
+    assert response_frames[0].cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel with no WIP + chat already has stale proposed_workflow -> clear-stale branch nulls it."""
+    chat = _make_chat(
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    original_workflow = _make_original_workflow()
+    agent_result = SimpleNamespace(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        unvalidated=False,
+    )
+    restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
+
+    restore_mock.assert_awaited_once()
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip_and_no_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel + no WIP + workflow_was_persisted=False still clears any stale proposal."""
+    chat = _make_chat(
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    original_workflow = _make_original_workflow()
+    agent_result = SimpleNamespace(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        unvalidated=False,
+    )
+    restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
+
+    restore_mock.assert_not_awaited()
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
+    """Pre-agent cancel (agent_result=None) must clear any stale proposal.
+
+    Without this, reload reattaches the old card to the new "Cancelled by user." message.
+    """
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="please update",
+        agent_result=None,
+    )
+
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
 
 
 # ---------------------------------------------------------------------------

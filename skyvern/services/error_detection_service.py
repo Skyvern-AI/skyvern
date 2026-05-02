@@ -13,7 +13,7 @@ from datetime import datetime
 import structlog
 from playwright.async_api import Page
 
-from skyvern.errors.errors import UserDefinedError
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
@@ -237,6 +237,16 @@ async def _detect_errors_from_context(
                     error_dict=error_dict,
                     exc_info=True,
                 )
+
+        user_defined_errors, dropped = filter_to_user_defined_codes(user_defined_errors, task.error_code_mapping)
+        if dropped:
+            LOG.warning(
+                "Dropped LLM-returned error codes not in user error_code_mapping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                dropped_codes=dropped,
+                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            )
 
         LOG.info(
             "Detected user-defined errors from context",

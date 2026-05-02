@@ -1,4 +1,5 @@
 import {
+  WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotToolCallUpdate,
   WorkflowCopilotToolResultUpdate,
 } from "./workflowCopilotTypes";
@@ -123,4 +124,60 @@ export function applyToolResult(
     }
     return item;
   });
+}
+
+// Same status taxonomy as the backend BlockStatus enum.
+const BLOCK_FAILED_STATUSES = new Set([
+  "failed",
+  "terminated",
+  "timed_out",
+  "canceled",
+]);
+const BLOCK_COMPLETED_STATUSES = new Set(["completed", "skipped"]);
+
+function blockStatusToActivityStatus(
+  status: string,
+): "running" | "success" | "error" | null {
+  if (status === "running") return "running";
+  if (BLOCK_COMPLETED_STATUSES.has(status)) return "success";
+  if (BLOCK_FAILED_STATUSES.has(status)) return "error";
+  return null;
+}
+
+// Per-block lifecycle update from inside long-running tool calls. Keyed by
+// `workflow_run_block_id` so duplicate labels in the same run never collide.
+export function applyBlockProgress(
+  prev: ToolActivity[],
+  payload: WorkflowCopilotBlockProgressUpdate,
+): ToolActivity[] {
+  const nextStatus = blockStatusToActivityStatus(payload.status);
+  if (nextStatus === null) return prev;
+
+  const tool_call_id = `block:${payload.workflow_run_block_id}`;
+  const tool_name = `Block ${payload.block_label}`;
+  const summary = payload.status;
+
+  const idx = prev.findIndex((item) => item.tool_call_id === tool_call_id);
+  if (idx === -1) {
+    return [
+      ...prev,
+      {
+        tool_name,
+        tool_call_id,
+        status: nextStatus,
+        summary,
+      },
+    ];
+  }
+
+  return prev.map((item, i) =>
+    i === idx
+      ? {
+          ...item,
+          tool_name,
+          status: nextStatus,
+          summary,
+        }
+      : item,
+  );
 }

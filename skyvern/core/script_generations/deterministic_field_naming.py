@@ -37,6 +37,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.webeye.actions.actions import ActionType
 
 CUSTOM_FIELD_ACTIONS: tuple[ActionType, ...] = (
@@ -51,9 +52,8 @@ class FieldPick:
     """Result of picking a field strategy for a single action.
 
     `rule` is the rule that fired: "jinja_ref" | "upstream_schema" |
-    "intention_derived". The caller can use this to emit telemetry on
-    rule-distribution and to branch in Phase 2 (e.g. Rule 3 becomes
-    inline-literal vs ai-proactive instead of synthesis).
+    "intention_derived" | "existing_assignment". The caller can use this to
+    emit telemetry on rule-distribution.
     """
 
     field_name: str
@@ -61,9 +61,56 @@ class FieldPick:
     description: str | None = None
 
 
-# `{{ name }}` or `{{ name.attr }}` or `{{ name | filter }}` — we only
-# care about the root identifier.
+# `{{ name }}` or `{{ name.attr }}` or `{{ name | filter }}` — root identifier only.
 _JINJA_ROOT_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\b")
+
+# `{{ root.sub }}` — captures both the root and one level of attribute,
+# used to detect dotted references like `{{credentials.username}}` for
+# nested-subscript emission. `\s*` around the dot tolerates the whitespace
+# Jinja allows in attribute access (e.g. `{{ credentials . username }}`).
+_JINJA_DOTTED_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b")
+
+# `placeholder_<random>_<subkey>` — extracts the trailing sub-key from a
+# substitution token recorded in action.text. The random part is fixed-width
+# (4 chars) per `WorkflowRunContext.generate_random_secret_id`, but using a
+# permissive `[A-Za-z0-9]+` keeps the parser tolerant of future format tweaks.
+_PLACEHOLDER_TOKEN_RE = re.compile(rf"^{re.escape(RANDOM_SECRET_ID_PREFIX)}[A-Za-z0-9]+_(.+)$")
+
+# Canonical sub-keys we will emit in `context.parameters[<root>][<sub>]`.
+# TOTP excluded: it has dedicated emission paths (get_totp_digit,
+# totp_identifier) and racing with sequence annotation is out of scope.
+KNOWN_CREDENTIAL_SUBKEYS: frozenset[str] = frozenset({"username", "password"})
+
+# Sub-key name variants → canonical key. Anything outside KNOWN_CREDENTIAL_SUBKEYS
+# and this map is treated as unsupported — emitting it would KeyError at runtime.
+_CREDENTIAL_SUBKEY_ALIASES: dict[str, str] = {
+    "email": "username",
+    "email_address": "username",
+    "user": "username",
+    "login": "username",
+    "user_name": "username",
+    "pass": "password",
+    "passwd": "password",
+}
+
+# Intention keywords that map to canonical credential sub-keys.
+_USERNAME_KEYWORDS: tuple[str, ...] = ("username", "email", "login", "user id", "userid")
+_PASSWORD_KEYWORDS: tuple[str, ...] = ("password", "passcode", "passphrase")
+
+# TOTP-flavored intentions must NOT route to credential subscript — substring
+# matches like "one-time password" would otherwise hit `_PASSWORD_KEYWORDS`
+# and emit a nested subscript that bypasses get_totp_digit / totp_identifier.
+_TOTP_INTENTION_DENYLIST: tuple[str, ...] = (
+    "verification code",
+    "one-time",
+    "one time",
+    "otp",
+    "2fa",
+    "two-factor",
+    "totp",
+    "mfa code",
+    "auth code",
+)
 
 # Sanitize an intention string down to a valid snake_case identifier.
 _NON_IDENT = re.compile(r"[^a-z0-9_]+")
@@ -102,6 +149,66 @@ def extract_jinja_root_names(template: str) -> set[str]:
     if not template:
         return set()
     return set(_JINJA_ROOT_RE.findall(template))
+
+
+def extract_jinja_dotted_pairs(template: str) -> set[tuple[str, str]]:
+    """Return `(root, sub)` pairs from dotted `{{root.sub}}` Jinja references.
+
+    Example:
+        >>> extract_jinja_dotted_pairs("Email: {{credentials.email}}")
+        {("credentials", "email")}
+    """
+    if not template:
+        return set()
+    return set(_JINJA_DOTTED_RE.findall(template))
+
+
+def normalize_credential_subkey(raw: str) -> str | None:
+    """Translate a sub-key name to its canonical credential dict key, or
+    None if the raw name doesn't map to anything in the runtime dict."""
+    raw_lower = raw.lower()
+    if raw_lower in KNOWN_CREDENTIAL_SUBKEYS:
+        return raw_lower
+    return _CREDENTIAL_SUBKEY_ALIASES.get(raw_lower)
+
+
+def _infer_credential_subkey_from_action(action: dict[str, Any]) -> str | None:
+    """Identify which credential sub-field an action targets.
+
+    Primary structural signal: a placeholder token of the form
+    ``placeholder_<random>_<subkey>`` in the recorded action text (built in
+    ``WorkflowRunContext.register_credential_parameter_value``). The sub-key
+    is extracted by stripping the prefix and validated against
+    ``KNOWN_CREDENTIAL_SUBKEYS`` so a future credential schema with a key
+    like ``backup_username`` wouldn't be silently routed to ``username``.
+
+    Fallback: intention keywords, used when the recorded text isn't a
+    placeholder token (rare — empty text or post-redaction). The TOTP
+    denylist short-circuits before the password-keyword match.
+    """
+    text = action.get("text") or ""
+    if text.startswith(RANDOM_SECRET_ID_PREFIX):
+        match = _PLACEHOLDER_TOKEN_RE.match(text)
+        if match:
+            subkey = match.group(1)
+            if subkey in KNOWN_CREDENTIAL_SUBKEYS:
+                return subkey
+            # Token matched but sub-key isn't canonical (e.g. totp). Return None
+            # rather than falling through to intention guessing — the placeholder
+            # is authoritative, and an intention like "enter passcode" would
+            # otherwise route the user's password into the OTP field.
+            return None
+
+    intention = (action.get("intention") or "").lower()
+    if not intention:
+        return None
+    if any(kw in intention for kw in _TOTP_INTENTION_DENYLIST):
+        return None
+    if any(kw in intention for kw in _PASSWORD_KEYWORDS):
+        return "password"
+    if any(kw in intention for kw in _USERNAME_KEYWORDS):
+        return "username"
+    return None
 
 
 def pick_field_name_for_action(
@@ -227,3 +334,36 @@ def pick_field_names_for_actions(
             picks[key] = pick
 
     return picks
+
+
+def infer_credential_subscript_for_emit(
+    *,
+    action: dict[str, Any],
+    goal_template: str,
+    block_type: str | None,
+    credential_param_keys: frozenset[str],
+) -> tuple[str, str] | None:
+    """Return `(root, sub)` if a login-block fill should emit nested
+    `context.parameters[<root>][<sub>]`, else None. Multi-credential
+    workflows are disambiguated by `{{<root>.<sub>}}` in the goal template."""
+    if block_type != "login" or not credential_param_keys:
+        return None
+
+    inferred_sub = _infer_credential_subkey_from_action(action)
+    if inferred_sub is None:
+        return None
+
+    matching_roots_from_jinja = {
+        root
+        for root, sub in extract_jinja_dotted_pairs(goal_template)
+        if root in credential_param_keys and normalize_credential_subkey(sub) == inferred_sub
+    }
+    if len(matching_roots_from_jinja) == 1:
+        return (next(iter(matching_roots_from_jinja)), inferred_sub)
+    if len(matching_roots_from_jinja) > 1:
+        return None
+
+    if len(credential_param_keys) == 1:
+        return (next(iter(credential_param_keys)), inferred_sub)
+
+    return None

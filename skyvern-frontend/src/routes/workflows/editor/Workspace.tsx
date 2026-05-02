@@ -288,6 +288,9 @@ function Workspace({
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
+  const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
+    string | null
+  >(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
   const [windowResizeTrigger, setWindowResizeTrigger] = useState(0);
@@ -568,6 +571,22 @@ function Workspace({
 
   const showBreakoutButton =
     activeDebugSession && activeDebugSession.browser_session_id;
+  const liveBrowserSessionId = activeDebugSession?.browser_session_id ?? null;
+  const copilotRequiresLiveBrowser =
+    showBrowser && shouldFetchDebugSession && !isRateLimited;
+  // readyBrowserSessionId is keyed to the browser session id rather than a
+  // bare boolean: when activeDebugSession's id changes, stale ready state
+  // from the previous session cannot leak into the next render.
+  const copilotLiveBrowserReady = Boolean(
+    readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
+  );
+
+  const handleLiveBrowserReadyChange = useCallback(
+    (ready: boolean, sessionId: string | null) => {
+      setReadyBrowserSessionId(ready ? sessionId : null);
+    },
+    [],
+  );
 
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
@@ -1831,6 +1850,7 @@ function Workspace({
                           showControlButtons={true}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={!!workflowRun && !isFinalized}
+                          onReadyChange={handleLiveBrowserReadyChange}
                         />
                       </div>
                     )}
@@ -1882,6 +1902,7 @@ function Workspace({
                           }
                           interactive={true}
                           showControlButtons={true}
+                          onReadyChange={handleLiveBrowserReadyChange}
                         />
                       </div>
                       <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
@@ -2033,7 +2054,11 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
-        liveBrowserSessionId={activeDebugSession?.browser_session_id ?? null}
+        liveBrowserSessionId={
+          copilotLiveBrowserReady ? liveBrowserSessionId : null
+        }
+        requiresLiveBrowser={copilotRequiresLiveBrowser}
+        isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onReviewWorkflow={async (pendingWorkflow, clearPending) => {

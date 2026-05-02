@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.copilot.output_utils import (
+    format_tool_result_for_user,
     parse_final_response,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
@@ -401,6 +402,211 @@ class TestSummarizeToolResult:
             {"ok": True, "data": {}},
         )
         assert summary == "Screenshot taken"
+
+
+class TestFormatToolResultForUser:
+    @staticmethod
+    def _format(tool_name: str, result: dict) -> str:
+        return format_tool_result_for_user(tool_name, result)
+
+    def test_loop_detected_failure_drops_use_a_different_tool_tail(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "LOOP DETECTED: 'click' has been called 3 times consecutively. "
+                    "This tool will not run again. Use a DIFFERENT tool to continue."
+                ),
+            },
+        )
+        assert summary == "The agent got stuck retrying the same step — moving on."
+        assert "DIFFERENT tool" not in summary
+        assert "click" not in summary
+
+    def test_jinja_template_failure_translates_to_parameter_phrasing(self) -> None:
+        summary = self._format(
+            "update_and_run_blocks",
+            {
+                "ok": False,
+                "error": (
+                    "navigation block failed. failure reason: Failed to format jinja "
+                    "template: Failed to format Jinja style parameter 'AchievementType'."
+                ),
+            },
+        )
+        assert summary == "A workflow parameter could not be filled in."
+        assert "AchievementType" not in summary
+        assert "Jinja" not in summary
+
+    def test_jinja_style_parameter_marker_alone_is_enough(self) -> None:
+        summary = self._format(
+            "update_and_run_blocks",
+            {"ok": False, "error": "Jinja style parameter 'foo' could not be resolved"},
+        )
+        assert summary == "A workflow parameter could not be filled in."
+
+    def test_invalid_selector_failure_replaces_engine_instruction_text(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "Invalid selector: 'div:contains(Submit)'. jQuery pseudo-selectors "
+                    "like :contains(), :eq(), :first, :visible are NOT valid CSS. "
+                    "Use standard CSS selectors instead."
+                ),
+            },
+        )
+        assert summary == "Couldn't complete that step."
+        assert "div:contains" not in summary
+        assert "jQuery" not in summary
+        assert "CSS" not in summary
+
+    def test_use_the_x_tool_failure_replaces_engine_instruction_text(self) -> None:
+        summary = self._format(
+            "evaluate",
+            {
+                "ok": False,
+                "error": "Do not use evaluate to click elements. Use the 'click' tool with a CSS selector instead.",
+            },
+        )
+        assert summary == "Couldn't complete that step."
+        assert "click" not in summary
+        assert "evaluate" not in summary
+
+    def test_use_the_tool_with_double_quotes_is_caught(self) -> None:
+        summary = self._format(
+            "click",
+            {"ok": False, "error": 'Do not click via JS. Use the "evaluate" tool instead.'},
+        )
+        assert summary == "Couldn't complete that step."
+
+    def test_use_the_tool_unquoted_is_caught(self) -> None:
+        summary = self._format(
+            "click",
+            {"ok": False, "error": "Use the click tool with a CSS selector."},
+        )
+        assert summary == "Couldn't complete that step."
+
+    def test_loop_detected_marker_in_middle_of_message_is_caught(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "Tool execution failed. LOOP DETECTED: 'click' has been called 3 times "
+                    "consecutively. This tool will not run again."
+                ),
+            },
+        )
+        assert summary == "The agent got stuck retrying the same step — moving on."
+
+    def test_playwright_locator_timeout_failure_replaces_selector_dump(self) -> None:
+        summary = self._format(
+            "click",
+            {
+                "ok": False,
+                "error": (
+                    "Locator.click: Timeout 30000ms exceeded. "
+                    'Call log: - waiting for locator("#btnSubmit").first - locator resolved to <input ...>'
+                ),
+            },
+        )
+        assert summary == "Couldn't complete that step."
+        assert "btnSubmit" not in summary
+        assert "Locator" not in summary
+        assert "Call log" not in summary
+
+    def test_unknown_error_sentinel_replaced_with_generic_phrasing(self) -> None:
+        summary = self._format(
+            "run_blocks_and_collect_debug",
+            {"ok": False, "data": {"blocks": []}},
+        )
+        assert summary == "Couldn't complete that step."
+        assert "Unknown error" not in summary
+        assert "Failed:" not in summary
+
+    def test_genuinely_user_relevant_failure_preserves_short_technical_token(self) -> None:
+        summary = self._format(
+            "navigate_browser",
+            {
+                "ok": False,
+                "error": (
+                    "Failed to navigate to url https://example.invalid. Error message: net::ERR_NAME_NOT_RESOLVED"
+                ),
+            },
+        )
+        assert summary.startswith("Failed:")
+        assert "ERR_NAME_NOT_RESOLVED" in summary
+
+    def test_click_success_returns_empty_summary(self) -> None:
+        summary = self._format(
+            "click",
+            {"ok": True, "data": {"selector": "input[name='ackStatus']"}},
+        )
+        assert summary == ""
+
+    def test_type_text_success_returns_empty_summary(self) -> None:
+        summary = self._format(
+            "type_text",
+            {"ok": True, "data": {"selector": "#last_name", "typed_length": 5}},
+        )
+        assert summary == ""
+
+    def test_evaluate_success_returns_empty_summary_dropping_shape_suffix(self) -> None:
+        summary = self._format(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "bodyText": "...",
+                        "rows": [],
+                        "tableText": "",
+                        "title": "Page",
+                        "url": "https://example.com/",
+                    },
+                },
+            },
+        )
+        assert summary == ""
+        assert "object with keys" not in summary
+
+    def test_select_option_success_returns_empty_summary(self) -> None:
+        summary = self._format(
+            "select_option",
+            {"ok": True, "data": {"value": "option-1"}},
+        )
+        assert summary == ""
+
+    def test_navigate_browser_success_falls_through_to_summarize(self) -> None:
+        summary = self._format(
+            "navigate_browser",
+            {"ok": True, "url": "https://example.com"},
+        )
+        assert summary == "Navigated to https://example.com"
+
+    def test_update_workflow_success_falls_through_to_summarize(self) -> None:
+        summary = self._format(
+            "update_workflow",
+            {"ok": True, "data": {"block_count": 3}},
+        )
+        assert "3" in summary
+
+    def test_press_key_success_falls_through_to_summarize(self) -> None:
+        summary = self._format(
+            "press_key",
+            {"ok": True, "data": {"key": "Enter"}},
+        )
+        assert summary == "Pressed 'Enter'"
+
+    def test_summarize_tool_result_unchanged_for_click_success(self) -> None:
+        agent_summary = summarize_tool_result(
+            "click",
+            {"ok": True, "data": {"selector": "#submit"}},
+        )
+        assert agent_summary == "Clicked '#submit'"
 
 
 class TestParseFinalResponse:

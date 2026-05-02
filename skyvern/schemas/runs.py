@@ -250,6 +250,12 @@ class GeoTarget(BaseModel):
 ProxyLocationInput = ProxyLocation | GeoTarget | dict | None
 
 
+def proxy_location_to_request(proxy_location: ProxyLocationInput) -> ProxyLocation | dict | None:
+    if isinstance(proxy_location, GeoTarget):
+        return proxy_location.model_dump()
+    return proxy_location
+
+
 def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     if proxy_location == ProxyLocation.NONE:
         return None

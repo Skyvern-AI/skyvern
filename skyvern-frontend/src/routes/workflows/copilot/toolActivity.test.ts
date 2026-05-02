@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { ToolActivity, applyToolCall, applyToolResult } from "./toolActivity";
 import {
+  ToolActivity,
+  applyBlockProgress,
+  applyToolCall,
+  applyToolResult,
+} from "./toolActivity";
+import {
+  WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotToolCallUpdate,
   WorkflowCopilotToolResultUpdate,
 } from "./workflowCopilotTypes";
@@ -333,5 +339,142 @@ describe("applyToolCall", () => {
       call({ tool_name: "evaluate", tool_call_id: "c2" }),
     );
     expect(next[0]!).toBe(prior);
+  });
+});
+
+const block = (
+  overrides: Partial<WorkflowCopilotBlockProgressUpdate> &
+    Pick<
+      WorkflowCopilotBlockProgressUpdate,
+      "workflow_run_block_id" | "status"
+    >,
+): WorkflowCopilotBlockProgressUpdate => ({
+  type: "block_progress",
+  block_label: `label_${overrides.workflow_run_block_id}`,
+  block_type: "navigation",
+  iteration: 0,
+  timestamp: "2026-04-30T07:00:00Z",
+  ...overrides,
+});
+
+describe("applyBlockProgress", () => {
+  it("appends a running entry on first sighting", () => {
+    const next = applyBlockProgress(
+      [],
+      block({
+        workflow_run_block_id: "wrb_1",
+        status: "running",
+        block_label: "step_navigate",
+      }),
+    );
+    expect(next).toHaveLength(1);
+    expect(next[0]!).toMatchObject({
+      tool_name: "Block step_navigate",
+      tool_call_id: "block:wrb_1",
+      status: "running",
+      summary: "running",
+    });
+  });
+
+  it("updates the same row by workflow_run_block_id when status changes", () => {
+    const prev = applyBlockProgress(
+      [],
+      block({
+        workflow_run_block_id: "wrb_1",
+        status: "running",
+        block_label: "step_navigate",
+      }),
+    );
+    const next = applyBlockProgress(
+      prev,
+      block({
+        workflow_run_block_id: "wrb_1",
+        status: "completed",
+        block_label: "step_navigate",
+      }),
+    );
+    expect(next).toHaveLength(1);
+    expect(next[0]!).toMatchObject({
+      tool_call_id: "block:wrb_1",
+      status: "success",
+      summary: "completed",
+    });
+  });
+
+  it("treats two blocks with the same label as separate rows when ids differ", () => {
+    let state: ToolActivity[] = [];
+    state = applyBlockProgress(
+      state,
+      block({
+        workflow_run_block_id: "wrb_1",
+        status: "running",
+        block_label: "iterate_url",
+      }),
+    );
+    state = applyBlockProgress(
+      state,
+      block({
+        workflow_run_block_id: "wrb_2",
+        status: "running",
+        block_label: "iterate_url",
+      }),
+    );
+    expect(state).toHaveLength(2);
+    expect(state[0]!.tool_call_id).toBe("block:wrb_1");
+    expect(state[1]!.tool_call_id).toBe("block:wrb_2");
+  });
+
+  it("maps failed/terminated/timed_out/canceled to error status", () => {
+    for (const status of [
+      "failed",
+      "terminated",
+      "timed_out",
+      "canceled",
+    ] as const) {
+      const next = applyBlockProgress(
+        [],
+        block({ workflow_run_block_id: `wrb_${status}`, status }),
+      );
+      expect(next[0]!.status).toBe("error");
+      expect(next[0]!.summary).toBe(status);
+    }
+  });
+
+  it("maps skipped to success status (benign-completed)", () => {
+    const next = applyBlockProgress(
+      [],
+      block({ workflow_run_block_id: "wrb_1", status: "skipped" }),
+    );
+    expect(next[0]!.status).toBe("success");
+  });
+
+  it("ignores unknown status values without mutating the list", () => {
+    const prev: ToolActivity[] = [
+      { tool_name: "x", tool_call_id: "x", status: "running" },
+    ];
+    const next = applyBlockProgress(
+      prev,
+      block({ workflow_run_block_id: "wrb_1", status: "weird_state" }),
+    );
+    expect(next).toBe(prev);
+  });
+
+  it("does not collide with regular tool_call rows that have different tool_call_ids", () => {
+    let state: ToolActivity[] = [];
+    state = applyToolCall(
+      state,
+      call({ tool_call_id: "c1", tool_name: "update_and_run_blocks" }),
+    );
+    state = applyBlockProgress(
+      state,
+      block({
+        workflow_run_block_id: "wrb_1",
+        status: "running",
+        block_label: "step_navigate",
+      }),
+    );
+    expect(state).toHaveLength(2);
+    expect(state[0]!.tool_call_id).toBe("c1");
+    expect(state[1]!.tool_call_id).toBe("block:wrb_1");
   });
 });

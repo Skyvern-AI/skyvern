@@ -407,6 +407,54 @@ class TestExecuteMaxIterationsCap:
 # ---------------------------------------------------------------------------
 
 
+class TestCurrentIndexWrittenBeforeCondition:
+    """Before each condition check, the WhileLoopBlock writes ``current_index`` to its
+    own block metadata so the existing for_loop injection in
+    ``format_block_parameter_template_from_workflow_run_context`` exposes it to the
+    condition's template scope. Authors can then bootstrap iteration 0 with
+    ``{{ current_index == 0 or <body_output_ref> }}``."""
+
+    @pytest.mark.asyncio
+    async def test_self_label_metadata_includes_current_index_zero_before_first_eval(self) -> None:
+        """Iteration 0's condition check sees ``current_index = 0`` written to the
+        WhileLoopBlock's own metadata BEFORE the eval lambda fires. Captured by
+        snapshotting ``update_block_metadata.call_args_list`` from inside the fake
+        evaluator and asserting the expected write happened first."""
+        loop_block = _make_while_loop()
+        mock_context = MagicMock()
+        mock_context.update_block_metadata = MagicMock()
+        prior_calls_at_first_eval: list[Any] = []
+
+        async def fake_eval(_self: Any, ctx: Any) -> bool:  # type: ignore[override]
+            if not prior_calls_at_first_eval:
+                prior_calls_at_first_eval.extend(ctx.update_block_metadata.call_args_list)
+            return False  # exit immediately after the first check
+
+        with (
+            patch.object(WhileLoopBlock, "_evaluate_condition", new=fake_eval),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+            await loop_block._execute_while_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=mock_context,
+                organization_id="org_test",
+            )
+
+        self_label_writes_before_eval = [
+            c
+            for c in prior_calls_at_first_eval
+            if c.args[0] == loop_block.label and c.args[1].get("current_index") == 0
+        ]
+        assert self_label_writes_before_eval, (
+            f"Expected current_index=0 written to self.label before first condition eval; "
+            f"got {prior_calls_at_first_eval}"
+        )
+
+
 class TestExecuteConditionRenderingErrors:
     @pytest.mark.asyncio
     async def test_failed_jinja_format_returns_failure_result(self) -> None:

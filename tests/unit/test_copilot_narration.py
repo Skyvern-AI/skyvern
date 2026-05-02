@@ -9,6 +9,7 @@ failure semantics -- the narrator must never be able to crash the agent run.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,8 @@ from skyvern.forge.sdk.copilot.narration import (
     _sanitize_narration,
     cancel_in_flight,
     detect_transitions,
+    narrator_poll_tick,
+    record_block_transitions,
     schedule_narration,
     should_emit,
     snapshot_ctx,
@@ -657,3 +660,549 @@ async def test_cancel_in_flight_returns_fast() -> None:
     await cancel_in_flight(state)
     elapsed = loop.time() - t0
     assert elapsed < 0.1, f"cancel_in_flight took {elapsed:.3f}s, expected <0.1s"
+
+
+# ---------------------------------------------------------------------------
+# record_block_transitions
+# ---------------------------------------------------------------------------
+
+
+def _snap(*entries: tuple[str, str]) -> list[tuple[str, str, str, str]]:
+    """Test helper: lift (block_id, status) pairs into the (id, label, type, status) shape narrator_poll_tick produces."""
+    return [(block_id, f"label_{block_id}", "navigation", status) for block_id, status in entries]
+
+
+def test_record_block_transitions_records_completed_on_running_to_completed() -> None:
+    state = NarratorState()
+    seen: dict[str, str] = {"b1": "running"}
+    events = record_block_transitions(state, _snap(("b1", "completed")), seen, iteration=3)
+    assert len(events) == 1
+    assert events[0].kind == TransitionKind.BLOCK_COMPLETED
+    assert events[0].block_label == "label_b1"
+    assert state.pending_transition == TransitionKind.BLOCK_COMPLETED
+    assert seen == {"b1": "completed"}
+
+
+def test_record_block_transitions_no_change_records_nothing() -> None:
+    state = NarratorState()
+    seen: dict[str, str] = {"b1": "running"}
+    events = record_block_transitions(state, _snap(("b1", "running")), seen, iteration=0)
+    assert events == []
+    assert state.pending_transition is None
+
+
+def test_record_block_transitions_failed_terminated_timed_out_canceled_all_map_to_block_failed() -> None:
+    for status in ("failed", "terminated", "timed_out", "canceled"):
+        state = NarratorState()
+        seen: dict[str, str] = {}
+        events = record_block_transitions(state, _snap(("b1", status)), seen, iteration=0)
+        assert len(events) == 1, f"status={status!r} should record"
+        assert events[0].kind == TransitionKind.BLOCK_FAILED, f"status={status!r}"
+        assert state.pending_transition == TransitionKind.BLOCK_FAILED, f"status={status!r}"
+
+
+def test_record_block_transitions_skipped_maps_to_block_completed() -> None:
+    state = NarratorState()
+    events = record_block_transitions(state, _snap(("b1", "skipped")), {}, iteration=0)
+    assert len(events) == 1
+    assert events[0].kind == TransitionKind.BLOCK_COMPLETED
+    assert state.pending_transition == TransitionKind.BLOCK_COMPLETED
+
+
+def test_record_block_transitions_running_records_block_started() -> None:
+    state = NarratorState()
+    events = record_block_transitions(state, _snap(("b1", "running")), {}, iteration=0)
+    assert len(events) == 1
+    assert events[0].kind == TransitionKind.BLOCK_STARTED
+    assert state.pending_transition == TransitionKind.BLOCK_STARTED
+
+
+def test_record_block_transitions_advances_seen_state_for_subsequent_calls() -> None:
+    state = NarratorState()
+    seen: dict[str, str] = {}
+    record_block_transitions(state, _snap(("b1", "running")), seen, iteration=0)
+    assert seen == {"b1": "running"}
+    state.pending_transition = None
+    events = record_block_transitions(state, _snap(("b1", "running")), seen, iteration=0)
+    assert events == []
+    assert state.pending_transition is None
+    record_block_transitions(state, _snap(("b1", "completed")), seen, iteration=0)
+    assert seen == {"b1": "completed"}
+    assert state.pending_transition == TransitionKind.BLOCK_COMPLETED
+
+
+def test_record_block_transitions_returns_empty_when_nothing_changed() -> None:
+    state = NarratorState()
+    seen = {"b1": "completed"}
+    assert record_block_transitions(state, _snap(("b1", "completed")), seen, iteration=0) == []
+
+
+def test_record_block_transitions_records_synthetic_activity_entry() -> None:
+    state = NarratorState()
+    record_block_transitions(state, _snap(("b1", "completed")), {}, iteration=4)
+    assert len(state.pending_activity) == 1
+    entry = state.pending_activity[0]
+    assert entry.tool_name == "block_completed"
+    assert entry.iteration == 4
+    assert entry.success is True
+
+
+def test_record_block_transitions_skips_blocks_with_empty_id() -> None:
+    state = NarratorState()
+    seen: dict[str, str] = {}
+    events = record_block_transitions(state, _snap(("", "completed")), seen, iteration=0)
+    assert events == []
+    assert seen == {}
+
+
+def test_record_block_transitions_skips_unknown_status() -> None:
+    state = NarratorState()
+    seen: dict[str, str] = {}
+    events = record_block_transitions(state, _snap(("b1", "weird_state")), seen, iteration=0)
+    assert events == []
+    # seen still advances so we don't keep retrying an unknown status
+    assert seen == {"b1": "weird_state"}
+
+
+# ---------------------------------------------------------------------------
+# Transition priority (block kinds)
+# ---------------------------------------------------------------------------
+
+
+def test_block_failed_priority_higher_than_block_completed() -> None:
+    state = NarratorState()
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    state.record_transition(TransitionKind.BLOCK_FAILED)
+    assert state.pending_transition == TransitionKind.BLOCK_FAILED
+
+
+def test_tool_in_progress_priority_above_tool_started_below_block_started() -> None:
+    state = NarratorState()
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.TOOL_IN_PROGRESS)
+    assert state.pending_transition == TransitionKind.TOOL_IN_PROGRESS
+
+    state2 = NarratorState()
+    state2.record_transition(TransitionKind.TOOL_IN_PROGRESS)
+    state2.record_transition(TransitionKind.BLOCK_STARTED)
+    assert state2.pending_transition == TransitionKind.BLOCK_STARTED
+
+
+# ---------------------------------------------------------------------------
+# should_emit attempt-bounded gate
+# ---------------------------------------------------------------------------
+
+
+def test_should_emit_blocked_within_attempt_window_after_failure() -> None:
+    # last_emitted_at is None (no successful delivery) but last_attempted_at
+    # was set when a doomed narrator task was launched. The gate must still
+    # block until MIN_NARRATION_GAP_SECONDS elapses, otherwise the polling
+    # loop would re-fire the doomed narrator every 5s tick.
+    state = NarratorState(
+        last_emitted_at=None,
+        last_attempted_at=100.0,
+        pending_transition=TransitionKind.BLOCK_COMPLETED,
+    )
+    assert should_emit(state, now=100.0 + 1.0) is False
+    assert should_emit(state, now=100.0 + MIN_NARRATION_GAP_SECONDS - 0.01) is False
+    assert should_emit(state, now=100.0 + MIN_NARRATION_GAP_SECONDS + 0.01) is True
+
+
+def test_should_emit_uses_max_of_emitted_and_attempted_clocks() -> None:
+    state = NarratorState(
+        last_emitted_at=200.0,
+        last_attempted_at=210.0,
+        pending_transition=TransitionKind.BLOCK_COMPLETED,
+    )
+    # Window measured from 210 (later attempt), not 200 (older success).
+    assert should_emit(state, now=210.0 + MIN_NARRATION_GAP_SECONDS - 0.5) is False
+    assert should_emit(state, now=210.0 + MIN_NARRATION_GAP_SECONDS + 0.5) is True
+
+
+# ---------------------------------------------------------------------------
+# narrator_poll_tick
+# ---------------------------------------------------------------------------
+
+
+class _StubBlock:
+    def __init__(self, block_id: str, status: str, label: str | None = None, block_type: str = "navigation") -> None:
+        self.workflow_run_block_id = block_id
+        self.status = status
+        self.label = label if label is not None else f"label_{block_id}"
+        self.block_type = block_type
+
+
+class _StubStream:
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    async def send(self, payload: Any) -> None:
+        self.sent.append(payload)
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+def _ts(seconds: float) -> Any:
+    """Cheap unique timestamp marker for the helper -- equality is all that matters."""
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    return _dt.fromtimestamp(seconds, tz=_tz.utc)
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_block_ts_change_triggers_fetch_and_records_transition() -> None:
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+    fetch_calls = 0
+
+    async def fetch() -> list[_StubBlock]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        # Repository returns DESC; helper reverses internally.
+        return [_StubBlock("b1", "completed"), _StubBlock("b0", "running")]
+
+    new_block_ts, new_step_ts, new_last_fetch = await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert fetch_calls == 1
+    assert seen == {"b0": "running", "b1": "completed"}
+    # Activity buffer captures one synthetic entry per state transition. The
+    # snapshot saw b0 (running) and b1 (completed), so two entries land.
+    tool_names = [entry.tool_name for entry in state.pending_activity]
+    assert "block_started" in tool_names
+    assert "block_completed" in tool_names
+    # schedule_narration was reached -- last_attempted_at advanced because
+    # the gate was open (no prior emission, no in-flight task).
+    assert state.last_attempted_at is not None
+    assert new_block_ts == _ts(2.0)
+    assert new_step_ts == _ts(1.0)
+    assert new_last_fetch > 0.0
+    # Drain the spawned narrator task so it doesn't outlive the test.
+    if state.in_flight_task is not None:
+        state.in_flight_task.cancel()
+        try:
+            await state.in_flight_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_step_ts_change_alone_records_tool_in_progress() -> None:
+    # Pre-populate last_attempted_at so the gate is closed and the
+    # TOOL_IN_PROGRESS transition stays in pending_transition for inspection
+    # rather than being drained by schedule_narration.
+    state = NarratorState(last_attempted_at=time.monotonic())
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+    fetch_calls = 0
+
+    async def fetch() -> list[_StubBlock]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return []
+
+    same_block_ts = _ts(1.0)
+    await narrator_poll_tick(
+        state,
+        current_block_ts=same_block_ts,
+        current_step_ts=_ts(2.0),
+        prior_block_ts=same_block_ts,
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert fetch_calls == 0  # block_ts didn't change
+    assert state.pending_transition == TransitionKind.TOOL_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_no_change_still_calls_schedule_narration() -> None:
+    """Pending transitions latched while the gate was closed must drain on
+    subsequent ticks even when no fresh block/step signal arrives."""
+    state = NarratorState(pending_transition=TransitionKind.BLOCK_COMPLETED)
+    stream = _StubStream()
+
+    async def fetch() -> list[_StubBlock]:
+        raise AssertionError("fetch should not be called when block_ts is unchanged")
+
+    same_ts = _ts(1.0)
+    await narrator_poll_tick(
+        state,
+        current_block_ts=same_ts,
+        current_step_ts=same_ts,
+        prior_block_ts=same_ts,
+        prior_step_ts=same_ts,
+        last_block_fetch_monotonic=0.0,
+        seen_block_states={},
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    # schedule_narration was invoked. With no in-flight task, no last_emitted
+    # clock, and a pending transition, it should have launched a task --
+    # detected by last_attempted_at advancing.
+    assert state.last_attempted_at is not None
+    assert state.in_flight_task is not None
+    state.in_flight_task.cancel()
+    try:
+        await state.in_flight_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_rate_limited_block_change_retries_on_next_tick() -> None:
+    """A block_ts change inside the rate-limit window must not advance
+    prior_block_ts -- the next tick must still see the diff."""
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+    fetch_calls = 0
+
+    async def fetch() -> list[_StubBlock]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return [_StubBlock("b1", "completed")]
+
+    fresh_now = time.monotonic()
+    next_block_ts, _, next_last_fetch = await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        # Last fetch a moment ago -- gate closed.
+        last_block_fetch_monotonic=fresh_now,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert fetch_calls == 0
+    # prior_block_ts must NOT have advanced -- the diff is still alive.
+    assert next_block_ts == _ts(1.0)
+    assert next_last_fetch == fresh_now
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_fetch_exception_retries_on_next_tick() -> None:
+    """A fetch raising must not advance prior_block_ts."""
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+    fetch_calls = 0
+
+    async def fetch() -> list[_StubBlock]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        raise RuntimeError("db transient failure")
+
+    next_block_ts, _, next_last_fetch = await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert fetch_calls == 1
+    # prior_block_ts unchanged (still 1.0) so the next tick retries.
+    assert next_block_ts == _ts(1.0)
+    # Rate-limit clock still advances so we don't hammer the DB on errors.
+    assert next_last_fetch > 0.0
+    # No transition recorded (snapshot unavailable, no step diff).
+    assert state.pending_transition is None
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_first_tick_with_zero_initial_fetch_marker_does_not_raise() -> None:
+    """`last_block_fetch_monotonic` is initialized to 0.0 (not None) so the
+    first tick can compute now - 0.0 without TypeError."""
+    state = NarratorState()
+    stream = _StubStream()
+
+    async def fetch() -> list[_StubBlock]:
+        return [_StubBlock("b1", "running")]
+
+    new_block_ts, new_step_ts, new_last_fetch = await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states={},
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert new_block_ts == _ts(2.0)
+    assert new_last_fetch > 0.0
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_uses_state_current_iteration_for_synthetic_entries() -> None:
+    state = NarratorState(current_iteration=7)
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+
+    async def fetch() -> list[_StubBlock]:
+        return [_StubBlock("b1", "completed")]
+
+    await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert state.pending_activity[-1].iteration == 7
+    # Drain the spawned narrator task so it doesn't outlive the test.
+    if state.in_flight_task is not None:
+        state.in_flight_task.cancel()
+        try:
+            await state.in_flight_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# narrator_poll_tick block_progress SSE emissions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_emits_block_progress_for_each_new_transition() -> None:
+    from skyvern.forge.sdk.schemas.workflow_copilot import (
+        WorkflowCopilotBlockProgressUpdate,
+        WorkflowCopilotStreamMessageType,
+    )
+
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+
+    async def fetch() -> list[_StubBlock]:
+        # DESC by created_at; helper reverses for chronological order.
+        return [
+            _StubBlock("b1", "completed", label="step_extract", block_type="extraction"),
+            _StubBlock("b0", "running", label="step_navigate", block_type="navigation"),
+        ]
+
+    await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    progress_payloads = [p for p in stream.sent if isinstance(p, WorkflowCopilotBlockProgressUpdate)]
+    assert len(progress_payloads) == 2
+    # Chronological order (running step_navigate first, completed step_extract second).
+    assert progress_payloads[0].block_label == "step_navigate"
+    assert progress_payloads[0].status == "running"
+    assert progress_payloads[0].block_type == "navigation"
+    assert progress_payloads[0].type == WorkflowCopilotStreamMessageType.BLOCK_PROGRESS
+    assert progress_payloads[0].workflow_run_block_id == "b0"
+    assert progress_payloads[1].block_label == "step_extract"
+    assert progress_payloads[1].status == "completed"
+    assert progress_payloads[1].block_type == "extraction"
+    assert progress_payloads[1].workflow_run_block_id == "b1"
+    # Drain the narrator task spawned by schedule_narration.
+    if state.in_flight_task is not None:
+        state.in_flight_task.cancel()
+        try:
+            await state.in_flight_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_does_not_emit_block_progress_for_unchanged_blocks() -> None:
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotBlockProgressUpdate
+
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {"b1": "completed"}
+
+    async def fetch() -> list[_StubBlock]:
+        return [_StubBlock("b1", "completed", label="step_extract", block_type="extraction")]
+
+    await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert [p for p in stream.sent if isinstance(p, WorkflowCopilotBlockProgressUpdate)] == []
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_skips_block_progress_when_label_blank() -> None:
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotBlockProgressUpdate
+
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+
+    async def fetch() -> list[_StubBlock]:
+        # Block with empty label -- nothing readable to show in the FE bullet.
+        return [_StubBlock("b1", "completed", label="", block_type="extraction")]
+
+    await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        current_step_ts=_ts(1.0),
+        prior_block_ts=_ts(1.0),
+        prior_step_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert [p for p in stream.sent if isinstance(p, WorkflowCopilotBlockProgressUpdate)] == []
+    # Internal state still updates (transition recorded for narrator) -- this only suppresses the FE bullet.
+    assert seen == {"b1": "completed"}
+    # Drain narrator task.
+    if state.in_flight_task is not None:
+        state.in_flight_task.cancel()
+        try:
+            await state.in_flight_task
+        except (asyncio.CancelledError, Exception):
+            pass

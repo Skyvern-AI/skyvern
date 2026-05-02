@@ -20,6 +20,7 @@ from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.config import settings
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS, SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION
+from skyvern.core.script_generations.deterministic_field_naming import infer_credential_subscript_for_emit
 from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
     generate_workflow_parameters_schema,
@@ -31,7 +32,10 @@ from skyvern.core.script_generations.parameter_reference_guard import (
     validate_context_parameter_refs,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.workflow.models.parameter import is_sensitive_workflow_parameter
+from skyvern.forge.sdk.workflow.models.parameter import (
+    WorkflowParameterType,
+    is_sensitive_workflow_parameter,
+)
 from skyvern.schemas.workflows import FileStorageType
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
@@ -109,6 +113,32 @@ def _collect_secret_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
             continue
         key = param.get("key")
         if key and is_sensitive_workflow_parameter(param):
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_credential_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Parameter keys typed `WorkflowParameterType.CREDENTIAL_ID`.
+
+    Narrower than `_collect_secret_param_keys`: only params whose runtime
+    value is a `{username, password, totp}` dict expanded by `setup()`.
+    """
+    target_enum = WorkflowParameterType.CREDENTIAL_ID
+    target_str = target_enum.value
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if not key:
+            continue
+        # Workflow definitions can carry the type as the enum object (when
+        # constructed live) or its string value (when round-tripped via JSON).
+        param_type = param.get("workflow_parameter_type")
+        if param_type == target_enum or param_type == target_str:
             keys.add(key)
     return frozenset(keys)
 
@@ -806,6 +836,9 @@ def _action_to_stmt(
     assign_to_output: bool = False,
     value_to_param: dict[str, str] | None = None,
     use_semantic_selectors: bool = False,
+    block_type: str | None = None,
+    goal_template: str = "",
+    credential_param_keys: frozenset[str] = frozenset(),
 ) -> cst.BaseStatement:
     """
     Turn one Action dict into:
@@ -819,6 +852,11 @@ def _action_to_stmt(
     When *value_to_param* is provided, click prompt strings that contain literal
     parameter values will be emitted as f-strings referencing
     ``context.parameters['field_name']`` instead of hardcoded text.
+
+    For ``page.fill``/``page.type`` inside a login block, credential fields are
+    detected via ``infer_credential_subscript_for_emit`` and emitted as nested
+    ``context.parameters[<root>][<sub>]``. Default args preserve existing
+    behavior at every call site that doesn't thread the credential context.
     """
     method = ACTION_MAP[act["action_type"]]
 
@@ -883,34 +921,52 @@ def _action_to_stmt(
                 )
             )
     elif method in ["type", "fill"]:
-        # Use context.parameters if field_name is available, otherwise fallback to direct value
-        if act.get("field_name"):
-            # Check if this is a multi-field TOTP sequence that needs digit indexing
-            totp_info = act.get("totp_timing_info") or {}
-            if totp_info.get("is_totp_sequence") and "action_index" in totp_info:
-                # Generate: await page.get_totp_digit(context, 'field_name', digit_index)
-                # This method properly resolves the TOTP code from credentials and returns the specific digit
-                text_value = cst.Await(
-                    expression=cst.Call(
-                        func=cst.Attribute(
-                            value=cst.Name("page"),
-                            attr=cst.Name("get_totp_digit"),
-                        ),
-                        args=[
-                            cst.Arg(value=cst.Name("context")),
-                            cst.Arg(value=_value(act["field_name"])),
-                            cst.Arg(value=_value(totp_info["action_index"])),
-                        ],
-                    )
+        # Dispatch: TOTP sequence → credential subscript → flat field_name → literal.
+        # Credential subscript intentionally precedes field_name — the picker has no
+        # concept of nested credentials and assigns a flat name even for credential
+        # fields, so the emitter overrides it when a credential pick fires.
+        totp_info = act.get("totp_timing_info") or {}
+        if act.get("field_name") and totp_info.get("is_totp_sequence") and "action_index" in totp_info:
+            text_value = cst.Await(
+                expression=cst.Call(
+                    func=cst.Attribute(
+                        value=cst.Name("page"),
+                        attr=cst.Name("get_totp_digit"),
+                    ),
+                    args=[
+                        cst.Arg(value=cst.Name("context")),
+                        cst.Arg(value=_value(act["field_name"])),
+                        cst.Arg(value=_value(totp_info["action_index"])),
+                    ],
                 )
-            else:
-                text_value = cst.Subscript(
+            )
+        elif (
+            cred_pick := infer_credential_subscript_for_emit(
+                action=act,
+                goal_template=goal_template,
+                block_type=block_type,
+                credential_param_keys=credential_param_keys,
+            )
+        ) is not None:
+            cred_root, cred_sub = cred_pick
+            text_value = cst.Subscript(
+                value=cst.Subscript(
                     value=cst.Attribute(
                         value=cst.Name("context"),
                         attr=cst.Name("parameters"),
                     ),
-                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
-                )
+                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(cred_root)))],
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(cred_sub)))],
+            )
+        elif act.get("field_name"):
+            text_value = cst.Subscript(
+                value=cst.Attribute(
+                    value=cst.Name("context"),
+                    attr=cst.Name("parameters"),
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+            )
         else:
             text_value = _value(act["text"])
 
@@ -1257,6 +1313,7 @@ def _build_block_fn(
     use_semantic_selectors: bool = False,
     is_in_for_loop: bool = False,
     all_blocks: list[dict[str, Any]] | None = None,
+    credential_param_keys: frozenset[str] = frozenset(),
 ) -> FunctionDef:
     # Check for platform-specific pipeline (cloud-only; returns None in OSS)
     if use_semantic_selectors:
@@ -1324,6 +1381,9 @@ def _build_block_fn(
                     assign_to_output=assign_to_output,
                     value_to_param=value_to_param,
                     use_semantic_selectors=use_semantic_selectors,
+                    block_type=block_type,
+                    goal_template=block.get("navigation_goal") or block.get("data_extraction_goal") or "",
+                    credential_param_keys=credential_param_keys,
                 )
             )
 
@@ -3011,6 +3071,7 @@ async def generate_workflow_script_python_code(
     declared_keys = _collect_declared_param_keys(workflow)
     upstream_keys = _collect_upstream_schema_keys(blocks)
     secret_param_keys = _collect_secret_param_keys(workflow)
+    credential_param_keys = _collect_credential_param_keys(workflow)
     goal_template_by_task = _collect_goal_templates(blocks)
     generated_schema, field_mappings = await generate_workflow_parameters_schema(
         actions_by_task,
@@ -3093,6 +3154,7 @@ async def generate_workflow_script_python_code(
                 value_to_param=value_to_param,
                 use_semantic_selectors=use_semantic_selectors,
                 all_blocks=task_v1_blocks,
+                credential_param_keys=credential_param_keys,
             )
             temp_module = cst.Module(body=[block_fn_def])
             block_code = temp_module.code
@@ -3169,6 +3231,7 @@ async def generate_workflow_script_python_code(
                         actions_by_task.get(child_block.get("task_id", ""), []),
                         value_to_param=value_to_param,
                         use_semantic_selectors=use_semantic_selectors,
+                        credential_param_keys=credential_param_keys,
                     )
                     task_v2_block_body.append(cst.EmptyLine())
                     task_v2_block_body.append(cst.EmptyLine())
@@ -3364,6 +3427,7 @@ async def generate_workflow_script_python_code(
                     value_to_param=value_to_param,
                     use_semantic_selectors=use_semantic_selectors,
                     is_in_for_loop=True,
+                    credential_param_keys=credential_param_keys,
                 )
                 inner_block_code = cst.Module(body=[inner_fn_def]).code
 

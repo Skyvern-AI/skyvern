@@ -18,16 +18,19 @@ import asyncio
 import re
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlparse
 
 import structlog
 
 from skyvern.forge import app
+from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotBlockProgressUpdate,
     WorkflowCopilotNarrationUpdate,
     WorkflowCopilotStreamMessageType,
 )
@@ -57,7 +60,11 @@ class TransitionKind(StrEnum):
     # Ordered by ascending priority: higher-priority transitions overwrite a
     # lower-priority pending one within the min-gap window.
     TOOL_STARTED = "tool_started"
+    TOOL_IN_PROGRESS = "tool_in_progress"
+    BLOCK_STARTED = "block_started"
+    BLOCK_COMPLETED = "block_completed"
     NEW_TOOL_CLUSTER = "new_tool_cluster"
+    BLOCK_FAILED = "block_failed"
     ENFORCEMENT_RETRY = "enforcement_retry"
     NAVIGATION_COMPLETED = "navigation_completed"
     TEST_COMPLETED = "test_completed"
@@ -83,6 +90,9 @@ class NarratorState:
     """Cadence + buffer state carried across stream_to_sse iterations."""
 
     last_emitted_at: float | None = None
+    # Advances on every narrator task launch (success or failure) so a flaky
+    # narrator path can't be re-fired every poll tick.
+    last_attempted_at: float | None = None
     pending_activity: deque[_ToolActivityEntry] = field(default_factory=lambda: deque(maxlen=MAX_TOOL_ACTIVITY_BUFFER))
     in_flight_task: asyncio.Task[None] | None = None
     pending_transition: TransitionKind | None = None
@@ -91,6 +101,10 @@ class NarratorState:
     # tool_output so post-tool transitions describe the finished action, not
     # the in-flight one.
     pending_tool_name: str | None = None
+    current_iteration: int = 0
+    # Narrator handler resolved once per stream so per-emission calls
+    # don't re-hit PostHog.
+    resolved_handler: Any = None
 
     def record_tool(
         self,
@@ -170,7 +184,8 @@ def should_emit(state: NarratorState, now: float) -> bool:
         return False
     if state.in_flight_task is not None and not state.in_flight_task.done():
         return False
-    if state.last_emitted_at is not None and (now - state.last_emitted_at) < MIN_NARRATION_GAP_SECONDS:
+    last_event = max(state.last_emitted_at or 0.0, state.last_attempted_at or 0.0)
+    if last_event > 0.0 and (now - last_event) < MIN_NARRATION_GAP_SECONDS:
         return False
     return True
 
@@ -189,11 +204,9 @@ def schedule_narration(
     transition = state.pending_transition
     assert transition is not None  # guaranteed by should_emit
     state.pending_transition = None
-    # last_emitted_at is advanced only after a narration is actually delivered
-    # (see _narration_task_body). Advancing here would silence the next 10s of
-    # valid transitions when a narration fails, times out, or is leak-dropped
-    # -- a bad trade since the in_flight_task slot already prevents concurrent
-    # emissions during the LLM call.
+    # Bound failure-path retries to the same gap window successes use; without
+    # this, a flaky narrator re-fires every poll tick.
+    state.last_attempted_at = now
 
     # Copy the deque at schedule time so the background task sees a stable
     # view while streaming_adapter keeps appending.
@@ -235,9 +248,10 @@ async def _narration_task_body(
     prompt_ctx: _NarratorPromptContext,
 ) -> None:
     transition_value = prompt_ctx.transition.value
+    handler = state.resolved_handler or _get_narrator_handler()
     try:
         try:
-            narration = await _call_narrator_llm(prompt_ctx)
+            narration = await _call_narrator_llm(prompt_ctx, handler)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -272,13 +286,12 @@ async def _narration_task_body(
         state.in_flight_task = None
 
 
-async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext) -> str | None:
+async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -> str | None:
     """Invoke a small/fast LLM to produce one user-facing sentence.
 
     Returns None on timeout or when no handler is configured. Never raises;
     failures propagate as None so the narration is silently dropped.
     """
-    handler = _get_narrator_handler()
     if handler is None:
         return None
 
@@ -319,20 +332,40 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext) -> str | None:
 
 
 def _get_narrator_handler() -> Any:
-    # Reuse SECONDARY_LLM_API_HANDLER so deployments already wired for the
-    # feasibility gate get narration for free. Returns None when the app
-    # holder isn't initialized (unit tests, pre-startup).
+    # SECONDARY also serves the scraper and other non-copilot paths; prefer
+    # the copilot-scoped fast handler so narration tunes independently.
     try:
-        handler = app.SECONDARY_LLM_API_HANDLER
+        handler = app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
+    except (RuntimeError, AttributeError):
+        handler = None
+    if handler is not None:
+        return handler
+    try:
+        return app.SECONDARY_LLM_API_HANDLER
     except (RuntimeError, AttributeError):
         return None
-    return handler
+
+
+async def resolve_narrator_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any:
+    # Resolution order: PostHog LLM_CONFIG_BY_PROMPT_TYPE["workflow-copilot-narration"]
+    # → env-driven WORKFLOW_COPILOT_FAST_LLM_API_HANDLER → SECONDARY_LLM_API_HANDLER.
+    if workflow_permanent_id and organization_id:
+        try:
+            posthog_handler = await get_llm_handler_for_prompt_type(
+                "workflow-copilot-narration", workflow_permanent_id, organization_id
+            )
+        except Exception as exc:
+            LOG.warning("narrator PostHog lookup failed, falling back", error=str(exc))
+            posthog_handler = None
+        if posthog_handler is not None:
+            return posthog_handler
+    return _get_narrator_handler()
 
 
 def handler_available() -> bool:
-    """Cheap check callers can use to skip all narrator-side bookkeeping
-    (transition detection, tool-details extraction, state updates) when no
-    narrator LLM is configured. Resolved once per stream, not per event."""
+    # Sync env-driven check used by callers that haven't run async resolution
+    # (tests, legacy paths). Production stream setup should use
+    # resolve_narrator_handler instead.
     return _get_narrator_handler() is not None
 
 
@@ -422,12 +455,19 @@ _USER_FACING_TOOL_LABELS: dict[str, str] = {
     "get_block_schema": "looking up workflow block options",
     "validate_block": "checking workflow block configuration",
     "get_run_results": "checking results of a prior run",
+    "block_started": "starting a step in the workflow",
+    "block_completed": "completing a step in the workflow",
+    "block_failed": "a step in the workflow failed",
 }
 
 
 _TRANSITION_LABELS: dict[TransitionKind, str] = {
     TransitionKind.TOOL_STARTED: "just started a new action",
+    TransitionKind.TOOL_IN_PROGRESS: "still working through the requested task",
+    TransitionKind.BLOCK_STARTED: "starting another step in the workflow",
+    TransitionKind.BLOCK_COMPLETED: "just finished a step in the workflow",
     TransitionKind.NEW_TOOL_CLUSTER: "starting a different kind of work",
+    TransitionKind.BLOCK_FAILED: "a step in the workflow failed",
     TransitionKind.ENFORCEMENT_RETRY: "course-correcting after a check",
     TransitionKind.NAVIGATION_COMPLETED: "just finished loading a page",
     TransitionKind.TEST_COMPLETED: "just finished a test of the workflow",
@@ -586,3 +626,179 @@ _IDENTIFIER_LEAK_PATTERNS = (
 
 def _narration_leaks_identifier(narration: str) -> bool:
     return any(pattern.search(narration) for pattern in _IDENTIFIER_LEAK_PATTERNS)
+
+
+# `skipped` is benign-completed, not a failure.
+_BLOCK_STATUS_TO_TRANSITION: dict[str, TransitionKind] = {
+    "running": TransitionKind.BLOCK_STARTED,
+    "completed": TransitionKind.BLOCK_COMPLETED,
+    "skipped": TransitionKind.BLOCK_COMPLETED,
+    "failed": TransitionKind.BLOCK_FAILED,
+    "terminated": TransitionKind.BLOCK_FAILED,
+    "timed_out": TransitionKind.BLOCK_FAILED,
+    "canceled": TransitionKind.BLOCK_FAILED,
+}
+
+_BLOCK_TRANSITION_TO_SYNTHETIC_TOOL: dict[TransitionKind, str] = {
+    TransitionKind.BLOCK_STARTED: "block_started",
+    TransitionKind.BLOCK_COMPLETED: "block_completed",
+    TransitionKind.BLOCK_FAILED: "block_failed",
+}
+
+
+@dataclass(frozen=True)
+class BlockProgressEvent:
+    """One block status change detected by record_block_transitions."""
+
+    block_id: str
+    block_label: str
+    block_type: str
+    status: str
+    kind: TransitionKind
+
+
+def record_block_transitions(
+    state: NarratorState,
+    snapshot: list[tuple[str, str, str, str]],
+    seen_state: dict[str, str],
+    iteration: int,
+) -> list[BlockProgressEvent]:
+    """Record transitions for status changes since the last snapshot; returns the new events for further fan-out."""
+    new_events: list[BlockProgressEvent] = []
+    for block_id, block_label, block_type, status in snapshot:
+        if not block_id:
+            continue
+        prior = seen_state.get(block_id)
+        if prior == status:
+            continue
+        seen_state[block_id] = status
+        kind = _BLOCK_STATUS_TO_TRANSITION.get(status)
+        if kind is None:
+            continue
+        synthetic_tool = _BLOCK_TRANSITION_TO_SYNTHETIC_TOOL.get(kind)
+        if synthetic_tool is None:
+            # Defensive: a new TransitionKind added to the status map without
+            # a matching synthetic-tool entry would otherwise KeyError here.
+            continue
+        state.record_tool(
+            tool_name=synthetic_tool,
+            summary=f"workflow step {status}",
+            success=(kind == TransitionKind.BLOCK_COMPLETED),
+            iteration=iteration,
+        )
+        state.record_transition(kind)
+        new_events.append(
+            BlockProgressEvent(
+                block_id=block_id,
+                block_label=block_label,
+                block_type=block_type,
+                status=status,
+                kind=kind,
+            )
+        )
+    return new_events
+
+
+# Returns objects exposing workflow_run_block_id and status; helper reads only those two fields.
+FetchBlockStatusesCallable = Callable[[], Awaitable[list[Any]]]
+
+
+class NarratorPollTickResult(NamedTuple):
+    """Updated bookkeeping the polling loop must thread into its next call."""
+
+    prior_block_ts: datetime | None
+    prior_step_ts: datetime | None
+    last_block_fetch_monotonic: float
+
+
+async def narrator_poll_tick(
+    state: NarratorState,
+    *,
+    current_block_ts: datetime | None,
+    current_step_ts: datetime | None,
+    prior_block_ts: datetime | None,
+    prior_step_ts: datetime | None,
+    last_block_fetch_monotonic: float,
+    seen_block_states: dict[str, str],
+    fetch_block_statuses: FetchBlockStatusesCallable,
+    stream: EventSourceStream,
+) -> NarratorPollTickResult:
+    """Per-tick narrator bookkeeping; returns updated (prior_block_ts, prior_step_ts, last_block_fetch_monotonic).
+
+    `prior_block_ts` advances only on a successful fetch so rate-limited and failed ticks retry on the next call.
+    """
+    now = time.monotonic()
+    block_changed = current_block_ts != prior_block_ts
+    step_changed = current_step_ts != prior_step_ts
+    gate_open = (now - last_block_fetch_monotonic) >= MIN_NARRATION_GAP_SECONDS
+
+    next_prior_block_ts = prior_block_ts
+    next_last_fetch = last_block_fetch_monotonic
+    block_transition_recorded = False
+
+    if block_changed and gate_open:
+        next_last_fetch = now
+        try:
+            blocks = await fetch_block_statuses()
+        except Exception:
+            LOG.debug("copilot narrator block-status fetch failed", exc_info=True)
+            blocks = None
+
+        if blocks is not None:
+            snapshot: list[tuple[str, str, str, str]] = []
+            for block in blocks:
+                block_id = getattr(block, "workflow_run_block_id", None)
+                if not block_id:
+                    continue
+                raw_status = getattr(block, "status", None)
+                if raw_status is None:
+                    continue
+                status = raw_status.value if hasattr(raw_status, "value") else str(raw_status)
+                if not status:
+                    continue
+                block_label = getattr(block, "label", None) or ""
+                raw_block_type = getattr(block, "block_type", None)
+                if raw_block_type is None:
+                    block_type = ""
+                elif hasattr(raw_block_type, "value"):
+                    block_type = raw_block_type.value
+                elif hasattr(raw_block_type, "name"):
+                    block_type = raw_block_type.name
+                else:
+                    block_type = str(raw_block_type)
+                snapshot.append((block_id, block_label, block_type, status))
+            # Repository returns DESC by created_at; reverse for chronological order.
+            snapshot.reverse()
+            new_events = record_block_transitions(state, snapshot, seen_block_states, state.current_iteration)
+            block_transition_recorded = bool(new_events)
+            next_prior_block_ts = current_block_ts
+            for event in new_events:
+                if not event.block_label:
+                    # Without a label the FE has nothing readable to render; skip
+                    # rather than ship empty bullets.
+                    continue
+                try:
+                    await stream.send(
+                        WorkflowCopilotBlockProgressUpdate(
+                            type=WorkflowCopilotStreamMessageType.BLOCK_PROGRESS,
+                            workflow_run_block_id=event.block_id,
+                            block_label=event.block_label,
+                            block_type=event.block_type,
+                            status=event.status,
+                            iteration=state.current_iteration,
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                    )
+                except Exception:
+                    LOG.debug("copilot block_progress send failed", exc_info=True)
+
+    if not block_transition_recorded and step_changed:
+        state.record_transition(TransitionKind.TOOL_IN_PROGRESS)
+
+    schedule_narration(state, stream, state.current_iteration)
+
+    return NarratorPollTickResult(
+        prior_block_ts=next_prior_block_ts,
+        prior_step_ts=current_step_ts,
+        last_block_fetch_monotonic=next_last_fetch,
+    )

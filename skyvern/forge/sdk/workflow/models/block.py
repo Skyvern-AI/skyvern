@@ -41,6 +41,7 @@ from skyvern.constants import (
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_UPLOAD_FILE_COUNT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
@@ -252,7 +253,7 @@ def _format_payload_path_segment(key: str) -> str:
 
 
 # ForLoop constants
-DEFAULT_MAX_LOOP_ITERATIONS = 100
+DEFAULT_MAX_LOOP_ITERATIONS = 500
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
 PERSIST_LOOP_OUTPUT_INTERVAL = 10
@@ -342,6 +343,7 @@ class Block(BaseModel, abc.ABC):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
         error_codes: list[str] | None = None,
+        is_synthetic_loop_failure: bool = False,
     ) -> BlockResult:
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -368,6 +370,7 @@ class Block(BaseModel, abc.ABC):
             output_parameter_value=output_parameter_value,
             status=status,
             workflow_run_block_id=workflow_run_block_id,
+            is_synthetic_loop_failure=is_synthetic_loop_failure,
         )
 
     async def get_or_create_browser_state(
@@ -1452,9 +1455,17 @@ class LoopBlockExecutedResult(BaseModel):
     outputs_with_loop_values: list[list[dict[str, Any]]]
     block_outputs: list[BlockResult]
     last_block: BlockTypeVar | None
+    # True only when the loop exhausted all iterations naturally (for-loop) or the
+    # condition turned false (while-loop). False on every early-return path
+    # (cancel, structural error, max iterations, body failure with no swallow flag).
+    natural_completion: bool = False
 
     def is_canceled(self) -> bool:
         return len(self.block_outputs) > 0 and self.block_outputs[-1].status == BlockStatus.canceled
+
+    def is_synthetic_loop_failure(self) -> bool:
+        """Last appended result is a loop-structural / safety-limit failure, not a child."""
+        return bool(self.block_outputs) and self.block_outputs[-1].is_synthetic_loop_failure
 
     def is_completed(self) -> bool:
         if len(self.block_outputs) == 0:
@@ -1470,7 +1481,15 @@ class LoopBlockExecutedResult(BaseModel):
         if last_ouput.success:
             return True
 
+        # Swallow flags apply only on natural-completion paths whose last result
+        # is a real child failure; structural/safety synthetics must propagate.
+        if not self.natural_completion or self.is_synthetic_loop_failure():
+            return False
+
         if self.last_block.continue_on_failure:
+            return True
+
+        if self.last_block.next_loop_on_failure:
             return True
 
         return False
@@ -1486,6 +1505,36 @@ class LoopBlockExecutedResult(BaseModel):
             return f"Block({self.last_block.label if self.last_block else ''}) with type {self.last_block.block_type if self.last_block else ''} was canceled, canceling for loop"
 
         return self.block_outputs[-1].failure_reason if len(self.block_outputs) > 0 else "No block has been executed"
+
+    def resolve_status(self, parent_next_loop_on_failure: bool) -> tuple[BlockStatus, bool, str | None]:
+        """Decide the loop block's overall status, success flag, and failure_reason.
+
+        ``parent_next_loop_on_failure`` is the parent loop's swallow flag; when
+        set, body failures swallowed mid-loop must not re-surface as the loop's
+        overall status. Synthetic safety/structural failures still propagate.
+        """
+        parent_swallow = (
+            parent_next_loop_on_failure
+            and self.natural_completion
+            and not self.is_canceled()
+            and not self.is_synthetic_loop_failure()
+        )
+
+        if self.is_canceled():
+            block_status = BlockStatus.canceled
+            success = False
+        elif self.is_completed() or parent_swallow:
+            block_status = BlockStatus.completed
+            success = True
+        elif self.is_terminated():
+            block_status = BlockStatus.terminated
+            success = False
+        else:
+            block_status = BlockStatus.failed
+            success = False
+
+        failure_reason = None if success else self.get_failure_reason()
+        return block_status, success, failure_reason
 
 
 def compute_conditional_scopes(
@@ -2081,6 +2130,7 @@ class ForLoopBlock(Block):
                     failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    is_synthetic_loop_failure=True,
                 )
                 block_outputs.append(failure_block_result)
                 await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
@@ -2152,6 +2202,7 @@ class ForLoopBlock(Block):
                         failure_reason=f"Unable to find block with label {current_label} inside loop {self.label}",
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
                     )
                     block_outputs.append(failure_block_result)
                     outputs_with_loop_values.append(each_loop_output_values)
@@ -2252,6 +2303,7 @@ class ForLoopBlock(Block):
                         failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
                     )
                     block_outputs.append(failure_block_result)
                     # If next_loop_on_failure is False, stop the entire loop
@@ -2328,6 +2380,7 @@ class ForLoopBlock(Block):
                             failure_reason=f"Next block label {next_label} not found inside loop {self.label}",
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            is_synthetic_loop_failure=True,
                         )
                         block_outputs.append(failure_block_result)
                         outputs_with_loop_values.append(each_loop_output_values)
@@ -2364,6 +2417,7 @@ class ForLoopBlock(Block):
             outputs_with_loop_values=outputs_with_loop_values,
             block_outputs=block_outputs,
             last_block=current_block,
+            natural_completion=True,
         )
 
     async def execute(
@@ -2498,22 +2552,11 @@ class ForLoopBlock(Block):
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
         )
 
-        block_status = BlockStatus.failed
-        success = False
-
-        if loop_executed_result.is_canceled():
-            block_status = BlockStatus.canceled
-        elif loop_executed_result.is_completed():
-            block_status = BlockStatus.completed
-            success = True
-        elif loop_executed_result.is_terminated():
-            block_status = BlockStatus.terminated
-        else:
-            block_status = BlockStatus.failed
+        block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
         return await self.build_block_result(
             success=success,
-            failure_reason=loop_executed_result.get_failure_reason(),
+            failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
@@ -2528,7 +2571,7 @@ class WhileLoopBlock(Block):
     first). If the condition is false on the first check, the body never runs and the block
     returns success with an empty output list.
 
-    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is
+    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is
     treated as a failure so that a misbehaving condition can never spin forever.
     """
 
@@ -2671,7 +2714,15 @@ class WhileLoopBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> bool:
         """Evaluate the loop condition. Raises on rendering errors so the caller can convert
-        the failure into a block result with a clear message."""
+        the failure into a block result with a clear message.
+
+        ``current_index`` (the 0-indexed iteration counter) is read from this block's own
+        metadata via the existing for_loop injection in
+        :meth:`format_block_parameter_template_from_workflow_run_context`. The caller is
+        responsible for writing it onto ``self.label`` before invoking this method, so
+        condition authors can bootstrap iteration 1 with
+        ``{{ current_index == 0 or <body_output_ref> }}``.
+        """
         evaluation_context = BranchEvaluationContext(
             workflow_run_context=workflow_run_context,
             block_label=self.label,
@@ -2709,6 +2760,19 @@ class WhileLoopBlock(Block):
             # iteration to iteration), but a Jinja render error means the condition itself
             # is malformed and will fail identically on the next iteration — there is no
             # forward progress to be made by retrying.
+            # Expose ``current_index`` to the condition's template scope before evaluation
+            # so authors can bootstrap iteration 0 with ``{{ current_index == 0 or ... }}``.
+            # The for_loop pattern at line 516-521 picks this up via ``get_block_metadata``.
+            # ``current_value`` and ``current_item`` are nulled for the same SKY-8835
+            # reason as the body-level write below — defend against an outer for_loop's
+            # values lingering on this label's bag and bleeding into the condition render.
+            condition_metadata: BlockMetadata = {
+                "current_index": loop_idx,
+                "current_value": None,
+                "current_item": None,
+            }
+            workflow_run_context.update_block_metadata(self.label, condition_metadata)
+
             try:
                 should_continue = await self._evaluate_condition(workflow_run_context)
             except (FailedToFormatJinjaStyleParameter, MissingJinjaVariables) as exc:
@@ -2757,6 +2821,7 @@ class WhileLoopBlock(Block):
                     failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    is_synthetic_loop_failure=True,
                 )
                 block_outputs.append(failure_block_result)
                 await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
@@ -2822,6 +2887,7 @@ class WhileLoopBlock(Block):
                         failure_reason=f"Unable to find block with label {current_label} inside loop {self.label}",
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
                     )
                     block_outputs.append(failure_block_result)
                     outputs_with_loop_values.append(each_loop_output_values)
@@ -2923,6 +2989,7 @@ class WhileLoopBlock(Block):
                         failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
                     )
                     block_outputs.append(failure_block_result)
                     if not self.next_loop_on_failure:
@@ -2997,6 +3064,7 @@ class WhileLoopBlock(Block):
                             failure_reason=f"Next block label {next_label} not found inside loop {self.label}",
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            is_synthetic_loop_failure=True,
                         )
                         block_outputs.append(failure_block_result)
                         outputs_with_loop_values.append(each_loop_output_values)
@@ -3036,6 +3104,7 @@ class WhileLoopBlock(Block):
             outputs_with_loop_values=outputs_with_loop_values,
             block_outputs=block_outputs,
             last_block=current_block,
+            natural_completion=True,
         )
 
     async def execute(
@@ -3143,22 +3212,11 @@ class WhileLoopBlock(Block):
                 organization_id=organization_id,
             )
 
-        block_status = BlockStatus.failed
-        success = False
-
-        if loop_executed_result.is_canceled():
-            block_status = BlockStatus.canceled
-        elif loop_executed_result.is_completed():
-            block_status = BlockStatus.completed
-            success = True
-        elif loop_executed_result.is_terminated():
-            block_status = BlockStatus.terminated
-        else:
-            block_status = BlockStatus.failed
+        block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
         return await self.build_block_result(
             success=success,
-            failure_reason=loop_executed_result.get_failure_reason(),
+            failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
@@ -6339,6 +6397,53 @@ class PrintPageBlock(Block):
 
         return artifact_uri, artifact_url
 
+    async def _register_pdf_as_downloaded_file(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+    ) -> list[FileInfo]:
+        # Workflow finalization eventually runs save_downloaded_files, but the block
+        # output snapshot is recorded now and the UI keys off downloaded_file_urls
+        # on the block — so we register up front and let finalization re-run safely.
+        if not organization_id:
+            return []
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock failed to register PDF as downloaded file; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout getting downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -6348,6 +6453,11 @@ class PrintPageBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Scope downloaded files to this block only.
+        block_context = skyvern_context.current()
+        if block_context:
+            await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
@@ -6416,12 +6526,27 @@ class PrintPageBlock(Block):
             organization_id=organization_id,
         )
 
+        artifact_org_id = organization_id or workflow_run_context.organization_id
+        downloaded_files = await self._register_pdf_as_downloaded_file(
+            organization_id=artifact_org_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+        current_context = skyvern_context.current()
+        downloaded_files = filter_downloaded_files_for_current_iteration(
+            downloaded_files,
+            current_context.loop_internal_state if current_context else None,
+        )
         output = {
             "filename": filename,
             "file_path": file_path,
             "size_bytes": len(pdf_bytes),
             "artifact_uri": artifact_uri,
             "artifact_url": artifact_url,
+            "downloaded_files": [fi.model_dump() for fi in downloaded_files],
+            "downloaded_file_urls": [fi.url for fi in downloaded_files],
+            "downloaded_file_artifact_ids": [fi.artifact_id for fi in downloaded_files if fi.artifact_id],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
 

@@ -84,7 +84,9 @@ Before deploying, ensure you have:
   </Step>
 </Steps>
 
-PostgreSQL 14+ is included in the Docker Compose setup. If you prefer an external database, you can configure `DATABASE_STRING` to point to your own instance.
+PostgreSQL 14+ is included in the Docker Compose setup. If you prefer an external database, configure `DATABASE_STRING` to point to your own instance.
+
+For the `pip install skyvern` path (Option A in the README), the default is a SQLite database at `~/.skyvern/data.db` — zero-config for local dev. To opt into Postgres for the pip path, run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`.
 
 ## Choose your deployment method
 

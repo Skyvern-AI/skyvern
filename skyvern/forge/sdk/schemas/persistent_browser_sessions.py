@@ -2,9 +2,10 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.forge.sdk.db.utils import deserialize_proxy_location
+from skyvern.schemas.runs import ProxyLocationInput
 
 
 class PersistentBrowserSessionStatus(StrEnum):
@@ -56,7 +57,7 @@ class PersistentBrowserSession(BaseModel):
     ip_address: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     instance_type: str | None = None
     vcpu_millicores: int | None = None
     memory_mb: int | None = None
@@ -70,6 +71,13 @@ class PersistentBrowserSession(BaseModel):
     extensions: list[Extensions] | None = None
     browser_type: PersistentBrowserType | None = None
     browser_profile_id: str | None = None
+
+    @field_validator("proxy_location", mode="before")
+    @classmethod
+    def deserialize_proxy_location_field(cls, value: object) -> object:
+        if isinstance(value, str):
+            return deserialize_proxy_location(value, raise_on_invalid_geo_target=True)
+        return value
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):
