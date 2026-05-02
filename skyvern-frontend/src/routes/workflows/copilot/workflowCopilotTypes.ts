@@ -85,6 +85,8 @@ export interface WorkflowCopilotStreamResponseUpdate {
   response_time: string;
   // Clients must NOT auto-apply when true; render Accept/Reject explicitly.
   unvalidated?: boolean;
+  // Same auto-apply guard as unvalidated; cancel forces explicit review.
+  cancelled?: boolean;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
