@@ -183,6 +183,7 @@ class TestShouldRestorePersistedWorkflow:
         r.workflow_was_persisted = persisted
         r.updated_workflow = updated_workflow
         r.unvalidated = False
+        r.cancelled = False
         return r
 
     def test_restores_when_no_proposal_even_under_auto_accept(self) -> None:
