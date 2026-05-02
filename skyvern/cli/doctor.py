@@ -416,7 +416,7 @@ def _check_llm_config() -> CheckResult:
 
     llm_key = os.environ.get("LLM_KEY", "")
 
-    providers = {
+    providers: dict[str, dict[str, str | None]] = {
         "OPENAI": {"enable": "ENABLE_OPENAI", "key": "OPENAI_API_KEY"},
         "ANTHROPIC": {"enable": "ENABLE_ANTHROPIC", "key": "ANTHROPIC_API_KEY"},
         "GEMINI": {"enable": "ENABLE_GEMINI", "key": "GEMINI_API_KEY"},
@@ -430,7 +430,8 @@ def _check_llm_config() -> CheckResult:
     enabled = []
     missing_key = []
     for name, cfg in providers.items():
-        if os.environ.get(cfg["enable"], "").lower() in ("true", "1", "yes"):
+        enable_var = cfg["enable"]
+        if enable_var and os.environ.get(enable_var, "").lower() in ("true", "1", "yes"):
             enabled.append(name)
             api_key_var = cfg.get("key")
             if api_key_var and not os.environ.get(api_key_var):
@@ -672,7 +673,7 @@ def _fix_start_postgres() -> bool:
 def _fix_api_key_consistency() -> bool:
     import re
 
-    from dotenv import dotenv_values
+    from dotenv import dotenv_values, set_key
 
     from skyvern.utils.env_paths import resolve_backend_env_path
 
@@ -703,15 +704,9 @@ def _fix_api_key_consistency() -> bool:
         console.print("  [yellow]→ skyvern-frontend/.env not found and no .env.example to copy[/yellow]")
         return False
 
-    content = frontend_env.read_text()
-    if re.search(r"^VITE_SKYVERN_API_KEY=", content, re.MULTILINE):
-        content = re.sub(r"^VITE_SKYVERN_API_KEY=.*$", f"VITE_SKYVERN_API_KEY={canonical}", content, flags=re.MULTILINE)
-    else:
-        content += f"\nVITE_SKYVERN_API_KEY={canonical}\n"
-    frontend_env.write_text(content)
-    console.print(
-        f"  [green]✅ Synced VITE_SKYVERN_API_KEY in skyvern-frontend/.env (from {'secrets.toml' if secrets_key else 'backend .env'})[/green]"
-    )
+    set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", canonical)
+    source = "secrets.toml" if secrets_key else "backend .env"
+    console.print(f"  [green]✅ Synced VITE_SKYVERN_API_KEY in skyvern-frontend/.env (from {source})[/green]")
     return True
 
 
