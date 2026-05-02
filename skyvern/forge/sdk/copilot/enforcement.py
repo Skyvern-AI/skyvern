@@ -280,6 +280,15 @@ class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
 
 
+def _mark_copilot_total_timeout(ctx: Any) -> None:
+    ctx.copilot_total_timeout_exceeded = True
+
+
+def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float) -> None:
+    if time.monotonic() - start_time >= TOTAL_TIMEOUT_SECONDS:
+        _mark_copilot_total_timeout(ctx)
+
+
 class CopilotNonRetriableNavError(Exception):
     """Raised from run_with_enforcement when the copilot's most recent run
     hit a permanent navigation error (DNS / cert / SSL / invalid URL) and
@@ -1017,6 +1026,7 @@ async def _run_streamed_with_deadline(
         finally:
             _accumulate_usage(result, ctx)
     except asyncio.TimeoutError:
+        _mark_copilot_total_timeout(ctx)
         LOG.warning(
             "Copilot total timeout exceeded mid-iteration",
             elapsed_seconds=round(time.monotonic() - start_time, 3),
@@ -1047,6 +1057,7 @@ async def run_with_enforcement(
         # chat history on the server side (see SKY-8986).
         elapsed = time.monotonic() - start_time
         if elapsed > TOTAL_TIMEOUT_SECONDS:
+            _mark_copilot_total_timeout(ctx)
             raise CopilotTotalTimeoutError()
 
         if iteration >= MAX_ITERATIONS:
@@ -1079,6 +1090,9 @@ async def run_with_enforcement(
                     start_time,
                     iteration,
                 )
+            except asyncio.CancelledError:
+                _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                raise
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -1098,7 +1112,11 @@ async def run_with_enforcement(
                     iteration=iteration,
                     has_session=session is not None,
                 )
-                current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
+                try:
+                    current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
+                except asyncio.CancelledError:
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    raise
                 if images_stripped:
                     # The agent could otherwise reason about the page from
                     # memory on the next turn; warn it explicitly.
@@ -1115,6 +1133,9 @@ async def run_with_enforcement(
                         start_time,
                         iteration,
                     )
+                except asyncio.CancelledError:
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    raise
                 except Exception as retry_err:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.

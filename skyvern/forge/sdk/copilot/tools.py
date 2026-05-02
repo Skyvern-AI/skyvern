@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
 from skyvern.forge.sdk.copilot.output_utils import (
+    _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     build_run_blocks_response,
     iter_failure_reasons,
     sanitize_tool_result_for_llm,
@@ -1170,6 +1171,7 @@ async def _run_blocks_and_collect_debug(
     final_status: str | None = None
     run: Any = initial_run
     exit_reason: WatchdogExitReason | None = None
+    run_cancelled_by_watchdog = False
     # Quiet blocks (WAIT/TEXT_PROMPT/HUMAN_INTERACTION) legitimately have
     # DB-silent periods; disable stagnation for any invocation that includes
     # one. Safety ceiling still applies.
@@ -1257,6 +1259,7 @@ async def _run_blocks_and_collect_debug(
                 exit_reason = "success"
             else:
                 await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                run_cancelled_by_watchdog = True
                 run = await _safe_read_workflow_run(
                     workflow_run.workflow_run_id, ctx.organization_id, context="post-drain"
                 )
@@ -1273,7 +1276,10 @@ async def _run_blocks_and_collect_debug(
             ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
             assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
             error_msg = await _watchdog_error_message(exit_reason, ctx, workflow_run.workflow_run_id, run)
-            return {"ok": False, "error": error_msg}
+            result = {"ok": False, "error": error_msg}
+            if run_cancelled_by_watchdog:
+                result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
+            return result
     except asyncio.CancelledError:
         # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
         # the cleanup so the parent cancellation can't interrupt it mid-await.
@@ -2097,7 +2103,11 @@ def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
 
 def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     run_ok = bool(result.get("ok", False))
-    copilot_ctx.last_test_ok = run_ok
+    # Watchdog cancels normally count as ok=False; only a coincident total
+    # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
+    cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
+    timeout_latched = bool(copilot_ctx.copilot_total_timeout_exceeded)
+    copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.last_test_anti_bot = None

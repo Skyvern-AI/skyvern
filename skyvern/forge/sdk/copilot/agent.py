@@ -325,6 +325,13 @@ def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | No
     )
 
 
+def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    if ctx.copilot_total_timeout_exceeded:
+        LOG.info("Copilot cancellation resolved as total timeout")
+        return _build_timeout_exit_result(ctx, global_llm_context)
+    return _build_cancel_exit_result(ctx, global_llm_context)
+
+
 def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
     return _build_wip_exit_result(
         ctx,
@@ -686,8 +693,8 @@ async def run_copilot_agent(
             except asyncio.CancelledError:
                 # Re-raising would leave the route with ``agent_result is None``
                 # and skip its ``workflow_was_persisted`` rollback decision.
-                LOG.info("Copilot run cancelled by user")
-                return _build_cancel_exit_result(ctx, global_llm_context)
+                LOG.info("Copilot run cancelled")
+                return _build_cancelled_exit_result(ctx, global_llm_context)
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:

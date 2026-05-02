@@ -75,6 +75,7 @@ class AgentContext:
     post_update_nudge_count: int = 0
     coverage_nudge_count: int = 0
     format_nudge_count: int = 0
+    copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     null_data_streak_count: int = 0

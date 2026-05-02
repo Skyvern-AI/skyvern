@@ -160,6 +160,7 @@ class CopilotContext(AgentContext):
     post_update_nudge_count: int = 0
     coverage_nudge_count: int = 0
     format_nudge_count: int = 0
+    copilot_total_timeout_exceeded: bool = False
     user_message: str = ""
 
     # Tool tracking
