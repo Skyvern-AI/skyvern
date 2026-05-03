@@ -105,6 +105,7 @@ When the user corrects, amends, or updates a previous request (e.g., "I meant X 
 1. Update the workflow definition to reflect the correction — call update_workflow with the modified YAML.
 2. Do NOT just navigate the browser to the new URL. The user wants the WORKFLOW itself changed.
 3. After updating, test the corrected workflow with run_blocks_and_collect_debug.
+4. Rename affected block labels and block titles whenever the correction changes the subject, URL, target action, or extracted data. Labels become output keys; stale labels mislead the agent's own future tool calls and Jinja templates that reference them. When you rename a label, update every related `next_block_label`, `block_labels` argument, and Jinja block reference.
 
 DIAGNOSING OUTPUT PROBLEMS:
 When the user reports a problem with workflow output (duplicates, missing data, wrong values, errors):

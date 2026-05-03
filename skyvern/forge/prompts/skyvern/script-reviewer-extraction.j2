@@ -59,6 +59,11 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 {% endfor %}
 For fields not covered by these parameters, use `ai='proactive'` with a descriptive prompt (see Rule 8b).
 {% endif %}
+{% if self_output_key %}
+
+### Forbidden parameter key for this block
+- `{{ self_output_key }}` — this block's own output slot. It is `None` until the block has finished running, so `context.parameters['{{ self_output_key }}']` crashes inside this block with `'NoneType' object is not subscriptable`. Upstream blocks' `<label>_output` keys ARE valid; only this block's own output is forbidden.
+{% endif %}
 {% if run_parameter_values %}
 
 ## Current Run Parameter Values

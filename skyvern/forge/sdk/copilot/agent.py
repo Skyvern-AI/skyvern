@@ -398,13 +398,20 @@ def _translate_to_agent_result(
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
                 _detect_new_banned_blocks,
+                _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
+                _stale_block_metadata_message,
             )
 
             banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
                 user_response = f"{user_response}\n\n(Note: {_banned_block_reject_message(banned_items)})"
+                workflow_yaml = ""
+            stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
+            if stale_metadata:
+                user_response = f"{user_response}\n\n(Note: {_stale_block_metadata_message(stale_metadata)})"
+                ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
             if ctx.user_message:
