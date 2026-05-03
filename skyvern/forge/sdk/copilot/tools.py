@@ -7,7 +7,7 @@ import base64
 import json
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Literal
 
@@ -15,6 +15,7 @@ import structlog
 import yaml
 from agents import function_tool
 from agents.run_context import RunContextWrapper
+from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
 
 from skyvern.forge import app
@@ -47,6 +48,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import (
+    RESERVED_PARAMETER_KEYS,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -517,6 +519,15 @@ def _parameter_binding_invariant_error(
 
 async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
     workflow_yaml = params["workflow_yaml"]
+    # Prefer the most-recent in-turn emission so cross-path flows (inline
+    # REPLACE_WORKFLOW followed by update_workflow) compare against what the
+    # LLM actually saw, not the turn-start persisted state.
+    last_yaml = getattr(ctx, "last_workflow_yaml", None)
+    prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+    stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
+    if stale_metadata:
+        return {"ok": False, "error": _stale_block_metadata_message(stale_metadata)}
+
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
     # schema; this safety net fires regardless of emission path. Label-based
@@ -619,7 +630,34 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
 # to an upstream state-establisher, or falls back to the full requested list.
 _BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
 
-_OUTPUT_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)_output\s*[\.}|]")
+_JINJA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_OUTPUT_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})_output\s*(?=[\.|}}])")
+_BLOCK_FORM_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})\s*\.")
+_JINJA_ROOT_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})\s*(?=[\.|}}])")
+
+_JINJA_RUNTIME_GLOBAL_ROOTS = frozenset(SandboxedEnvironment().globals)
+_JINJA_LITERAL_ROOTS = frozenset({"none", "true", "false"})
+_JINJA_SPECIAL_CONTEXT_ROOTS = frozenset({"loop", "self", "varargs", "kwargs"})
+_SKYVERN_TEMPLATE_CONTEXT_ROOTS = frozenset(RESERVED_PARAMETER_KEYS) | frozenset(
+    {
+        "parameters",
+        "browser_session_id",
+        "organization_id",
+        # Conditional / branch evaluation roots — see BranchEvaluationContext.build_template_data.
+        "params",
+        "outputs",
+        "environment",
+        "env",
+        "llm",
+    }
+)
+_TEMPLATE_BUILTIN_ROOTS = (
+    _JINJA_RUNTIME_GLOBAL_ROOTS | _JINJA_LITERAL_ROOTS | _JINJA_SPECIAL_CONTEXT_ROOTS | _SKYVERN_TEMPLATE_CONTEXT_ROOTS
+)
+
+# Keep this to grammatical glue only. Workflow/action words are intentionally
+# not filtered; the two-token stale threshold is the conservative guardrail.
+_BLOCK_METADATA_STOPWORDS = frozenset({"and", "for", "the", "with"})
 
 
 def _block_type_name(block: Any) -> str:
@@ -641,6 +679,218 @@ def _blocks_by_label(workflow_definition: Any) -> dict[str, Any]:
         if isinstance(label, str):
             by_label[label] = block
     return by_label
+
+
+# Minimum length to apply the trailing-``s`` plural strip; below this we
+# leave the token alone so words like ``is``/``us``/``has`` aren't mangled.
+_MIN_STEMMABLE_TOKEN_LEN = 5
+
+
+def _metadata_token(token: str) -> str:
+    token = token.lower()
+    if len(token) >= _MIN_STEMMABLE_TOKEN_LEN and token.endswith("s"):
+        token = token[:-1]
+    return token
+
+
+def _metadata_tokens(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    tokens: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9]+", value):
+        normalized = _metadata_token(token)
+        if len(normalized) <= 2 or normalized in _BLOCK_METADATA_STOPWORDS:
+            continue
+        tokens.add(normalized)
+    return tokens
+
+
+def _iter_yaml_blocks(blocks: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if not isinstance(blocks, list):
+        return found
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        found.append(block)
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            found.extend(_iter_yaml_blocks(loop_blocks))
+    return found
+
+
+def _workflow_yaml_blocks_by_label(workflow_yaml: str | None) -> dict[str, dict[str, Any]]:
+    if not workflow_yaml:
+        return {}
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return {}
+    by_label: dict[str, dict[str, Any]] = {}
+    for block in _iter_yaml_blocks(workflow_definition.get("blocks")):
+        label = block.get("label")
+        if isinstance(label, str):
+            by_label[label] = block
+    return by_label
+
+
+def _semantic_tokens_from_yaml(value: Any, *, exclude_keys: frozenset[str]) -> set[str]:
+    tokens: set[str] = set()
+    if isinstance(value, str):
+        return _metadata_tokens(value)
+    if isinstance(value, list):
+        for item in value:
+            tokens.update(_semantic_tokens_from_yaml(item, exclude_keys=exclude_keys))
+        return tokens
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in exclude_keys:
+                continue
+            tokens.update(_semantic_tokens_from_yaml(item, exclude_keys=exclude_keys))
+    return tokens
+
+
+def _stale_metadata_reason(
+    *,
+    field_name: str,
+    field_value: Any,
+    prior_block: dict[str, Any],
+    submitted_block: dict[str, Any],
+    current_exclude_keys: frozenset[str],
+) -> str | None:
+    tokens = _metadata_tokens(field_value)
+    if len(tokens) < 2:
+        return None
+
+    prior_tokens = _semantic_tokens_from_yaml(prior_block, exclude_keys=current_exclude_keys)
+    current_tokens = _semantic_tokens_from_yaml(submitted_block, exclude_keys=current_exclude_keys)
+    removed_tokens = prior_tokens - current_tokens
+    if len(tokens & removed_tokens) < 2:
+        return None
+
+    return f"{field_name} {field_value!r} appears stale"
+
+
+def _prior_blocks_by_unique_title(prior_by_label: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    titled = [(b["title"], b) for b in prior_by_label.values() if isinstance(b.get("title"), str) and b["title"]]
+    counts = Counter(title for title, _ in titled)
+    return {title: block for title, block in titled if counts[title] == 1}
+
+
+_STALE_BASE_EXCLUDE = frozenset({"label", "next_block_label"})
+_STALE_TITLE_EXCLUDE = frozenset({"label", "title", "next_block_label"})
+
+
+def _stale_for_renamed_label(
+    label: str,
+    submitted_block: dict[str, Any],
+    prior_by_unique_title: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    submitted_title = submitted_block.get("title")
+    # Title-less blocks intentionally skip the renamed-label path: with no
+    # title there is no cross-reference to a prior block, so we'd be
+    # guessing whether the rename was warranted.
+    if not (isinstance(submitted_title, str) and submitted_title):
+        return None
+    prior_block = prior_by_unique_title.get(submitted_title)
+    if prior_block is None:
+        return None
+    title_reason = _stale_metadata_reason(
+        field_name="title",
+        field_value=submitted_title,
+        prior_block=prior_block,
+        submitted_block=submitted_block,
+        current_exclude_keys=_STALE_TITLE_EXCLUDE,
+    )
+    if not title_reason:
+        return None
+    return {"label": label, "reasons": [title_reason]}
+
+
+def _stale_for_matched_label(
+    label: str,
+    submitted_block: dict[str, Any],
+    prior_block: dict[str, Any],
+) -> dict[str, Any] | None:
+    reasons: list[str] = []
+    submitted_title = submitted_block.get("title")
+    prior_title = prior_block.get("title")
+    title_reason = None
+    if isinstance(submitted_title, str) and submitted_title and submitted_title == prior_title:
+        title_reason = _stale_metadata_reason(
+            field_name="title",
+            field_value=submitted_title,
+            prior_block=prior_block,
+            submitted_block=submitted_block,
+            current_exclude_keys=_STALE_TITLE_EXCLUDE,
+        )
+        if title_reason:
+            reasons.append(title_reason)
+
+    # When the title was already flagged stale, exclude its tokens from the
+    # label-stale comparison so the same words don't double-count; otherwise
+    # the title's tokens are stable content that should weigh in.
+    label_exclude_keys = _STALE_TITLE_EXCLUDE if title_reason else _STALE_BASE_EXCLUDE
+    label_reason = _stale_metadata_reason(
+        field_name="label",
+        field_value=label,
+        prior_block=prior_block,
+        submitted_block=submitted_block,
+        current_exclude_keys=label_exclude_keys,
+    )
+    if label_reason:
+        reasons.insert(0, label_reason)
+
+    if not reasons:
+        return None
+    return {"label": label, "reasons": reasons}
+
+
+def _detect_stale_block_metadata(submitted_yaml: str | None, prior_yaml: str | None) -> list[dict[str, Any]]:
+    """Find corrected blocks whose old label/title no longer matches their revised goal text."""
+    prior_by_label = _workflow_yaml_blocks_by_label(prior_yaml)
+    submitted_by_label = _workflow_yaml_blocks_by_label(submitted_yaml)
+    if not prior_by_label or not submitted_by_label:
+        return []
+
+    prior_by_unique_title = _prior_blocks_by_unique_title(prior_by_label)
+
+    stale_items: list[dict[str, Any]] = []
+    for label, submitted_block in submitted_by_label.items():
+        prior_block = prior_by_label.get(label)
+        if prior_block is None:
+            item = _stale_for_renamed_label(label, submitted_block, prior_by_unique_title)
+        else:
+            item = _stale_for_matched_label(label, submitted_block, prior_block)
+        if item is not None:
+            stale_items.append(item)
+    return stale_items
+
+
+_STALE_BLOCK_METADATA_MESSAGE_LIMIT = 5
+
+
+def _stale_block_metadata_message(items: list[dict[str, Any]]) -> str:
+    details = []
+    for item in items[:_STALE_BLOCK_METADATA_MESSAGE_LIMIT]:
+        label = item.get("label", "?")
+        reasons = item.get("reasons") or []
+        detail = "; ".join(str(reason) for reason in reasons)
+        details.append(f"{label}: {detail}")
+    if len(items) > _STALE_BLOCK_METADATA_MESSAGE_LIMIT:
+        details.append(f"(and {len(items) - _STALE_BLOCK_METADATA_MESSAGE_LIMIT} more)")
+    joined = "; ".join(details)
+    return (
+        "Workflow validation failed: corrected block metadata still appears stale. "
+        "When changing a user's requested subject, URL, or action, rename affected block labels and titles "
+        "to match the revised goal, and update next_block_label, block_labels, and Jinja references accordingly. "
+        f"Stale metadata: {joined}"
+    )
 
 
 def _find_invalidated_labels(
@@ -698,20 +948,98 @@ def _nearest_upstream_state_establisher(
     return None
 
 
-def _referenced_output_labels(frontier_labels: list[str], new_definition: Any) -> set[str]:
+def _serialized_frontier_block_configs(frontier_labels: list[str], new_definition: Any) -> list[str]:
     by_label = _blocks_by_label(new_definition)
-    needed: set[str] = set()
+    serialized_configs: list[str] = []
     for label in frontier_labels:
         block = by_label.get(label)
         if block is None:
             continue
         try:
-            serialized = json.dumps(_canonical_block_config(block), default=str, separators=(",", ":"))
+            serialized_configs.append(json.dumps(_canonical_block_config(block), default=str, separators=(",", ":")))
         except (TypeError, ValueError):
-            serialized = repr(block)
+            serialized_configs.append(repr(block))
+    return serialized_configs
+
+
+def _workflow_parameter_keys(definition: Any) -> set[str]:
+    parameters = getattr(definition, "parameters", None) if definition else None
+    keys: set[str] = set()
+    if not parameters:
+        return keys
+    for parameter in parameters:
+        key = getattr(parameter, "key", None)
+        if isinstance(key, str):
+            keys.add(key)
+    return keys
+
+
+_CREDENTIAL_REAL_VALUE_SUFFIXES = ("_real_username", "_real_password")
+
+
+def _classify_frontier_jinja_refs(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> tuple[set[str], set[str], set[str]]:
+    """Single pass over frontier blocks; returns ``(suffix_form_refs, block_form_refs, unknown_roots)``."""
+    if serialized_configs is None:
+        serialized_configs = _serialized_frontier_block_configs(frontier_labels, new_definition)
+    known_labels = set(_blocks_by_label(new_definition))
+    parameter_keys = _workflow_parameter_keys(new_definition)
+    known_roots = known_labels | parameter_keys | _TEMPLATE_BUILTIN_ROOTS
+
+    suffix_form_refs: set[str] = set()
+    block_form_refs: set[str] = set()
+    unknown_roots: set[str] = set()
+
+    for serialized in serialized_configs:
         for match in _OUTPUT_REF_RE.findall(serialized):
-            needed.add(match)
-    return needed
+            if match in known_labels:
+                suffix_form_refs.add(match)
+        for match in _BLOCK_FORM_REF_RE.findall(serialized):
+            if match in known_labels:
+                block_form_refs.add(match)
+        for root in _JINJA_ROOT_RE.findall(serialized):
+            if root in known_roots:
+                continue
+            if root.endswith("_output") and root[: -len("_output")] in known_labels:
+                continue
+            if any(
+                root.endswith(suffix) and root[: -len(suffix)] in parameter_keys
+                for suffix in _CREDENTIAL_REAL_VALUE_SUFFIXES
+            ):
+                continue
+            unknown_roots.add(root)
+
+    return suffix_form_refs, block_form_refs, unknown_roots
+
+
+def _referenced_output_labels(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> set[str]:
+    suffix_refs, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
+    return suffix_refs | block_form_refs
+
+
+def _block_form_output_labels(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> set[str]:
+    _, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
+    return block_form_refs
+
+
+def _unknown_jinja_roots(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> set[str]:
+    _, _, unknown_roots = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
+    return unknown_roots
 
 
 def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
@@ -846,20 +1174,24 @@ def _seed_for_frontier(
     prefix_labels = requested_labels[:idx]
     if not prefix_labels:
         return labels_to_execute, {}, frontier
-    # Only seed outputs that are actually referenced by the frontier suffix.
-    # Over-seeding would weaken the "seed what downstream needs" discipline
-    # and risks masking bugs where a block references an output that doesn't
-    # flow through the normal {{label_output}} path.
-    needed = _referenced_output_labels(labels_to_execute, new_definition)
-    prefix_needed = [label for label in prefix_labels if label in needed]
+    serialized_configs = _serialized_frontier_block_configs(labels_to_execute, new_definition)
+    suffix_refs, block_form_refs, unknown_roots = _classify_frontier_jinja_refs(
+        labels_to_execute, new_definition, serialized_configs
+    )
+    if any(label in block_form_refs for label in prefix_labels):
+        # Seeded block_outputs only register <label>_output; block-form refs
+        # need a normal upstream execution to populate the <label> namespace.
+        return requested_labels, {}, requested_labels[0]
+    needed = suffix_refs | block_form_refs
     seed: dict[str, Any] = {}
-    for label in prefix_needed:
-        if label in verified_outputs:
-            seed[label] = verified_outputs[label]
-        else:
-            # A referenced output is missing from the verified cache — we
-            # can't safely seed just the suffix. Fall back to the full list.
+    for label in prefix_labels:
+        if label not in needed:
+            continue
+        if label not in verified_outputs:
             return requested_labels, {}, requested_labels[0]
+        seed[label] = verified_outputs[label]
+    if unknown_roots:
+        return requested_labels, {}, requested_labels[0]
     return labels_to_execute, seed, frontier
 
 
