@@ -20,7 +20,11 @@ from mcp.types import (
     TextContent,
 )
 
-from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
+from skyvern.forge.sdk.copilot.loop_detection import (
+    detect_failed_tool_step_loop_for_ctx,
+    detect_tool_loop,
+    record_tool_step_result_for_ctx,
+)
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -194,6 +198,14 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
 
+        loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
+        if loop_error:
+            LOG.warning(
+                "Failed tool step loop detected, skipping execution",
+                tool_name=tool_name,
+            )
+            return _copilot_to_call_tool_result({"ok": False, "error": loop_error})
+
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
         loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
         if loop_error:
@@ -219,6 +231,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         if overlay.pre_hook:
             hook_result = await overlay.pre_hook(arguments, copilot_ctx)
             if hook_result is not None:
+                record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
 
         mcp_name = self._alias_map.get(tool_name, tool_name)
@@ -227,6 +240,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         if overlay.requires_browser:
             err = await ensure_browser_session(copilot_ctx)
             if err:
+                record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err)
             mcp_args["session_id"] = copilot_ctx.browser_session_id
 
@@ -244,7 +258,9 @@ class SkyvernOverlayMCPServer(MCPServer):
                 error=str(e),
                 exc_info=True,
             )
-            return _copilot_to_call_tool_result({"ok": False, "error": f"{tool_name} failed: {e}"})
+            err = {"ok": False, "error": f"{tool_name} failed: {e}"}
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
+            return _copilot_to_call_tool_result(err)
 
         # Copy fastmcp's structured_content so mutations below stay local to
         # this call — the client may reuse or cache the response object.
@@ -261,6 +277,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         if overlay.post_hook:
             copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
 
+        record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
         enqueue_screenshot_from_result(copilot_ctx, copilot_result)
         return _copilot_to_call_tool_result(copilot_result)
 

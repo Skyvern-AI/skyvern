@@ -10,6 +10,7 @@ import hashlib
 import json
 import keyword
 import re
+import zlib
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +32,7 @@ from skyvern.core.script_generations.parameter_reference_guard import (
     log_or_raise_guard_result,
     validate_context_parameter_refs,
 )
+from skyvern.core.script_generations.script_validators import validate_missing_selectors
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
@@ -354,6 +356,9 @@ ACTIONS_WITH_XPATH = [
     "upload_file",
     "select_option",
 ]
+# Methods whose runtime threads `recoverable_marker_id` to the recorder.
+# Markers emitted on other methods would be dead — the recovery loop can never match them.
+RECOVERABLE_MARKER_METHODS = frozenset({"click", "fill", "type"})
 
 
 def _build_semantic_selector(act: dict[str, Any]) -> str | None:
@@ -861,6 +866,8 @@ def _action_to_stmt(
     method = ACTION_MAP[act["action_type"]]
 
     args: list[cst.Arg] = []
+    selector_emitted = False
+    recoverable_marker_id: int | None = None
     if method in ACTIONS_WITH_XPATH:
         if use_semantic_selectors:
             semantic = _build_semantic_selector(act)
@@ -875,7 +882,26 @@ def _action_to_stmt(
                         ),
                     )
                 )
-            # If no semantic selector, skip selector arg — ai with prompt= handles it
+                selector_emitted = True
+            # No semantic selector — caller downgrades to ai='proactive' so the
+            # runtime never sees selectorless ai='fallback' (which crashes with
+            # `selector: expected string, got undefined`). The marker_id is the
+            # stable join key so a future recovery loop can later upgrade this
+            # call back to fallback+selector once the AI's element pick is
+            # captured at runtime.
+            elif method in RECOVERABLE_MARKER_METHODS:
+                # crc32 is process-stable (built-in hash() is salted); action_id
+                # disambiguates duplicate xpath+intention pairs within a block;
+                # 31-bit mask keeps the value within PG signed INTEGER range.
+                # Both intention and reasoning are concatenated (not OR'd) so the marker
+                # stays stable if a regen flips which field is populated.
+                marker_seed = (
+                    f"{act.get('xpath', '')}|"
+                    f"{act.get('intention') or ''}|"
+                    f"{act.get('reasoning') or ''}|"
+                    f"{act.get('action_id', '')}"
+                )
+                recoverable_marker_id = (zlib.crc32(marker_seed.encode("utf-8")) & 0x7FFFFFFF) or 1
         else:
             args.append(
                 cst.Arg(
@@ -887,11 +913,11 @@ def _action_to_stmt(
                     ),
                 )
             )
+            selector_emitted = True
 
     if method == "click":
         if use_semantic_selectors:
-            # With semantic selectors, try selector first, AI only if miss
-            ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+            ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
         else:
             ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
             click_context = act.get("click_context")
@@ -970,7 +996,7 @@ def _action_to_stmt(
         else:
             text_value = _value(act["text"])
 
-        ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+        ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
         if _requires_mini_agent(act):
             ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
 
@@ -1022,6 +1048,17 @@ def _action_to_stmt(
         value = option.get("value")
         label = option.get("label")
         value = value or label
+        if not value and use_semantic_selectors and (act.get("intention") or act.get("reasoning")):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("ai"),
+                    value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
         if value:
             # Mirror the click branch: with semantic selectors we have a real
             # CSS selector + value, so try the selector path first and fall
@@ -1029,7 +1066,7 @@ def _action_to_stmt(
             # selector is an xpath harvested from iteration 0 and unlikely to
             # be reliable, so go straight to AI.
             if use_semantic_selectors:
-                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
             else:
                 ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
             if act.get("field_name"):
@@ -1207,15 +1244,35 @@ def _action_to_stmt(
         if prompt_value is None:
             prompt_value = _value(intention)
 
+        # When a marker arg follows the prompt, prompt's last_line must point
+        # at the inner indent so the marker lines up with sibling args (libcst
+        # uses the *previous* arg's last_line to position the next arg).
+        prompt_trailing = (
+            cst.ParenthesizedWhitespace(indent=True, last_line=cst.SimpleWhitespace(INDENT))
+            if recoverable_marker_id is not None
+            else cst.ParenthesizedWhitespace(indent=True)
+        )
         args.extend(
             [
                 cst.Arg(
                     keyword=cst.Name("prompt"),
                     value=prompt_value,
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
+                    whitespace_after_arg=prompt_trailing,
                     comma=cst.Comma(),
                 ),
             ]
+        )
+    if recoverable_marker_id is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("recoverable_marker_id"),
+                value=_value(recoverable_marker_id),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+                comma=cst.Comma(),
+            )
         )
     _mark_last_arg_as_comma(args)
 
@@ -3705,7 +3762,40 @@ async def generate_workflow_script_python_code(
     except Exception:
         LOG.warning("parameter_reference_guard_failed_to_run", exc_info=True)
 
+    _check_missing_selectors_and_warn(
+        source_code,
+        organization_id=organization_id,
+        workflow_permanent_id=workflow.get("workflow_permanent_id"),
+        workflow_run_id=run_id,
+    )
+
     return CodeGenResult(source_code=source_code, blocks_created=blocks_created, blocks_failed=blocks_failed)
+
+
+def _check_missing_selectors_and_warn(
+    source_code: str,
+    *,
+    organization_id: str | None = None,
+    workflow_permanent_id: str | None,
+    workflow_run_id: str | None,
+) -> str | None:
+    # Returns the validator error string (or None) so tests can assert without
+    # capturing log output. Validator exceptions are swallowed so a parse crash
+    # never blocks codegen.
+    try:
+        selector_warning = validate_missing_selectors(source_code)
+    except Exception:
+        LOG.warning("script_generator_missing_selector_validator_failed_to_run", exc_info=True)
+        return None
+    if selector_warning:
+        LOG.warning(
+            "script_generator_emitted_selectorless_action",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            detail=selector_warning,
+        )
+    return selector_warning
 
 
 async def create_or_update_script_block(
