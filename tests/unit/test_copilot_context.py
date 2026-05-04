@@ -59,6 +59,7 @@ class TestCopilotContext:
             "explore_without_workflow_nudge_count",
             "user_message",
             "consecutive_tool_tracker",
+            "failed_tool_step_tracker",
             "tool_activity",
             "last_workflow",
             "last_workflow_yaml",
@@ -86,6 +87,7 @@ class TestCopilotContext:
         assert ctx.explore_without_workflow_nudge_count == 0
         assert ctx.user_message == ""
         assert ctx.consecutive_tool_tracker == []
+        assert ctx.failed_tool_step_tracker == {}
         assert ctx.tool_activity == []
         assert ctx.last_workflow is None
         assert ctx.workflow_persisted is False
