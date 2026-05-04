@@ -1,13 +1,9 @@
 #!/bin/sh
 # Smoke-test install.sh against fresh Docker base images.
 #
-# Verifies the curl installer works on machines with:
-#   - no Python preinstalled (ubuntu:22.04, ubuntu:24.04, debian:12-slim)
-#   - Python preinstalled but no uv (python:3.11-slim, python:3.13-slim)
-#
 # Usage:
 #   scripts/test-install.sh                # default matrix, --no-init
-#   scripts/test-install.sh --with-init    # full e2e including Chromium download
+#   scripts/test-install.sh --with-init    # full e2e (downloads Chromium)
 #   IMAGES="ubuntu:22.04" scripts/test-install.sh   # subset
 #
 # Requires Docker on the host.
@@ -20,9 +16,7 @@ WITH_INIT=0
 DEFAULT_IMAGES="ubuntu:22.04 ubuntu:24.04 debian:12-slim python:3.11-slim python:3.13-slim"
 IMAGES="${IMAGES:-$DEFAULT_IMAGES}"
 
-# Variant matrix. Today only 'server' is accepted by install.sh; the loop
-# scaffolding is in place so that split day is a data-only change — append
-# 'sdk', 'mcp', 'all' once their PyPI targets exist.
+# Today only 'server' is valid; append other variants when they exist.
 DEFAULT_VARIANTS="server"
 VARIANTS="${VARIANTS:-$DEFAULT_VARIANTS}"
 
@@ -44,9 +38,8 @@ for variant in $VARIANTS; do
             apt-get install -qq -y curl ca-certificates >/dev/null
             sh /tmp/install.sh --variant '$variant' $init_flag
             export PATH=\"\$HOME/.local/bin:\$PATH\"
-            # skyvern's CLI exposes no '--version' flag; --help exiting 0
-            # proves the package imports cleanly (including playwright for
-            # variants that pull it in).
+            # --help exit 0 proves the package imports cleanly (the CLI
+            # has no --version flag).
             skyvern --help >/dev/null
         "; then
             printf 'PASS: %s / variant=%s\n' "$img" "$variant"
