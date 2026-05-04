@@ -509,7 +509,19 @@ async def test_poll_passes_immediately_with_complete_file(setup, tmp_path):
         from skyvern.services.script_service import download
 
         sleep_mock = AsyncMock()
-        with patch(f"{MODULE}.asyncio.sleep", sleep_mock):
+
+        # Patching `script_service.asyncio.sleep` directly mutates the shared
+        # asyncio module, so a stray sleep from any in-process code lands on
+        # the mock and breaks `assert_not_called`. Swap script_service's
+        # asyncio reference for a proxy that intercepts only `sleep`.
+        class _AsyncioProxy:
+            def __init__(self, sleep_attr):
+                self.sleep = sleep_attr
+
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+        with patch(f"{MODULE}.asyncio", _AsyncioProxy(sleep_mock)):
             await download(prompt="Download invoice", label="test_block")
 
         refs["fallback"].assert_not_called()
