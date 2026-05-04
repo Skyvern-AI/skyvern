@@ -459,6 +459,86 @@ class TestUpdateWorkflowDirect:
 
         assert ctx.workflow_yaml == "original yaml"
 
+    @pytest.mark.asyncio
+    async def test_rejects_stale_block_metadata_before_persistence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _update_workflow
+
+        prior_yaml = """
+title: Count example.com topic alpha results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: null
+      navigation_goal: Search example.com for topic alpha.
+"""
+        submitted_yaml = """
+title: Count example.com sample beta results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: null
+      navigation_goal: Search example.com for sample beta.
+"""
+        ctx = _make_ctx(workflow_yaml=prior_yaml)
+
+        result = await _update_workflow({"workflow_yaml": submitted_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert "corrected block metadata still appears stale" in result["error"]
+        assert "search_topic_alpha" in result["error"]
+        assert ctx.workflow_yaml == prior_yaml
+
+    @pytest.mark.asyncio
+    async def test_stale_check_prefers_in_turn_emission_over_turn_start_yaml(self) -> None:
+        # Cross-path flow: an earlier inline REPLACE_WORKFLOW left
+        # ctx.last_workflow_yaml at the renamed state. A subsequent
+        # update_workflow call submits a regression that re-stales the label
+        # — this must compare against ctx.last_workflow_yaml, not the older
+        # ctx.workflow_yaml that still points at turn-start.
+        from skyvern.forge.sdk.copilot.tools import _update_workflow
+
+        turn_start_yaml = """
+title: Alpha workflow
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: review_alpha_one
+      title: Review Alpha One
+      next_block_label: null
+      navigation_goal: Review the alpha one records on the directory.
+"""
+        in_turn_emission_yaml = """
+title: Beta workflow
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: review_beta_two
+      title: Review Beta Two
+      next_block_label: null
+      navigation_goal: Review the beta two records on the directory.
+"""
+        regressed_yaml = """
+title: Beta workflow
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: review_beta_two
+      title: Review Beta Two
+      next_block_label: null
+      navigation_goal: Review the gamma three records on the directory.
+"""
+        ctx = _make_ctx(workflow_yaml=turn_start_yaml)
+        ctx.last_workflow_yaml = in_turn_emission_yaml
+
+        result = await _update_workflow({"workflow_yaml": regressed_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert "review_beta_two" in result["error"]
+
 
 class TestWorkflowUpdatePersistence:
     def test_record_marks_persisted_even_when_workflow_has_zero_blocks(self) -> None:

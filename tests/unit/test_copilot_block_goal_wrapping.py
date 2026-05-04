@@ -143,6 +143,36 @@ def test_idempotent_on_already_wrapped_fields() -> None:
     assert block["complete_criterion"] == already_wrapped_criterion
 
 
+def test_normalizes_spaced_fence_wrapped_goal_without_adding_reword_turn() -> None:
+    revised_goal = "Go to https://example.com. Tell me how many results there are referencing topic beta"
+    spaced_fence_wrapped_goal = textwrap.dedent(
+        f"""
+        Achieve the following mini goal and once it's achieved, complete:
+        ` ` `In the main search box, enter the phrase 'topic beta' and submit the search.` ` `
+
+        This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
+        ` ` `{revised_goal}` ` `
+        """
+    ).strip()
+    src = _yaml_with_blocks(
+        {
+            "block_type": "navigation",
+            "label": "search_topic_beta",
+            "navigation_goal": spaced_fence_wrapped_goal,
+        }
+    )
+
+    out = wrap_block_goals(src, "I meant topic beta")
+
+    goal = _blocks_from(out)[0]["navigation_goal"]
+    assert goal == MINI_GOAL_TEMPLATE.format(
+        mini_goal="In the main search box, enter the phrase 'topic beta' and submit the search.",
+        main_goal=revised_goal,
+    )
+    assert "I meant topic beta" not in goal
+    assert goal.count("Achieve the following mini goal") == 1
+
+
 def test_noop_on_empty_user_message() -> None:
     src = _yaml_with_blocks(
         {
