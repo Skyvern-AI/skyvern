@@ -70,7 +70,11 @@ if [ -n "$SKYVERN_VERSION" ]; then
 fi
 
 printf 'installing %s via uv tool install...\n' "$PKG_SPEC"
-uv tool install --force "$PKG_SPEC"
+# Pin Python to a version inside skyvern's `requires-python = ">=3.11,<3.14"`.
+# Without this, uv may pick the host's Python 3.14 (or newer), in which case
+# environment-marker dependencies like playwright (`<'3.14'`) silently drop
+# out of the resolution and the CLI crashes at import time.
+uv tool install --python 3.13 --force "$PKG_SPEC"
 
 if [ "$SKYVERN_RUN_INIT" = "1" ]; then
     printf "\nrunning 'skyvern init' (installs Chromium, ~150MB)...\n"
