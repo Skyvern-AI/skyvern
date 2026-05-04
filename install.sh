@@ -71,14 +71,13 @@ if ! command -v uv >/dev/null 2>&1; then
     # Download then execute (not `curl ... | sh`): POSIX /bin/sh has no
     # pipefail, so curl failures would otherwise be swallowed silently.
     UV_INSTALLER="$(mktemp -t skyvern-uv-installer.XXXXXX)"
+    trap 'rm -f "$UV_INSTALLER"' EXIT
     if ! curl -LsSf https://astral.sh/uv/install.sh -o "$UV_INSTALLER"; then
-        rm -f "$UV_INSTALLER"
         printf 'ERROR: failed to download uv installer from astral.sh.\n' >&2
         printf '       Check your network/proxy. See https://docs.astral.sh/uv/getting-started/installation/\n' >&2
         exit 1
     fi
     sh "$UV_INSTALLER"
-    rm -f "$UV_INSTALLER"
     export PATH="$HOME/.local/bin:$PATH"
     if ! command -v uv >/dev/null 2>&1; then
         printf 'ERROR: uv installer ran but uv is not on PATH.\n' >&2
