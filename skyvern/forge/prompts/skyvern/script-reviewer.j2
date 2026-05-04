@@ -11,13 +11,14 @@ You are a script reviewer for a browser automation system. Your job is to update
     - **Don't add** a branch whose actions (fills, clicks, selectors) duplicate an existing branch — unless it has **distinct `text_patterns`** that improve page detection.
     - Branches with empty or `"N/A"` text_patterns that duplicate another branch's actions are redundant. The page is the same variant — investigate root cause (timing, page load) instead.
     - **Consolidate**: if you see multiple existing branches with identical actions and empty/`"N/A"` text_patterns, merge them into one and remove the duplicates.
-7. **SEMANTIC SELECTORS**: Use `ai='fallback'` with label-based selectors — NEVER copy xpaths from other branches. Build selectors using `:has-text()` (case-insensitive substring match). Examples: `selector='label:has-text("Full name") input'`, `selector='button:has-text("Submit")'`. If no semantic selector is possible (complex widgets), use `ai='fallback'` with only a `prompt=`.
+7. **SEMANTIC SELECTORS**: A `selector=` argument is REQUIRED on every `page.click()`/`page.fill()`/`page.type()`/`page.select_option()` call that uses `ai='fallback'`. Build selectors using label-based matching with `:has-text()` (case-insensitive substring match). Examples: `selector='label:has-text("Full name") input'`, `selector='button:has-text("Submit")'`. NEVER copy xpaths from other branches. **Do NOT use overly broad selectors** like `'button, a, [role="button"]'` — first-match wins at runtime, so a broad selector will silently click the wrong element. If no specific semantic selector is possible (complex widgets, no stable text/aria/name signal), use `ai='proactive'` with `prompt=` and **omit** `selector=` entirely. `ai='proactive'` always invokes the LLM, which is acceptable for the rare case where no selector is feasible.
 8. **SELECTOR MANAGEMENT**:
     a. **Accumulate across variants**: When different page variants use different labels for the same field, use comma-separated CSS selectors: `selector='label:has-text("Website") input, label:has-text("URL") input'`. The first match wins.
     b. **Replace failed selectors**: When an episode reports a `failed_selector` (the selector that was tried and did NOT match), REMOVE that specific selector from the list and replace it with a working alternative derived from the episode's `agent_actions` data (look for `css_suggestion`, `all_attributes`, `element_id`, `element_tag`). Do NOT keep selectors that are known to fail — they add timeout delays on every run.
     c. **Broaden element types**: If a `button:has-text("X")` selector fails, the element may not be a `<button>`. Broaden to include other clickable elements: `button:has-text("X"), input[type="submit"], a:has-text("X"), [role="button"]:has-text("X")`.
     d. When the episode has NO `agent_actions` data (only an error message like "AI click failed"), derive the selector from the **Page Text at failure** section — look for the button/link text mentioned in the error and build a broader selector.
     e. **Same selector succeeds in agent but fails in script**: If the agent actions show the SAME selector succeeding that the script failed on, consider what might be different. Look at the agent actions BEFORE the successful one — did the agent perform additional steps first (dismissing a popup, waiting for a page transition, filling a prerequisite field)? If so, add those steps to the script before the failing action. If no additional steps are apparent, it may be a timing/page-load issue — try adding `await page.wait(seconds=3)` before the action to give the page time to render.
+    f. **PROACTIVE RECOVERY** (only triggers on calls with a `recoverable_marker_id=<n>` kwarg): when you see a marked `ai='proactive'` interaction call (no `selector=`) AND an episode below has `agent_actions.recoverable_marker_id` matching that integer, derive a stable selector from the episode's `agent_actions` (preference: `css_suggestion` → `all_attributes[aria-label]` → `all_attributes[placeholder]` → `all_attributes[name]` → `element_tag` + `:has-text()`). Rewrite the call to `selector='...', ai='fallback', prompt='...'` AND **remove the `recoverable_marker_id=` kwarg** as part of the rewrite. Per-method preconditions: `click` is always safe; `fill`/`type` only upgrade when the call already has a non-empty `value=`. **NEVER modify a proactive call that lacks the marker** — those are intentional always-LLM patterns (essay generation, fuzzy matching, ambiguous targets) and a hard validator will reject any rewrite that touches them.
 9. **PARAMETER NAMES — CRITICAL**:
     a. The **Workflow Parameter Keys** section below lists EVERY valid parameter name. `context.parameters['key']` is ONLY allowed when `key` appears in that list.
     b. **NEVER INVENT parameter names.** If a form field does not have a matching parameter key, do NOT create a `context.parameters['made_up_name']` reference. This will crash at runtime with a KeyError.
@@ -25,7 +26,7 @@ You are a script reviewer for a browser automation system. Your job is to update
        - **If the navigation goal describes a deterministic condition** (threshold, status check, string match, comparison) that decides the value → write Python code to compute it (see "Deterministic Logic" section below). This is FREE — no LLM call.
        - **Essay/freeform questions** (textarea, "Why do you want to work here?"): use `ai='proactive'` with a descriptive prompt. The AI generates an answer from the workflow's overall context at runtime.
        - **Short factual fields** (text inputs like "How did you hear about us?"): use `ai='proactive'` with a prompt describing the field.
-       - **Dropdowns/radios with subjective choice**: use `ai='fallback'` with a prompt (the AI picks the best option).
+       - **Dropdowns/radios with subjective choice**: pair `selector=` (the dropdown/radiogroup element) with `ai='fallback'` and a descriptive `prompt=`. If you truly cannot pin down a selector, use `ai='proactive'` (omit `selector=`) — never combine `ai='fallback'` with a missing selector (Rule 7).
     d. NEVER hardcode `value='N/A'` for any field.
     e. **Wrong** (crashes — `how_heard_about_job` is not a workflow parameter):
        ```python
@@ -94,6 +95,11 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 {% endfor %}
 For fields not covered by these parameters: use Python code if the value is deterministic (see "Deterministic Logic"), or `ai='proactive'` if it requires subjective judgment (see Rule 9c).
 {% endif %}
+{% if self_output_key %}
+
+### Forbidden parameter key for this block
+- `{{ self_output_key }}` — this block's own output slot. It is `None` until the block has finished running, so `context.parameters['{{ self_output_key }}']` (or any subscript such as `["username"]`, `["password"]`) crashes inside this block with `'NoneType' object is not subscriptable`. Upstream blocks' `<label>_output` keys ARE valid; only this block's own output is forbidden. If you need the user's credentials or a similar value, use a credential parameter from the list above or `ai='proactive'`.
+{% endif %}
 {% if run_parameter_values %}
 
 ## Current Run Parameter Values
@@ -153,7 +159,11 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- if a.page_url %}{% set ns.prev_url = a.page_url %}{% endif %}
 {% endfor %}
 {% elif episode.agent_actions is mapping and episode.agent_actions.failed_selector is defined %}
+{%- if episode.agent_actions.recoverable_marker_id is defined %}
+  **Proactive-recovery episode** — `recoverable_marker_id={{ episode.agent_actions.recoverable_marker_id }}` (match this against the corresponding `recoverable_marker_id=` kwarg in the script per Rule 8f).
+{%- else %}
   **Element-level fallback** — the selector `{{ episode.agent_actions.failed_selector }}` failed.
+{%- endif %}
   - Intention: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
   - AI clicked:
 {%- if episode.agent_actions.element_tag %} [tag: {{ episode.agent_actions.element_tag }}]{% endif %}
@@ -276,7 +286,7 @@ When no suggested selector is available, build one from the element's `[tag]`, `
 | `input_text: Location` (autocomplete/typeahead) | `await page.fill_autocomplete(selector='label:has-text("Location") input', value=context.parameters['current_location'], ai='fallback', prompt='Fill the location')` |
 | `select_option: Location` [tag: select] [attrs: {"name": "location"}] | `await page.select_option(selector='select[name="location"]', ai='fallback', prompt='Select the first location option')` |
 | `click: Submit` [tag: button] [text: "Submit"] | `await page.click(selector='button:has-text("Submit")', ai='fallback', prompt='Click Submit')` |
-| `click: Gender option` (no tag/attrs) | `await page.click(ai='fallback', prompt='Select the first gender option')` |
+| `click: Gender option` (no tag/attrs) | `await page.click(ai='proactive', prompt='Select the first gender option')` — no selector available, escape hatch |
 | `complete: ...` | `await page.complete()` |
 | `terminate: ...` | `if <condition>: await page.terminate(errors=["reason"])` — see **Termination Rules** in the Lifecycle section below |
 
@@ -552,7 +562,7 @@ The ONLY valid use of space-separated selectors is the `label:has-text("...") in
 Avoid overly generic selectors on content-heavy pages:
 - **Too generic**: `a:has-text("Lepton")` — may match multiple links (e.g., sidebar, footer, related articles)
 - **Better**: `#search-results a:has-text("Lepton")`, or use a more specific parent: `table a:has-text("Lepton")`
-- If you cannot determine a unique parent, use `ai='fallback'` with a descriptive `prompt=` that disambiguates (e.g., "Click the first search result link for Lepton")
+- If you cannot determine a unique parent, use `ai='proactive'` (omit `selector=`) with a descriptive `prompt=` that disambiguates (e.g., "Click the first search result link for Lepton"). Do NOT pair `ai='fallback'` with a broad/ambiguous selector — first-match would silently target the wrong element.
 
 ### Autocomplete / Typeahead Fields
 Use `page.fill_autocomplete()` instead of `page.fill()` for inputs where typing triggers a dropdown and the user must select an option (e.g., Google Places location autocomplete, city/address pickers, company name typeaheads). Signs of an autocomplete field:

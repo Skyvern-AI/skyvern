@@ -14,6 +14,15 @@ from skyvern.core.script_generations.generate_script import (
     MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB,
     MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB,
 )
+from skyvern.core.script_generations.script_validators import (
+    INTERACTION_METHODS,
+    PAGE_CALL_RE,
+    find_recoverable_proactive_candidates,
+    validate_marker_kwarg_only_on_recoverable_proactive,
+    validate_missing_selectors,
+    validate_proactive_misuse,
+    validate_unmarked_proactive_unchanged,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
@@ -166,6 +175,348 @@ _ALLOWED_PAGE_API: frozenset[str] = frozenset(
         "url",
     }
 )
+
+
+class _ClassifyBranchCounter(cst.CSTVisitor):
+    """Count classify branches via literal options keys and matching if-arms.
+
+    Returns ``max(options_count, if_arm_count)`` so non-literal classify
+    shapes don't silently underreport growth. If-arms are only counted when
+    the tested name was bound from ``await page.classify(...)``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.options_count = 0
+        self.if_arm_count = 0
+        # Names known to hold a classify result, e.g. ``state`` from
+        # ``state = await page.classify(...)``.  Populated lazily as the
+        # visitor encounters the assignments.  CSTVisitor walks in source
+        # order, so a classify-assignment is visited before any if-arm that
+        # tests its variable.
+        self._classify_vars: set[str] = set()
+
+    @property
+    def total(self) -> int:
+        return max(self.options_count, self.if_arm_count)
+
+    def visit_Assign(self, node: cst.Assign) -> None:
+        if len(node.targets) != 1:
+            return
+        target = node.targets[0].target
+        if not isinstance(target, cst.Name):
+            return
+        if ScriptReviewer._classify_call_node(node.value) is not None:
+            self._classify_vars.add(target.value)
+        else:
+            self._classify_vars.discard(target.value)
+
+    def visit_Call(self, node: cst.Call) -> None:
+        if not ScriptReviewer._is_classify_call(node):
+            return
+        options = ScriptReviewer._dict_kwarg(node, "options")
+        if options is None:
+            return
+        for el in options.elements:
+            if isinstance(el, cst.DictElement) and ScriptReviewer._string_literal_value(el.key) is not None:
+                self.options_count += 1
+
+    def visit_If(self, node: cst.If) -> None:
+        test = node.test
+        if not isinstance(test, cst.Comparison):
+            return
+        if not isinstance(test.left, cst.Name):
+            return
+        if test.left.value not in self._classify_vars:
+            return
+        if len(test.comparisons) != 1:
+            return
+        target = test.comparisons[0]
+        if not isinstance(target.operator, cst.Equal):
+            return
+        if ScriptReviewer._string_literal_value(target.comparator) is None:
+            return
+        self.if_arm_count += 1
+
+
+class _ClassifyConsolidator(cst.CSTTransformer):
+    """Rewrite ``page.classify()`` calls + matching if-chains to merge duplicate branches.
+
+    Walks each function body looking for the pattern::
+
+        var = await page.classify(options={...}, text_patterns={...}, url_patterns={...})
+        if var == "key_a":
+            <body_a>
+        elif var == "key_b":
+            <body_b>
+        ...
+        else:
+            <fallback>
+
+    Within one such pair, branches whose action bodies serialize identically
+    are collapsed into a single branch (preferring to retain the one with
+    non-empty ``text_patterns``). The dict literals and the if-chain are
+    rewritten in lockstep so the output remains a valid script.
+
+    Conservative bail-outs (skip consolidation for that classify call):
+      - Pattern doesn't match (no var, no following if-chain, etc.)
+      - Consolidation would leave zero keyed arms (would orphan the classify result)
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dropped_keys: list[str] = []
+
+    def leave_IndentedBlock(
+        self,
+        original_node: cst.IndentedBlock,
+        updated_node: cst.IndentedBlock,
+    ) -> cst.IndentedBlock:
+        new_body = self._rewrite_body(list(updated_node.body))
+        if new_body is None:
+            return updated_node
+        return updated_node.with_changes(body=tuple(new_body))
+
+    def _rewrite_body(
+        self,
+        stmts: list[cst.BaseStatement],
+    ) -> list[cst.BaseStatement] | None:
+        changed = False
+        i = 0
+        while i < len(stmts):
+            assign_info = self._extract_classify_assignment(stmts[i])
+            if assign_info is None:
+                i += 1
+                continue
+            var_name, classify_call = assign_info
+            # Find the if-chain following classify. Look up to
+            # ``_MAX_PRE_IF_SCAN`` non-If statements ahead — matching the
+            # tolerance of ``_validate_classify_handling`` so any LLM
+            # output that passes validation is reachable for consolidation.
+            if_stmt_idx: int | None = None
+            scan_stop = min(i + 1 + ScriptReviewer._MAX_PRE_IF_SCAN + 1, len(stmts))
+            for j in range(i + 1, scan_stop):
+                candidate = stmts[j]
+                if isinstance(candidate, cst.If):
+                    if_stmt_idx = j
+                    break
+            if if_stmt_idx is None:
+                i += 1
+                continue
+            if_stmt = stmts[if_stmt_idx]
+            assert isinstance(if_stmt, cst.If)
+            # Refuse to consolidate when ``options=`` is non-literal: keys
+            # cannot be stripped from the classify call, so dropping their
+            # if-arms would leave the keys live in the classify output with
+            # no handler.
+            if not isinstance(ScriptReviewer._dict_kwarg(classify_call, "options"), cst.Dict):
+                i += 1
+                continue
+            arms = ScriptReviewer._walk_if_chain(if_stmt, var_name)
+            if len(arms) < 2:
+                i += 1
+                continue
+            # Skip if ``var_name`` is reassigned between classify and the
+            # if-chain — the chain may be testing a rebound value.
+            rebound = False
+            for j in range(i + 1, if_stmt_idx):
+                if ScriptReviewer._stmt_assigns_to(stmts[j], var_name):
+                    rebound = True
+                    break
+            if rebound:
+                i += 1
+                continue
+            options_dict = ScriptReviewer._dict_kwarg(classify_call, "options")
+            assert isinstance(options_dict, cst.Dict)
+            options_keys = set(ScriptReviewer._dict_keys(options_dict).keys())
+            arm_keys = {key for key, _ in arms}
+            if not arm_keys.issubset(options_keys):
+                i += 1
+                continue
+            # If any arm body reads ``var_name``, textual-identity does not
+            # imply runtime-identity (the matched value flows through the
+            # body). Skip rather than risk semantic drift.
+            if any(ScriptReviewer._body_references_name(body, var_name) for _, body in arms):
+                i += 1
+                continue
+            text_patterns_dict = ScriptReviewer._dict_kwarg(classify_call, "text_patterns")
+            url_patterns_dict = ScriptReviewer._dict_kwarg(classify_call, "url_patterns")
+            text_patterns_signal = {
+                k: ScriptReviewer._pattern_node_has_signal(el.value)
+                for k, el in ScriptReviewer._dict_keys(text_patterns_dict).items()
+            }
+            url_patterns_signal = {
+                k: ScriptReviewer._url_pattern_node_has_signal(el.value)
+                for k, el in ScriptReviewer._dict_keys(url_patterns_dict).items()
+            }
+            text_dict_elements = ScriptReviewer._dict_keys(text_patterns_dict)
+            url_dict_elements = ScriptReviewer._dict_keys(url_patterns_dict)
+            # Two-stage rule, per Rule 6b in the reviewer prompt:
+            #   1. Within a body-sig group, sub-group by exact pattern
+            #      values; drop within-bucket duplicates.
+            #   2. Among survivors, drop no-signal duplicates of
+            #      signal-bearing keys; if all survivors are no-signal,
+            #      keep first by source order.
+            groups: dict[str, list[str]] = {}
+            for key, body in arms:
+                sig = ScriptReviewer._body_signature(body)
+                if not sig:
+                    continue
+                groups.setdefault(sig, []).append(key)
+
+            def _has_pattern_signal(k: str) -> bool:
+                return text_patterns_signal.get(k, False) or url_patterns_signal.get(k, False)
+
+            def _bucket_key(elements: dict[str, cst.DictElement], k: str, prefix: str) -> str:
+                # "M" for missing entries (collapse together), "L:<v>" for
+                # literals (collapse identical literals), "O:<dim>:<key>"
+                # for opaque AST shapes (per-key unique — distinctness is
+                # unknown, not proven absent).
+                if k not in elements:
+                    return "M"
+                repr_val = ScriptReviewer._pattern_node_repr(elements[k].value)
+                if repr_val is None:
+                    return f"O:{prefix}:{k}"
+                return f"L:{repr_val}"
+
+            drop_keys: set[str] = set()
+            for sig_keys in groups.values():
+                if len(sig_keys) < 2:
+                    continue
+                pair_buckets: dict[tuple[str, str], list[str]] = {}
+                for k in sig_keys:
+                    pair = (
+                        _bucket_key(text_dict_elements, k, "t"),
+                        _bucket_key(url_dict_elements, k, "u"),
+                    )
+                    pair_buckets.setdefault(pair, []).append(k)
+                for bucket in pair_buckets.values():
+                    if len(bucket) > 1:
+                        drop_keys.update(bucket[1:])
+                survivors = [k for k in sig_keys if k not in drop_keys]
+                if len(survivors) < 2:
+                    continue
+                signal_bearing = [k for k in survivors if _has_pattern_signal(k)]
+                no_signal = [k for k in survivors if not _has_pattern_signal(k)]
+                if signal_bearing and no_signal:
+                    drop_keys.update(no_signal)
+                elif not signal_bearing:
+                    drop_keys.update(survivors[1:])
+
+            if not drop_keys:
+                i += 1
+                continue
+            # Defense-in-depth: the picker always keeps at least one key per
+            # body group, so this guard is unreachable today. Kept against
+            # future refactors that might bypass keeper selection.
+            remaining = len(arms) - len(drop_keys)
+            if remaining < 1:
+                i += 1
+                continue
+            new_classify = self._strip_keys_from_classify(classify_call, drop_keys)
+            new_if_chain = self._filter_if_chain(if_stmt, var_name, drop_keys)
+            if new_if_chain is None or not isinstance(new_if_chain, cst.If):
+                i += 1
+                continue
+            stmts[i] = self._rewrap_classify_call(stmts[i], classify_call, new_classify)
+            stmts[if_stmt_idx] = new_if_chain
+            self.dropped_keys.extend(sorted(drop_keys))
+            changed = True
+            i = if_stmt_idx + 1
+        return stmts if changed else None
+
+    @staticmethod
+    def _extract_classify_assignment(
+        stmt: cst.BaseStatement,
+    ) -> tuple[str, cst.Call] | None:
+        """If ``stmt`` is ``var = await page.classify(...)``, return (var_name, call)."""
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            return None
+        for small in stmt.body:
+            if not isinstance(small, cst.Assign):
+                continue
+            if len(small.targets) != 1:
+                continue
+            target = small.targets[0].target
+            if not isinstance(target, cst.Name):
+                continue
+            call = ScriptReviewer._classify_call_node(small.value)
+            if call is None:
+                continue
+            return target.value, call
+        return None
+
+    @staticmethod
+    def _strip_keys_from_classify(call: cst.Call, drop: set[str]) -> cst.Call:
+        """Return a copy of the classify call with dropped keys removed from its dict kwargs."""
+        new_args: list[cst.Arg] = []
+        for arg in call.args:
+            if (
+                arg.keyword is not None
+                and arg.keyword.value in {"options", "text_patterns", "url_patterns"}
+                and isinstance(arg.value, cst.Dict)
+            ):
+                new_dict = _ClassifyConsolidator._strip_keys_from_dict(arg.value, drop)
+                new_args.append(arg.with_changes(value=new_dict))
+            else:
+                new_args.append(arg)
+        return call.with_changes(args=tuple(new_args))
+
+    @staticmethod
+    def _strip_keys_from_dict(d: cst.Dict, drop: set[str]) -> cst.Dict:
+        new_elements: list[cst.BaseDictElement] = []
+        for el in d.elements:
+            if isinstance(el, cst.DictElement):
+                key = ScriptReviewer._string_literal_value(el.key)
+                if key is not None and key in drop:
+                    continue
+            new_elements.append(el)
+        return d.with_changes(elements=tuple(new_elements))
+
+    @staticmethod
+    def _rewrap_classify_call(
+        stmt: cst.BaseStatement,
+        old_call: cst.Call,
+        new_call: cst.Call,
+    ) -> cst.BaseStatement:
+        """Replace ``old_call`` with ``new_call`` inside the classify-assign statement."""
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            return stmt
+        new_body: list[cst.BaseSmallStatement] = []
+        for small in stmt.body:
+            if isinstance(small, cst.Assign):
+                value = small.value
+                if isinstance(value, cst.Await) and value.expression is old_call:
+                    new_body.append(small.with_changes(value=value.with_changes(expression=new_call)))
+                    continue
+                if value is old_call:
+                    new_body.append(small.with_changes(value=new_call))
+                    continue
+            new_body.append(small)
+        return stmt.with_changes(body=tuple(new_body))
+
+    @staticmethod
+    def _filter_if_chain(
+        if_stmt: cst.If,
+        var_name: str,
+        drop: set[str],
+    ) -> cst.If | cst.Else | None:
+        """Recursively rebuild the if-chain with dropped arms elided.
+
+        Walks the chain via ``.orelse``. When an arm's test matches
+        ``var_name == "<dropped_key>"``, it is replaced by its tail
+        (its ``.orelse``) — effectively removing the arm while keeping
+        the remaining chain intact.
+        """
+        key = ScriptReviewer._if_chain_test_against(if_stmt.test, var_name)
+        new_orelse: cst.If | cst.Else | None
+        if isinstance(if_stmt.orelse, cst.If):
+            new_orelse = _ClassifyConsolidator._filter_if_chain(if_stmt.orelse, var_name, drop)
+        else:
+            new_orelse = if_stmt.orelse
+        if key is not None and key in drop:
+            return new_orelse
+        return if_stmt.with_changes(orelse=new_orelse)
 
 
 class ScriptReviewer:
@@ -384,6 +735,14 @@ class ScriptReviewer:
         if not conditional_episodes:
             return None
 
+        # Conditional code is persisted via `create_script_version_from_review`
+        # too, so it must run the same parameter-reference validation as the
+        # regular reviewer path. Load the workflow's parameter keys here.
+        _, all_parameter_keys, _ = await self._load_workflow_context(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
         # Group episodes by block label — keep only the latest per block
         latest_by_block: dict[str, ScriptFallbackEpisode] = {}
         for ep in conditional_episodes:
@@ -399,6 +758,7 @@ class ScriptReviewer:
                     episode=episode,
                     organization_id=organization_id,
                     run_parameter_values=run_parameter_values,
+                    all_parameter_keys=all_parameter_keys,
                 )
                 if code:
                     updated_blocks[block_label] = code
@@ -415,6 +775,7 @@ class ScriptReviewer:
         block_label: str,
         episode: ScriptFallbackEpisode,
         organization_id: str,
+        all_parameter_keys: list[str],
         run_parameter_values: dict[str, str] | None = None,
     ) -> str | None:
         """Generate Python code for a conditional block based on its expression patterns.
@@ -560,6 +921,29 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(code, hardcoded_error, function_signature)
                     continue
 
+                # The filter strips `<block_label>_output` from the valid set so
+                # the validator's primary mode rejects any ref to the current
+                # block's own output. `self_output_key` is also threaded through
+                # to (a) catch the empty-valid-set edge case and (b) augment the
+                # retry hint with the NoneType crash explanation.
+                self_output_key = f"{block_label}_output" if block_label else None
+                conditional_param_keys = self._filter_self_output_param_keys(
+                    sorted(set(all_parameter_keys)), block_label or ""
+                )
+                param_error = self._validate_parameter_references(
+                    code, conditional_param_keys, self_output_key=self_output_key
+                )
+                if param_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: conditional code has invalid parameter references",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=param_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(code, param_error, function_signature)
+                    continue
+
                 LOG.info(
                     "ScriptReviewer: generated conditional code",
                     block_label=block_label,
@@ -692,6 +1076,20 @@ class ScriptReviewer:
             code_length=len(existing_code),
         )
 
+        # SKY-9436: log marker-tagged proactive calls for Datadog visibility.
+        # Rule 8f instructs the LLM to upgrade these to fallback+selector when
+        # matching proactive_recovery episode data is available (recording
+        # path is the explicit follow-up).
+        recoverable_candidates = find_recoverable_proactive_candidates(existing_code)
+        if recoverable_candidates:
+            LOG.info(
+                "script_recoverable_proactive_detected",
+                block_label=block_label,
+                script_revision_id=script_revision_id,
+                count=len(recoverable_candidates),
+                marker_ids=[c.marker_id for c in recoverable_candidates[:10]],
+            )
+
         # Use provided navigation goal, or fall back to a generic description
         if not navigation_goal:
             navigation_goal = "Complete the navigation task for this block"
@@ -731,6 +1129,14 @@ class ScriptReviewer:
         # and merge with workflow-level parameter keys for a complete list.
         goal_param_keys = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", navigation_goal))
         parameter_keys = sorted(goal_param_keys | set(all_parameter_keys or []))
+        # The filter strips `<block_label>_output` from the valid set so the
+        # validator's primary mode rejects any ref to the current block's own
+        # output (it's None until the block finishes — `'NoneType' object is
+        # not subscriptable'`). `self_output_key` is also threaded into the
+        # validator and prompt template to (a) catch the empty-valid-set edge
+        # case and (b) explain the crash mode in retry hints.
+        self_output_key = f"{block_label}_output" if block_label else None
+        parameter_keys = self._filter_self_output_param_keys(parameter_keys, block_label or "")
 
         # Build historical episode summaries for cross-run context.
         # Include per-run parameter values so the reviewer can detect that
@@ -782,6 +1188,7 @@ class ScriptReviewer:
             terminate_criterion=terminate_criterion,
             complete_criterion=complete_criterion,
             error_code_mapping=error_code_mapping,
+            self_output_key=self_output_key,
         )
 
         LOG.info(
@@ -858,6 +1265,38 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, api_error, function_signature)
                     continue
 
+                # SKY-9436 safety: reject any rewrite that mutates an unmarked
+                # ai='proactive' call (essay/fuzzy/ambiguous patterns are
+                # intentional always-LLM and must be preserved).
+                marker_safety_error = validate_unmarked_proactive_unchanged(existing_code, updated_code)
+                if marker_safety_error is not None:
+                    LOG.warning(
+                        "safety_validator_blocked_unmarked_proactive_change",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=marker_safety_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, marker_safety_error, function_signature)
+                    continue
+
+                # SKY-9436: marker kwarg must be removed when call is upgraded
+                # past the recoverable-proactive shape. If it leaks through, we
+                # can crash at runtime when Playwright sees an unknown kwarg.
+                marker_position_error = validate_marker_kwarg_only_on_recoverable_proactive(updated_code)
+                if marker_position_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: stray recoverable_marker_id detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=marker_position_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(
+                            updated_code, marker_position_error, function_signature
+                        )
+                    continue
+
                 # Validate method kwargs (catch invented kwargs like classify(description=...))
                 kwargs_error = self._validate_method_kwargs(updated_code)
                 if kwargs_error is not None:
@@ -918,8 +1357,11 @@ class ScriptReviewer:
                             current_prompt = self._build_retry_prompt(updated_code, classify_error, function_signature)
                         continue
 
-                # Validate parameter references (catch invented context.parameters['...'] keys)
-                param_error = self._validate_parameter_references(updated_code, parameter_keys)
+                # Validate parameter references — invented keys and the
+                # current block's own `_output` ref both fail here.
+                param_error = self._validate_parameter_references(
+                    updated_code, parameter_keys, self_output_key=self_output_key
+                )
                 if param_error is not None:
                     LOG.warning(
                         "ScriptReviewer: invalid parameter reference, retrying",
@@ -988,7 +1430,9 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, hardcoded_error, function_signature)
                     continue
 
-                # Validate ai='proactive' misuse (should be 'fallback' on interaction methods)
+                # The validator already permits the one legitimate proactive+selector case
+                # (no-value select_option with semantic selector), so any remaining flag is
+                # a real caching regression — block and retry.
                 proactive_error = self._validate_proactive_misuse(updated_code)
                 if proactive_error is not None:
                     LOG.warning(
@@ -1042,12 +1486,54 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, run_data_error, function_signature)
                     continue
 
+                # Rule 6b enforcement: merge classify branches with
+                # byte-identical action bodies. Net-add growth is logged
+                # for telemetry but not rejected.
+                pre_consolidation_branches = self._count_classify_branches(updated_code)
+                consolidated_code, dropped_keys = self._consolidate_classify_duplicates(updated_code)
+                if dropped_keys:
+                    final_branches = self._count_classify_branches(consolidated_code)
+                    LOG.info(
+                        "ScriptReviewer: consolidated duplicate classify branches",
+                        block_label=block_label,
+                        dropped_keys=dropped_keys,
+                        branches_before=pre_consolidation_branches,
+                        branches_after=final_branches,
+                    )
+                    updated_code = consolidated_code
+                else:
+                    final_branches = pre_consolidation_branches
+                existing_branches = self._count_classify_branches(existing_code)
+                if final_branches > existing_branches:
+                    LOG.info(
+                        "ScriptReviewer: classify branches net-added after consolidation",
+                        block_label=block_label,
+                        branches_before=existing_branches,
+                        branches_after=final_branches,
+                        net_added=final_branches - existing_branches,
+                    )
+
                 LOG.info(
                     "ScriptReviewer: generated updated code for block",
                     block_label=block_label,
                     attempt=attempt,
                     code_length=len(updated_code),
                 )
+
+                # SKY-9436: emit applied event for each marker that vanished
+                # from input → output (the LLM successfully upgraded it).
+                input_markers = {c.marker_id for c in find_recoverable_proactive_candidates(existing_code)}
+                output_markers = {c.marker_id for c in find_recoverable_proactive_candidates(updated_code)}
+                applied_marker_ids = sorted(input_markers - output_markers)
+                if applied_marker_ids:
+                    LOG.info(
+                        "script_proactive_recovery_applied",
+                        block_label=block_label,
+                        script_revision_id=script_revision_id,
+                        applied_count=len(applied_marker_ids),
+                        marker_ids=applied_marker_ids[:10],
+                    )
+
                 return BlockReviewResult(
                     code=updated_code,
                     original_prompt=reviewer_prompt,
@@ -1476,9 +1962,20 @@ class ScriptReviewer:
     # Anything not in the set triggers a retry so the LLM fixes its code.
     _METHOD_KWARGS: dict[str, frozenset[str]] = {
         "classify": frozenset({"options", "url_patterns", "text_patterns"}),
-        "click": frozenset({"selector", "prompt", "ai", "intention", "data", "timeout"}),
+        "click": frozenset({"selector", "prompt", "ai", "intention", "data", "timeout", "recoverable_marker_id"}),
         "fill": frozenset(
-            {"selector", "value", "ai", "prompt", "intention", "data", "totp_identifier", "totp_url", "timeout"}
+            {
+                "selector",
+                "value",
+                "ai",
+                "prompt",
+                "intention",
+                "data",
+                "totp_identifier",
+                "totp_url",
+                "timeout",
+                "recoverable_marker_id",
+            }
         ),
         "fill_autocomplete": frozenset(
             {
@@ -1495,6 +1992,20 @@ class ScriptReviewer:
             }
         ),
         "select_option": frozenset({"selector", "value", "ai", "prompt", "intention", "data", "timeout"}),
+        "type": frozenset(
+            {
+                "selector",
+                "value",
+                "ai",
+                "prompt",
+                "intention",
+                "data",
+                "totp_identifier",
+                "totp_url",
+                "timeout",
+                "recoverable_marker_id",
+            }
+        ),
         "extract": frozenset({"prompt", "schema", "error_code_mapping", "intention", "data"}),
         "validate": frozenset({"prompt", "model"}),
         "element_fallback": frozenset({"navigation_goal", "max_steps"}),
@@ -1656,50 +2167,118 @@ class ScriptReviewer:
             return None
         return "; ".join(errors[:3])
 
-    # Regex to find context.parameters['key'] or context.parameters["key"]
-    _PARAM_REF_RE = re.compile(r"""context\.parameters\[['"](\w+)['"]\]""")
+    # Matches both subscript (`context.parameters['key']` / `[ 'key' ]`) and
+    # dict-get (`context.parameters.get('key')` / `.get('key', default)`) access.
+    # `\s*` at every accessor boundary so reformatted variants (newlines inside
+    # the subscript, spaces between `parameters` and `.get`, etc.) can't bypass
+    # the validator. A libcst AST walker would be a stronger replacement —
+    # `_validate_no_hardcoded_values` already uses libcst as precedent.
+    _PARAM_REF_RE = re.compile(
+        r"""context\s*\.\s*parameters\s*(?:\[\s*['"](\w+)['"]\s*\]|\.\s*get\s*\(\s*['"](\w+)['"]\s*(?:,[^)]*)?\))"""
+    )
 
-    def _find_param_refs_excluding_comments(self, code: str) -> list[str]:
-        """Extract parameter reference keys from code, skipping comment lines."""
-        refs: list[str] = []
+    @staticmethod
+    def _strip_comment_lines(code: str) -> str:
+        out = []
         for line in code.split("\n"):
             if line.lstrip().startswith("#"):
-                continue
-            for match in self._PARAM_REF_RE.finditer(line):
-                refs.append(match.group(1))
+                out.append("")
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    def _find_param_refs_excluding_comments(self, code: str) -> list[str]:
+        """Extract parameter reference keys from code, skipping comment lines.
+
+        Uses a whole-code regex scan (rather than per-line) so multiline
+        access like::
+
+            value=context.parameters[
+                'block_output'
+            ]['username']
+
+        is still matched. The regex's ``\\s*`` already permits newlines inside
+        the subscript brackets and `.get()` parens.
+        """
+        scrubbed = self._strip_comment_lines(code)
+        refs: list[str] = []
+        for match in self._PARAM_REF_RE.finditer(scrubbed):
+            # Group 1 = subscript form, group 2 = .get() form; exactly one fires.
+            key = match.group(1) or match.group(2)
+            if key:
+                refs.append(key)
         return refs
 
-    def _validate_parameter_references(self, code: str, parameter_keys: list[str]) -> str | None:
+    @staticmethod
+    def _filter_self_output_param_keys(parameter_keys: list[str], block_label: str) -> list[str]:
+        """Drop the current block's own ``<block_label>_output`` from the parameter list.
+
+        The output slot is ``None`` until the block has finished running, so any
+        ``context.parameters['<self>_output']`` reference inside the block crashes
+        with ``'NoneType' object is not subscriptable``. Upstream and downstream
+        block outputs stay — only the current block's output is forbidden.
+        """
+        if not block_label:
+            return parameter_keys
+        self_output_key = f"{block_label}_output"
+        return [k for k in parameter_keys if k != self_output_key]
+
+    def _validate_parameter_references(
+        self,
+        code: str,
+        parameter_keys: list[str],
+        self_output_key: str | None = None,
+    ) -> str | None:
         """Validate that context.parameters['key'] references use known parameter keys.
 
         Catches KeyError crashes at runtime when the LLM invents parameter names.
-        Returns an error message or None if all references are valid.
+        When ``self_output_key`` is supplied and matches one of the rejected
+        references, the retry hint explains the self-output ``None``-subscript
+        crash so the LLM doesn't reintroduce the same pattern.
+
+        Short-circuits on an empty valid set only when ``self_output_key`` is
+        also absent. With a self-output key in play we still scan so the bug
+        can't slip through workflows whose only declared parameter was the
+        block's own output.
         """
-        if not parameter_keys:
-            return None  # No parameter keys to validate against
+        if not parameter_keys and not self_output_key:
+            return None  # No constraints to validate against (preserves prior behavior).
 
         valid_keys = set(parameter_keys)
         invalid: list[str] = []
 
-        for line in code.split("\n"):
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
+        # Empty valid set + ``self_output_key`` rejects only the self-output
+        # ref; other unknown refs may be runtime-valid synthesized keys we
+        # don't load into the valid set, so we let them through.
+        scrubbed = self._strip_comment_lines(code)
+        for match in self._PARAM_REF_RE.finditer(scrubbed):
+            key = match.group(1) or match.group(2)
+            if not key:
                 continue
-            for match in self._PARAM_REF_RE.finditer(line):
-                key = match.group(1)
-                if key not in valid_keys:
-                    invalid.append(key)
+            if valid_keys and key not in valid_keys:
+                invalid.append(key)
+            elif not valid_keys and self_output_key and key == self_output_key:
+                invalid.append(key)
 
         if not invalid:
             return None
 
         unique_invalid = sorted(set(invalid))
-        return (
+        valid_list = ", ".join(repr(k) for k in sorted(valid_keys)) or "(none)"
+        message = (
             f"Invalid context.parameters references: {', '.join(repr(k) for k in unique_invalid)}. "
-            f"Valid parameter keys are: {', '.join(repr(k) for k in sorted(valid_keys))}. "
+            f"Valid parameter keys are: {valid_list}. "
             f"For fields without a matching parameter, use ai='proactive' with a descriptive prompt "
             f"instead of context.parameters['invented_name']."
         )
+        if self_output_key and self_output_key in set(invalid):
+            message += (
+                f" NOTE: {self_output_key!r} is the current block's own output slot — it is None "
+                f"during this block's execution and reading it (or any subscript of it) crashes with "
+                f"'NoneType' object is not subscriptable'. Use a parameter from the valid list, an "
+                f"upstream block's output, or ai='proactive' instead."
+            )
+        return message
 
     def _validate_parameter_preservation(
         self, new_code: str, existing_code: str | None, parameter_keys: list[str]
@@ -2061,105 +2640,16 @@ class ScriptReviewer:
             f"Replace ALL hardcoded parameter values with context.parameters['key'] references."
         )
 
-    # Methods whose primary purpose is interaction — ai='proactive' on these
-    # defeats caching by always invoking the LLM even when the selector works.
-    _INTERACTION_METHODS: frozenset[str] = frozenset({"click", "fill", "fill_autocomplete", "type", "select_option"})
-
-    # Regex to find page.<method>( calls
-    _PAGE_CALL_RE: re.Pattern[str] = re.compile(r"""\bpage\.(\w+)\s*\(""")
+    # Re-exported from the shared validator module to avoid drift between
+    # generator-side and reviewer-side rules.
+    _INTERACTION_METHODS: frozenset[str] = INTERACTION_METHODS
+    _PAGE_CALL_RE: re.Pattern[str] = PAGE_CALL_RE
 
     def _validate_proactive_misuse(self, code: str) -> str | None:
-        """Flag ai='proactive' on interaction methods (click, fill, type, select_option).
-
-        Using ai='proactive' means the LLM is always invoked even when the selector
-        works, defeating the zero-LLM-cost goal of caching. These should almost always
-        use ai='fallback' instead.
-
-        Returns an error message or None if no issues found.
-        """
-        issues: list[str] = []
-        lines = code.split("\n")
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].lstrip()
-            if stripped.startswith("#"):
-                i += 1
-                continue
-            match = self._PAGE_CALL_RE.search(lines[i])
-            if match and match.group(1) in self._INTERACTION_METHODS:
-                # Gather the full call (may span multiple lines)
-                call_text = lines[i]
-                end_line = self._find_call_end(lines, i)
-                if end_line > i:
-                    call_text = "\n".join(lines[i : end_line + 1])
-                if re.search(r"""\bai\s*=\s*['"]proactive['"]""", call_text):
-                    issues.append(f"page.{match.group(1)}() on line {i + 1}")
-                i = end_line + 1
-            else:
-                i += 1
-
-        if not issues:
-            return None
-
-        return (
-            f"ai='proactive' used on interaction methods: {', '.join(issues[:5])}. "
-            f"Using ai='proactive' on interaction methods ({'/'.join(sorted(self._INTERACTION_METHODS))}) means the LLM is "
-            f"ALWAYS invoked even when the selector works, defeating the zero-LLM-cost "
-            f"goal of caching. Change to ai='fallback' — this tries the selector first "
-            f"and only invokes the LLM if the selector fails."
-        )
+        return validate_proactive_misuse(code)
 
     def _validate_missing_selectors(self, code: str) -> str | None:
-        """Flag interaction methods that lack a selector= argument.
-
-        Two cases are flagged:
-        1. ai='fallback' but no selector — the CSS-try block is skipped entirely and
-           AI fires as the primary path on every run, burning LLM tokens silently.
-        2. No ai= argument at all and no selector — the call has no deterministic path
-           and no explicit AI strategy, so it silently burns tokens with no fallback
-           episode created.
-
-        ai='proactive' without a selector is intentional (AI always generates the value)
-        and is NOT flagged here.
-
-        Returns an error message or None if no issues found.
-        """
-        issues: list[str] = []
-        lines = code.split("\n")
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].lstrip()
-            if stripped.startswith("#"):
-                i += 1
-                continue
-            match = self._PAGE_CALL_RE.search(lines[i])
-            if match and match.group(1) in self._INTERACTION_METHODS:
-                end_line = self._find_call_end(lines, i)
-                call_text = "\n".join(lines[i : end_line + 1]) if end_line > i else lines[i]
-                has_selector = bool(re.search(r"""\bselector\s*=""", call_text))
-                has_any_ai = bool(re.search(r"""\bai\s*=""", call_text))
-                has_proactive = bool(re.search(r"""\bai\s*=\s*['"]proactive['"]""", call_text))
-                # Flag if no selector AND (explicit fallback OR no ai argument at all).
-                # ai='proactive' without selector is fine — intentional AI-driven fill.
-                if not has_selector and has_any_ai and not has_proactive:
-                    issues.append(f"page.{match.group(1)}() on line {i + 1}")
-                elif not has_selector and not has_any_ai:
-                    issues.append(f"page.{match.group(1)}() on line {i + 1} (no ai= argument)")
-                i = end_line + 1
-            else:
-                i += 1
-
-        if not issues:
-            return None
-
-        return (
-            f"Missing selector on interaction methods: {', '.join(issues[:5])}. "
-            f"Interaction methods without a selector= argument have no deterministic path — "
-            f"they silently invoke the LLM on every run, burning tokens with no fallback "
-            f"episode created. Add a selector= argument with a stable CSS selector "
-            f"(aria-label, placeholder, name, role, :has-text()) and set ai='fallback' "
-            f"so the element is found without an LLM call."
-        )
+        return validate_missing_selectors(code)
 
     # Known auto-generated ID patterns from popular web frameworks.
     # These IDs change across deployments/sessions and break cached selectors.
@@ -2234,7 +2724,8 @@ class ScriptReviewer:
             f"These IDs are generated by web frameworks (DotNetNuke, Ember, React, MUI, etc.) "
             f"and change across deployments. Replace with stable selectors: "
             f"aria-label, placeholder, name, role, data-testid, or :has-text() with stable text. "
-            f"If no stable selector exists, use ai='fallback' with a descriptive prompt and NO selector."
+            f"If no stable selector exists, use ai='proactive' with a descriptive prompt and OMIT selector= entirely "
+            f"(the no-selector escape hatch). Do NOT keep ai='fallback' without a selector — that crashes at runtime."
         )
 
     # Regex for dates in common formats (MM/DD/YYYY, M/D/YYYY, YYYY-MM-DD)
@@ -2532,6 +3023,286 @@ class ScriptReviewer:
                     lines = lines[: last_branch_body_end + 1] + else_block + lines[last_branch_body_end + 1 :]
 
         return "\n".join(lines)
+
+    # Patterns the consolidation pass treats as "no real text fingerprint" — branches
+    # carrying these as their text_patterns entry are mergeable with any sibling whose
+    # action body matches byte-for-byte.
+    _CONSOLIDATE_EMPTY_PATTERNS: frozenset[str] = frozenset({"", "n/a"})
+
+    @staticmethod
+    def _is_classify_call(node: cst.BaseExpression) -> bool:
+        """Return True if ``node`` is (``await``-wrapped) ``page.classify(...)``."""
+        if isinstance(node, cst.Await):
+            node = node.expression
+        if not isinstance(node, cst.Call):
+            return False
+        func = node.func
+        return (
+            isinstance(func, cst.Attribute)
+            and isinstance(func.value, cst.Name)
+            and func.value.value == "page"
+            and func.attr.value == "classify"
+        )
+
+    @staticmethod
+    def _classify_call_node(value: cst.BaseExpression) -> cst.Call | None:
+        """Unwrap ``await page.classify(...)`` and return the inner Call node, or None."""
+        if isinstance(value, cst.Await):
+            value = value.expression
+        if isinstance(value, cst.Call) and ScriptReviewer._is_classify_call(value):
+            return value
+        return None
+
+    @staticmethod
+    def _string_literal_value(node: cst.BaseExpression) -> str | None:
+        """Extract the runtime string value from a ``cst.SimpleString`` (or None for f-strings)."""
+        if isinstance(node, cst.SimpleString):
+            try:
+                evaluated = node.evaluated_value
+            except Exception:
+                return None
+            return evaluated if isinstance(evaluated, str) else None
+        return None
+
+    @staticmethod
+    def _dict_kwarg(call: cst.Call, name: str) -> cst.Dict | None:
+        """Return the dict literal passed as ``name=...`` to this call, or None."""
+        for arg in call.args:
+            if arg.keyword is not None and arg.keyword.value == name and isinstance(arg.value, cst.Dict):
+                return arg.value
+        return None
+
+    @staticmethod
+    def _dict_keys(d: cst.Dict | None) -> dict[str, cst.DictElement]:
+        """Index a Dict literal's elements by their string-literal key. Non-string keys are skipped."""
+        if d is None:
+            return {}
+        out: dict[str, cst.DictElement] = {}
+        for el in d.elements:
+            if isinstance(el, cst.DictElement):
+                key = ScriptReviewer._string_literal_value(el.key)
+                if key is not None:
+                    out[key] = el
+        return out
+
+    @staticmethod
+    def _if_chain_test_against(test: cst.BaseExpression, var_name: str) -> str | None:
+        """If ``test`` is ``var_name == "literal"``, return the literal value; else None."""
+        if not isinstance(test, cst.Comparison):
+            return None
+        if not isinstance(test.left, cst.Name) or test.left.value != var_name:
+            return None
+        if len(test.comparisons) != 1:
+            return None
+        target = test.comparisons[0]
+        if not isinstance(target.operator, cst.Equal):
+            return None
+        return ScriptReviewer._string_literal_value(target.comparator)
+
+    @staticmethod
+    def _walk_if_chain(if_stmt: cst.If, var_name: str) -> list[tuple[str, cst.IndentedBlock]]:
+        """Return ``[(branch_key, body), ...]`` for each ``if/elif var == "key"`` arm.
+
+        Stops at the first arm whose test does not match the ``var == literal`` shape
+        (the ``else:`` branch returns no entry — it is the fallback, not a key).
+        """
+        arms: list[tuple[str, cst.IndentedBlock]] = []
+        node: cst.If | cst.Else | None = if_stmt
+        while isinstance(node, cst.If):
+            key = ScriptReviewer._if_chain_test_against(node.test, var_name)
+            if key is None:
+                break
+            if isinstance(node.body, cst.IndentedBlock):
+                arms.append((key, node.body))
+            node = node.orelse
+        return arms
+
+    @staticmethod
+    def _body_signature(body: cst.IndentedBlock) -> str:
+        """Serialize an arm body to canonical Python source for byte-equal comparison."""
+        try:
+            return cst.Module(body=list(body.body)).code.strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_empty_pattern(value: str | None) -> bool:
+        if value is None:
+            return True
+        return value.strip().lower() in ScriptReviewer._CONSOLIDATE_EMPTY_PATTERNS
+
+    @staticmethod
+    def _stmt_assigns_to(stmt: cst.BaseStatement, name: str) -> bool:
+        """Return True if ``stmt`` is a top-level rebind of ``name``.
+
+        Handles plain, annotated, and augmented assigns. Walrus/unpacking
+        targets are conservatively reported as False — the consolidator's
+        safety gate biases toward over-eager skipping, so a false negative
+        here just means we skip consolidation when we could have proceeded.
+        """
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            return False
+        for small in stmt.body:
+            if isinstance(small, cst.Assign):
+                for target in small.targets:
+                    inner = target.target
+                    if isinstance(inner, cst.Name) and inner.value == name:
+                        return True
+            elif isinstance(small, cst.AnnAssign):
+                if isinstance(small.target, cst.Name) and small.target.value == name:
+                    return True
+            elif isinstance(small, cst.AugAssign):
+                if isinstance(small.target, cst.Name) and small.target.value == name:
+                    return True
+        return False
+
+    @staticmethod
+    def _body_references_name(body: cst.IndentedBlock, name: str) -> bool:
+        """Return True if ``body`` references the bare name ``name`` anywhere.
+
+        Used to refuse consolidation when textually-identical arm bodies
+        depend on the matched value (e.g. ``log(state)``, ``f"go {state}"``)
+        — those are not semantically equivalent. ``Attribute`` access like
+        ``self.name`` is not matched.
+        """
+
+        class _NameProbe(cst.CSTVisitor):
+            def __init__(self) -> None:
+                super().__init__()
+                self.found = False
+
+            def visit_Name(self, node: cst.Name) -> None:
+                if node.value == name:
+                    self.found = True
+
+        probe = _NameProbe()
+        try:
+            body.visit(probe)
+        except Exception:
+            return True  # conservative on traversal failure
+        return probe.found
+
+    @staticmethod
+    def _pattern_node_repr(node: cst.BaseExpression | None) -> str | None:
+        """Canonical string repr of a pattern AST node, used for equality testing.
+
+        Returns the literal value for SimpleString, ``repr(tuple(values))`` for
+        List/Tuple of strings (order-sensitive — over-preserving safer than
+        over-merging), and None for opaque shapes (name refs, f-strings).
+        """
+        if isinstance(node, cst.SimpleString):
+            return ScriptReviewer._string_literal_value(node)
+        if isinstance(node, (cst.List, cst.Tuple)):
+            values: list[str] = []
+            for el in node.elements:
+                if not isinstance(el, cst.Element):
+                    return None
+                if not isinstance(el.value, cst.SimpleString):
+                    return None
+                v = ScriptReviewer._string_literal_value(el.value)
+                if v is None:
+                    return None
+                values.append(v)
+            return repr(tuple(values))
+        return None
+
+    @staticmethod
+    def _url_pattern_node_has_signal(node: cst.BaseExpression | None) -> bool:
+        """Return True if a ``url_patterns`` value yields a runtime URL match.
+
+        Runtime classify wraps ``re.search`` in ``try/except re.error`` and
+        silently skips invalid regex patterns. This helper mirrors that:
+        SimpleString only, must be non-empty/non-N-A, must compile.
+        """
+        if not isinstance(node, cst.SimpleString):
+            return False
+        value = ScriptReviewer._string_literal_value(node)
+        if value is None or ScriptReviewer._is_empty_pattern(value):
+            return False
+        try:
+            re.compile(value)
+        except re.error:
+            return False
+        return True
+
+    @staticmethod
+    def _pattern_node_has_signal(node: cst.BaseExpression | None) -> bool:
+        """Return True if a ``text_patterns`` value represents a real page-text signal.
+
+        ``page.classify(text_patterns=...)`` accepts ``dict[str, str | list[str]]``.
+        Runtime list-matching is conjunctive (``all(p in extracted_text for p in
+        patterns)``) — one empty/N-A element makes the whole list fail. So a list
+        is meaningful only when every element is a non-empty/non-N-A SimpleString.
+        Opaque shapes (name refs, f-strings) return False — we cannot read them.
+        """
+        if node is None:
+            return False
+        if isinstance(node, cst.SimpleString):
+            return not ScriptReviewer._is_empty_pattern(ScriptReviewer._string_literal_value(node))
+        if isinstance(node, (cst.List, cst.Tuple)):
+            if not node.elements:
+                return False
+            for el in node.elements:
+                if not isinstance(el, cst.Element):
+                    return False
+                if not isinstance(el.value, cst.SimpleString):
+                    return False
+                value = ScriptReviewer._string_literal_value(el.value)
+                if ScriptReviewer._is_empty_pattern(value):
+                    return False
+            return True
+        return False
+
+    def _consolidate_classify_duplicates(self, code: str) -> tuple[str, list[str]]:
+        """Merge ``page.classify()`` branches with byte-identical action bodies.
+
+        Enforces Rule 6b deterministically. For every ``page.classify()`` call
+        directly followed by an ``if/elif`` chain testing the assigned variable:
+
+          1. Group branch keys by serialized body code.
+          2. For each group of size > 1, keep one key (preferring non-N/A
+             ``text_patterns``) and drop the rest from ``options``,
+             ``text_patterns``, ``url_patterns``, and the if/elif chain.
+
+        Returns ``(consolidated_code, dropped_keys)``. On any parse/transform
+        failure, returns the input unchanged with an empty drop list — this is
+        a defense-in-depth pass and must not break the review pipeline.
+        """
+        if "page.classify(" not in code:
+            return code, []
+        try:
+            tree = cst.parse_module(code)
+        except Exception:
+            return code, []
+        transformer = _ClassifyConsolidator()
+        try:
+            new_tree = tree.visit(transformer)
+        except Exception:
+            return code, []
+        if not transformer.dropped_keys:
+            return code, []
+        return new_tree.code, transformer.dropped_keys
+
+    @staticmethod
+    def _count_classify_branches(code: str) -> int:
+        """Count the number of branch keys across all ``page.classify()`` calls.
+
+        Counts keys in the ``options=`` dict literal of every classify call in
+        the code. Returns 0 if the code does not parse or contains no classify
+        calls.
+        """
+        if "page.classify(" not in code:
+            return 0
+        try:
+            tree = cst.parse_module(code)
+        except Exception:
+            return 0
+        counter = _ClassifyBranchCounter()
+        try:
+            tree.visit(counter)
+        except Exception:
+            return 0
+        return counter.total
 
     def _build_retry_prompt(self, failed_code: str, error: str, function_signature: str = "") -> str:
         """Build a retry prompt that includes the failed code and error."""
