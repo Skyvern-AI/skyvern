@@ -15634,6 +15634,11 @@
             ],
             "title": "Workflow Permanent Id"
           },
+          "workflow_deleted": {
+            "type": "boolean",
+            "title": "Workflow Deleted",
+            "default": false
+          },
           "script_run": {
             "type": "boolean",
             "title": "Script Run",
