@@ -13,6 +13,7 @@ Without this wrap:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import yaml
@@ -39,6 +40,19 @@ _WRAPPABLE_FIELDS: tuple[str, ...] = (
 # hard-coded substring) keeps idempotency intact if the template's wording
 # changes.
 _WRAPPED_PREFIX = MINI_GOAL_TEMPLATE.partition("{mini_goal}")[0]
+_MINI_GOAL_HEADER = "Achieve the following mini goal and once it's achieved, complete:"
+_MAIN_GOAL_HEADER = (
+    "This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve "
+    "the mini goal:"
+)
+# Tolerates the spaced-fence variant (`` ` ` ` ``) that the LLM sometimes
+# emits to avoid nested markdown fences inside an already-wrapped goal.
+_FENCE_RE = r"`\s*`\s*`"
+_WRAPPED_GOAL_RE = re.compile(
+    rf"^\s*{re.escape(_MINI_GOAL_HEADER)}\s*{_FENCE_RE}\s*(?P<mini_goal>.*?)\s*{_FENCE_RE}\s*"
+    rf"{re.escape(_MAIN_GOAL_HEADER)}\s*{_FENCE_RE}\s*(?P<main_goal>.*?)\s*{_FENCE_RE}\s*$",
+    re.DOTALL,
+)
 
 
 def wrap_block_goals(workflow_yaml: str, user_message: str) -> str:
@@ -86,7 +100,15 @@ def _wrap_blocks_in_place(blocks: list[Any], user_message: str) -> bool:
             continue
         for field_name in _WRAPPABLE_FIELDS:
             value = block.get(field_name)
-            if isinstance(value, str) and value and _WRAPPED_PREFIX not in value:
+            if not isinstance(value, str) or not value:
+                continue
+            normalized_existing_goal = _normalize_existing_wrapped_goal(value)
+            if normalized_existing_goal is not None:
+                if normalized_existing_goal != value:
+                    block[field_name] = normalized_existing_goal
+                    mutated = True
+                continue
+            if _WRAPPED_PREFIX not in value:
                 block[field_name] = MINI_GOAL_TEMPLATE.format(
                     mini_goal=value,
                     main_goal=user_message,
@@ -96,3 +118,32 @@ def _wrap_blocks_in_place(blocks: list[Any], user_message: str) -> bool:
         if isinstance(loop_blocks, list):
             mutated = _wrap_blocks_in_place(loop_blocks, user_message) or mutated
     return mutated
+
+
+def _normalize_existing_wrapped_goal(value: str) -> str | None:
+    parsed = _extract_wrapped_goal(value)
+    if parsed is None:
+        return None
+    mini_goal, main_goal = parsed
+    return MINI_GOAL_TEMPLATE.format(mini_goal=mini_goal, main_goal=main_goal)
+
+
+# Bounded peel count: a reword turn stacks one layer; anything deeper is
+# malformed and we'd rather stop than recurse on adversarial input.
+_MAX_GOAL_UNWRAP_DEPTH = 8
+
+
+def _extract_wrapped_goal(value: str) -> tuple[str, str] | None:
+    current = value
+    last: tuple[str, str] | None = None
+    for _ in range(_MAX_GOAL_UNWRAP_DEPTH):
+        match = _WRAPPED_GOAL_RE.match(current)
+        if not match:
+            return last
+        mini_goal = match.group("mini_goal").strip()
+        main_goal = match.group("main_goal").strip()
+        if not mini_goal or not main_goal:
+            return last
+        last = (mini_goal, main_goal)
+        current = mini_goal
+    return last

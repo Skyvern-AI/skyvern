@@ -297,6 +297,29 @@ class WorkflowRunsRepository(BaseRepository):
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
+    @db_operation("increment_workflow_run_credits")
+    async def increment_workflow_run_credits(
+        self,
+        workflow_run_id: str,
+        credits: int,
+        is_cached: bool = False,
+    ) -> None:
+        col = WorkflowRunModel.cached_credits_used if is_cached else WorkflowRunModel.credits_used
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                .values({col: func.coalesce(col, 0) + credits})
+            )
+            if result.rowcount == 0:
+                LOG.warning(
+                    "increment_workflow_run_credits matched no rows",
+                    workflow_run_id=workflow_run_id,
+                    credits=credits,
+                    is_cached=is_cached,
+                )
+            await session.commit()
+
     @db_operation("update_workflow_run_if_not_final")
     async def update_workflow_run_if_not_final(
         self,
@@ -493,6 +516,23 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
+            # task_runs.workflow_permanent_id is unreliable on legacy workflow_run rows; the joined
+            # workflow_runs row carries the canonical WPID, so coalesce both before deriving anything.
+            effective_wpid = func.coalesce(
+                TaskRunModel.workflow_permanent_id,
+                WorkflowRunModel.workflow_permanent_id,
+            )
+            # True iff this row's workflow_permanent_id has no active (deleted_at IS NULL) version.
+            workflow_deleted_expr = and_(
+                effective_wpid.isnot(None),
+                ~exists().where(
+                    and_(
+                        WorkflowModel.workflow_permanent_id == effective_wpid,
+                        WorkflowModel.organization_id == TaskRunModel.organization_id,
+                        WorkflowModel.deleted_at.is_(None),
+                    )
+                ),
+            ).label("workflow_deleted")
             query = (
                 select(
                     TaskRunModel.task_run_id.label("task_run_id"),
@@ -503,9 +543,10 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.started_at.label("started_at"),
                     TaskRunModel.finished_at.label("finished_at"),
                     TaskRunModel.created_at.label("created_at"),
-                    TaskRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    effective_wpid.label("workflow_permanent_id"),
                     TaskRunModel.script_run.label("script_run"),
                     TaskRunModel.searchable_text.label("searchable_text"),
+                    workflow_deleted_expr,
                 )
                 .select_from(TaskRunModel)
                 .outerjoin(
@@ -531,7 +572,7 @@ class WorkflowRunsRepository(BaseRepository):
                     or_(
                         TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
                         TaskRunModel.run_id.icontains(search_key, autoescape=True),
-                        TaskRunModel.workflow_permanent_id.icontains(search_key, autoescape=True),
+                        effective_wpid.icontains(search_key, autoescape=True),
                     )
                 )
 
