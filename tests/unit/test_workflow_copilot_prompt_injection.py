@@ -64,6 +64,15 @@ class TestSystemTemplateSecurity:
         assert "TRUSTED_KB_CONTENT" in rendered
 
 
+class TestAgentTemplateCorrectionRules:
+    def test_agent_template_requires_label_and_title_refresh_on_corrections(self) -> None:
+        rendered = prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+
+        assert "Rename affected block labels and block titles" in rendered
+        assert "Labels become output keys" in rendered
+        assert "Jinja block reference" in rendered
+
+
 class TestUserTemplateCodeFencing:
     """Verify untrusted variables are wrapped in code fences."""
 
