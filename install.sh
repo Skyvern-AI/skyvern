@@ -21,14 +21,19 @@
 
 set -eu
 
-SKYVERN_RUN_INIT="${SKYVERN_RUN_INIT:-1}"
+# Empty SKYVERN_RUN_INIT means "use the variant's default"; --no-init or
+# `SKYVERN_RUN_INIT=0` overrides to 0; `SKYVERN_RUN_INIT=1` forces it on.
+SKYVERN_RUN_INIT="${SKYVERN_RUN_INIT:-}"
 SKYVERN_VERSION="${SKYVERN_VERSION:-}"
+SKYVERN_VARIANT="${SKYVERN_VARIANT:-server}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-init)   SKYVERN_RUN_INIT=0; shift ;;
         --version)   SKYVERN_VERSION="${2:?--version requires a value}"; shift 2 ;;
         --version=*) SKYVERN_VERSION="${1#--version=}"; shift ;;
+        --variant)   SKYVERN_VARIANT="${2:?--variant requires a value}"; shift 2 ;;
+        --variant=*) SKYVERN_VARIANT="${1#--variant=}"; shift ;;
         --help|-h)
             # Self-parsing of "$0" doesn't work when piped (`curl ... | sh`);
             # `$0` is then the shell name, not a real file. Embed help inline.
@@ -39,19 +44,28 @@ Usage:
   curl -LsSf https://install.skyvern.com | sh
   curl -LsSf https://install.skyvern.com | sh -s -- --no-init
   curl -LsSf https://install.skyvern.com | sh -s -- --version 1.0.31
+  curl -LsSf https://install.skyvern.com | sh -s -- --variant server
+
+Flags:
+  --variant V    install variant (default: server). Other variants
+                 (sdk, mcp, all) are reserved for the upcoming SDK
+                 package split — currently only 'server' is accepted.
+  --no-init      skip 'skyvern init' (the Chromium browser install).
+  --version X    pin a specific PyPI version (e.g., 1.0.31).
 
 Environment overrides:
-  SKYVERN_RUN_INIT=0   skip 'skyvern init' (Chromium browser install)
-  SKYVERN_VERSION=X    pin a specific PyPI version
+  SKYVERN_VARIANT=V    same as --variant
+  SKYVERN_RUN_INIT=0   same as --no-init
+  SKYVERN_VERSION=X    same as --version
 
 What this does:
   1. Bootstraps 'uv' (Astral's Python toolchain) if not already installed.
      uv handles Python version management — the host machine doesn't need
      a pre-installed Python.
-  2. Installs the 'skyvern' package from PyPI as an isolated tool, exposing
+  2. Installs the matching PyPI package as an isolated tool, exposing
      the 'skyvern' command on PATH.
-  3. Runs 'skyvern init' to install Chromium for browser automation
-     (skip with --no-init when running in CI / minimal containers).
+  3. For variants that need a browser, runs 'skyvern init' to download
+     Chromium (skip with --no-init when running in CI / minimal containers).
 EOF
             exit 0
             ;;
@@ -98,22 +112,55 @@ if ! command -v uv >/dev/null 2>&1; then
     fi
 fi
 
-# When the SDK package split lands (lightweight `skyvern` SDK + full
-# `skyvern[server]` + standalone `skyvern-mcp`), change the next line to:
-#     PKG_SPEC="skyvern[server]"
-# until then, the monolithic `skyvern` package contains the full server.
-PKG_SPEC="skyvern"
+# Variant policy table. Each variant decides:
+#   PKG_SPEC          which PyPI spec to install
+#   PYTHON_SPEC       which Python range to pin (PEP 440 / 508 specifier)
+#   DEFAULT_RUN_INIT  whether 'skyvern init' (Chromium) runs by default
+#   SUCCESS_HINT      the "what to try next" line printed on success
+#
+# Today only 'server' is accepted. The Skyvern SDK package split (per the
+# March 2026 PRD) will introduce additional variants; when their PyPI
+# targets exist, add cases below — no other code change needed:
+#   sdk: lightweight `skyvern` (no Chromium, no server). DEFAULT_RUN_INIT=0.
+#   mcp: standalone `skyvern-mcp` (SKY-7946).
+#   all: backward-compat alias for today's monolithic install.
+case "$SKYVERN_VARIANT" in
+    server)
+        # Pre-split: monolithic `skyvern` already includes server, browsers,
+        # and LLM clients. Post-split: change to `skyvern[server]`.
+        PKG_SPEC="skyvern"
+        PYTHON_SPEC=">=3.11,<3.14"
+        DEFAULT_RUN_INIT=1
+        SUCCESS_HINT="Try: skyvern --help"
+        ;;
+    sdk|mcp|cli|cloud|all)
+        printf "ERROR: --variant '%s' is reserved for the upcoming SDK package split\n" "$SKYVERN_VARIANT" >&2
+        printf "       and is not yet available. Use --variant server (the default) for now.\n" >&2
+        exit 2
+        ;;
+    *)
+        printf "ERROR: unknown variant '%s'. Valid: server (default).\n" "$SKYVERN_VARIANT" >&2
+        exit 2
+        ;;
+esac
+
+# Apply --no-init / SKYVERN_RUN_INIT user override; otherwise use variant default.
+[ -n "$SKYVERN_RUN_INIT" ] || SKYVERN_RUN_INIT="$DEFAULT_RUN_INIT"
+
+PKG_SPEC_INSTALL="$PKG_SPEC"
 if [ -n "$SKYVERN_VERSION" ]; then
-    PKG_SPEC="${PKG_SPEC}==${SKYVERN_VERSION}"
+    PKG_SPEC_INSTALL="${PKG_SPEC}==${SKYVERN_VERSION}"
 fi
 
-printf 'installing %s via uv tool install...\n' "$PKG_SPEC"
-# Pin the Python version range to skyvern's `requires-python`. Without this,
-# uv may pick a host Python outside the supported range (e.g., 3.14), in
-# which case environment-marker dependencies like playwright (`<'3.14'`)
-# silently drop out of the resolution and the CLI crashes at import time.
-# The range form tracks `requires-python` automatically as it evolves.
-uv tool install --python '>=3.11,<3.14' --force "$PKG_SPEC"
+printf 'installing %s via uv tool install...\n' "$PKG_SPEC_INSTALL"
+# PYTHON_SPEC is hardcoded per variant. Without this, uv may pick a host
+# Python outside the supported range (e.g., 3.14), in which case
+# environment-marker dependencies like playwright (`<'3.14'`) silently drop
+# out of the resolution and the CLI crashes at import time. Bump this range
+# intentionally when the upstream `requires-python` shifts — it does NOT
+# auto-track. (Filed as a follow-up: CI job that diffs PYTHON_SPEC against
+# the published `requires-python` for the variant.)
+uv tool install --python "$PYTHON_SPEC" --force "$PKG_SPEC_INSTALL"
 
 if [ "$SKYVERN_RUN_INIT" = "1" ]; then
     printf "\nrunning 'skyvern init' (installs Chromium, ~150MB)...\n"
@@ -126,7 +173,7 @@ if [ "$SKYVERN_RUN_INIT" = "1" ]; then
     fi
 fi
 
-printf '\nSkyvern installed. Try: skyvern --help\n'
+printf '\nSkyvern installed. %s\n' "$SUCCESS_HINT"
 
 if [ "$uv_was_freshly_installed" = "1" ]; then
     printf "\nNote: uv was just installed in ~/.local/bin. To use 'skyvern' in\n"
