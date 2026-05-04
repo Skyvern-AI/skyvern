@@ -22,6 +22,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
                     "finished_at": None,
                     "created_at": "2026-04-01T00:00:00Z",
                     "workflow_permanent_id": "wpid_123",
+                    "workflow_deleted": False,
                     "script_run": False,
                     "searchable_text": "Workflow run",
                 }
@@ -56,6 +57,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
             "finished_at": None,
             "created_at": "2026-04-01T00:00:00Z",
             "workflow_permanent_id": "wpid_123",
+            "workflow_deleted": False,
             "script_run": False,
         }
     ]
