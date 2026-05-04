@@ -37,7 +37,9 @@ for img in $IMAGES; do
         apt-get install -qq -y curl ca-certificates >/dev/null
         sh /tmp/install.sh $init_flag
         export PATH=\"\$HOME/.local/bin:\$PATH\"
-        skyvern --version
+        # skyvern's CLI exposes no '--version' flag; --help exiting 0 proves
+        # the package imports cleanly (including playwright).
+        skyvern --help >/dev/null
     "; then
         printf 'PASS: %s\n' "$img"
     else
