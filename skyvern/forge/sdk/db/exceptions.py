@@ -3,11 +3,10 @@ class NotFoundError(Exception):
 
 
 class ScheduleLimitExceededError(Exception):
-    """Raised when attempting to create a schedule that would exceed the per-workflow limit."""
+    """Raised when attempting to create a schedule that would exceed the org-wide tier limit."""
 
-    def __init__(self, organization_id: str, workflow_permanent_id: str, current_count: int, max_allowed: int):
+    def __init__(self, organization_id: str, current_count: int, max_allowed: int):
         self.organization_id = organization_id
-        self.workflow_permanent_id = workflow_permanent_id
         self.current_count = current_count
         self.max_allowed = max_allowed
         super().__init__(f"Schedule limit {max_allowed} reached (current: {current_count})")
