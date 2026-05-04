@@ -447,6 +447,9 @@ class WorkflowRunModel(Base):
     )
     copilot_session_id = Column(String, nullable=True)
 
+    credits_used = Column(Integer, nullable=True, default=0, server_default="0")
+    cached_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
+
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)

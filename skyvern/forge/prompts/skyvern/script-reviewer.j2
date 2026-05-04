@@ -94,6 +94,11 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 {% endfor %}
 For fields not covered by these parameters: use Python code if the value is deterministic (see "Deterministic Logic"), or `ai='proactive'` if it requires subjective judgment (see Rule 9c).
 {% endif %}
+{% if self_output_key %}
+
+### Forbidden parameter key for this block
+- `{{ self_output_key }}` — this block's own output slot. It is `None` until the block has finished running, so `context.parameters['{{ self_output_key }}']` (or any subscript such as `["username"]`, `["password"]`) crashes inside this block with `'NoneType' object is not subscriptable`. Upstream blocks' `<label>_output` keys ARE valid; only this block's own output is forbidden. If you need the user's credentials or a similar value, use a credential parameter from the list above or `ai='proactive'`.
+{% endif %}
 {% if run_parameter_values %}
 
 ## Current Run Parameter Values
