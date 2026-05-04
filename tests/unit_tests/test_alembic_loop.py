@@ -6,7 +6,10 @@ import os
 import subprocess
 import sys
 
+import pytest
 
+
+@pytest.mark.asyncio
 async def test_alembic_with_running_loop():
     """Test alembic migration execution within an existing event loop."""
     print("Testing alembic migration with existing event loop...")
