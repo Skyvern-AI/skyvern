@@ -51,6 +51,7 @@ class AgentContext:
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    failed_tool_step_tracker: dict[str, int] = field(default_factory=dict)
 
     # Cross-turn agent state accumulated by tools.py as the agent runs.
     # Read back by failure_tracking / loop_detection to detect stuck loops,
