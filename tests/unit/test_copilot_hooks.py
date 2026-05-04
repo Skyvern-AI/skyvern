@@ -225,6 +225,62 @@ class TestSchemaOverlay:
         assert "clear_first" not in result
 
 
+class TestMCPFailedStepLoopDetection:
+    @pytest.mark.asyncio
+    async def test_interleaved_same_step_failures_short_circuit_third_dispatch(self) -> None:
+        from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+
+        class FakeRawResult:
+            def __init__(self, payload: dict[str, Any], is_error: bool = False) -> None:
+                self.structured_content = payload
+                self.is_error = is_error
+                self.content: list[Any] = []
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, Any]]] = []
+
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                self.calls.append((name, args))
+                if name == "get_browser_screenshot":
+                    return FakeRawResult({"ok": False, "error": "screenshot failed"}, is_error=True)
+                return FakeRawResult({"ok": True, "data": {"status": "failed"}})
+
+        ctx = MagicMock()
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        client = FakeClient()
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = client
+
+        await server.call_tool("get_browser_screenshot", {})
+        await server.call_tool("get_run_results", {})
+        await server.call_tool("get_browser_screenshot", {})
+        await server.call_tool("get_run_results", {})
+        blocked = await server.call_tool("get_browser_screenshot", {})
+
+        parsed = json.loads(blocked.content[0].text)
+        assert blocked.isError is True
+        assert "LOOP DETECTED" in parsed["error"]
+        assert client.calls == [
+            ("get_browser_screenshot", {}),
+            ("get_run_results", {}),
+            ("get_browser_screenshot", {}),
+            ("get_run_results", {}),
+        ]
+
+
 class TestMCPToolOverlayCompleteness:
     """Verify alias map and overlay configs are in sync and complete."""
 
