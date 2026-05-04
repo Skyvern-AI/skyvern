@@ -73,5 +73,16 @@
     "publishConfig": {
         "access": "public",
         "provenance": true
+    },
+    "pnpm": {
+        "overrides": {
+            "picomatch@2": ">=2.3.2",
+            "picomatch@4": ">=4.0.4",
+            "postcss": ">=8.5.10",
+            "rollup": ">=4.59.0",
+            "serialize-javascript": ">=7.0.5",
+            "vite": "^7.3.2",
+            "webpack": ">=5.104.1"
+        }
     }
 }
