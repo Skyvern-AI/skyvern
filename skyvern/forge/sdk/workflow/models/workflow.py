@@ -204,6 +204,8 @@ class WorkflowRun(BaseModel):
     workflow_schedule_id: str | None = None
     ignore_inherited_workflow_system_prompt: bool = False
     copilot_session_id: str | None = None
+    credits_used: int = 0
+    cached_credits_used: int = 0
 
     @field_validator("run_with", mode="before")
     @classmethod
