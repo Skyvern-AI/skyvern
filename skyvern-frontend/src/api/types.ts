@@ -563,6 +563,7 @@ export type TaskRunListItem = {
   finished_at: string | null;
   created_at: string;
   workflow_permanent_id: string | null;
+  workflow_deleted: boolean;
   script_run: boolean;
   searchable_text: string | null;
 };
