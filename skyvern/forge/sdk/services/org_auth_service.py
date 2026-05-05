@@ -376,7 +376,10 @@ async def resolve_org_from_api_key(
     )
 
 
-@cached(cache=TTLCache(maxsize=CACHE_SIZE, ttl=AUTHENTICATION_TTL))
+_current_org_cache: TTLCache = TTLCache(maxsize=CACHE_SIZE, ttl=AUTHENTICATION_TTL)
+
+
+@cached(cache=_current_org_cache)
 async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
     """Authentication is cached for one hour."""
     validation = await resolve_org_from_api_key(x_api_key, db)
@@ -387,3 +390,16 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
         context.organization_id = validation.organization.organization_id
         context.organization_name = validation.organization.organization_name
     return validation.organization
+
+
+def invalidate_cached_org(organization_id: str) -> None:
+    """
+    Drop every cached ``Organization`` entry whose id matches.
+    """
+    keys_to_remove = [
+        key
+        for key, value in list(_current_org_cache.items())
+        if isinstance(value, Organization) and value.organization_id == organization_id
+    ]
+    for key in keys_to_remove:
+        _current_org_cache.pop(key, None)
