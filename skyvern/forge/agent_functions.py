@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.webeye.actions.actions import Action
@@ -707,12 +708,32 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
     ) -> str | None:
-        """Get a Google Sheets access token for the given credential.
+        """Mint a Google Sheets access token from the stored refresh token.
 
-        Returns None in OSS. Cloud override uses the OAuth service to
-        decrypt the stored refresh token and exchange it for an access token.
+        Returns None on any failure so callers can surface a reconnect prompt
+        instead of crashing. Cloud overrides this with an access-token cache
+        on top of the same backend.
         """
-        return None
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return await google_oauth_service.access_token_from_secrets(secrets)
+        except google_oauth_service.EncryptionNotConfiguredError:
+            LOG.error(
+                "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+        except Exception:
+            LOG.exception(
+                "Failed to get Google Sheets credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
 
     async def get_google_workspace_credentials(
         self,
@@ -720,8 +741,40 @@ class AgentFunction:
         credential_id: str,
         required_scopes: list[str] | None = None,
     ) -> object | None:
-        """OSS no-op; cloud override returns a refreshed google.oauth2.credentials.Credentials or None."""
-        return None
+        """Return a refreshed ``google.oauth2.credentials.Credentials``, or None on failure.
+
+        ``required_scopes`` is accepted for forward-compat with cloud overrides
+        that may enforce scope checks; the OSS path does not yet use it.
+        """
+        if required_scopes:
+            # Debug-level so OSS operators don't see this on every call; scope
+            # enforcement lives on the cloud override and a future caller can
+            # grep for this message if they need to audit usage.
+            LOG.debug(
+                "required_scopes ignored by OSS get_google_workspace_credentials; cloud override gates this",
+                required_scopes=required_scopes,
+                credential_id=credential_id,
+            )
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return await google_oauth_service.credentials_from_secrets(secrets)
+        except google_oauth_service.EncryptionNotConfiguredError:
+            LOG.error(
+                "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+        except Exception:
+            LOG.exception(
+                "Failed to get Google Workspace credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
 
     async def ensure_sheet_tab(
         self,

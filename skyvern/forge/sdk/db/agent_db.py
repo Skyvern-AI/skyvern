@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRe
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.db.repositories.debug import DebugRepository
 from skyvern.forge.sdk.db.repositories.folders import FoldersRepository
+from skyvern.forge.sdk.db.repositories.google_oauth import GoogleOAuthRepository
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
@@ -131,6 +132,7 @@ class AgentDB(BaseAlchemyDB):
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.scripts = ScriptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(
             self.Session,
             debug_enabled,
