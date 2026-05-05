@@ -54,6 +54,7 @@ import {
   WorkflowApiResponse,
   WorkflowBlock,
   WorkflowParameter,
+  isNestedLoopWorkflowBlock,
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
@@ -76,8 +77,7 @@ function getLoginBlocksWithoutCredentials(
       }
     }
 
-    // Check nested blocks in for_loop
-    if (block.block_type === "for_loop" && block.loop_blocks) {
+    if (isNestedLoopWorkflowBlock(block) && block.loop_blocks) {
       result.push(...getLoginBlocksWithoutCredentials(block.loop_blocks));
     }
   }

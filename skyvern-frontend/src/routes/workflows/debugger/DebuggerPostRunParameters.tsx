@@ -1,12 +1,21 @@
+import { useMemo } from "react";
+import { useParams } from "react-router-dom";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { CodeEditor } from "../components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { useActiveWorkflowRunItem } from "@/routes/workflows/workflowRun/useActiveWorkflowRunItem";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
-import { isAction, isWorkflowRunBlock } from "../types/workflowRunTypes";
+import {
+  isAction,
+  isWorkflowRunBlock,
+  isWorkflowRunLoopContainerBlock,
+} from "../types/workflowRunTypes";
 import { findBlockSurroundingAction } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
 import { DebuggerTaskBlockParameters } from "./DebuggerTaskBlockParameters";
 import { isTaskVariantBlock, WorkflowBlockTypes } from "../types/workflowTypes";
+import { findWorkflowBlockByLabel } from "../workflowBlockUtils";
+import { WhileLoopPostRunFields } from "../components/WhileLoopPostRunFields";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { DebuggerSendEmailBlockParameters } from "./DebuggerSendEmailBlockInfo";
@@ -16,24 +25,19 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Switch } from "@/components/ui/switch";
 
 function DebuggerPostRunParameters() {
+  const { workflowPermanentId } = useParams();
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunQuery();
-  const parameters = workflowRun?.parameters ?? {};
+  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
+    workflowPermanentId,
+  });
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
-    return <div>Loading workflow parameters...</div>;
-  }
-
-  if (!workflowRun || !workflowRunTimeline) {
-    return null;
-  }
-
-  function getActiveBlock() {
+  const activeBlock = useMemo(() => {
     if (!workflowRunTimeline) {
-      return;
+      return undefined;
     }
     if (isWorkflowRunBlock(activeItem)) {
       return activeItem;
@@ -44,9 +48,34 @@ function DebuggerPostRunParameters() {
         activeItem.action_id,
       );
     }
+    return undefined;
+  }, [workflowRunTimeline, activeItem]);
+
+  const activeBlockLabel = activeBlock?.label ?? null;
+  const definitionBlock = useMemo(() => {
+    if (!workflow || !activeBlockLabel) {
+      return null;
+    }
+    return findWorkflowBlockByLabel(
+      workflow.workflow_definition.blocks,
+      activeBlockLabel,
+    );
+  }, [workflow, activeBlockLabel]);
+
+  const parameters = workflowRun?.parameters ?? {};
+
+  if (
+    workflowRunIsLoading ||
+    workflowRunTimelineIsLoading ||
+    workflowIsLoading
+  ) {
+    return <div>Loading workflow parameters...</div>;
   }
 
-  const activeBlock = getActiveBlock();
+  if (!workflowRun || !workflowRunTimeline) {
+    return null;
+  }
+
   const isTaskV2 = workflowRun.task_v2 !== null;
 
   const webhookCallbackUrl = isTaskV2
@@ -84,24 +113,36 @@ function DebuggerPostRunParameters() {
           </div>
         </div>
       ) : null}
-      {activeBlock && activeBlock.block_type === WorkflowBlockTypes.ForLoop ? (
+      {activeBlock && isWorkflowRunLoopContainerBlock(activeBlock) ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">For Loop Block Parameters</h1>
-            <div className="flex flex-col gap-2">
-              <div className="flex w-full items-center justify-start gap-2">
-                <h1 className="text-sm">Loop Values</h1>
-                <HelpTooltip content="The values that are being looped over." />
+            <h1 className="text-sm font-bold">Loop Block Parameters</h1>
+            {activeBlock.block_type === WorkflowBlockTypes.ForLoop ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex w-full items-center justify-start gap-2">
+                  <h1 className="text-sm">Loop Values</h1>
+                  <HelpTooltip content="The values that are being looped over." />
+                </div>
+                <CodeEditor
+                  className="w-full"
+                  language="json"
+                  value={JSON.stringify(
+                    activeBlock?.loop_values ?? [],
+                    null,
+                    2,
+                  )}
+                  readOnly
+                  minHeight="96px"
+                  maxHeight="200px"
+                />
               </div>
-              <CodeEditor
-                className="w-full"
-                language="json"
-                value={JSON.stringify(activeBlock?.loop_values, null, 2)}
-                readOnly
-                minHeight="96px"
-                maxHeight="200px"
+            ) : (
+              <WhileLoopPostRunFields
+                layout="stacked"
+                definitionBlock={definitionBlock}
+                loopOutput={activeBlock.output}
               />
-            </div>
+            )}
           </div>
         </div>
       ) : null}
