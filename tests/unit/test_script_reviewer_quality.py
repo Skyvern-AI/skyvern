@@ -63,6 +63,27 @@ async def block_fn(page, context):
         # extract is not in _INTERACTION_METHODS, so this should pass
         assert self.reviewer._validate_proactive_misuse(code) is None
 
+    def test_proactive_without_selector_not_flagged(self) -> None:
+        """ai='proactive' WITHOUT selector= is the documented escape hatch (SKY-9436).
+
+        It is intentional and runtime-safe (always invokes LLM, no
+        `selector: expected string` crash). Only flag when paired with selector=.
+        """
+        code = """
+async def block_fn(page, context):
+    await page.click(ai='proactive', prompt='Click the next-step button')
+    await page.fill(value='hello', ai='proactive', prompt='Fill the field')
+"""
+        assert self.reviewer._validate_proactive_misuse(code) is None
+
+    def test_selector_inside_prompt_does_not_falsely_flag(self) -> None:
+        """Regression: prompt text containing 'selector=' must not make a proactive call look like proactive-with-selector (CORR-3)."""
+        code = """
+async def block_fn(page, context):
+    await page.click(ai='proactive', prompt='No selector= available for this widget')
+"""
+        assert self.reviewer._validate_proactive_misuse(code) is None
+
     def test_comments_ignored(self) -> None:
         code = """
 async def block_fn(page, context):
