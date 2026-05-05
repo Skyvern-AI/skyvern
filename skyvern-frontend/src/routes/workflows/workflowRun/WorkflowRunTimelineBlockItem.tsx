@@ -476,7 +476,7 @@ function WorkflowRunTimelineBlockItem({
           "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
           getBlockElevation(depth),
           {
-            "ring-white/30":
+            "ring-2 ring-white/55 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/55":
               isWorkflowRunBlock(activeItem) &&
               activeItem.workflow_run_block_id === block.workflow_run_block_id,
           },
