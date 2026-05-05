@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -10,6 +10,19 @@ from playwright.async_api import Frame, Page
 from skyvern.config import settings
 
 LOG = structlog.get_logger()
+
+# Cap on entries kept in `recent_dialog_messages` so a chatty page (e.g. validation
+# alerts firing on every keystroke) cannot inflate the next prompt unboundedly.
+MAX_RECENT_DIALOG_MESSAGES = 5
+# Per-message length cap so a single pathological alert (multi-KB page-stack
+# trace, etc.) cannot dominate the prompt budget.
+MAX_DIALOG_MESSAGE_CHARS = 500
+
+
+class DialogEntry(TypedDict):
+    type: str
+    message: str
+    count: int
 
 
 @dataclass
@@ -104,6 +117,10 @@ class SkyvernContext:
     # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
     proactive_captcha_task_ids: set[str] = field(default_factory=set)
 
+    # Browser dialogs captured since the last agent prompt build, surfaced into the
+    # next extract-action prompt so the LLM can react to validation rejections.
+    recent_dialog_messages: list[DialogEntry] = field(default_factory=list)
+
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id}, copilot_session_id={self.copilot_session_id})"
 
@@ -113,6 +130,34 @@ class SkyvernContext:
     def pop_totp_code(self, task_id: str) -> None:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
+
+    def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
+        """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""
+        if not dialog_message:
+            return
+        if len(dialog_message) > MAX_DIALOG_MESSAGE_CHARS:
+            dialog_message = dialog_message[:MAX_DIALOG_MESSAGE_CHARS] + "…"
+        for entry in self.recent_dialog_messages:
+            if entry["type"] == dialog_type and entry["message"] == dialog_message:
+                entry["count"] += 1
+                return
+        self.recent_dialog_messages.append({"type": dialog_type, "message": dialog_message, "count": 1})
+        if len(self.recent_dialog_messages) > MAX_RECENT_DIALOG_MESSAGES:
+            del self.recent_dialog_messages[0]
+
+    def format_recent_dialog_messages(self) -> str | None:
+        """Render the buffered dialogs into prompt-ready text without clearing; None when empty."""
+        if not self.recent_dialog_messages:
+            return None
+        lines: list[str] = []
+        for entry in self.recent_dialog_messages:
+            suffix = f" (x{entry['count']})" if entry["count"] > 1 else ""
+            lines.append(f"[{entry['type']}{suffix}] {entry['message']}")
+        return "\n".join(lines)
+
+    def clear_recent_dialog_messages(self) -> None:
+        """Drop the buffered dialogs once the prompt has consumed them."""
+        self.recent_dialog_messages.clear()
 
     def add_magic_link_page(self, task_id: str, page: Page) -> None:
         self.magic_link_pages[task_id] = page

@@ -70,6 +70,12 @@ export type WorkflowRunBlock = {
   negative_descriptor?: string | null;
 };
 
+export function isWorkflowRunLoopContainerBlock(block: {
+  block_type: WorkflowBlockType;
+}): boolean {
+  return block.block_type === "for_loop" || block.block_type === "while_loop";
+}
+
 export type WorkflowRunTimelineBlockItem = {
   type: "block";
   block: WorkflowRunBlock;

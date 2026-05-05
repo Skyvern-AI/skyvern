@@ -12,12 +12,20 @@ import {
   type Node,
 } from "@xyflow/react";
 import { AppNode } from "..";
-import { helpTooltips } from "../../helpContent";
+import {
+  helpTooltips,
+  buildWhileLoopConditionTooltip,
+} from "../../helpContent";
 import { dataSchemaExampleValue } from "../types";
 import type { LoopNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
-import { getLoopNodeWidth } from "../../workflowEditorUtils";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
+import {
+  inferBranchCriteriaTypeFromExpression,
+  getLoopNodeWidth,
+} from "../../workflowEditorUtils";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
@@ -87,6 +95,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     24;
 
   const loopNodeWidth = getLoopNodeWidth(node, nodes);
+  const loopKind = data.loopKind;
+  const headerBlockType: WorkflowBlockType =
+    loopKind === "while" ? "while_loop" : "for_loop";
 
   return (
     <div
@@ -132,59 +143,172 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               nodeId={id}
               totpIdentifier={null}
               totpUrl={null}
-              type="for_loop" // sic: the naming is not consistent
+              type={headerBlockType}
             />
-            <div className="space-y-2">
-              <div className="flex justify-between">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Loop Value</Label>
-                  <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
-                </div>
-                {isFirstWorkflowBlock ? (
-                  <div className="flex justify-end text-xs text-slate-400">
-                    Tip: Use the {"+"} button to add parameters!
+            <Tabs
+              value={loopKind}
+              onValueChange={(v) => {
+                if (!data.editable) {
+                  return;
+                }
+                if (v !== "for_each" && v !== "while") {
+                  return;
+                }
+                if (v === "while") {
+                  const expr =
+                    data.whileConditionExpression.trim() === ""
+                      ? "{{ true }}"
+                      : data.whileConditionExpression;
+                  update({
+                    loopKind: "while",
+                    whileConditionExpression: expr,
+                    whileConditionCriteriaType:
+                      inferBranchCriteriaTypeFromExpression(expr),
+                  });
+                } else {
+                  update({ loopKind: "for_each" });
+                }
+              }}
+            >
+              <TabsList className="grid h-9 w-full grid-cols-2">
+                <TabsTrigger value="for_each" disabled={!data.editable}>
+                  For each
+                </TabsTrigger>
+                <TabsTrigger value="while" disabled={!data.editable}>
+                  While
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+            {loopKind === "for_each" ? (
+              <>
+                <div className="space-y-2">
+                  <div className="flex justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Loop Value
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["loop"]["loopValue"]}
+                      />
+                    </div>
+                    {isFirstWorkflowBlock ? (
+                      <div className="flex justify-end text-xs text-slate-400">
+                        Tip: Use the {"+"} button to add parameters!
+                      </div>
+                    ) : null}
                   </div>
-                ) : null}
-              </div>
-              <WorkflowBlockInput
-                nodeId={id}
-                value={data.loopVariableReference}
-                onChange={(value) => {
-                  update({ loopVariableReference: value });
-                }}
-              />
-            </div>
-            <WorkflowDataSchemaInputGroup
-              value={data.dataSchema}
-              onChange={(value) => {
-                update({ dataSchema: value });
-              }}
-              suggestionContext={{
-                loop_variable_reference: data.loopVariableReference,
-              }}
-              exampleValue={dataSchemaExampleValue}
-              helpTooltip="Specify a format for extracted data in JSON. Only applies when the loop value is natural language — ignored for parameter references."
-            />
-            <div className="space-y-2">
+                  <WorkflowBlockInput
+                    nodeId={id}
+                    value={data.loopVariableReference}
+                    onChange={(value) => {
+                      update({ loopVariableReference: value });
+                    }}
+                  />
+                </div>
+                <WorkflowDataSchemaInputGroup
+                  value={data.dataSchema}
+                  onChange={(value) => {
+                    update({ dataSchema: value });
+                  }}
+                  suggestionContext={{
+                    loop_variable_reference: data.loopVariableReference,
+                  }}
+                  exampleValue={dataSchemaExampleValue}
+                  helpTooltip={helpTooltips["loop"]["loopDataSchema"]}
+                />
+              </>
+            ) : (
               <div className="space-y-2">
                 <div className="flex justify-between">
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      checked={data.completeIfEmpty}
-                      disabled={!data.editable}
-                      onCheckedChange={(checked) => {
-                        update({
-                          completeIfEmpty:
-                            checked === "indeterminate" ? false : checked,
-                        });
-                      }}
-                    />
+                  <div className="flex gap-2">
                     <Label className="text-xs text-slate-300">
-                      Continue if Empty
+                      Loop Condition
                     </Label>
-                    <HelpTooltip content="When checked, the for loop block will successfully complete and workflow execution will continue if the loop value is empty" />
+                    <HelpTooltip content={buildWhileLoopConditionTooltip()} />
                   </div>
-
+                  {isFirstWorkflowBlock ? (
+                    <div className="flex justify-end text-xs text-slate-400">
+                      Tip: Use the {"+"} button to add parameters!
+                    </div>
+                  ) : null}
+                </div>
+                <WorkflowBlockInput
+                  nodeId={id}
+                  value={data.whileConditionExpression}
+                  onChange={(value) => {
+                    update({
+                      whileConditionExpression: value,
+                      whileConditionCriteriaType:
+                        inferBranchCriteriaTypeFromExpression(value),
+                    });
+                  }}
+                />
+              </div>
+            )}
+            <div className="space-y-2">
+              {loopKind === "for_each" ? (
+                <>
+                  <div className="flex flex-wrap justify-between gap-x-4 gap-y-3">
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        checked={data.completeIfEmpty}
+                        disabled={!data.editable}
+                        onCheckedChange={(checked) => {
+                          update({
+                            completeIfEmpty:
+                              checked === "indeterminate" ? false : checked,
+                          });
+                        }}
+                      />
+                      <Label className="text-xs text-slate-300">
+                        Continue if Empty
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["loop"]["completeIfEmpty"]}
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        checked={data.continueOnFailure}
+                        disabled={!data.editable}
+                        onCheckedChange={(checked) => {
+                          update({
+                            continueOnFailure:
+                              checked === "indeterminate" ? false : checked,
+                          });
+                        }}
+                      />
+                      <Label className="text-xs text-slate-300">
+                        Continue Workflow if Loop Fails
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["loop"]["continueOnFailure"]}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-3">
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        checked={data.nextLoopOnFailure ?? false}
+                        disabled={!data.editable}
+                        onCheckedChange={(checked) => {
+                          update({
+                            nextLoopOnFailure:
+                              checked === "indeterminate" ? false : checked,
+                          });
+                        }}
+                      />
+                      <Label className="text-xs text-slate-300">
+                        Skip Iterations that Fail
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["loop"]["nextLoopOnFailure"]}
+                      />
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
                   <div className="flex items-center gap-2">
                     <Checkbox
                       checked={data.continueOnFailure}
@@ -200,11 +324,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       Continue Workflow if Loop Fails
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["loop"]["continueOnFailure"]}
+                      content={helpTooltips["while_loop"]["continueOnFailure"]}
                     />
                   </div>
-                </div>
-                <div className="flex justify-between">
                   <div className="flex items-center gap-2">
                     <Checkbox
                       checked={data.nextLoopOnFailure ?? false}
@@ -220,11 +342,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       Skip Iterations that Fail
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["loop"]["nextLoopOnFailure"]}
+                      content={helpTooltips["while_loop"]["nextLoopOnFailure"]}
                     />
                   </div>
                 </div>
-              </div>
+              )}
             </div>
           </div>
         </div>
