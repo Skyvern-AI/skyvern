@@ -384,6 +384,14 @@ class ScriptReviewer:
         if not conditional_episodes:
             return None
 
+        # Conditional code is persisted via `create_script_version_from_review`
+        # too, so it must run the same parameter-reference validation as the
+        # regular reviewer path. Load the workflow's parameter keys here.
+        _, all_parameter_keys, _ = await self._load_workflow_context(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
         # Group episodes by block label — keep only the latest per block
         latest_by_block: dict[str, ScriptFallbackEpisode] = {}
         for ep in conditional_episodes:
@@ -399,6 +407,7 @@ class ScriptReviewer:
                     episode=episode,
                     organization_id=organization_id,
                     run_parameter_values=run_parameter_values,
+                    all_parameter_keys=all_parameter_keys,
                 )
                 if code:
                     updated_blocks[block_label] = code
@@ -415,6 +424,7 @@ class ScriptReviewer:
         block_label: str,
         episode: ScriptFallbackEpisode,
         organization_id: str,
+        all_parameter_keys: list[str],
         run_parameter_values: dict[str, str] | None = None,
     ) -> str | None:
         """Generate Python code for a conditional block based on its expression patterns.
@@ -558,6 +568,29 @@ class ScriptReviewer:
                     )
                     if attempt < max_attempts:
                         current_prompt = self._build_retry_prompt(code, hardcoded_error, function_signature)
+                    continue
+
+                # The filter strips `<block_label>_output` from the valid set so
+                # the validator's primary mode rejects any ref to the current
+                # block's own output. `self_output_key` is also threaded through
+                # to (a) catch the empty-valid-set edge case and (b) augment the
+                # retry hint with the NoneType crash explanation.
+                self_output_key = f"{block_label}_output" if block_label else None
+                conditional_param_keys = self._filter_self_output_param_keys(
+                    sorted(set(all_parameter_keys)), block_label or ""
+                )
+                param_error = self._validate_parameter_references(
+                    code, conditional_param_keys, self_output_key=self_output_key
+                )
+                if param_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: conditional code has invalid parameter references",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=param_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(code, param_error, function_signature)
                     continue
 
                 LOG.info(
@@ -731,6 +764,14 @@ class ScriptReviewer:
         # and merge with workflow-level parameter keys for a complete list.
         goal_param_keys = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", navigation_goal))
         parameter_keys = sorted(goal_param_keys | set(all_parameter_keys or []))
+        # The filter strips `<block_label>_output` from the valid set so the
+        # validator's primary mode rejects any ref to the current block's own
+        # output (it's None until the block finishes — `'NoneType' object is
+        # not subscriptable'`). `self_output_key` is also threaded into the
+        # validator and prompt template to (a) catch the empty-valid-set edge
+        # case and (b) explain the crash mode in retry hints.
+        self_output_key = f"{block_label}_output" if block_label else None
+        parameter_keys = self._filter_self_output_param_keys(parameter_keys, block_label or "")
 
         # Build historical episode summaries for cross-run context.
         # Include per-run parameter values so the reviewer can detect that
@@ -782,6 +823,7 @@ class ScriptReviewer:
             terminate_criterion=terminate_criterion,
             complete_criterion=complete_criterion,
             error_code_mapping=error_code_mapping,
+            self_output_key=self_output_key,
         )
 
         LOG.info(
@@ -918,8 +960,11 @@ class ScriptReviewer:
                             current_prompt = self._build_retry_prompt(updated_code, classify_error, function_signature)
                         continue
 
-                # Validate parameter references (catch invented context.parameters['...'] keys)
-                param_error = self._validate_parameter_references(updated_code, parameter_keys)
+                # Validate parameter references — invented keys and the
+                # current block's own `_output` ref both fail here.
+                param_error = self._validate_parameter_references(
+                    updated_code, parameter_keys, self_output_key=self_output_key
+                )
                 if param_error is not None:
                     LOG.warning(
                         "ScriptReviewer: invalid parameter reference, retrying",
@@ -1656,50 +1701,118 @@ class ScriptReviewer:
             return None
         return "; ".join(errors[:3])
 
-    # Regex to find context.parameters['key'] or context.parameters["key"]
-    _PARAM_REF_RE = re.compile(r"""context\.parameters\[['"](\w+)['"]\]""")
+    # Matches both subscript (`context.parameters['key']` / `[ 'key' ]`) and
+    # dict-get (`context.parameters.get('key')` / `.get('key', default)`) access.
+    # `\s*` at every accessor boundary so reformatted variants (newlines inside
+    # the subscript, spaces between `parameters` and `.get`, etc.) can't bypass
+    # the validator. A libcst AST walker would be a stronger replacement —
+    # `_validate_no_hardcoded_values` already uses libcst as precedent.
+    _PARAM_REF_RE = re.compile(
+        r"""context\s*\.\s*parameters\s*(?:\[\s*['"](\w+)['"]\s*\]|\.\s*get\s*\(\s*['"](\w+)['"]\s*(?:,[^)]*)?\))"""
+    )
 
-    def _find_param_refs_excluding_comments(self, code: str) -> list[str]:
-        """Extract parameter reference keys from code, skipping comment lines."""
-        refs: list[str] = []
+    @staticmethod
+    def _strip_comment_lines(code: str) -> str:
+        out = []
         for line in code.split("\n"):
             if line.lstrip().startswith("#"):
-                continue
-            for match in self._PARAM_REF_RE.finditer(line):
-                refs.append(match.group(1))
+                out.append("")
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    def _find_param_refs_excluding_comments(self, code: str) -> list[str]:
+        """Extract parameter reference keys from code, skipping comment lines.
+
+        Uses a whole-code regex scan (rather than per-line) so multiline
+        access like::
+
+            value=context.parameters[
+                'block_output'
+            ]['username']
+
+        is still matched. The regex's ``\\s*`` already permits newlines inside
+        the subscript brackets and `.get()` parens.
+        """
+        scrubbed = self._strip_comment_lines(code)
+        refs: list[str] = []
+        for match in self._PARAM_REF_RE.finditer(scrubbed):
+            # Group 1 = subscript form, group 2 = .get() form; exactly one fires.
+            key = match.group(1) or match.group(2)
+            if key:
+                refs.append(key)
         return refs
 
-    def _validate_parameter_references(self, code: str, parameter_keys: list[str]) -> str | None:
+    @staticmethod
+    def _filter_self_output_param_keys(parameter_keys: list[str], block_label: str) -> list[str]:
+        """Drop the current block's own ``<block_label>_output`` from the parameter list.
+
+        The output slot is ``None`` until the block has finished running, so any
+        ``context.parameters['<self>_output']`` reference inside the block crashes
+        with ``'NoneType' object is not subscriptable``. Upstream and downstream
+        block outputs stay — only the current block's output is forbidden.
+        """
+        if not block_label:
+            return parameter_keys
+        self_output_key = f"{block_label}_output"
+        return [k for k in parameter_keys if k != self_output_key]
+
+    def _validate_parameter_references(
+        self,
+        code: str,
+        parameter_keys: list[str],
+        self_output_key: str | None = None,
+    ) -> str | None:
         """Validate that context.parameters['key'] references use known parameter keys.
 
         Catches KeyError crashes at runtime when the LLM invents parameter names.
-        Returns an error message or None if all references are valid.
+        When ``self_output_key`` is supplied and matches one of the rejected
+        references, the retry hint explains the self-output ``None``-subscript
+        crash so the LLM doesn't reintroduce the same pattern.
+
+        Short-circuits on an empty valid set only when ``self_output_key`` is
+        also absent. With a self-output key in play we still scan so the bug
+        can't slip through workflows whose only declared parameter was the
+        block's own output.
         """
-        if not parameter_keys:
-            return None  # No parameter keys to validate against
+        if not parameter_keys and not self_output_key:
+            return None  # No constraints to validate against (preserves prior behavior).
 
         valid_keys = set(parameter_keys)
         invalid: list[str] = []
 
-        for line in code.split("\n"):
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
+        # Empty valid set + ``self_output_key`` rejects only the self-output
+        # ref; other unknown refs may be runtime-valid synthesized keys we
+        # don't load into the valid set, so we let them through.
+        scrubbed = self._strip_comment_lines(code)
+        for match in self._PARAM_REF_RE.finditer(scrubbed):
+            key = match.group(1) or match.group(2)
+            if not key:
                 continue
-            for match in self._PARAM_REF_RE.finditer(line):
-                key = match.group(1)
-                if key not in valid_keys:
-                    invalid.append(key)
+            if valid_keys and key not in valid_keys:
+                invalid.append(key)
+            elif not valid_keys and self_output_key and key == self_output_key:
+                invalid.append(key)
 
         if not invalid:
             return None
 
         unique_invalid = sorted(set(invalid))
-        return (
+        valid_list = ", ".join(repr(k) for k in sorted(valid_keys)) or "(none)"
+        message = (
             f"Invalid context.parameters references: {', '.join(repr(k) for k in unique_invalid)}. "
-            f"Valid parameter keys are: {', '.join(repr(k) for k in sorted(valid_keys))}. "
+            f"Valid parameter keys are: {valid_list}. "
             f"For fields without a matching parameter, use ai='proactive' with a descriptive prompt "
             f"instead of context.parameters['invented_name']."
         )
+        if self_output_key and self_output_key in set(invalid):
+            message += (
+                f" NOTE: {self_output_key!r} is the current block's own output slot — it is None "
+                f"during this block's execution and reading it (or any subscript of it) crashes with "
+                f"'NoneType' object is not subscriptable'. Use a parameter from the valid list, an "
+                f"upstream block's output, or ai='proactive' instead."
+            )
+        return message
 
     def _validate_parameter_preservation(
         self, new_code: str, existing_code: str | None, parameter_keys: list[str]
