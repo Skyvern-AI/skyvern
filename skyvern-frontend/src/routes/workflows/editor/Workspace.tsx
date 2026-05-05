@@ -91,6 +91,7 @@ import { cn } from "@/util/utils";
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
+import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
@@ -1134,7 +1135,7 @@ function Workspace({
     workflowChangesStore.setHasChanges(true);
     postHog.capture("builder.block.added", {
       org_id: workflow.organization_id,
-      block_type: nodeType,
+      block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
