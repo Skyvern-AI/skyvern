@@ -171,6 +171,7 @@ function GoogleSheetsReadNode({
                 displayName={effectiveDisplayName}
                 placeholder="Search or paste a spreadsheet URL"
                 allowCreate={false}
+                blockType="google_sheets_read"
                 onChange={(value) => {
                   setSpreadsheetDisplayName(null);
                   const oldId = extractSpreadsheetIdFromUrl(
@@ -230,6 +231,7 @@ function GoogleSheetsReadNode({
                       value={data.sheetName}
                       placeholder="Sheet1"
                       allowCreate={false}
+                      blockType="google_sheets_read"
                       onChange={(value) => update({ sheetName: value })}
                       onSelect={(tabName) => update({ sheetName: tabName })}
                     />
