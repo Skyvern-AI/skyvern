@@ -524,6 +524,32 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+    ENABLE_ENCRYPTION: bool = False
+
+    # Google OAuth settings (used by the Google Sheets connector)
+    GOOGLE_OAUTH_CLIENT_ID: str | None = None
+    GOOGLE_OAUTH_CLIENT_SECRET: str | None = None
+    # Hostnames allowed as the OAuth ``redirect_uri`` sent to Google. Defense-in-depth
+    # alongside Google's own redirect_uri allowlist (which is the real enforcement
+    # gate — it validates the full URI against its registered list). This setting is
+    # intentionally host-only: any path or port on an approved host passes. Empty
+    # list means no redirect_uri may be supplied at all (the route layer rejects
+    # with 400) when CLIENT_ID is set.
+    GOOGLE_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Origins allowed as the bounce-back destination after OAuth callback.
+    # Never sent to Google. Two entry shapes — port handling differs:
+    #   - Exact-match: ``https://host:port`` matches that exact origin (port included).
+    #     ``https://app.example.com`` does NOT match ``https://app.example.com:8443``.
+    #   - Suffix wildcard: ``*.foo.com`` matches any HTTPS hostname ending in ``.foo.com``
+    #     regardless of port (so preview deploys on non-default ports work). Rejects
+    #     bare-suffix spoofs like ``attacker-foo.com``.
+    # Fails closed: an empty list rejects every app_origin, so self-hosted operators
+    # who want to use the bounce-back flow must populate this with at least one entry.
+    GOOGLE_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
+
+    # Google Sheets API runtime tuning
+    GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
+    GOOGLE_SHEETS_API_MAX_RETRIES: int = 3
 
     # Cleanup Cron Settings
     ENABLE_CLEANUP_CRON: bool = False

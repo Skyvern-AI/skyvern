@@ -44,6 +44,7 @@ CREDENTIAL_PREFIX = "cred"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
+GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -244,6 +245,11 @@ def generate_debug_session_id() -> str:
 def generate_folder_id() -> str:
     int_id = generate_id()
     return f"{FOLDER_PREFIX}_{int_id}"
+
+
+def generate_google_oauth_credential_id() -> str:
+    int_id = generate_id()
+    return f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:
