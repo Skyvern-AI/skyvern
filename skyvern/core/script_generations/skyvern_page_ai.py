@@ -22,6 +22,7 @@ class SkyvernPageAi(Protocol):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention."""
         ...
@@ -37,6 +38,7 @@ class SkyvernPageAi(Protocol):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
         ...

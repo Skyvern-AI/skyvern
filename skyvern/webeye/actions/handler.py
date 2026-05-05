@@ -2593,6 +2593,12 @@ ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_acti
 def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    if secret_value is not None:
+        credential_parameter_key = workflow_run_context.find_credential_parameter_key_for_secret(parameter)
+        if credential_parameter_key is not None:
+            current_context = skyvern_context.current()
+            if current_context is not None:
+                current_context.active_credential_parameter_key = credential_parameter_key
     return secret_value if secret_value is not None else parameter
 
 

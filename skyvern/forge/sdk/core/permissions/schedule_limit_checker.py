@@ -5,11 +5,11 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 
 class ScheduleLimitChecker(abc.ABC):
     @abc.abstractmethod
-    async def get_schedule_limit(self, organization: Organization, workflow_permanent_id: str) -> int | None: ...
+    async def get_schedule_limit(self, organization: Organization) -> int | None: ...
 
 
 class NoopScheduleLimitChecker(ScheduleLimitChecker):
-    async def get_schedule_limit(self, organization: Organization, workflow_permanent_id: str) -> int | None:
+    async def get_schedule_limit(self, organization: Organization) -> int | None:
         return None  # unlimited in OSS
 
 

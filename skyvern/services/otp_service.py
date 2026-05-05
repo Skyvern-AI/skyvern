@@ -1,15 +1,20 @@
 import asyncio
 import re
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pyotp
 import structlog
 from pydantic import BaseModel, Field
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+
 from skyvern.config import settings
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -120,13 +125,43 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
     return None
 
 
-def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue | None:
-    """Try to generate a TOTP code from a credential secret stored in the workflow run context.
+def _try_generate_totp_for_credential(
+    workflow_run_context: "WorkflowRunContext",
+    credential_key: str,
+    workflow_run_id: str,
+) -> OTPValue | None:
+    value = workflow_run_context.values.get(credential_key)
+    if not isinstance(value, dict):
+        return None
+    totp_secret_id = value.get("totp")
+    if not totp_secret_id or not isinstance(totp_secret_id, str):
+        return None
+    totp_secret_key = workflow_run_context.totp_secret_value_key(totp_secret_id)
+    totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+    if not totp_secret:
+        return None
+    try:
+        code = pyotp.TOTP(totp_secret).now()
+        LOG.info(
+            "Generated TOTP from credential secret",
+            workflow_run_id=workflow_run_id,
+            credential_key=credential_key,
+        )
+        return OTPValue(value=code, type=OTPType.TOTP)
+    except Exception:
+        LOG.warning(
+            "Failed to generate TOTP from credential secret",
+            workflow_run_id=workflow_run_id,
+            credential_key=credential_key,
+            exc_info=True,
+        )
+        return None
 
-    Scans workflow_run_context.values for credential entries with a "totp" key
-    (e.g. Bitwarden, 1Password, Azure Key Vault credentials) and generates a
-    TOTP code using pyotp. This should be checked BEFORE poll_otp_value so that
-    credential-based TOTP takes priority over webhook (totp_url) and totp_identifier.
+
+def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue | None:
+    """Generate a TOTP only for the credential the agent is currently typing into.
+
+    Falls back to single-credential heuristic when no active credential is recorded.
     """
     if not workflow_run_id:
         return None
@@ -135,30 +170,26 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     if not workflow_run_context:
         return None
 
-    for key, value in workflow_run_context.values.items():
-        if isinstance(value, dict) and "totp" in value:
-            totp_secret_id = value.get("totp")
-            if not totp_secret_id or not isinstance(totp_secret_id, str):
-                continue
-            totp_secret_key = workflow_run_context.totp_secret_value_key(totp_secret_id)
-            totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-            if totp_secret:
-                try:
-                    code = pyotp.TOTP(totp_secret).now()
-                    LOG.info(
-                        "Generated TOTP from credential secret",
-                        workflow_run_id=workflow_run_id,
-                        credential_key=key,
-                    )
-                    return OTPValue(value=code, type=OTPType.TOTP)
-                except Exception:
-                    LOG.warning(
-                        "Failed to generate TOTP from credential secret",
-                        workflow_run_id=workflow_run_id,
-                        credential_key=key,
-                        exc_info=True,
-                    )
-    return None
+    current_context = skyvern_context.current()
+    active_credential_key = current_context.active_credential_parameter_key if current_context else None
+
+    if active_credential_key:
+        return _try_generate_totp_for_credential(workflow_run_context, active_credential_key, workflow_run_id)
+
+    candidate_keys = [
+        key
+        for key, value in workflow_run_context.values.items()
+        if isinstance(value, dict) and isinstance(value.get("totp"), str)
+    ]
+    if len(candidate_keys) != 1:
+        if len(candidate_keys) > 1:
+            LOG.info(
+                "Skipping credential-TOTP: multiple credentials with TOTP and no active credential",
+                workflow_run_id=workflow_run_id,
+                candidate_credential_keys=candidate_keys,
+            )
+        return None
+    return _try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
 
 
 async def poll_otp_value(
