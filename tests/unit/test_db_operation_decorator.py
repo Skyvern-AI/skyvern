@@ -182,7 +182,7 @@ async def test_db_operation_schedule_limit_exceeded_is_passthrough() -> None:
     class ScheduleDB:
         @db_operation("create_schedule")
         async def create_schedule(self) -> None:
-            raise ScheduleLimitExceededError("org1", "wpid1", 5, 5)
+            raise ScheduleLimitExceededError("org1", 5, 5)
 
     db = ScheduleDB()
     with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:

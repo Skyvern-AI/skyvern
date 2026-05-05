@@ -196,7 +196,9 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
     # list, so a substring check on the full SQL would be a false positive.
     where_clause = _where_clause_sql(captured["query"])
     assert "task_runs.run_id" in where_clause
-    assert "task_runs.workflow_permanent_id" in where_clause
+    # WPID search must match across both task_runs and the joined workflow_runs
+    # so legacy rows with task_runs.workflow_permanent_id=NULL still hit.
+    assert "coalesce(task_runs.workflow_permanent_id, workflow_runs.workflow_permanent_id)" in where_clause
     # autoescape rewrites '_' to e.g. '/_' so check the distinctive suffix.
     assert "abc123" in where_clause
 
@@ -221,6 +223,9 @@ async def test_get_all_runs_v2_selects_workflow_deleted_flag() -> None:
     # NOT EXISTS subquery against an active (non-deleted) workflows row.
     assert "NOT (EXISTS" in rendered
     assert "workflows.deleted_at IS NULL" in rendered
+    # WPID must coalesce task_runs over workflow_runs so legacy rows where
+    # task_runs.workflow_permanent_id is NULL still resolve via the join.
+    assert "coalesce(task_runs.workflow_permanent_id, workflow_runs.workflow_permanent_id)" in rendered
 
 
 @pytest.mark.asyncio

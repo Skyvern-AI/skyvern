@@ -28,6 +28,11 @@ def _make_input_action(field_name: str, value: str = "test") -> dict:
         "element_id": f"elem_{field_name}",
         "reasoning": f"Fill the {field_name} field",
         "text": value,
+        "skyvern_element_data": {
+            "tagName": "input",
+            "text": "",
+            "attributes": {"name": field_name, "type": "text"},
+        },
     }
 
 
@@ -38,6 +43,11 @@ def _make_select_action(field_name: str) -> dict:
         "element_id": f"elem_{field_name}",
         "reasoning": f"Select {field_name}",
         "option": {"label": "Option A", "value": "a"},
+        "skyvern_element_data": {
+            "tagName": "select",
+            "text": "",
+            "attributes": {"name": field_name},
+        },
     }
 
 
