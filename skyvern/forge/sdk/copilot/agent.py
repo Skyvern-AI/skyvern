@@ -43,6 +43,12 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 
 MAX_TURNS = 25
 
+_BLOCK_GOAL_CONTEXT_PREAMBLE = (
+    "Interpret the latest user message in the context of the prior conversation. If it is a correction, "
+    "refinement, or continuation, preserve the established website, actions, filters, and output requirements "
+    "except where the latest message changes them."
+)
+
 
 async def _resolve_live_browser_session_id(
     chat_request: WorkflowCopilotChatRequest,
@@ -112,6 +118,34 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         return ""
     lines = [f"{msg.sender}: {msg.content}" for msg in chat_history]
     return "\n".join(lines)
+
+
+def _build_block_goal_main_goal(
+    user_message: str,
+    chat_history_text: str,
+    global_llm_context: str | None,
+) -> str:
+    raw_current_message = (user_message or "").strip()
+    if not raw_current_message:
+        return ""
+    current_message = escape_code_fences(raw_current_message)
+    structured_context = StructuredContext.from_json_str(global_llm_context)
+    context_sections: list[str] = []
+    if structured_context.user_goal.strip():
+        prior_goal = escape_code_fences(structured_context.user_goal.strip())
+        context_sections.append(f"Prior high-level goal:\n{prior_goal}")
+    if chat_history_text.strip():
+        escaped_chat_history = escape_code_fences(chat_history_text.strip())
+        context_sections.append(f"Recent chat history:\n{escaped_chat_history}")
+    if not context_sections:
+        return current_message
+
+    return (
+        _BLOCK_GOAL_CONTEXT_PREAMBLE
+        + "\n\n"
+        + "\n\n".join(context_sections)
+        + f"\n\nLatest user message:\n{current_message}"
+    )
 
 
 def _build_system_prompt(
@@ -414,10 +448,11 @@ def _translate_to_agent_result(
                 ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
-            if ctx.user_message:
-                workflow_yaml = wrap_block_goals(workflow_yaml, ctx.user_message)
+            block_goal_main_goal = ctx.block_goal_main_goal or ctx.user_message
+            if block_goal_main_goal:
+                workflow_yaml = wrap_block_goals(workflow_yaml, block_goal_main_goal)
             else:
-                LOG.warning("REPLACE_WORKFLOW inline path missing ctx.user_message; skipping block-goal wrap")
+                LOG.warning("REPLACE_WORKFLOW inline path missing block-goal context; skipping block-goal wrap")
             try:
                 last_workflow = _process_workflow_yaml(
                     workflow_id=chat_request.workflow_id,
@@ -598,6 +633,7 @@ async def run_copilot_agent(
     )
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
+    chat_history_text = _format_chat_history(chat_history)
 
     ctx = CopilotContext(
         organization_id=organization_id,
@@ -608,6 +644,11 @@ async def run_copilot_agent(
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
+        block_goal_main_goal=_build_block_goal_main_goal(
+            user_message=chat_request.message,
+            chat_history_text=chat_history_text,
+            global_llm_context=global_llm_context,
+        ),
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
     )
 
@@ -629,7 +670,6 @@ async def run_copilot_agent(
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in NATIVE_TOOLS]
     tool_info.extend((name, overlay.description or "") for name, overlay in overlays.items())
 
-    chat_history_text = _format_chat_history(chat_history)
     tool_usage_guide = _build_tool_usage_guide(tool_info)
     system_prompt = _build_system_prompt(
         tool_usage_guide=tool_usage_guide,
