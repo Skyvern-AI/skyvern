@@ -53,6 +53,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock()
     fake_app_module.EXPERIMENTATION_PROVIDER = _LazyNamespace()
     fake_app_module.STORAGE = _LazyNamespace()
+    fake_app_module.CACHE = _LazyNamespace()
 
     return fake_app_module
 
