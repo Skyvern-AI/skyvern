@@ -246,14 +246,12 @@ async def create_workflow_schedule(
     )
     stored_parameters = _strip_none_parameters(body.parameters)
 
-    # Atomic limit check + insert
     max_schedules = await ScheduleLimitCheckerFactory.get_instance().get_schedule_limit(
         organization,
-        workflow_permanent_id,
     )
 
     try:
-        schedule, count = await app.DATABASE.schedules.create_workflow_schedule_with_limit(
+        schedule = await app.DATABASE.schedules.create_workflow_schedule_with_limit(
             organization_id=organization.organization_id,
             workflow_permanent_id=workflow_permanent_id,
             max_schedules=max_schedules,
@@ -274,24 +272,8 @@ async def create_workflow_schedule(
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Maximum of {e.max_allowed} schedules per workflow reached",
+            detail=f"Maximum of {e.max_allowed} schedules reached for your plan",
         ) from e
-
-    # Auto-generate name if not provided
-    if not body.name:
-        auto_name = f"{workflow.title} - Schedule #{count + 1}"
-        updated = await app.DATABASE.schedules.update_workflow_schedule(
-            workflow_schedule_id=schedule.workflow_schedule_id,
-            organization_id=organization.organization_id,
-            cron_expression=body.cron_expression,
-            timezone=body.timezone,
-            enabled=body.enabled,
-            parameters=stored_parameters,
-            name=auto_name,
-            description=body.description,
-        )
-        if updated:
-            schedule = updated
 
     backend_schedule_id = app.AGENT_FUNCTION.build_workflow_schedule_id(schedule.workflow_schedule_id)
     # The 501 guard above ensures this route only runs when schedules are enabled,

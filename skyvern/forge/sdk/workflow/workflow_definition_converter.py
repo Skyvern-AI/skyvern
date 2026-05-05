@@ -453,27 +453,24 @@ def block_yaml_to_block(
         loop_blocks = [block_yaml_to_block(loop_block, parameters) for loop_block in block_yaml.loop_blocks]
 
         condition_yaml = block_yaml.condition
-        condition: JinjaBranchCriteria | PromptBranchCriteria
-        if condition_yaml.criteria_type == "jinja2_template":
-            condition = JinjaBranchCriteria(
-                criteria_type=condition_yaml.criteria_type,
+        criteria_type = condition_yaml.criteria_type
+        if criteria_type == "prompt":
+            condition = PromptBranchCriteria(
+                criteria_type=criteria_type,
                 expression=condition_yaml.expression,
                 description=condition_yaml.description,
             )
-        elif condition_yaml.criteria_type == "prompt":
-            condition = PromptBranchCriteria(
-                criteria_type=condition_yaml.criteria_type,
+        elif criteria_type == "jinja2_template":
+            condition = JinjaBranchCriteria(
+                criteria_type=criteria_type,
                 expression=condition_yaml.expression,
                 description=condition_yaml.description,
             )
         else:
-            # Defensive: BranchCriteriaYAML.criteria_type is a Literal, so Pydantic
-            # rejects unknown values at parse time. This branch surfaces the error
-            # explicitly if the schema ever grows a third criteria type without a
-            # converter update — better to fail loudly than silently coerce to Jinja.
             raise InvalidWorkflowDefinition(
-                f"Unknown criteria_type {condition_yaml.criteria_type!r} for while_loop "
-                f"block {block_yaml.label!r}. Supported types: jinja2_template, prompt."
+                f"While loop block '{block_yaml.label}' has unsupported condition.criteria_type {criteria_type!r}. "
+                "Conversion accepts only 'prompt' and 'jinja2_template', so new or unexpected YAML values fail here "
+                "instead of being mapped to the wrong criteria type."
             )
 
         return WhileLoopBlock(

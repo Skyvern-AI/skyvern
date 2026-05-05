@@ -5271,12 +5271,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        # 1. Check navigation payload first for inline OTP.
         otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        # 2. Then try to generate TOTP from credential if payload has no OTP.
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
         if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             workflow_id = workflow_permanent_id = None
             if task.workflow_run_id:
@@ -5293,6 +5288,8 @@ class ForgeAgent:
                 totp_verification_url=task.totp_verification_url,
                 totp_identifier=task.totp_identifier,
             )
+        if not otp_value:
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response

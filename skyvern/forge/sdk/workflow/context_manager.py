@@ -66,6 +66,15 @@ jinja_sandbox_env = SandboxedEnvironment()
 
 RANDOM_SECRET_ID_PREFIX = "placeholder_"
 
+_CREDENTIAL_PARAMETER_TYPES: tuple[type, ...] = (
+    AzureVaultCredentialParameter,
+    BitwardenCreditCardDataParameter,
+    BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
+    CredentialParameter,
+    OnePasswordCredentialParameter,
+)
+
 # 1Password's Python SDK forwards generic 5xx upstream failures as plain Exceptions
 # whose stringified message embeds the HTTP status.
 _ONEPASSWORD_5XX_PATTERN = re.compile(
@@ -569,8 +578,8 @@ class WorkflowRunContext:
         }
         credential_dict: dict[str, str | None] = credential.model_dump()
         for key, value in credential_dict.items():
-            # Exclude totp_type from navigation payload as it's metadata, not input data
-            if key == "totp_type":
+            # totp_type is metadata; totp is registered as a TOTP seed below, not as a plain field.
+            if key in ("totp_type", "totp"):
                 continue
             if not value:
                 continue
@@ -1350,6 +1359,18 @@ class WorkflowRunContext:
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
+
+    def find_credential_parameter_key_for_secret(self, secret_id: str) -> str | None:
+        for parameter_key, value in self.values.items():
+            if not isinstance(value, dict):
+                continue
+            parameter = self.parameters.get(parameter_key)
+            if not isinstance(parameter, _CREDENTIAL_PARAMETER_TYPES):
+                continue
+            for field_value in value.values():
+                if field_value == secret_id:
+                    return parameter_key
+        return None
 
     def _resolve_required_parameter_value(self, parameter_value: str | None, name: str) -> str:
         result = self._resolve_parameter_value(parameter_value)

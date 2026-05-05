@@ -516,12 +516,18 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
+            # task_runs.workflow_permanent_id is unreliable on legacy workflow_run rows; the joined
+            # workflow_runs row carries the canonical WPID, so coalesce both before deriving anything.
+            effective_wpid = func.coalesce(
+                TaskRunModel.workflow_permanent_id,
+                WorkflowRunModel.workflow_permanent_id,
+            )
             # True iff this row's workflow_permanent_id has no active (deleted_at IS NULL) version.
             workflow_deleted_expr = and_(
-                TaskRunModel.workflow_permanent_id.isnot(None),
+                effective_wpid.isnot(None),
                 ~exists().where(
                     and_(
-                        WorkflowModel.workflow_permanent_id == TaskRunModel.workflow_permanent_id,
+                        WorkflowModel.workflow_permanent_id == effective_wpid,
                         WorkflowModel.organization_id == TaskRunModel.organization_id,
                         WorkflowModel.deleted_at.is_(None),
                     )
@@ -537,7 +543,7 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.started_at.label("started_at"),
                     TaskRunModel.finished_at.label("finished_at"),
                     TaskRunModel.created_at.label("created_at"),
-                    TaskRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    effective_wpid.label("workflow_permanent_id"),
                     TaskRunModel.script_run.label("script_run"),
                     TaskRunModel.searchable_text.label("searchable_text"),
                     workflow_deleted_expr,
@@ -566,7 +572,7 @@ class WorkflowRunsRepository(BaseRepository):
                     or_(
                         TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
                         TaskRunModel.run_id.icontains(search_key, autoescape=True),
-                        TaskRunModel.workflow_permanent_id.icontains(search_key, autoescape=True),
+                        effective_wpid.icontains(search_key, autoescape=True),
                     )
                 )
 
