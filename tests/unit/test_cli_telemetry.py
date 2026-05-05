@@ -62,3 +62,9 @@ def test_register_cli_telemetry_flush_is_idempotent() -> None:
         fake_register.assert_called_once_with(telemetry.flush_cli_telemetry)
     finally:
         telemetry._flush_registered = original
+
+
+def test_cli_telemetry_noops_when_posthog_is_not_installed() -> None:
+    with patch.object(telemetry, "_load_analytics", return_value=None):
+        telemetry.capture_cli_tool_call("skyvern_capabilities", ok=True)
+        telemetry.flush_cli_telemetry()
