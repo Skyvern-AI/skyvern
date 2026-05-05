@@ -9,8 +9,10 @@ import {
   WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
+  BranchCriteriaTypes,
   debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
+  type BranchCriteriaType,
   type OutputParameter,
   type Parameter,
   type WorkflowApiResponse,
@@ -18,6 +20,8 @@ import {
   type WorkflowSettings,
   type ConditionalBlock,
   type ForLoopBlock,
+  type WhileLoopBlock,
+  isNestedLoopWorkflowBlock,
 } from "../types/workflowTypes";
 import {
   ActionBlockYAML,
@@ -27,6 +31,7 @@ import {
   DownloadToS3BlockYAML,
   FileUrlParserBlockYAML,
   ForLoopBlockYAML,
+  WhileLoopBlockYAML,
   ParameterYAML,
   SendEmailBlockYAML,
   TaskBlockYAML,
@@ -152,6 +157,64 @@ import {
   isGoogleSheetsWriteNode,
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
+
+/** If the trimmed expression is exactly one `{{ ... }}` wrapper, use `jinja2_template`; otherwise `prompt`. */
+export function inferBranchCriteriaTypeFromExpression(
+  expression: string,
+): BranchCriteriaType {
+  const stripped = expression.trim();
+  const openCount = (stripped.match(/\{\{/g) ?? []).length;
+  if (stripped.startsWith("{{") && stripped.endsWith("}}") && openCount === 1) {
+    return BranchCriteriaTypes.Jinja2Template;
+  }
+  return BranchCriteriaTypes.Prompt;
+}
+
+function buildWhileLoopBlockYAML(args: {
+  label: string;
+  continue_on_failure: boolean;
+  next_loop_on_failure: boolean;
+  next_block_label: string | null;
+  ignore_workflow_system_prompt: boolean;
+  loop_blocks: Array<BlockYAML>;
+  criteria_type: BranchCriteriaType;
+  expression: string;
+  description: string | null;
+}): WhileLoopBlockYAML {
+  return {
+    block_type: "while_loop",
+    label: args.label,
+    continue_on_failure: args.continue_on_failure,
+    next_loop_on_failure: args.next_loop_on_failure,
+    next_block_label: args.next_block_label,
+    ignore_workflow_system_prompt: args.ignore_workflow_system_prompt,
+    loop_blocks: args.loop_blocks,
+    condition: {
+      criteria_type: args.criteria_type,
+      expression: args.expression,
+      description: args.description,
+    },
+  };
+}
+
+function serializeLoopNodeWhileBranchToYAML(
+  node: LoopNode,
+  loopChildren: Array<BlockYAML>,
+  nextBlockLabel: string | null,
+): WhileLoopBlockYAML {
+  return buildWhileLoopBlockYAML({
+    label: node.data.label,
+    continue_on_failure: node.data.continueOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
+    next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
+    loop_blocks: loopChildren,
+    criteria_type: node.data.whileConditionCriteriaType,
+    expression: node.data.whileConditionExpression,
+    description: node.data.whileConditionDescription ?? null,
+  });
+}
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -855,7 +918,9 @@ function convertToNode(
         ...common,
         type: "loop",
         data: {
+          ...loopNodeDefaultData,
           ...commonData,
+          loopKind: "for_each",
           loopValue: block.loop_over?.key ?? "",
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
@@ -866,6 +931,32 @@ function convertToNode(
               : typeof block.data_schema === "string"
                 ? block.data_schema
                 : JSON.stringify(block.data_schema, null, 2),
+        },
+      };
+    }
+    case "while_loop": {
+      const wblock = block as WhileLoopBlock;
+      const rawExpr = wblock.condition.expression;
+      const whileConditionExpression =
+        rawExpr.trim() === "" ? "{{ true }}" : rawExpr;
+      return {
+        ...identifiers,
+        ...common,
+        type: "loop",
+        data: {
+          ...loopNodeDefaultData,
+          ...commonData,
+          loopKind: "while",
+          loopValue: "",
+          loopVariableReference: "",
+          completeIfEmpty: false,
+          dataSchema: "null",
+          whileConditionExpression,
+          whileConditionDescription: wblock.condition.description ?? null,
+          whileConditionCriteriaType:
+            rawExpr.trim() === ""
+              ? inferBranchCriteriaTypeFromExpression(whileConditionExpression)
+              : wblock.condition.criteria_type,
         },
       };
     }
@@ -1096,7 +1187,7 @@ function generateNodeData(blocks: Array<WorkflowBlock>): Array<{
     const block = stack.pop()!;
     const id = nanoid();
     idMap.set(block, id);
-    if (block.block_type === "for_loop") {
+    if (isNestedLoopWorkflowBlock(block)) {
       stack.push(...block.loop_blocks);
     }
   }
@@ -1129,7 +1220,7 @@ function getNodeData(
     const next =
       index === blocks.length - 1 ? null : ids.get(blocks[index + 1]!)!;
     data.push({ id, previous, next, parentId, block });
-    if (block.block_type === "for_loop") {
+    if (isNestedLoopWorkflowBlock(block)) {
       data.push(...getNodeData(block.loop_blocks, ids, id));
     }
   });
@@ -1145,7 +1236,7 @@ function buildLabelToBlockMap(
   const traverse = (list: Array<WorkflowBlock>) => {
     list.forEach((block) => {
       map.set(block.label, block);
-      if (block.block_type === "for_loop") {
+      if (isNestedLoopWorkflowBlock(block)) {
         traverse(block.loop_blocks);
       }
     });
@@ -1216,7 +1307,7 @@ function reconstructConditionalStructure(
   // Process each conditional block
   blocks.forEach((block, blockIndex) => {
     if (block.block_type !== "conditional") {
-      if (block.block_type === "for_loop") {
+      if (isNestedLoopWorkflowBlock(block)) {
         // Recursively handle conditionals inside loops
         const recursiveResult = reconstructConditionalStructure(
           block.loop_blocks,
@@ -1619,8 +1710,8 @@ function getElements(
   });
 
   const loopBlocks = data.filter(
-    (d): d is typeof d & { block: ForLoopBlock } =>
-      d.block.block_type === "for_loop",
+    (d): d is typeof d & { block: ForLoopBlock | WhileLoopBlock } =>
+      isNestedLoopWorkflowBlock(d.block),
   );
   loopBlocks.forEach((block) => {
     const loopBlock = block.block;
@@ -1660,7 +1751,7 @@ function getElements(
             ).forEach((label) => branchLabels.add(label));
           });
         }
-        if (child.block_type === "for_loop") {
+        if (isNestedLoopWorkflowBlock(child)) {
           collectBranchLabels(child.loop_blocks);
         }
       });
@@ -2205,6 +2296,35 @@ function JSONSafeOrString(
   } catch {
     return json;
   }
+}
+
+function serializeLoopNodeToYAML(
+  node: LoopNode,
+  loopChildren: Array<BlockYAML>,
+  nextBlockLabel: string | null,
+): ForLoopBlockYAML | WhileLoopBlockYAML {
+  const loopKind = node.data.loopKind;
+  if (loopKind === "while") {
+    return serializeLoopNodeWhileBranchToYAML(
+      node,
+      loopChildren,
+      nextBlockLabel,
+    );
+  }
+  return {
+    label: node.data.label,
+    continue_on_failure: node.data.continueOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
+    next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
+    loop_blocks: loopChildren,
+    block_type: "for_loop",
+    loop_variable_reference: node.data.loopVariableReference,
+    complete_if_empty: node.data.completeIfEmpty,
+    data_schema: JSONSafeOrString(node.data.dataSchema),
+    loop_over_parameter_key: node.data.loopValue ?? "",
+  };
 }
 
 function findNextBlockLabel(
@@ -2784,17 +2904,13 @@ function getOrderedChildrenBlocks(
       );
       // Compute next_block_label for nested loops (same as regular blocks)
       const nextBlockLabel = findNextBlockLabel(currentNode.id, nodes, edges);
-      children.push({
-        block_type: "for_loop",
-        label: currentNode.data.label,
-        continue_on_failure: currentNode.data.continueOnFailure,
-        next_loop_on_failure: currentNode.data.nextLoopOnFailure,
-        next_block_label: nextBlockLabel,
-        loop_blocks: loopChildren,
-        loop_variable_reference: currentNode.data.loopVariableReference,
-        complete_if_empty: currentNode.data.completeIfEmpty,
-        data_schema: JSONSafeOrString(currentNode.data.dataSchema),
-      });
+      children.push(
+        serializeLoopNodeToYAML(
+          currentNode as LoopNode,
+          loopChildren,
+          nextBlockLabel,
+        ),
+      );
     } else {
       children.push(getWorkflowBlock(currentNode, nodes, edges));
     }
@@ -2823,17 +2939,9 @@ function getOrderedChildrenBlocks(
     if (node.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
       const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
-      children.push({
-        block_type: "for_loop",
-        label: node.data.label,
-        continue_on_failure: node.data.continueOnFailure,
-        next_loop_on_failure: node.data.nextLoopOnFailure,
-        next_block_label: nextBlockLabel,
-        loop_blocks: loopChildren,
-        loop_variable_reference: node.data.loopVariableReference,
-        complete_if_empty: node.data.completeIfEmpty,
-        data_schema: JSONSafeOrString(node.data.dataSchema),
-      });
+      children.push(
+        serializeLoopNodeToYAML(node as LoopNode, loopChildren, nextBlockLabel),
+      );
       includedIds.add(node.id);
       return;
     }
@@ -2889,17 +2997,11 @@ function getWorkflowBlocksUtil(
       const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
 
       return [
-        {
-          block_type: "for_loop",
-          label: node.data.label,
-          continue_on_failure: node.data.continueOnFailure,
-          next_loop_on_failure: node.data.nextLoopOnFailure,
-          next_block_label: nextBlockLabel,
-          loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
-          loop_variable_reference: node.data.loopVariableReference,
-          complete_if_empty: node.data.completeIfEmpty,
-          data_schema: JSONSafeOrString(node.data.dataSchema),
-        },
+        serializeLoopNodeToYAML(
+          node as LoopNode,
+          getOrderedChildrenBlocks(nodes, edges, node.id),
+          nextBlockLabel,
+        ),
       ];
     }
     return [getWorkflowBlock(node as WorkflowBlockNode, nodes, edges)];
@@ -3511,7 +3613,10 @@ function getBlocksOfType(
 ): Array<BlockYAML> {
   const blocksOfType: Array<BlockYAML> = [];
   for (const block of blocks) {
-    if (block.block_type === WorkflowBlockTypes.ForLoop) {
+    if (
+      block.block_type === WorkflowBlockTypes.ForLoop ||
+      block.block_type === WorkflowBlockTypes.WhileLoop
+    ) {
       const subBlocks = block.loop_blocks;
       const subBlocksOfType = getBlocksOfType(subBlocks, blockType);
       blocksOfType.push(...subBlocksOfType);
@@ -3775,11 +3880,10 @@ export function upgradeWorkflowBlocksV1toV2(
     };
 
     // Recursively handle loop blocks
-    if (block.block_type === "for_loop") {
-      const loopBlock = block as ForLoopBlock;
+    if (isNestedLoopWorkflowBlock(block)) {
       return {
         ...upgradedBlock,
-        loop_blocks: upgradeWorkflowBlocksV1toV2(loopBlock.loop_blocks),
+        loop_blocks: upgradeWorkflowBlocksV1toV2(block.loop_blocks),
       } as WorkflowBlock;
     }
 
@@ -4016,6 +4120,20 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "while_loop": {
+        const wblock = block as WhileLoopBlock;
+        const blockYaml: WhileLoopBlockYAML = {
+          ...base,
+          block_type: "while_loop",
+          loop_blocks: convertBlocksToBlockYAML(wblock.loop_blocks),
+          condition: {
+            criteria_type: wblock.condition.criteria_type,
+            expression: wblock.condition.expression,
+            description: wblock.condition.description ?? null,
+          },
+        };
+        return blockYaml;
+      }
       case "code": {
         const blockYaml: CodeBlockYAML = {
           ...base,
@@ -4247,12 +4365,24 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   // check loop node parameters
   const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
-  const emptyLoopNodes = loopNodes.filter(
-    (node: LoopNode) => node.data.loopVariableReference === "",
+  const emptyForEachLoops = loopNodes.filter(
+    (node: LoopNode) =>
+      node.data.loopKind === "for_each" &&
+      node.data.loopVariableReference === "",
   );
-  if (emptyLoopNodes.length > 0) {
-    emptyLoopNodes.forEach((node) => {
+  if (emptyForEachLoops.length > 0) {
+    emptyForEachLoops.forEach((node) => {
       errors.push(`${node.data.label}: Loop value is required.`);
+    });
+  }
+  const whileLoopsMissingCondition = loopNodes.filter(
+    (node: LoopNode) =>
+      node.data.loopKind === "while" &&
+      node.data.whileConditionExpression.trim() === "",
+  );
+  if (whileLoopsMissingCondition.length > 0) {
+    whileLoopsMissingCondition.forEach((node) => {
+      errors.push(`${node.data.label}: While loop condition is required.`);
     });
   }
 

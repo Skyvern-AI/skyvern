@@ -6,7 +6,7 @@ import {
 } from "../types/workflowRunTypes";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 
-const containerBlockTypes = new Set(["for_loop", "conditional"]);
+const containerBlockTypes = new Set(["for_loop", "while_loop", "conditional"]);
 
 function findBlockSurroundingAction(
   timeline: Array<WorkflowRunTimelineItem>,
