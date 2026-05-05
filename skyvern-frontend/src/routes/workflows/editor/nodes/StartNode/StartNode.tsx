@@ -65,6 +65,7 @@ import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { getWorkflowBlocks } from "../../workflowEditorUtils";
+import { isLoopNode } from "../LoopNode/types";
 
 interface StartSettings {
   webhookCallbackUrl: string;
@@ -124,7 +125,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
 
   const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
   const isInsideConditional = parentNode?.type === "conditional";
-  const isInsideLoop = parentNode?.type === "loop";
+  const loopParent = parentNode && isLoopNode(parentNode) ? parentNode : null;
   const withWorkflowSettings = data.withWorkflowSettings;
   const finallyBlockLabel = withWorkflowSettings
     ? data.finallyBlockLabel
@@ -595,18 +596,26 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
       />
       <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
         Start
-        {isInsideLoop && (
+        {loopParent ? (
           <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
             <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
             <div className="space-y-1 text-left font-normal text-slate-400">
-              Use{" "}
-              <code className="text-white">
-                &#123;&#123;&nbsp;current_value&nbsp;&#125;&#125;
-              </code>{" "}
-              to get the current loop value for a given iteration.
+              {loopParent.data.loopKind === "while" ? (
+                <>
+                  Use{" "}
+                  <code className="text-white">{`{{ current_index }}`}</code> to
+                  get the current zero-based loop index for a given iteration.
+                </>
+              ) : (
+                <>
+                  Use{" "}
+                  <code className="text-white">{`{{ current_value }}`}</code> to
+                  get the current loop value for a given iteration.
+                </>
+              )}
             </div>
           </div>
-        )}
+        ) : null}
         {isInsideConditional && (
           <div className="mt-4 rounded-md border border-dashed border-slate-500 p-4 text-center font-normal normal-case tracking-normal text-slate-300">
             Start adding blocks to be executed for the selected condition

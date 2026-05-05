@@ -740,6 +740,7 @@ class TaskRunListItem(BaseModel):
     finished_at: datetime | None = None
     created_at: datetime
     workflow_permanent_id: str | None = None
+    workflow_deleted: bool = False
     script_run: bool = False
     searchable_text: str | None = Field(default=None, exclude=True)
 
