@@ -583,9 +583,6 @@ class AgentDB(BaseAlchemyDB):
     async def restore_workflow_schedule(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.restore_workflow_schedule(*args, **kwargs)
 
-    async def count_workflow_schedules(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.schedules.count_workflow_schedules(*args, **kwargs)
-
     async def list_organization_schedules(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.list_organization_schedules(*args, **kwargs)
 

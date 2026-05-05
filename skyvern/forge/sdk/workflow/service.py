@@ -5610,32 +5610,37 @@ class WorkflowService:
             task_block = task_id_to_block[action.task_id]
             task_block.actions.append(action)
 
-        result = []
         block_map: dict[str, WorkflowRunTimeline] = {}
-        counter = 0
-        while workflow_run_blocks:
-            counter += 1
-            block = workflow_run_blocks.pop(0)
-            workflow_run_timeline = WorkflowRunTimeline(
+        for block in workflow_run_blocks:
+            if block.workflow_run_block_id in block_map:
+                LOG.warning(
+                    "Duplicate workflow_run_block_id in timeline; later occurrence wins",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=block.workflow_run_block_id,
+                )
+            block_map[block.workflow_run_block_id] = WorkflowRunTimeline(
                 type=WorkflowRunTimelineType.block,
                 block=block,
                 created_at=block.created_at,
                 modified_at=block.modified_at,
             )
-            if block.parent_workflow_run_block_id:
-                if block.parent_workflow_run_block_id in block_map:
-                    block_map[block.parent_workflow_run_block_id].children.append(workflow_run_timeline)
-                    block_map[block.workflow_run_block_id] = workflow_run_timeline
-                else:
-                    # put the block back to the queue
-                    workflow_run_blocks.append(block)
-            else:
-                result.append(workflow_run_timeline)
-                block_map[block.workflow_run_block_id] = workflow_run_timeline
 
-            if counter > 1000:
-                LOG.error("Too many blocks in the workflow run", workflow_run_id=workflow_run_id)
-                break
+        result: list[WorkflowRunTimeline] = []
+        for timeline in block_map.values():
+            if timeline.block is None:
+                continue
+            parent_id = timeline.block.parent_workflow_run_block_id
+            if parent_id and parent_id in block_map:
+                block_map[parent_id].children.append(timeline)
+                continue
+            if parent_id:
+                LOG.warning(
+                    "Workflow run block references missing parent; surfacing as root",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=timeline.block.workflow_run_block_id,
+                    parent_workflow_run_block_id=parent_id,
+                )
+            result.append(timeline)
 
         return result
 
