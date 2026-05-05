@@ -2,7 +2,8 @@
 
 Covers schema validation, top-of-loop semantics, max-iteration safety,
 condition rendering errors, per-iteration metadata shape, cancellation
-propagation, get_all_blocks recursion, and nested-label validation.
+propagation, get_all_blocks recursion, nested-label validation, and real-Jinja
+integration for ``current_index`` in loop conditions.
 """
 
 from datetime import UTC, datetime
@@ -39,6 +40,7 @@ from skyvern.schemas.workflows import (
     WhileLoopBlockYAML,
     WorkflowDefinitionYAML,
 )
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,8 +95,6 @@ class TestWhileLoopBlockYAMLSchema:
         assert block.condition.criteria_type == "jinja2_template"
 
     def test_prompt_condition_accepted_at_parse_time(self) -> None:
-        # Forward-compat: prompt criteria parses cleanly. Execution-time rejection
-        # is verified separately in the runtime tests below.
         block = WhileLoopBlockYAML(
             label="loop",
             loop_blocks=[TaskBlockYAML(label="t", url="https://example.com")],
@@ -125,6 +125,48 @@ class TestWhileLoopBlockYAMLSchema:
         restored = WorkflowDefinitionYAML(**as_dict)
         assert restored.blocks[0].block_type == BlockType.WHILE_LOOP
         assert isinstance(restored.blocks[0], WhileLoopBlockYAML)
+
+
+class TestWhileLoopConverterCriteriaType:
+    """block_yaml_to_block must honor condition.criteria_type (SKY-8771)."""
+
+    def test_jinja_type_kept_when_expression_has_multiple_jinja_segments(self) -> None:
+        yaml_def = WorkflowDefinitionYAML(
+            parameters=[],
+            blocks=[
+                WhileLoopBlockYAML(
+                    label="loop",
+                    loop_blocks=[TaskBlockYAML(label="inner", url="https://example.com")],
+                    condition=BranchCriteriaYAML(
+                        criteria_type="jinja2_template",
+                        expression="{{ a }} and {{ b }}",
+                    ),
+                ),
+            ],
+        )
+        wf_def = convert_workflow_definition(yaml_def, workflow_id="wf_test")
+        block = wf_def.blocks[0]
+        assert isinstance(block, WhileLoopBlock)
+        assert isinstance(block.condition, JinjaBranchCriteria)
+
+    def test_prompt_type_kept_when_expression_is_single_jinja_placeholder(self) -> None:
+        yaml_def = WorkflowDefinitionYAML(
+            parameters=[],
+            blocks=[
+                WhileLoopBlockYAML(
+                    label="loop",
+                    loop_blocks=[TaskBlockYAML(label="inner", url="https://example.com")],
+                    condition=BranchCriteriaYAML(
+                        criteria_type="prompt",
+                        expression="{{ x }}",
+                    ),
+                ),
+            ],
+        )
+        wf_def = convert_workflow_definition(yaml_def, workflow_id="wf_test")
+        block = wf_def.blocks[0]
+        assert isinstance(block, WhileLoopBlock)
+        assert isinstance(block.condition, PromptBranchCriteria)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +271,7 @@ class TestExecuteTopOfLoopSemantics:
 
         condition_results = iter([True, True, False])
 
-        async def fake_eval(_self: Any, _ctx: Any) -> bool:  # type: ignore[override]
+        async def fake_eval(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             return next(condition_results)
 
         with (
@@ -253,9 +295,8 @@ class TestExecuteTopOfLoopSemantics:
             assert len(result.outputs_with_loop_values) == 2
             assert len(result.block_outputs) == 2
 
-            # Verify per-iteration metadata sets current_index 0 and 1, with
-            # current_value / current_item explicitly nulled so a stale outer-loop
-            # value can't leak into child Jinja expressions (SKY-8835).
+            # Verify per-iteration metadata sets current_index 0 and 1; ``current_value``
+            # stays None (same as persisted timeline / ``execute_safe``); ``current_item`` None.
             metadata_calls = [c.args for c in mock_context.update_block_metadata.call_args_list]
             indices_set = [args[1].get("current_index") for args in metadata_calls if isinstance(args[1], dict)]
             assert 0 in indices_set
@@ -266,11 +307,9 @@ class TestExecuteTopOfLoopSemantics:
                 assert meta.get("current_item") is None
 
     @pytest.mark.asyncio
-    async def test_metadata_explicitly_nulls_for_loop_keys(self) -> None:
-        """SKY-8771 review fix (SKY-8835 dependency): when WhileLoopBlock writes its
-        per-iteration metadata, ``current_value`` and ``current_item`` must be present
-        as explicit None so that ``update_block_metadata``'s merge semantics overwrite
-        any stale outer for_loop values rather than letting them linger.
+    async def test_metadata_overwrites_outer_loop_keys_with_while_iteration_slots(self) -> None:
+        """While-loop metadata merges the same keys as for-loops so outer rows are overwritten,
+        but ``current_value`` / ``current_item`` stay ``None`` (iteration is ``current_index`` only).
         """
         loop_block = _make_while_loop()
         inner_block = loop_block.loop_blocks[0]
@@ -283,7 +322,7 @@ class TestExecuteTopOfLoopSemantics:
 
         condition_results = iter([True, False])
 
-        async def fake_eval(_self: Any, _ctx: Any) -> bool:  # type: ignore[override]
+        async def fake_eval(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             return next(condition_results)
 
         with (
@@ -303,11 +342,12 @@ class TestExecuteTopOfLoopSemantics:
                 organization_id="org_test",
             )
 
-            # Every metadata write must carry the for_loop keys with explicit None values.
+            # Every metadata write must carry for-loop-shaped keys for merge overwrite.
             metadata_calls = [c.args[1] for c in mock_context.update_block_metadata.call_args_list]
             assert metadata_calls, "expected at least one metadata write"
             for meta in metadata_calls:
-                assert "current_value" in meta and meta["current_value"] is None
+                assert "current_value" in meta
+                assert meta["current_value"] is None
                 assert "current_item" in meta and meta["current_item"] is None
                 assert isinstance(meta.get("current_index"), int)
 
@@ -374,7 +414,7 @@ class TestExecuteMaxIterationsCap:
 
         condition_results = iter([True, True, True, False])
 
-        async def fake_eval(_self: Any, _ctx: Any) -> bool:  # type: ignore[override]
+        async def fake_eval(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             return next(condition_results)
 
         with (
@@ -425,7 +465,7 @@ class TestCurrentIndexWrittenBeforeCondition:
         mock_context.update_block_metadata = MagicMock()
         prior_calls_at_first_eval: list[Any] = []
 
-        async def fake_eval(_self: Any, ctx: Any) -> bool:  # type: ignore[override]
+        async def fake_eval(_self: Any, ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             if not prior_calls_at_first_eval:
                 prior_calls_at_first_eval.extend(ctx.update_block_metadata.call_args_list)
             return False  # exit immediately after the first check
@@ -455,13 +495,107 @@ class TestCurrentIndexWrittenBeforeCondition:
         )
 
 
+class TestWhileLoopJinjaCurrentIndexIntegration:
+    """Real Jinja evaluation for while conditions (no mock of ``_evaluate_condition``).
+
+    Documents ``current_index == 0`` combined with another predicate: ``and`` requires that
+    predicate to be true on the first check or the body never runs; ``or`` runs the body
+    once on iteration 0 even when the predicate is false, then exits once ``current_index``
+    advances.
+    """
+
+    @pytest.mark.asyncio
+    async def test_current_index_zero_and_need_more_false_skips_body(self) -> None:
+        loop_block = _make_while_loop(
+            "{{ current_index == 0 and params.need_more }}",
+        )
+        mock_context = FakeWorkflowRunContext(values={"params": {"need_more": False}})
+
+        with (
+            patch.object(Block, "execute_safe", new_callable=AsyncMock) as mock_execute_safe,
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+
+            result = await loop_block._execute_while_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=mock_context,
+                organization_id="org_test",
+            )
+
+        assert mock_execute_safe.call_count == 0
+        assert result.outputs_with_loop_values == []
+        assert result.block_outputs == []
+
+    @pytest.mark.asyncio
+    async def test_current_index_zero_and_need_more_true_runs_once_then_exits(self) -> None:
+        loop_block = _make_while_loop(
+            "{{ current_index == 0 and params.need_more }}",
+        )
+        inner_block = loop_block.loop_blocks[0]
+        inner_result = _make_block_result(inner_block.output_parameter)
+        mock_context = FakeWorkflowRunContext(values={"params": {"need_more": True}})
+
+        with (
+            patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result) as mock_execute_safe,
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+
+            result = await loop_block._execute_while_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=mock_context,
+                organization_id="org_test",
+            )
+
+        assert mock_execute_safe.call_count == 1
+        assert len(result.outputs_with_loop_values) == 1
+
+    @pytest.mark.asyncio
+    async def test_current_index_zero_or_need_more_false_runs_body_once(self) -> None:
+        """``current_index == 0`` alone forces the first condition check true even when
+        ``params.need_more`` is false; the second check exits."""
+        loop_block = _make_while_loop(
+            "{{ current_index == 0 or params.need_more }}",
+        )
+        inner_block = loop_block.loop_blocks[0]
+        inner_result = _make_block_result(inner_block.output_parameter)
+        mock_context = FakeWorkflowRunContext(values={"params": {"need_more": False}})
+
+        with (
+            patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result) as mock_execute_safe,
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+
+            result = await loop_block._execute_while_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=mock_context,
+                organization_id="org_test",
+            )
+
+        assert mock_execute_safe.call_count == 1
+        assert len(result.outputs_with_loop_values) == 1
+
+
 class TestExecuteConditionRenderingErrors:
     @pytest.mark.asyncio
     async def test_failed_jinja_format_returns_failure_result(self) -> None:
         loop_block = _make_while_loop()
         mock_context = MagicMock()
 
-        async def raise_format_error(_self: Any, _ctx: Any) -> bool:  # type: ignore[override]
+        async def raise_format_error(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             raise FailedToFormatJinjaStyleParameter("{{ ??? }}", "syntax error")
 
         with (
@@ -489,7 +623,7 @@ class TestExecuteConditionRenderingErrors:
         loop_block = _make_while_loop()
         mock_context = MagicMock()
 
-        async def raise_missing(_self: Any, _ctx: Any) -> bool:  # type: ignore[override]
+        async def raise_missing(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             raise MissingJinjaVariables("{{ undefined_var }}", {"undefined_var"})
 
         with (
@@ -556,9 +690,9 @@ class TestExecuteCancellationPropagation:
 # ---------------------------------------------------------------------------
 
 
-class TestPromptCriteriaRejected:
+class TestPromptCriteriaEvaluation:
     @pytest.mark.asyncio
-    async def test_prompt_criteria_returns_clear_failure(self) -> None:
+    async def test_prompt_condition_delegates_to_batch_evaluator(self) -> None:
         inner = TaskBlock(label="inner_task", output_parameter=_make_output_param("inner_task"))
         loop_block = WhileLoopBlock(
             label="my_while",
@@ -566,24 +700,23 @@ class TestPromptCriteriaRejected:
             loop_blocks=[inner],
             condition=PromptBranchCriteria(expression="dates on the page are still recent"),
         )
-
         mock_context = MagicMock()
 
-        with (
-            patch.object(Block, "get_workflow_run_context", return_value=mock_context),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        ):
-            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
-
-            result = await loop_block._run_loop(
+        with patch(
+            "skyvern.forge.sdk.workflow.models.block._evaluate_prompt_branch_conditions_batch",
+            new_callable=AsyncMock,
+        ) as mock_batch:
+            mock_batch.return_value = ([True], ["dates on the page are still recent"], "goal", {})
+            result = await loop_block._evaluate_condition(
+                mock_context,
                 workflow_run_id="wr_test",
                 workflow_run_block_id="wrb_loop",
                 organization_id="org_test",
+                browser_session_id=None,
             )
 
-            assert result.success is False
-            assert result.status == BlockStatus.failed
-            assert "Prompt criteria are not yet supported" in (result.failure_reason or "")
+            assert result is True
+            mock_batch.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
