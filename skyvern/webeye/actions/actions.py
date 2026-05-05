@@ -351,8 +351,8 @@ class ScrollAction(Action):
     action_type: ActionType = ActionType.SCROLL
     x: int | None = None
     y: int | None = None
-    scroll_x: int
-    scroll_y: int
+    scroll_x: int | None = None
+    scroll_y: int | None = None
 
 
 class KeypressAction(Action):
@@ -370,8 +370,8 @@ class GotoUrlAction(Action):
 
 class MoveAction(Action):
     action_type: ActionType = ActionType.MOVE
-    x: int
-    y: int
+    x: int | None = None
+    y: int | None = None
 
 
 class DragAction(Action):

@@ -2373,6 +2373,8 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.scroll_x is None or action.scroll_y is None:
+        return [ActionFailure(Exception("ScrollAction is missing scroll_x/scroll_y coordinates"))]
     if action.element_id:
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
@@ -2499,6 +2501,8 @@ async def handle_move_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.x is None or action.y is None:
+        return [ActionFailure(Exception("MoveAction is missing x/y coordinates"))]
     await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
