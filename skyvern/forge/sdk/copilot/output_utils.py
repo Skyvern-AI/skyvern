@@ -15,6 +15,8 @@ from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
+_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY = "_copilot_internal_run_cancelled_by_watchdog"
+
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_PREFIX = b"\xff\xd8\xff"
 
@@ -211,6 +213,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                 ]
         sanitized["data"] = data
     sanitized.pop("_workflow", None)
+    sanitized.pop(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY, None)
     return sanitized
 
 

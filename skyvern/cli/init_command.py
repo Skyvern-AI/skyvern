@@ -10,15 +10,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
 from skyvern.analytics import capture_setup_event
-from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.utils import migrate_db
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .browser import setup_browser_config
 from .console import console
 from .database import setup_postgresql
 from .llm_setup import setup_llm_providers, update_or_add_env_var
-from .mcp import setup_local_organization, setup_mcp
 
 
 def init_env(
@@ -50,10 +47,16 @@ def init_env(
         else:
             setup_postgresql(no_postgres)
         console.print("📊 [bold blue]Running database migrations...[/bold blue]")
+        from skyvern.utils import migrate_db  # noqa: PLC0415
+
         migrate_db()
         console.print("✅ [green]Database migration complete.[/green]")
 
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
+        from skyvern.forge.forge_app_initializer import start_forge_app  # noqa: PLC0415
+
+        from .mcp import setup_local_organization  # noqa: PLC0415
+
         start_forge_app()
         api_key = asyncio.run(setup_local_organization())
         if api_key:
@@ -155,6 +158,8 @@ def init_env(
     _mcp_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if run_local else None
 
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
+        from .mcp import setup_mcp  # noqa: PLC0415
+
         setup_mcp(
             local=run_local,
             browser_type=_mcp_browser_type,

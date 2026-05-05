@@ -45,6 +45,5 @@ class ForLoopBlock(UniversalBaseModel):
 
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
-from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
 
 update_forward_refs(ForLoopBlock)

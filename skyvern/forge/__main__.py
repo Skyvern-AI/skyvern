@@ -38,6 +38,11 @@ if __name__ == "__main__":
         port=port,
         log_level="info",
         access_log=False,
+        # uvicorn's default LOGGING_CONFIG runs dictConfig() which resets the
+        # uvicorn.error / uvicorn.access levels we set in setup_logger() back to
+        # INFO, leaking WebSocket "connection open" / "WebSocket [accepted]" spam
+        # to stderr. Pass a no-op dict so structlog stays in charge.
+        log_config={"version": 1, "disable_existing_loggers": False},
         reload=reload,
         reload_excludes=[
             f"{temp_path_for_excludes}/**/*.py",

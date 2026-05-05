@@ -11,17 +11,6 @@ from .while_loop_block_condition import WhileLoopBlockCondition
 
 
 class WhileLoopBlock(UniversalBaseModel):
-    """
-    Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.
-
-    Top-of-loop semantics: the condition is evaluated *before* each iteration (including the
-    first). If the condition is false on the first check, the body never runs and the block
-    returns success with an empty output list.
-
-    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is
-    treated as a failure so that a misbehaving condition can never spin forever.
-    """
-
     label: str = pydantic.Field()
     """
     Author-facing identifier for a block; unique within a workflow.
@@ -36,7 +25,6 @@ class WhileLoopBlock(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
     condition: WhileLoopBlockCondition
@@ -53,6 +41,5 @@ class WhileLoopBlock(UniversalBaseModel):
 
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 from .while_loop_block_loop_blocks_item import WhileLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
-from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
 
 update_forward_refs(WhileLoopBlock)

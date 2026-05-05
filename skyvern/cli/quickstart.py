@@ -109,6 +109,15 @@ def run_docker_compose_setup() -> None:
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
     setup_llm_providers()
 
+    # Ensure frontend .env exists (docker-compose.yml references it via env_file)
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        import shutil
+
+        shutil.copy(frontend_example, frontend_env)
+        console.print("✅ [green]Created skyvern-frontend/.env from .env.example[/green]")
+
     # Run docker compose up
     console.print("\n[bold blue]Step 2: Starting Docker Compose...[/bold blue]")
     with Progress(
@@ -134,14 +143,27 @@ def run_docker_compose_setup() -> None:
             console.print(f"[bold red]Error starting Docker Compose: {e.stderr}[/bold red]")
             raise typer.Exit(1)
 
-    console.print(
-        Panel(
-            "[bold green]Skyvern is now running![/bold green]\n\n"
-            "Navigate to [link]http://localhost:8080[/link] to start using the UI.\n\n"
-            "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
-            border_style="green",
+    from skyvern.cli.utils import wait_for_docker_services  # noqa: PLC0415
+
+    if wait_for_docker_services():
+        console.print(
+            Panel(
+                "[bold green]Skyvern is ready![/bold green]\n\n"
+                "Navigate to [link]http://localhost:8080[/link] to start using the UI.\n\n"
+                "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
+                border_style="green",
+            )
         )
-    )
+    else:
+        console.print(
+            Panel(
+                "[yellow]Services are still starting up.[/yellow]\n\n"
+                "Navigate to [link]http://localhost:8080[/link] once ready.\n"
+                "Run [cyan]docker compose logs -f[/cyan] to monitor progress.\n\n"
+                "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
+                border_style="yellow",
+            )
+        )
 
     # Offer to set up "Control your own browser"
     use_own_browser = Confirm.ask(

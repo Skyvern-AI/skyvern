@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_output,
 )
 from skyvern.forge.sdk.copilot.tools import (
+    _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _analyze_run_blocks,
     _is_meaningful_extracted_data,
     _record_run_blocks_result,
@@ -258,6 +259,7 @@ def _fresh_ctx_for_record() -> Any:
         pending_action_sequence_fingerprint=None,
         last_action_sequence_fingerprint=None,
         repeated_action_fingerprint_streak_count=0,
+        copilot_total_timeout_exceeded=False,
     )
 
 
@@ -272,6 +274,38 @@ def test_record_run_blocks_result_flips_last_test_ok_on_empty_extraction_envelop
     assert ctx.last_test_ok is None
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_test_failure_reason is not None
+
+
+def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:
+    """Stagnation/ceiling cancels mid-session must still set last_test_ok=False
+    so the failed-test nudge can fire — only a coincident total timeout softens
+    to ``None`` for the unvalidated WIP rescue path."""
+    ctx = _fresh_ctx_for_record()
+    result = {
+        "ok": False,
+        "error": "Run ID: wr_stagnation. Stuck.",
+        _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY: True,
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_failure_reason == "Run ID: wr_stagnation. Stuck."
+
+
+def test_record_run_blocks_result_sets_last_test_ok_none_on_watchdog_cancel_at_timeout() -> None:
+    ctx = _fresh_ctx_for_record()
+    ctx.copilot_total_timeout_exceeded = True
+    result = {
+        "ok": False,
+        "error": "Run ID: wr_timeout. Outcome is uncertain.",
+        _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY: True,
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_failure_reason == "Run ID: wr_timeout. Outcome is uncertain."
 
 
 # ---------------------------------------------------------------------------

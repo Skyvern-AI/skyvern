@@ -1042,7 +1042,11 @@ class LLMAPIHandlerFactory:
                     await _persist_block_llm_cost(
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
-                parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -1574,7 +1578,11 @@ class LLMAPIHandlerFactory:
                     await _persist_block_llm_cost(
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
-                parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:

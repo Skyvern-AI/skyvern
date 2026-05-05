@@ -121,6 +121,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         False,
         description="When true, clients must not auto-apply; render Accept/Reject explicitly.",
     )
+    cancelled: bool = Field(
+        False,
+        description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):

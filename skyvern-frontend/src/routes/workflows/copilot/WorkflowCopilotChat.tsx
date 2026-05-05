@@ -223,6 +223,10 @@ export function WorkflowCopilotChat({
   const streamingAbortController = useRef<AbortController | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
+  const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Backend cancel watcher polls Redis: a turn can complete normally between
+  // the cancel POST and the watcher firing, so the frontend must remember it.
+  const cancelInFlightController = useRef<AbortController | null>(null);
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -232,6 +236,15 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
+  useEffect(() => {
+    return () => {
+      streamingAbortController.current?.abort();
+      if (cancelSafetyTimer.current !== null) {
+        clearTimeout(cancelSafetyTimer.current);
+        cancelSafetyTimer.current = null;
+      }
+    };
+  }, []);
   const [size, setSize] = useState({
     width: DEFAULT_WINDOW_WIDTH,
     height: DEFAULT_WINDOW_HEIGHT,
@@ -572,40 +585,56 @@ export function WorkflowCopilotChat({
   }, [credentialGetter, workflowPermanentId]);
 
   const cancelSend = useCallback(async () => {
-    if (!streamingAbortController.current) return;
+    // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
+    const controllerAtCancel = streamingAbortController.current;
+    if (!controllerAtCancel) return;
 
     const cancelToken = pendingCancelToken.current;
     pendingCancelToken.current = null;
     if (!cancelToken) return;
 
-    // Backend persists the user message + a matching AI bubble on cancel,
-    // so chat history reload stays consistent. We don't remove the user's
-    // pending message either — reload would otherwise show only the AI
-    // cancellation reply with no prompt above it.
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `${Date.now()}-cancel`,
-        sender: "ai",
-        content: "Cancelled by user.",
-        timestamp: new Date().toISOString(),
-      },
-    ]);
+    setProcessingStatus("Cancelling...");
+    setLatestNarration("");
+    setToolActivity([]);
+    cancelInFlightController.current = controllerAtCancel;
 
-    streamingAbortController.current.abort();
+    const appendCancelledBubble = () => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-cancel`,
+          sender: "ai",
+          content: "Cancelled by user.",
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    };
 
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       await client.post<void>("/workflow/copilot/cancel", {
         cancel_token: cancelToken,
       } as WorkflowCopilotCancelRequest);
+      // Safety net: if the SSE channel never resolves, surface a fallback
+      // bubble and abort so handleSend's finally clears "Cancelling...".
+      if (cancelSafetyTimer.current !== null) {
+        clearTimeout(cancelSafetyTimer.current);
+      }
+      cancelSafetyTimer.current = setTimeout(() => {
+        cancelSafetyTimer.current = null;
+        if (streamingAbortController.current !== controllerAtCancel) return;
+        appendCancelledBubble();
+        controllerAtCancel.abort();
+      }, 15_000);
     } catch (error) {
       // 503 (Redis disabled) or network failure: client-side abort still
       // gives the user immediate feedback; the backend will run to
       // completion in that environment. Log so we can spot it in dev.
       console.warn("Workflow copilot cancel POST failed", error);
+      controllerAtCancel.abort();
+      appendCancelledBubble();
     }
-  }, [credentialGetter]);
+  }, [credentialGetter, setToolActivity]);
 
   const cancelQueuedPrompt = useCallback(() => {
     if (!queuedPrompt) {
@@ -831,10 +860,14 @@ export function WorkflowCopilotChat({
           };
 
           setMessages((prev) => [...prev, aiMessage]);
+          const userCancelledThisTurn =
+            cancelInFlightController.current === abortController;
           if (
             response.updated_workflow &&
             autoAccept &&
-            !response.unvalidated
+            !response.unvalidated &&
+            !response.cancelled &&
+            !userCancelledThisTurn
           ) {
             applyWorkflowUpdate(response.updated_workflow);
           } else {
@@ -919,6 +952,13 @@ export function WorkflowCopilotChat({
       } finally {
         if (streamingAbortController.current === abortController) {
           streamingAbortController.current = null;
+        }
+        if (cancelInFlightController.current === abortController) {
+          cancelInFlightController.current = null;
+        }
+        if (cancelSafetyTimer.current !== null) {
+          clearTimeout(cancelSafetyTimer.current);
+          cancelSafetyTimer.current = null;
         }
         pendingMessageId.current = null;
         pendingCancelToken.current = null;

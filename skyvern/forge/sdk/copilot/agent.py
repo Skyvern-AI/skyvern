@@ -265,18 +265,32 @@ _MAX_TURNS_REPLY_UNVALIDATED = (
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
+_UNEXPECTED_ERROR_REPLY_DEFAULT = "An unexpected error occurred. Please try again."
+_UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
+    "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
+    "accept it to save (note: it hasn't been verified end-to-end), or discard."
+)
+_UNEXPECTED_ERROR_REPLY_TESTED = (
+    "I hit an unexpected issue, but I have a tested draft for you. Accept it to save, or discard."
+)
+_CANCEL_REPLY_DEFAULT = "Cancelled by user."
+_CANCEL_REPLY_UNVALIDATED = (
+    "Cancelled. I have a draft workflow you can keep — accept it to save "
+    "(note: it hasn't been verified end-to-end), or discard."
+)
+_CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
 
 
-def _build_capacity_exit_result(
+def _build_wip_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
     *,
     default_reply: str,
     unvalidated_reply: str,
     tested_reply: str,
+    cancelled: bool = False,
 ) -> AgentResult:
-    """Capacity-exhausted exits (timeout, max-turns) surface the most recent
-    successfully-parsed workflow rather than discard the WIP."""
+    """Selected non-success exits surface the most recent successfully parsed workflow."""
     # ``last_test_ok=None`` covers both "test never ran" and "test ran with
     # ambiguous output"; only the first case earns the carve-out (the REPLY
     # path is more permissive because its reply text carries the context).
@@ -296,12 +310,13 @@ def _build_capacity_exit_result(
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
             unvalidated=unvalidated,
+            cancelled=cancelled,
         )
-    return _build_exit_result(ctx, default_reply, global_llm_context)
+    return _build_exit_result(ctx, default_reply, global_llm_context, cancelled=cancelled)
 
 
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_capacity_exit_result(
+    return _build_wip_exit_result(
         ctx,
         global_llm_context,
         default_reply=_TIMEOUT_REPLY_DEFAULT,
@@ -310,13 +325,41 @@ def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | No
     )
 
 
+def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    if ctx.copilot_total_timeout_exceeded:
+        LOG.info("Copilot cancellation resolved as total timeout")
+        return _build_timeout_exit_result(ctx, global_llm_context)
+    return _build_cancel_exit_result(ctx, global_llm_context)
+
+
 def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_capacity_exit_result(
+    return _build_wip_exit_result(
         ctx,
         global_llm_context,
         default_reply=_MAX_TURNS_REPLY_DEFAULT,
         unvalidated_reply=_MAX_TURNS_REPLY_UNVALIDATED,
         tested_reply=_MAX_TURNS_REPLY_TESTED,
+    )
+
+
+def _build_unexpected_error_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_wip_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_UNEXPECTED_ERROR_REPLY_DEFAULT,
+        unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
+        tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
+    )
+
+
+def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return _build_wip_exit_result(
+        ctx,
+        global_llm_context,
+        default_reply=_CANCEL_REPLY_DEFAULT,
+        unvalidated_reply=_CANCEL_REPLY_UNVALIDATED,
+        tested_reply=_CANCEL_REPLY_TESTED,
+        cancelled=True,
     )
 
 
@@ -355,13 +398,20 @@ def _translate_to_agent_result(
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
                 _detect_new_banned_blocks,
+                _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
+                _stale_block_metadata_message,
             )
 
             banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
                 user_response = f"{user_response}\n\n(Note: {_banned_block_reject_message(banned_items)})"
+                workflow_yaml = ""
+            stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
+            if stale_metadata:
+                user_response = f"{user_response}\n\n(Note: {_stale_block_metadata_message(stale_metadata)})"
+                ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
             if ctx.user_message:
@@ -650,8 +700,8 @@ async def run_copilot_agent(
             except asyncio.CancelledError:
                 # Re-raising would leave the route with ``agent_result is None``
                 # and skip its ``workflow_was_persisted`` rollback decision.
-                LOG.info("Copilot run cancelled by user")
-                return _build_exit_result(ctx, "Cancelled by user.", global_llm_context, cancelled=True)
+                LOG.info("Copilot run cancelled")
+                return _build_cancelled_exit_result(ctx, global_llm_context)
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
@@ -678,7 +728,7 @@ async def run_copilot_agent(
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return _build_exit_result(ctx, "An unexpected error occurred. Please try again.", global_llm_context)
+        return _build_unexpected_error_exit_result(ctx, global_llm_context)
     finally:
         _copilot_model_name.reset(model_token)
         session.close()

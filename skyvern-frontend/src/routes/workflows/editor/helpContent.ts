@@ -106,6 +106,19 @@ export const helpTooltips = {
     ...baseHelpTooltipContent,
     loopValue:
       "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
+    loopDataSchema:
+      "JSON shape for extracted items when the loop value is natural language that triggers extraction—not when you point at an existing list parameter.",
+    completeIfEmpty:
+      "If the list is empty, treat this loop as successful and continue the workflow instead of failing.",
+    nextLoopOnFailure:
+      "When an iteration fails, skip its remaining blocks and start the next iteration instead of stopping the entire loop.",
+    continueOnFailure:
+      "If this loop ends in failure, let the rest of the workflow continue running instead of stopping. Does not affect iteration behavior — use 'Skip Iterations that Fail' for that.",
+  },
+  while_loop: {
+    ...baseHelpTooltipContent,
+    condition:
+      "Define when to keep iterating. Use a Jinja expression or natural language. The condition is checked before each round—if it is false on the first check, the loop body never runs. Use {{ current_index }} inside the loop; while loops do not set {{ current_value }}.",
     nextLoopOnFailure:
       "When an iteration fails, skip its remaining blocks and start the next iteration instead of stopping the entire loop.",
     continueOnFailure:
@@ -170,6 +183,10 @@ export const helpTooltips = {
   },
 };
 
+export function buildWhileLoopConditionTooltip(): string {
+  return helpTooltips.while_loop.condition;
+}
+
 export const placeholders = {
   task: basePlaceholderContent,
   taskv2: {
@@ -200,6 +217,7 @@ export const placeholders = {
     navigationGoal: "Login to the website using the {{ credentials }}",
   },
   loop: basePlaceholderContent,
+  while_loop: basePlaceholderContent,
   sendEmail: basePlaceholderContent,
   upload: basePlaceholderContent,
   fileUpload: basePlaceholderContent,

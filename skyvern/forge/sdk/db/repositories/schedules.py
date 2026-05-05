@@ -83,16 +83,16 @@ class SchedulesRepository(BaseRepository):
         parameters: dict[str, Any] | None = None,
         name: str | None = None,
         description: str | None = None,
-    ) -> tuple[WorkflowSchedule, int]:
-        """Create a schedule atomically with limit enforcement.
+    ) -> WorkflowSchedule:
+        """Create a schedule atomically with org-wide limit enforcement.
 
-        On PostgreSQL, uses an advisory lock to serialize concurrent creates for
-        the same workflow, preventing TOCTOU races on the schedule count.
+        On PostgreSQL, uses an advisory lock keyed on the organization to
+        serialize concurrent creates within the org, preventing TOCTOU races on
+        the org-wide schedule count.
 
         On SQLite, uses an asyncio.Lock (set on AgentDB.__init__) since SQLite
         is single-writer and has no advisory lock support.
 
-        Returns (created_schedule, count_before_insert).
         Raises ScheduleLimitExceededError if count >= max_schedules.
         """
         # SQLite: serialize via Python lock (no advisory locks available).
@@ -139,10 +139,10 @@ class SchedulesRepository(BaseRepository):
         description: str | None,
         *,
         use_advisory_lock: bool,
-    ) -> tuple[WorkflowSchedule, int]:
+    ) -> WorkflowSchedule:
         async with self.Session() as session:
             if use_advisory_lock:
-                lock_key = f"schedule:{organization_id}:{workflow_permanent_id}"
+                lock_key = f"schedule:{organization_id}"
                 await session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
                     {"key": lock_key},
@@ -152,7 +152,6 @@ class SchedulesRepository(BaseRepository):
                 await session.execute(
                     select(func.count()).where(
                         WorkflowScheduleModel.organization_id == organization_id,
-                        WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id,
                         WorkflowScheduleModel.deleted_at.is_(None),
                     )
                 )
@@ -161,7 +160,6 @@ class SchedulesRepository(BaseRepository):
             if max_schedules is not None and count >= max_schedules:
                 raise ScheduleLimitExceededError(
                     organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
                     current_count=count,
                     max_allowed=max_schedules,
                 )
@@ -179,7 +177,7 @@ class SchedulesRepository(BaseRepository):
             session.add(workflow_schedule)
             await session.commit()
             await session.refresh(workflow_schedule)
-            return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled), count
+            return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
 
     @db_operation("set_backend_schedule_id")
     async def set_backend_schedule_id(
@@ -399,22 +397,6 @@ class SchedulesRepository(BaseRepository):
             await session.commit()
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
-
-    @db_operation("count_workflow_schedules")
-    async def count_workflow_schedules(
-        self,
-        organization_id: str,
-        workflow_permanent_id: str,
-    ) -> int:
-        async with self.Session() as session:
-            result = await session.execute(
-                select(func.count()).where(
-                    WorkflowScheduleModel.organization_id == organization_id,
-                    WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id,
-                    WorkflowScheduleModel.deleted_at.is_(None),
-                )
-            )
-            return result.scalar_one()
 
     @db_operation("list_organization_schedules")
     async def list_organization_schedules(

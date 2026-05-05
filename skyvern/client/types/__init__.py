@@ -224,6 +224,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem_UploadToS3,
         ForLoopBlockYamlLoopBlocksItem_Validation,
         ForLoopBlockYamlLoopBlocksItem_Wait,
+        ForLoopBlockYamlLoopBlocksItem_WhileLoop,
         ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger,
     )
     from .geo_target import GeoTarget
@@ -871,6 +872,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Validation": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Wait": ".for_loop_block_yaml_loop_blocks_item",
+    "ForLoopBlockYamlLoopBlocksItem_WhileLoop": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger": ".for_loop_block_yaml_loop_blocks_item",
     "GeoTarget": ".geo_target",
     "GetRunResponse": ".get_run_response",
@@ -1501,6 +1503,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3",
     "ForLoopBlockYamlLoopBlocksItem_Validation",
     "ForLoopBlockYamlLoopBlocksItem_Wait",
+    "ForLoopBlockYamlLoopBlocksItem_WhileLoop",
     "ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger",
     "GeoTarget",
     "GetRunResponse",

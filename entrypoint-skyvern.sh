@@ -2,6 +2,38 @@
 
 set -e
 
+# ---------------------------------------------------------------------------
+# Ensure the target database exists (POSTGRES_DB is only honoured on first
+# volume init — a stale postgres-data dir means the DB may be missing).
+# ---------------------------------------------------------------------------
+if [ -n "$DATABASE_STRING" ]; then
+    # Parse postgresql+psycopg://user:pass@host:port/dbname
+    db_name=$(echo "$DATABASE_STRING" | sed -n 's|.*/.*/\([^?]*\).*|\1|p')
+    db_user=$(echo "$DATABASE_STRING" | sed -n 's|.*://\([^:]*\):.*|\1|p')
+    db_host=$(echo "$DATABASE_STRING" | sed -n 's|.*@\([^:]*\):.*|\1|p')
+    db_port=$(echo "$DATABASE_STRING" | sed -n 's|.*:\([0-9]*\)/.*|\1|p')
+
+    if [ -n "$db_name" ] && [ -n "$db_user" ] && [ -n "$db_host" ]; then
+        export PGHOST="$db_host"
+        export PGPORT="${db_port:-5432}"
+        export PGUSER="$db_user"
+        # Extract password (between first : after :// and @)
+        db_pass=$(echo "$DATABASE_STRING" | sed -n 's|.*://[^:]*:\([^@]*\)@.*|\1|p')
+        if [ -n "$db_pass" ]; then
+            export PGPASSWORD="$db_pass"
+        fi
+
+        if psql -d "$db_name" -c "SELECT 1" > /dev/null 2>&1; then
+            echo "✅ Database '$db_name' exists."
+        else
+            echo "Database '$db_name' not found — creating..."
+            createdb "$db_name" && echo "✅ Database '$db_name' created." \
+                || echo "⚠️  Could not create database '$db_name' — migrations may fail."
+        fi
+        unset PGPASSWORD
+    fi
+fi
+
 # Set ALLOWED_SKIP_DB_MIGRATION_VERSION env var to the DB version you want to allow (select * from alembic_version)
 # If current DB matches this version, migrations will be skipped. Use at your own risk.
 ALLOWED_SKIP_DB_MIGRATION_VERSION=${ALLOWED_SKIP_DB_MIGRATION_VERSION:-}
