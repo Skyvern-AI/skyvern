@@ -25,6 +25,7 @@ def test_setup_ai_env_uv_sync_groups_are_expanded(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["UV_SYNC_GROUPS"] = " cloud, dev , ,"
+    env["UV_SYNC_EXTRAS"] = " server , ,"
     env["UV_ARGS_FILE"] = str(args_file)
 
     result = subprocess.run(["bash", str(SCRIPT_PATH)], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
@@ -32,6 +33,8 @@ def test_setup_ai_env_uv_sync_groups_are_expanded(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert args_file.read_text(encoding="utf-8").splitlines() == [
         "sync",
+        "--extra",
+        "server",
         "--group",
         "cloud",
         "--group",

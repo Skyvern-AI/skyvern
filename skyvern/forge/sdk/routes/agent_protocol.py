@@ -3277,7 +3277,7 @@ async def update_organization(
                 "artifact_url_expiry_seconds — pick one"
             ),
         )
-    return await app.DATABASE.organizations.update_organization(
+    updated = await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
         max_retries_per_step=org_update.max_retries_per_step,
@@ -3285,6 +3285,9 @@ async def update_organization(
         artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
         clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
     )
+
+    org_auth_service.invalidate_cached_org(current_org.organization_id)
+    return updated
 
 
 @legacy_base_router.get(

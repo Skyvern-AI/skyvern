@@ -7,8 +7,20 @@ requires-python = ">=3.11,<3.14"
 readme = "README.md"
 
 dependencies = [
-    "azure-storage-blob>=12.26.0",
     "python-dotenv>=1.0.0,<2",
+    "pydantic>=2.5.2,<3",
+    "pydantic-settings>=2.1.0,<3",
+    "cachetools>=5.3.2,<6",
+    "orjson>=3.9.10,<4",
+    "structlog>=23.2.0,<24",
+    "typer>=0.16.0",
+    "httpx[socks]>=0.27.0",
+    "rich>=13.7.0,<14",
+]
+
+[project.optional-dependencies]
+server = [
+    "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
     "aiohttp>=3.13.5,<4",
@@ -23,21 +35,14 @@ dependencies = [
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
     "pillow>=10.2.0",
     "starlette-context>=0.3.6,<0.6",
-    "pydantic>=2.5.2,<3",
-    "pydantic-settings>=2.1.0,<3",
     "fastapi>=0.136.0,<0.137",
     "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
     "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
     "alembic>=1.12.1,<2",
     "PyJWT[crypto]>=2.12.0,<3",
-    "cachetools>=5.3.2,<6",
     "aioboto3>=14.3.0,<15",
     "asyncache>=0.3.1,<0.4",
-    "orjson>=3.9.10,<4",
-    "structlog>=23.2.0,<24",
-    "typer>=0.16.0",
     "types-toml>=0.10.8.7,<0.11",
-    "httpx[socks]>=0.27.0",
     "filetype>=1.2.0,<2",
     "fuzzysearch>=0.8,<1",
     "aioredlock>=0.7.3,<0.8",
@@ -45,7 +50,6 @@ dependencies = [
     "websockets>=12.0,<15.1",
     "email-validator>=2.2.0,<3",
     "requests-toolbelt>=1.0.0,<2",
-    "rich[jupyter]>=13.7.0,<14",
     "posthog>=3.7.0,<4",
     "aiofiles>=24.1.0,<25",
     "pyotp>=2.9.0,<3",
@@ -114,8 +118,8 @@ dev = [
     "isort>=5.13.2",
     "mypy>=1.18.2,<2",
     "types-requests>=2.31.0.2,<3",
-    "pytest>=9.0.3,<10",
-    "pytest-asyncio>=1.0.0,<2",
+    "pytest>=7.4.0,<8",
+    "pytest-asyncio>=0.21.1,<0.22",
     # Needed by tests/unit/test_llm_handler_tracing.py which exercises the LLM
     # chokepoint's OTEL instrumentation. Cloud runtime also uses this via
     # cloud/observability/, but that ships via the `cloud` group's transitive
@@ -142,7 +146,7 @@ dev = [
 ]
 
 [tool.hatch.build]
-packages = ["skyvern", "alembic"]
+packages = ["skyvern"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -150,32 +154,15 @@ include = [
     "alembic",
 ]
 exclude = [
+    "skyvern-frontend/.env",
+    "skyvern-frontend/.env.*",
     "skyvern-frontend/node_modules",
     "skyvern-frontend/dist",
 ]
-[tool.hatch.build.targets.sdist.force-include]
-"skyvern-frontend" = "skyvern-frontend"
-
 [tool.hatch.build.targets.wheel]
 include = [
     "skyvern",
-    "alembic",
 ]
-[tool.hatch.build.targets.wheel.force-include]
-"skyvern-frontend/src" = "skyvern-frontend/src"
-"skyvern-frontend/public" = "skyvern-frontend/public"
-"skyvern-frontend/package.json" = "skyvern-frontend/package.json"
-"skyvern-frontend/package-lock.json" = "skyvern-frontend/package-lock.json"
-"skyvern-frontend/postcss.config.js" = "skyvern-frontend/postcss.config.js"
-"skyvern-frontend/tailwind.config.js" = "skyvern-frontend/tailwind.config.js"
-"skyvern-frontend/vite.config.ts" = "skyvern-frontend/vite.config.ts"
-"skyvern-frontend/index.html" = "skyvern-frontend/index.html"
-"skyvern-frontend/README.md" = "skyvern-frontend/README.md"
-"skyvern-frontend/.env.example" = "skyvern-frontend/.env.example"
-"skyvern-frontend/artifactServer.js" = "skyvern-frontend/artifactServer.js"
-"skyvern-frontend/localServer.js" = "skyvern-frontend/localServer.js"
-"skyvern-frontend/tsconfig.json" = "skyvern-frontend/tsconfig.json"
-"skyvern-frontend/tsconfig.node.json" = "skyvern-frontend/tsconfig.node.json"
 
 [tool.uv]
 # Supply chain quarantine: block packages published less than 7 days ago.

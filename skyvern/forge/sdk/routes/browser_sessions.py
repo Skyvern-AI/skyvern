@@ -18,6 +18,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.browser_sessions import (
     CreateBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
@@ -195,6 +196,38 @@ async def get_browser_session(
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
     return await BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+
+
+@base_router.get(
+    "/browser_sessions/{browser_session_id}/workflow_runs",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
+@base_router.get(
+    "/browser_sessions/{browser_session_id}/workflow_runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
+async def get_workflow_runs_for_browser_session(
+    browser_session_id: str = Path(
+        ..., description="The ID of the browser session. browser_session_id starts with `pbs_`", examples=["pbs_123456"]
+    ),
+    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[WorkflowRun]:
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if not browser_session:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
+    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_browser_session(
+        browser_session_id=browser_session_id,
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @base_router.get(

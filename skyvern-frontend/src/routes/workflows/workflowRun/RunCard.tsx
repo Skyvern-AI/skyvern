@@ -37,9 +37,9 @@ function RunCard({
         status != null && "border-l-2 border-l-transparent",
         {
           "cursor-pointer hover:ring-white/25": !!onClick,
-          "border-l-destructive": status === "failure",
-          "border-l-success": status === "success",
-          "ring-white/25": active,
+          "border-l-destructive": status === "failure" && !active,
+          "border-l-success": status === "success" && !active,
+          "ring-2 ring-white/55 hover:ring-white/55": active,
         },
         className,
       )}

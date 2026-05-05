@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any, Iterator, TypedDict
+from typing import TYPE_CHECKING, Any, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
-from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
+
+if TYPE_CHECKING:
+    from playwright.async_api import Frame, Page
 
 LOG = structlog.get_logger()
 

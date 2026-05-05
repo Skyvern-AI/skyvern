@@ -2722,12 +2722,13 @@ async def update_and_run_blocks_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
 
     # Wrap each block's navigation_goal / complete_criterion / terminate_criterion
-    # with the user's message as "big goal" context so downstream LLMs (verifier,
+    # with the effective "big goal" context so downstream LLMs (verifier,
     # validation-block prompt) have user-intent framing — mirrors TaskV2.
-    if copilot_ctx.user_message:
-        workflow_yaml = wrap_block_goals(workflow_yaml, copilot_ctx.user_message)
+    block_goal_main_goal = copilot_ctx.block_goal_main_goal or copilot_ctx.user_message
+    if block_goal_main_goal:
+        workflow_yaml = wrap_block_goals(workflow_yaml, block_goal_main_goal)
     else:
-        LOG.warning("update_and_run_blocks invoked without copilot_ctx.user_message; skipping block-goal wrap")
+        LOG.warning("update_and_run_blocks invoked without block-goal context; skipping block-goal wrap")
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):

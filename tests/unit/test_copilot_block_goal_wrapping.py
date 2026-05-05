@@ -34,6 +34,10 @@ def _wrapped(mini_goal: str) -> str:
     return MINI_GOAL_TEMPLATE.format(mini_goal=mini_goal, main_goal=USER_MESSAGE)
 
 
+def _wrapped_with(mini_goal: str, main_goal: str) -> str:
+    return MINI_GOAL_TEMPLATE.format(mini_goal=mini_goal, main_goal=main_goal)
+
+
 def test_wraps_task_block_navigation_goal() -> None:
     src = _yaml_with_blocks(
         {"block_type": "task", "label": "fill_form", "navigation_goal": "Fill in name and email, click Send"}
@@ -143,7 +147,7 @@ def test_idempotent_on_already_wrapped_fields() -> None:
     assert block["complete_criterion"] == already_wrapped_criterion
 
 
-def test_normalizes_spaced_fence_wrapped_goal_without_adding_reword_turn() -> None:
+def test_normalizes_spaced_fence_wrapped_goal_without_stacking_wrapper() -> None:
     revised_goal = "Go to https://example.com. Tell me how many results there are referencing topic beta"
     spaced_fence_wrapped_goal = textwrap.dedent(
         f"""
@@ -162,7 +166,7 @@ def test_normalizes_spaced_fence_wrapped_goal_without_adding_reword_turn() -> No
         }
     )
 
-    out = wrap_block_goals(src, "I meant topic beta")
+    out = wrap_block_goals(src, revised_goal)
 
     goal = _blocks_from(out)[0]["navigation_goal"]
     assert goal == MINI_GOAL_TEMPLATE.format(
@@ -171,6 +175,56 @@ def test_normalizes_spaced_fence_wrapped_goal_without_adding_reword_turn() -> No
     )
     assert "I meant topic beta" not in goal
     assert goal.count("Achieve the following mini goal") == 1
+
+
+def test_rewraps_spaced_fence_wrapped_goal_when_main_goal_changes() -> None:
+    original_goal = "Go to arXiv and find research about gravitational waves."
+    resolved_goal = "Go to arXiv and find research about black holes."
+    spaced_fence_wrapped_goal = textwrap.dedent(
+        f"""
+        Achieve the following mini goal and once it's achieved, complete:
+        ` ` `Enter '{{{{ search_query }}}}' and submit the search` ` `
+
+        This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
+        ` ` `{original_goal}` ` `
+        """
+    ).strip()
+    src = _yaml_with_blocks(
+        {
+            "block_type": "navigation",
+            "label": "search_arxiv",
+            "navigation_goal": spaced_fence_wrapped_goal,
+        }
+    )
+
+    out = wrap_block_goals(src, resolved_goal)
+
+    block = _blocks_from(out)[0]
+    assert block["navigation_goal"] == _wrapped_with(
+        "Enter '{{ search_query }}' and submit the search",
+        resolved_goal,
+    )
+
+
+def test_rewraps_already_wrapped_fields_when_main_goal_changes() -> None:
+    src = _yaml_with_blocks(
+        {
+            "block_type": "navigation",
+            "label": "search_arxiv",
+            "navigation_goal": _wrapped_with(
+                "Enter '{{ search_query }}' and submit the search",
+                "Go to arXiv and find research about gravitational waves.",
+            ),
+        }
+    )
+
+    out = wrap_block_goals(src, "Go to arXiv and find research about black holes.")
+
+    block = _blocks_from(out)[0]
+    assert block["navigation_goal"] == _wrapped_with(
+        "Enter '{{ search_query }}' and submit the search",
+        "Go to arXiv and find research about black holes.",
+    )
 
 
 def test_noop_on_empty_user_message() -> None:

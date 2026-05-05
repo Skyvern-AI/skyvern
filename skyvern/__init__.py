@@ -1,16 +1,25 @@
 import typing
 from typing import Any
 
-from skyvern.forge.sdk.forge_log import setup_logger
+from skyvern._version import __version__
 from skyvern.utils import setup_windows_event_loop_policy
 
 if typing.TYPE_CHECKING:
     from skyvern.library import Skyvern  # noqa: E402
+
+
+def _setup_package_logging() -> None:
+    from skyvern.forge.sdk.forge_log import setup_logger  # noqa: PLC0415
+
+    setup_logger()
+
+
 setup_windows_event_loop_policy()
-setup_logger()
+_setup_package_logging()
 
 # noinspection PyUnresolvedReferences
 __all__ = [
+    "__version__",
     "Skyvern",
     "SkyvernPage",
     "RunContext",

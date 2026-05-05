@@ -3999,6 +3999,20 @@ class WorkflowService:
             error_code=error_code,
         )
 
+    async def get_workflow_runs_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[WorkflowRun]:
+        return await app.DATABASE.workflow_runs.get_workflow_runs_for_browser_session(
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+        )
+
     async def create_workflow_run(
         self,
         workflow_request: WorkflowRequestBody,
