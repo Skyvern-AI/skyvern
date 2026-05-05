@@ -50,7 +50,8 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "file_url_parser": {
       return <CursorTextIcon className={className} />;
     }
-    case "for_loop": {
+    case "for_loop":
+    case "while_loop": {
       return <UpdateIcon className={className} />;
     }
     case "login": {

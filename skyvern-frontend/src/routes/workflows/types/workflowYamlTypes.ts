@@ -131,6 +131,7 @@ export type BlockYAML =
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
+  | WhileLoopBlockYAML
   | ConditionalBlockYAML
   | ValidationBlockYAML
   | HumanInteractionBlockYAML
@@ -367,6 +368,12 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
   data_schema?: Record<string, unknown> | string | null;
+};
+
+export type WhileLoopBlockYAML = BlockYAMLBase & {
+  block_type: "while_loop";
+  loop_blocks: Array<BlockYAML>;
+  condition: BranchCriteriaYAML;
 };
 
 export type BranchCriteriaYAML = {

@@ -7,12 +7,8 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import { isAction, isWorkflowRunBlock } from "../types/workflowRunTypes";
 import { findBlockSurroundingAction } from "./workflowTimelineUtils";
 import { TaskBlockParameters } from "./TaskBlockParameters";
-import {
-  isTaskVariantBlock,
-  WorkflowBlockTypes,
-  type WorkflowBlock,
-  type WorkflowBlockType,
-} from "../types/workflowTypes";
+import { isTaskVariantBlock, WorkflowBlockTypes } from "../types/workflowTypes";
+import { findWorkflowBlockByLabel, isBlockOfType } from "../workflowBlockUtils";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { SendEmailBlockParameters } from "./blockInfo/SendEmailBlockInfo";
@@ -29,6 +25,7 @@ import { PrintPageBlockParameters } from "./blockInfo/PrintPageBlockParameters";
 import { HumanInteractionBlockParameters } from "./blockInfo/HumanInteractionBlockParameters";
 import { ConditionalBlockParameters } from "./blockInfo/ConditionalBlockParameters";
 import { Taskv2BlockParameters } from "./blockInfo/Taskv2BlockParameters";
+import { WhileLoopPostRunFields } from "../components/WhileLoopPostRunFields";
 
 function WorkflowPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -137,23 +134,36 @@ function WorkflowPostRunParameters() {
       {activeBlock && activeBlock.block_type === WorkflowBlockTypes.ForLoop ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Block Parameters</h1>
+            <h1 className="text-sm font-bold">Block Parameters</h1>
             <div className="flex gap-16">
               <div className="w-80">
-                <h1 className="text-lg">Loop Values</h1>
-                <h2 className="text-base text-slate-400">
+                <h1 className="text-sm">Loop Values</h1>
+                <h2 className="text-sm text-slate-400">
                   The values that are being looped over
                 </h2>
               </div>
               <CodeEditor
                 className="w-full"
                 language="json"
-                value={JSON.stringify(activeBlock.loop_values, null, 2)}
+                value={JSON.stringify(activeBlock.loop_values ?? [], null, 2)}
                 readOnly
                 minHeight="96px"
                 maxHeight="200px"
               />
             </div>
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.WhileLoop ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-sm font-bold">Block Parameters</h1>
+            <WhileLoopPostRunFields
+              layout="sidebar"
+              definitionBlock={definitionBlock}
+              loopOutput={activeBlock.output}
+            />
           </div>
         </div>
       ) : null}
@@ -460,31 +470,3 @@ function WorkflowPostRunParameters() {
 }
 
 export { WorkflowPostRunParameters };
-
-function findWorkflowBlockByLabel(
-  blocks: Array<WorkflowBlock>,
-  label: string,
-): WorkflowBlock | null {
-  for (const block of blocks) {
-    if (block.label === label) {
-      return block;
-    }
-    if (
-      block.block_type === WorkflowBlockTypes.ForLoop &&
-      block.loop_blocks.length > 0
-    ) {
-      const nested = findWorkflowBlockByLabel(block.loop_blocks, label);
-      if (nested) {
-        return nested;
-      }
-    }
-  }
-  return null;
-}
-
-function isBlockOfType<T extends WorkflowBlockType>(
-  block: WorkflowBlock | null,
-  type: T,
-): block is Extract<WorkflowBlock, { block_type: T }> {
-  return block?.block_type === type;
-}
