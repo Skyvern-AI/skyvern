@@ -50,6 +50,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   send_email: "sendEmail",
   text_prompt: "textPrompt",
   for_loop: "loop",
+  while_loop: "loop",
   file_url_parser: "fileParser",
   pdf_parser: "pdfParser",
   download_to_s3: "download",

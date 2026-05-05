@@ -1,4 +1,8 @@
-import { LightningBoltIcon, MixerHorizontalIcon } from "@radix-ui/react-icons";
+import {
+  ExclamationTriangleIcon,
+  LightningBoltIcon,
+  MixerHorizontalIcon,
+} from "@radix-ui/react-icons";
 
 import {
   Select,
@@ -192,16 +196,31 @@ function RunHistory() {
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
       const navPath = getRunNavigationPath(run);
 
-      const titleContent = run.script_run ? (
-        <div className="flex items-center gap-2">
-          <Tip content="Ran with code">
-            <LightningBoltIcon className="text-[gold]" />
-          </Tip>
-          <span>{run.title ?? ""}</span>
-        </div>
-      ) : (
-        (run.title ?? "")
-      );
+      const titleContent =
+        run.script_run || run.workflow_deleted ? (
+          <div className="flex items-center gap-2">
+            {run.script_run && (
+              <Tip content="Ran with code">
+                <LightningBoltIcon className="text-[gold]" />
+              </Tip>
+            )}
+            {run.workflow_deleted && (
+              <Tip content="Source workflow deleted">
+                <ExclamationTriangleIcon className="text-amber-400" />
+              </Tip>
+            )}
+            <span
+              className={cn(
+                run.workflow_deleted && "text-slate-400",
+                "truncate",
+              )}
+            >
+              {run.title ?? ""}
+            </span>
+          </div>
+        ) : (
+          (run.title ?? "")
+        );
 
       return (
         <React.Fragment key={run.task_run_id}>

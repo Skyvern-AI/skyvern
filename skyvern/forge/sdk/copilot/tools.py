@@ -29,7 +29,12 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
 )
-from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
+from skyvern.forge.sdk.copilot.loop_detection import (
+    clear_failed_step_tracker_for_tools_in_ctx,
+    detect_failed_tool_step_loop_for_ctx,
+    detect_tool_loop,
+    record_tool_step_result_for_ctx,
+)
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
@@ -375,10 +380,14 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
-def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
-    # The name-only guard false-positives on the intended iterative build
-    # (one new block per update_and_run_blocks). Block-running tools rely
-    # on the progress-aware checks below instead.
+def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
+    detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
+    if detected is not None:
+        return detected
+
+    # Consecutive same-name guard: false-positives on the intended iterative
+    # build (one new block per update_and_run_blocks). Block-running tools
+    # rely on the progress-aware checks below instead.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
     if isinstance(tracker, list) and tool_name not in BLOCK_RUNNING_TOOLS:
         detected = detect_tool_loop(tracker, tool_name)
@@ -2311,6 +2320,11 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
     copilot_ctx.workflow_persisted = True
 
+    # Block-running failures keyed off (labels, parameters) go stale once the
+    # workflow itself changes — without this clear, a user who fixes the bug
+    # via update_workflow gets a LOOP DETECTED on the next legitimate run.
+    clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
+
 
 def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
     """Single-pass analysis of run result blocks.
@@ -2442,6 +2456,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.last_test_suspicious_success = False
+    copilot_ctx.suspicious_success_nudge_count = 0
     copilot_ctx.last_test_anti_bot = None
     copilot_ctx.last_failure_category_top = None
     copilot_ctx.last_test_non_retriable_nav_error = None
@@ -2517,13 +2532,15 @@ async def update_workflow_tool(
     Returns the validated workflow or validation errors.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "update_workflow")
+    arguments = {"workflow_yaml": workflow_yaml}
+    loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        result = await _update_workflow(arguments, copilot_ctx)
         _record_workflow_update_result(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -2543,11 +2560,13 @@ async def list_credentials_tool(
     a credential they have already stored on a later page.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "list_credentials")
+    arguments = {"page": page, "page_size": page_size}
+    loop_error = _tool_loop_error(copilot_ctx, "list_credentials", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
-    result = await _list_credentials({"page": page, "page_size": page_size}, copilot_ctx)
+    result = await _list_credentials(arguments, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "list_credentials", arguments, result)
     sanitized = sanitize_tool_result_for_llm("list_credentials", result)
     return json.dumps(sanitized)
 
@@ -2604,7 +2623,8 @@ async def run_blocks_tool(
     HANDLING refusal rule in the system prompt.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug")
+    arguments = {"block_labels": block_labels, "parameters": parameters or {}}
+    loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
@@ -2623,13 +2643,14 @@ async def run_blocks_tool(
         ),
     ):
         result = await _run_blocks_and_collect_debug(
-            {"block_labels": block_labels, "parameters": parameters or {}},
+            arguments,
             copilot_ctx,
             labels_to_execute=labels_to_execute,
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
         _record_run_blocks_result(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         enqueue_screenshot_from_result(copilot_ctx, result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
@@ -2649,15 +2670,16 @@ async def get_run_results_tool(
     pass an explicit workflow_run_id from a prior tool response.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "get_run_results")
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
-
     params: dict[str, Any] = {}
     if workflow_run_id:
         params["workflow_run_id"] = workflow_run_id
+    loop_error = _tool_loop_error(copilot_ctx, "get_run_results", params)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
     result = await _get_run_results(params, copilot_ctx)
     _maybe_clear_reconciliation_flag(copilot_ctx, result)
+    record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
 
     sanitized = sanitize_tool_result_for_llm("get_run_results", result)
     return json.dumps(sanitized)
@@ -2690,7 +2712,8 @@ async def update_and_run_blocks_tool(
     HANDLING refusal rule in the system prompt.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks")
+    arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
@@ -2712,6 +2735,7 @@ async def update_and_run_blocks_tool(
         _record_workflow_update_result(copilot_ctx, update_result)
 
     if not update_result.get("ok"):
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
@@ -2761,6 +2785,7 @@ async def update_and_run_blocks_tool(
             frontier_start_label=frontier_start_label,
         )
         _record_run_blocks_result(copilot_ctx, run_result)
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
         enqueue_screenshot_from_result(copilot_ctx, run_result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)

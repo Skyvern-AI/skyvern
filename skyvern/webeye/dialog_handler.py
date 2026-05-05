@@ -46,6 +46,15 @@ async def _handle_dialog(dialog: Dialog) -> None:
         organization_id=organization_id,
     )
 
+    # Record alert only — beforeunload is informational ("Changes you made may not
+    # be saved") and would misfit the "field rejection" prompt copy; confirm/prompt
+    # are handled deliberately by the LLM and would be mislabeled as rejections.
+    if ctx is not None and dialog_type == "alert":
+        try:
+            ctx.record_dialog_message(dialog_type, dialog_message)
+        except Exception:
+            log.exception("Failed to record dialog message into context")
+
     # Alert, beforeunload, or no task context — auto-accept without LLM call
     if dialog_type in ("alert", "beforeunload"):
         log.info("Dialog auto-accepted", dialog_type=dialog_type)
