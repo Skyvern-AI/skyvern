@@ -1,7 +1,9 @@
 import { ExternalLinkIcon } from "@radix-ui/react-icons";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { usePostHog } from "posthog-js/react";
 import { useGoogleSheetTabs } from "@/hooks/useGoogleSheetTabs";
 import { useCreateGoogleSheetTab } from "@/hooks/useCreateGoogleSheetTab";
+import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
 import {
   Popover,
   PopoverAnchor,
@@ -14,6 +16,10 @@ import {
   isTemplateExpression,
 } from "@/util/googleSheetsUrl";
 import { isReconnectRequired } from "@/util/googleSheetsErrors";
+import {
+  describeAxiosError,
+  type SheetsBlockType,
+} from "@/util/sheetsTelemetry";
 import { InlineCreateRow } from "./InlineCreateRow";
 
 type Props = {
@@ -24,6 +30,7 @@ type Props = {
   value: string;
   placeholder?: string;
   allowCreate: boolean;
+  blockType: SheetsBlockType;
   onChange: (value: string) => void;
   onSelect: (tabName: string) => void;
 };
@@ -36,11 +43,14 @@ function SheetTabCombobox({
   value,
   placeholder,
   allowCreate,
+  blockType,
   onChange,
   onSelect,
 }: Props) {
   const [isOpen, setIsOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
+  const postHog = usePostHog();
+  const orgId = useCurrentOrgId();
 
   const isTypeable =
     hasSelectedAccount &&
@@ -91,7 +101,13 @@ function SheetTabCombobox({
           spreadsheetUrl={spreadsheetUrl}
           filter={value}
           allowCreate={allowCreate}
-          onPick={(name) => {
+          blockType={blockType}
+          onPick={(name, tabIndex) => {
+            postHog?.capture("sheets.tab.selected", {
+              org_id: orgId,
+              block_type: blockType,
+              tab_index: tabIndex,
+            });
             onSelect(name);
             setIsOpen(false);
           }}
@@ -106,7 +122,8 @@ type ListPanelProps = {
   spreadsheetUrl: string;
   filter: string;
   allowCreate: boolean;
-  onPick: (tabName: string) => void;
+  blockType: SheetsBlockType;
+  onPick: (tabName: string, tabIndex: number) => void;
 };
 
 function SheetTabListPanel({
@@ -114,14 +131,57 @@ function SheetTabListPanel({
   spreadsheetUrl,
   filter,
   allowCreate,
+  blockType,
   onPick,
 }: ListPanelProps) {
+  const postHog = usePostHog();
+  const orgId = useCurrentOrgId();
+  const errorReportedRef = useRef<unknown>(null);
+  const loadedReportedRef = useRef(false);
   const tabsQuery = useGoogleSheetTabs({
     credentialId,
     spreadsheetUrlOrId: spreadsheetUrl,
     enabled: true,
   });
   const createMutation = useCreateGoogleSheetTab();
+
+  // Reset dedup refs when the underlying spreadsheet/credential changes so
+  // telemetry reflects the new selection rather than a single per-mount fire.
+  useEffect(() => {
+    errorReportedRef.current = null;
+    loadedReportedRef.current = false;
+  }, [credentialId, spreadsheetUrl]);
+
+  useEffect(() => {
+    if (!tabsQuery.error) {
+      errorReportedRef.current = null;
+    } else if (errorReportedRef.current !== tabsQuery.error) {
+      errorReportedRef.current = tabsQuery.error;
+      const meta = describeAxiosError(tabsQuery.error);
+      postHog?.capture("sheets.tab.error", {
+        org_id: orgId,
+        block_type: blockType,
+        error_code: meta.error_code,
+        http_status: meta.http_status,
+      });
+      return;
+    }
+    if (!tabsQuery.isFetching && tabsQuery.data && !loadedReportedRef.current) {
+      loadedReportedRef.current = true;
+      postHog?.capture("sheets.tab.loaded", {
+        org_id: orgId,
+        block_type: blockType,
+        tab_count: tabsQuery.data.length,
+      });
+    }
+  }, [
+    tabsQuery.error,
+    tabsQuery.data,
+    tabsQuery.isFetching,
+    postHog,
+    orgId,
+    blockType,
+  ]);
 
   const tabs = useMemo(() => {
     const list = tabsQuery.data ?? [];
@@ -158,7 +218,7 @@ function SheetTabListPanel({
       spreadsheetUrlOrId: spreadsheetUrl,
       title,
     });
-    onPick(tab.title);
+    onPick(tab.title, -1);
   };
 
   return (
@@ -183,11 +243,11 @@ function SheetTabListPanel({
         ) : tabs.length === 0 ? (
           <div className="px-3 py-3 text-xs text-slate-500">No sheets.</div>
         ) : (
-          tabs.map((tab) => (
+          tabs.map((tab, index) => (
             <button
               key={tab.sheet_id}
               type="button"
-              onClick={() => onPick(tab.title)}
+              onClick={() => onPick(tab.title, index)}
               className="flex w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-700"
             >
               {tab.title}

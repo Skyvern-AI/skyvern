@@ -1,8 +1,10 @@
 import { ExternalLinkIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { usePostHog } from "posthog-js/react";
 import { useDebounce } from "use-debounce";
 import { useGoogleSpreadsheets } from "@/hooks/useGoogleSpreadsheets";
 import { useCreateGoogleSpreadsheet } from "@/hooks/useCreateGoogleSpreadsheet";
+import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
 import {
   Popover,
   PopoverAnchor,
@@ -17,6 +19,11 @@ import {
   isTemplateExpression,
 } from "@/util/googleSheetsUrl";
 import { isReconnectRequired } from "@/util/googleSheetsErrors";
+import {
+  describeAxiosError,
+  hashSpreadsheetId,
+  type SheetsBlockType,
+} from "@/util/sheetsTelemetry";
 import { InlineCreateRow } from "./InlineCreateRow";
 
 type Selection = {
@@ -33,6 +40,7 @@ type Props = {
   displayName: string | null;
   placeholder?: string;
   allowCreate: boolean;
+  blockType: SheetsBlockType;
   onChange: (value: string) => void;
   onSelect: (selection: Selection) => void;
 };
@@ -45,11 +53,14 @@ function SpreadsheetCombobox({
   displayName,
   placeholder,
   allowCreate,
+  blockType,
   onChange,
   onSelect,
 }: Props) {
   const [isOpen, setIsOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
+  const postHog = usePostHog();
+  const orgId = useCurrentOrgId();
   const renderedValue = displayName ?? value;
   // Skip the Drive search whenever we already have a resolved selection
   // (displayName) or the input is a parseable URL/ID. Drive `q` searches by
@@ -74,6 +85,32 @@ function SpreadsheetCombobox({
     if (isTypeable) {
       setIsOpen(true);
     }
+  };
+
+  const popoverOpen = isOpen && isTypeable;
+  useEffect(() => {
+    if (popoverOpen) {
+      postHog?.capture("sheets.spreadsheet.picker.opened", {
+        org_id: orgId,
+        block_type: blockType,
+      });
+    }
+  }, [popoverOpen, postHog, orgId, blockType]);
+
+  const handlePick = (selection: Selection) => {
+    onSelect(selection);
+    setIsOpen(false);
+    // Hash off the hot path so a slow SubtleCrypto call never blocks the UI.
+    const spreadsheetId = extractSpreadsheetIdFromUrl(selection.url);
+    void (
+      spreadsheetId ? hashSpreadsheetId(spreadsheetId) : Promise.resolve(null)
+    ).then((spreadsheetIdHash) => {
+      postHog?.capture("sheets.spreadsheet.picker.selected", {
+        org_id: orgId,
+        block_type: blockType,
+        spreadsheet_id_hash: spreadsheetIdHash,
+      });
+    });
   };
 
   return (
@@ -106,10 +143,8 @@ function SpreadsheetCombobox({
           credentialId={credentialId}
           query={debouncedQuery}
           allowCreate={allowCreate}
-          onPick={(selection) => {
-            onSelect(selection);
-            setIsOpen(false);
-          }}
+          blockType={blockType}
+          onPick={handlePick}
         />
       </PopoverContent>
     </Popover>
@@ -120,6 +155,7 @@ type ListPanelProps = {
   credentialId: string;
   query: string;
   allowCreate: boolean;
+  blockType: SheetsBlockType;
   onPick: (selection: Selection) => void;
 };
 
@@ -127,9 +163,13 @@ function SpreadsheetListPanel({
   credentialId,
   query,
   allowCreate,
+  blockType,
   onPick,
 }: ListPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const postHog = usePostHog();
+  const orgId = useCurrentOrgId();
+  const errorReportedRef = useRef<unknown>(null);
   const listing = useGoogleSpreadsheets({
     credentialId,
     query,
@@ -141,6 +181,27 @@ function SpreadsheetListPanel({
     () => listing.data?.pages.flatMap((p) => p.spreadsheets) ?? [],
     [listing.data],
   );
+
+  // Reset dedup so a new credential gets a fresh error window.
+  useEffect(() => {
+    errorReportedRef.current = null;
+  }, [credentialId]);
+
+  useEffect(() => {
+    if (!listing.error) {
+      errorReportedRef.current = null;
+      return;
+    }
+    if (errorReportedRef.current === listing.error) return;
+    errorReportedRef.current = listing.error;
+    const meta = describeAxiosError(listing.error);
+    postHog?.capture("sheets.spreadsheet.picker.error", {
+      org_id: orgId,
+      block_type: blockType,
+      error_code: meta.error_code,
+      http_status: meta.http_status,
+    });
+  }, [listing.error, postHog, orgId, blockType]);
 
   useEffect(() => {
     const el = scrollRef.current;
