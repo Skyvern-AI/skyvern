@@ -1,6 +1,12 @@
 ```
 {{ action_history }}
 ```
+{% if recent_dialog_messages_str %}
+Browser alert messages raised during the previous step (the agent auto-accepted each one). Use these as additional context: if a message indicates a validation error or that the previous action was rejected, change the value, its format, or the target element before retrying — do NOT retry the same INPUT_TEXT with the same text on the same field. Treat purely informational messages (e.g. "Saved successfully") as confirmation, not as a signal to change anything.
+```
+{{ recent_dialog_messages_str }}
+```
+{% endif %}
 {% if complete_criterion %}
 Complete criterion:
 ```

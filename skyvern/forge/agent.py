@@ -3368,6 +3368,12 @@ class ForgeAgent:
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
+        # Format-then-clear so a render failure can't drop the signal permanently;
+        # gate on extract-action template since other task types don't render it.
+        recent_dialog_messages_str = (
+            context.format_recent_dialog_messages() if template == EXTRACT_ACTION_TEMPLATE else None
+        )
+
         if template == EXTRACT_ACTION_TEMPLATE and cache_enabled:
             try:
                 # Try to load split templates for caching
@@ -3387,6 +3393,7 @@ class ForgeAgent:
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "parse_select_feature_enabled": context.enable_parse_select_in_extract,
                     "has_magic_link_page": context.has_magic_link_page(task.task_id),
+                    "recent_dialog_messages_str": recent_dialog_messages_str,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
@@ -3438,6 +3445,8 @@ class ForgeAgent:
                 )
                 # Map template to prompt_name for logging/caching guards
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+                if recent_dialog_messages_str is not None:
+                    context.clear_recent_dialog_messages()
                 return combined_prompt, use_caching, prompt_name
 
             except Exception as e:
@@ -3462,6 +3471,7 @@ class ForgeAgent:
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
             has_magic_link_page=context.has_magic_link_page(task.task_id),
+            recent_dialog_messages_str=recent_dialog_messages_str,
         )
 
         # Map template to prompt_name for logging/caching guards
@@ -3473,6 +3483,9 @@ class ForgeAgent:
         _prompt_build_span.set_attribute("prompt_name", prompt_name)
         _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
         _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+
+        if recent_dialog_messages_str is not None:
+            context.clear_recent_dialog_messages()
 
         return full_prompt, use_caching, prompt_name
 
