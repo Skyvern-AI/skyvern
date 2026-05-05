@@ -32,6 +32,10 @@ MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
+# Stops the suspicious-success nudge from re-firing forever when the agent has
+# correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
+# longer willing to re-run extraction.
+MAX_SUSPICIOUS_SUCCESS_NUDGES = 2
 # Escalate after this many consecutive all-null extraction runs so the agent
 # inspects browser state instead of re-prompting the extractor.
 NULL_DATA_STREAK_ESCALATE_AT = 2
@@ -454,7 +458,10 @@ def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     # to the dedicated stop path rather than competing for the nudge slot.
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
         return False
-    return bool(getattr(ctx, "last_test_suspicious_success", False))
+    if not getattr(ctx, "last_test_suspicious_success", False):
+        return False
+    nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0)
+    return nudge_count < MAX_SUSPICIOUS_SUCCESS_NUDGES
 
 
 def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
@@ -562,6 +569,7 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
         return POST_REPEATED_NULL_DATA_NUDGE
 
     if _needs_suspicious_success_nudge(ctx):
+        ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
         return POST_SUSPICIOUS_SUCCESS_NUDGE
 
     # Checked before the generic failed-test nudge so a scrape-wall streak
