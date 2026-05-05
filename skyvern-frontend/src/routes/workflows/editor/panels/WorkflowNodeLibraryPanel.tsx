@@ -151,7 +151,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Loop Block",
-    description: "Repeat blocks for each item",
+    description: "Iterate over a list or while a condition stays true",
   },
   {
     nodeType: "codeBlock",
