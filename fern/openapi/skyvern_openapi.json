@@ -18431,7 +18431,7 @@
           "condition"
         ],
         "title": "WhileLoopBlock",
-        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
+        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
       },
       "WhileLoopBlockYAML": {
         "properties": {
