@@ -169,6 +169,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention.
 
@@ -236,6 +237,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     intention=intention,
                     action=action,
                     block_label=block_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
 
                 return selector
@@ -263,6 +265,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
 
@@ -386,6 +389,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 intention=intention,
                 action=action,
                 block_label=block_label,
+                recoverable_marker_id=recoverable_marker_id,
             )
         else:
             locator = self.page.locator(selector)
@@ -691,28 +695,32 @@ class RealSkyvernPageAi(SkyvernPageAi):
         intention: str,
         action: Any,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> None:
         """Record an element-level fallback episode when ai_click/ai_input_text fires
         because a CSS selector failed or was missing. Gated on code_version >= 2.
 
-        This gives the script reviewer the signal AND the action data (css_suggestion,
-        element attributes) it needs to write a proper selector for the next script version.
+        Two trigger conditions:
+        - `failed_selector` set → fallback path: a tried selector missed.
+        - `recoverable_marker_id` set → SKY-9436 escape hatch: generator emitted
+          `ai='proactive'` because no semantic selector existed at codegen.
+          AI succeeded; capture the element pick so the reviewer can later
+          upgrade the call to `selector=, ai='fallback'`.
         """
-        if failed_selector is None:
-            # None means the caller didn't pass failed_selector — this is a direct
-            # ai_click call (not from the ai='fallback' path), so don't record.
+        if failed_selector is None and recoverable_marker_id is None:
             return
         if (context.code_version or 0) < 2:
             return
         if not context.workflow_run_id or not context.workflow_permanent_id:
             return
         try:
-            # Build agent_actions data for the reviewer
             action_data: dict[str, Any] = {
                 "action_type": action_type,
                 "intention": intention,
                 "failed_selector": failed_selector if failed_selector else "(missing — no selector= argument)",
             }
+            if recoverable_marker_id is not None:
+                action_data["recoverable_marker_id"] = recoverable_marker_id
             if hasattr(action, "element_id"):
                 action_data["element_id"] = action.element_id
             if hasattr(action, "skyvern_element_data") and action.skyvern_element_data:
@@ -752,12 +760,19 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if hasattr(action, "reasoning"):
                 action_data["reasoning"] = action.reasoning
 
-            error_msg = (
-                f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
-                f"AI fallback succeeded. "
-                f"Original selector: {failed_selector or '(none)'}. "
-                f"Intention: {intention}"
-            )
+            if recoverable_marker_id is not None and failed_selector is None:
+                error_msg = (
+                    f"Proactive recovery on page.{action_type}() (marker={recoverable_marker_id}): "
+                    f"generator emitted ai='proactive' (no semantic selector at codegen); "
+                    f"AI picked the element. Intention: {intention}"
+                )
+            else:
+                error_msg = (
+                    f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
+                    f"AI fallback succeeded. "
+                    f"Original selector: {failed_selector or '(none)'}. "
+                    f"Intention: {intention}"
+                )
             await app.DATABASE.scripts.create_fallback_episode(
                 organization_id=context.organization_id or "",
                 workflow_permanent_id=context.workflow_permanent_id,

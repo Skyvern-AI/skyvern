@@ -1148,25 +1148,17 @@ async def run_with_enforcement(
                     )
                     raise
 
-        # Inject pending screenshots as a follow-up user message because OpenAI
-        # rejects images in tool messages.
-        screenshot_msg = _consume_pending_screenshots(ctx)
-        if screenshot_msg is not None:
-            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
-            current_input = (
-                [screenshot_msg]
-                if session is not None
-                else _prune_input_list(result.to_input_list()) + [screenshot_msg]
-            )
-            iteration += 1
-            continue
-
+        # The post-run screenshot drain must follow the enforcement check:
+        # without a nudge, re-invoking with just the screenshot would replace
+        # the agent's already-final REPLY with one synthesized from a single
+        # browser frame.
         if pending_recovery_nudge is not None:
             nudge: str | None = pending_recovery_nudge
             pending_recovery_nudge = None
         else:
             nudge = _check_enforcement(ctx, result)
         if nudge is None:
+            _consume_pending_screenshots(ctx)
             _maybe_raise_non_retriable_nav(ctx)
             return result
 
@@ -1176,6 +1168,7 @@ async def run_with_enforcement(
                     "Enforcement exhausted post-update nudges, allowing response",
                     nudge_count=ctx.post_update_nudge_count,
                 )
+                _consume_pending_screenshots(ctx)
                 _maybe_raise_non_retriable_nav(ctx)
                 return result
             ctx.post_update_nudge_count += 1
@@ -1183,10 +1176,17 @@ async def run_with_enforcement(
         nudge_type = _NUDGE_TYPE_BY_MESSAGE.get(nudge, "intermediate_success")
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
+        # OpenAI rejects images in tool messages, so a queued post-run
+        # screenshot rides as its own user message just before the nudge.
+        screenshot_msg = _consume_pending_screenshots(ctx)
+        if screenshot_msg is not None:
+            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
+
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
             nudge_msg = {"role": "user", "content": NUDGE_SENTINEL + nudge}
+            extra_msgs = [nudge_msg] if screenshot_msg is None else [screenshot_msg, nudge_msg]
             current_input = (
-                [nudge_msg] if session is not None else _prune_input_list(result.to_input_list()) + [nudge_msg]
+                extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )
         # Signal the narrator that the agent is re-entering the loop after an
         # enforcement correction. stream_to_sse creates the state on the first
