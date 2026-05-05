@@ -293,3 +293,36 @@ async def test_workflow_run_history_queries_exclude_copilot_session_runs() -> No
         where_clause = _where_clause_sql(query)
         assert "workflow_runs.copilot_session_id IS NULL" in where_clause
         _assert_not_filtering_copilot_authored_workflows(where_clause)
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_for_browser_session_filters_and_excludes() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_for_browser_session(
+        browser_session_id="pbs_abc123",
+        organization_id="o_test",
+        page=2,
+        page_size=5,
+    )
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "workflow_runs.browser_session_id = 'pbs_abc123'" in where_clause
+    assert "workflow_runs.organization_id = 'o_test'" in where_clause
+    assert "workflow_runs.parent_workflow_run_id IS NULL" in where_clause
+    assert "workflow_runs.copilot_session_id IS NULL" in where_clause
+    _assert_not_filtering_copilot_authored_workflows(where_clause)
+
+    rendered = str(captured["query"].compile(compile_kwargs={"literal_binds": True}))
+    assert "ORDER BY workflow_runs.created_at DESC" in rendered
+    assert "LIMIT 5" in rendered
+    assert "OFFSET 5" in rendered
