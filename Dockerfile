@@ -6,13 +6,16 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
  && ln -s /root/.local/bin/uv /usr/local/bin/uv
 COPY ./pyproject.toml /tmp/pyproject.toml
 COPY ./uv.lock /tmp/uv.lock
-RUN uv pip compile pyproject.toml -o requirements.txt --no-annotate --no-header
+RUN uv pip compile pyproject.toml --extra server --python-version 3.11 -o requirements.txt --no-annotate --no-header
 
 FROM python:3.11-slim-bookworm
 WORKDIR /app
 COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+# --no-deps: requirements.txt is fully resolved by uv, including the
+# pyproject overrides that loosen litellm's jsonschema==4.23.0 pin.
+# Letting pip re-resolve here would re-introduce that conflict.
+RUN pip install --no-cache-dir --no-deps -r requirements.txt
 RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth x11-apps netpbm gpg ca-certificates x11vnc && apt-get clean
