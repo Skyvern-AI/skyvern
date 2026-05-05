@@ -31,6 +31,7 @@ override-dependencies = [
     "python-multipart>=0.0.26",
     "cryptography>=46.0.7",
     "langsmith>=0.7.31",
+    "pygments>=2.20.0",
 ]
 
 [tool.uv.sources]
