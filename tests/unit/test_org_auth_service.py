@@ -1,3 +1,4 @@
+from datetime import datetime
 from types import SimpleNamespace
 
 import jwt
@@ -6,6 +7,7 @@ from fastapi import HTTPException
 
 from skyvern.config import settings
 from skyvern.forge.sdk.core.security import create_access_token
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.org_auth_service import (
     _get_api_key_debug_fields,
@@ -175,3 +177,50 @@ async def test_resolve_org_from_api_key_returns_403_when_diagnostic_helper_fails
 
     assert exc_info.value.status_code == 403
     assert warnings["diagnostic_error_type"] == "RuntimeError"
+
+
+def _make_org(organization_id: str, name: str = "test-org") -> Organization:
+    now = datetime.utcnow()
+    return Organization(
+        organization_id=organization_id,
+        organization_name=name,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def test_invalidate_cached_org_drops_only_matching_entries() -> None:
+    cache = org_auth_service._current_org_cache
+    cache.clear()
+    org_a = _make_org("org-a")
+    org_b = _make_org("org-b")
+    cache[("api-key-a", "db")] = org_a
+    cache[("api-key-a-rotated", "db")] = org_a
+    cache[("api-key-b", "db")] = org_b
+
+    org_auth_service.invalidate_cached_org("org-a")
+
+    assert ("api-key-a", "db") not in cache
+    assert ("api-key-a-rotated", "db") not in cache
+    assert ("api-key-b", "db") in cache
+    cache.clear()
+
+
+def test_invalidate_cached_org_is_noop_when_id_absent() -> None:
+    cache = org_auth_service._current_org_cache
+    cache.clear()
+    org = _make_org("org-a")
+    cache[("api-key", "db")] = org
+
+    org_auth_service.invalidate_cached_org("never-seen")
+
+    assert ("api-key", "db") in cache
+    cache.clear()
+
+
+def test_invalidate_cached_org_handles_empty_cache() -> None:
+    cache = org_auth_service._current_org_cache
+    cache.clear()
+
+    # Should not raise.
+    org_auth_service.invalidate_cached_org("anything")
