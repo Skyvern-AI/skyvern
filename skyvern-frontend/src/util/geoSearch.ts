@@ -5,6 +5,7 @@ import {
   SUPPORTED_COUNTRY_CODES,
   SupportedCountryCode,
 } from "./geoData";
+import { importWithRetry } from "./lazyWithReload";
 
 export type SearchResultItem = {
   type: "country" | "subdivision" | "city";
@@ -30,7 +31,9 @@ let cscModulePromise: Promise<typeof import("country-state-city")> | null =
 
 function loadCsc() {
   if (!cscModulePromise) {
-    cscModulePromise = import("country-state-city").catch((error) => {
+    cscModulePromise = importWithRetry(
+      () => import("country-state-city"),
+    ).catch((error) => {
       // Reset on failure so next user action can retry
       cscModulePromise = null;
       throw error;

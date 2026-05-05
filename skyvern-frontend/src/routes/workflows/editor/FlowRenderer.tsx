@@ -72,6 +72,7 @@ import {
   nodeTypes,
   WorkflowBlockNode,
 } from "./nodes";
+import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -663,7 +664,7 @@ function FlowRenderer({
       workflowChangesStore.setHasChanges(true);
       postHog.capture("builder.block.removed", {
         org_id: workflow.organization_id,
-        block_type: node.type,
+        block_type: blockTypeFromNode(node) ?? node.type,
       });
 
       doLayout(newNodesWithUpdatedParameters, newEdges);

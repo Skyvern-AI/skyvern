@@ -37,6 +37,7 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_parameter_id,
     generate_debug_session_id,
     generate_folder_id,
+    generate_google_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -1349,3 +1350,39 @@ class ScriptBranchHitModel(Base):
     hit_count = Column(Integer, default=1, nullable=False)
     first_hit_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     last_hit_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
+class GoogleOAuthCredentialModel(Base):
+    """Single-row lifecycle: pending_consent -> active -> revoked/error"""
+
+    __tablename__ = "google_oauth_credentials"
+    __table_args__ = (
+        Index(
+            "ux_google_oauth_credentials_consent_nonce",
+            "consent_nonce",
+            unique=True,
+            postgresql_where=text("consent_nonce IS NOT NULL"),
+        ),
+    )
+
+    id = Column(String, primary_key=True, default=generate_google_oauth_credential_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
+    credential_name = Column(String, nullable=False, default="Default")
+    provider = Column(String, nullable=False, default="google")
+    state = Column(String, nullable=False, default="pending_consent", index=True)
+    scopes_requested = Column(JSON, nullable=False, default=list)
+    scopes_granted = Column(JSON, nullable=False, default=list)
+    encrypted_refresh_token = Column(String, nullable=True)
+    encrypted_method = Column(String, nullable=True)
+    consent_nonce = Column(String, nullable=True)
+    consent_redirect_uri = Column(String, nullable=True)
+    consent_code_verifier = Column(String, nullable=True)
+    consent_app_origin = Column(String, nullable=True)
+    consent_expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
