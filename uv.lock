@@ -2049,22 +2049,6 @@ wheels = [
 ]
 
 [[package]]
-name = "ipywidgets"
-version = "8.1.8"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "comm" },
-    { name = "ipython" },
-    { name = "jupyterlab-widgets" },
-    { name = "traitlets" },
-    { name = "widgetsnbextension" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4c/ae/c5ce1edc1afe042eadb445e95b0671b03cee61895264357956e61c0d2ac0/ipywidgets-8.1.8.tar.gz", hash = "sha256:61f969306b95f85fba6b6986b7fe45d73124d1d9e3023a8068710d47a22ea668", size = 116739, upload-time = "2025-11-01T21:18:12.393Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/56/6d/0d9848617b9f753b87f214f1c682592f7ca42de085f564352f10f0843026/ipywidgets-8.1.8-py3-none-any.whl", hash = "sha256:ecaca67aed704a338f88f67b1181b58f821ab5dc89c1f0f5ef99db43c1c2921e", size = 139808, upload-time = "2025-11-01T21:18:10.956Z" },
-]
-
-[[package]]
 name = "isodate"
 version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2495,15 +2479,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d6/2c/90153f189e421e93c4bb4f9e3f59802a1f01abd2ac5cf40b152d7f735232/jupyterlab_server-2.28.0.tar.gz", hash = "sha256:35baa81898b15f93573e2deca50d11ac0ae407ebb688299d3a5213265033712c", size = 76996, upload-time = "2025-10-22T13:59:18.37Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/07/a000fe835f76b7e1143242ab1122e6362ef1c03f23f83a045c38859c2ae0/jupyterlab_server-2.28.0-py3-none-any.whl", hash = "sha256:e4355b148fdcf34d312bbbc80f22467d6d20460e8b8736bf235577dd18506968", size = 59830, upload-time = "2025-10-22T13:59:16.767Z" },
-]
-
-[[package]]
-name = "jupyterlab-widgets"
-version = "3.0.16"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/26/2d/ef58fed122b268c69c0aa099da20bc67657cdfb2e222688d5731bd5b971d/jupyterlab_widgets-3.0.16.tar.gz", hash = "sha256:423da05071d55cf27a9e602216d35a3a65a3e41cdf9c5d3b643b814ce38c19e0", size = 897423, upload-time = "2025-11-01T21:11:29.724Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/b5/36c712098e6191d1b4e349304ef73a8d06aed77e56ceaac8c0a306c7bda1/jupyterlab_widgets-3.0.16-py3-none-any.whl", hash = "sha256:45fa36d9c6422cf2559198e4db481aa243c7a32d9926b500781c830c80f7ecf8", size = 914926, upload-time = "2025-11-01T21:11:28.008Z" },
 ]
 
 [[package]]
@@ -5344,11 +5319,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/19/71/39c7c0d87f8d4e6c020a393182060eaefeeae6c01dab6a84ec346f2567df/rich-13.9.4-py3-none-any.whl", hash = "sha256:6049d5e6ec054bf2779ab3358186963bac2ea89175919d699e378b99738c2a90", size = 242424, upload-time = "2024-11-01T16:43:55.817Z" },
 ]
 
-[package.optional-dependencies]
-jupyter = [
-    { name = "ipywidgets" },
-]
-
 [[package]]
 name = "rich-rst"
 version = "1.3.2"
@@ -5567,6 +5537,19 @@ name = "skyvern"
 version = "1.0.31"
 source = { editable = "." }
 dependencies = [
+    { name = "cachetools" },
+    { name = "httpx", extra = ["socks"] },
+    { name = "orjson" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "python-dotenv" },
+    { name = "rich" },
+    { name = "structlog" },
+    { name = "typer" },
+]
+
+[package.optional-dependencies]
+server = [
     { name = "aioboto3" },
     { name = "aiofiles" },
     { name = "aiohttp" },
@@ -5580,7 +5563,6 @@ dependencies = [
     { name = "azure-identity" },
     { name = "azure-keyvault-secrets" },
     { name = "azure-storage-blob" },
-    { name = "cachetools" },
     { name = "croniter" },
     { name = "curlparser" },
     { name = "email-validator" },
@@ -5593,7 +5575,6 @@ dependencies = [
     { name = "google-cloud-aiplatform" },
     { name = "greenlet", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "greenlet", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "httpx", extra = ["socks"] },
     { name = "jinja2" },
     { name = "json-repair" },
     { name = "json5" },
@@ -5605,7 +5586,6 @@ dependencies = [
     { name = "openai" },
     { name = "openai-agents" },
     { name = "opentelemetry-api" },
-    { name = "orjson" },
     { name = "pandas" },
     { name = "pdfplumber" },
     { name = "pillow" },
@@ -5616,27 +5596,21 @@ dependencies = [
     { name = "psycopg", version = "3.1.18", source = { registry = "https://pypi.org/simple" }, extra = ["binary", "pool"], marker = "python_full_version < '3.13'" },
     { name = "psycopg", version = "3.2.13", source = { registry = "https://pypi.org/simple" }, extra = ["binary", "pool"], marker = "python_full_version >= '3.13'" },
     { name = "pyasn1" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "pyotp" },
     { name = "pypdf" },
     { name = "python-calamine" },
     { name = "python-docx" },
-    { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "requests-toolbelt" },
-    { name = "rich", extra = ["jupyter"] },
     { name = "selectolax" },
     { name = "sqlalchemy", extra = ["mypy"] },
     { name = "sse-starlette" },
     { name = "starlette-context" },
-    { name = "structlog" },
     { name = "tiktoken" },
     { name = "tldextract" },
     { name = "toml" },
     { name = "tornado" },
-    { name = "typer" },
     { name = "types-boto3", extra = ["full"] },
     { name = "types-toml" },
     { name = "urllib3" },
@@ -5695,84 +5669,85 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aioboto3", specifier = ">=14.3.0,<15" },
-    { name = "aiofiles", specifier = ">=24.1.0,<25" },
-    { name = "aiohttp", specifier = ">=3.13.5,<4" },
-    { name = "aioredlock", specifier = ">=0.7.3,<0.8" },
-    { name = "aiosqlite", specifier = ">=0.21.0,<0.23" },
-    { name = "alembic", specifier = ">=1.12.1,<2" },
-    { name = "anthropic", specifier = ">=0.96.0,<0.97" },
-    { name = "asyncache", specifier = ">=0.3.1,<0.4" },
-    { name = "asyncpg", specifier = ">=0.30.0,<0.32" },
-    { name = "authlib", specifier = ">=1.6.9" },
-    { name = "azure-identity", specifier = ">=1.24.0,<2" },
-    { name = "azure-keyvault-secrets", specifier = ">=4.2.0,<5" },
-    { name = "azure-storage-blob", specifier = ">=12.26.0" },
+    { name = "aioboto3", marker = "extra == 'server'", specifier = ">=14.3.0,<15" },
+    { name = "aiofiles", marker = "extra == 'server'", specifier = ">=24.1.0,<25" },
+    { name = "aiohttp", marker = "extra == 'server'", specifier = ">=3.13.5,<4" },
+    { name = "aioredlock", marker = "extra == 'server'", specifier = ">=0.7.3,<0.8" },
+    { name = "aiosqlite", marker = "extra == 'server'", specifier = ">=0.21.0,<0.23" },
+    { name = "alembic", marker = "extra == 'server'", specifier = ">=1.12.1,<2" },
+    { name = "anthropic", marker = "extra == 'server'", specifier = ">=0.96.0,<0.97" },
+    { name = "asyncache", marker = "extra == 'server'", specifier = ">=0.3.1,<0.4" },
+    { name = "asyncpg", marker = "extra == 'server'", specifier = ">=0.30.0,<0.32" },
+    { name = "authlib", marker = "extra == 'server'", specifier = ">=1.6.9" },
+    { name = "azure-identity", marker = "extra == 'server'", specifier = ">=1.24.0,<2" },
+    { name = "azure-keyvault-secrets", marker = "extra == 'server'", specifier = ">=4.2.0,<5" },
+    { name = "azure-storage-blob", marker = "extra == 'server'", specifier = ">=12.26.0" },
     { name = "cachetools", specifier = ">=5.3.2,<6" },
-    { name = "croniter", specifier = ">=1.3.8,<4" },
-    { name = "curlparser", specifier = ">=0.1.0,<0.2" },
-    { name = "email-validator", specifier = ">=2.2.0,<3" },
-    { name = "fastapi", specifier = ">=0.136.0,<0.137" },
-    { name = "fastmcp", specifier = ">=3.2.0,<4" },
-    { name = "filetype", specifier = ">=1.2.0,<2" },
-    { name = "fuzzysearch", specifier = ">=0.8,<1" },
-    { name = "google-auth", specifier = ">=2.49.2,<3" },
-    { name = "google-auth-oauthlib", specifier = ">=1.3.1,<2" },
-    { name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" },
-    { name = "greenlet", marker = "python_full_version == '3.11.*'", specifier = "==3.0.3" },
-    { name = "greenlet", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">3.0.3" },
+    { name = "croniter", marker = "extra == 'server'", specifier = ">=1.3.8,<4" },
+    { name = "curlparser", marker = "extra == 'server'", specifier = ">=0.1.0,<0.2" },
+    { name = "email-validator", marker = "extra == 'server'", specifier = ">=2.2.0,<3" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.136.0,<0.137" },
+    { name = "fastmcp", marker = "extra == 'server'", specifier = ">=3.2.0,<4" },
+    { name = "filetype", marker = "extra == 'server'", specifier = ">=1.2.0,<2" },
+    { name = "fuzzysearch", marker = "extra == 'server'", specifier = ">=0.8,<1" },
+    { name = "google-auth", marker = "extra == 'server'", specifier = ">=2.49.2,<3" },
+    { name = "google-auth-oauthlib", marker = "extra == 'server'", specifier = ">=1.3.1,<2" },
+    { name = "google-cloud-aiplatform", marker = "extra == 'server'", specifier = ">=1.90.0,<2" },
+    { name = "greenlet", marker = "python_full_version == '3.11.*' and extra == 'server'", specifier = "==3.0.3" },
+    { name = "greenlet", marker = "python_full_version >= '3.12' and python_full_version < '3.14' and extra == 'server'", specifier = ">3.0.3" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
-    { name = "jinja2", specifier = ">=3.1.2,<4" },
-    { name = "json-repair", specifier = ">=0.59.4,<0.60" },
-    { name = "json5", specifier = ">=0.13.0,<1" },
-    { name = "jsonschema", specifier = ">=4.25.1" },
-    { name = "lark", specifier = ">=1.2.2,<2" },
-    { name = "libcst", specifier = ">=1.8.2,<2" },
-    { name = "litellm", specifier = ">=1.83.7" },
-    { name = "onepassword-sdk", specifier = "==0.4.0" },
-    { name = "openai", specifier = ">=1.68.2" },
-    { name = "openai-agents", specifier = ">=0.14.4,<0.15" },
-    { name = "opentelemetry-api", specifier = ">=1.41.1,<2" },
+    { name = "jinja2", marker = "extra == 'server'", specifier = ">=3.1.2,<4" },
+    { name = "json-repair", marker = "extra == 'server'", specifier = ">=0.59.4,<0.60" },
+    { name = "json5", marker = "extra == 'server'", specifier = ">=0.13.0,<1" },
+    { name = "jsonschema", marker = "extra == 'server'", specifier = ">=4.25.1" },
+    { name = "lark", marker = "extra == 'server'", specifier = ">=1.2.2,<2" },
+    { name = "libcst", marker = "extra == 'server'", specifier = ">=1.8.2,<2" },
+    { name = "litellm", marker = "extra == 'server'", specifier = ">=1.83.7" },
+    { name = "onepassword-sdk", marker = "extra == 'server'", specifier = "==0.4.0" },
+    { name = "openai", marker = "extra == 'server'", specifier = ">=1.68.2" },
+    { name = "openai-agents", marker = "extra == 'server'", specifier = ">=0.14.4,<0.15" },
+    { name = "opentelemetry-api", marker = "extra == 'server'", specifier = ">=1.41.1,<2" },
     { name = "orjson", specifier = ">=3.9.10,<4" },
-    { name = "pandas", specifier = ">=2.3.1,<4" },
-    { name = "pdfplumber", specifier = ">=0.11.0,<0.12" },
-    { name = "pillow", specifier = ">=10.2.0" },
-    { name = "playwright", marker = "python_full_version == '3.11.*'", specifier = "==1.46.0" },
-    { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">1.46.0" },
-    { name = "posthog", specifier = ">=3.7.0,<4" },
-    { name = "psutil", specifier = ">=7.0.0" },
-    { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version >= '3.11' and python_full_version < '3.13'", specifier = "==3.1.18" },
-    { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version == '3.13.*'", specifier = ">=3.2.2,<3.3.0" },
-    { name = "pyasn1", specifier = ">=0.6.3" },
+    { name = "pandas", marker = "extra == 'server'", specifier = ">=2.3.1,<4" },
+    { name = "pdfplumber", marker = "extra == 'server'", specifier = ">=0.11.0,<0.12" },
+    { name = "pillow", marker = "extra == 'server'", specifier = ">=10.2.0" },
+    { name = "playwright", marker = "python_full_version == '3.11.*' and extra == 'server'", specifier = "==1.46.0" },
+    { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14' and extra == 'server'", specifier = ">1.46.0" },
+    { name = "posthog", marker = "extra == 'server'", specifier = ">=3.7.0,<4" },
+    { name = "psutil", marker = "extra == 'server'", specifier = ">=7.0.0" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version >= '3.11' and python_full_version < '3.13' and extra == 'server'", specifier = "==3.1.18" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version == '3.13.*' and extra == 'server'", specifier = ">=3.2.2,<3.3.0" },
+    { name = "pyasn1", marker = "extra == 'server'", specifier = ">=0.6.3" },
     { name = "pydantic", specifier = ">=2.5.2,<3" },
     { name = "pydantic-settings", specifier = ">=2.1.0,<3" },
-    { name = "pyjwt", specifier = ">=2.12.0" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.12.0,<3" },
-    { name = "pyotp", specifier = ">=2.9.0,<3" },
-    { name = "pypdf", specifier = ">=6.7.5,<7" },
-    { name = "python-calamine", specifier = ">=0.6.1" },
-    { name = "python-docx", specifier = ">=1.1.0" },
+    { name = "pyjwt", marker = "extra == 'server'", specifier = ">=2.12.0" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'server'", specifier = ">=2.12.0,<3" },
+    { name = "pyotp", marker = "extra == 'server'", specifier = ">=2.9.0,<3" },
+    { name = "pypdf", marker = "extra == 'server'", specifier = ">=6.7.5,<7" },
+    { name = "python-calamine", marker = "extra == 'server'", specifier = ">=0.6.1" },
+    { name = "python-docx", marker = "extra == 'server'", specifier = ">=1.1.0" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2" },
-    { name = "python-multipart", specifier = ">=0.0.22,<1" },
-    { name = "requests-toolbelt", specifier = ">=1.0.0,<2" },
-    { name = "rich", extras = ["jupyter"], specifier = ">=13.7.0,<14" },
-    { name = "selectolax", specifier = ">=0.4.7,<0.5" },
-    { name = "sqlalchemy", extras = ["mypy"], specifier = ">=2.0.29,<3" },
-    { name = "sse-starlette", specifier = ">=3.0.3,<4" },
-    { name = "starlette-context", specifier = ">=0.3.6,<0.6" },
+    { name = "python-multipart", marker = "extra == 'server'", specifier = ">=0.0.22,<1" },
+    { name = "requests-toolbelt", marker = "extra == 'server'", specifier = ">=1.0.0,<2" },
+    { name = "rich", specifier = ">=13.7.0,<14" },
+    { name = "selectolax", marker = "extra == 'server'", specifier = ">=0.4.7,<0.5" },
+    { name = "sqlalchemy", extras = ["mypy"], marker = "extra == 'server'", specifier = ">=2.0.29,<3" },
+    { name = "sse-starlette", marker = "extra == 'server'", specifier = ">=3.0.3,<4" },
+    { name = "starlette-context", marker = "extra == 'server'", specifier = ">=0.3.6,<0.6" },
     { name = "structlog", specifier = ">=23.2.0,<24" },
-    { name = "tiktoken", specifier = ">=0.9.0" },
-    { name = "tldextract", specifier = ">=5.1.2,<6" },
-    { name = "toml", specifier = ">=0.10.2,<0.11" },
-    { name = "tornado", specifier = ">=6.5.5" },
+    { name = "tiktoken", marker = "extra == 'server'", specifier = ">=0.9.0" },
+    { name = "tldextract", marker = "extra == 'server'", specifier = ">=5.1.2,<6" },
+    { name = "toml", marker = "extra == 'server'", specifier = ">=0.10.2,<0.11" },
+    { name = "tornado", marker = "extra == 'server'", specifier = ">=6.5.5" },
     { name = "typer", specifier = ">=0.16.0" },
-    { name = "types-boto3", extras = ["full"], specifier = ">=1.38.31,<2" },
-    { name = "types-toml", specifier = ">=0.10.8.7,<0.11" },
-    { name = "urllib3", specifier = ">=2.6.3" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.35.0" },
-    { name = "websockets", specifier = ">=12.0,<15.1" },
-    { name = "zstandard", specifier = ">=0.25.0" },
+    { name = "types-boto3", extras = ["full"], marker = "extra == 'server'", specifier = ">=1.38.31,<2" },
+    { name = "types-toml", marker = "extra == 'server'", specifier = ">=0.10.8.7,<0.11" },
+    { name = "urllib3", marker = "extra == 'server'", specifier = ">=2.6.3" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.35.0" },
+    { name = "websockets", marker = "extra == 'server'", specifier = ">=12.0,<15.1" },
+    { name = "zstandard", marker = "extra == 'server'", specifier = ">=0.25.0" },
 ]
+provides-extras = ["server"]
 
 [package.metadata.requires-dev]
 cloud = [
@@ -6540,15 +6515,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/dd/b2/381be8cfdee792dd117872481b6e378f85c957dd7c5bca38897b08f765fd/werkzeug-3.1.8.tar.gz", hash = "sha256:9bad61a4268dac112f1c5cd4630a56ede601b6ed420300677a869083d70a4c44", size = 875852, upload-time = "2026-04-02T18:49:14.268Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/93/8c/2e650f2afeb7ee576912636c23ddb621c91ac6a98e66dc8d29c3c69446e1/werkzeug-3.1.8-py3-none-any.whl", hash = "sha256:63a77fb8892bf28ebc3178683445222aa500e48ebad5ec77b0ad80f8726b1f50", size = 226459, upload-time = "2026-04-02T18:49:12.72Z" },
-]
-
-[[package]]
-name = "widgetsnbextension"
-version = "4.0.15"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/bd/f4/c67440c7fb409a71b7404b7aefcd7569a9c0d6bd071299bf4198ae7a5d95/widgetsnbextension-4.0.15.tar.gz", hash = "sha256:de8610639996f1567952d763a5a41af8af37f2575a41f9852a38f947eb82a3b9", size = 1097402, upload-time = "2025-11-01T21:15:55.178Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3f/0e/fa3b193432cfc60c93b42f3be03365f5f909d2b3ea410295cf36df739e31/widgetsnbextension-4.0.15-py3-none-any.whl", hash = "sha256:8156704e4346a571d9ce73b84bee86a29906c9abfd7223b7228a28899ccf3366", size = 2196503, upload-time = "2025-11-01T21:15:53.565Z" },
 ]
 
 [[package]]
