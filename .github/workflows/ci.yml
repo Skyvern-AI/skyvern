@@ -60,12 +60,12 @@ jobs:
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           uv lock
-          uv sync --group dev
+          uv sync --extra server --group dev
       # Ensure venv is current even on cache hit (cheap no-op if up to date)
       - name: Ensure environment is up to date
         if: steps.cache-venv.outputs.cache-hit == 'true'
         run: |
-          uv sync --group dev
+          uv sync --extra server --group dev
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

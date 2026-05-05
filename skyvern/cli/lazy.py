@@ -14,6 +14,7 @@ import click
 import typer
 import typer.core
 import typer.main
+from rich.markup import escape
 from rich.panel import Panel
 
 from skyvern.cli.console import console
@@ -80,7 +81,11 @@ class _LazyPlaceholder(click.Command):
     """A lightweight stand-in that renders help text without importing anything."""
 
     def __init__(self, name: str, help_text: str) -> None:
-        super().__init__(name=name, help=help_text)
+        super().__init__(
+            name=name,
+            help=help_text,
+            context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+        )
 
     def get_short_help_str(self, limit: int = 150) -> str:
         return self.help or ""
@@ -171,7 +176,7 @@ def _handle_missing_dep(exc: ImportError) -> None:
         Panel(
             f"[bold red]This command requires a dependency that is not installed.[/bold red]\n\n"
             f"Missing: [yellow]{dep_name}[/yellow]\n"
-            f"Run: [green]pip install {dep_name}[/green]",
+            f"Run: [green]{escape('pip install skyvern[server]')}[/green]",
             title="Missing Dependency",
             border_style="red",
         )
