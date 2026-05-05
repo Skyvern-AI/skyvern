@@ -225,6 +225,91 @@ def _chat_request() -> SimpleNamespace:
     )
 
 
+class TestBlockGoalMainGoal:
+    def test_empty_message_returns_empty(self) -> None:
+        assert agent_module._build_block_goal_main_goal("", chat_history_text="", global_llm_context=None) == ""
+        assert agent_module._build_block_goal_main_goal("   ", chat_history_text="", global_llm_context=None) == ""
+
+    def test_no_prior_context_returns_message_verbatim(self) -> None:
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="Go to a site and extract the latest release notes.",
+            chat_history_text="",
+            global_llm_context=None,
+        )
+
+        assert goal == "Go to a site and extract the latest release notes."
+
+    def test_no_prior_context_escapes_code_fences(self) -> None:
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="Use ```this``` safely.",
+            chat_history_text="",
+            global_llm_context=None,
+        )
+
+        assert goal == "Use ` ` `this` ` ` safely."
+
+    def test_structured_user_goal_added_as_prior_high_level_goal(self) -> None:
+        global_context = json.dumps(
+            {"user_goal": "Locate research about gravitational waves this week.", "workflow_state": "draft"}
+        )
+
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="I meant black holes",
+            chat_history_text="",
+            global_llm_context=global_context,
+        )
+
+        assert "Prior high-level goal:\nLocate research about gravitational waves this week." in goal
+        assert "Latest user message:\nI meant black holes" in goal
+        assert "Recent chat history" not in goal
+
+    def test_plain_global_context_becomes_prior_high_level_goal(self) -> None:
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="I meant black holes",
+            chat_history_text="",
+            global_llm_context="Legacy goal with ```fenced``` context.",
+        )
+
+        assert "Prior high-level goal:\nLegacy goal with ` ` `fenced` ` ` context." in goal
+        assert "Latest user message:\nI meant black holes" in goal
+
+    def test_chat_history_added_when_present(self) -> None:
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="I meant black holes",
+            chat_history_text="user: Search arXiv for recent papers.\nai: Drafted workflow.",
+            global_llm_context=None,
+        )
+
+        assert "Recent chat history:\nuser: Search arXiv for recent papers." in goal
+        assert "ai: Drafted workflow." in goal
+        assert "Latest user message:\nI meant black holes" in goal
+
+    def test_chat_history_and_latest_message_escape_code_fences(self) -> None:
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="I meant ```black holes```",
+            chat_history_text="user: Search ```arXiv``` for recent papers.",
+            global_llm_context=None,
+        )
+
+        assert "user: Search ` ` `arXiv` ` ` for recent papers." in goal
+        assert "Latest user message:\nI meant ` ` `black holes` ` `" in goal
+        assert "```" not in goal
+
+    def test_includes_both_structured_goal_and_chat_history(self) -> None:
+        global_context = json.dumps({"user_goal": "Find papers about gravitational waves."})
+
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="I meant neutron stars",
+            chat_history_text="user: Find papers about gravitational waves.",
+            global_llm_context=global_context,
+        )
+
+        assert "Prior high-level goal:\nFind papers about gravitational waves." in goal
+        assert "Recent chat history:" in goal
+        assert "Latest user message:\nI meant neutron stars" in goal
+        assert goal.find("Prior high-level goal") < goal.find("Recent chat history") < goal.find("Latest user message")
+
+
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
 
@@ -546,6 +631,32 @@ workflow_definition:
 
         assert captured["yaml"] == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
         assert ctx.last_workflow_yaml == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+
+    def test_inline_replace_workflow_prefers_resolved_block_goal_main_goal(self, monkeypatch) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_process(**kwargs):
+            captured["yaml"] = kwargs["workflow_yaml"]
+            return SimpleNamespace(name="new-wf")
+
+        def fake_wrap(workflow_yaml: str, user_message: str) -> str:
+            return f"WRAPPED::{user_message}::{workflow_yaml}"
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.wrap_block_goals", fake_wrap)
+
+        ctx = _ctx(
+            user_message="I meant black holes",
+            block_goal_main_goal="Go to arXiv and find research about black holes.",
+        )
+        result = _fake_run_result(
+            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "raw: yaml"}
+        )
+        agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert captured["yaml"] == "WRAPPED::Go to arXiv and find research about black holes.::raw: yaml"
 
     def test_ask_question_with_verified_workflow_suppresses_and_clears(self) -> None:
         # A verified-but-non-terminal workflow built this turn must not surface

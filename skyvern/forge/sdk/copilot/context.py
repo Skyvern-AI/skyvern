@@ -162,6 +162,7 @@ class CopilotContext(AgentContext):
     format_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
     user_message: str = ""
+    block_goal_main_goal: str = ""
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
