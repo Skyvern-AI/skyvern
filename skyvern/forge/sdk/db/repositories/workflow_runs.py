@@ -974,6 +974,33 @@ class WorkflowRunsRepository(BaseRepository):
             ]
             return workflow_runs
 
+    @db_operation("get_workflow_runs_for_browser_session")
+    async def get_workflow_runs_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[WorkflowRun]:
+        async with self.Session() as session:
+            db_page = page - 1
+            query = (
+                select(WorkflowRunModel, WorkflowModel.title)
+                .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                .filter(WorkflowRunModel.browser_session_id == browser_session_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(page_size)
+                .offset(db_page * page_size)
+            )
+            workflow_runs_and_titles_tuples = (await session.execute(query)).all()
+            return [
+                convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
+                for run, title in workflow_runs_and_titles_tuples
+            ]
+
     @db_operation("get_workflow_runs_by_parent_workflow_run_id")
     async def get_workflow_runs_by_parent_workflow_run_id(
         self,
