@@ -5,51 +5,20 @@ from skyvern._version import __version__
 from skyvern.utils import setup_windows_event_loop_policy
 
 if typing.TYPE_CHECKING:
-    from skyvern.library import Skyvern  # noqa: E402
-
-
-def _setup_package_logging() -> None:
-    from skyvern.forge.sdk.forge_log import setup_logger  # noqa: PLC0415
-
-    setup_logger()
+    from skyvern.library import Skyvern  # noqa: E402,F401
 
 
 setup_windows_event_loop_policy()
-_setup_package_logging()
+# Server entrypoints configure package logging; base SDK imports stay side-effect-light.
 
-# noinspection PyUnresolvedReferences
-__all__ = [
-    "__version__",
-    "Skyvern",
-    "SkyvernPage",
-    "RunContext",
-    "action",
-    "cached",
-    "conditional",
-    "download",
-    "extract",
-    "http_request",
-    "goto",
-    "login",
-    "loop",
-    "parse_file",
-    "parse_pdf",
-    "prompt",
-    "render_list",
-    "render_template",
-    "run_code",
-    "run_script",
-    "run_task",
-    "send_email",
-    "setup",
-    "upload_file",
-    "validate",
-    "wait",
-    "workflow",
-]
-
-_lazy_imports = {
+_base_lazy_imports = {
     "Skyvern": "skyvern.library",
+    "SkyvernEnvironment": "skyvern.client",
+    "RunEngine": "skyvern.schemas.run_enums",
+    "RunStatus": "skyvern.schemas.run_enums",
+}
+
+_server_lazy_imports = {
     "SkyvernPage": "skyvern.core.script_generations.skyvern_page",
     "RunContext": "skyvern.core.script_generations.skyvern_page",
     "setup": "skyvern.core.script_generations.run_initializer",
@@ -76,14 +45,25 @@ _lazy_imports = {
     "validate": "skyvern.services.script_service",
     "wait": "skyvern.services.script_service",
 }
+# Keep server-only names in __all__ for backwards-compatible wildcard exports;
+# direct access remains lazily gated by the skyvern[server] extra.
+_all_lazy_imports = {**_base_lazy_imports, **_server_lazy_imports}
+__all__ = ["__version__", *_base_lazy_imports, *_server_lazy_imports]
 
 
 def __getattr__(name: str) -> Any:
-    if name in _lazy_imports:
-        module_path = _lazy_imports[name]
+    if name in _all_lazy_imports:
+        module_path = _all_lazy_imports[name]
         from importlib import import_module  # noqa: PLC0415
 
-        module = import_module(module_path)
+        try:
+            module = import_module(module_path)
+        except ImportError as exc:
+            if name in _server_lazy_imports:
+                from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+
+                raise_server_extra_required(f"skyvern.{name}", exc)
+            raise
 
         # For attributes that need to be extracted from the module
         if hasattr(module, name):

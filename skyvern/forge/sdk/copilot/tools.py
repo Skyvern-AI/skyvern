@@ -24,7 +24,9 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import (
+    PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
@@ -97,6 +99,13 @@ assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
 # inner poll loop leaves a 10 s headroom below this ceiling for orderly
 # cleanup before the SDK cancels.
 RUN_BLOCKS_SAFETY_CEILING_SECONDS = 1200  # 20 min
+
+# Per-tool-call budget for active block runs — caps a single tool invocation
+# below the session-level wall clock (``enforcement.TOTAL_TIMEOUT_SECONDS``,
+# 600 s) so a long chain cannot consume the whole budget without giving the
+# copilot a chance to issue a smaller chain. Quiet-block runs keep the longer
+# ``RUN_BLOCKS_SAFETY_CEILING_SECONDS`` above.
+PER_TOOL_CALL_BUDGET_SECONDS = 240
 
 # Primary exit condition: seconds of no observed progress across the combined
 # run / block / step heartbeat. Sized to accommodate the slowest single LLM
@@ -211,15 +220,10 @@ def _trusted_post_drain_status(run: WorkflowRun | None) -> str | None:
 
 
 def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
-    """Clear ``pending_reconciliation_run_id`` iff ``result`` proves the
-    pending run has reached a trustworthy-final status.
-
-    Called from ``get_run_results_tool`` after ``_get_run_results`` returns.
-    Requires (a) a pending run_id on the ctx, (b) a matching resolved run_id
-    in ``result.data`` (so a ``workflow_run_id=None`` call that resolves to
-    a different run does NOT clear), and (c) the resolved ``overall_status``
-    passes ``is_final_excluding_canceled`` (so an ambiguous ``canceled``
-    does NOT clear).
+    """Clear ``pending_reconciliation_run_id`` iff the matching resolved run
+    landed in a status the caller can move past: any ``is_final_excluding_canceled``
+    status, or any status (including ``canceled``) when the prior exit was an
+    internal per-tool-budget cancel.
     """
     pending_run_id = getattr(copilot_ctx, "pending_reconciliation_run_id", None)
     if not isinstance(pending_run_id, str) or not pending_run_id:
@@ -231,12 +235,16 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
         return
     resolved_run_id = data.get("workflow_run_id")
     resolved_status = data.get("overall_status")
-    if (
-        isinstance(resolved_run_id, str)
-        and resolved_run_id == pending_run_id
-        and isinstance(resolved_status, str)
-        and WorkflowRunStatus(resolved_status).is_final_excluding_canceled()
-    ):
+    if not isinstance(resolved_run_id, str) or resolved_run_id != pending_run_id:
+        return
+    if not isinstance(resolved_status, str):
+        return
+    is_trusted_final = WorkflowRunStatus(resolved_status).is_final_excluding_canceled()
+    # ``last_failure_category_top`` reflects the prior block-running tool's outcome —
+    # only ``_record_run_blocks_result`` writes it, and the reconciliation guard
+    # prevents another block-running call from clobbering it before this read.
+    was_per_tool_budget = getattr(copilot_ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
+    if is_trusted_final or was_per_tool_budget:
         copilot_ctx.pending_reconciliation_run_id = None
 
 
@@ -448,6 +456,27 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 "regardless of subdomain or path variations. Reply to the user "
                 "explaining the failure and asking them to verify the URL."
             )
+
+        # Gate on ``last_failed_workflow_yaml`` (sticky across
+        # ``update_workflow``) rather than ``last_test_ok``: otherwise the
+        # agent can sandwich an ``update_workflow`` call between the failure
+        # and the retry to clear ``last_test_ok=None`` and slip past.
+        start_ts = getattr(ctx, "copilot_run_start_monotonic", None)
+        last_failed_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
+        last_good_yaml = getattr(ctx, "last_good_workflow_yaml", None)
+        if start_ts is not None and last_failed_yaml and last_good_yaml:
+            remaining = TOTAL_TIMEOUT_SECONDS - (time.monotonic() - start_ts)
+            if remaining < PER_TOOL_CALL_BUDGET_SECONDS:
+                return (
+                    f"Wall-clock budget too low to retry: about "
+                    f"{int(max(0.0, remaining))}s remain of the "
+                    f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified "
+                    "workflow exists from before the failure. Do NOT call "
+                    "update_and_run_blocks or run_blocks_and_collect_debug "
+                    "again. REPLY now: summarize what worked, name the "
+                    "block that failed, and tell the user they can keep "
+                    "the verified prefix or discard."
+                )
     return None
 
 
@@ -1212,7 +1241,7 @@ def _seed_for_frontier(
 # last-resort budget-exhausted branch, and ``task_exit_unfinalized`` is the
 # rare race where ``execute_workflow`` naturally exits before writing a
 # terminal row.
-WatchdogExitReason = Literal["success", "stagnation", "ceiling", "task_exit_unfinalized"]
+WatchdogExitReason = Literal["success", "stagnation", "ceiling", "per_tool_budget", "task_exit_unfinalized"]
 
 
 # Block types that legitimately execute long silent periods: one DB write on
@@ -1310,16 +1339,10 @@ async def _watchdog_error_message(
     ctx: AgentContext,
     workflow_run_id: str,
     run: WorkflowRun | None,
+    budget_seconds: int,
 ) -> str:
-    """Build the LLM-facing error string for a non-success watchdog exit.
-
-    Every variant ends with the same reconciliation instruction so the agent
-    has a consistent next step: call ``get_run_results`` with the run_id to
-    resolve the outcome before running more blocks. The ``pending_reconciliation_run_id``
-    guard in ``_tool_loop_error`` enforces that the agent actually does so.
-
-    None of the variants contain "timed out" or retry-inviting phrasing —
-    that's the SKY-9163 regression we're fixing.
+    """LLM-facing error string for a non-success watchdog exit. No variant uses
+    "timed out" or other retry-inviting phrasing — those are SKY-9163 traps.
     """
     if exit_reason == "stagnation":
         body = (
@@ -1329,9 +1352,27 @@ async def _watchdog_error_message(
             f"hidden validation error, or an infinite-retry loop on an action the agent "
             f"cannot detect is failing."
         )
+    elif exit_reason == "per_tool_budget":
+        message = (
+            f"The run exceeded the {budget_seconds}s per-tool-call budget while still "
+            f"making progress. This budget exists so a single in-flight call cannot "
+            f"consume the whole copilot session.\n"
+            f"Run ID: {workflow_run_id}.\n"
+            f"Next step: call get_run_results with this workflow_run_id to inspect what "
+            f"the cancelled run actually completed (the in-flight block was cancelled "
+            f"mid-execution and may have left partial side effects). Then call "
+            f"update_and_run_blocks with a smaller chain — the first 1-2 unverified "
+            f"blocks. Verified-prefix state is preserved, so the next call only re-runs "
+            f"from the new frontier. Do NOT retry the same chain unchanged — a longer "
+            f"run won't fit either."
+        )
+        current_url, _ = await _fallback_page_info(ctx)
+        if current_url:
+            message += f" Browser was on: {current_url}"
+        return message
     elif exit_reason == "ceiling":
         body = (
-            f"The run exceeded the {RUN_BLOCKS_SAFETY_CEILING_SECONDS}s absolute ceiling "
+            f"The run exceeded the {budget_seconds}s absolute ceiling "
             f"while still showing progress. The workflow is too long to fit in a single "
             f"tool invocation — split it into smaller block groups."
         )
@@ -1508,7 +1549,6 @@ async def _run_blocks_and_collect_debug(
     progress_marker = _progress_marker(initial_run, initial_step_ts, initial_block_ts)
     last_progress_monotonic = time.monotonic()
     started_monotonic = last_progress_monotonic
-    budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
     final_status: str | None = None
     run: Any = initial_run
     exit_reason: WatchdogExitReason | None = None
@@ -1517,6 +1557,17 @@ async def _run_blocks_and_collect_debug(
     # DB-silent periods; disable stagnation for any invocation that includes
     # one. Safety ceiling still applies.
     stagnation_enabled = not _any_quiet_block_requested(ctx, labels_to_execute)
+    # Active block runs use the tighter per-tool budget so a single in-flight
+    # call cannot consume the whole copilot session. Quiet-block runs keep the
+    # long safety ceiling because HumanInteractionBlock can legitimately pause
+    # indefinitely.
+    budget_exit_reason: WatchdogExitReason
+    if stagnation_enabled:
+        budget_seconds = max(1, PER_TOOL_CALL_BUDGET_SECONDS)
+        budget_exit_reason = "per_tool_budget"
+    else:
+        budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
+        budget_exit_reason = "ceiling"
 
     # Mid-tool narrator bridge: feed block-status changes and step-level
     # heartbeats into NarratorState so the narration ticker keeps emitting
@@ -1580,7 +1631,7 @@ async def _run_blocks_and_collect_debug(
                 break
 
             if now - started_monotonic >= budget_seconds:
-                exit_reason = "ceiling"
+                exit_reason = budget_exit_reason
                 break
 
         if exit_reason is not None and exit_reason != "success":
@@ -1610,14 +1661,31 @@ async def _run_blocks_and_collect_debug(
                     exit_reason = "success"
 
         if exit_reason != "success":
-            # Turn-scoped reconciliation guard — cleared only by a
-            # ``get_run_results`` call that resolves this run_id to an
-            # ``is_final_excluding_canceled`` status
-            # (``_maybe_clear_reconciliation_flag``).
-            ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
             assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
-            error_msg = await _watchdog_error_message(exit_reason, ctx, workflow_run.workflow_run_id, run)
-            result = {"ok": False, "error": error_msg}
+            ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
+            error_msg = await _watchdog_error_message(
+                exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds
+            )
+            result: dict[str, Any] = {"ok": False, "error": error_msg}
+            if exit_reason == "per_tool_budget":
+                # Stable failure_categories entry so consecutive budget trips
+                # hash to the same streak signature; without it the run_id in
+                # ``error_msg`` would make every trip unique.
+                result["data"] = {
+                    "workflow_run_id": workflow_run.workflow_run_id,
+                    "overall_status": run.status if run is not None else None,
+                    "failure_reason": error_msg,
+                    "failure_categories": [
+                        {
+                            "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
+                            "confidence_float": 1.0,
+                            "reasoning": (
+                                f"Per-tool-call budget of {budget_seconds}s exceeded; "
+                                "the run was making progress but cannot fit in a single tool call."
+                            ),
+                        }
+                    ],
+                }
             if run_cancelled_by_watchdog:
                 result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
             return result
@@ -2399,21 +2467,14 @@ _PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS = (
     "page may have navigated unexpectedly",
 )
 
-_NAV_BLOCK_TYPES = ("goto_url", "navigation")
-
 
 def _detect_probable_site_block_wall(result: dict[str, Any]) -> bool:
-    """Return True when the run shows the "site-block-wall" pattern: a
-    navigation block completed successfully but every subsequent block
-    failed to scrape the page.
-
-    Pattern:
-      - ``ok`` is false (run failed)
-      - at least one ``goto_url`` / ``navigation`` block completed successfully
-      - at least one block's ``failure_reason`` matches the generic
-        "Skyvern failed to load the website..." template
-    """
+    """True when a block failed with the site-load template and the failure is
+    not a non-retriable nav error (DNS / SSL / invalid URL are owned by
+    :func:`_detect_non_retriable_nav_error`)."""
     if bool(result.get("ok", False)):
+        return False
+    if _detect_non_retriable_nav_error(result):
         return False
     data = result.get("data")
     if not isinstance(data, dict):
@@ -2422,20 +2483,15 @@ def _detect_probable_site_block_wall(result: dict[str, Any]) -> bool:
     if not isinstance(blocks, list):
         return False
 
-    nav_completed = False
-    matched_reason = False
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("block_type") in _NAV_BLOCK_TYPES and block.get("status") == "completed":
-            nav_completed = True
         reason = block.get("failure_reason")
         if isinstance(reason, str):
             lowered = reason.lower()
             if any(sub in lowered for sub in _PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS):
-                matched_reason = True
-
-    return nav_completed and matched_reason
+                return True
+    return False
 
 
 def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
@@ -2458,6 +2514,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.suspicious_success_nudge_count = 0
     copilot_ctx.last_test_anti_bot = None
+    prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
     copilot_ctx.last_failure_category_top = None
     copilot_ctx.last_test_non_retriable_nav_error = None
 
@@ -2470,6 +2527,12 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
             top_category = top.get("category")
             if isinstance(top_category, str):
                 copilot_ctx.last_failure_category_top = top_category
+
+    # A fresh budget trip on a different chain should get the dedicated split
+    # nudge again rather than falling through to the generic failed-test path,
+    # so reset the cap when the latest run is not itself a budget trip.
+    if prior_budget_flag and copilot_ctx.last_failure_category_top != PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        copilot_ctx.per_tool_budget_nudge_count = 0
 
     # Expose full failure classification in tool output for agent reasoning
     if failure_categories:
@@ -2499,6 +2562,8 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
         # Real success: clear the signature latch so a subsequent bad URL in
         # the same session can re-fire the stop nudge.
         copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
+        copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+        copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         return
 

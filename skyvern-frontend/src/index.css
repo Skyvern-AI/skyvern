@@ -35,11 +35,29 @@
     --warning: 32.1 94.6% 43.7%; /* amber-600 */
     --warning-foreground: 36 100% 97.1%; /* amber-50 */
 
+    --success: 142.1 76.2% 36.3%; /* green-600 */
+    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
+
     --border: 214.3 31.8% 91.4%;
     --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
+    --ring: 222.2 84% 5%;
 
     --radius: 0.5rem;
+
+    --tertiary: 227.6 11.6% 48.8%;
+    --tertiary-foreground: 213 27% 84%;
+
+    --warning: 32.1 94.6% 43.7%; /* amber-600 */
+    --warning-foreground: 36 100% 97.1%; /* amber-50 */
+
+    --success: 142.1 76.2% 36.3%; /* green-600 */
+    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
+
+    --slate-elevation-1: 222 47% 96%;
+    --slate-elevation-2: 222 40% 93%;
+    --slate-elevation-3: 222 35% 90%;
+    --slate-elevation-4: 222 30% 87%;
+    --slate-elevation-5: 222 25% 84%;
   }
 
   .dark {
