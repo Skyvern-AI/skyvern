@@ -46,6 +46,12 @@ REPEATED_FRONTIER_STREAK_STOP_AT = 3
 # scraper could not read the page. Aligned with MAX_FAILED_TEST_NUDGES so the
 # copilot gets one generic retry nudge, then stops on the second occurrence.
 PROBABLE_SITE_BLOCK_STREAK_STOP_AT = 2
+# Caps how many times the stop nudge can re-fire — without this, the streak
+# stays latched while no new test runs reset it and every subsequent turn
+# re-injects the same nudge until MAX_ITERATIONS. Independent of
+# PROBABLE_SITE_BLOCK_STREAK_STOP_AT (both default to 2 but tune different
+# axes: streak depth vs nudge count).
+MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 600
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -465,13 +471,11 @@ def _needs_suspicious_success_nudge(ctx: Any) -> bool:
 
 
 def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
-    """Return True when the site-block-wall streak has reached the stop level.
-
-    The streak is maintained in :func:`tools._record_run_blocks_result` and
-    crosses workflow-shape changes deliberately (the repeated-frontier streak
-    resets on shape edits; this one tracks the shape-independent scrape wall).
-    """
-    return _get_int(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    """Return True when the site-block-wall streak has reached the stop level
+    AND the per-streak nudge cap has not been exhausted."""
+    if _get_int(ctx, "probable_site_block_streak_count") < PROBABLE_SITE_BLOCK_STREAK_STOP_AT:
+        return False
+    return _get_int(ctx, "probable_site_block_stop_nudge_count") < MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
 
 
 def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
@@ -498,6 +502,11 @@ def _repeated_frontier_failure_nudge(ctx: Any) -> str | None:
     # Non-retriable nav errors get their own dedicated stop path; don't let a
     # repeated-frontier nudge smuggle different retry advice past the gate.
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return None
+    # Defer to the probable-site-block stop path once the wall has been
+    # confirmed across ≥ PROBABLE_SITE_BLOCK_STREAK_STOP_AT shape-independent
+    # attempts — at that point "try yet another shape" is empirically wrong.
+    if _get_int(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT:
         return None
     streak = _get_int(ctx, "repeated_failure_streak_count")
     emitted = _get_int(ctx, "repeated_failure_nudge_emitted_at_streak")
@@ -574,11 +583,9 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
 
     # Checked before the generic failed-test nudge so a scrape-wall streak
     # emits the specific STOP text and does not also consume a
-    # failed_test_nudge_count slot. The two states are orthogonal by
-    # construction (scrape-wall requires a completed nav block;
-    # non_retriable_nav / anti_bot / suspicious_success populate different
-    # ctx fields).
+    # failed_test_nudge_count slot.
     if _needs_probable_site_block_stop_nudge(ctx):
+        ctx.probable_site_block_stop_nudge_count = getattr(ctx, "probable_site_block_stop_nudge_count", 0) + 1
         return POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
 
     if _needs_failed_test_nudge(ctx):
