@@ -62,7 +62,6 @@ TOTAL_TIMEOUT_SECONDS = 600
 # already prevent individual branches from looping; this stops a brand-new
 # enforcement rule that forgets its own counter from spinning within 600s.
 MAX_ITERATIONS = 50
-
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
@@ -1098,6 +1097,7 @@ async def run_with_enforcement(
     session = runner_kwargs.pop("session", None)
     current_input: str | list = initial_input
     start_time = time.monotonic()
+    ctx.copilot_run_start_monotonic = start_time
     iteration = 0
     pending_recovery_nudge: str | None = None
 

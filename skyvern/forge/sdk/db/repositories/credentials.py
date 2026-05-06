@@ -64,6 +64,21 @@ class CredentialRepository(BaseRepository):
                 return Credential.model_validate(credential)
             return None
 
+    @db_operation("get_credentials_by_ids")
+    async def get_credentials_by_ids(self, credential_ids: list[str], organization_id: str) -> list[Credential]:
+        if not credential_ids:
+            return []
+        async with self.Session() as session:
+            credentials = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter(CredentialModel.credential_id.in_(credential_ids))
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                )
+            ).all()
+            return [Credential.model_validate(credential) for credential in credentials]
+
     @db_operation("get_credentials")
     async def get_credentials(
         self,

@@ -24,6 +24,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
@@ -455,6 +456,27 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 "regardless of subdomain or path variations. Reply to the user "
                 "explaining the failure and asking them to verify the URL."
             )
+
+        # Gate on ``last_failed_workflow_yaml`` (sticky across
+        # ``update_workflow``) rather than ``last_test_ok``: otherwise the
+        # agent can sandwich an ``update_workflow`` call between the failure
+        # and the retry to clear ``last_test_ok=None`` and slip past.
+        start_ts = getattr(ctx, "copilot_run_start_monotonic", None)
+        last_failed_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
+        last_good_yaml = getattr(ctx, "last_good_workflow_yaml", None)
+        if start_ts is not None and last_failed_yaml and last_good_yaml:
+            remaining = TOTAL_TIMEOUT_SECONDS - (time.monotonic() - start_ts)
+            if remaining < PER_TOOL_CALL_BUDGET_SECONDS:
+                return (
+                    f"Wall-clock budget too low to retry: about "
+                    f"{int(max(0.0, remaining))}s remain of the "
+                    f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified "
+                    "workflow exists from before the failure. Do NOT call "
+                    "update_and_run_blocks or run_blocks_and_collect_debug "
+                    "again. REPLY now: summarize what worked, name the "
+                    "block that failed, and tell the user they can keep "
+                    "the verified prefix or discard."
+                )
     return None
 
 
@@ -2540,6 +2562,8 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
         # Real success: clear the signature latch so a subsequent bad URL in
         # the same session can re-fire the stop nudge.
         copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
+        copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+        copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         return
 
