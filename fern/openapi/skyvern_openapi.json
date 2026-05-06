@@ -1550,7 +1550,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RunWebhookReplayResponse"
+                }
               }
             }
           },
@@ -2110,6 +2112,71 @@
           }
         },
         "x-fern-sdk-method-name": "get_workflow_versions"
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/browser_session/reset_profile": {
+      "post": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Reset persisted browser profile",
+        "description": "Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.",
+        "operationId": "reset_workflow_browser_profile",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The permanent ID of the workflow. Starts with `wpid_`.",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "The permanent ID of the workflow. Starts with `wpid_`."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successfully cleared persisted browser profile"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage deletion failed; retry"
+          }
+        }
       }
     },
     "/v1/upload_file": {
@@ -3982,6 +4049,7 @@
             }
           }
         },
+        "x-excluded": true,
         "x-fern-sdk-method-name": "run_sdk_action"
       }
     },
@@ -5210,6 +5278,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -5449,6 +5522,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -5499,6 +5577,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -5697,6 +5780,17 @@
             ],
             "title": "Bundle Key"
           },
+          "checksum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checksum"
+          },
           "task_id": {
             "anyOf": [
               {
@@ -5751,6 +5845,17 @@
               }
             ],
             "title": "Run Id"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
           },
           "observer_cruise_id": {
             "anyOf": [
@@ -5843,7 +5948,8 @@
           "script_file",
           "pdf",
           "step_archive",
-          "task_archive"
+          "task_archive",
+          "download"
         ],
         "title": "ArtifactType"
       },
@@ -6583,7 +6689,9 @@
           "http_request",
           "human_interaction",
           "print_page",
-          "workflow_trigger"
+          "workflow_trigger",
+          "google_sheets_read",
+          "google_sheets_write"
         ],
         "title": "BlockType"
       },
@@ -6764,6 +6872,17 @@
               }
             ],
             "title": "Description"
+          },
+          "source_browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Browser Type"
           },
           "created_at": {
             "type": "string",
@@ -7191,6 +7310,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -7309,6 +7433,11 @@
             ],
             "title": "Model"
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -7390,6 +7519,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -7452,6 +7586,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -7677,10 +7816,18 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
+            "title": "Proxy Location",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
           },
           "extensions": {
             "anyOf": [
@@ -8430,6 +8577,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -8489,6 +8641,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -8647,6 +8804,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -8879,6 +9041,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": false
           }
         },
         "type": "object",
@@ -8930,6 +9097,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -9072,6 +9244,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -9311,6 +9488,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -9361,6 +9543,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -9544,6 +9731,18 @@
             ],
             "title": "Modified At",
             "description": "Modified time of the file"
+          },
+          "artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Id",
+            "description": "Artifact row id for refresh-on-read"
           }
         },
         "type": "object",
@@ -9676,6 +9875,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -9751,6 +9955,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -9853,6 +10062,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
             "default": false
           },
           "next_loop_on_failure": {
@@ -10001,6 +10215,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -10286,6 +10505,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -10368,6 +10592,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsReadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 }
               ],
               "discriminator": {
@@ -10382,6 +10612,8 @@
                   "file_upload": "#/components/schemas/FileUploadBlock",
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlock",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
@@ -10547,6 +10779,11 @@
             ],
             "title": "Model"
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -10560,6 +10797,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ForLoopBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WhileLoopBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/CodeBlockYAML"
@@ -10626,6 +10866,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsReadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
                 }
               ]
             },
@@ -10737,6 +10983,632 @@
         "title": "GeoTarget",
         "description": "Granular geographic targeting for proxy selection.\n\nSupports country, subdivision (state/region), and city level targeting.\nUses ISO 3166-1 alpha-2 for countries, ISO 3166-2 for subdivisions,\nand GeoNames English names for cities.\n\nExamples:\n    - {\"country\": \"US\"} - United States (same as RESIDENTIAL)\n    - {\"country\": \"US\", \"subdivision\": \"CA\"} - California, US\n    - {\"country\": \"US\", \"subdivision\": \"NY\", \"city\": \"New York\"} - New York City\n    - {\"country\": \"GB\", \"city\": \"London\"} - London, UK"
       },
+      "GoogleSheetsReadBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "google_sheets_read",
+            "title": "Block Type",
+            "default": "google_sheets_read"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "spreadsheet_url": {
+            "type": "string",
+            "title": "Spreadsheet Url"
+          },
+          "sheet_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheet Name"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "has_header_row": {
+            "type": "boolean",
+            "title": "Has Header Row",
+            "default": true
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "spreadsheet_url"
+        ],
+        "title": "GoogleSheetsReadBlock"
+      },
+      "GoogleSheetsReadBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "google_sheets_read",
+            "title": "Block Type",
+            "default": "google_sheets_read"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "spreadsheet_url": {
+            "type": "string",
+            "title": "Spreadsheet Url"
+          },
+          "sheet_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheet Name"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "has_header_row": {
+            "type": "boolean",
+            "title": "Has Header Row",
+            "default": true
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "spreadsheet_url"
+        ],
+        "title": "GoogleSheetsReadBlockYAML"
+      },
+      "GoogleSheetsWriteBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "google_sheets_write",
+            "title": "Block Type",
+            "default": "google_sheets_write"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "spreadsheet_url": {
+            "type": "string",
+            "title": "Spreadsheet Url"
+          },
+          "sheet_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheet Name"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "write_mode": {
+            "type": "string",
+            "enum": [
+              "append",
+              "update"
+            ],
+            "title": "Write Mode",
+            "default": "append"
+          },
+          "values": {
+            "type": "string",
+            "title": "Values",
+            "default": ""
+          },
+          "column_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column Mapping"
+          },
+          "create_sheet_if_missing": {
+            "type": "boolean",
+            "title": "Create Sheet If Missing",
+            "default": false
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "spreadsheet_url"
+        ],
+        "title": "GoogleSheetsWriteBlock"
+      },
+      "GoogleSheetsWriteBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "google_sheets_write",
+            "title": "Block Type",
+            "default": "google_sheets_write"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "spreadsheet_url": {
+            "type": "string",
+            "title": "Spreadsheet Url"
+          },
+          "sheet_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheet Name"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "write_mode": {
+            "type": "string",
+            "enum": [
+              "append",
+              "update"
+            ],
+            "title": "Write Mode",
+            "default": "append"
+          },
+          "values": {
+            "type": "string",
+            "title": "Values",
+            "default": ""
+          },
+          "column_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column Mapping"
+          },
+          "create_sheet_if_missing": {
+            "type": "boolean",
+            "title": "Create Sheet If Missing",
+            "default": false
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "spreadsheet_url"
+        ],
+        "title": "GoogleSheetsWriteBlockYAML"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -10798,6 +11670,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
             "default": false
           },
           "next_loop_on_failure": {
@@ -10995,6 +11872,11 @@
             ],
             "title": "Model"
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -11151,6 +12033,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
             "default": false
           },
           "next_loop_on_failure": {
@@ -11393,6 +12280,11 @@
             ],
             "title": "Download Timeout"
           },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
+          },
           "instructions": {
             "type": "string",
             "title": "Instructions",
@@ -11486,6 +12378,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -11827,6 +12724,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -12066,6 +12968,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -12116,6 +13023,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -12573,6 +13485,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -12805,6 +13722,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -12856,6 +13778,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -13559,6 +14486,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -13631,6 +14563,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -13760,6 +14697,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
             "default": false
           },
           "next_loop_on_failure": {
@@ -13905,6 +14847,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -14068,6 +15015,7 @@
           "RESIDENTIAL_NL",
           "RESIDENTIAL_PH",
           "RESIDENTIAL_KR",
+          "RESIDENTIAL_SA",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -14240,6 +15188,113 @@
         ],
         "title": "RunStatus"
       },
+      "RunWebhookReplayResponse": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id",
+            "description": "Identifier of the run that was replayed"
+          },
+          "run_type": {
+            "type": "string",
+            "title": "Run Type",
+            "description": "Run type associated with the payload"
+          },
+          "default_webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Webhook Url",
+            "description": "Webhook URL stored on the original run configuration"
+          },
+          "target_webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Webhook Url",
+            "description": "Webhook URL that the replay attempted to reach"
+          },
+          "payload": {
+            "type": "string",
+            "title": "Payload",
+            "description": "JSON payload that was delivered during the replay attempt"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Headers",
+            "description": "Signed headers that were generated for the replay attempt"
+          },
+          "status_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Code",
+            "description": "HTTP status code returned by the webhook receiver, if available"
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms",
+            "description": "Round-trip latency in milliseconds for the replay attempt"
+          },
+          "response_body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Body",
+            "description": "Body returned by the webhook receiver (truncated to 2KB)"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error",
+            "description": "Error message if the replay attempt failed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "run_type",
+          "payload",
+          "headers"
+        ],
+        "title": "RunWebhookReplayResponse"
+      },
       "Script": {
         "properties": {
           "script_revision_id": {
@@ -14360,11 +15415,25 @@
             "default": false
           },
           "script_id": {
-            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Script Id"
           },
           "script_revision_id": {
-            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Script Revision Id"
           }
         },
@@ -14577,6 +15646,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -14678,6 +15752,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -15083,6 +16162,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -15322,6 +16406,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -15372,6 +16461,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -15720,7 +16814,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -16280,6 +17374,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -16382,6 +17481,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -16496,6 +17600,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
             "default": false
           },
           "next_loop_on_failure": {
@@ -16638,6 +17747,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -16883,6 +17997,17 @@
             ],
             "title": "Thought Cost"
           },
+          "last_llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Llm Model"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -17100,6 +18225,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -17165,6 +18295,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -17237,6 +18372,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
             "default": false
           },
           "next_loop_on_failure": {
@@ -17471,6 +18611,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -17522,6 +18667,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -17649,6 +18799,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -17888,6 +19043,11 @@
               }
             ],
             "title": "Download Timeout"
+          },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
           }
         },
         "type": "object",
@@ -17938,6 +19098,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -18096,6 +19261,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -18213,6 +19383,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
@@ -18368,6 +19543,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsReadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 }
               ],
               "discriminator": {
@@ -18382,6 +19563,8 @@
                   "file_upload": "#/components/schemas/FileUploadBlock",
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlock",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
@@ -18562,6 +19745,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsReadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
                 }
               ]
             },
@@ -18807,6 +19996,28 @@
               }
             ],
             "title": "Import Error"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "edited_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edited By"
           },
           "created_at": {
             "type": "string",
@@ -19188,6 +20399,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsReadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 }
               ],
               "discriminator": {
@@ -19202,6 +20419,8 @@
                   "file_upload": "#/components/schemas/FileUploadBlock",
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlock",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
@@ -19234,6 +20453,31 @@
               }
             ],
             "title": "Finally Block Label"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "workflow_system_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow System Prompt"
           }
         },
         "type": "object",
@@ -19380,6 +20624,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsReadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
                 }
               ],
               "discriminator": {
@@ -19394,6 +20644,8 @@
                   "file_upload": "#/components/schemas/FileUploadBlockYAML",
                   "file_url_parser": "#/components/schemas/FileParserBlockYAML",
                   "for_loop": "#/components/schemas/ForLoopBlockYAML",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlockYAML",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlockYAML",
                   "goto_url": "#/components/schemas/UrlBlockYAML",
                   "http_request": "#/components/schemas/HttpRequestBlockYAML",
                   "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
@@ -19426,6 +20678,31 @@
               }
             ],
             "title": "Finally Block Label"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "workflow_system_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow System Prompt"
           }
         },
         "type": "object",
@@ -19854,8 +21131,7 @@
               {
                 "type": "null"
               }
-            ],
-            "title": "Script Run"
+            ]
           },
           "job_id": {
             "anyOf": [
@@ -19932,6 +21208,32 @@
               }
             ],
             "title": "Workflow Schedule Id"
+          },
+          "ignore_inherited_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Inherited Workflow System Prompt",
+            "default": false
+          },
+          "copilot_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Copilot Session Id"
+          },
+          "credits_used": {
+            "type": "integer",
+            "title": "Credits Used",
+            "default": 0
+          },
+          "cached_credits_used": {
+            "type": "integer",
+            "title": "Cached Credits Used",
+            "default": 0
           },
           "queued_at": {
             "anyOf": [
@@ -20251,6 +21553,11 @@
             "title": "Include Action History In Verification",
             "default": false
           },
+          "include_extracted_text": {
+            "type": "boolean",
+            "title": "Include Extracted Text",
+            "default": true
+          },
           "duration": {
             "anyOf": [
               {
@@ -20431,8 +21738,7 @@
               {
                 "type": "null"
               }
-            ],
-            "title": "Script Run"
+            ]
           }
         },
         "type": "object",
@@ -20498,7 +21804,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -21298,6 +22604,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
@@ -21448,6 +22759,11 @@
               }
             ],
             "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
           },
           "next_loop_on_failure": {
             "type": "boolean",
