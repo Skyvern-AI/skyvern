@@ -151,7 +151,7 @@ def create_forge_app() -> ForgeApp:
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
     app.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     app.OPENAI_CLIENT = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY or "",
+        api_key=settings.OPENAI_API_KEY or "dummy",
         http_client=ForgeAsyncHttpxClientWrapper(),
     )
     if settings.ENABLE_AZURE_CUA:
