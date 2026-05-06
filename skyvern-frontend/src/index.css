@@ -35,9 +35,12 @@
     --warning: 32.1 94.6% 43.7%; /* amber-600 */
     --warning-foreground: 36 100% 97.1%; /* amber-50 */
 
+    --success: 142.1 76.2% 36.3%; /* green-600 */
+    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
+
     --border: 214.3 31.8% 91.4%;
     --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
+    --ring: 222.2 84% 5%;
 
     --radius: 0.5rem;
   }
