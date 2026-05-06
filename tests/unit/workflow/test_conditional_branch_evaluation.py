@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
     BranchEvaluationContext,
@@ -479,3 +480,22 @@ async def test_extraction_failure_with_reason_preserves_original_message() -> No
                 workflow_run_block_id="wrb_test",
                 organization_id="org_test",
             )
+
+
+def test_prompt_template_includes_count_and_atomicity_for_compound_conditions() -> None:
+    rendered_one = prompt_engine.load_prompt(
+        "conditional-prompt-branch-evaluation",
+        conditions=["If A and if B"],
+        context_json=None,
+    )
+    rendered_two = prompt_engine.load_prompt(
+        "conditional-prompt-branch-evaluation",
+        conditions=["A", "B"],
+        context_json=None,
+    )
+
+    assert "exactly 1" in rendered_one
+    assert "exactly 2" in rendered_two
+
+    # Wording-coupled: if rephrased, confirm the replacement still conveys atomicity.
+    assert "split" in rendered_one.lower()
