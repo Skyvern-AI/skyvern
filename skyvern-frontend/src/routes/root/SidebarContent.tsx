@@ -1,5 +1,6 @@
 import { Logo } from "@/components/Logo";
 import { LogoMinimized } from "@/components/LogoMinimized";
+import { ThemeToggle } from "@/components/ThemeSwitch";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { Link } from "react-router-dom";
 import { SideNav } from "./SideNav";
@@ -24,11 +25,12 @@ function SidebarContent({ useCollapsedState }: Props) {
       </Link>
       <SideNav />
       <div
-        className={cn("mt-auto flex min-h-16", {
+        className={cn("mt-auto flex min-h-16 items-center", {
           "justify-center": collapsed,
-          "justify-end": !collapsed,
+          "justify-end gap-2": !collapsed,
         })}
       >
+        <ThemeToggle />
         <Button
           size="icon"
           variant="ghost"
