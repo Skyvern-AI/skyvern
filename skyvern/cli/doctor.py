@@ -467,7 +467,7 @@ def _check_llm_config() -> CheckResult:
 def _read_credential_file(path: Path) -> str:
     if not path.exists():
         return ""
-    m = re.search(r'cred\s*=\s*"([^"]*)"', path.read_text())
+    m = re.search(r'(?<![A-Za-z0-9_])cred\s*=\s*"([^"]*)"', path.read_text())
     return m.group(1) if m else ""
 
 
@@ -480,7 +480,11 @@ def _read_legacy_streamlit_credential() -> str:
 
 
 def _check_api_key_consistency() -> CheckResult:
-    """Check that backend and frontend API keys are consistent."""
+    """Check that local API keys are consistent.
+
+    Generated Docker credentials are only a fallback for compose startup; backend .env
+    remains the preferred source when present.
+    """
 
     from dotenv import dotenv_values
 
@@ -758,8 +762,6 @@ def _fix_api_key_consistency() -> bool:
     set_key(str(backend_env), "SKYVERN_API_KEY", canonical)
 
     if not frontend_env.exists() and frontend_example.exists():
-        import shutil
-
         shutil.copy(frontend_example, frontend_env)
         console.print("  [cyan]Created skyvern-frontend/.env from .env.example[/cyan]")
 
@@ -792,6 +794,12 @@ def _fix_legacy_streamlit_secrets() -> bool:
     legacy_key = _read_legacy_streamlit_credential()
 
     if not LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
+        return False
+
+    if not legacy_key:
+        console.print(
+            "  [yellow]→ Legacy .streamlit/secrets.toml has no cred value; leaving it for inspection[/yellow]"
+        )
         return False
 
     if not backend_key and legacy_key:

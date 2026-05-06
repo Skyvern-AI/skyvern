@@ -34,8 +34,9 @@ spec:
             - name: credentials
               mountPath: /app/.skyvern
           readinessProbe:
-            exec:
-              command: ["test", "-f", "/app/.skyvern/credentials.toml"]
+            httpGet:
+              path: /api/v1/heartbeat
+              port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5
