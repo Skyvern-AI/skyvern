@@ -34,10 +34,8 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./log:/data/log
-      # Deprecated compatibility mount for current public Docker images.
-      # .env / skyvern-frontend/.env are canonical; secrets.toml is only
-      # kept so older entrypoints can hand the local API key to the UI.
-      - ./.streamlit:/app/.streamlit
+      # Generated credentials allow the UI to pick up the local API key on first startup.
+      - ./.skyvern:/app/.skyvern
       # Uncomment the following two lines if you want to connect to any local changes
       # - ./skyvern:/app/skyvern
       # - ./alembic:/app/alembic
@@ -154,10 +152,8 @@ services:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
       - ./har:/data/har
-      # Deprecated compatibility mount for current public Docker images.
-      # .env / skyvern-frontend/.env are canonical; secrets.toml is only
-      # kept so older entrypoints can hand the local API key to the UI.
-      - ./.streamlit:/app/.streamlit
+      # Generated credentials allow the UI to pick up the local API key on first startup.
+      - ./.skyvern:/app/.skyvern
     # User secrets and frontend config live in skyvern-frontend/.env
     # (loaded via env_file). No inline environment for the UI service.
     env_file:

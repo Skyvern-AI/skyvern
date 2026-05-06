@@ -11,7 +11,8 @@
 **/.vscode
 *.env*
 !/.env
-# Streamlit ignores
+# Generated local deployment credentials
+**/.skyvern
 **/secrets*.toml
 
 # Skyvern

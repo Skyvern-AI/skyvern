@@ -709,7 +709,7 @@ class Settings(BaseSettings):
 
     def execute_all_steps(self) -> bool:
         """
-        This provides the functionality to execute steps one by one through the Streamlit UI.
+        This provides the functionality to execute steps one by one through the local UI.
         ***Value is always True if ENV is not local.***
 
         :return: True if env is not local, else the value of EXECUTE_ALL_STEPS

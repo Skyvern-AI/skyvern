@@ -31,11 +31,11 @@ spec:
               mountPath: /data/har
             - name: log
               mountPath: /data/log
-            - name: streamlit
-              mountPath: /app/.streamlit
+            - name: credentials
+              mountPath: /app/.skyvern
           readinessProbe:
             exec:
-              command: ["test", "-f", "/app/.streamlit/secrets.toml"]
+              command: ["test", "-f", "/app/.skyvern/credentials.toml"]
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5
@@ -57,7 +57,7 @@ spec:
           hostPath:
             path: /data/log
             type: DirectoryOrCreate
-        - name: streamlit
+        - name: credentials
           hostPath:
-            path: /app/.streamlit
+            path: /app/.skyvern
             type: DirectoryOrCreate
