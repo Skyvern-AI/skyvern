@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -25,7 +26,7 @@ from skyvern.constants import (
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
-from skyvern.errors.errors import TOTPExpiredError, filter_to_user_defined_codes
+from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -105,7 +106,6 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SelectOptionAction,
     UploadFileAction,
-    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
@@ -4906,6 +4906,40 @@ async def _get_input_or_select_context(
     return input_or_select_context
 
 
+def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: str) -> list[UserDefinedError]:
+    # If the LLM returns no structured errors but its terminate reasoning
+    # explicitly mentions a configured code or description, preserve that
+    # machine-readable code for task/run/webhook error aggregation.
+    normalized_reasoning = reasoning.lower()
+    matched_errors: list[UserDefinedError] = []
+    for error_code, error_description in (task.error_code_mapping or {}).items():
+        # Only match structured codes directly. Generic single-word codes like
+        # "timeout" can appear in unrelated reasoning and look falsely authoritative.
+        code_matches = (
+            "_" in error_code and re.search(rf"\b{re.escape(error_code.lower())}\b", normalized_reasoning) is not None
+        )
+        description_matches = isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        if code_matches or description_matches:
+            matched_errors.append(
+                UserDefinedError(
+                    error_code=error_code,
+                    reasoning=reasoning,
+                    confidence_float=1.0,
+                )
+            )
+    if matched_errors:
+        if len(matched_errors) > 1:
+            LOG.warning(
+                "Multiple user-defined error mappings matched terminate reasoning; using first match",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                matched_error_codes=[error.error_code for error in matched_errors],
+                selected_error_code=matched_errors[0].error_code,
+            )
+        return [matched_errors[0]]
+    return []
+
+
 async def extract_user_defined_errors(
     task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
 ) -> list[UserDefinedError]:
@@ -4938,4 +4972,6 @@ async def extract_user_defined_errors(
             dropped_codes=dropped,
             allowed_codes=sorted((task.error_code_mapping or {}).keys()),
         )
+    if not kept and reasoning:
+        return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
     return kept
