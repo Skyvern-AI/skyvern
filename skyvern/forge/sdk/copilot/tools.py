@@ -2399,21 +2399,14 @@ _PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS = (
     "page may have navigated unexpectedly",
 )
 
-_NAV_BLOCK_TYPES = ("goto_url", "navigation")
-
 
 def _detect_probable_site_block_wall(result: dict[str, Any]) -> bool:
-    """Return True when the run shows the "site-block-wall" pattern: a
-    navigation block completed successfully but every subsequent block
-    failed to scrape the page.
-
-    Pattern:
-      - ``ok`` is false (run failed)
-      - at least one ``goto_url`` / ``navigation`` block completed successfully
-      - at least one block's ``failure_reason`` matches the generic
-        "Skyvern failed to load the website..." template
-    """
+    """True when a block failed with the site-load template and the failure is
+    not a non-retriable nav error (DNS / SSL / invalid URL are owned by
+    :func:`_detect_non_retriable_nav_error`)."""
     if bool(result.get("ok", False)):
+        return False
+    if _detect_non_retriable_nav_error(result):
         return False
     data = result.get("data")
     if not isinstance(data, dict):
@@ -2422,20 +2415,15 @@ def _detect_probable_site_block_wall(result: dict[str, Any]) -> bool:
     if not isinstance(blocks, list):
         return False
 
-    nav_completed = False
-    matched_reason = False
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("block_type") in _NAV_BLOCK_TYPES and block.get("status") == "completed":
-            nav_completed = True
         reason = block.get("failure_reason")
         if isinstance(reason, str):
             lowered = reason.lower()
             if any(sub in lowered for sub in _PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS):
-                matched_reason = True
-
-    return nav_completed and matched_reason
+                return True
+    return False
 
 
 def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
