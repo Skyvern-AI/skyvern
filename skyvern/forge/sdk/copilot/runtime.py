@@ -95,6 +95,11 @@ class AgentContext:
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None
 
+    copilot_run_start_monotonic: float | None = None
+
+    last_good_workflow: Any | None = None
+    last_good_workflow_yaml: str | None = None
+
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     """Convert an MCP result dict to the copilot {ok, data, error} format."""

@@ -3,13 +3,19 @@ import typing
 from typing import Any, Literal, overload
 
 import structlog
-from playwright.async_api import Page
 
-from skyvern.client import GetRunResponse, SkyvernEnvironment, WorkflowRunResponse
-from skyvern.client.core import RequestOptions
-from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
-from skyvern.schemas.run_blocks import CredentialType
-from skyvern.schemas.runs import RunEngine, RunStatus, TaskRunResponse
+from skyvern.exceptions import require_server_extra_modules
+
+require_server_extra_modules("skyvern.library.skyvern_browser_page_agent")
+
+from playwright.async_api import Page  # noqa: E402
+
+from skyvern.client import GetRunResponse, SkyvernEnvironment, WorkflowRunResponse  # noqa: E402
+from skyvern.client.core import RequestOptions  # noqa: E402
+from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT  # noqa: E402
+from skyvern.schemas.credential_type import CredentialType  # noqa: E402
+from skyvern.schemas.run_enums import RunEngine, RunStatus  # noqa: E402
+from skyvern.schemas.runs import TaskRunResponse  # noqa: E402
 
 if typing.TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -102,7 +108,7 @@ class SkyvernBrowserPageAgent:
     async def login(
         self,
         *,
-        credential_type: Literal[CredentialType.skyvern] = CredentialType.skyvern,
+        credential_type: Literal[CredentialType.skyvern, "skyvern"] = CredentialType.skyvern,  # type: ignore[valid-type]
         credential_id: str,
         url: str | None = None,
         prompt: str | None = None,
@@ -117,7 +123,7 @@ class SkyvernBrowserPageAgent:
     async def login(
         self,
         *,
-        credential_type: Literal[CredentialType.bitwarden],
+        credential_type: Literal[CredentialType.bitwarden, "bitwarden"],  # type: ignore[valid-type]
         bitwarden_item_id: str,
         bitwarden_collection_id: str | None = None,
         url: str | None = None,
@@ -133,7 +139,7 @@ class SkyvernBrowserPageAgent:
     async def login(
         self,
         *,
-        credential_type: Literal[CredentialType.onepassword],
+        credential_type: Literal[CredentialType.onepassword, "1password"],  # type: ignore[valid-type]
         onepassword_vault_id: str,
         onepassword_item_id: str,
         url: str | None = None,
@@ -149,7 +155,7 @@ class SkyvernBrowserPageAgent:
     async def login(
         self,
         *,
-        credential_type: Literal[CredentialType.azure_vault],
+        credential_type: Literal[CredentialType.azure_vault, "azure_vault"],  # type: ignore[valid-type]
         azure_vault_name: str,
         azure_vault_username_key: str,
         azure_vault_password_key: str,
@@ -166,7 +172,7 @@ class SkyvernBrowserPageAgent:
     async def login(
         self,
         *,
-        credential_type: CredentialType = CredentialType.skyvern,
+        credential_type: CredentialType | str = CredentialType.skyvern,
         url: str | None = None,
         credential_id: str | None = None,
         bitwarden_collection_id: str | None = None,
@@ -243,6 +249,8 @@ class SkyvernBrowserPageAgent:
         Returns:
             WorkflowRunResponse containing the login workflow execution results.
         """
+
+        credential_type = CredentialType(credential_type)
 
         LOG.info("Starting AI login workflow", credential_type=credential_type)
 

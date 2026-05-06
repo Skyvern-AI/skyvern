@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 
 _FAILURE_REASON_MAX_CHARS = 200
 
+# Stable identifier for the per-tool budget failure category written into
+# ``failure_categories`` by the watchdog. Used by enforcement, reconciliation,
+# and signature normalization as a single source of truth.
+PER_TOOL_BUDGET_FAILURE_CATEGORY = "PER_TOOL_BUDGET"
+
 
 def normalize_failure_reason(raw: str | None) -> str:
     if not raw:
@@ -67,11 +72,13 @@ def compute_failure_signature(
         return None
     safe_label = frontier_start_label if isinstance(frontier_start_label, str) else ""
     top_category = _top_failure_category(failure_categories)
-    # PARAMETER_BINDING_ERROR failure_reason embeds the offending key name, so
-    # collapse it to a stable constant or repeats on different keys won't hash
-    # to the same signature.
+    # Categories whose failure_reason embeds per-call data (key name, run id):
+    # collapse to a stable constant so consecutive trips hash to the same
+    # signature instead of each one looking unique.
     if top_category == "PARAMETER_BINDING_ERROR":
         normalized = "parameter_binding_error"
+    elif top_category == PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        normalized = "per_tool_budget"
     parts = [
         safe_label,
         normalized,

@@ -14,6 +14,8 @@ setup_windows_event_loop_policy()
 _base_lazy_imports = {
     "Skyvern": "skyvern.library",
     "SkyvernEnvironment": "skyvern.client",
+    "RunEngine": "skyvern.schemas.run_enums",
+    "RunStatus": "skyvern.schemas.run_enums",
 }
 
 _server_lazy_imports = {

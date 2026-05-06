@@ -8,13 +8,20 @@ exceptions, and malformed classifier output must all fall through to
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
+from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot.agent import _format_chat_history
 from skyvern.forge.sdk.copilot.feasibility_gate import (
     FeasibilityVerdict,
     _coerce_verdict,
     run_feasibility_gate,
+)
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
 )
 
 # ---------------------------------------------------------------------------
@@ -303,15 +310,19 @@ def test_feasibility_verdict_dataclass() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_feasibility_prompt() -> str:
-    from skyvern.forge.prompts import prompt_engine
-
+def _render_feasibility_prompt(
+    *,
+    user_message: str = "I meant the other one",
+    workflow_yaml: str = "name: example_workflow",
+    chat_history: str = "USER: place an order\nAI: tested, no result",
+    global_llm_context: str = "",
+) -> str:
     return prompt_engine.load_prompt(
         template="feasibility-gate",
-        user_message="I meant the other one",
-        workflow_yaml="name: example_workflow",
-        chat_history="USER: place an order\nAI: tested, no result",
-        global_llm_context="",
+        user_message=user_message,
+        workflow_yaml=workflow_yaml,
+        chat_history=chat_history,
+        global_llm_context=global_llm_context,
     )
 
 
@@ -326,3 +337,41 @@ def test_prompt_does_not_revert_to_single_request_framing() -> None:
     prompt = _render_feasibility_prompt()
     assert "single user request" not in prompt
     assert "before any navigation happens" not in prompt
+
+
+def test_prompt_handles_bare_value_continuation() -> None:
+    prompt = _render_feasibility_prompt()
+    assert "bare-value replies" in prompt
+    assert "slot-fill" in prompt
+
+
+def test_prompt_lists_inheritable_block_and_field_context() -> None:
+    prompt = _render_feasibility_prompt()
+    assert "block or field name" in prompt
+    assert "named a block" in prompt
+
+
+def test_prompt_carries_prior_turns_in_chat_history_section() -> None:
+    now = datetime.now(timezone.utc)
+    history_messages = [
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="do you see lookup_record, the crawler isn't using the search/filter tool I'm trying to point it at",
+            created_at=now,
+        ),
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="record-aaaa-bbbb-cccc-user",
+            created_at=now,
+        ),
+    ]
+    prompt = _render_feasibility_prompt(
+        user_message="record-aaaa-bbbb-cccc-pass",
+        workflow_yaml="",
+        chat_history=_format_chat_history(history_messages),
+    )
+    user_section = prompt[prompt.index("### user_message") : prompt.index("### workflow_yaml")]
+    history_section = prompt[prompt.index("### chat_history") : prompt.index("### global_llm_context")]
+    assert "record-aaaa-bbbb-cccc-pass" in user_section
+    assert "lookup_record" in history_section
+    assert "record-aaaa-bbbb-cccc-user" in history_section

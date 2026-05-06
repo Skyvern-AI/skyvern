@@ -15,16 +15,17 @@ from skyvern.client.core import RequestOptions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
-from skyvern.schemas.run_blocks import CredentialType
-from skyvern.schemas.runs import ProxyLocationInput, RunEngine, RunStatus, proxy_location_to_request
+from skyvern.schemas.credential_type import CredentialType
+from skyvern.schemas.proxy_location import ProxyLocationInput, proxy_location_to_request
+from skyvern.schemas.run_enums import RunEngine, RunStatus
 
 LOG = structlog.get_logger()
 
 if TYPE_CHECKING:
     from playwright.async_api import Playwright
 
-    from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
     from skyvern.library.skyvern_browser import SkyvernBrowser
+    from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 
 def _get_browser_session_url(browser_session_id: str) -> str:
@@ -176,7 +177,7 @@ class Skyvern(AsyncSkyvern):
                 Example 4 - Custom LLM with environment variables:
                     ```python
                     from skyvern import Skyvern
-                    from skyvern.forge.sdk.api.llm.models import LLMConfig
+                    from skyvern.schemas.llm import LLMConfig
 
                     # Assumes OPENAI_API_KEY is set in your environment
                     skyvern = Skyvern.local(
