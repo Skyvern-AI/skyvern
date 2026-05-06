@@ -11,7 +11,7 @@ from httpx import ASGITransport
 from skyvern.config import settings
 from skyvern.forge.api_app import create_api_app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 _EMBEDDED_ACTIVE: bool = False
 

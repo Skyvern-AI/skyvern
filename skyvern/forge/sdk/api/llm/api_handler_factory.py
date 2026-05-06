@@ -30,11 +30,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
-from skyvern.forge.sdk.api.llm.models import (
-    LLMAllowedFailsPolicy,
-    LLMConfig,
-    LLMRouterConfig,
-)
+from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_image_message,
@@ -50,7 +46,16 @@ from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.schemas.llm import (
+    LLMAllowedFailsPolicy,
+    LLMConfig,
+    LLMRouterConfig,
+)
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
+
+# Keep this server-only side effect out of the package __init__ so the legacy
+# models shim can import without litellm. Legacy LLM calls enter this module.
+configure_litellm_transport()
 
 LOG = structlog.get_logger()
 
