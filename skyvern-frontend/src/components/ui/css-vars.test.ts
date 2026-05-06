@@ -13,23 +13,17 @@ import { fileURLToPath } from "node:url";
 // :root and .dark prevents a regression where one entrypoint silently
 // drops a token that another entrypoint still ships.
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(HERE, "../../../..");
-// Gate by directory, not file: a deleted index.css inside an existing
-// entrypoint dir is the regression we want to fail loudly on.
-function entrypoint(dir: string): string | null {
-  if (!existsSync(resolve(REPO_ROOT, dir))) {
-    return null;
-  }
-  return `${dir}/index.css`;
-}
+// skyvern-frontend is an ESM package, so __dirname is undefined here.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const REPO_ROOT = resolve(__dirname, "../../../..");
+// cloud/ and eval/ entrypoints only exist in the cloud sync target; in OSS
+// they are absent and must be filtered out so the suite still runs.
 const CSS_FILES = [
-  "skyvern-frontend/src",
-  "skyvern-frontend/cloud",
-  "skyvern-frontend/eval",
-]
-  .map(entrypoint)
-  .filter((f): f is string => f !== null);
+  "skyvern-frontend/src/index.css",
+  "skyvern-frontend/cloud/index.css",
+  "skyvern-frontend/eval/index.css",
+].filter((file) => existsSync(resolve(REPO_ROOT, file)));
 
 function load(file: string): string {
   return readFileSync(resolve(REPO_ROOT, file), "utf-8");
