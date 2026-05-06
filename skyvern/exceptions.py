@@ -1,12 +1,60 @@
 import re
+from http import HTTPStatus
+from importlib.util import find_spec
+from typing import NoReturn
 
-from fastapi import status
+# Representative modules that indicate the server extra is installed enough for
+# server/local/browser import graphs. Keep this list intentionally small, but
+# include the heavy modules users commonly have partially installed.
+_SERVER_EXTRA_SENTINELS = (
+    "fastapi",
+    "jinja2",
+    "libcst",
+    "litellm",
+    "playwright",
+    "sqlalchemy",
+    "starlette",
+    "starlette_context",
+)
+
+
+def _missing_server_extra_dependency(module_name: str) -> bool:
+    root_module = module_name.split(".", maxsplit=1)[0]
+    if root_module in _SERVER_EXTRA_SENTINELS:
+        return find_spec(root_module) is None
+    if root_module == "skyvern":
+        return False
+    # Unknown missing modules may be genuine dependency bugs, so only known
+    # server-extra sentinels are rewritten to the install hint.
+    return False
 
 
 class SkyvernException(Exception):
     def __init__(self, message: str | None = None):
         self.message = message
         super().__init__(message)
+
+
+class SkyvernExtraNotInstalled(ImportError):
+    def __init__(self, feature: str, extra: str = "server"):
+        self.feature = feature
+        self.extra = extra
+        super().__init__(f"{feature} requires server support. Install it with `pip install skyvern[{extra}]`.")
+
+
+def raise_server_extra_required(feature: str, exc: ImportError) -> NoReturn:
+    if isinstance(exc, ModuleNotFoundError) and exc.name is not None and _missing_server_extra_dependency(exc.name):
+        raise SkyvernExtraNotInstalled(feature) from exc
+    raise exc
+
+
+def require_server_extra_modules(feature: str, module_names: tuple[str, ...] = ()) -> None:
+    # Server/local/browser APIs require the full server extra, not a partial Playwright-only install.
+    required_modules = dict.fromkeys((*_SERVER_EXTRA_SENTINELS, *module_names))
+    for module_name in required_modules:
+        if find_spec(module_name) is None:
+            missing = ModuleNotFoundError(f"No module named '{module_name}'", name=module_name)
+            raise SkyvernExtraNotInstalled(feature) from missing
 
 
 class SkyvernClientException(SkyvernException):
@@ -16,8 +64,8 @@ class SkyvernClientException(SkyvernException):
 
 
 class SkyvernHTTPException(SkyvernException):
-    def __init__(self, message: str | None = None, status_code: int = status.HTTP_400_BAD_REQUEST):
-        self.status_code = status_code
+    def __init__(self, message: str | None = None, status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST):
+        self.status_code = int(status_code)
         super().__init__(message)
 
 
@@ -55,7 +103,7 @@ def get_user_facing_exception_message(exception: Exception) -> str:
 
 class DisabledBlockExecutionError(SkyvernHTTPException):
     def __init__(self, message: str | None = None):
-        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+        super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
 
 
 class RateLimitExceeded(SkyvernHTTPException):
@@ -64,7 +112,7 @@ class RateLimitExceeded(SkyvernHTTPException):
             f"Rate limit exceeded for organization {organization_id}. "
             f"Maximum {max_requests} requests per {window_seconds} seconds allowed."
         )
-        super().__init__(message, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+        super().__init__(message, status_code=HTTPStatus.TOO_MANY_REQUESTS)
 
 
 class InvalidOpenAIResponseFormat(SkyvernException):
@@ -97,7 +145,7 @@ class WebhookReplayError(SkyvernHTTPException):
         self,
         message: str | None = None,
         *,
-        status_code: int = status.HTTP_400_BAD_REQUEST,
+        status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST,
     ):
         super().__init__(message=message or "Webhook replay failed.", status_code=status_code)
 
@@ -114,7 +162,7 @@ class MissingApiKey(WebhookReplayError):
 
 class TaskNotFound(SkyvernHTTPException):
     def __init__(self, task_id: str | None = None):
-        super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+        super().__init__(f"Task {task_id} not found", status_code=HTTPStatus.NOT_FOUND)
 
 
 class MissingElement(SkyvernException):
@@ -212,7 +260,7 @@ class WorkflowNotFound(SkyvernHTTPException):
 
         super().__init__(
             f"Workflow not found. {workflow_repr}",
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=HTTPStatus.NOT_FOUND,
         )
 
 
@@ -223,20 +271,20 @@ class WorkflowNotFoundForWorkflowRun(SkyvernHTTPException):
     ) -> None:
         super().__init__(
             f"Workflow not found for workflow run {workflow_run_id}",
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=HTTPStatus.NOT_FOUND,
         )
 
 
 class WorkflowRunNotFound(SkyvernHTTPException):
     def __init__(self, workflow_run_id: str) -> None:
-        super().__init__(f"WorkflowRun {workflow_run_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+        super().__init__(f"WorkflowRun {workflow_run_id} not found", status_code=HTTPStatus.NOT_FOUND)
 
 
 class MissingValueForParameter(SkyvernHTTPException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
         super().__init__(
             f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -276,7 +324,7 @@ class InvalidCredentialId(SkyvernHTTPException):
         super().__init__(
             f"Invalid credential ID: {sanitize_credential_for_error(credential_id)}."
             " Failed to resolve to a valid credential.",
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -284,7 +332,7 @@ class WorkflowParameterNotFound(SkyvernHTTPException):
     def __init__(self, workflow_parameter_id: str) -> None:
         super().__init__(
             f"Workflow parameter {workflow_parameter_id} not found",
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=HTTPStatus.NOT_FOUND,
         )
 
 
@@ -411,7 +459,7 @@ class OrganizationNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
         super().__init__(
             f"Organization {organization_id} not found",
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=HTTPStatus.NOT_FOUND,
         )
 
 
@@ -419,7 +467,7 @@ class StepNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str, task_id: str, step_id: str | None = None) -> None:
         super().__init__(
             f"Step {step_id or 'latest'} not found. organization_id={organization_id} task_id={task_id}",
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=HTTPStatus.NOT_FOUND,
         )
 
 
@@ -856,7 +904,7 @@ class BlockedHost(SkyvernHTTPException):
     def __init__(self, host: str) -> None:
         super().__init__(
             f"The host in your url is blocked: {host}",
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -867,7 +915,7 @@ class InvalidWorkflowParameter(SkyvernHTTPException):
             message += f" Workflow permanent id: {workflow_permanent_id}"
         super().__init__(
             message,
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -1007,7 +1055,7 @@ class BrowserSessionClosed(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
             f"Browser session {browser_session_id} is closed.",
-            status_code=status.HTTP_410_GONE,
+            status_code=HTTPStatus.GONE,
         )
 
 
@@ -1015,7 +1063,7 @@ class BrowserSessionNotFound(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
             f"Browser session {browser_session_id} does not exist or is not live.",
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=HTTPStatus.NOT_FOUND,
         )
 
 
@@ -1023,7 +1071,7 @@ class BrowserSessionStartupTimeout(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
             f"Browser session {browser_session_id} failed to start within the timeout period.",
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
         )
 
 
@@ -1032,7 +1080,7 @@ class BrowserProfileNotFound(SkyvernHTTPException):
         message = f"Browser profile {profile_id} not found"
         if organization_id:
             message += f" for organization {organization_id}"
-        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
+        super().__init__(message, status_code=HTTPStatus.NOT_FOUND)
 
 
 class APIKeyNotFound(SkyvernHTTPException):
@@ -1064,7 +1112,7 @@ class OutputParameterNotFound(SkyvernHTTPException):
     def __init__(self, block_label: str, workflow_permanent_id: str) -> None:
         super().__init__(
             f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}",
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -1073,7 +1121,7 @@ class TemporalSubmissionFailed(SkyvernHTTPException):
         workflow_run_str = f" for workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         super().__init__(
             f"Failed to submit {workflow_type} to Temporal{workflow_run_str}",
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
 
 

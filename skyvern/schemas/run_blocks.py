@@ -1,15 +1,7 @@
-from enum import StrEnum
-
 from pydantic import BaseModel, Field
 
-from skyvern.schemas.runs import ProxyLocation
-
-
-class CredentialType(StrEnum):
-    skyvern = "skyvern"
-    bitwarden = "bitwarden"
-    onepassword = "1password"
-    azure_vault = "azure_vault"
+from skyvern.schemas.credential_type import CredentialType
+from skyvern.schemas.proxy_location import ProxyLocation
 
 
 class BaseRunBlockRequest(BaseModel):

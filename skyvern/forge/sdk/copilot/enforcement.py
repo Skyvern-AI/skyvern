@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from agents.run import Runner
 
-from skyvern.forge.sdk.copilot.failure_tracking import normalize_failure_reason
+from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -52,6 +52,10 @@ PROBABLE_SITE_BLOCK_STREAK_STOP_AT = 2
 # PROBABLE_SITE_BLOCK_STREAK_STOP_AT (both default to 2 but tune different
 # axes: streak depth vs nudge count).
 MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
+# Caps how many times the per-tool-budget split nudge can fire. After two
+# trips the agent should already be at single-block granularity; further
+# trips fall through to the repeated-frontier escalation path.
+MAX_PER_TOOL_BUDGET_NUDGES = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 600
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -232,6 +236,24 @@ POST_PARAMETER_BINDING_STOP_NUDGE = (
     "to decide what belongs in the parameters list, respond with an "
     "ASK_QUESTION instead. Do not resubmit a workflow that still has the "
     "same parameter-binding drift."
+)
+
+POST_PER_TOOL_BUDGET_NUDGE = (
+    "STOP — your last update_and_run_blocks call exceeded the per-tool-call "
+    "time budget while still making progress. This is NOT a site failure or "
+    "a wording problem — the chain you submitted is too long to complete in a "
+    "single tool call.\n"
+    "Do NOT retry the same chain. Do NOT change navigation_goal wording or "
+    "selectors hoping it will run faster.\n"
+    "1. Shrink the requested block_labels list to the first 1-2 unverified "
+    "blocks. The verified-prefix optimization will replay any earlier blocks "
+    "from cached state without re-running the browser, so passing a smaller "
+    "frontier is cheap.\n"
+    "2. Test that smaller frontier with update_and_run_blocks. If it succeeds, "
+    "extend by one block at a time on subsequent calls.\n"
+    "3. If your workflow only has 1-2 blocks and one block is still hitting "
+    "the budget, the single block is too ambitious — either narrow its "
+    "navigation_goal scope, or reply with a blocker explanation."
 )
 
 POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
@@ -470,6 +492,12 @@ def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     return nudge_count < MAX_SUSPICIOUS_SUCCESS_NUDGES
 
 
+def _needs_per_tool_budget_nudge(ctx: Any) -> bool:
+    if getattr(ctx, "last_failure_category_top", None) != PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        return False
+    return _get_int(ctx, "per_tool_budget_nudge_count") < MAX_PER_TOOL_BUDGET_NUDGES
+
+
 def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
     """Return True when the site-block-wall streak has reached the stop level
     AND the per-streak nudge cap has not been exhausted."""
@@ -560,6 +588,13 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
 
     if ctx.update_workflow_called and not ctx.test_after_update_done:
         return POST_UPDATE_NUDGE
+
+    # A budget-trip is a structural problem (chain too long), not a
+    # workflow-shape problem — emit the targeted "split the chain" advice
+    # before the generic repeated-frontier and failed-test paths can fire.
+    if _needs_per_tool_budget_nudge(ctx):
+        ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
+        return POST_PER_TOOL_BUDGET_NUDGE
 
     repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx)
     if repeated_frontier_nudge is not None:
@@ -888,6 +923,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_PARAMETER_BINDING_STOP_NUDGE: "parameter_binding_stop",
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE: "probable_site_block_stop",
+    POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
 }
