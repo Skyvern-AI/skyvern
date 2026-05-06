@@ -26,12 +26,13 @@ from agents.run_config import RunConfig
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
-from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
+from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     copilot_session_input_callback,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 
@@ -125,6 +126,8 @@ def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, boo
 
     Returns (model_name, run_config, llm_key, supports_vision).
     """
+    configure_litellm_transport()
+
     llm_key = getattr(llm_api_handler, "llm_key", None) or settings.LLM_KEY
     config = LLMConfigRegistry.get_config(llm_key)
 

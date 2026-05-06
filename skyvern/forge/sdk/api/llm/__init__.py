@@ -1,4 +1,5 @@
-import litellm
+"""LLM package namespace.
 
-# litellm's aiohttp_transport drops per-request timeout; httpx default honors it.
-litellm.disable_aiohttp_transport = True
+Keep this package import side-effect free so legacy type shims can be imported
+from a base SDK install without requiring the server extra.
+"""

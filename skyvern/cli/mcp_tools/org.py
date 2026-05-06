@@ -47,7 +47,9 @@ async def skyvern_org_update(
         Field(
             description=(
                 "Partial settings dict. Allowed keys: "
-                "max_steps_per_run (int >= 1), "
+                "max_steps_per_run (int >= 1, per-block cap), "
+                "max_steps_per_workflow_run (int >= 1, per-workflow-run total cap), "
+                "clear_max_steps_per_workflow_run (bool — resets the run-level cap to NULL), "
                 "max_retries_per_step (int >= 0), "
                 "webhook_callback_url (string), "
                 "artifact_url_expiry_seconds (int 3600-604800), "
