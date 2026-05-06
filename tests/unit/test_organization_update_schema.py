@@ -32,6 +32,25 @@ class TestOrganizationUpdateSchema:
     def test_clear_artifact_flag_defaults_false(self) -> None:
         assert OrganizationUpdate().clear_artifact_url_expiry_seconds is False
 
+    def test_clear_max_steps_per_workflow_run_defaults_false(self) -> None:
+        assert OrganizationUpdate().clear_max_steps_per_workflow_run is False
+
+    def test_accepts_max_steps_per_workflow_run(self) -> None:
+        update = OrganizationUpdate(max_steps_per_workflow_run=42)
+        assert update.model_dump(exclude_unset=True) == {"max_steps_per_workflow_run": 42}
+
+    def test_rejects_zero_max_steps_per_workflow_run(self) -> None:
+        with pytest.raises(ValueError):
+            OrganizationUpdate(max_steps_per_workflow_run=0)
+
+    def test_rejects_negative_max_steps_per_workflow_run(self) -> None:
+        with pytest.raises(ValueError):
+            OrganizationUpdate(max_steps_per_workflow_run=-5)
+
+    def test_clear_max_steps_per_workflow_run_can_be_set(self) -> None:
+        update = OrganizationUpdate(clear_max_steps_per_workflow_run=True)
+        assert update.clear_max_steps_per_workflow_run is True
+
     def test_rejects_non_int_max_steps(self) -> None:
         with pytest.raises(ValueError):
             OrganizationUpdate(max_steps_per_run="not a number")  # type: ignore[arg-type]
