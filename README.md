@@ -115,7 +115,7 @@ Use this option if you want everything containerized (Postgres, API, UI) and don
 
 ```bash
 rm ~/.skyvern/data.db   # remove the leftover SQLite file
-pip install --upgrade skyvern   # 1.0.32+ contains the fix
+pip install --upgrade skyvern   # 1.0.33+ contains the fix
 skyvern quickstart
 ```
 
@@ -125,7 +125,7 @@ If you are still on 1.0.31 and cannot upgrade, install via uv instead:
 uv pip install skyvern
 ```
 
-**`pip install skyvern` fails with ResolutionImpossible (litellm / fastmcp)** — You hit a dependency-resolution conflict in 1.0.31. Either upgrade to 1.0.32+ or use uv: `uv pip install skyvern`.
+**`pip install skyvern` fails with ResolutionImpossible (litellm / fastmcp)** — You hit a dependency-resolution conflict in 1.0.31 or 1.0.32. Upgrade to 1.0.33+.
 
 ## SDK
 
