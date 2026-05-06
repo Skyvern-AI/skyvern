@@ -3277,9 +3277,19 @@ async def update_organization(
                 "artifact_url_expiry_seconds — pick one"
             ),
         )
+    if org_update.clear_max_steps_per_workflow_run and org_update.max_steps_per_workflow_run is not None:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "clear_max_steps_per_workflow_run cannot be combined with a non-null "
+                "max_steps_per_workflow_run — pick one"
+            ),
+        )
     updated = await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
+        max_steps_per_workflow_run=org_update.max_steps_per_workflow_run,
+        clear_max_steps_per_workflow_run=org_update.clear_max_steps_per_workflow_run,
         max_retries_per_step=org_update.max_retries_per_step,
         webhook_callback_url=org_update.webhook_callback_url,
         artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
