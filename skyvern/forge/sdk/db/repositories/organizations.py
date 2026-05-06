@@ -153,7 +153,11 @@ class OrganizationsRepository(BaseRepository):
         organization_name: str | None = None,
         webhook_callback_url: str | None = None,
         max_steps_per_run: int | None = None,
+        max_steps_per_workflow_run: int | None = None,
+        clear_max_steps_per_workflow_run: bool = False,
         max_retries_per_step: int | None = None,
+        artifact_url_expiry_seconds: int | None = None,
+        clear_artifact_url_expiry_seconds: bool = False,
     ) -> Organization:
         async with self.Session() as session:
             organization = (
@@ -163,12 +167,24 @@ class OrganizationsRepository(BaseRepository):
                 raise NotFoundError
             if organization_name:
                 organization.organization_name = organization_name
-            if webhook_callback_url:
+            # ``is not None`` (not truthy): "" clears the webhook, 0 disables retries.
+            if webhook_callback_url is not None:
                 organization.webhook_callback_url = webhook_callback_url
-            if max_steps_per_run:
+            if max_steps_per_run is not None:
                 organization.max_steps_per_run = max_steps_per_run
-            if max_retries_per_step:
+            if clear_max_steps_per_workflow_run:
+                organization.max_steps_per_workflow_run = None
+            elif max_steps_per_workflow_run is not None:
+                organization.max_steps_per_workflow_run = max_steps_per_workflow_run
+            if max_retries_per_step is not None:
                 organization.max_retries_per_step = max_retries_per_step
+            # ``clear_*`` decouples "don't update" (None) from "explicitly clear":
+            # callers pass ``clear_artifact_url_expiry_seconds=True`` to reset
+            # the value to NULL, falling back to the global default.
+            if clear_artifact_url_expiry_seconds:
+                organization.artifact_url_expiry_seconds = None
+            elif artifact_url_expiry_seconds is not None:
+                organization.artifact_url_expiry_seconds = artifact_url_expiry_seconds
             await session.commit()
             await session.refresh(organization)
             return Organization.model_validate(organization)

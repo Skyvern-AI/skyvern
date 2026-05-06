@@ -7,7 +7,7 @@ import base64
 import json
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Literal
 
@@ -15,31 +15,47 @@ import structlog
 import yaml
 from agents import function_tool
 from agents.run_context import RunContextWrapper
+from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import (
+    PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
 )
-from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
+from skyvern.forge.sdk.copilot.loop_detection import (
+    clear_failed_step_tracker_for_tools_in_ctx,
+    detect_failed_tool_step_loop_for_ctx,
+    detect_tool_loop,
+    record_tool_step_result_for_ctx,
+)
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.narration import NarratorState
+from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
+from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
 from skyvern.forge.sdk.copilot.output_utils import (
+    _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    build_run_blocks_response,
     iter_failure_reasons,
     sanitize_tool_result_for_llm,
     truncate_output,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import (
+    RESERVED_PARAMETER_KEYS,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -48,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -82,6 +99,13 @@ assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
 # inner poll loop leaves a 10 s headroom below this ceiling for orderly
 # cleanup before the SDK cancels.
 RUN_BLOCKS_SAFETY_CEILING_SECONDS = 1200  # 20 min
+
+# Per-tool-call budget for active block runs — caps a single tool invocation
+# below the session-level wall clock (``enforcement.TOTAL_TIMEOUT_SECONDS``,
+# 600 s) so a long chain cannot consume the whole budget without giving the
+# copilot a chance to issue a smaller chain. Quiet-block runs keep the longer
+# ``RUN_BLOCKS_SAFETY_CEILING_SECONDS`` above.
+PER_TOOL_CALL_BUDGET_SECONDS = 240
 
 # Primary exit condition: seconds of no observed progress across the combined
 # run / block / step heartbeat. Sized to accommodate the slowest single LLM
@@ -196,15 +220,10 @@ def _trusted_post_drain_status(run: WorkflowRun | None) -> str | None:
 
 
 def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
-    """Clear ``pending_reconciliation_run_id`` iff ``result`` proves the
-    pending run has reached a trustworthy-final status.
-
-    Called from ``get_run_results_tool`` after ``_get_run_results`` returns.
-    Requires (a) a pending run_id on the ctx, (b) a matching resolved run_id
-    in ``result.data`` (so a ``workflow_run_id=None`` call that resolves to
-    a different run does NOT clear), and (c) the resolved ``overall_status``
-    passes ``is_final_excluding_canceled`` (so an ambiguous ``canceled``
-    does NOT clear).
+    """Clear ``pending_reconciliation_run_id`` iff the matching resolved run
+    landed in a status the caller can move past: any ``is_final_excluding_canceled``
+    status, or any status (including ``canceled``) when the prior exit was an
+    internal per-tool-budget cancel.
     """
     pending_run_id = getattr(copilot_ctx, "pending_reconciliation_run_id", None)
     if not isinstance(pending_run_id, str) or not pending_run_id:
@@ -216,12 +235,16 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
         return
     resolved_run_id = data.get("workflow_run_id")
     resolved_status = data.get("overall_status")
-    if (
-        isinstance(resolved_run_id, str)
-        and resolved_run_id == pending_run_id
-        and isinstance(resolved_status, str)
-        and WorkflowRunStatus(resolved_status).is_final_excluding_canceled()
-    ):
+    if not isinstance(resolved_run_id, str) or resolved_run_id != pending_run_id:
+        return
+    if not isinstance(resolved_status, str):
+        return
+    is_trusted_final = WorkflowRunStatus(resolved_status).is_final_excluding_canceled()
+    # ``last_failure_category_top`` reflects the prior block-running tool's outcome —
+    # only ``_record_run_blocks_result`` writes it, and the reconciliation guard
+    # prevents another block-running call from clobbering it before this read.
+    was_per_tool_budget = getattr(copilot_ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
+    if is_trusted_final or was_per_tool_budget:
         copilot_ctx.pending_reconciliation_run_id = None
 
 
@@ -365,9 +388,16 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
-def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
+def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
+    detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
+    if detected is not None:
+        return detected
+
+    # Consecutive same-name guard: false-positives on the intended iterative
+    # build (one new block per update_and_run_blocks). Block-running tools
+    # rely on the progress-aware checks below instead.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list):
+    if isinstance(tracker, list) and tool_name not in BLOCK_RUNNING_TOOLS:
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
             return detected
@@ -426,6 +456,27 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str) -> str | None:
                 "regardless of subdomain or path variations. Reply to the user "
                 "explaining the failure and asking them to verify the URL."
             )
+
+        # Gate on ``last_failed_workflow_yaml`` (sticky across
+        # ``update_workflow``) rather than ``last_test_ok``: otherwise the
+        # agent can sandwich an ``update_workflow`` call between the failure
+        # and the retry to clear ``last_test_ok=None`` and slip past.
+        start_ts = getattr(ctx, "copilot_run_start_monotonic", None)
+        last_failed_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
+        last_good_yaml = getattr(ctx, "last_good_workflow_yaml", None)
+        if start_ts is not None and last_failed_yaml and last_good_yaml:
+            remaining = TOTAL_TIMEOUT_SECONDS - (time.monotonic() - start_ts)
+            if remaining < PER_TOOL_CALL_BUDGET_SECONDS:
+                return (
+                    f"Wall-clock budget too low to retry: about "
+                    f"{int(max(0.0, remaining))}s remain of the "
+                    f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified "
+                    "workflow exists from before the failure. Do NOT call "
+                    "update_and_run_blocks or run_blocks_and_collect_debug "
+                    "again. REPLY now: summarize what worked, name the "
+                    "block that failed, and tell the user they can keep "
+                    "the verified prefix or discard."
+                )
     return None
 
 
@@ -506,6 +557,15 @@ def _parameter_binding_invariant_error(
 
 async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
     workflow_yaml = params["workflow_yaml"]
+    # Prefer the most-recent in-turn emission so cross-path flows (inline
+    # REPLACE_WORKFLOW followed by update_workflow) compare against what the
+    # LLM actually saw, not the turn-start persisted state.
+    last_yaml = getattr(ctx, "last_workflow_yaml", None)
+    prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+    stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
+    if stale_metadata:
+        return {"ok": False, "error": _stale_block_metadata_message(stale_metadata)}
+
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
     # schema; this safety net fires regardless of emission path. Label-based
@@ -521,6 +581,9 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml,
         )
+
+        created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
+
         await app.WORKFLOW_SERVICE.update_workflow_definition(
             workflow_id=ctx.workflow_id,
             organization_id=ctx.organization_id,
@@ -538,6 +601,8 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             cache_key=workflow.cache_key,
             run_sequentially=workflow.run_sequentially,
             sequential_key=workflow.sequential_key,
+            created_by=created_by_stamp,
+            edited_by="copilot",
         )
         ctx.workflow_yaml = workflow_yaml
         return {
@@ -603,7 +668,34 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
 # to an upstream state-establisher, or falls back to the full requested list.
 _BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
 
-_OUTPUT_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)_output\s*[\.}|]")
+_JINJA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_OUTPUT_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})_output\s*(?=[\.|}}])")
+_BLOCK_FORM_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})\s*\.")
+_JINJA_ROOT_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})\s*(?=[\.|}}])")
+
+_JINJA_RUNTIME_GLOBAL_ROOTS = frozenset(SandboxedEnvironment().globals)
+_JINJA_LITERAL_ROOTS = frozenset({"none", "true", "false"})
+_JINJA_SPECIAL_CONTEXT_ROOTS = frozenset({"loop", "self", "varargs", "kwargs"})
+_SKYVERN_TEMPLATE_CONTEXT_ROOTS = frozenset(RESERVED_PARAMETER_KEYS) | frozenset(
+    {
+        "parameters",
+        "browser_session_id",
+        "organization_id",
+        # Conditional / branch evaluation roots — see BranchEvaluationContext.build_template_data.
+        "params",
+        "outputs",
+        "environment",
+        "env",
+        "llm",
+    }
+)
+_TEMPLATE_BUILTIN_ROOTS = (
+    _JINJA_RUNTIME_GLOBAL_ROOTS | _JINJA_LITERAL_ROOTS | _JINJA_SPECIAL_CONTEXT_ROOTS | _SKYVERN_TEMPLATE_CONTEXT_ROOTS
+)
+
+# Keep this to grammatical glue only. Workflow/action words are intentionally
+# not filtered; the two-token stale threshold is the conservative guardrail.
+_BLOCK_METADATA_STOPWORDS = frozenset({"and", "for", "the", "with"})
 
 
 def _block_type_name(block: Any) -> str:
@@ -625,6 +717,218 @@ def _blocks_by_label(workflow_definition: Any) -> dict[str, Any]:
         if isinstance(label, str):
             by_label[label] = block
     return by_label
+
+
+# Minimum length to apply the trailing-``s`` plural strip; below this we
+# leave the token alone so words like ``is``/``us``/``has`` aren't mangled.
+_MIN_STEMMABLE_TOKEN_LEN = 5
+
+
+def _metadata_token(token: str) -> str:
+    token = token.lower()
+    if len(token) >= _MIN_STEMMABLE_TOKEN_LEN and token.endswith("s"):
+        token = token[:-1]
+    return token
+
+
+def _metadata_tokens(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    tokens: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9]+", value):
+        normalized = _metadata_token(token)
+        if len(normalized) <= 2 or normalized in _BLOCK_METADATA_STOPWORDS:
+            continue
+        tokens.add(normalized)
+    return tokens
+
+
+def _iter_yaml_blocks(blocks: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if not isinstance(blocks, list):
+        return found
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        found.append(block)
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            found.extend(_iter_yaml_blocks(loop_blocks))
+    return found
+
+
+def _workflow_yaml_blocks_by_label(workflow_yaml: str | None) -> dict[str, dict[str, Any]]:
+    if not workflow_yaml:
+        return {}
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return {}
+    by_label: dict[str, dict[str, Any]] = {}
+    for block in _iter_yaml_blocks(workflow_definition.get("blocks")):
+        label = block.get("label")
+        if isinstance(label, str):
+            by_label[label] = block
+    return by_label
+
+
+def _semantic_tokens_from_yaml(value: Any, *, exclude_keys: frozenset[str]) -> set[str]:
+    tokens: set[str] = set()
+    if isinstance(value, str):
+        return _metadata_tokens(value)
+    if isinstance(value, list):
+        for item in value:
+            tokens.update(_semantic_tokens_from_yaml(item, exclude_keys=exclude_keys))
+        return tokens
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in exclude_keys:
+                continue
+            tokens.update(_semantic_tokens_from_yaml(item, exclude_keys=exclude_keys))
+    return tokens
+
+
+def _stale_metadata_reason(
+    *,
+    field_name: str,
+    field_value: Any,
+    prior_block: dict[str, Any],
+    submitted_block: dict[str, Any],
+    current_exclude_keys: frozenset[str],
+) -> str | None:
+    tokens = _metadata_tokens(field_value)
+    if len(tokens) < 2:
+        return None
+
+    prior_tokens = _semantic_tokens_from_yaml(prior_block, exclude_keys=current_exclude_keys)
+    current_tokens = _semantic_tokens_from_yaml(submitted_block, exclude_keys=current_exclude_keys)
+    removed_tokens = prior_tokens - current_tokens
+    if len(tokens & removed_tokens) < 2:
+        return None
+
+    return f"{field_name} {field_value!r} appears stale"
+
+
+def _prior_blocks_by_unique_title(prior_by_label: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    titled = [(b["title"], b) for b in prior_by_label.values() if isinstance(b.get("title"), str) and b["title"]]
+    counts = Counter(title for title, _ in titled)
+    return {title: block for title, block in titled if counts[title] == 1}
+
+
+_STALE_BASE_EXCLUDE = frozenset({"label", "next_block_label"})
+_STALE_TITLE_EXCLUDE = frozenset({"label", "title", "next_block_label"})
+
+
+def _stale_for_renamed_label(
+    label: str,
+    submitted_block: dict[str, Any],
+    prior_by_unique_title: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    submitted_title = submitted_block.get("title")
+    # Title-less blocks intentionally skip the renamed-label path: with no
+    # title there is no cross-reference to a prior block, so we'd be
+    # guessing whether the rename was warranted.
+    if not (isinstance(submitted_title, str) and submitted_title):
+        return None
+    prior_block = prior_by_unique_title.get(submitted_title)
+    if prior_block is None:
+        return None
+    title_reason = _stale_metadata_reason(
+        field_name="title",
+        field_value=submitted_title,
+        prior_block=prior_block,
+        submitted_block=submitted_block,
+        current_exclude_keys=_STALE_TITLE_EXCLUDE,
+    )
+    if not title_reason:
+        return None
+    return {"label": label, "reasons": [title_reason]}
+
+
+def _stale_for_matched_label(
+    label: str,
+    submitted_block: dict[str, Any],
+    prior_block: dict[str, Any],
+) -> dict[str, Any] | None:
+    reasons: list[str] = []
+    submitted_title = submitted_block.get("title")
+    prior_title = prior_block.get("title")
+    title_reason = None
+    if isinstance(submitted_title, str) and submitted_title and submitted_title == prior_title:
+        title_reason = _stale_metadata_reason(
+            field_name="title",
+            field_value=submitted_title,
+            prior_block=prior_block,
+            submitted_block=submitted_block,
+            current_exclude_keys=_STALE_TITLE_EXCLUDE,
+        )
+        if title_reason:
+            reasons.append(title_reason)
+
+    # When the title was already flagged stale, exclude its tokens from the
+    # label-stale comparison so the same words don't double-count; otherwise
+    # the title's tokens are stable content that should weigh in.
+    label_exclude_keys = _STALE_TITLE_EXCLUDE if title_reason else _STALE_BASE_EXCLUDE
+    label_reason = _stale_metadata_reason(
+        field_name="label",
+        field_value=label,
+        prior_block=prior_block,
+        submitted_block=submitted_block,
+        current_exclude_keys=label_exclude_keys,
+    )
+    if label_reason:
+        reasons.insert(0, label_reason)
+
+    if not reasons:
+        return None
+    return {"label": label, "reasons": reasons}
+
+
+def _detect_stale_block_metadata(submitted_yaml: str | None, prior_yaml: str | None) -> list[dict[str, Any]]:
+    """Find corrected blocks whose old label/title no longer matches their revised goal text."""
+    prior_by_label = _workflow_yaml_blocks_by_label(prior_yaml)
+    submitted_by_label = _workflow_yaml_blocks_by_label(submitted_yaml)
+    if not prior_by_label or not submitted_by_label:
+        return []
+
+    prior_by_unique_title = _prior_blocks_by_unique_title(prior_by_label)
+
+    stale_items: list[dict[str, Any]] = []
+    for label, submitted_block in submitted_by_label.items():
+        prior_block = prior_by_label.get(label)
+        if prior_block is None:
+            item = _stale_for_renamed_label(label, submitted_block, prior_by_unique_title)
+        else:
+            item = _stale_for_matched_label(label, submitted_block, prior_block)
+        if item is not None:
+            stale_items.append(item)
+    return stale_items
+
+
+_STALE_BLOCK_METADATA_MESSAGE_LIMIT = 5
+
+
+def _stale_block_metadata_message(items: list[dict[str, Any]]) -> str:
+    details = []
+    for item in items[:_STALE_BLOCK_METADATA_MESSAGE_LIMIT]:
+        label = item.get("label", "?")
+        reasons = item.get("reasons") or []
+        detail = "; ".join(str(reason) for reason in reasons)
+        details.append(f"{label}: {detail}")
+    if len(items) > _STALE_BLOCK_METADATA_MESSAGE_LIMIT:
+        details.append(f"(and {len(items) - _STALE_BLOCK_METADATA_MESSAGE_LIMIT} more)")
+    joined = "; ".join(details)
+    return (
+        "Workflow validation failed: corrected block metadata still appears stale. "
+        "When changing a user's requested subject, URL, or action, rename affected block labels and titles "
+        "to match the revised goal, and update next_block_label, block_labels, and Jinja references accordingly. "
+        f"Stale metadata: {joined}"
+    )
 
 
 def _find_invalidated_labels(
@@ -682,20 +986,98 @@ def _nearest_upstream_state_establisher(
     return None
 
 
-def _referenced_output_labels(frontier_labels: list[str], new_definition: Any) -> set[str]:
+def _serialized_frontier_block_configs(frontier_labels: list[str], new_definition: Any) -> list[str]:
     by_label = _blocks_by_label(new_definition)
-    needed: set[str] = set()
+    serialized_configs: list[str] = []
     for label in frontier_labels:
         block = by_label.get(label)
         if block is None:
             continue
         try:
-            serialized = json.dumps(_canonical_block_config(block), default=str, separators=(",", ":"))
+            serialized_configs.append(json.dumps(_canonical_block_config(block), default=str, separators=(",", ":")))
         except (TypeError, ValueError):
-            serialized = repr(block)
+            serialized_configs.append(repr(block))
+    return serialized_configs
+
+
+def _workflow_parameter_keys(definition: Any) -> set[str]:
+    parameters = getattr(definition, "parameters", None) if definition else None
+    keys: set[str] = set()
+    if not parameters:
+        return keys
+    for parameter in parameters:
+        key = getattr(parameter, "key", None)
+        if isinstance(key, str):
+            keys.add(key)
+    return keys
+
+
+_CREDENTIAL_REAL_VALUE_SUFFIXES = ("_real_username", "_real_password")
+
+
+def _classify_frontier_jinja_refs(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> tuple[set[str], set[str], set[str]]:
+    """Single pass over frontier blocks; returns ``(suffix_form_refs, block_form_refs, unknown_roots)``."""
+    if serialized_configs is None:
+        serialized_configs = _serialized_frontier_block_configs(frontier_labels, new_definition)
+    known_labels = set(_blocks_by_label(new_definition))
+    parameter_keys = _workflow_parameter_keys(new_definition)
+    known_roots = known_labels | parameter_keys | _TEMPLATE_BUILTIN_ROOTS
+
+    suffix_form_refs: set[str] = set()
+    block_form_refs: set[str] = set()
+    unknown_roots: set[str] = set()
+
+    for serialized in serialized_configs:
         for match in _OUTPUT_REF_RE.findall(serialized):
-            needed.add(match)
-    return needed
+            if match in known_labels:
+                suffix_form_refs.add(match)
+        for match in _BLOCK_FORM_REF_RE.findall(serialized):
+            if match in known_labels:
+                block_form_refs.add(match)
+        for root in _JINJA_ROOT_RE.findall(serialized):
+            if root in known_roots:
+                continue
+            if root.endswith("_output") and root[: -len("_output")] in known_labels:
+                continue
+            if any(
+                root.endswith(suffix) and root[: -len(suffix)] in parameter_keys
+                for suffix in _CREDENTIAL_REAL_VALUE_SUFFIXES
+            ):
+                continue
+            unknown_roots.add(root)
+
+    return suffix_form_refs, block_form_refs, unknown_roots
+
+
+def _referenced_output_labels(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> set[str]:
+    suffix_refs, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
+    return suffix_refs | block_form_refs
+
+
+def _block_form_output_labels(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> set[str]:
+    _, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
+    return block_form_refs
+
+
+def _unknown_jinja_roots(
+    frontier_labels: list[str],
+    new_definition: Any,
+    serialized_configs: list[str] | None = None,
+) -> set[str]:
+    _, _, unknown_roots = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
+    return unknown_roots
 
 
 def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
@@ -830,20 +1212,24 @@ def _seed_for_frontier(
     prefix_labels = requested_labels[:idx]
     if not prefix_labels:
         return labels_to_execute, {}, frontier
-    # Only seed outputs that are actually referenced by the frontier suffix.
-    # Over-seeding would weaken the "seed what downstream needs" discipline
-    # and risks masking bugs where a block references an output that doesn't
-    # flow through the normal {{label_output}} path.
-    needed = _referenced_output_labels(labels_to_execute, new_definition)
-    prefix_needed = [label for label in prefix_labels if label in needed]
+    serialized_configs = _serialized_frontier_block_configs(labels_to_execute, new_definition)
+    suffix_refs, block_form_refs, unknown_roots = _classify_frontier_jinja_refs(
+        labels_to_execute, new_definition, serialized_configs
+    )
+    if any(label in block_form_refs for label in prefix_labels):
+        # Seeded block_outputs only register <label>_output; block-form refs
+        # need a normal upstream execution to populate the <label> namespace.
+        return requested_labels, {}, requested_labels[0]
+    needed = suffix_refs | block_form_refs
     seed: dict[str, Any] = {}
-    for label in prefix_needed:
-        if label in verified_outputs:
-            seed[label] = verified_outputs[label]
-        else:
-            # A referenced output is missing from the verified cache — we
-            # can't safely seed just the suffix. Fall back to the full list.
+    for label in prefix_labels:
+        if label not in needed:
+            continue
+        if label not in verified_outputs:
             return requested_labels, {}, requested_labels[0]
+        seed[label] = verified_outputs[label]
+    if unknown_roots:
+        return requested_labels, {}, requested_labels[0]
     return labels_to_execute, seed, frontier
 
 
@@ -855,7 +1241,7 @@ def _seed_for_frontier(
 # last-resort budget-exhausted branch, and ``task_exit_unfinalized`` is the
 # rare race where ``execute_workflow`` naturally exits before writing a
 # terminal row.
-WatchdogExitReason = Literal["success", "stagnation", "ceiling", "task_exit_unfinalized"]
+WatchdogExitReason = Literal["success", "stagnation", "ceiling", "per_tool_budget", "task_exit_unfinalized"]
 
 
 # Block types that legitimately execute long silent periods: one DB write on
@@ -953,16 +1339,10 @@ async def _watchdog_error_message(
     ctx: AgentContext,
     workflow_run_id: str,
     run: WorkflowRun | None,
+    budget_seconds: int,
 ) -> str:
-    """Build the LLM-facing error string for a non-success watchdog exit.
-
-    Every variant ends with the same reconciliation instruction so the agent
-    has a consistent next step: call ``get_run_results`` with the run_id to
-    resolve the outcome before running more blocks. The ``pending_reconciliation_run_id``
-    guard in ``_tool_loop_error`` enforces that the agent actually does so.
-
-    None of the variants contain "timed out" or retry-inviting phrasing —
-    that's the SKY-9163 regression we're fixing.
+    """LLM-facing error string for a non-success watchdog exit. No variant uses
+    "timed out" or other retry-inviting phrasing — those are SKY-9163 traps.
     """
     if exit_reason == "stagnation":
         body = (
@@ -972,9 +1352,27 @@ async def _watchdog_error_message(
             f"hidden validation error, or an infinite-retry loop on an action the agent "
             f"cannot detect is failing."
         )
+    elif exit_reason == "per_tool_budget":
+        message = (
+            f"The run exceeded the {budget_seconds}s per-tool-call budget while still "
+            f"making progress. This budget exists so a single in-flight call cannot "
+            f"consume the whole copilot session.\n"
+            f"Run ID: {workflow_run_id}.\n"
+            f"Next step: call get_run_results with this workflow_run_id to inspect what "
+            f"the cancelled run actually completed (the in-flight block was cancelled "
+            f"mid-execution and may have left partial side effects). Then call "
+            f"update_and_run_blocks with a smaller chain — the first 1-2 unverified "
+            f"blocks. Verified-prefix state is preserved, so the next call only re-runs "
+            f"from the new frontier. Do NOT retry the same chain unchanged — a longer "
+            f"run won't fit either."
+        )
+        current_url, _ = await _fallback_page_info(ctx)
+        if current_url:
+            message += f" Browser was on: {current_url}"
+        return message
     elif exit_reason == "ceiling":
         body = (
-            f"The run exceeded the {RUN_BLOCKS_SAFETY_CEILING_SECONDS}s absolute ceiling "
+            f"The run exceeded the {budget_seconds}s absolute ceiling "
             f"while still showing progress. The workflow is too long to fit in a single "
             f"tool invocation — split it into smaller block groups."
         )
@@ -1095,6 +1493,12 @@ async def _run_blocks_and_collect_debug(
                     parameter_type=str(wp.workflow_parameter_type),
                 )
 
+    # Without a session, the workflow service launches the browser in-process,
+    # which only works in worker pods (cloakbrowser isn't in the API image).
+    session_err = await ensure_browser_session(ctx)
+    if session_err is not None:
+        return session_err
+
     workflow_request = WorkflowRequestBody(
         data=data if data else None,
         browser_session_id=ctx.browser_session_id,
@@ -1111,6 +1515,7 @@ async def _run_blocks_and_collect_debug(
         version=None,
         max_steps=None,
         request_id=None,
+        copilot_session_id=ctx.workflow_copilot_chat_id,
     )
 
     from skyvern.utils.files import initialize_skyvern_state_file
@@ -1144,20 +1549,61 @@ async def _run_blocks_and_collect_debug(
     progress_marker = _progress_marker(initial_run, initial_step_ts, initial_block_ts)
     last_progress_monotonic = time.monotonic()
     started_monotonic = last_progress_monotonic
-    budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
     final_status: str | None = None
     run: Any = initial_run
     exit_reason: WatchdogExitReason | None = None
+    run_cancelled_by_watchdog = False
     # Quiet blocks (WAIT/TEXT_PROMPT/HUMAN_INTERACTION) legitimately have
     # DB-silent periods; disable stagnation for any invocation that includes
     # one. Safety ceiling still applies.
     stagnation_enabled = not _any_quiet_block_requested(ctx, labels_to_execute)
+    # Active block runs use the tighter per-tool budget so a single in-flight
+    # call cannot consume the whole copilot session. Quiet-block runs keep the
+    # long safety ceiling because HumanInteractionBlock can legitimately pause
+    # indefinitely.
+    budget_exit_reason: WatchdogExitReason
+    if stagnation_enabled:
+        budget_seconds = max(1, PER_TOOL_CALL_BUDGET_SECONDS)
+        budget_exit_reason = "per_tool_budget"
+    else:
+        budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
+        budget_exit_reason = "ceiling"
+
+    # Mid-tool narrator bridge: feed block-status changes and step-level
+    # heartbeats into NarratorState so the narration ticker keeps emitting
+    # while a long workflow run is in flight.
+    narrator_state: NarratorState | None = getattr(ctx, "narrator_state", None)
+    narrator_enabled = narrator_state is not None and narration_handler_available()
+    seen_block_states: dict[str, str] = {}
+    prior_block_ts: datetime | None = initial_block_ts
+    prior_step_ts: datetime | None = initial_step_ts
+    last_block_fetch_monotonic = 0.0
 
     try:
         while True:
             await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
 
             run, step_ts, block_ts = await _read_progress_sources(ctx, workflow_run.workflow_run_id)
+
+            if narrator_enabled:
+                assert narrator_state is not None  # narrator_enabled implies non-None
+                tick_result = await narrator_poll_tick(
+                    narrator_state,
+                    current_block_ts=block_ts,
+                    current_step_ts=step_ts,
+                    prior_block_ts=prior_block_ts,
+                    prior_step_ts=prior_step_ts,
+                    last_block_fetch_monotonic=last_block_fetch_monotonic,
+                    seen_block_states=seen_block_states,
+                    fetch_block_statuses=lambda: app.DATABASE.observer.get_workflow_run_blocks(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=ctx.organization_id,
+                    ),
+                    stream=ctx.stream,
+                )
+                prior_block_ts = tick_result.prior_block_ts
+                prior_step_ts = tick_result.prior_step_ts
+                last_block_fetch_monotonic = tick_result.last_block_fetch_monotonic
 
             if run and WorkflowRunStatus(run.status).is_final():
                 final_status = run.status
@@ -1185,7 +1631,7 @@ async def _run_blocks_and_collect_debug(
                 break
 
             if now - started_monotonic >= budget_seconds:
-                exit_reason = "ceiling"
+                exit_reason = budget_exit_reason
                 break
 
         if exit_reason is not None and exit_reason != "success":
@@ -1205,6 +1651,7 @@ async def _run_blocks_and_collect_debug(
                 exit_reason = "success"
             else:
                 await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                run_cancelled_by_watchdog = True
                 run = await _safe_read_workflow_run(
                     workflow_run.workflow_run_id, ctx.organization_id, context="post-drain"
                 )
@@ -1214,14 +1661,34 @@ async def _run_blocks_and_collect_debug(
                     exit_reason = "success"
 
         if exit_reason != "success":
-            # Turn-scoped reconciliation guard — cleared only by a
-            # ``get_run_results`` call that resolves this run_id to an
-            # ``is_final_excluding_canceled`` status
-            # (``_maybe_clear_reconciliation_flag``).
-            ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
             assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
-            error_msg = await _watchdog_error_message(exit_reason, ctx, workflow_run.workflow_run_id, run)
-            return {"ok": False, "error": error_msg}
+            ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
+            error_msg = await _watchdog_error_message(
+                exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds
+            )
+            result: dict[str, Any] = {"ok": False, "error": error_msg}
+            if exit_reason == "per_tool_budget":
+                # Stable failure_categories entry so consecutive budget trips
+                # hash to the same streak signature; without it the run_id in
+                # ``error_msg`` would make every trip unique.
+                result["data"] = {
+                    "workflow_run_id": workflow_run.workflow_run_id,
+                    "overall_status": run.status if run is not None else None,
+                    "failure_reason": error_msg,
+                    "failure_categories": [
+                        {
+                            "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
+                            "confidence_float": 1.0,
+                            "reasoning": (
+                                f"Per-tool-call budget of {budget_seconds}s exceeded; "
+                                "the run was making progress but cannot fit in a single tool call."
+                            ),
+                        }
+                    ],
+                }
+            if run_cancelled_by_watchdog:
+                result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
+            return result
     except asyncio.CancelledError:
         # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
         # the cleanup so the parent cancellation can't interrupt it mid-await.
@@ -1305,7 +1772,19 @@ async def _run_blocks_and_collect_debug(
             )
             if browser_state:
                 page = await browser_state.get_or_create_page()
-                screenshot_bytes = await page.screenshot(type="png")
+                if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                    try:
+                        await SkyvernFrame.hide_cursor_overlay(page)
+                    except Exception:
+                        pass
+                try:
+                    screenshot_bytes = await page.screenshot(type="png")
+                finally:
+                    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                        try:
+                            await SkyvernFrame.show_cursor_overlay(page)
+                        except Exception:
+                            pass
                 screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
         except Exception:
             LOG.debug("Failed to capture post-run screenshot", exc_info=True)
@@ -1341,15 +1820,7 @@ async def _run_blocks_and_collect_debug(
                 existing_set.add(label)
         ctx.verified_prefix_labels = existing_prefix
 
-    response: dict[str, Any] = {"ok": run_ok, "data": result_data}
-    if not run_ok:
-        # Promote the real failure message into a top-level ``error`` field so
-        # every downstream consumer (summarize_tool_result, SSE frames, logs,
-        # LLM context) sees it instead of defaulting to "Unknown error".
-        # Wording matches ExtractionBlock's "Unknown error (no failure reason
-        # provided)" fallback so error-message matching stays consistent.
-        response["error"] = next(iter_failure_reasons(response), "Unknown error (no failure reason provided)")
-    return response
+    return build_run_blocks_response(run_ok, result_data)
 
 
 async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
@@ -1917,6 +2388,11 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
     copilot_ctx.workflow_persisted = True
 
+    # Block-running failures keyed off (labels, parameters) go stale once the
+    # workflow itself changes — without this clear, a user who fixes the bug
+    # via update_workflow gets a LOOP DETECTED on the next legitimate run.
+    clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
+
 
 def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
     """Single-pass analysis of run result blocks.
@@ -1977,6 +2453,47 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
     return anti_bot_match, empty_data_blocks, categories
 
 
+# Generic failure-reason template emitted by the shared agent when the
+# browser-side scraper catches ScrapingFailed / NoElementFound. Matching on
+# the template (not the shared classifier) lets the copilot notice a repeated
+# site-block/unreadable-page pattern even though the classifier routes it to
+# DATA_EXTRACTION_FAILURE, not ANTI_BOT_DETECTION.
+# Coupling note: these substrings come from the run-level failure_reason
+# produced when the shared scraper raises ScrapingFailed. If the template
+# wording changes, update this tuple and the test that locks it in
+# (tests/unit/test_copilot_probable_site_block.py).
+_PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS = (
+    "failed to load the website",
+    "page may have navigated unexpectedly",
+)
+
+
+def _detect_probable_site_block_wall(result: dict[str, Any]) -> bool:
+    """True when a block failed with the site-load template and the failure is
+    not a non-retriable nav error (DNS / SSL / invalid URL are owned by
+    :func:`_detect_non_retriable_nav_error`)."""
+    if bool(result.get("ok", False)):
+        return False
+    if _detect_non_retriable_nav_error(result):
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return False
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        reason = block.get("failure_reason")
+        if isinstance(reason, str):
+            lowered = reason.lower()
+            if any(sub in lowered for sub in _PROBABLE_SITE_BLOCK_FAILURE_REASON_SUBSTRINGS):
+                return True
+    return False
+
+
 def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
     """Return the first failure_reason that matches SKIP_INNER_NAV_RETRY_ERRORS
     (DNS / cert / SSL / invalid URL), preferring run-level over block-level.
@@ -1988,10 +2505,16 @@ def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
 
 def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     run_ok = bool(result.get("ok", False))
-    copilot_ctx.last_test_ok = run_ok
+    # Watchdog cancels normally count as ok=False; only a coincident total
+    # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
+    cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
+    timeout_latched = bool(copilot_ctx.copilot_total_timeout_exceeded)
+    copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.last_test_suspicious_success = False
+    copilot_ctx.suspicious_success_nudge_count = 0
     copilot_ctx.last_test_anti_bot = None
+    prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
     copilot_ctx.last_failure_category_top = None
     copilot_ctx.last_test_non_retriable_nav_error = None
 
@@ -2004,6 +2527,12 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
             top_category = top.get("category")
             if isinstance(top_category, str):
                 copilot_ctx.last_failure_category_top = top_category
+
+    # A fresh budget trip on a different chain should get the dedicated split
+    # nudge again rather than falling through to the generic failed-test path,
+    # so reset the cap when the latest run is not itself a budget trip.
+    if prior_budget_flag and copilot_ctx.last_failure_category_top != PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        copilot_ctx.per_tool_budget_nudge_count = 0
 
     # Expose full failure classification in tool output for agent reasoning
     if failure_categories:
@@ -2022,19 +2551,28 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                 "(missing, empty, or all-null fields). "
                 "The workflow may not be working correctly."
             )
+            # Clean-ish success (no scrape-fail pattern): reset the streak.
+            copilot_ctx.probable_site_block_streak_count = 0
             update_repeated_failure_state(copilot_ctx, result)
             return
         copilot_ctx.failed_test_nudge_count = 0
         copilot_ctx.null_data_streak_count = 0
+        copilot_ctx.probable_site_block_streak_count = 0
         copilot_ctx.last_failed_workflow_yaml = None
         # Real success: clear the signature latch so a subsequent bad URL in
         # the same session can re-fire the stop nudge.
         copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
+        copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+        copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         return
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
     copilot_ctx.last_test_non_retriable_nav_error = _detect_non_retriable_nav_error(result)
+    if _detect_probable_site_block_wall(result):
+        copilot_ctx.probable_site_block_streak_count += 1
+    else:
+        copilot_ctx.probable_site_block_streak_count = 0
 
     data = result.get("data")
     if isinstance(data, dict):
@@ -2059,13 +2597,15 @@ async def update_workflow_tool(
     Returns the validated workflow or validation errors.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "update_workflow")
+    arguments = {"workflow_yaml": workflow_yaml}
+    loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        result = await _update_workflow(arguments, copilot_ctx)
         _record_workflow_update_result(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -2085,11 +2625,13 @@ async def list_credentials_tool(
     a credential they have already stored on a later page.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "list_credentials")
+    arguments = {"page": page, "page_size": page_size}
+    loop_error = _tool_loop_error(copilot_ctx, "list_credentials", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
-    result = await _list_credentials({"page": page, "page_size": page_size}, copilot_ctx)
+    result = await _list_credentials(arguments, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "list_credentials", arguments, result)
     sanitized = sanitize_tool_result_for_llm("list_credentials", result)
     return json.dumps(sanitized)
 
@@ -2146,7 +2688,8 @@ async def run_blocks_tool(
     HANDLING refusal rule in the system prompt.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug")
+    arguments = {"block_labels": block_labels, "parameters": parameters or {}}
+    loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
@@ -2165,13 +2708,14 @@ async def run_blocks_tool(
         ),
     ):
         result = await _run_blocks_and_collect_debug(
-            {"block_labels": block_labels, "parameters": parameters or {}},
+            arguments,
             copilot_ctx,
             labels_to_execute=labels_to_execute,
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
         _record_run_blocks_result(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         enqueue_screenshot_from_result(copilot_ctx, result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
@@ -2191,15 +2735,16 @@ async def get_run_results_tool(
     pass an explicit workflow_run_id from a prior tool response.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "get_run_results")
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
-
     params: dict[str, Any] = {}
     if workflow_run_id:
         params["workflow_run_id"] = workflow_run_id
+    loop_error = _tool_loop_error(copilot_ctx, "get_run_results", params)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
     result = await _get_run_results(params, copilot_ctx)
     _maybe_clear_reconciliation_flag(copilot_ctx, result)
+    record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
 
     sanitized = sanitize_tool_result_for_llm("get_run_results", result)
     return json.dumps(sanitized)
@@ -2232,7 +2777,8 @@ async def update_and_run_blocks_tool(
     HANDLING refusal rule in the system prompt.
     """
     copilot_ctx = ctx.context
-    loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks")
+    arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
 
@@ -2241,12 +2787,13 @@ async def update_and_run_blocks_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
 
     # Wrap each block's navigation_goal / complete_criterion / terminate_criterion
-    # with the user's message as "big goal" context so downstream LLMs (verifier,
+    # with the effective "big goal" context so downstream LLMs (verifier,
     # validation-block prompt) have user-intent framing — mirrors TaskV2.
-    if copilot_ctx.user_message:
-        workflow_yaml = wrap_block_goals(workflow_yaml, copilot_ctx.user_message)
+    block_goal_main_goal = copilot_ctx.block_goal_main_goal or copilot_ctx.user_message
+    if block_goal_main_goal:
+        workflow_yaml = wrap_block_goals(workflow_yaml, block_goal_main_goal)
     else:
-        LOG.warning("update_and_run_blocks invoked without copilot_ctx.user_message; skipping block-goal wrap")
+        LOG.warning("update_and_run_blocks invoked without block-goal context; skipping block-goal wrap")
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
@@ -2254,6 +2801,7 @@ async def update_and_run_blocks_tool(
         _record_workflow_update_result(copilot_ctx, update_result)
 
     if not update_result.get("ok"):
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
@@ -2303,6 +2851,7 @@ async def update_and_run_blocks_tool(
             frontier_start_label=frontier_start_label,
         )
         _record_run_blocks_result(copilot_ctx, run_result)
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
         enqueue_screenshot_from_result(copilot_ctx, run_result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)

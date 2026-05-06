@@ -29,7 +29,7 @@ import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined
+from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
@@ -41,6 +41,7 @@ from skyvern.constants import (
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_UPLOAD_FILE_COUNT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
@@ -50,6 +51,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
     MissingStarterUrl,
     PDFParsingError,
+    SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
     get_user_facing_exception_message,
@@ -97,6 +99,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     MissingJinjaVariables,
     NoIterableValueFound,
     NoValidEmailRecipient,
+    PayloadTemplateRenderError,
+    PayloadTemplateSyntaxError,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     DOWNLOADED_FILE_SIGS_KEY,
@@ -238,8 +242,18 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
 
+
+def _format_payload_path_segment(key: str) -> str:
+    """Plain identifiers render as `.key`; anything else (dots, brackets, spaces,
+    quotes) renders as a bracketed JSON-escaped string so paths stay unambiguous
+    against keys that contain `.` or `[`."""
+    if key.isidentifier():
+        return f".{key}"
+    return f"[{json.dumps(key)}]"
+
+
 # ForLoop constants
-DEFAULT_MAX_LOOP_ITERATIONS = 100
+DEFAULT_MAX_LOOP_ITERATIONS = 500
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
 PERSIST_LOOP_OUTPUT_INTERVAL = 10
@@ -261,6 +275,19 @@ class Block(BaseModel, abc.ABC):
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
     disable_cache: bool = False
+    # Opt-out from workflow-level workflow_system_prompt inheritance (and, on a
+    # WorkflowTriggerBlock, from propagating the parent chain's prompt into the
+    # spawned child run). A no-op for deterministic blocks that don't call an LLM.
+    ignore_workflow_system_prompt: bool = False
+    # Runtime cache populated by ``Block._apply_workflow_system_prompt`` — not
+    # user-settable. Excluded from serialization (``model_dump`` / JSON / API
+    # responses) so the resolved prompt doesn't leak into logs, workflow
+    # definition round-trips, or responses that weren't meant to carry it.
+    # Deliberately absent from the BlockYAML schema so it can never be set
+    # through YAML or the API. The user-facing opt-out is
+    # ``ignore_workflow_system_prompt``. Only consumed by block types that call
+    # an LLM; deterministic blocks ignore it.
+    workflow_system_prompt: str | None = Field(default=None, exclude=True)
 
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
@@ -316,6 +343,7 @@ class Block(BaseModel, abc.ABC):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
         error_codes: list[str] | None = None,
+        is_synthetic_loop_failure: bool = False,
     ) -> BlockResult:
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -342,6 +370,7 @@ class Block(BaseModel, abc.ABC):
             output_parameter_value=output_parameter_value,
             status=status,
             workflow_run_block_id=workflow_run_block_id,
+            is_synthetic_loop_failure=is_synthetic_loop_failure,
         )
 
     async def get_or_create_browser_state(
@@ -420,7 +449,10 @@ class Block(BaseModel, abc.ABC):
             BlockType.HTTP_REQUEST,
         ]
 
-        template = (env or jinja_sandbox_env).from_string(potential_template)
+        try:
+            template = (env or jinja_sandbox_env).from_string(potential_template)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
@@ -515,7 +547,48 @@ class Block(BaseModel, abc.ABC):
                     variables=missing_variables,
                 )
 
-        return template.render(template_data)
+        try:
+            return template.render(template_data)
+        except SkyvernException:
+            raise
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
+
+    def _apply_workflow_system_prompt(
+        self,
+        workflow_run_context: WorkflowRunContext,
+    ) -> None:
+        """Resolve the workflow-level ``workflow_system_prompt`` for this block and
+        materialize it onto ``self.workflow_system_prompt``.
+
+        Concatenates any prompt inherited from ancestor workflows (propagated through
+        ``WorkflowTriggerBlock``) with this workflow's own ``workflow_system_prompt``.
+        Jinja substitutions on this workflow's own prompt are resolved against
+        ``workflow_run_context``; the inherited portion is already resolved at the
+        trigger boundary.
+
+        Shared by every block type that needs to inherit the workflow system prompt
+        into its own ``workflow_system_prompt`` runtime cache before dispatching an
+        LLM call. Callers invoke this inside ``format_potential_template_parameters``
+        so the value is available at execute time. ``workflow_system_prompt`` on each
+        block is a runtime cache — it's deliberately absent from the BlockYAML schema
+        and not user-settable.
+
+        When a block opts out via ``ignore_workflow_system_prompt``, this leaves
+        the block's own ``workflow_system_prompt`` untouched (falling back to the
+        system default if none is set). The opt-out covers both this workflow's
+        prompt and any inherited prompt from parent workflows.
+        """
+        if self.ignore_workflow_system_prompt:
+            # Record the opt-out so the script path (``ai_extract``) reads the
+            # same decision instead of re-resolving the flag from the
+            # definition. See ``WorkflowRunContext.record_block_workflow_system_prompt``.
+            workflow_run_context.record_block_workflow_system_prompt(self.label, None)
+            return
+        resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        if resolved is not None:
+            self.workflow_system_prompt = resolved
+        workflow_run_context.record_block_workflow_system_prompt(self.label, resolved)
 
     @classmethod
     def get_subclasses(cls) -> tuple[type[Block], ...]:
@@ -568,7 +641,10 @@ class Block(BaseModel, abc.ABC):
                 block=block_data,
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
+                prompt=description_generation_prompt,
+                prompt_name="generate-workflow-run-block-description",
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             description = json_response.get("summary")
             LOG.info(
@@ -805,6 +881,10 @@ class BaseTaskBlock(Block):
                 )
                 for error_code, error_description in merged_mapping.items()
             }
+
+        # Materialize the workflow-level workflow_system_prompt onto this block so
+        # ForgeAgent.create_task can hand it off to the Task row verbatim.
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     @staticmethod
     async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
@@ -1375,9 +1455,17 @@ class LoopBlockExecutedResult(BaseModel):
     outputs_with_loop_values: list[list[dict[str, Any]]]
     block_outputs: list[BlockResult]
     last_block: BlockTypeVar | None
+    # True only when the loop exhausted all iterations naturally (for-loop) or the
+    # condition turned false (while-loop). False on every early-return path
+    # (cancel, structural error, max iterations, body failure with no swallow flag).
+    natural_completion: bool = False
 
     def is_canceled(self) -> bool:
         return len(self.block_outputs) > 0 and self.block_outputs[-1].status == BlockStatus.canceled
+
+    def is_synthetic_loop_failure(self) -> bool:
+        """Last appended result is a loop-structural / safety-limit failure, not a child."""
+        return bool(self.block_outputs) and self.block_outputs[-1].is_synthetic_loop_failure
 
     def is_completed(self) -> bool:
         if len(self.block_outputs) == 0:
@@ -1393,7 +1481,15 @@ class LoopBlockExecutedResult(BaseModel):
         if last_ouput.success:
             return True
 
+        # Swallow flags apply only on natural-completion paths whose last result
+        # is a real child failure; structural/safety synthetics must propagate.
+        if not self.natural_completion or self.is_synthetic_loop_failure():
+            return False
+
         if self.last_block.continue_on_failure:
+            return True
+
+        if self.last_block.next_loop_on_failure:
             return True
 
         return False
@@ -1409,6 +1505,36 @@ class LoopBlockExecutedResult(BaseModel):
             return f"Block({self.last_block.label if self.last_block else ''}) with type {self.last_block.block_type if self.last_block else ''} was canceled, canceling for loop"
 
         return self.block_outputs[-1].failure_reason if len(self.block_outputs) > 0 else "No block has been executed"
+
+    def resolve_status(self, parent_next_loop_on_failure: bool) -> tuple[BlockStatus, bool, str | None]:
+        """Decide the loop block's overall status, success flag, and failure_reason.
+
+        ``parent_next_loop_on_failure`` is the parent loop's swallow flag; when
+        set, body failures swallowed mid-loop must not re-surface as the loop's
+        overall status. Synthetic safety/structural failures still propagate.
+        """
+        parent_swallow = (
+            parent_next_loop_on_failure
+            and self.natural_completion
+            and not self.is_canceled()
+            and not self.is_synthetic_loop_failure()
+        )
+
+        if self.is_canceled():
+            block_status = BlockStatus.canceled
+            success = False
+        elif self.is_completed() or parent_swallow:
+            block_status = BlockStatus.completed
+            success = True
+        elif self.is_terminated():
+            block_status = BlockStatus.terminated
+            success = False
+        else:
+            block_status = BlockStatus.failed
+            success = False
+
+        failure_reason = None if success else self.get_failure_reason()
+        return block_status, success, failure_reason
 
 
 def compute_conditional_scopes(
@@ -1927,14 +2053,14 @@ class ForLoopBlock(Block):
         """Validate the loop_blocks graph for cycles, orphans, and dangling references.
 
         Skips sequential defaulting so that disconnected subgraphs are detected.
-        Also recursively validates any nested ForLoopBlock children.
+        Also recursively validates any nested loop block children.
         Raises InvalidWorkflowDefinition (422) on validation failure.
         """
         if not self.loop_blocks:
             return
         self._build_loop_graph(self.loop_blocks, skip_sequential_defaulting=True)
         for block in self.loop_blocks:
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 block.validate_loop_blocks()
 
     async def _persist_partial_loop_output(
@@ -2004,6 +2130,7 @@ class ForLoopBlock(Block):
                     failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    is_synthetic_loop_failure=True,
                 )
                 block_outputs.append(failure_block_result)
                 await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
@@ -2075,6 +2202,7 @@ class ForLoopBlock(Block):
                         failure_reason=f"Unable to find block with label {current_label} inside loop {self.label}",
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
                     )
                     block_outputs.append(failure_block_result)
                     outputs_with_loop_values.append(each_loop_output_values)
@@ -2175,6 +2303,7 @@ class ForLoopBlock(Block):
                         failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
                     )
                     block_outputs.append(failure_block_result)
                     # If next_loop_on_failure is False, stop the entire loop
@@ -2251,6 +2380,7 @@ class ForLoopBlock(Block):
                             failure_reason=f"Next block label {next_label} not found inside loop {self.label}",
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            is_synthetic_loop_failure=True,
                         )
                         block_outputs.append(failure_block_result)
                         outputs_with_loop_values.append(each_loop_output_values)
@@ -2287,6 +2417,7 @@ class ForLoopBlock(Block):
             outputs_with_loop_values=outputs_with_loop_values,
             block_outputs=block_outputs,
             last_block=current_block,
+            natural_completion=True,
         )
 
     async def execute(
@@ -2421,22 +2552,681 @@ class ForLoopBlock(Block):
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
         )
 
-        block_status = BlockStatus.failed
-        success = False
-
-        if loop_executed_result.is_canceled():
-            block_status = BlockStatus.canceled
-        elif loop_executed_result.is_completed():
-            block_status = BlockStatus.completed
-            success = True
-        elif loop_executed_result.is_terminated():
-            block_status = BlockStatus.terminated
-        else:
-            block_status = BlockStatus.failed
+        block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
         return await self.build_block_result(
             success=success,
-            failure_reason=loop_executed_result.get_failure_reason(),
+            failure_reason=failure_reason,
+            output_parameter_value=loop_executed_result.outputs_with_loop_values,
+            status=block_status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
+class WhileLoopBlock(Block):
+    """Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.
+
+    Top-of-loop semantics: the condition is evaluated *before* each iteration (including the
+    first). If the condition is false on the first check, the body never runs and the block
+    returns success with an empty output list.
+
+    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is
+    treated as a failure so that a misbehaving condition can never spin forever.
+    """
+
+    block_type: Literal[BlockType.WHILE_LOOP] = BlockType.WHILE_LOOP  # type: ignore
+
+    loop_blocks: list[BlockTypeVar]
+    # The discriminated union on ``criteria_type`` handles dict→typed coercion. Pydantic
+    # rejects a dict missing ``criteria_type`` with ``union_tag_not_found`` before any
+    # model_validator runs, so no extra coercion validator is needed here.
+    condition: BranchCriteriaTypeVar
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        parameters: set[PARAMETER_TYPE] = set()
+        for loop_block in self.loop_blocks:
+            for parameter in loop_block.get_all_parameters(workflow_run_id):
+                parameters.add(parameter)
+        return list(parameters)
+
+    def _build_loop_graph(
+        self,
+        blocks: list[BlockTypeVar],
+        skip_sequential_defaulting: bool = False,
+    ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
+        # Duplicated from ForLoopBlock._build_loop_graph for PR 1; promotion to a shared
+        # helper is tracked in PR 7 (refactor).
+        label_to_block: dict[str, BlockTypeVar] = {}
+        default_next_map: dict[str, str | None] = {}
+
+        for block in blocks:
+            if block.label in label_to_block:
+                raise InvalidWorkflowDefinition(f"Duplicate block label detected in loop: {block.label}")
+            label_to_block[block.label] = block
+            default_next_map[block.label] = block.next_block_label
+
+        if not skip_sequential_defaulting:
+            has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
+            if not has_conditional_blocks:
+                for idx, block in enumerate(blocks[:-1]):
+                    if default_next_map.get(block.label) is None:
+                        default_next_map[block.label] = blocks[idx + 1].label
+
+        adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
+        incoming: dict[str, int] = {label: 0 for label in label_to_block}
+
+        def _add_edge(source: str, target: str | None) -> None:
+            if not target:
+                return
+            if target not in label_to_block:
+                raise InvalidWorkflowDefinition(
+                    f"Block {source} references unknown next_block_label {target} inside loop {self.label}"
+                )
+            if target not in adjacency[source]:
+                adjacency[source].add(target)
+                incoming[target] += 1
+
+        for label, block in label_to_block.items():
+            if block.block_type == BlockType.CONDITIONAL:
+                for branch in block.ordered_branches:
+                    _add_edge(label, branch.next_block_label)
+            else:
+                _add_edge(label, default_next_map.get(label))
+
+        roots = [label for label, count in incoming.items() if count == 0]
+        if not roots:
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: every block is the target of another"
+                " block's next_block_label, so there is no starting block."
+                " At least one block must not be the target of any next_block_label or branch condition."
+            )
+        if len(roots) > 1:
+            raise InvalidWorkflowDefinition(
+                f"Disconnected blocks detected inside loop {self.label}: blocks"
+                f" ({', '.join(sorted(roots))}) are not reachable from any other block."
+                " Every block must be reachable from the first block through next_block_label or"
+                " conditional branch references."
+                " Either connect them by setting another block's next_block_label to point to them, or remove them."
+            )
+
+        queue: deque[str] = deque([roots[0]])
+        visited_count = 0
+        in_degree = dict(incoming)
+        while queue:
+            node = queue.popleft()
+            visited_count += 1
+            for neighbor in adjacency[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if visited_count != len(label_to_block):
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: some blocks form a loop through their"
+                " next_block_label references, causing an infinite cycle."
+                " Ensure that following next_block_label from any block eventually reaches a block"
+                " with next_block_label set to null."
+            )
+
+        return roots[0], label_to_block, default_next_map
+
+    def validate_loop_blocks(self) -> None:
+        """Validate the loop_blocks graph and recurse into nested loop blocks."""
+        if not self.loop_blocks:
+            return
+        self._build_loop_graph(self.loop_blocks, skip_sequential_defaulting=True)
+        for block in self.loop_blocks:
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
+                block.validate_loop_blocks()
+
+    async def _persist_partial_loop_output(
+        self,
+        workflow_run_id: str,
+        outputs_with_loop_values: list[list[dict[str, Any]]],
+        loop_idx: int,
+    ) -> None:
+        """Persist partial while-loop output to DB so accumulated iteration data survives
+        Temporal activity timeouts. Mirrors ``ForLoopBlock._persist_partial_loop_output``.
+        """
+        if not self.output_parameter:
+            return
+        try:
+            await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                value=outputs_with_loop_values,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to incrementally persist while-loop output",
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                loop_idx=loop_idx,
+                exc_info=True,
+            )
+
+    async def _evaluate_condition(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> bool:
+        """Evaluate the loop condition. Raises on rendering errors so the caller can convert
+        the failure into a block result with a clear message.
+
+        ``current_index`` (the 0-indexed iteration counter) is read from this block's own
+        metadata via the existing for_loop injection in
+        :meth:`format_block_parameter_template_from_workflow_run_context`. ``current_value``
+        holds the same integer so ``{{ current_value }}`` caps work like For Each loops.
+        The caller writes both onto ``self.label`` before invoking this method, so
+        condition authors can bootstrap iteration 1 with
+        ``{{ current_index == 0 or <body_output_ref> }}``.
+        """
+        evaluation_context = BranchEvaluationContext(
+            workflow_run_context=workflow_run_context,
+            block_label=self.label,
+            template_renderer=lambda potential_template: self.format_block_parameter_template_from_workflow_run_context(
+                potential_template,
+                workflow_run_context,
+            ),
+        )
+        if isinstance(self.condition, PromptBranchCriteria):
+            synthetic_branch = BranchCondition(
+                id=str(uuid.uuid4()),
+                criteria=self.condition,
+                next_block_label=None,
+                is_default=False,
+            )
+            results, _, _, _ = await _evaluate_prompt_branch_conditions_batch(
+                log_label=self.label,
+                branches=[synthetic_branch],
+                evaluation_context=evaluation_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                workflow_id=self.output_parameter.workflow_id,
+                extraction_description_suffix="while_loop condition",
+            )
+            return results[0]
+
+        return await self.condition.evaluate(evaluation_context)
+
+    async def _execute_while_loop_helper(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> LoopBlockExecutedResult:
+        outputs_with_loop_values: list[list[dict[str, Any]]] = []
+        block_outputs: list[BlockResult] = []
+        current_block: BlockTypeVar | None = None
+
+        start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+
+        loop_idx = 0
+        while True:
+            # Evaluate the condition at the top of every iteration (including the first).
+            # The cap check fires *after* the condition check so that a loop which would
+            # naturally exit on the (cap+1)-th check returns success rather than tripping
+            # the cap one iteration early.
+            #
+            # Condition rendering errors always terminate the loop, regardless of
+            # ``next_loop_on_failure``. The flag governs *body* failures (which can vary
+            # iteration to iteration), but a Jinja render error means the condition itself
+            # is malformed and will fail identically on the next iteration — there is no
+            # forward progress to be made by retrying.
+            # Expose ``current_index`` to the condition's template scope before evaluation
+            # so authors can bootstrap iteration 0 or cap iterations. ``current_value`` and
+            # ``current_item`` stay None so Jinja matches persisted timeline rows
+            # (``execute_safe(..., current_value=None)``) and outer for-loop rows cannot leak.
+            condition_metadata: BlockMetadata = {
+                "current_index": loop_idx,
+                "current_value": None,
+                "current_item": None,
+            }
+            workflow_run_context.update_block_metadata(self.label, condition_metadata)
+
+            try:
+                should_continue = await self._evaluate_condition(
+                    workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                )
+            except (FailedToFormatJinjaStyleParameter, MissingJinjaVariables, ValueError) as exc:
+                LOG.error(
+                    "WhileLoopBlock condition evaluation failed",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    error=str(exc),
+                )
+                failure_block_result = await self.build_block_result(
+                    success=False,
+                    status=BlockStatus.failed,
+                    failure_reason=f"Failed to evaluate while-loop condition: {str(exc)}",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                block_outputs.append(failure_block_result)
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                return LoopBlockExecutedResult(
+                    outputs_with_loop_values=outputs_with_loop_values,
+                    block_outputs=block_outputs,
+                    last_block=current_block,
+                )
+
+            if not should_continue:
+                LOG.info(
+                    "WhileLoopBlock condition is false, exiting loop",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                )
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                break
+
+            # Check max_iterations limit: only fires when the condition is still true at
+            # iteration index ``cap``, i.e. the loop would have run a (cap+1)-th body.
+            if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
+                LOG.info(
+                    "WhileLoopBlock reached max_iterations limit, stopping loop",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                    max_iterations=DEFAULT_MAX_LOOP_ITERATIONS,
+                )
+                failure_block_result = await self.build_block_result(
+                    success=False,
+                    status=BlockStatus.failed,
+                    failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    is_synthetic_loop_failure=True,
+                )
+                block_outputs.append(failure_block_result)
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                return LoopBlockExecutedResult(
+                    outputs_with_loop_values=outputs_with_loop_values,
+                    block_outputs=block_outputs,
+                    last_block=current_block,
+                )
+
+            # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
+            loop_context = skyvern_context.current()
+            if loop_context:
+                downloaded_file_sigs_before: list[tuple[str | None, str | None, str | None]] = []
+                baseline_timed_out = False
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_file_sigs_before = [
+                            to_downloaded_file_signature(fi)
+                            for fi in await app.STORAGE.get_downloaded_files(
+                                organization_id=organization_id or "",
+                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                            )
+                        ]
+                except asyncio.TimeoutError:
+                    baseline_timed_out = True
+                    LOG.warning(
+                        "Timeout getting baseline downloaded files for loop iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                    )
+                if baseline_timed_out:
+                    loop_context.loop_internal_state = None
+                else:
+                    loop_context.loop_internal_state = {
+                        DOWNLOADED_FILE_SIGS_KEY: downloaded_file_sigs_before,
+                    }
+
+            each_loop_output_values: list[dict[str, Any]] = []
+
+            iteration_step_count = 0
+            LOG.debug(
+                "WhileLoopBlock starting iteration",
+                workflow_run_id=workflow_run_id,
+                loop_idx=loop_idx,
+                max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+            )
+
+            block_idx = 0
+            current_label: str | None = start_label
+            conditional_wrb_ids: dict[str, str] = {}
+            while current_label:
+                loop_block = label_to_block.get(current_label)
+                if not loop_block:
+                    LOG.error(
+                        "Unable to find loop block with label in loop graph",
+                        workflow_run_id=workflow_run_id,
+                        loop_label=self.label,
+                        current_label=current_label,
+                    )
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Unable to find block with label {current_label} inside loop {self.label}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
+                    )
+                    block_outputs.append(failure_block_result)
+                    outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                    return LoopBlockExecutedResult(
+                        outputs_with_loop_values=outputs_with_loop_values,
+                        block_outputs=block_outputs,
+                        last_block=current_block,
+                    )
+
+                # ``current_index`` is the iteration counter. ``current_value`` stays None so
+                # runtime matches ``execute_safe`` / timeline rows; use ``{{ current_index }}``
+                # in Jinja. ``current_item`` stays None.
+                metadata: BlockMetadata = {
+                    "current_index": loop_idx,
+                    "current_value": None,
+                    "current_item": None,
+                }
+                workflow_run_context.update_block_metadata(self.label, metadata)
+                workflow_run_context.update_block_metadata(loop_block.label, metadata)
+
+                original_loop_block = loop_block
+                loop_block = loop_block.model_copy(deep=True)
+                current_block = loop_block
+
+                parent_wrb_id = workflow_run_block_id
+                if current_label in conditional_scopes:
+                    cond_label = conditional_scopes[current_label]
+                    if cond_label in conditional_wrb_ids:
+                        parent_wrb_id = conditional_wrb_ids[cond_label]
+
+                # ``current_value`` is None on persisted timeline rows and in block metadata;
+                # iteration is available only as ``current_index``.
+                block_output = await loop_block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    parent_workflow_run_block_id=parent_wrb_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    current_value=None,
+                    current_index=loop_idx,
+                )
+
+                if loop_block.block_type == BlockType.CONDITIONAL and block_output.workflow_run_block_id:
+                    conditional_wrb_ids[current_label] = block_output.workflow_run_block_id
+
+                output_value = (
+                    workflow_run_context.get_value(block_output.output_parameter.key)
+                    if workflow_run_context.has_value(block_output.output_parameter.key)
+                    else None
+                )
+
+                if block_output.output_parameter.key.endswith("_output"):
+                    LOG.debug("Block output", block_type=loop_block.block_type, output_value=output_value)
+
+                if loop_block.block_type == BlockType.GOTO_URL:
+                    LOG.info("Goto URL block executed", url=loop_block.url, loop_idx=loop_idx)
+
+                each_loop_output_values.append(
+                    {
+                        "output_parameter": block_output.output_parameter,
+                        "output_value": output_value,
+                    }
+                )
+
+                try:
+                    if block_output.workflow_run_block_id:
+                        await app.DATABASE.observer.update_workflow_run_block(
+                            workflow_run_block_id=block_output.workflow_run_block_id,
+                            organization_id=organization_id,
+                            current_value=None,
+                            current_index=loop_idx,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to update workflow run block",
+                        workflow_run_block_id=block_output.workflow_run_block_id,
+                        loop_idx=loop_idx,
+                    )
+                loop_block = original_loop_block
+                block_outputs.append(block_output)
+
+                iteration_step_count += 1
+                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
+                    LOG.info(
+                        "WhileLoopBlock reached max_steps_per_iteration limit, stopping iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+                        iteration_step_count=iteration_step_count,
+                    )
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
+                    )
+                    block_outputs.append(failure_block_result)
+                    if not self.next_loop_on_failure:
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+                    break
+
+                if block_output.status == BlockStatus.canceled:
+                    LOG.info(
+                        "WhileLoopBlock child block canceled, canceling while loop",
+                        block_type=loop_block.block_type,
+                        workflow_run_id=workflow_run_id,
+                        block_idx=block_idx,
+                        loop_idx=loop_idx,
+                        block_result=block_outputs,
+                    )
+                    outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                    return LoopBlockExecutedResult(
+                        outputs_with_loop_values=outputs_with_loop_values,
+                        block_outputs=block_outputs,
+                        last_block=current_block,
+                    )
+
+                if (
+                    not block_output.success
+                    and not loop_block.continue_on_failure
+                    and not loop_block.next_loop_on_failure
+                    and not self.next_loop_on_failure
+                ):
+                    LOG.info(
+                        "WhileLoopBlock encountered a failure processing block, terminating early",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_block_continue_on_failure=loop_block.continue_on_failure,
+                        failure_reason=block_output.failure_reason,
+                        next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
+                    )
+                    outputs_with_loop_values.append(each_loop_output_values)
+                    await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                    return LoopBlockExecutedResult(
+                        outputs_with_loop_values=outputs_with_loop_values,
+                        block_outputs=block_outputs,
+                        last_block=current_block,
+                    )
+
+                if block_output.success or loop_block.continue_on_failure:
+                    next_label: str | None = None
+                    if loop_block.block_type == BlockType.CONDITIONAL:
+                        branch_metadata = (
+                            block_output.output_parameter_value
+                            if isinstance(block_output.output_parameter_value, dict)
+                            else None
+                        )
+                        next_label = (branch_metadata or {}).get("next_block_label")
+                    else:
+                        next_label = default_next_map.get(loop_block.label)
+
+                    if not next_label:
+                        break
+
+                    if next_label not in label_to_block:
+                        failure_block_result = await self.build_block_result(
+                            success=False,
+                            status=BlockStatus.failed,
+                            failure_reason=f"Next block label {next_label} not found inside loop {self.label}",
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            is_synthetic_loop_failure=True,
+                        )
+                        block_outputs.append(failure_block_result)
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+
+                    current_label = next_label
+                    block_idx += 1
+                    continue
+
+                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                    LOG.info(
+                        "WhileLoopBlock child block failed but will continue to next iteration",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_block_next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
+                    )
+                    break
+
+                break
+
+            outputs_with_loop_values.append(each_loop_output_values)
+            # We don't know "is_last_iteration" for a while-loop ahead of time, so persist
+            # every PERSIST_LOOP_OUTPUT_INTERVAL iterations and once again at the top of the
+            # next iteration when the condition is false (handled at the break above).
+            if loop_idx % PERSIST_LOOP_OUTPUT_INTERVAL == 0:
+                await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+
+            loop_idx += 1
+
+        return LoopBlockExecutedResult(
+            outputs_with_loop_values=outputs_with_loop_values,
+            block_outputs=block_outputs,
+            last_block=current_block,
+            natural_completion=True,
+        )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # Save the caller's loop_internal_state so we can restore it after this loop
+        # finishes. Mirrors ForLoopBlock.execute.
+        outer_context = skyvern_context.current()
+        outer_loop_state = outer_context.loop_internal_state if outer_context else None
+        try:
+            return await self._run_loop(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                **kwargs,
+            )
+        finally:
+            if outer_context:
+                outer_context.loop_internal_state = outer_loop_state
+
+    async def _run_loop(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        if not self.loop_blocks:
+            LOG.info(
+                "No defined blocks to loop, terminating block",
+                block_type=self.block_type,
+                workflow_run_id=workflow_run_id,
+                num_loop_blocks=len(self.loop_blocks),
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No defined blocks to loop",
+                status=BlockStatus.terminated,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        try:
+            loop_executed_result = await self._execute_while_loop_helper(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_context=workflow_run_context,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+        except InvalidWorkflowDefinition as exc:
+            LOG.error(
+                "While-loop graph validation failed",
+                error=str(exc),
+                workflow_run_id=workflow_run_id,
+                loop_label=self.label,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(exc),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        await self.record_output_parameter_value(
+            workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
+        )
+
+        # Special case: condition false on the very first check. The body never ran, so
+        # there are no block_outputs. Return success with an empty output list — this is
+        # the normal/expected "nothing to do" path for a while-loop.
+        if not loop_executed_result.block_outputs:
+            return await self.build_block_result(
+                success=True,
+                failure_reason=None,
+                output_parameter_value=loop_executed_result.outputs_with_loop_values,
+                status=BlockStatus.completed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
+
+        return await self.build_block_result(
+            success=success,
+            failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
@@ -2784,6 +3574,8 @@ class TextPromptBlock(Block):
         if self.json_schema:
             self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def send_prompt(
         self,
         prompt: str,
@@ -2833,7 +3625,13 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
+        response = await llm_api_handler(
+            prompt=prompt,
+            prompt_name="text-prompt",
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -3778,6 +4576,8 @@ class FileParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
         url_parsed = urlparse(file_url)
@@ -3980,7 +4780,12 @@ class FileParserBlock(Block):
                 file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse Excel file: {str(e)}"
             )
 
-    async def _parse_pdf_file(self, file_path: str) -> str:
+    async def _parse_pdf_file(
+        self,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         """Parse PDF file and return extracted text.
 
         Uses the shared PDF parsing utility that tries pypdf first,
@@ -4011,11 +4816,15 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key, default=app.LLM_API_HANDLER
             )
+            # OCR transcription intentionally skips system_prompt
+            # It still applies to the downstream extract-information-from-file-text call.
             llm_response = await llm_api_handler(
                 prompt=llm_prompt,
                 prompt_name="extract-text-from-image",
                 screenshots=page_images,
                 force_dict=True,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             return llm_response.get("extracted_text", "")
         except Exception:
@@ -4025,7 +4834,12 @@ class FileParserBlock(Block):
             )
             raise
 
-    async def _parse_image_file(self, file_path: str) -> str:
+    async def _parse_image_file(
+        self,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         """Parse image file using vision LLM for OCR."""
         try:
             with open(file_path, "rb") as f:
@@ -4035,11 +4849,15 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key, default=app.LLM_API_HANDLER
             )
+            # OCR transcription intentionally skips system_prompt — see
+            # _parse_pdf_file_with_vision_ocr for rationale.
             llm_response = await llm_api_handler(
                 prompt=llm_prompt,
                 prompt_name="extract-text-from-image",
                 screenshots=[image_bytes],
                 force_dict=True,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
             return llm_response.get("extracted_text", "")
         except Exception:
@@ -4117,7 +4935,11 @@ class FileParserBlock(Block):
             )
 
     async def _extract_with_ai(
-        self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
+        self,
+        content: str | list[dict[str, Any]],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
     ) -> dict[str, Any]:
         """Extract structured data using AI based on json_schema."""
         # Use local variable to avoid mutating the instance
@@ -4146,7 +4968,12 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
 
         llm_response = await llm_api_handler(
-            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+            prompt=llm_prompt,
+            prompt_name="extract-information-from-file-text",
+            force_dict=False,
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
         return llm_response
 
@@ -4223,9 +5050,17 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.EXCEL:
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
-            parsed_data = await self._parse_pdf_file(file_path)
+            parsed_data = await self._parse_pdf_file(
+                file_path,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         elif self.file_type == FileType.IMAGE:
-            parsed_data = await self._parse_image_file(file_path)
+            parsed_data = await self._parse_image_file(
+                file_path,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         elif self.file_type == FileType.DOCX:
             parsed_data = await self._parse_docx_file(file_path)
         else:
@@ -4250,7 +5085,12 @@ class FileParserBlock(Block):
 
         if self.json_schema:
             try:
-                ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
+                ai_extracted_data = await self._extract_with_ai(
+                    parsed_data,
+                    workflow_run_context,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
                 final_data = ai_extracted_data
             except Exception as e:
                 return await self.build_block_result(
@@ -4304,6 +5144,8 @@ class PDFParserBlock(Block):
         self.file_url = self.format_block_parameter_template_from_workflow_run_context(
             self.file_url, workflow_run_context
         )
+
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     async def execute(
         self,
@@ -4370,7 +5212,12 @@ class PDFParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+            prompt=llm_prompt,
+            prompt_name="extract-information-from-file-text",
+            force_dict=False,
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
@@ -4790,6 +5637,10 @@ class TaskV2Block(Block):
             )
             self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
+        # Materialize the workflow-level workflow_system_prompt onto this block so
+        # execute() can hand it off to the TaskV2 row verbatim.
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4865,6 +5716,7 @@ class TaskV2Block(Block):
                 totp_identifier=resolved_totp_identifier,
                 totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
+                workflow_system_prompt=self.workflow_system_prompt,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -5555,6 +6407,53 @@ class PrintPageBlock(Block):
 
         return artifact_uri, artifact_url
 
+    async def _register_pdf_as_downloaded_file(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+    ) -> list[FileInfo]:
+        # Workflow finalization eventually runs save_downloaded_files, but the block
+        # output snapshot is recorded now and the UI keys off downloaded_file_urls
+        # on the block — so we register up front and let finalization re-run safely.
+        if not organization_id:
+            return []
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock failed to register PDF as downloaded file; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout getting downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -5564,6 +6463,11 @@ class PrintPageBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Scope downloaded files to this block only.
+        block_context = skyvern_context.current()
+        if block_context:
+            await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
@@ -5632,12 +6536,27 @@ class PrintPageBlock(Block):
             organization_id=organization_id,
         )
 
+        artifact_org_id = organization_id or workflow_run_context.organization_id
+        downloaded_files = await self._register_pdf_as_downloaded_file(
+            organization_id=artifact_org_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+        current_context = skyvern_context.current()
+        downloaded_files = filter_downloaded_files_for_current_iteration(
+            downloaded_files,
+            current_context.loop_internal_state if current_context else None,
+        )
         output = {
             "filename": filename,
             "file_path": file_path,
             "size_bytes": len(pdf_bytes),
             "artifact_uri": artifact_uri,
             "artifact_url": artifact_url,
+            "downloaded_files": [fi.model_dump() for fi in downloaded_files],
+            "downloaded_file_urls": [fi.url for fi in downloaded_files],
+            "downloaded_file_artifact_ids": [fi.artifact_id for fi in downloaded_files if fi.artifact_id],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
 
@@ -5881,8 +6800,9 @@ class PromptBranchCriteria(BranchCriteria):
     criteria_type: Literal["prompt"] = "prompt"
 
     async def evaluate(self, context: BranchEvaluationContext) -> bool:
-        # Natural language criteria are evaluated in batch by ConditionalBlock.execute.
-        raise NotImplementedError("PromptBranchCriteria is evaluated in batch, not per-branch.")
+        # Evaluated via ConditionalBlock.execute (batched) or WhileLoopBlock
+        # _evaluate_condition (single-branch batch helper).
+        raise NotImplementedError("PromptBranchCriteria is evaluated via extraction batch helpers, not per-branch.")
 
     def requires_llm(self) -> bool:
         return True
@@ -6115,7 +7035,7 @@ def _parse_single_evaluation(
         else:
             bool_result = _evaluate_truthy_string(str(result))
             LOG.warning(
-                "Prompt branch evaluation returned non-boolean result",
+                "Conditional branch evaluation returned non-boolean result",
                 branch_index=idx,
                 result=result,
                 evaluated_result=bool_result,
@@ -6249,6 +7169,227 @@ class BranchCondition(BaseModel):
         return self
 
 
+async def _evaluate_prompt_branch_conditions_batch(
+    *,
+    log_label: str,
+    branches: list[BranchCondition],
+    evaluation_context: BranchEvaluationContext,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+    organization_id: str | None,
+    browser_session_id: str | None,
+    workflow_id: str,
+    extraction_description_suffix: str = "",
+) -> tuple[list[bool], list[str], str | None, dict | None]:
+    if organization_id is None:
+        raise ValueError("organization_id is required to evaluate natural language branches")
+
+    if not branches:
+        return ([], [], None, None)
+
+    workflow_run_context = evaluation_context.workflow_run_context
+
+    rendered_expressions: list[str] = []
+    has_any_pure_natlang = False
+
+    for idx, branch in enumerate(branches):
+        expression = branch.criteria.expression if branch.criteria else ""
+        has_jinja = "{{" in expression
+
+        if has_jinja:
+            try:
+                rendered_expression = (
+                    evaluation_context.template_renderer(expression)
+                    if evaluation_context.template_renderer
+                    else expression
+                )
+            except Exception as render_exc:
+                LOG.error(
+                    "Conditional branch expression rendering FAILED",
+                    block_label=log_label,
+                    branch_index=idx,
+                    original_expression=expression,
+                    error=str(render_exc),
+                    exc_info=True,
+                )
+                rendered_expression = expression
+                has_any_pure_natlang = True
+            else:
+                rendered_expression, was_patched = _make_empty_params_explicit(expression, rendered_expression)
+                if was_patched:
+                    LOG.info(
+                        "Conditional branch expression patched for empty parameter(s)",
+                        workflow_run_id=workflow_run_id,
+                        block_label=log_label,
+                        branch_index=idx,
+                        original_expression=expression,
+                        patched_expression=rendered_expression,
+                    )
+        else:
+            rendered_expression = expression
+            has_any_pure_natlang = True
+
+        LOG.info(
+            "Conditional branch expression rendering",
+            block_label=log_label,
+            branch_index=idx,
+            original_expression=expression,
+            rendered_expression=rendered_expression,
+            has_jinja=has_jinja,
+            expression_changed=expression != rendered_expression,
+        )
+
+        rendered_expressions.append(rendered_expression)
+
+    if has_any_pure_natlang:
+        context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
+        context_json = json.dumps(context_snapshot, default=str)
+    else:
+        context_json = None
+
+    extraction_goal = prompt_engine.load_prompt(
+        "conditional-prompt-branch-evaluation",
+        conditions=rendered_expressions,
+        context_json=context_json,
+    )
+
+    data_schema = {
+        "type": "object",
+        "properties": {
+            "evaluations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Explanation of the reasoning behind evaluating the condition.",
+                        },
+                        "result": {
+                            "type": "boolean",
+                            "description": "TRUE if the condition is satisfied, FALSE otherwise.",
+                        },
+                    },
+                    "required": ["reasoning", "result"],
+                },
+                "description": "Array of evaluation results for each condition in the same order.",
+                "minItems": len(branches),
+                "maxItems": len(branches),
+            }
+        },
+        "required": ["evaluations"],
+    }
+
+    desc_suffix = extraction_description_suffix or f"{len(branches)} conditions"
+    prompt_branch_eval_id = generate_random_string()
+    output_param = OutputParameter(
+        output_parameter_id=str(uuid.uuid4()),
+        key=f"prompt_branch_eval_{prompt_branch_eval_id}",
+        workflow_id=workflow_id,
+        created_at=datetime.now(),
+        modified_at=datetime.now(),
+        parameter_type=ParameterType.OUTPUT,
+        description=f"Conditional branch evaluation results ({desc_suffix})",
+    )
+    extraction_block = ExtractionBlock(
+        label=f"prompt_branch_eval_{prompt_branch_eval_id}",
+        data_extraction_goal=extraction_goal,
+        data_schema=data_schema,
+        output_parameter=output_param,
+    )
+
+    LOG.info(
+        "Conditional branch ExtractionBlock created (batched)",
+        block_label=log_label,
+        prompt_branch_eval_id=prompt_branch_eval_id,
+        num_conditions=len(branches),
+        extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+        has_browser_session=browser_session_id is not None,
+        has_any_pure_natlang=has_any_pure_natlang,
+        has_context=context_json is not None,
+    )
+
+    try:
+        extraction_result = await extraction_block.execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+
+        if not extraction_result.success:
+            LOG.error(
+                "Conditional branch ExtractionBlock failed",
+                block_label=log_label,
+                failure_reason=extraction_result.failure_reason,
+            )
+            raise ValueError(
+                f"Branch evaluation failed: "
+                f"{extraction_result.failure_reason or 'Unknown error (no failure reason provided)'}"
+            )
+
+        if workflow_run_context:
+            try:
+                await extraction_block.record_output_parameter_value(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    value=extraction_result.output_parameter_value,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record conditional branch evaluation output",
+                    workflow_run_id=workflow_run_id,
+                    block_label=log_label,
+                    exc_info=True,
+                )
+
+        output_value = extraction_result.output_parameter_value
+
+        results_array: list[bool] = []
+        llm_rendered_expressions: list[str] = []
+
+        if isinstance(output_value, list):
+            output_value = {"evaluations": output_value}
+
+        if not isinstance(output_value, dict):
+            raise ValueError(f"Unexpected output format: {type(output_value)}")
+
+        raw_evaluations = _find_evaluations_array(output_value)
+
+        for idx, evaluation in enumerate(raw_evaluations):
+            bool_result, rendered_expr = _parse_single_evaluation(
+                evaluation=evaluation,
+                idx=idx,
+                fallback_rendered_expressions=rendered_expressions,
+            )
+            results_array.append(bool_result)
+            llm_rendered_expressions.append(rendered_expr)
+
+        LOG.info(
+            "Conditional branch evaluation results",
+            block_label=log_label,
+            results=results_array,
+            llm_rendered_expressions=llm_rendered_expressions,
+            raw_output=output_value,
+        )
+
+        if len(results_array) != len(branches):
+            raise ValueError(
+                f"Conditional branch evaluation returned {len(results_array)} results for {len(branches)} branches"
+            )
+
+        return (results_array, llm_rendered_expressions, extraction_goal, output_value)
+
+    except Exception as exc:
+        LOG.error(
+            "Conditional branch evaluation failed",
+            block_label=log_label,
+            error=str(exc),
+            exc_info=True,
+        )
+        raise ValueError(f"Conditional branch evaluation failed: {str(exc)}") from exc
+
+
 class ConditionalBlock(Block):
     """Branching block that selects the next block label based on list-ordered conditions."""
 
@@ -6303,235 +7444,17 @@ class ConditionalBlock(Block):
             - extraction_goal: The prompt sent to the LLM (for UI display)
             - llm_response: The raw LLM response for debugging
         """
-        if organization_id is None:
-            raise ValueError("organization_id is required to evaluate natural language branches")
-
-        if not branches:
-            return ([], [], None, None)
-
-        workflow_run_context = evaluation_context.workflow_run_context
-
-        # Step 1: Pre-render all expressions (resolve any Jinja {{ }} parts)
-        rendered_expressions: list[str] = []
-        has_any_pure_natlang = False
-
-        for idx, branch in enumerate(branches):
-            expression = branch.criteria.expression if branch.criteria else ""
-            has_jinja = "{{" in expression
-
-            if has_jinja:
-                try:
-                    rendered_expression = (
-                        evaluation_context.template_renderer(expression)
-                        if evaluation_context.template_renderer
-                        else expression
-                    )
-                except Exception as render_exc:
-                    LOG.error(
-                        "Conditional branch expression rendering FAILED",
-                        block_label=self.label,
-                        branch_index=idx,
-                        original_expression=expression,
-                        error=str(render_exc),
-                        exc_info=True,
-                    )
-                    rendered_expression = expression
-                    # Rendering failed, so this expression is effectively unresolved and must
-                    # take the ExtractionBlock path (with context) instead of direct LLM mode.
-                    has_any_pure_natlang = True
-                else:
-                    # When a Jinja variable resolves to an empty string the rendered
-                    # expression becomes malformed (e.g. "if  is not empty") and the
-                    # LLM cannot reason about emptiness correctly.  Replace empty gaps
-                    # with an explicit "(empty value)" marker so the intent is clear.
-                    rendered_expression, was_patched = _make_empty_params_explicit(expression, rendered_expression)
-                    if was_patched:
-                        LOG.info(
-                            "Conditional branch expression patched for empty parameter(s)",
-                            workflow_run_id=workflow_run_id,
-                            block_label=self.label,
-                            branch_index=idx,
-                            original_expression=expression,
-                            patched_expression=rendered_expression,
-                        )
-            else:
-                rendered_expression = expression
-                has_any_pure_natlang = True
-
-            LOG.info(
-                "Conditional branch expression rendering",
-                block_label=self.label,
-                branch_index=idx,
-                original_expression=expression,
-                rendered_expression=rendered_expression,
-                has_jinja=has_jinja,
-                expression_changed=expression != rendered_expression,
-            )
-
-            rendered_expressions.append(rendered_expression)
-
-        # Step 2: Build extraction goal with all conditions
-        # Include context only if there are pure NatLang expressions that need variable resolution
-        if has_any_pure_natlang:
-            context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
-            context_json = json.dumps(context_snapshot, default=str)
-        else:
-            context_json = None
-
-        extraction_goal = prompt_engine.load_prompt(
-            "conditional-prompt-branch-evaluation",
-            conditions=rendered_expressions,
-            context_json=context_json,
-        )
-
-        # Step 3: Build schema for array of evaluation results
-        # Order matters: reasoning -> result (chain-of-thought)
-        data_schema = {
-            "type": "object",
-            "properties": {
-                "evaluations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "reasoning": {
-                                "type": "string",
-                                "description": "Explanation of the reasoning behind evaluating the condition.",
-                            },
-                            "result": {
-                                "type": "boolean",
-                                "description": "TRUE if the condition is satisfied, FALSE otherwise.",
-                            },
-                        },
-                        "required": ["reasoning", "result"],
-                    },
-                    "description": "Array of evaluation results for each condition in the same order.",
-                    "minItems": len(branches),
-                    "maxItems": len(branches),
-                }
-            },
-            "required": ["evaluations"],
-        }
-
-        # Step 4: Create and execute single ExtractionBlock.
-        # Always pass the browser_session_id so page-referencing conditions
-        # (e.g. "the date on the page matches X") can see the screenshot.
-        # The prompt template instructs the LLM to only use page content
-        # when the condition explicitly references the page, and to evaluate
-        # self-contained conditions purely from the expression text.
-        # NOTE: The previous approach of setting browser_session_id=None for
-        # Jinja-rendered expressions (SKY-7985) was ineffective because
-        # BaseTaskBlock.execute() finds the browser via workflow_run_id cache
-        # regardless of browser_session_id.
-
-        output_param = OutputParameter(
-            output_parameter_id=str(uuid.uuid4()),
-            key=f"conditional_branch_eval_{generate_random_string()}",
+        return await _evaluate_prompt_branch_conditions_batch(
+            log_label=self.label,
+            branches=branches,
+            evaluation_context=evaluation_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
             workflow_id=self.output_parameter.workflow_id,
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-            parameter_type=ParameterType.OUTPUT,
-            description=f"Conditional branch evaluation results ({len(branches)} conditions)",
+            extraction_description_suffix=f"{len(branches)} conditions",
         )
-        extraction_block = ExtractionBlock(
-            label=f"conditional_branch_eval_{generate_random_string()}",
-            data_extraction_goal=extraction_goal,
-            data_schema=data_schema,
-            output_parameter=output_param,
-        )
-
-        LOG.info(
-            "Conditional branch ExtractionBlock created (batched)",
-            block_label=self.label,
-            num_conditions=len(branches),
-            extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-            has_browser_session=browser_session_id is not None,
-            has_any_pure_natlang=has_any_pure_natlang,
-            has_context=context_json is not None,
-        )
-
-        try:
-            extraction_result = await extraction_block.execute(
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-            )
-
-            if not extraction_result.success:
-                LOG.error(
-                    "Conditional branch ExtractionBlock failed",
-                    block_label=self.label,
-                    failure_reason=extraction_result.failure_reason,
-                )
-                raise ValueError(
-                    f"Branch evaluation failed: "
-                    f"{extraction_result.failure_reason or 'Unknown error (no failure reason provided)'}"
-                )
-
-            if workflow_run_context:
-                try:
-                    await extraction_block.record_output_parameter_value(
-                        workflow_run_context=workflow_run_context,
-                        workflow_run_id=workflow_run_id,
-                        value=extraction_result.output_parameter_value,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to record conditional branch evaluation output",
-                        workflow_run_id=workflow_run_id,
-                        block_label=self.label,
-                        exc_info=True,
-                    )
-
-            output_value = extraction_result.output_parameter_value
-
-            # Step 5: Extract the evaluation results (reasoning + result)
-            results_array: list[bool] = []
-            llm_rendered_expressions: list[str] = []
-
-            if isinstance(output_value, list):
-                output_value = {"evaluations": output_value}
-
-            if not isinstance(output_value, dict):
-                raise ValueError(f"Unexpected output format: {type(output_value)}")
-
-            # Find evaluations array from LLM output (handles ExtractionBlock nesting)
-            raw_evaluations = _find_evaluations_array(output_value)
-
-            # Parse each evaluation to extract result (rendered expression comes from Jinja pre-rendering)
-            for idx, evaluation in enumerate(raw_evaluations):
-                bool_result, rendered_expr = _parse_single_evaluation(
-                    evaluation=evaluation,
-                    idx=idx,
-                    fallback_rendered_expressions=rendered_expressions,
-                )
-                results_array.append(bool_result)
-                llm_rendered_expressions.append(rendered_expr)
-
-            LOG.info(
-                "Conditional branch evaluation results",
-                block_label=self.label,
-                results=results_array,
-                llm_rendered_expressions=llm_rendered_expressions,
-                raw_output=output_value,
-            )
-
-            if len(results_array) != len(branches):
-                raise ValueError(
-                    f"Prompt branch evaluation returned {len(results_array)} results for {len(branches)} branches"
-                )
-
-            return (results_array, llm_rendered_expressions, extraction_goal, output_value)
-
-        except Exception as exc:
-            LOG.error(
-                "Conditional branch prompt evaluation failed",
-                block_label=self.label,
-                error=str(exc),
-                exc_info=True,
-            )
-            raise ValueError(f"Prompt branch evaluation failed: {str(exc)}") from exc
 
     async def execute(  # noqa: D401
         self,
@@ -6878,20 +7801,37 @@ class WorkflowTriggerBlock(Block):
             )
         return rendered
 
+    def _render_scalar_with_path(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+        path: str,
+    ) -> Any:
+        # Wrap render errors with JSON-pointer-style payload path + template so
+        # the failure reason surfaces where to look in the workflow.
+        try:
+            return self._render_template_value(value, workflow_run_context)
+        except PayloadTemplateRenderError:
+            raise
+        except Exception as exc:
+            raise PayloadTemplateRenderError(path=path, template=value, original=exc) from exc
+
     def _render_templates_in_payload(
         self,
         payload: dict[str, Any],
         workflow_run_context: WorkflowRunContext,
+        _path: str = "payload",
     ) -> dict[str, Any]:
         """Recursively render Jinja2 templates in payload values."""
         resolved: dict[str, Any] = {}
         for key, value in payload.items():
+            current_path = f"{_path}{_format_payload_path_segment(key)}"
             if isinstance(value, str):
-                resolved[key] = self._render_template_value(value, workflow_run_context)
+                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path)
             elif isinstance(value, dict):
-                resolved[key] = self._render_templates_in_payload(value, workflow_run_context)
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path)
             elif isinstance(value, list):
-                resolved[key] = self._render_templates_in_list(value, workflow_run_context)
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path)
             else:
                 resolved[key] = value
         return resolved
@@ -6900,19 +7840,49 @@ class WorkflowTriggerBlock(Block):
         self,
         items: list[Any],
         workflow_run_context: WorkflowRunContext,
+        _path: str = "payload",
     ) -> list[Any]:
         """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
         result: list[Any] = []
-        for item in items:
+        for idx, item in enumerate(items):
+            current_path = f"{_path}[{idx}]"
             if isinstance(item, str):
-                result.append(self._render_template_value(item, workflow_run_context))
+                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path))
             elif isinstance(item, dict):
-                result.append(self._render_templates_in_payload(item, workflow_run_context))
+                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path))
             elif isinstance(item, list):
-                result.append(self._render_templates_in_list(item, workflow_run_context))
+                result.append(self._render_templates_in_list(item, workflow_run_context, current_path))
             else:
                 result.append(item)
         return result
+
+    def validate_payload_templates(self) -> None:
+        """Parse-check every Jinja2 template in self.payload at workflow save time.
+
+        Walks the payload mirroring _render_templates_in_payload so paths match the
+        runtime PayloadTemplateRenderError format. On TemplateSyntaxError raises
+        PayloadTemplateSyntaxError with block label, JSON-pointer key path, and
+        the offending template string.
+        """
+        if not self.payload:
+            return
+
+        def _walk(value: Any, path: str) -> None:
+            if isinstance(value, dict):
+                for key, sub in value.items():
+                    _walk(sub, f"{path}{_format_payload_path_segment(key)}")
+            elif isinstance(value, list):
+                for idx, sub in enumerate(value):
+                    _walk(sub, f"{path}[{idx}]")
+            elif isinstance(value, str):
+                try:
+                    jinja_sandbox_env.parse(value)
+                except TemplateSyntaxError as exc:
+                    raise PayloadTemplateSyntaxError(
+                        block_label=self.label, path=path, template=value, original=exc
+                    ) from exc
+
+        _walk(self.payload, "payload")
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
@@ -7035,6 +8005,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                 )
             ):
                 try:
@@ -7044,6 +8015,7 @@ class WorkflowTriggerBlock(Block):
                         workflow_permanent_id=resolved_workflow_permanent_id,
                         organization=organization,
                         parent_workflow_run_id=workflow_run_id,
+                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                     )
                 except Exception as e:
                     error_msg = get_user_facing_exception_message(e)
@@ -7059,6 +8031,9 @@ class WorkflowTriggerBlock(Block):
                 )
 
                 try:
+                    # The opt-out flag is persisted on the child's workflow_run row at
+                    # spawn time (setup_workflow_run above), so execute_workflow reads
+                    # it from the DB. This works identically for sync and async triggers.
                     final_run = await app.WORKFLOW_SERVICE.execute_workflow(
                         workflow_run_id=triggered_run_id,
                         api_key=None,
@@ -7126,6 +8101,12 @@ class WorkflowTriggerBlock(Block):
                 browser_session_id=resolved_browser_session_id,
             )
             try:
+                # ``run_workflow`` persists this flag to the child's
+                # workflow_run row via its internal setup_workflow_run call,
+                # then dispatches to Temporal without passing the flag
+                # separately; the worker reads it back from the DB inside
+                # ``execute_workflow``. Symmetric with the sync branch above
+                # — the flag is written once, at spawn time, for both paths.
                 triggered_workflow_run = await run_workflow(
                     workflow_id=resolved_workflow_permanent_id,
                     organization=organization,
@@ -7133,6 +8114,7 @@ class WorkflowTriggerBlock(Block):
                     request=None,
                     background_tasks=None,
                     parent_workflow_run_id=workflow_run_id,
+                    ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                 )
             except Exception as e:
                 error_msg = get_user_facing_exception_message(e)
@@ -7169,8 +8151,8 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
 
-    At time of writing, blocks can be nested via the ForLoop block. This function
-    returns all blocks, flattened.
+    Blocks can be nested via ForLoop and WhileLoop blocks. This function returns
+    all blocks, flattened.
     """
 
     all_blocks: list[BlockTypeVar] = []
@@ -7178,7 +8160,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     for block in blocks:
         all_blocks.append(block)
 
-        if block.block_type == BlockType.FOR_LOOP:
+        if block.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
             nested_blocks = get_all_blocks(block.loop_blocks)
             all_blocks.extend(nested_blocks)
 
@@ -7194,6 +8176,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
 BlockSubclasses = Union[
     ConditionalBlock,
     ForLoopBlock,
+    WhileLoopBlock,
     TaskBlock,
     CodeBlock,
     TextPromptBlock,

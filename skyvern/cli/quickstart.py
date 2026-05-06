@@ -12,6 +12,7 @@ from rich.prompt import Confirm
 from skyvern.analytics import capture_setup_error, capture_setup_event
 
 # Import console after skyvern.cli to ensure proper initialization
+from skyvern.cli.browser import _open_chrome_inspect
 from skyvern.cli.console import console
 from skyvern.cli.init_command import init_env  # init is used directly
 from skyvern.cli.llm_setup import setup_llm_providers
@@ -108,6 +109,15 @@ def run_docker_compose_setup() -> None:
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
     setup_llm_providers()
 
+    # Ensure frontend .env exists (docker-compose.yml references it via env_file)
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        import shutil
+
+        shutil.copy(frontend_example, frontend_env)
+        console.print("✅ [green]Created skyvern-frontend/.env from .env.example[/green]")
+
     # Run docker compose up
     console.print("\n[bold blue]Step 2: Starting Docker Compose...[/bold blue]")
     with Progress(
@@ -133,14 +143,58 @@ def run_docker_compose_setup() -> None:
             console.print(f"[bold red]Error starting Docker Compose: {e.stderr}[/bold red]")
             raise typer.Exit(1)
 
-    console.print(
-        Panel(
-            "[bold green]Skyvern is now running![/bold green]\n\n"
-            "Navigate to [link]http://localhost:8080[/link] to start using the UI.\n\n"
-            "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
-            border_style="green",
+    from skyvern.cli.utils import wait_for_docker_services  # noqa: PLC0415
+
+    if wait_for_docker_services():
+        console.print(
+            Panel(
+                "[bold green]Skyvern is ready![/bold green]\n\n"
+                "Navigate to [link]http://localhost:8080[/link] to start using the UI.\n\n"
+                "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
+                border_style="green",
+            )
         )
+    else:
+        console.print(
+            Panel(
+                "[yellow]Services are still starting up.[/yellow]\n\n"
+                "Navigate to [link]http://localhost:8080[/link] once ready.\n"
+                "Run [cyan]docker compose logs -f[/cyan] to monitor progress.\n\n"
+                "To stop Skyvern, run: [cyan]docker compose down[/cyan]",
+                border_style="yellow",
+            )
+        )
+
+    # Offer to set up "Control your own browser"
+    use_own_browser = Confirm.ask(
+        "\nWould you like to [bold yellow]control your own Chrome browser[/bold yellow] (use your cookies, logins, and extensions)?",
+        default=False,
     )
+    if use_own_browser:
+        console.print(
+            Panel(
+                "[bold]Enable Remote Debugging in Chrome[/bold]\n\n"
+                "1. We'll open [cyan]chrome://inspect/#remote-debugging[/cyan] in your browser\n"
+                "2. Click [bold]Enable[/bold] to start the debugging server\n"
+                "3. You should see: [green]Server running at: 127.0.0.1:9222[/green]",
+                border_style="cyan",
+            )
+        )
+        open_page = Confirm.ask("Open chrome://inspect/#remote-debugging now?", default=True)
+        if open_page:
+            _open_chrome_inspect()
+        confirmed = Confirm.ask("Have you enabled remote debugging in Chrome?", default=False)
+        if confirmed:
+            from skyvern.cli.llm_setup import update_or_add_env_var
+
+            update_or_add_env_var("BROWSER_TYPE", "cdp-connect")
+            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", "http://host.docker.internal:9222/")
+            console.print("✅ [green]Browser debugging configured in .env. Restart with:[/green]")
+            console.print("  [cyan]docker compose up -d[/cyan]")
+        else:
+            console.print(
+                "[yellow]No problem — you can enable it later by navigating to chrome://inspect/#remote-debugging in Chrome.[/yellow]"
+            )
 
 
 @quickstart_app.callback(invoke_without_command=True)

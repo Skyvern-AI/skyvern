@@ -226,10 +226,18 @@ async def new_debug_session(
                 )
             )
 
+    # Look up the workflow's proxy_location so the debug session browser
+    # uses the same proxy region the user configured on the workflow.
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    proxy_location = workflow.proxy_location or ProxyLocation.RESIDENTIAL
+
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=ProxyLocation.RESIDENTIAL,
+        proxy_location=proxy_location,
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(
@@ -249,6 +257,7 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
+        proxy_location=str(proxy_location),
     )
 
     return debug_session

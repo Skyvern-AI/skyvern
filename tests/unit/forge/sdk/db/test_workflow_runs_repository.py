@@ -42,6 +42,23 @@ class _SessionContext:
         return False
 
 
+class _EmptyExecuteResult:
+    def mappings(self) -> _EmptyExecuteResult:
+        return self
+
+    def all(self) -> list[Any]:
+        return []
+
+
+def _where_clause_sql(query: Any) -> str:
+    return str(query.whereclause.compile(compile_kwargs={"literal_binds": True}))
+
+
+def _assert_not_filtering_copilot_authored_workflows(where_clause: str) -> None:
+    assert "workflows.created_by" not in where_clause
+    assert "workflows.edited_by" not in where_clause
+
+
 @pytest.mark.asyncio
 async def test_batch_create_uses_add_all_flush_commit_not_refresh() -> None:
     """Batch insert should use add_all + flush + commit and never call refresh."""
@@ -164,17 +181,9 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
     `searchable_text` (which contains only title + url)."""
     captured: dict[str, Any] = {}
 
-    class _Result:
-        def mappings(self):
-            class _M:
-                def all(self_inner):
-                    return []
-
-            return _M()
-
     async def _execute(query):
         captured["query"] = query
-        return _Result()
+        return _EmptyExecuteResult()
 
     session = MagicMock()
     session.execute = AsyncMock(side_effect=_execute)
@@ -185,8 +194,135 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
 
     # Inspect the WHERE clause specifically — both columns are also in the SELECT
     # list, so a substring check on the full SQL would be a false positive.
-    where_clause = str(captured["query"].whereclause.compile(compile_kwargs={"literal_binds": True}))
+    where_clause = _where_clause_sql(captured["query"])
     assert "task_runs.run_id" in where_clause
-    assert "task_runs.workflow_permanent_id" in where_clause
+    # WPID search must match across both task_runs and the joined workflow_runs
+    # so legacy rows with task_runs.workflow_permanent_id=NULL still hit.
+    assert "coalesce(task_runs.workflow_permanent_id, workflow_runs.workflow_permanent_id)" in where_clause
     # autoescape rewrites '_' to e.g. '/_' so check the distinctive suffix.
     assert "abc123" in where_clause
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_selects_workflow_deleted_flag() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test")
+
+    rendered = str(captured["query"].compile(compile_kwargs={"literal_binds": True}))
+    assert "AS workflow_deleted" in rendered
+    # NOT EXISTS subquery against an active (non-deleted) workflows row.
+    assert "NOT (EXISTS" in rendered
+    assert "workflows.deleted_at IS NULL" in rendered
+    # WPID must coalesce task_runs over workflow_runs so legacy rows where
+    # task_runs.workflow_permanent_id is NULL still resolve via the join.
+    assert "coalesce(task_runs.workflow_permanent_id, workflow_runs.workflow_permanent_id)" in rendered
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_excludes_copilot_session_workflow_runs() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test")
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "workflow_runs.copilot_session_id IS NULL" in where_clause
+    _assert_not_filtering_copilot_authored_workflows(where_clause)
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_excludes_copilot_session_workflow_runs() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+    session.scalars = AsyncMock(return_value=_EmptyExecuteResult())
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs(organization_id="o_test")
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "workflow_runs.copilot_session_id IS NULL" in where_clause
+    _assert_not_filtering_copilot_authored_workflows(where_clause)
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_history_queries_exclude_copilot_session_runs() -> None:
+    captured_queries: list[Any] = []
+
+    async def _execute(query):
+        captured_queries.append(query)
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs(organization_id="o_test")
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+    )
+
+    assert len(captured_queries) == 2
+    for query in captured_queries:
+        where_clause = _where_clause_sql(query)
+        assert "workflow_runs.copilot_session_id IS NULL" in where_clause
+        _assert_not_filtering_copilot_authored_workflows(where_clause)
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_for_browser_session_filters_and_excludes() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_for_browser_session(
+        browser_session_id="pbs_abc123",
+        organization_id="o_test",
+        page=2,
+        page_size=5,
+    )
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "workflow_runs.browser_session_id = 'pbs_abc123'" in where_clause
+    assert "workflow_runs.organization_id = 'o_test'" in where_clause
+    assert "workflow_runs.parent_workflow_run_id IS NULL" in where_clause
+    assert "workflow_runs.copilot_session_id IS NULL" in where_clause
+    _assert_not_filtering_copilot_authored_workflows(where_clause)
+
+    rendered = str(captured["query"].compile(compile_kwargs={"literal_binds": True}))
+    assert "ORDER BY workflow_runs.created_at DESC" in rendered
+    assert "LIMIT 5" in rendered
+    assert "OFFSET 5" in rendered

@@ -40,6 +40,10 @@ Key derivation (shared with the cross-run tier):
       correctness if an intra-task second-step extraction happens.
     - llm_key — the caller's model override. Prevents stale hits when a user
       changes models to retune quality.
+    - workflow_system_prompt — the workflow's workflow_system_prompt (or None).
+      The prompt is sent to the LLM as the `system` message; changing it
+      changes the output even if all user-prompt inputs are identical, so two
+      calls that differ only in workflow_system_prompt must not collide.
 - Date is intentionally NOT in the key. Two calls on byte-identical page
   content are semantically the same extraction regardless of wall-clock
   date; relying on the content hash keeps hit rate up for scheduled
@@ -61,7 +65,6 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import structlog
-from selectolax.parser import HTMLParser
 
 LOG = structlog.get_logger()
 
@@ -280,51 +283,200 @@ def _canonical_url(url: str | None) -> str | None:
         return url
 
 
+# Raw-text element bodies are passed through verbatim; the canonicalizer must
+# not interpret their contents as HTML (e.g. textarea text containing literal
+# `<` or `>` would otherwise be tokenized as tags).
+_RAW_TEXT_ELEMENTS = frozenset({"script", "style", "textarea", "title"})
+
+# Pre-compiled close-tag matchers per raw-text element so `_walk_html` doesn't
+# rebuild the regex on every open tag.
+_RAW_TEXT_CLOSE_RES: dict[str, re.Pattern[str]] = {
+    name: re.compile(rf"</\s*{name}\s*>", re.IGNORECASE) for name in _RAW_TEXT_ELEMENTS
+}
+
+# Tag-name matcher (group 1 = name). Shared by `_canonicalize_tag` and `_walk_html`.
+_TAG_NAME_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9]*)")
+
+# Walks attribute tokens within a tag body. Quoted-value alternatives are
+# split by quote style so each alternative excludes only its own delimiter
+# (a double-quoted value can contain `'` and vice versa, per HTML spec).
+_ATTR_TOKEN_RE = re.compile(
+    r"\s+"
+    r"([a-zA-Z][a-zA-Z0-9_:-]*)"
+    r"(?:"
+    r"\s*=\s*"
+    r"(?:\"([^\"]*)\"|'([^']*)'|([^\s>\"']+))"
+    r")?",
+    re.IGNORECASE,
+)
+
+
+def _find_tag_end(html: str, start: int) -> int:
+    """Index of the `>` that closes the tag starting at `html[start] == '<'`,
+    respecting quoted attribute values. Returns -1 if no closing `>`.
+    """
+    i = start + 1
+    n = len(html)
+    while i < n:
+        c = html[i]
+        if c == '"':
+            j = html.find('"', i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+        elif c == "'":
+            j = html.find("'", i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+        elif c == ">":
+            return i
+        else:
+            i += 1
+    return -1
+
+
+def _canonicalize_tag(tag: str, tag_name: str) -> str:
+    """Rewrite suspect attributes and CSRF input/meta values inside one tag string."""
+    name_match = _TAG_NAME_RE.match(tag)
+    if not name_match:
+        return tag
+    body = tag[name_match.end() :]
+
+    name_attr_value = ""
+    if tag_name in ("input", "meta"):
+        for am in _ATTR_TOKEN_RE.finditer(body):
+            if am.group(1).lower() == "name":
+                name_attr_value = (am.group(2) or am.group(3) or am.group(4) or "").lower()
+                break
+    is_csrf_input = tag_name == "input" and name_attr_value in _CSRF_INPUT_NAMES
+    is_csrf_meta = tag_name == "meta" and name_attr_value in _CSRF_META_NAMES
+
+    def _rewrite_attr(am: re.Match) -> str:
+        full = am.group(0)
+        attr_name = am.group(1).lower()
+        if am.group(2) is not None:
+            value, quote = am.group(2), '"'
+        elif am.group(3) is not None:
+            value, quote = am.group(3), "'"
+        elif am.group(4) is not None:
+            value, quote = am.group(4), ""
+        else:
+            return full
+
+        if attr_name in _SUSPECT_ATTR_NAMES:
+            new_value = _redact_transient_in_value(value)
+        elif attr_name == "value" and is_csrf_input:
+            new_value = ""
+        elif attr_name == "content" and is_csrf_meta:
+            new_value = ""
+        else:
+            return full
+
+        ws = full[: len(full) - len(full.lstrip())]
+        if quote:
+            return f"{ws}{am.group(1)}={quote}{new_value}{quote}"
+        return f"{ws}{am.group(1)}={new_value}"
+
+    return tag[: name_match.end()] + _ATTR_TOKEN_RE.sub(_rewrite_attr, body)
+
+
+def _walk_html(html: str) -> str:
+    """Walk HTML producing a canonicalized copy. Tag-boundary aware (respects
+    quoted attribute values), raw-text aware (script/style/textarea/title
+    bodies pass through verbatim).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(html)
+    while i < n:
+        if html[i] != "<":
+            j = html.find("<", i)
+            if j < 0:
+                out.append(html[i:])
+                break
+            out.append(html[i:j])
+            i = j
+            continue
+
+        if html.startswith("<!--", i):
+            end = html.find("-->", i + 4)
+            if end < 0:
+                out.append(html[i:])
+                break
+            out.append(html[i : end + 3])
+            i = end + 3
+            continue
+        if html.startswith("<![CDATA[", i):
+            end = html.find("]]>", i + 9)
+            if end < 0:
+                out.append(html[i:])
+                break
+            out.append(html[i : end + 3])
+            i = end + 3
+            continue
+        if html.startswith("<!", i) or html.startswith("<?", i):
+            end = html.find(">", i + 2)
+            if end < 0:
+                out.append(html[i:])
+                break
+            out.append(html[i : end + 1])
+            i = end + 1
+            continue
+        if html.startswith("</", i):
+            end = _find_tag_end(html, i)
+            if end < 0:
+                out.append(html[i:])
+                break
+            out.append(html[i : end + 1])
+            i = end + 1
+            continue
+        if i + 1 < n and html[i + 1].isalpha():
+            end = _find_tag_end(html, i)
+            if end < 0:
+                out.append(html[i:])
+                break
+            tag = html[i : end + 1]
+            tn_match = _TAG_NAME_RE.match(tag)
+            tag_name = tn_match.group(1).lower() if tn_match else ""
+            out.append(_canonicalize_tag(tag, tag_name))
+            i = end + 1
+            if tag_name in _RAW_TEXT_ELEMENTS and not tag.endswith("/>"):
+                close_re = _RAW_TEXT_CLOSE_RES[tag_name]
+                cm = close_re.search(html, i)
+                if cm:
+                    out.append(html[i : cm.start()])
+                    out.append(cm.group(0))
+                    i = cm.end()
+                else:
+                    out.append(html[i:])
+                    i = n
+            continue
+        out.append(html[i])
+        i += 1
+    return "".join(out)
+
+
 def _canonical_element_tree(html: str | None) -> str | None:
     """Return a canonicalized HTML string for cache-key derivation.
 
-    Redacts UUID-v4 / random-hex-suffix substrings within identifier-style
-    attribute values (id/for/aria-*/data-testid) and zeros CSRF-token
-    <input>/<meta> contents. Stable business IDs (``id='submit-button'``,
-    ``id='order-123456'``) and semantic fields (``class``, ``href``, ``src``,
-    ``name``, text content, document structure) are preserved.
+    Redacts UUID-v4 / random-hex-suffix substrings inside id/for/aria-
+    labelledby/aria-describedby/data-testid values; zeros CSRF-token
+    <input>/<meta> contents. Other attributes and text content are preserved.
 
-    Never raises. Returns the input unchanged if parsing fails.
+    No-longer-normalized vs. the prior parser round-trip (SKY-9535 supersedes):
+    whitespace inside tags, attribute order, attribute quote style, attribute-
+    name case, tag-name case. Never raises.
     """
     if html is None:
         return None
     if html == "":
         return ""
     try:
-        tree = HTMLParser(html)
-        for node in tree.root.traverse(include_text=False):
-            if not node.attributes:
-                continue
-            tag = node.tag
-
-            # CSRF scrubbing reads `name` before the sentinel pass so it is
-            # always available regardless of _SUSPECT_ATTR_NAMES membership.
-            if tag == "input":
-                input_name = (node.attributes.get("name", "") or "").lower()
-                if input_name in _CSRF_INPUT_NAMES:
-                    node.attrs["value"] = ""
-            elif tag == "meta":
-                meta_name = (node.attributes.get("name", "") or "").lower()
-                if meta_name in _CSRF_META_NAMES:
-                    node.attrs["content"] = ""
-
-            # Pattern-based value redaction inside suspect attributes: UUIDs
-            # and random hex suffixes collapse; stable business IDs survive.
-            for attr_name in list(node.attributes.keys()):
-                if attr_name.lower() in _SUSPECT_ATTR_NAMES:
-                    current_val = node.attributes.get(attr_name) or ""
-                    node.attrs[attr_name] = _redact_transient_in_value(current_val)
-
-        # selectolax's html property returns the full serialized tree
-        return tree.html or html
+        return _walk_html(html)
     except Exception:
-        # WARNING rather than DEBUG so a transient parser regression surfaces
-        # in Datadog instead of silently degrading cache hits.
+        # WARNING (not DEBUG) so a transient regression surfaces in Datadog
+        # rather than silently degrading cache hits.
         LOG.warning("canonical_element_tree_failed", exc_info=True)
         return html
 
@@ -353,6 +505,7 @@ def compute_cache_key(
     error_code_mapping: Any = None,
     previous_extracted_information: Any = None,
     llm_key: str | None = None,
+    workflow_system_prompt: str | None = None,
 ) -> str:
     """Return a stable sha256 hex digest for the inputs that affect extraction output.
 
@@ -391,6 +544,7 @@ def compute_cache_key(
         _normalize(error_code_mapping),
         _normalize(previous_extracted_information),
         _s(llm_key),
+        _s(workflow_system_prompt),
     ]
     joined = "\x1f".join(parts).encode("utf-8", errors="replace")
     return hashlib.sha256(joined).hexdigest()

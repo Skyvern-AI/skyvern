@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.webeye.actions.actions import Action
@@ -439,6 +440,19 @@ class AgentFunction:
     Cloud overrides this to True and provides the Temporal-backed implementations below.
     """
 
+    # Phrases that indicate a magic-link confirmation page meant to be closed.
+    # Keep lowercase; matching is case-insensitive.
+    MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (
+        "close this page",
+        "close this tab",
+        "close this window",
+        "you can close",
+        "you may now close",
+        "safe to close",
+        "return to the original page",
+        "return to the original tab",
+    )
+
     def get_mcp_oauth_issuer_url(self) -> str | None:
         """Return the cloud OAuth issuer URL when the build provides one.
 
@@ -463,6 +477,22 @@ class AgentFunction:
         cloud modules from the OSS-synced ``skyvern/`` tree.
         """
         return AgentDB(database_string, debug_enabled=debug_enabled)
+
+    def resolve_mcp_oauth_org_lookups(self, db: object) -> tuple[Any, Any] | None:
+        """Return ``(get_organization_entities, get_valid_org_auth_token)`` callables
+        bound to the cloud DB's nested organizations repository.
+
+        OSS no-op — the OSS path in ``_get_oauth_org_auth_methods`` probes the
+        flat shape directly. Cloud overrides this to expose the
+        ``CloudAgentDB.organizations`` repository's methods so the OSS-synced
+        ``mcp_http_auth`` module doesn't need to know about cloud-specific
+        DB layout.
+        """
+        return None
+
+    async def resolve_org_api_key(self, organization_id: str) -> str | None:
+        """Return an org-scoped API key; returns None in the base implementation."""
+        return None
 
     async def validate_step_execution(
         self,
@@ -521,7 +551,74 @@ class AgentFunction:
         return None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
-        return
+        if step.status == StepStatus.completed:
+            await self._maybe_close_magic_link_page(task)
+
+    async def _maybe_close_magic_link_page(self, task: Task) -> None:
+        """Close a magic-link confirmation page if it shows close/return signals.
+
+        Some magic-link flows open a new tab for verification.
+        After the user clicks "Allow", the page says "close this page and return
+        to the original page".  The LLM may miss the CLOSE_PAGE action, leaving
+        the tab open.  This fallback detects such confirmation pages and closes
+        them so subsequent workflow blocks see the original page.
+        """
+        context = skyvern_context.current()
+        if not context:
+            return
+
+        if not context.has_magic_link_page(task.task_id):
+            return
+
+        page = context.magic_link_pages[task.task_id]
+
+        try:
+            visible_text = (await page.inner_text("body", timeout=5000)).lower()
+        except Exception:
+            LOG.warning(
+                "Failed to read magic link page content, skipping auto-close",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+
+        matched_signal = next(
+            (signal for signal in self.MAGIC_LINK_CLOSE_SIGNALS if signal in visible_text),
+            None,
+        )
+        if matched_signal is None:
+            LOG.debug(
+                "Magic link page does not contain close signals, keeping open",
+                task_id=task.task_id,
+                page_url=page.url,
+            )
+            return
+
+        LOG.info(
+            "Magic link confirmation page detected, auto-closing",
+            task_id=task.task_id,
+            page_url=page.url,
+            matched_signal=matched_signal,
+        )
+        try:
+            async with asyncio.timeout(5):
+                await page.close()
+        except Exception:
+            # Intentionally keep the stale reference so the next completed step
+            # retries the close.  Eventually page.is_closed() will return True
+            # and the entry will be cleaned up at the top of this method.
+            LOG.warning(
+                "Failed to close magic link page, will retry on next step",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+
+        context.magic_link_pages.pop(task.task_id, None)
+        LOG.info(
+            "Magic link page closed successfully",
+            task_id=task.task_id,
+        )
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
@@ -611,12 +708,32 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
     ) -> str | None:
-        """Get a Google Sheets access token for the given credential.
+        """Mint a Google Sheets access token from the stored refresh token.
 
-        Returns None in OSS. Cloud override uses the OAuth service to
-        decrypt the stored refresh token and exchange it for an access token.
+        Returns None on any failure so callers can surface a reconnect prompt
+        instead of crashing. Cloud overrides this with an access-token cache
+        on top of the same backend.
         """
-        return None
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return await google_oauth_service.access_token_from_secrets(secrets)
+        except google_oauth_service.EncryptionNotConfiguredError:
+            LOG.error(
+                "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+        except Exception:
+            LOG.exception(
+                "Failed to get Google Sheets credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
 
     async def get_google_workspace_credentials(
         self,
@@ -624,8 +741,40 @@ class AgentFunction:
         credential_id: str,
         required_scopes: list[str] | None = None,
     ) -> object | None:
-        """OSS no-op; cloud override returns a refreshed google.oauth2.credentials.Credentials or None."""
-        return None
+        """Return a refreshed ``google.oauth2.credentials.Credentials``, or None on failure.
+
+        ``required_scopes`` is accepted for forward-compat with cloud overrides
+        that may enforce scope checks; the OSS path does not yet use it.
+        """
+        if required_scopes:
+            # Debug-level so OSS operators don't see this on every call; scope
+            # enforcement lives on the cloud override and a future caller can
+            # grep for this message if they need to audit usage.
+            LOG.debug(
+                "required_scopes ignored by OSS get_google_workspace_credentials; cloud override gates this",
+                required_scopes=required_scopes,
+                credential_id=credential_id,
+            )
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return await google_oauth_service.credentials_from_secrets(secrets)
+        except google_oauth_service.EncryptionNotConfiguredError:
+            LOG.error(
+                "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+        except Exception:
+            LOG.exception(
+                "Failed to get Google Workspace credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
 
     async def ensure_sheet_tab(
         self,
@@ -758,9 +907,7 @@ class AgentFunction:
 
                 element_cnt += 1
                 if element_cnt == MAX_ELEMENT_CNT:
-                    LOG.warning(
-                        f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element."
-                    )
+                    LOG.debug(f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element.")
                 disable_conversion = element_cnt > MAX_ELEMENT_CNT
                 if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None or not settings.ENABLE_CSS_SVG_PARSING:
                     disable_conversion = True

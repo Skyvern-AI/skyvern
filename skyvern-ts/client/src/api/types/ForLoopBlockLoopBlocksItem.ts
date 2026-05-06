@@ -26,6 +26,7 @@ export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.UploadToS3
     | Skyvern.ForLoopBlockLoopBlocksItem.Validation
     | Skyvern.ForLoopBlockLoopBlocksItem.Wait
+    | Skyvern.ForLoopBlockLoopBlocksItem.WhileLoop
     | Skyvern.ForLoopBlockLoopBlocksItem.WorkflowTrigger;
 
 export namespace ForLoopBlockLoopBlocksItem {
@@ -119,6 +120,10 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface Wait extends Skyvern.WaitBlock {
         block_type: "wait";
+    }
+
+    export interface WhileLoop extends Skyvern.WhileLoopBlock {
+        block_type: "while_loop";
     }
 
     export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlock {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from agents.run import Runner
 
-from skyvern.forge.sdk.copilot.failure_tracking import normalize_failure_reason
+from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -31,19 +32,36 @@ MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
+# Stops the suspicious-success nudge from re-firing forever when the agent has
+# correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
+# longer willing to re-run extraction.
+MAX_SUSPICIOUS_SUCCESS_NUDGES = 2
 # Escalate after this many consecutive all-null extraction runs so the agent
 # inspects browser state instead of re-prompting the extractor.
 NULL_DATA_STREAK_ESCALATE_AT = 2
 # Streak levels for repeated-failure (same frontier + same failure signature).
 REPEATED_FRONTIER_STREAK_ESCALATE_AT = 2
 REPEATED_FRONTIER_STREAK_STOP_AT = 3
+# Stop after this many consecutive runs where navigation succeeded but the
+# scraper could not read the page. Aligned with MAX_FAILED_TEST_NUDGES so the
+# copilot gets one generic retry nudge, then stops on the second occurrence.
+PROBABLE_SITE_BLOCK_STREAK_STOP_AT = 2
+# Caps how many times the stop nudge can re-fire — without this, the streak
+# stays latched while no new test runs reset it and every subsequent turn
+# re-injects the same nudge until MAX_ITERATIONS. Independent of
+# PROBABLE_SITE_BLOCK_STREAK_STOP_AT (both default to 2 but tune different
+# axes: streak depth vs nudge count).
+MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
+# Caps how many times the per-tool-budget split nudge can fire. After two
+# trips the agent should already be at single-block granularity; further
+# trips fall through to the repeated-frontier escalation path.
+MAX_PER_TOOL_BUDGET_NUDGES = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 600
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
 # already prevent individual branches from looping; this stops a brand-new
 # enforcement rule that forgets its own counter from spinning within 600s.
 MAX_ITERATIONS = 50
-
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
@@ -219,6 +237,39 @@ POST_PARAMETER_BINDING_STOP_NUDGE = (
     "same parameter-binding drift."
 )
 
+POST_PER_TOOL_BUDGET_NUDGE = (
+    "STOP — your last update_and_run_blocks call exceeded the per-tool-call "
+    "time budget while still making progress. This is NOT a site failure or "
+    "a wording problem — the chain you submitted is too long to complete in a "
+    "single tool call.\n"
+    "Do NOT retry the same chain. Do NOT change navigation_goal wording or "
+    "selectors hoping it will run faster.\n"
+    "1. Shrink the requested block_labels list to the first 1-2 unverified "
+    "blocks. The verified-prefix optimization will replay any earlier blocks "
+    "from cached state without re-running the browser, so passing a smaller "
+    "frontier is cheap.\n"
+    "2. Test that smaller frontier with update_and_run_blocks. If it succeeds, "
+    "extend by one block at a time on subsequent calls.\n"
+    "3. If your workflow only has 1-2 blocks and one block is still hitting "
+    "the budget, the single block is too ambitious — either narrow its "
+    "navigation_goal scope, or reply with a blocker explanation."
+)
+
+POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
+    "STOP — the target site has failed to scrape on every attempt across "
+    "multiple workflow shapes. Every run navigated successfully but the "
+    'scraper could not read the page ("failed to load the website" / '
+    '"page may have navigated unexpectedly"). This pattern indicates the '
+    "site is either blocking automated access, genuinely unresponsive in "
+    "this environment, or rendering content Skyvern cannot read reliably.\n"
+    "Do NOT retry with another workflow variation. Do NOT call "
+    "update_and_run_blocks or run_blocks_and_collect_debug again.\n"
+    "Reply to the user now: state that the site could not be loaded after "
+    "multiple attempts, quote the last failure_reason verbatim, and ask "
+    "whether to try a different URL, configure a proxy, or provide an "
+    "alternate entry point."
+)
+
 POST_ANTI_BOT_FAILED_TEST_NUDGE = (
     "STOP — your last test run failed due to an anti-bot/WAF block "
     "(Access Denied, Cloudflare, Akamai, etc.).\n"
@@ -258,6 +309,15 @@ def _is_progress_narration(user_response: Any) -> bool:
 
 class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
+
+
+def _mark_copilot_total_timeout(ctx: Any) -> None:
+    ctx.copilot_total_timeout_exceeded = True
+
+
+def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float) -> None:
+    if time.monotonic() - start_time >= TOTAL_TIMEOUT_SECONDS:
+        _mark_copilot_total_timeout(ctx)
 
 
 class CopilotNonRetriableNavError(Exception):
@@ -425,7 +485,24 @@ def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     # to the dedicated stop path rather than competing for the nudge slot.
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
         return False
-    return bool(getattr(ctx, "last_test_suspicious_success", False))
+    if not getattr(ctx, "last_test_suspicious_success", False):
+        return False
+    nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0)
+    return nudge_count < MAX_SUSPICIOUS_SUCCESS_NUDGES
+
+
+def _needs_per_tool_budget_nudge(ctx: Any) -> bool:
+    if getattr(ctx, "last_failure_category_top", None) != PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        return False
+    return _get_int(ctx, "per_tool_budget_nudge_count") < MAX_PER_TOOL_BUDGET_NUDGES
+
+
+def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
+    """Return True when the site-block-wall streak has reached the stop level
+    AND the per-streak nudge cap has not been exhausted."""
+    if _get_int(ctx, "probable_site_block_streak_count") < PROBABLE_SITE_BLOCK_STREAK_STOP_AT:
+        return False
+    return _get_int(ctx, "probable_site_block_stop_nudge_count") < MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
 
 
 def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
@@ -452,6 +529,11 @@ def _repeated_frontier_failure_nudge(ctx: Any) -> str | None:
     # Non-retriable nav errors get their own dedicated stop path; don't let a
     # repeated-frontier nudge smuggle different retry advice past the gate.
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return None
+    # Defer to the probable-site-block stop path once the wall has been
+    # confirmed across ≥ PROBABLE_SITE_BLOCK_STREAK_STOP_AT shape-independent
+    # attempts — at that point "try yet another shape" is empirically wrong.
+    if _get_int(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT:
         return None
     streak = _get_int(ctx, "repeated_failure_streak_count")
     emitted = _get_int(ctx, "repeated_failure_nudge_emitted_at_streak")
@@ -506,6 +588,13 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
     if ctx.update_workflow_called and not ctx.test_after_update_done:
         return POST_UPDATE_NUDGE
 
+    # A budget-trip is a structural problem (chain too long), not a
+    # workflow-shape problem — emit the targeted "split the chain" advice
+    # before the generic repeated-frontier and failed-test paths can fire.
+    if _needs_per_tool_budget_nudge(ctx):
+        ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
+        return POST_PER_TOOL_BUDGET_NUDGE
+
     repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx)
     if repeated_frontier_nudge is not None:
         # Latch the emitted level so each escalation fires at most once per streak.
@@ -523,7 +612,15 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
         return POST_REPEATED_NULL_DATA_NUDGE
 
     if _needs_suspicious_success_nudge(ctx):
+        ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
         return POST_SUSPICIOUS_SUCCESS_NUDGE
+
+    # Checked before the generic failed-test nudge so a scrape-wall streak
+    # emits the specific STOP text and does not also consume a
+    # failed_test_nudge_count slot.
+    if _needs_probable_site_block_stop_nudge(ctx):
+        ctx.probable_site_block_stop_nudge_count = getattr(ctx, "probable_site_block_stop_nudge_count", 0) + 1
+        return POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
@@ -824,6 +921,8 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_PARAMETER_BINDING_WARN_NUDGE: "parameter_binding_warn",
     POST_PARAMETER_BINDING_STOP_NUDGE: "parameter_binding_stop",
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
+    POST_PROBABLE_SITE_BLOCK_STOP_NUDGE: "probable_site_block_stop",
+    POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
 }
@@ -919,28 +1018,72 @@ class _SendTrackingStream:
 
 
 def _accumulate_usage(result: RunResultStreaming, ctx: Any) -> None:
-    """Sum actual token usage from raw_responses onto the context.
+    """Sum the SDK's per-iteration usage into ``ctx``.
 
-    Called per enforcement iteration in a ``finally:`` so pre-overflow
-    response tokens are still counted even when ``stream_to_sse`` raises.
-    First observed usage flips the counters from ``None`` to ``0``; if no
-    response on this stream carries a usage object the counters stay
-    ``None``, which the eval surfaces as "telemetry missing" rather than
-    "ran for free".
+    The SDK aggregates usage into ``context_wrapper.usage`` before tool execution,
+    so prior-turn tokens survive a mid-tool abort; each ``Runner.run_streamed``
+    call gets a fresh wrapper, so totals must accumulate on ``ctx`` across
+    iterations rather than overwrite.
     """
     if not hasattr(ctx, "total_tokens_used"):
         return
-    for resp in getattr(result, "raw_responses", []) or []:
-        usage = getattr(resp, "usage", None)
-        if usage is None:
-            continue
-        if ctx.total_tokens_used is None:
-            ctx.total_tokens_used = 0
-            ctx.input_tokens_used = 0
-            ctx.output_tokens_used = 0
-        ctx.total_tokens_used += getattr(usage, "total_tokens", 0) or 0
-        ctx.input_tokens_used += getattr(usage, "input_tokens", 0) or 0
-        ctx.output_tokens_used += getattr(usage, "output_tokens", 0) or 0
+    usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+    if usage is None:
+        return
+
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    total_tokens = getattr(usage, "total_tokens", 0) or 0
+
+    if not (input_tokens or output_tokens or total_tokens):
+        return
+
+    ctx.input_tokens_used = (ctx.input_tokens_used or 0) + input_tokens
+    ctx.output_tokens_used = (ctx.output_tokens_used or 0) + output_tokens
+    ctx.total_tokens_used = (ctx.total_tokens_used or 0) + total_tokens
+
+
+async def _run_streamed_with_deadline(
+    agent: Agent,
+    current_input: str | list,
+    ctx: Any,
+    session: Any,
+    tracked_stream: _SendTrackingStream,
+    runner_kwargs: dict[str, Any],
+    start_time: float,
+    iteration: int,
+) -> Any:
+    """Run ``Runner.run_streamed`` + ``stream_to_sse`` with a deadline
+    against ``TOTAL_TIMEOUT_SECONDS``.
+
+    The top-of-loop elapsed check only fires between iterations; a
+    long-running tool inside ``Runner.run_streamed`` needs ``wait_for``
+    to raise ``CopilotTotalTimeoutError`` mid-tool so the caller's
+    ``_build_exit_result`` path emits a non-empty REPLY before the
+    client's own transport timeout closes the stream.
+
+    ``max(1.0, ...)`` floors ``remaining`` so ``wait_for(timeout=0)``
+    never panics on an already-spent budget.
+    """
+    from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
+
+    elapsed = time.monotonic() - start_time
+    remaining = max(1.0, TOTAL_TIMEOUT_SECONDS - elapsed)
+    result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
+    try:
+        try:
+            await asyncio.wait_for(stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+        finally:
+            _accumulate_usage(result, ctx)
+    except asyncio.TimeoutError:
+        _mark_copilot_total_timeout(ctx)
+        LOG.warning(
+            "Copilot total timeout exceeded mid-iteration",
+            elapsed_seconds=round(time.monotonic() - start_time, 3),
+            iteration=iteration,
+        )
+        raise CopilotTotalTimeoutError() from None
+    return result
 
 
 async def run_with_enforcement(
@@ -951,12 +1094,10 @@ async def run_with_enforcement(
     **runner_kwargs: Any,
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
-    # Lazy import: streaming_adapter lives in a sibling PR in the stack.
-    from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
-
     session = runner_kwargs.pop("session", None)
     current_input: str | list = initial_input
     start_time = time.monotonic()
+    ctx.copilot_run_start_monotonic = start_time
     iteration = 0
     pending_recovery_nudge: str | None = None
 
@@ -967,6 +1108,7 @@ async def run_with_enforcement(
         # chat history on the server side (see SKY-8986).
         elapsed = time.monotonic() - start_time
         if elapsed > TOTAL_TIMEOUT_SECONDS:
+            _mark_copilot_total_timeout(ctx)
             raise CopilotTotalTimeoutError()
 
         if iteration >= MAX_ITERATIONS:
@@ -989,11 +1131,19 @@ async def run_with_enforcement(
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
             try:
-                result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
-                try:
-                    await stream_to_sse(result, tracked_stream, ctx)
-                finally:
-                    _accumulate_usage(result, ctx)
+                result = await _run_streamed_with_deadline(
+                    agent,
+                    current_input,
+                    ctx,
+                    session,
+                    tracked_stream,
+                    runner_kwargs,
+                    start_time,
+                    iteration,
+                )
+            except asyncio.CancelledError:
+                _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                raise
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -1013,20 +1163,30 @@ async def run_with_enforcement(
                     iteration=iteration,
                     has_session=session is not None,
                 )
-                current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
+                try:
+                    current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
+                except asyncio.CancelledError:
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    raise
                 if images_stripped:
                     # The agent could otherwise reason about the page from
                     # memory on the next turn; warn it explicitly.
                     pending_recovery_nudge = SCREENSHOT_DROPPED_NUDGE
                 tracked_stream = _SendTrackingStream(stream)
                 try:
-                    result = Runner.run_streamed(
-                        agent, input=current_input, context=ctx, session=session, **runner_kwargs
+                    result = await _run_streamed_with_deadline(
+                        agent,
+                        current_input,
+                        ctx,
+                        session,
+                        tracked_stream,
+                        runner_kwargs,
+                        start_time,
+                        iteration,
                     )
-                    try:
-                        await stream_to_sse(result, tracked_stream, ctx)
-                    finally:
-                        _accumulate_usage(result, ctx)
+                except asyncio.CancelledError:
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    raise
                 except Exception as retry_err:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
@@ -1039,25 +1199,17 @@ async def run_with_enforcement(
                     )
                     raise
 
-        # Inject pending screenshots as a follow-up user message because OpenAI
-        # rejects images in tool messages.
-        screenshot_msg = _consume_pending_screenshots(ctx)
-        if screenshot_msg is not None:
-            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
-            current_input = (
-                [screenshot_msg]
-                if session is not None
-                else _prune_input_list(result.to_input_list()) + [screenshot_msg]
-            )
-            iteration += 1
-            continue
-
+        # The post-run screenshot drain must follow the enforcement check:
+        # without a nudge, re-invoking with just the screenshot would replace
+        # the agent's already-final REPLY with one synthesized from a single
+        # browser frame.
         if pending_recovery_nudge is not None:
             nudge: str | None = pending_recovery_nudge
             pending_recovery_nudge = None
         else:
             nudge = _check_enforcement(ctx, result)
         if nudge is None:
+            _consume_pending_screenshots(ctx)
             _maybe_raise_non_retriable_nav(ctx)
             return result
 
@@ -1067,6 +1219,7 @@ async def run_with_enforcement(
                     "Enforcement exhausted post-update nudges, allowing response",
                     nudge_count=ctx.post_update_nudge_count,
                 )
+                _consume_pending_screenshots(ctx)
                 _maybe_raise_non_retriable_nav(ctx)
                 return result
             ctx.post_update_nudge_count += 1
@@ -1074,10 +1227,17 @@ async def run_with_enforcement(
         nudge_type = _NUDGE_TYPE_BY_MESSAGE.get(nudge, "intermediate_success")
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
+        # OpenAI rejects images in tool messages, so a queued post-run
+        # screenshot rides as its own user message just before the nudge.
+        screenshot_msg = _consume_pending_screenshots(ctx)
+        if screenshot_msg is not None:
+            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
+
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
             nudge_msg = {"role": "user", "content": NUDGE_SENTINEL + nudge}
+            extra_msgs = [nudge_msg] if screenshot_msg is None else [screenshot_msg, nudge_msg]
             current_input = (
-                [nudge_msg] if session is not None else _prune_input_list(result.to_input_list()) + [nudge_msg]
+                extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )
         # Signal the narrator that the agent is re-entering the loop after an
         # enforcement correction. stream_to_sse creates the state on the first

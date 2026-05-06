@@ -54,6 +54,7 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
@@ -80,6 +81,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     NavigationBlock,
     TaskV2Block,
+    WhileLoopBlock,
+    WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
 )
@@ -135,6 +138,31 @@ LOG = structlog.get_logger()
 DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
+# Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
+RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _select_recording_urls_in_window(
+    recordings: Sequence[FileInfo],
+    lower_bound: datetime,
+    upper_bound: datetime,
+) -> list[str]:
+    """Filter recordings to [lower_bound, upper_bound] by modified_at (UTC), sort oldest-first."""
+    in_window: list[tuple[datetime, str]] = []
+    for r in recordings:
+        if r.modified_at is None:
+            continue
+        modified_utc = _as_utc(r.modified_at)
+        if lower_bound <= modified_utc <= upper_bound:
+            in_window.append((modified_utc, r.url))
+    in_window.sort(key=lambda pair: pair[0])
+    return [url for _, url in in_window]
+
+
 CacheInvalidationReason = Literal["updated_block", "new_block", "removed_block"]
 BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.TASK,
@@ -149,13 +177,13 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 
 
 def _collect_uncached_loop_children(
-    block: ForLoopBlock,
+    block: ForLoopBlock | WhileLoopBlock,
     script_blocks_by_label: dict[str, object],
     blocks_to_update: set[str],
 ) -> None:
-    """Recursively collect uncached cacheable children from nested for-loops.
+    """Recursively collect uncached cacheable children from nested loop blocks.
 
-    ForLoopBlock children execute via block.py's execute_loop_helper(),
+    Loop block children execute via block.py's execute_*_loop_helper(),
     bypassing _execute_single_block() where blocks_to_update tracking lives.
     This function walks all nesting levels so the script generator produces
     cached functions for deeply nested blocks (e.g., file_download inside
@@ -168,9 +196,9 @@ def _collect_uncached_loop_children(
             and child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
         ):
             blocks_to_update.add(child.label)
-        # Recurse into nested for-loops regardless of whether the for-loop
+        # Recurse into nested loop blocks regardless of whether the loop
         # itself is cached — its children may not be.
-        if isinstance(child, ForLoopBlock):
+        if isinstance(child, (ForLoopBlock, WhileLoopBlock)):
             _collect_uncached_loop_children(child, script_blocks_by_label, blocks_to_update)
 
 
@@ -488,21 +516,101 @@ class WorkflowService:
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
         return [u for u in urls if u is not None]
 
-    async def _refresh_output_screenshot_urls(
+    async def _file_infos_from_download_artifact_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str | None,
+    ) -> list[FileInfo]:
+        """Rebuild ``FileInfo`` objects from DOWNLOAD artifact IDs.
+
+        Used to refresh persisted block-output ``downloaded_files`` snapshots:
+        the URL captured at execution time may be a legacy presigned S3 URL,
+        but the artifact row has everything we need to mint a fresh signed
+        ``/v1/artifacts/{id}/content`` URL on each API fetch.
+        """
+        if not artifact_ids or not organization_id:
+            return []
+        artifacts = await app.DATABASE.artifacts.get_artifacts_by_ids(artifact_ids, organization_id)
+        if not artifacts:
+            return []
+        # Preserve the input order so block outputs render files in save order.
+        by_id = {a.artifact_id: a for a in artifacts}
+        ordered = [by_id[aid] for aid in artifact_ids if aid in by_id]
+        return await _file_infos_from_download_artifacts(ordered)
+
+    async def _file_infos_for_workflow_run_filtered_by_filenames(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        filenames: set[str],
+    ) -> list[FileInfo]:
+        """Look up DOWNLOAD artifact rows for the workflow run and filter to
+        the given filename set.
+
+        Used as a backwards-compat fallback for block-output snapshots that
+        were persisted without ``downloaded_file_artifact_ids`` — typically
+        because the block's ``get_downloaded_files`` ran before
+        ``save_downloaded_files`` finished creating the artifact rows. We
+        match by filename so a multi-block run doesn't merge sibling blocks'
+        downloads into one another's snapshots.
+
+        Filenames are matched case-sensitively against ``Artifact.uri``'s
+        basename, mirroring how ``_file_infos_from_download_artifacts``
+        derives ``filename`` from the URI.
+        """
+        if not workflow_run_id or not organization_id or not filenames:
+            return []
+        try:
+            artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                run_id=workflow_run_id,
+                organization_id=organization_id,
+                artifact_type=ArtifactType.DOWNLOAD,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to refresh block-output downloaded_files via run-id lookup",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return []
+        if not artifacts:
+            return []
+        matched: list[Artifact] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            basename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+            if basename in filenames and basename not in seen:
+                matched.append(artifact)
+                seen.add(basename)
+        return await _file_infos_from_download_artifacts(matched)
+
+    async def _refresh_output_urls(
         self,
         value: Any,
         organization_id: str | None,
         workflow_run_id: str,
     ) -> Any:
-        """
-        Recursively walk through output values and generate presigned URLs for screenshots.
+        """Recursively refresh URL fields inside persisted block-output snapshots.
 
-        TaskOutput dicts stored in workflow_run_output_parameters contain artifact IDs.
-        This method finds any TaskOutput-like dicts and generates fresh presigned URLs
-        from the stored artifact IDs.
+        ``TaskOutput`` dicts stored in ``workflow_run_output_parameters`` carry
+        URLs that were minted at execution time and may now be stale: legacy
+        S3 presigned URLs whose signature has expired, or short signed
+        ``/v1/artifacts/{id}/content`` URLs whose ``expiry`` has passed. This
+        method finds any TaskOutput-like dict and rebuilds:
 
-        For backwards compatibility with old data that stored URLs directly (now expired),
-        we also check for task_id and regenerate URLs using the task_id lookup.
+        - ``task_screenshots`` / ``workflow_screenshots`` from the stored
+          screenshot artifact IDs (or ``task_id`` lookup for legacy snapshots
+          that pre-date the artifact-ID format).
+        - ``downloaded_files`` / ``downloaded_file_urls`` from
+          ``downloaded_file_artifact_ids``, or — when those IDs are missing
+          (race with ``save_downloaded_files`` at block completion) — by
+          looking up the run's DOWNLOAD artifact rows and matching by
+          basename.
+
+        End result: every URL in the response is a freshly minted short
+        signed ``/v1/artifacts/{id}/content`` URL, regardless of what was
+        captured at execution time.
         """
         if isinstance(value, dict):
             # Check if this looks like a TaskOutput with screenshot artifact IDs (new format)
@@ -522,6 +630,38 @@ class WorkflowService:
                         value["workflow_screenshot_artifact_ids"],
                         organization_id,
                     )
+                if value.get("downloaded_file_artifact_ids"):
+                    refreshed = await self._file_infos_from_download_artifact_ids(
+                        value["downloaded_file_artifact_ids"],
+                        organization_id,
+                    )
+                    if refreshed:
+                        value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
+                        value["downloaded_file_urls"] = [fi.url for fi in refreshed]
+                elif value.get("downloaded_files") and organization_id:
+                    # Backwards compatibility / race fallback: the snapshot has
+                    # ``downloaded_files`` but no ``downloaded_file_artifact_ids``.
+                    # This happens when the block ran the artifact-first read in
+                    # ``get_downloaded_files`` BEFORE save_downloaded_files
+                    # finished creating the artifact rows (or before this PR
+                    # was deployed). Re-query the run's current DOWNLOAD rows
+                    # and match by filename so we don't pick up downloads from
+                    # sibling blocks in a multi-block run.
+                    stored_filenames: set[str] = set()
+                    for fi in value["downloaded_files"]:
+                        if isinstance(fi, dict):
+                            filename = fi.get("filename")
+                            if isinstance(filename, str) and filename:
+                                stored_filenames.add(filename)
+                    if stored_filenames:
+                        refreshed = await self._file_infos_for_workflow_run_filtered_by_filenames(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            filenames=stored_filenames,
+                        )
+                        if refreshed:
+                            value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
+                            value["downloaded_file_urls"] = [fi.url for fi in refreshed]
             elif has_old_format:
                 # Old format (backwards compat): regenerate URLs using task_id lookup
                 task_id = value.get("task_id")
@@ -538,19 +678,24 @@ class WorkflowService:
             else:
                 # Recurse into nested dicts
                 for k, v in value.items():
-                    value[k] = await self._refresh_output_screenshot_urls(v, organization_id, workflow_run_id)
+                    value[k] = await self._refresh_output_urls(v, organization_id, workflow_run_id)
         elif isinstance(value, list):
             # Recurse into list items
             for i, item in enumerate(value):
-                value[i] = await self._refresh_output_screenshot_urls(item, organization_id, workflow_run_id)
+                value[i] = await self._refresh_output_urls(item, organization_id, workflow_run_id)
         return value
 
-    async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
-        credential = await app.DATABASE.credentials.get_credential(
-            credential_id, organization_id=organization.organization_id
+    async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> None:
+        if not credential_ids:
+            return
+        unique_ids = list(dict.fromkeys(credential_ids))
+        existing = await app.DATABASE.credentials.get_credentials_by_ids(
+            unique_ids, organization_id=organization.organization_id
         )
-        if credential is None:
-            raise InvalidCredentialId(credential_id)
+        found = {credential.credential_id for credential in existing}
+        missing = [credential_id for credential_id in unique_ids if credential_id not in found]
+        if missing:
+            raise InvalidCredentialId(", ".join(missing))
 
     async def validate_schedule_parameters(
         self,
@@ -577,6 +722,7 @@ class WorkflowService:
             )
 
         missing_parameters: list[str] = []
+        credential_ids_to_validate: list[str] = []
         for workflow_parameter in schedule_parameters:
             if workflow_parameter.key in request_data:
                 request_value = request_data[workflow_parameter.key]
@@ -590,14 +736,14 @@ class WorkflowService:
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     if not isinstance(request_value, str):
                         raise InvalidCredentialId(f"Credential ID must be a string, got {type(request_value).__name__}")
-                    await self._validate_credential_id(request_value, organization)
+                    credential_ids_to_validate.append(request_value)
             elif workflow_parameter.default_value is not None:
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     if not isinstance(workflow_parameter.default_value, str):
                         raise InvalidCredentialId(
                             f"Credential ID must be a string, got {type(workflow_parameter.default_value).__name__}"
                         )
-                    await self._validate_credential_id(workflow_parameter.default_value, organization)
+                    credential_ids_to_validate.append(workflow_parameter.default_value)
             else:
                 missing_parameters.append(workflow_parameter.key)
 
@@ -608,6 +754,8 @@ class WorkflowService:
                     f"Missing schedule parameters for workflow {workflow.workflow_permanent_id}: {missing_keys_str}"
                 )
             )
+
+        await self._validate_credential_ids(credential_ids_to_validate, organization)
 
     async def setup_workflow_run(
         self,
@@ -624,6 +772,8 @@ class WorkflowService:
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        ignore_inherited_workflow_system_prompt: bool = False,
+        copilot_session_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -670,6 +820,16 @@ class WorkflowService:
                 )
                 workflow_request.ai_fallback = True
 
+        # Inherit from ambient context so descendant runs (TriggerWorkflowBlock children)
+        # carry the parent's chat id forward without per-call plumbing. Resolved here so
+        # the same value reaches both the DB row and the new SkyvernContext below.
+        ambient_context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+        resolved_copilot_session_id = (
+            copilot_session_id
+            if copilot_session_id is not None
+            else (ambient_context.copilot_session_id if ambient_context else None)
+        )
+
         # Create the workflow run and set skyvern context
         workflow_run = await self.create_workflow_run(
             workflow_request=workflow_request,
@@ -683,6 +843,8 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
+            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+            copilot_session_id=resolved_copilot_session_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -715,6 +877,7 @@ class WorkflowService:
                 max_steps_override=max_steps_override,
                 max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                 loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
+                copilot_session_id=resolved_copilot_session_id,
             )
         )
 
@@ -756,7 +919,6 @@ class WorkflowService:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         if not isinstance(request_body_value, str):
                             raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
-                        await self._validate_credential_id(request_body_value, organization)
                     workflow_parameter_values.append((workflow_parameter, request_body_value))
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
@@ -764,7 +926,6 @@ class WorkflowService:
                             raise InvalidCredentialId(
                                 f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
                             )
-                        await self._validate_credential_id(workflow_parameter.default_value, organization)
                     workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
                 else:
                     missing_parameters.append(workflow_parameter.key)
@@ -776,6 +937,15 @@ class WorkflowService:
                     workflow_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+            await self._validate_credential_ids(
+                [
+                    value
+                    for (workflow_parameter, value) in workflow_parameter_values
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                ],
+                organization,
+            )
 
             if workflow_parameter_values:
                 try:
@@ -915,6 +1085,79 @@ class WorkflowService:
 
         return None
 
+    async def _collect_inherited_workflow_system_prompt(
+        self,
+        parent_workflow_run_id: str | None,
+    ) -> str | None:
+        """Walk up the parent workflow-run chain and join each ancestor's raw
+        ``workflow_system_prompt`` (outermost first). Returns None when no ancestor
+        has one set. A depth cap matches ``WorkflowTriggerBlock.MAX_TRIGGER_DEPTH``
+        to keep the traversal bounded against malformed chains.
+
+        This reads raw prompt strings from each ancestor's ``workflow_definition``
+        without Jinja rendering — the child's context will render them later via
+        ``WorkflowRunContext.resolve_effective_workflow_system_prompt``. Using raw
+        strings here avoids depending on the parent's live ``WorkflowRunContext``,
+        which isn't available for async/fire-and-forget child runs.
+
+        Chain-break on opt-out: when an ancestor has ``ignore_inherited_workflow_system_prompt``
+        set, its own prompt is still included (it ran without its own ancestors'
+        prompts, but its own rules remain its statement to descendants), but the
+        traversal stops there. A workflow explicitly opting out of its parents'
+        rules creates a clean boundary for itself and everything it triggers —
+        otherwise descendants would silently reintroduce prompts the opted-out
+        workflow rejected.
+        """
+        # Two-phase walk to keep DB round trips bounded. Phase 1 is an
+        # inherently sequential chain walk (each ``parent_workflow_run_id`` is
+        # only known after fetching the previous run), capped at
+        # ``MAX_TRIGGER_DEPTH``. Phase 2 batches the independent workflow-
+        # definition fetches with ``asyncio.gather`` so all N definition
+        # lookups happen in one concurrent burst instead of N sequential
+        # awaits — brings the worst case from 2N round trips down to
+        # N + 1 (depth-bounded at 10). A deeper optimization (single
+        # recursive CTE across workflow_runs + workflows) is possible if
+        # trigger chains ever get deep enough to matter.
+        chain: list[tuple[str, bool]] = []  # [(workflow_id, ignore_inherited), ...] outermost child first
+        current_parent_id: str | None = parent_workflow_run_id
+        visited: set[str] = set()
+        depth = 0
+        while current_parent_id and depth < WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
+            if current_parent_id in visited:
+                break
+            visited.add(current_parent_id)
+            parent_run = await app.DATABASE.workflow_runs.get_workflow_run(current_parent_id)
+            if parent_run is None:
+                break
+            chain.append((parent_run.workflow_id, parent_run.ignore_inherited_workflow_system_prompt))
+            if parent_run.ignore_inherited_workflow_system_prompt:
+                break
+            current_parent_id = parent_run.parent_workflow_run_id
+            depth += 1
+
+        if not chain:
+            return None
+
+        # Fetch all ancestor workflow definitions concurrently.
+        ancestor_workflows = await asyncio.gather(
+            *(self.get_workflow(workflow_id=workflow_id) for workflow_id, _ in chain),
+            return_exceptions=False,
+        )
+
+        prompts: list[str] = []
+        for workflow in ancestor_workflows:
+            if workflow is None or workflow.workflow_definition is None:
+                continue
+            raw = workflow.workflow_definition.workflow_system_prompt
+            if raw:
+                prompts.append(raw)
+
+        if not prompts:
+            return None
+        # Outermost ancestor first so child-local rules appear after broader rules.
+        prompts.reverse()
+        return "\n\n".join(prompts)
+
     @traced(name="skyvern.workflow.execute", role="wrapper")
     async def execute_workflow(
         self,
@@ -926,7 +1169,15 @@ class WorkflowService:
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
     ) -> WorkflowRun:
-        """Execute a workflow."""
+        """Execute a workflow.
+
+        When the workflow_run row has ``ignore_inherited_workflow_system_prompt``
+        set (populated at spawn time by a ``WorkflowTriggerBlock`` whose
+        ``ignore_workflow_system_prompt`` flag is True), the child workflow
+        starts with a clean slate — no inherited prompt from the ancestor
+        chain. Persisting the intent on the row means the flag is honored for
+        both sync and async (Temporal-dispatched) trigger modes.
+        """
         organization_id = organization.organization_id
 
         LOG.info(
@@ -983,6 +1234,19 @@ class WorkflowService:
         # Get all <workflow parameter, workflow run parameter> tuples
         wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
         workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
+        # Collect resolved workflow_system_prompt from every ancestor workflow so child
+        # blocks inherit them (SKY-9147). We read each parent's workflow_definition from
+        # the DB because the parent's in-memory WorkflowRunContext may be gone by the
+        # time a fire-and-forget child runs on its own worker. Jinja placeholders in
+        # ancestor prompts are rendered against this run's values; parent-only
+        # parameters will simply render empty in non-strict mode.
+        inherited_workflow_system_prompt = (
+            None
+            if workflow_run.ignore_inherited_workflow_system_prompt
+            else await self._collect_inherited_workflow_system_prompt(
+                parent_workflow_run_id=workflow_run.parent_workflow_run_id,
+            )
+        )
         try:
             await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
                 organization,
@@ -996,6 +1260,7 @@ class WorkflowService:
                 secret_parameters,
                 block_outputs,
                 workflow,
+                inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             )
         except Exception as e:
             LOG.exception(
@@ -1523,6 +1788,12 @@ class WorkflowService:
             script_block_count=len(script_blocks_by_label),
             empty_blocks_detected=script is not None and is_script_run and not script_blocks_by_label,
         )
+
+        if script_mode_active and script is not None:
+            # Regression-locked by tests/unit/workflow/test_mark_script_run_loaded.py
+            # ::test_mark_script_run_loaded_calls_update_with_script_identity.
+            # If you modify this branch, update that test.
+            await self._mark_script_run_loaded(workflow_run_id, script)
 
         if block_labels and len(block_labels):
             blocks: list[BlockTypeVar] = []
@@ -2090,6 +2361,22 @@ class WorkflowService:
                     block_label=block.label,
                     run_signature=script_block.run_signature,
                 )
+                # Script path skips the block's own execute() (which is where
+                # format_potential_template_parameters runs in the agent path),
+                # so we apply the workflow_system_prompt here to thread the
+                # block-resolved value into the ``WorkflowRunContext`` cache.
+                # ``ai_extract`` reads from that cache so the script-generated
+                # extraction honors ``ignore_workflow_system_prompt`` the same
+                # way the agent path does — same string, same cache key.
+                try:
+                    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+                    block._apply_workflow_system_prompt(workflow_run_context)
+                except Exception:
+                    LOG.warning(
+                        "Failed to apply workflow_system_prompt for script-path block; continuing",
+                        block_label=block.label,
+                        exc_info=True,
+                    )
                 block_exec_start = time.monotonic()
                 try:
                     vars_dict = vars(loaded_script_module) if loaded_script_module else {}
@@ -2283,6 +2570,33 @@ class WorkflowService:
                         organization_id=organization_id,
                         browser_session_id=browser_session_id,
                     )
+                    # Record that this run experienced a script → AI fallback if
+                    # the agent execution we just ran was a consequence of a failed
+                    # script attempt. The gate correctly excludes:
+                    #   - ai_fallback=False kept-the-failure (execute_safe not reached)
+                    #   - requires_agent / uncached / disable_cache / non-cacheable
+                    #     routes (valid_to_run_code is False for these)
+                    #   - agent-only workflows (is_script_run=False → valid_to_run_code=False)
+                    # and correctly covers all three script-failure modes: script-
+                    # block failed, script threw, and script-ran-but-no-block-found.
+                    # Complements the task-block AI-fallback writers in `services/script_service.py`
+                    # writers which handle a separate task-block AI-fallback surface.
+                    # Perf: a fallback-heavy run issues N writes for N fallbacks.
+                    # Typical runs have 0-3. `_merge_script_run` is idempotent at the
+                    # DB layer. If observed latency regresses, add a context-scoped
+                    # already-flipped cache (tracked separately).
+                    await self._mark_script_fallback_triggered(
+                        workflow_run_id=workflow_run_id,
+                        # `valid_to_run_code` is computed as a chain of `and`s that
+                        # includes `block.label` (str | None), so its static type is
+                        # `Literal[''] | bool` when block.label is an empty string.
+                        # The helper treats it as a pure truthiness gate; `bool(...)`
+                        # narrows the type cleanly for mypy without changing runtime
+                        # semantics.
+                        valid_to_run_code=bool(valid_to_run_code),
+                        block_executed_with_code=block_executed_with_code,
+                        block_label=block.label,
+                    )
 
                 # Update fallback episode with agent actions for both success and failure.
                 # Failed fallbacks are kept for triage — the reviewer will determine
@@ -2469,13 +2783,13 @@ class WorkflowService:
             # recorded and the reviewer will patch the specific block that failed.
             # See _trigger_script_reviewer() for the capped reviewer flow.
 
-            # Track uncached for-loop child blocks for regeneration.
-            # ForLoopBlock children execute via block.py's execute_loop_helper(),
+            # Track uncached loop block children for regeneration.
+            # Loop block children execute via block.py's execute_*_loop_helper(),
             # bypassing _execute_single_block. Recursively walk all nesting levels
             # so deeply nested blocks (e.g., file_download inside a double-nested
-            # for-loop) get cached functions generated.
+            # loop) get cached functions generated.
             if (
-                isinstance(block, ForLoopBlock)
+                isinstance(block, (ForLoopBlock, WhileLoopBlock))
                 and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
                 and workflow_run_block_result.status in cacheable_statuses
             ):
@@ -2484,7 +2798,7 @@ class WorkflowService:
                 new_labels = sorted(blocks_to_update - previous_labels)
                 if new_labels:
                     LOG.info(
-                        "For-loop child blocks marked for caching",
+                        "Loop block child blocks marked for caching",
                         parent_label=block.label,
                         child_labels=new_labels,
                         child_count=len(new_labels),
@@ -2976,10 +3290,21 @@ class WorkflowService:
 
     @staticmethod
     def _validate_nested_blocks(blocks: list[BlockTypeVar]) -> None:
-        """Recursively validate ForLoopBlock graphs at all nesting depths."""
+        """Recursively validate loop block graphs at all nesting depths."""
         for block in blocks:
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 block.validate_loop_blocks()
+
+    @staticmethod
+    def _validate_payload_templates(workflow_definition: WorkflowDefinition) -> None:
+        """Reject workflow_trigger blocks whose payload has malformed Jinja2 templates.
+
+        Surfaces the same JSON-pointer key path + raw template that the runtime
+        PayloadTemplateRenderError reports - shifted left from execute() to save().
+        """
+        for block in workflow_definition.blocks:
+            if isinstance(block, WorkflowTriggerBlock):
+                block.validate_payload_templates()
 
     async def create_workflow(
         self,
@@ -3008,6 +3333,8 @@ class WorkflowService:
         adaptive_caching: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         try:
             return await app.DATABASE.workflows.create_workflow(
@@ -3036,6 +3363,8 @@ class WorkflowService:
                 adaptive_caching=adaptive_caching,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
+                created_by=created_by,
+                edited_by=edited_by,
             )
         except IntegrityError as e:
             if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
@@ -3408,6 +3737,8 @@ class WorkflowService:
         cache_key: str | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         if workflow_definition is not None:
             updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
@@ -3427,6 +3758,8 @@ class WorkflowService:
                 cache_key=cache_key,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
+                created_by=created_by,
+                edited_by=edited_by,
             )
             return updated_workflow
 
@@ -3447,6 +3780,8 @@ class WorkflowService:
             cache_key=cache_key,
             run_sequentially=run_sequentially,
             sequential_key=sequential_key,
+            created_by=created_by,
+            edited_by=edited_by,
         )
 
         return updated_workflow
@@ -3679,6 +4014,20 @@ class WorkflowService:
             error_code=error_code,
         )
 
+    async def get_workflow_runs_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[WorkflowRun]:
+        return await app.DATABASE.workflow_runs.get_workflow_runs_for_browser_session(
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+        )
+
     async def create_workflow_run(
         self,
         workflow_request: WorkflowRequestBody,
@@ -3692,6 +4041,8 @@ class WorkflowService:
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        ignore_inherited_workflow_system_prompt: bool = False,
+        copilot_session_id: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session or profile id
         browser_profile_id = workflow_request.browser_profile_id
@@ -3782,6 +4133,8 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
+            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+            copilot_session_id=copilot_session_id,
         )
 
     async def _update_workflow_run_status(
@@ -4395,6 +4748,43 @@ class WorkflowService:
         urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
         return [u for u in urls if u is not None]
 
+    async def get_workflow_run_llm_cost_sum(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> float:
+        """Sum per-LLM-call cost across step_cost, thought_cost, and
+        workflow_run_blocks.llm_cost for this workflow_run.
+
+        `organization_id` is required: passing None makes repo filters
+        evaluate as `IS NULL` and silently return 0.0.
+        """
+        if not organization_id:
+            raise ValueError(
+                "get_workflow_run_llm_cost_sum requires organization_id; "
+                "passing None would compile to IS NULL and silently return 0.0"
+            )
+        # thought + block sums are independent of the task list; run them in
+        # parallel with the task fetch + step sum (which depends on task ids).
+        thought_task = app.DATABASE.observer.get_thought_cost_sum_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        block_task = app.DATABASE.observer.get_block_llm_cost_sum_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+        step_cost_sum, thought_cost_sum, block_llm_cost_sum = await asyncio.gather(
+            app.DATABASE.tasks.get_step_cost_sum_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks],
+                organization_id=organization_id,
+            ),
+            thought_task,
+            block_task,
+        )
+        return step_cost_sum + thought_cost_sum + block_llm_cost_sum
+
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
@@ -4452,29 +4842,43 @@ class WorkflowService:
         )
         screenshot_urls = screenshot_urls or None
 
-        recording_url = None
-        # Get recording url from browser session first,
-        # if not found, get the recording url from the artifacts
+        recording_urls: list[str] = []
+        # Prefer browser-session recordings; fall back to artifact store.
         if workflow_run.browser_session_id:
-            try:
-                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
-                        organization_id=workflow_run.organization_id,
-                        browser_session_id=workflow_run.browser_session_id,
-                    )
-                    # FIXME: we only support one recording for now
-                    recording_url = recordings[0].url if recordings else None
-            except asyncio.TimeoutError:
-                LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
+            if workflow_run.started_at is None:
+                LOG.warning(
+                    "Skipping recording fan-out: workflow run has browser_session_id but no started_at",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=workflow_run.browser_session_id,
+                )
+            else:
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                            organization_id=workflow_run.organization_id,
+                            browser_session_id=workflow_run.browser_session_id,
+                        )
+                        # started_at excludes prior-run uploads on reused sessions.
+                        lower_bound = _as_utc(workflow_run.started_at)
+                        run_end = _as_utc(workflow_run.finished_at) if workflow_run.finished_at else datetime.now(UTC)
+                        upper_bound = run_end + RECORDING_WINDOW_END_BUFFER
+                        recording_urls = _select_recording_urls_in_window(recordings, lower_bound, upper_bound)
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
 
-        if recording_url is None:
+        if not recording_urls:
             recording_artifact = await app.DATABASE.artifacts.get_artifact_for_run(
                 run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
                 artifact_type=ArtifactType.RECORDING,
                 organization_id=organization_id,
             )
             if recording_artifact:
-                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+                artifact_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+                if artifact_url:
+                    recording_urls = [artifact_url]
+
+        # Preserve legacy singular contract: last element is the newest (old code returned recordings[0] of newest-first list).
+        recording_url = recording_urls[-1] if recording_urls else None
 
         downloaded_files: list[FileInfo] = []
         downloaded_file_urls: list[str] | None = None
@@ -4526,7 +4930,7 @@ class WorkflowService:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
             # Refresh any expired presigned screenshot URLs in the outputs
-            outputs = await self._refresh_output_screenshot_urls(
+            outputs = await self._refresh_output_urls(
                 outputs, organization_id=organization_id, workflow_run_id=workflow_run_id
             )
 
@@ -4567,7 +4971,7 @@ class WorkflowService:
                 text_prompt_blocks = [
                     block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
                 ]
-                # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
+                # This is a temporary cost calculation.
                 total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
         return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
@@ -4589,6 +4993,7 @@ class WorkflowService:
             parameters=parameters_with_value,
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
+            recording_urls=recording_urls or None,  # omit field when empty
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
@@ -4673,10 +5078,37 @@ class WorkflowService:
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 context = skyvern_context.current()
+                finalization_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
                 await app.STORAGE.save_downloaded_files(
                     organization_id=workflow_run.organization_id,
-                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
+                    run_id=finalization_run_id,
                 )
+                # Tag any session-scoped DOWNLOAD artifacts created during this
+                # workflow run with run_id (see
+                # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                browser_session_id = context.browser_session_id if context else None
+                if browser_session_id and finalization_run_id:
+                    try:
+                        claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
+                            run_id=finalization_run_id,
+                            browser_session_id=browser_session_id,
+                            organization_id=workflow_run.organization_id,
+                            run_started_at=workflow_run.created_at,
+                        )
+                        if claimed:
+                            LOG.debug(
+                                "Claimed session-scoped download artifacts for workflow run",
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                browser_session_id=browser_session_id,
+                                claimed=claimed,
+                            )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to claim session-scoped download artifacts for workflow run",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            browser_session_id=browser_session_id,
+                            exc_info=True,
+                        )
         except asyncio.TimeoutError:
             LOG.warning(
                 "Timeout to save downloaded files",
@@ -4994,6 +5426,8 @@ class WorkflowService:
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
         delete_script: bool = True,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         organization_id = organization.organization_id
 
@@ -5062,6 +5496,8 @@ class WorkflowService:
                     if request.code_version is not None
                     else existing_latest_workflow.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
+                    created_by=created_by,
+                    edited_by=edited_by,
                 )
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -5089,6 +5525,8 @@ class WorkflowService:
                     adaptive_caching=request.adaptive_caching,
                     code_version=request.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
+                    created_by=created_by,
+                    edited_by=edited_by,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = potential_workflow.workflow_id
@@ -5100,6 +5538,9 @@ class WorkflowService:
 
             # Validate the block graph before persisting (detects orphans, cycles, dangling references)
             self.validate_workflow_block_graph(workflow_definition)
+
+            # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
+            self._validate_payload_templates(workflow_definition)
 
             updated_workflow = await self.update_workflow_definition(
                 workflow_id=potential_workflow.workflow_id,
@@ -5198,32 +5639,37 @@ class WorkflowService:
             task_block = task_id_to_block[action.task_id]
             task_block.actions.append(action)
 
-        result = []
         block_map: dict[str, WorkflowRunTimeline] = {}
-        counter = 0
-        while workflow_run_blocks:
-            counter += 1
-            block = workflow_run_blocks.pop(0)
-            workflow_run_timeline = WorkflowRunTimeline(
+        for block in workflow_run_blocks:
+            if block.workflow_run_block_id in block_map:
+                LOG.warning(
+                    "Duplicate workflow_run_block_id in timeline; later occurrence wins",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=block.workflow_run_block_id,
+                )
+            block_map[block.workflow_run_block_id] = WorkflowRunTimeline(
                 type=WorkflowRunTimelineType.block,
                 block=block,
                 created_at=block.created_at,
                 modified_at=block.modified_at,
             )
-            if block.parent_workflow_run_block_id:
-                if block.parent_workflow_run_block_id in block_map:
-                    block_map[block.parent_workflow_run_block_id].children.append(workflow_run_timeline)
-                    block_map[block.workflow_run_block_id] = workflow_run_timeline
-                else:
-                    # put the block back to the queue
-                    workflow_run_blocks.append(block)
-            else:
-                result.append(workflow_run_timeline)
-                block_map[block.workflow_run_block_id] = workflow_run_timeline
 
-            if counter > 1000:
-                LOG.error("Too many blocks in the workflow run", workflow_run_id=workflow_run_id)
-                break
+        result: list[WorkflowRunTimeline] = []
+        for timeline in block_map.values():
+            if timeline.block is None:
+                continue
+            parent_id = timeline.block.parent_workflow_run_block_id
+            if parent_id and parent_id in block_map:
+                block_map[parent_id].children.append(timeline)
+                continue
+            if parent_id:
+                LOG.warning(
+                    "Workflow run block references missing parent; surfacing as root",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=timeline.block.workflow_run_block_id,
+                    parent_workflow_run_block_id=parent_id,
+                )
+            result.append(timeline)
 
         return result
 
@@ -5871,7 +6317,15 @@ class WorkflowService:
         historical_episodes: list | None = None,
     ) -> None:
         """Run the AI Script Reviewer and create a new script version if successful."""
-        from skyvern.services.script_reviewer import BlockReviewResult, ScriptReviewer, store_review_artifacts
+        # Imports are method-local to defer the script_reviewer module load to
+        # the rare path where the reviewer is actually triggered (most workflow
+        # runs never invoke it). Pre-existing convention in this method.
+        from skyvern.services.script_reviewer import (
+            BlockReviewResult,
+            ScriptReviewer,
+            load_filtered_run_param_values,
+            store_review_artifacts,
+        )
         from skyvern.services.workflow_script_service import create_script_version_from_review
 
         LOG.info(
@@ -5886,22 +6340,9 @@ class WorkflowService:
             reviewer = ScriptReviewer()
 
             # Load the workflow run's parameter values so the reviewer can detect
-            # hardcoded values in generated code (e.g., a customer email that should
-            # use context.parameters['recipient'] instead of a literal string).
-            run_parameter_values: dict[str, str] = {}
-            try:
-                run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-                for wf_param, run_param in run_param_tuples:
-                    if (
-                        run_param.value is not None
-                        and str(run_param.value).strip()
-                        and not wf_param.parameter_type.is_secret_or_credential()
-                    ):
-                        run_parameter_values[wf_param.key] = str(run_param.value)
-            except Exception:
-                LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
+            # hardcoded values in generated code. The shared loader filters
+            # secret/credential params before passing to the validator.
+            run_parameter_values = await load_filtered_run_param_values(workflow_run.workflow_run_id)
 
             # Split episodes by type: regular fallback vs conditional_agent
             regular_episodes = [ep for ep in episodes if ep.fallback_type != "conditional_agent"]
@@ -6019,3 +6460,88 @@ class WorkflowService:
         if workflow_run.run_with is not None:
             return workflow_run.run_with == "code"
         return workflow.run_with == "code"
+
+    async def _mark_script_run_loaded(self, workflow_run_id: str, script: Script) -> None:
+        """Record that a cached script was loaded for this workflow run.
+
+        Populates `workflow_run.script_run` with the script's identity at
+        workflow setup time so API consumers can detect cache use. Sets
+        `ai_fallback_triggered=False` as the initial state; if a fallback
+        fires mid-execution, other writers (`services/script_service.py`
+        and `_mark_script_fallback_triggered` below) merge the flipped
+        `ai_fallback_triggered=True` on top without clobbering identity
+        via the merge-on-write behavior in `update_workflow_run`.
+
+        Semantic: `script_run != null` after this runs means "a cached
+        script was loaded for this run at setup time." It does NOT imply
+        that every (or any) block actually executed from that cache —
+        `block_labels` filtering, `requires_agent`, `disable_cache`, and
+        non-cacheable block types can still route individual blocks to AI.
+        See `ScriptRunResponse` docstrings for the full semantic.
+
+        Wrapped in try/except (matching `_mark_script_fallback_triggered`) so
+        a transient DB error on the metadata write doesn't abort workflow
+        setup. The `script_run` payload is informational — reporting state
+        to API consumers — not load-bearing for the run's own execution.
+        """
+        try:
+            await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                ai_fallback_triggered=False,
+                script_id=script.script_id,
+                script_revision_id=script.script_revision_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to mark script_run loaded at workflow setup",
+                workflow_run_id=workflow_run_id,
+                script_id=script.script_id,
+                script_revision_id=script.script_revision_id,
+                exc_info=True,
+            )
+
+    async def _mark_script_fallback_triggered(
+        self,
+        workflow_run_id: str,
+        valid_to_run_code: bool,
+        block_executed_with_code: bool,
+        block_label: str | None,
+    ) -> None:
+        """Flip `ai_fallback_triggered=True` on the run iff the just-executed
+        agent block was a script→AI fallback (not an always-agent route).
+
+        Gate semantics:
+        - `valid_to_run_code=True` ⇒ we attempted script execution for this
+          block. False rules out always-agent routes (requires_agent,
+          disable_cache, uncached, non-cacheable block types, agent-only
+          workflows).
+        - `block_executed_with_code=False` ⇒ script didn't succeed. True means
+          script ran cleanly; no fallback occurred; no flag flip.
+
+        Together, a True/False combination means "we tried script, it failed,
+        we then ran agent." That's the precise definition of a mid-execution
+        script→AI fallback.
+
+        Caller must only invoke this AFTER `block.execute_safe` actually ran
+        (i.e., the fallback agent execution happened). Calling before would
+        risk false positives in the `ai_fallback=False` kept-the-failure
+        case where `execute_safe` is never reached.
+
+        Wrapped in try/except so a transient DB error on the flag flip can't
+        abort downstream block post-processing. Regression-locked by
+        `tests/unit/workflow/test_mark_script_fallback_triggered.py`.
+        """
+        if not (valid_to_run_code and not block_executed_with_code):
+            return
+        try:
+            await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                ai_fallback_triggered=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to mark ai_fallback_triggered after script→AI fallback",
+                workflow_run_id=workflow_run_id,
+                block_label=block_label,
+                exc_info=True,
+            )

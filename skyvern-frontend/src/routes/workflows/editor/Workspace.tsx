@@ -18,7 +18,12 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useParams, useSearchParams } from "react-router-dom";
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   useEdgesState,
   useNodesState,
@@ -86,6 +91,7 @@ import { cn } from "@/util/utils";
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
+import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
@@ -236,6 +242,20 @@ function Workspace({
   workflow,
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const locationState = location.state as { copilotMessage?: unknown } | null;
+  const initialCopilotMessage =
+    typeof locationState?.copilotMessage === "string"
+      ? locationState.copilotMessage
+      : null;
+  const handleInitialCopilotMessageConsumed = useCallback(() => {
+    if (!initialCopilotMessage) return;
+    navigate(location.pathname + location.search, {
+      replace: true,
+      state: null,
+    });
+  }, [initialCopilotMessage, location.pathname, location.search, navigate]);
   const [searchParams, setSearchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const [timelineMode, setTimelineMode] = useState("wide");
@@ -263,12 +283,15 @@ function Workspace({
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
   const [isCopilotOpen, setIsCopilotOpen] = useState(
-    () => !initialNodes.some(isWorkflowBlockNode),
+    () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
   );
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
+  const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
+    string | null
+  >(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
   const [windowResizeTrigger, setWindowResizeTrigger] = useState(0);
@@ -549,6 +572,22 @@ function Workspace({
 
   const showBreakoutButton =
     activeDebugSession && activeDebugSession.browser_session_id;
+  const liveBrowserSessionId = activeDebugSession?.browser_session_id ?? null;
+  const copilotRequiresLiveBrowser =
+    showBrowser && shouldFetchDebugSession && !isRateLimited;
+  // readyBrowserSessionId is keyed to the browser session id rather than a
+  // bare boolean: when activeDebugSession's id changes, stale ready state
+  // from the previous session cannot leak into the next render.
+  const copilotLiveBrowserReady = Boolean(
+    readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
+  );
+
+  const handleLiveBrowserReadyChange = useCallback(
+    (ready: boolean, sessionId: string | null) => {
+      setReadyBrowserSessionId(ready ? sessionId : null);
+    },
+    [],
+  );
 
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
@@ -565,7 +604,10 @@ function Workspace({
     if (activeDebugSession) {
       const pbsId = activeDebugSession.browser_session_id;
       if (pbsId) {
-        window.open(`${location.origin}/browser-session/${pbsId}`, "_blank");
+        window.open(
+          `${window.location.origin}/browser-session/${pbsId}`,
+          "_blank",
+        );
       }
     }
   };
@@ -1093,7 +1135,7 @@ function Workspace({
     workflowChangesStore.setHasChanges(true);
     postHog.capture("builder.block.added", {
       org_id: workflow.organization_id,
-      block_type: nodeType,
+      block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
@@ -1188,7 +1230,10 @@ function Workspace({
     }
   };
 
-  const applyWorkflowUpdate = (workflowData: WorkflowVersion) => {
+  const applyWorkflowUpdate = (
+    workflowData: WorkflowVersion,
+    options?: { persisted?: boolean },
+  ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
@@ -1206,6 +1251,8 @@ function Workspace({
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
         workflowData.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        workflowData.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -1220,7 +1267,17 @@ function Workspace({
     const initialParameters = getInitialParameters(workflowData);
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
-    workflowChangesStore.setHasChanges(true);
+    if (options?.persisted) {
+      // Atomic accept: server wrote a new version; treat as clean baseline and refresh cached workflow.
+      workflowChangesStore.setHasChanges(false);
+      if (workflowPermanentId) {
+        queryClient.invalidateQueries({
+          queryKey: ["workflow", workflowPermanentId],
+        });
+      }
+    } else {
+      workflowChangesStore.setHasChanges(true);
+    }
   };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
@@ -1254,6 +1311,8 @@ function Workspace({
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
         selectedVersion.workflow_definition?.finally_block_label ?? null,
+      workflowSystemPrompt:
+        selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
     };
 
     const elements = getElements(
@@ -1792,6 +1851,7 @@ function Workspace({
                           showControlButtons={true}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={!!workflowRun && !isFinalized}
+                          onReadyChange={handleLiveBrowserReadyChange}
                         />
                       </div>
                     )}
@@ -1843,6 +1903,7 @@ function Workspace({
                           }
                           interactive={true}
                           showControlButtons={true}
+                          onReadyChange={handleLiveBrowserReadyChange}
                         />
                       </div>
                       <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
@@ -1994,6 +2055,13 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
+        liveBrowserSessionId={
+          copilotLiveBrowserReady ? liveBrowserSessionId : null
+        }
+        requiresLiveBrowser={copilotRequiresLiveBrowser}
+        isLiveBrowserReady={copilotLiveBrowserReady}
+        initialMessage={initialCopilotMessage ?? undefined}
+        onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onReviewWorkflow={async (pendingWorkflow, clearPending) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;
@@ -2006,6 +2074,8 @@ function Workspace({
               blocks: saveData.blocks,
               finally_block_label:
                 saveData.settings.finallyBlockLabel ?? undefined,
+              workflow_system_prompt:
+                saveData.settings.workflowSystemPrompt ?? undefined,
             });
 
             // Convert current workflow definition YAML to blocks
@@ -2127,9 +2197,9 @@ function Workspace({
             });
           }
         }}
-        onWorkflowUpdate={(workflowData) => {
+        onWorkflowUpdate={(workflowData, options) => {
           try {
-            applyWorkflowUpdate(workflowData);
+            applyWorkflowUpdate(workflowData, options);
           } catch (error) {
             console.error(
               "Failed to parse and apply workflow",

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -25,7 +26,7 @@ from skyvern.constants import (
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
-from skyvern.errors.errors import TOTPExpiredError
+from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -79,6 +80,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
@@ -104,7 +106,6 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SelectOptionAction,
     UploadFileAction,
-    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
@@ -121,6 +122,23 @@ from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElem
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+
+async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
+    """Take a screenshot with cursor overlay hidden so it doesn't interfere with LLM analysis."""
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
+        try:
+            return await page.screenshot(**kwargs)
+        finally:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
+    return await page.screenshot(**kwargs)
 
 
 class CustomSingleSelectResult:
@@ -614,30 +632,10 @@ class ActionHandler:
             action_type=action.action_type,
             action_id=action.action_id,
             status=action.status,
-            source_action_id=action.source_action_id,
             step_order=action.step_order,
             action_order=action.action_order,
-            confidence_float=action.confidence_float,
-            description=action.description,
-            reasoning=action.reasoning,
-            intention=action.intention,
-            response=action.response,
             element_id=action.element_id,
             errors=action.errors,
-            file_name=action.file_name,
-            file_url=action.file_url,
-            download=action.download,
-            download_triggered=action.download_triggered,
-            is_upload_file_tag=action.is_upload_file_tag,
-            text=action.text,
-            input_or_select_context=action.input_or_select_context,
-            option=action.option,
-            is_checked=action.is_checked,
-            verified=action.verified,
-            click_context=action.click_context,
-            totp_timing_info=action.totp_timing_info,
-            has_mini_agent=action.has_mini_agent,
-            skip_auto_complete_tab=action.skip_auto_complete_tab,
         )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
@@ -1244,6 +1242,7 @@ async def handle_input_text_action(
         element_id=skyvern_element.get_id(),
         option=SelectOption(label=text),
         intention=action.intention,
+        input_or_select_context=action.input_or_select_context,
     )
     if await skyvern_element.get_selectable():
         LOG.info(
@@ -1908,6 +1907,7 @@ async def handle_select_option_action(
                 element_id=selectable_child.get_id(),
                 option=action.option,
                 intention=action.intention,
+                input_or_select_context=action.input_or_select_context,
             )
             action = select_action
             skyvern_element = selectable_child
@@ -1972,6 +1972,7 @@ async def handle_select_option_action(
             element_id=blocking_element.get_id(),
             option=action.option,
             intention=action.intention,
+            input_or_select_context=action.input_or_select_context,
         )
         action = select_action
         skyvern_element = blocking_element
@@ -2372,6 +2373,8 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.scroll_x is None or action.scroll_y is None:
+        return [ActionFailure(Exception("ScrollAction is missing scroll_x/scroll_y coordinates"))]
     if action.element_id:
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
@@ -2498,6 +2501,8 @@ async def handle_move_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.x is None or action.y is None:
+        return [ActionFailure(Exception("MoveAction is missing x/y coordinates"))]
     await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
@@ -2592,6 +2597,12 @@ ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_acti
 def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    if secret_value is not None:
+        credential_parameter_key = workflow_run_context.find_credential_parameter_key_for_secret(parameter)
+        if credential_parameter_key is not None:
+            current_context = skyvern_context.current()
+            if current_context is not None:
+                current_context.active_credential_parameter_key = credential_parameter_key
     return secret_value if secret_value is not None else parameter
 
 
@@ -3519,7 +3530,7 @@ async def sequentially_select_from_dropdown(
             )
             continue
 
-        screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        screenshot = await _screenshot_without_cursor(page, timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         mini_goal = (
             input_or_select_context.field
             if not input_or_select_context.intention
@@ -4463,6 +4474,7 @@ async def extract_information_for_navigation_goal(
             error_code_mapping=error_code_mapping_str,
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
+            workflow_system_prompt=task.workflow_system_prompt,
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
@@ -4548,6 +4560,7 @@ async def extract_information_for_navigation_goal(
                     # reasons unrelated to cache correctness.
                     prompt_name="extract-information",
                     force_dict=False,
+                    system_prompt=task.workflow_system_prompt,
                 )
                 # Apply the same post-processing the miss path applies so the
                 # comparison is apples-to-apples against the cached value.
@@ -4696,6 +4709,7 @@ async def extract_information_for_navigation_goal(
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
         force_dict=False,
+        system_prompt=task.workflow_system_prompt,
     )
 
     # Validate and fill missing fields based on schema
@@ -4892,6 +4906,40 @@ async def _get_input_or_select_context(
     return input_or_select_context
 
 
+def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: str) -> list[UserDefinedError]:
+    # If the LLM returns no structured errors but its terminate reasoning
+    # explicitly mentions a configured code or description, preserve that
+    # machine-readable code for task/run/webhook error aggregation.
+    normalized_reasoning = reasoning.lower()
+    matched_errors: list[UserDefinedError] = []
+    for error_code, error_description in (task.error_code_mapping or {}).items():
+        # Only match structured codes directly. Generic single-word codes like
+        # "timeout" can appear in unrelated reasoning and look falsely authoritative.
+        code_matches = (
+            "_" in error_code and re.search(rf"\b{re.escape(error_code.lower())}\b", normalized_reasoning) is not None
+        )
+        description_matches = isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        if code_matches or description_matches:
+            matched_errors.append(
+                UserDefinedError(
+                    error_code=error_code,
+                    reasoning=reasoning,
+                    confidence_float=1.0,
+                )
+            )
+    if matched_errors:
+        if len(matched_errors) > 1:
+            LOG.warning(
+                "Multiple user-defined error mappings matched terminate reasoning; using first match",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                matched_error_codes=[error.error_code for error in matched_errors],
+                selected_error_code=matched_errors[0].error_code,
+            )
+        return [matched_errors[0]]
+    return []
+
+
 async def extract_user_defined_errors(
     task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
 ) -> list[UserDefinedError]:
@@ -4914,4 +4962,16 @@ async def extract_user_defined_errors(
         step=step,
         prompt_name="surface-user-defined-errors",
     )
-    return [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    parsed = [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    kept, dropped = filter_to_user_defined_codes(parsed, task.error_code_mapping)
+    if dropped:
+        LOG.warning(
+            "Dropped LLM-returned error codes not in user error_code_mapping",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            dropped_codes=dropped,
+            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+        )
+    if not kept and reasoning:
+        return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
+    return kept

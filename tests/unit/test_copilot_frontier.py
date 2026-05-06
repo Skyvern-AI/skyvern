@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from jinja2.sandbox import SandboxedEnvironment
 
+from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_FAILED_TEST_NUDGES,
@@ -26,6 +28,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _plan_frontier,
     _referenced_output_labels,
 )
+from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
 
 
 class _FakeBlock:
@@ -50,9 +53,15 @@ class _FakeBlock:
         }
 
 
+class _FakeParameter:
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+
 class _FakeDefinition:
-    def __init__(self, blocks: list[_FakeBlock]) -> None:
+    def __init__(self, blocks: list[_FakeBlock], parameters: list[_FakeParameter] | None = None) -> None:
         self.blocks = blocks
+        self.parameters = parameters or []
 
 
 class _FakeWorkflow:
@@ -211,6 +220,490 @@ def test_referenced_output_labels_finds_jinja_refs() -> None:
     )
     refs = _referenced_output_labels(["extract"], new)
     assert "a" in refs
+
+
+def test_referenced_output_labels_finds_block_form_jinja_refs() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock("extract_article_info", "extraction"),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {
+                    "prompt": (
+                        "Summarize {{ extract_article_info.output.extracted_information.abstract }} "
+                        "and {{ extract_article_info.title }}."
+                    )
+                },
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == {"extract_article_info"}
+
+
+def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {
+                    "prompt": (
+                        "Summarize the main findings from "
+                        "{{ extract_article_info.output.extracted_information.abstract }}."
+                    )
+                },
+            ),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page", "extract_article_info"]
+    ctx.verified_block_outputs = {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open_page", "extract_article_info", "summarize_article"],
+        old,
+        new,
+    )
+
+    assert labels == ["open_page", "extract_article_info", "summarize_article"]
+    assert seed == {}
+    assert frontier == "open_page"
+
+
+def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {
+                    "prompt": (
+                        "Summarize the main findings from "
+                        "{{ extract_article_info_output.extracted_information.abstract }}."
+                    )
+                },
+            ),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page", "extract_article_info"]
+    ctx.verified_block_outputs = {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open_page", "extract_article_info", "summarize_article"],
+        old,
+        new,
+    )
+
+    assert labels == ["summarize_article"]
+    assert seed == {"extract_article_info": {"extracted_information": {"abstract": "Prior output"}}}
+    assert frontier == "summarize_article"
+
+
+def test_stale_metadata_detects_corrected_subject_label_and_title() -> None:
+    prior_yaml = """
+title: Count example.com topic alpha results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: extract_results
+      navigation_goal: Search example.com for topic alpha.
+    - block_type: extraction
+      label: extract_results
+      title: Extract Results
+      next_block_label: null
+      data_extraction_goal: Extract the total number of topic alpha search results.
+"""
+    submitted_yaml = """
+title: Count example.com sample beta results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: extract_results
+      navigation_goal: Search example.com for sample beta.
+    - block_type: extraction
+      label: extract_results
+      title: Extract Results
+      next_block_label: null
+      data_extraction_goal: Extract the total number of sample beta search results.
+"""
+
+    stale = tools._detect_stale_block_metadata(submitted_yaml, prior_yaml)
+
+    assert stale == [
+        {
+            "label": "search_topic_alpha",
+            "reasons": [
+                "label 'search_topic_alpha' appears stale",
+                "title 'Search Topic Alpha' appears stale",
+            ],
+        }
+    ]
+
+
+def test_stale_metadata_accepts_renamed_corrected_subject() -> None:
+    prior_yaml = """
+title: Count example.com topic alpha results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: extract_results
+      navigation_goal: Search example.com for topic alpha.
+    - block_type: extraction
+      label: extract_results
+      title: Extract Results
+      next_block_label: null
+      data_extraction_goal: Extract the total number of topic alpha search results.
+"""
+    submitted_yaml = """
+title: Count example.com sample beta results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_sample_beta
+      title: Search Sample Beta
+      next_block_label: extract_results
+      navigation_goal: Search example.com for sample beta.
+    - block_type: extraction
+      label: extract_results
+      title: Extract Results
+      next_block_label: null
+      data_extraction_goal: Extract the total number of sample beta search results.
+"""
+
+    assert tools._detect_stale_block_metadata(submitted_yaml, prior_yaml) == []
+
+
+def test_stale_metadata_accepts_reworded_action_with_same_subject() -> None:
+    prior_yaml = """
+title: Count example.com topic alpha results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: null
+      navigation_goal: Search example.com for topic alpha.
+"""
+    submitted_yaml = """
+title: Count example.com topic alpha results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: null
+      navigation_goal: Find example.com pages about topic alpha.
+"""
+
+    assert tools._detect_stale_block_metadata(submitted_yaml, prior_yaml) == []
+
+
+def test_plan_frontier_unknown_jinja_root_falls_back_to_full_requested_list() -> None:
+    old = _FakeDefinition([_FakeBlock("open_page", "navigation")])
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("summarize_article", "text_prompt", {"prompt": "Summarize {{ missing_block.abstract }}."}),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page"]
+    ctx.verified_block_outputs = {"open_page": "nav_ok"}
+
+    labels, seed, frontier = _plan_frontier(ctx, ["open_page", "summarize_article"], old, new)
+
+    assert labels == ["open_page", "summarize_article"]
+    assert seed == {}
+    assert frontier == "open_page"
+
+
+def test_plan_frontier_falls_back_when_unknown_root_coexists_with_seedable_ref() -> None:
+    # Even when the suffix references a verified upstream output (so seeding
+    # would otherwise let us skip the prefix), an additional unknown Jinja
+    # root must still trigger the conservative full-rerun fallback.
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("extract_article_info", "extraction", {"prompt": "extract abstract"}),
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {
+                    "prompt": (
+                        "Summarize {{ extract_article_info_output.extracted_information.abstract }} "
+                        "with context {{ missing_block.note }}."
+                    )
+                },
+            ),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page", "extract_article_info"]
+    ctx.verified_block_outputs = {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open_page", "extract_article_info", "summarize_article"],
+        old,
+        new,
+    )
+
+    assert labels == ["open_page", "extract_article_info", "summarize_article"]
+    assert seed == {}
+    assert frontier == "open_page"
+
+
+def test_unknown_jinja_roots_ignores_credential_real_value_synthetic_roots() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock(
+                "login",
+                "login",
+                {"prompt": "Sign in with {{ creds_real_username }} / {{ creds_real_password }}."},
+            ),
+        ],
+        parameters=[_FakeParameter("creds")],
+    )
+
+    assert tools._unknown_jinja_roots(["login"], new) == set()
+
+
+def test_unknown_jinja_roots_ignores_conditional_branch_context_roots() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock(
+                "branch",
+                "conditional",
+                {
+                    "expression": (
+                        "{{ params.foo }} {{ outputs.bar }} {{ environment.region }} {{ env.flag }} {{ llm.model }}"
+                    )
+                },
+            ),
+        ]
+    )
+
+    assert tools._unknown_jinja_roots(["branch"], new) == set()
+
+
+def test_stale_metadata_accepts_single_token_subject_change_as_known_limit() -> None:
+    prior_yaml = """
+title: Search results page
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_cats
+      title: Search Cats
+      next_block_label: null
+      navigation_goal: Search the directory for cats.
+"""
+    submitted_yaml = """
+title: Search results page
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_cats
+      title: Search Cats
+      next_block_label: null
+      navigation_goal: Search the directory for dogs.
+"""
+
+    # The code gate is a conservative backstop: it requires at least two
+    # removed metadata tokens before rejecting. Single-token subject swaps are
+    # expected to be handled by the prompt instruction to rename changed
+    # subject metadata.
+    assert tools._detect_stale_block_metadata(submitted_yaml, prior_yaml) == []
+
+
+def test_stale_metadata_detects_stale_title_after_label_rename() -> None:
+    prior_yaml = """
+title: Count example.com topic alpha results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_topic_alpha
+      title: Search Topic Alpha
+      next_block_label: null
+      navigation_goal: Search example.com for topic alpha.
+"""
+    submitted_yaml = """
+title: Count example.com sample beta results
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: search_sample_beta
+      title: Search Topic Alpha
+      next_block_label: null
+      navigation_goal: Search example.com for sample beta.
+"""
+
+    stale = tools._detect_stale_block_metadata(submitted_yaml, prior_yaml)
+
+    assert stale == [
+        {
+            "label": "search_sample_beta",
+            "reasons": ["title 'Search Topic Alpha' appears stale"],
+        }
+    ]
+
+
+def test_stale_metadata_detects_stale_block_inside_loop_blocks() -> None:
+    prior_yaml = """
+title: For-each search results
+workflow_definition:
+  blocks:
+    - block_type: for_loop
+      label: per_topic
+      loop_blocks:
+        - block_type: navigation
+          label: search_topic_alpha
+          title: Search Topic Alpha
+          next_block_label: null
+          navigation_goal: Search example.com for topic alpha.
+"""
+    submitted_yaml = """
+title: For-each search results
+workflow_definition:
+  blocks:
+    - block_type: for_loop
+      label: per_topic
+      loop_blocks:
+        - block_type: navigation
+          label: search_topic_alpha
+          title: Search Topic Alpha
+          next_block_label: null
+          navigation_goal: Search example.com for sample beta.
+"""
+
+    stale = tools._detect_stale_block_metadata(submitted_yaml, prior_yaml)
+
+    assert {item["label"] for item in stale} == {"search_topic_alpha"}
+
+
+def test_stale_metadata_message_indicates_truncation_when_over_limit() -> None:
+    items = [{"label": f"label_{i}", "reasons": [f"reason {i}"]} for i in range(7)]
+    message = tools._stale_block_metadata_message(items)
+    assert "and 2 more" in message
+
+
+def test_stale_metadata_message_omits_truncation_indicator_under_limit() -> None:
+    items = [{"label": f"label_{i}", "reasons": [f"reason {i}"]} for i in range(3)]
+    message = tools._stale_block_metadata_message(items)
+    assert "more" not in message
+
+
+def test_referenced_output_labels_ignores_non_block_jinja_roots() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock(
+                "summarize_article",
+                "text_prompt",
+                {"prompt": "Summarize {{ search_term.field }} for {{ loop.index }}."},
+            ),
+        ]
+    )
+
+    refs = _referenced_output_labels(["summarize_article"], new)
+
+    assert refs == set()
+
+
+def test_plan_frontier_append_only_with_workflow_param_does_not_fall_back() -> None:
+    old = _FakeDefinition(
+        [_FakeBlock("open_page", "navigation")],
+        parameters=[_FakeParameter("search_term")],
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "navigation"),
+            _FakeBlock("search", "navigation", {"prompt": "Search for {{ search_term }} on this site"}),
+        ],
+        parameters=[_FakeParameter("search_term")],
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_page"]
+    ctx.verified_block_outputs = {"open_page": "nav_ok"}
+
+    labels, seed, frontier = _plan_frontier(ctx, ["open_page", "search"], old, new)
+
+    assert labels == ["search"]
+    assert seed == {}
+    assert frontier == "search"
+
+
+def test_template_builtin_roots_track_jinja_and_skyvern_contexts() -> None:
+    assert tools._JINJA_RUNTIME_GLOBAL_ROOTS == frozenset(SandboxedEnvironment().globals)
+    assert tools._JINJA_RUNTIME_GLOBAL_ROOTS <= tools._TEMPLATE_BUILTIN_ROOTS
+    assert tools._JINJA_LITERAL_ROOTS <= tools._TEMPLATE_BUILTIN_ROOTS
+    assert tools._JINJA_SPECIAL_CONTEXT_ROOTS <= tools._TEMPLATE_BUILTIN_ROOTS
+    assert frozenset(RESERVED_PARAMETER_KEYS) <= tools._SKYVERN_TEMPLATE_CONTEXT_ROOTS
+    assert {"parameters", "browser_session_id", "organization_id"} <= tools._SKYVERN_TEMPLATE_CONTEXT_ROOTS
+    assert tools._SKYVERN_TEMPLATE_CONTEXT_ROOTS <= tools._TEMPLATE_BUILTIN_ROOTS
+
+
+def test_unknown_jinja_roots_ignores_jinja_and_skyvern_context_roots() -> None:
+    new = _FakeDefinition(
+        [
+            _FakeBlock(
+                "summarize",
+                "text_prompt",
+                {
+                    "prompt": (
+                        "{{ range }} {{ dict }} {{ namespace }} {{ cycler }} {{ joiner }} {{ lipsum }} "
+                        "{{ none }} {{ true }} {{ false }} {{ loop.index }} {{ self }} {{ varargs }} {{ kwargs }} "
+                        "{{ parameters.search_term }} {{ browser_session_id }} {{ organization_id }} "
+                        "{{ current_date }} {{ workflow_run_id }}"
+                    )
+                },
+            ),
+        ]
+    )
+
+    assert tools._unknown_jinja_roots(["summarize"], new) == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +893,36 @@ def test_failed_unchanged_rerun_preserves_verified_prefix_and_outputs() -> None:
     tools._record_run_blocks_result(ctx, failed_result)
     assert ctx.verified_prefix_labels == ["a", "b"]
     assert ctx.verified_block_outputs == {"a": "nav", "b": {"title": "hi"}}
+
+
+def test_run_blocks_outcome_rolls_forward_after_failed_preview() -> None:
+    ctx = _make_ctx()
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_fail",
+                "blocks": [{"label": "summarize", "status": "failed", "failure_reason": "Jinja ref undefined"}],
+            },
+        },
+    )
+    assert ctx.last_test_ok is False
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_success",
+                "blocks": [{"label": "summarize", "status": "completed", "extracted_data": {"summary": "ok"}}],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_failure_reason is None
 
 
 def test_yaml_diff_invalidation_drops_edited_label_and_downstream() -> None:

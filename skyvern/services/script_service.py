@@ -20,14 +20,13 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
-    DEFAULT_LOGIN_COMPLETE_CRITERION,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
-from skyvern.errors.errors import UserDefinedError
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
     ScriptNotFound,
@@ -91,6 +90,10 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
+
+# Max wait for any download signal after a cached click; downstream
+# .crdownload polling handles in-progress completion separately. (SKY-9431)
+CACHED_DOWNLOAD_NO_FILE_GRACE_SECONDS = 60
 
 
 class SkyvernLoopItem:
@@ -481,17 +484,12 @@ async def _create_workflow_block_run_and_task(
             # Include script parameters as navigation_payload so handlers
             # (e.g. file upload) can find URLs like resume_link in the payload.
             nav_payload = context.script_run_parameters or None
-            # Apply default complete_criterion for login blocks so cached scripts
-            # get the same rigorous LLM verification as the agent path (SKY-8540).
-            # Without this, the LLM only sees a generic navigation_goal and can
-            # falsely mark login as complete when credentials were never entered.
-            task_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION if block_type == BlockType.LOGIN else None
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
-                complete_criterion=task_complete_criterion,
+                complete_criterion=None,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
@@ -636,9 +634,14 @@ async def _update_workflow_block(
     label: str | None = None,
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
-    ai_fallback_triggered: bool = False,
+    ai_fallback_triggered: bool | None = None,
 ) -> None:
-    """Update the status of a workflow run block."""
+    """Update workflow_run_block status, optionally setting `script_run`.
+
+    `ai_fallback_triggered` is three-valued: `None` = no assertion (no
+    write); `True`/`False` = explicit fallback signal, written to
+    `workflow_run_blocks.script_run` as `{"ai_fallback_triggered": <bool>}`.
+    """
     try:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.workflow_run_id or not context.workflow_id:
@@ -727,7 +730,9 @@ async def _update_workflow_block(
                 )
             if step_for_billing:
                 try:
-                    if not ai_fallback_triggered:
+                    # Explicit `is not True` — `None` means "caller made no
+                    # assertion" and falls through to billing like False.
+                    if ai_fallback_triggered is not True:
                         await app.AGENT_FUNCTION.post_cache_step_execution(
                             updated_task,
                             step_for_billing,
@@ -754,6 +759,7 @@ async def _update_workflow_block(
             status=status,
             failure_reason=failure_reason,
             output=final_output,
+            ai_fallback_triggered=ai_fallback_triggered,
         )
 
         await _record_output_parameter_value(
@@ -1039,6 +1045,16 @@ async def _detect_user_defined_errors(
                     error_dict=error_dict,
                 )
 
+        user_defined_errors, dropped = filter_to_user_defined_codes(user_defined_errors, error_code_mapping)
+        if dropped:
+            LOG.warning(
+                "Dropped LLM-returned error codes not in user error_code_mapping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                dropped_codes=dropped,
+                allowed_codes=sorted((error_code_mapping or {}).keys()),
+            )
+
         LOG.info(
             "Detected user-defined errors",
             task_id=task.task_id,
@@ -1179,6 +1195,8 @@ async def _fallback_to_ai_run(
                 task_failure_reason = f"{task_failure_reason}. Detected errors: {', '.join(error_codes)}"
 
             if workflow_run_block_id:
+                # No `ai_fallback_triggered` here — the script step failed
+                # before the AI agent ran, so no fallback actually fired.
                 await _update_workflow_block(
                     workflow_run_block_id,
                     BlockStatus.failed,
@@ -1424,6 +1442,7 @@ async def _fallback_to_ai_run(
                 task_status=TaskStatus.failed,
                 label=cache_key,
                 failure_reason=str(e),
+                ai_fallback_triggered=True,
             )
         raise e
 
@@ -1911,16 +1930,17 @@ async def download(
             #   - Check immediately (catches fast CDP atomic writes).
             #   - If a .crdownload is detected, a browser-native download is in
             #     progress — keep polling until it completes or times out.
-            #   - If nothing appears within a short grace period, the cached click
+            #   - If nothing appears within the grace period, the cached click
             #     likely did nothing (e.g. download_selector() returned None).
-            # Shorter than agent-path constants (BROWSER_DOWNLOAD_TIMEOUT=600,
-            # BROWSER_DOWNLOAD_MAX_WAIT_TIME=120) — cached fallback to AI is cheap.
+            # Grace accommodates slow report-generation backends; in-progress
+            # timeout is anchored at first detection so the grace doesn't eat
+            # the download budget. (SKY-9431)
             _POLL_INTERVAL = 2  # seconds between filesystem checks
-            _GRACE_PERIOD = 6  # seconds to wait when no download activity detected
             _DOWNLOAD_TIMEOUT = 300  # max seconds to wait for an in-progress download
             _DISAPPEARED_TIMEOUT = 30  # seconds to wait after .crdownload vanishes without completion
             _download_detected = False
             _disappeared_at: float | None = None
+            _first_detected_at: float | None = None
             _loop = asyncio.get_running_loop()
             _poll_start = _loop.time()
 
@@ -1944,9 +1964,10 @@ async def download(
                             workflow_run_id=run_id,
                             downloading_files=len(_new_downloading),
                         )
+                        _first_detected_at = _now
                     _download_detected = True
                     _disappeared_at = None  # reset — file is (still) present
-                    if _elapsed > _DOWNLOAD_TIMEOUT:
+                    if _first_detected_at is not None and (_now - _first_detected_at) > _DOWNLOAD_TIMEOUT:
                         raise CachedDownloadError(
                             ".crdownload file never completed. "
                             f"Files before: {len(local_files_before)}, after: {len(_local_files_now)}"
@@ -1969,7 +1990,7 @@ async def download(
                     continue
 
                 # Nothing new at all — wait a grace period then give up
-                if _elapsed >= _GRACE_PERIOD:
+                if _elapsed >= CACHED_DOWNLOAD_NO_FILE_GRACE_SECONDS:
                     LOG.warning(
                         "Cached download produced no file after grace period",
                         workflow_run_id=run_id,
@@ -2537,6 +2558,8 @@ async def run_script(
         workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run_id,
             ai_fallback_triggered=False,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
         )
         context.workflow_run_id = workflow_run_id
         context.organization_id = organization_id

@@ -28,8 +28,14 @@ export interface WorkflowCopilotChatRequest {
   workflow_id: string;
   workflow_copilot_chat_id?: string | null;
   workflow_run_id?: string | null;
+  browser_session_id?: string | null;
   message: string;
   workflow_yaml: string;
+  cancel_token?: string;
+}
+
+export interface WorkflowCopilotCancelRequest {
+  cancel_token: string;
 }
 
 export interface WorkflowCopilotChatHistoryMessage {
@@ -50,6 +56,11 @@ export interface WorkflowCopilotClearProposedWorkflowRequest {
   auto_accept: boolean;
 }
 
+export interface WorkflowCopilotApplyProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
+}
+
 export type WorkflowCopilotStreamMessageType =
   | "processing_update"
   | "response"
@@ -57,7 +68,8 @@ export type WorkflowCopilotStreamMessageType =
   | "tool_call"
   | "tool_result"
   | "condensing"
-  | "narration";
+  | "narration"
+  | "block_progress";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -71,6 +83,10 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
+  // Clients must NOT auto-apply when true; render Accept/Reject explicitly.
+  unvalidated?: boolean;
+  // Same auto-apply guard as unvalidated; cancel forces explicit review.
+  cancelled?: boolean;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
@@ -93,6 +109,7 @@ export interface WorkflowCopilotToolResultUpdate {
   summary: string;
   iteration: number;
   tool_call_id: string;
+  detail?: string | null;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
@@ -103,6 +120,16 @@ export interface WorkflowCopilotCondensingUpdate {
 export interface WorkflowCopilotNarrationUpdate {
   type: "narration";
   narration: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export interface WorkflowCopilotBlockProgressUpdate {
+  type: "block_progress";
+  workflow_run_block_id: string;
+  block_label: string;
+  block_type: string;
+  status: string;
   iteration: number;
   timestamp: string;
 }

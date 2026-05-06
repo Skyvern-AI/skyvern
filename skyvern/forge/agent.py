@@ -37,6 +37,7 @@ from skyvern.errors.errors import (
     ReachMaxStepsError,
     TimeoutGetTOTPVerificationCodeError,
     UserDefinedError,
+    filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
     BrowserSessionNotFound,
@@ -393,6 +394,7 @@ class ForgeAgent:
             retry=task_retry,
             max_steps_per_run=task_block.max_steps_per_run,
             error_code_mapping=task_block.error_code_mapping,
+            workflow_system_prompt=task_block.workflow_system_prompt,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
@@ -462,6 +464,7 @@ class ForgeAgent:
             proxy_location=task_request.proxy_location,
             extracted_information_schema=task_request.extracted_information_schema,
             error_code_mapping=task_request.error_code_mapping,
+            workflow_system_prompt=task_request.workflow_system_prompt,
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
@@ -509,6 +512,8 @@ class ForgeAgent:
         context = skyvern_context.ensure_context()
         context.step_id = step.step_id
         context.task_id = task.task_id
+        context.navigation_goal = task.navigation_goal
+        context.navigation_payload = task.navigation_payload
 
         # do not need to do complete verification when it's a CUA task
         # 1. CUA executes only one action step by step -- it's pretty less likely to have a hallucination for completion or forget to return a complete
@@ -1059,6 +1064,8 @@ class ForgeAgent:
             context = skyvern_context.ensure_context()
             context.step_id = None
             context.task_id = None
+            context.navigation_goal = None
+            context.navigation_payload = None
 
     async def fail_task(
         self,
@@ -1311,6 +1318,7 @@ class ForgeAgent:
                             prompt_name=prompt_name,
                             step=step,
                             screenshots=scraped_page.screenshots,
+                            system_prompt=task.workflow_system_prompt,
                         )
                     else:
                         LOG.debug(
@@ -1834,10 +1842,11 @@ class ForgeAgent:
         previous_response: OpenAIResponse | None = None,
         engine: RunEngine = RunEngine.openai_cua,
     ) -> tuple[list[Action], OpenAIResponse | None]:
+        cua_model = app.OPENAI_CUA_MODEL
         if not previous_response:
             # this is the first step
             first_response: OpenAIResponse = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 tools=[
                     {
                         "type": "computer_use_preview",
@@ -1917,13 +1926,14 @@ class ForgeAgent:
                     prompt_name="cua-answer-question",
                     step=step,
                     screenshots=scraped_page.screenshots,
+                    system_prompt=task.workflow_system_prompt,
                 )
                 LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
             current_response = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 previous_response_id=previous_response.id,
                 tools=[
                     {
@@ -1955,7 +1965,7 @@ class ForgeAgent:
                 computer_call_input["acknowledged_safety_checks"] = pending_checks
 
             current_response = await app.OPENAI_CLIENT.responses.create(
-                model="computer-use-preview",
+                model=cua_model,
                 previous_response_id=previous_response.id,
                 tools=[
                     {
@@ -2014,10 +2024,14 @@ class ForgeAgent:
         type = "computer_20250124"
         betas = ["computer-use-2025-01-24"]
         # according to https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool
-        # "computer-use-2025-11-24" for Claude Opus 4.6, Claude Opus 4.5
-        # "computer-use-2025-01-24" for Claude Sonnet 4.6, Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
+        # "computer-use-2025-11-24" for Claude Opus 4.7, Claude Opus 4.6, Claude Sonnet 4.6, Claude Opus 4.5
+        # "computer-use-2025-01-24" for Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
 
-        if "OPUS" in llm_caller.llm_key and ("4.6" in llm_caller.llm_key or "4.5" in llm_caller.llm_key):
+        key = llm_caller.llm_key
+        uses_new_computer_tool = ("OPUS" in key and any(v in key for v in ("4.5", "4.6", "4.7"))) or (
+            "SONNET" in key and "4.6" in key
+        )
+        if uses_new_computer_tool:
             type = "computer_20251124"
             betas = ["computer-use-2025-11-24"]
         tools = [
@@ -2028,19 +2042,31 @@ class ForgeAgent:
                 "display_width_px": settings.BROWSER_WIDTH,
             }
         ]
-        thinking = {"type": "enabled", "budget_tokens": 1024}
+        thinking: dict[str, Any]
+        output_config: dict[str, Any] | None
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(llm_caller.llm_config.model_name):
+            thinking = {"type": "adaptive"}
+            output_config = {"effort": LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT}
+        else:
+            thinking = {"type": "enabled", "budget_tokens": 1024}
+            output_config = None
         window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
+        call_kwargs: dict[str, Any] = {
+            "step": step,
+            "screenshots": scraped_page.screenshots,
+            "use_message_history": True,
+            "tools": tools,
+            "raw_response": True,
+            "betas": betas,
+            "thinking": thinking,
+            "window_dimension": window_dimension,
+        }
+        if output_config is not None:
+            call_kwargs["output_config"] = output_config
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                use_message_history=True,
-                tools=tools,
-                raw_response=True,
-                betas=betas,
-                thinking=thinking,
-                window_dimension=window_dimension,
+                **call_kwargs,
             )
         else:
             current_context = skyvern_context.ensure_context()
@@ -2057,14 +2083,7 @@ class ForgeAgent:
 
             llm_response = await llm_caller.call(
                 prompt=resp_content,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                use_message_history=True,
-                tools=tools,
-                raw_response=True,
-                betas=betas,
-                thinking=thinking,
-                window_dimension=window_dimension,
+                **call_kwargs,
             )
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
@@ -2172,6 +2191,7 @@ class ForgeAgent:
                 prompt_name=prompt_name,
                 step=next_step,
                 screenshots=scraped_page.screenshots,
+                system_prompt=task.workflow_system_prompt,
             )
 
             LOG.info(
@@ -2499,6 +2519,7 @@ class ForgeAgent:
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name=prompt_name,
+            system_prompt=task.workflow_system_prompt,
         )
         result = CompleteVerifyResult.model_validate(verification_result)
         if result.is_complete:
@@ -3286,7 +3307,9 @@ class ForgeAgent:
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key, default=app.LLM_API_HANDLER
             )
-            json_response = await llm_api_handler(prompt=prompt, step=step, prompt_name="infer-action-type")
+            json_response = await llm_api_handler(
+                prompt=prompt, step=step, prompt_name="infer-action-type", system_prompt=task.workflow_system_prompt
+            )
             if json_response.get("error"):
                 raise FailedToParseActionInstruction(
                     reason=json_response.get("thought"), error_type=json_response.get("error")
@@ -3350,6 +3373,12 @@ class ForgeAgent:
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
+        # Format-then-clear so a render failure can't drop the signal permanently;
+        # gate on extract-action template since other task types don't render it.
+        recent_dialog_messages_str = (
+            context.format_recent_dialog_messages() if template == EXTRACT_ACTION_TEMPLATE else None
+        )
+
         if template == EXTRACT_ACTION_TEMPLATE and cache_enabled:
             try:
                 # Try to load split templates for caching
@@ -3369,6 +3398,7 @@ class ForgeAgent:
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "parse_select_feature_enabled": context.enable_parse_select_in_extract,
                     "has_magic_link_page": context.has_magic_link_page(task.task_id),
+                    "recent_dialog_messages_str": recent_dialog_messages_str,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
@@ -3420,6 +3450,8 @@ class ForgeAgent:
                 )
                 # Map template to prompt_name for logging/caching guards
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+                if recent_dialog_messages_str is not None:
+                    context.clear_recent_dialog_messages()
                 return combined_prompt, use_caching, prompt_name
 
             except Exception as e:
@@ -3444,6 +3476,7 @@ class ForgeAgent:
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
             has_magic_link_page=context.has_magic_link_page(task.task_id),
+            recent_dialog_messages_str=recent_dialog_messages_str,
         )
 
         # Map template to prompt_name for logging/caching guards
@@ -3455,6 +3488,9 @@ class ForgeAgent:
         _prompt_build_span.set_attribute("prompt_name", prompt_name)
         _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
         _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+
+        if recent_dialog_messages_str is not None:
+            context.clear_recent_dialog_messages()
 
         return full_prompt, use_caching, prompt_name
 
@@ -3834,12 +3870,41 @@ class ForgeAgent:
                                 randomize_if_missing=False,
                             )
                         context = skyvern_context.current()
+                        finalization_run_id = (
+                            context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+                        )
                         await app.STORAGE.save_downloaded_files(
                             organization_id=task.organization_id,
-                            run_id=context.run_id
-                            if context and context.run_id
-                            else task.workflow_run_id or task.task_id,
+                            run_id=finalization_run_id,
                         )
+                        # Tag any session-scoped DOWNLOAD artifacts created during
+                        # this run with run_id, so GET /v1/runs/{id} surfaces them
+                        # (the watcher in browser_controller can't know the active
+                        # run at upload time — see
+                        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                        browser_session_id = context.browser_session_id if context else None
+                        if browser_session_id and task.organization_id and finalization_run_id:
+                            try:
+                                claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
+                                    run_id=finalization_run_id,
+                                    browser_session_id=browser_session_id,
+                                    organization_id=task.organization_id,
+                                    run_started_at=task.created_at,
+                                )
+                                if claimed:
+                                    LOG.debug(
+                                        "Claimed session-scoped download artifacts for run",
+                                        run_id=finalization_run_id,
+                                        browser_session_id=browser_session_id,
+                                        claimed=claimed,
+                                    )
+                            except Exception:
+                                LOG.warning(
+                                    "Failed to claim session-scoped download artifacts for run",
+                                    run_id=finalization_run_id,
+                                    browser_session_id=browser_session_id,
+                                    exc_info=True,
+                                )
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to save downloaded files",
@@ -4504,6 +4569,18 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
 
+        workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
+        if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
+            last_step = await self._terminate_for_workflow_run_step_budget(
+                organization=organization,
+                task=task,
+                step=step,
+                total_workflow_run_steps=workflow_run_budget[0],
+                max_steps_per_workflow_run=workflow_run_budget[1],
+                speculative_next_step=next_step,
+            )
+            return False, last_step, None
+
         if step.order + 1 >= max_steps_per_run:
             LOG.info(
                 "Step completed but max steps reached, marking task as failed",
@@ -4651,6 +4728,18 @@ class ForgeAgent:
             )
             return next_step
 
+    def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
+        kept, dropped = filter_to_user_defined_codes(errors, task.error_code_mapping)
+        if dropped:
+            LOG.warning(
+                "Dropped LLM-returned error codes not in user error_code_mapping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                dropped_codes=dropped,
+                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            )
+        return kept
+
     async def summary_failure_reason_for_max_steps(
         self,
         organization: Organization,
@@ -4665,26 +4754,26 @@ class ForgeAgent:
             steps = await app.DATABASE.tasks.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
-            for step_cnt, step in enumerate(steps):
-                if step.output is None:
+            for step_cnt, cur_step in enumerate(steps):
+                if cur_step.output is None:
                     continue
 
-                if len(step.output.errors) > 0:
-                    failure_reason = ";".join([repr(err) for err in step.output.errors])
+                if len(cur_step.output.errors) > 0:
+                    failure_reason = ";".join([repr(err) for err in cur_step.output.errors])
                     return MaxStepsReasonResponse(
                         page_info="",
                         reasoning=failure_reason,
-                        errors=step.output.errors,
+                        errors=cur_step.output.errors,
                     )
 
-                if step.output.actions_and_results is None:
+                if cur_step.output.actions_and_results is None:
                     continue
 
                 action_result_summary: list[str] = []
                 step_result: dict[str, Any] = {
                     "order": step_cnt,
                 }
-                for action, action_results in step.output.actions_and_results:
+                for action, action_results in cur_step.output.actions_and_results:
                     if len(action_results) == 0:
                         continue
                     last_result = action_results[-1]
@@ -4736,9 +4825,15 @@ class ForgeAgent:
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.LLM_API_HANDLER(
-                prompt=prompt, screenshots=screenshots, step=step, prompt_name="summarize-max-steps-reason"
+                prompt=prompt,
+                screenshots=screenshots,
+                step=step,
+                prompt_name="summarize-max-steps-reason",
+                system_prompt=task.workflow_system_prompt,
             )
-            return MaxStepsReasonResponse.model_validate(json_response)
+            response = MaxStepsReasonResponse.model_validate(json_response)
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            return response
         except Exception:
             LOG.warning("Failed to summary the failure reason")
             # Check if we have LLM errors even if the summarization failed
@@ -4879,8 +4974,11 @@ class ForgeAgent:
                 screenshots=screenshots,
                 step=step,
                 prompt_name="summarize-max-retries-reason",
+                system_prompt=task.workflow_system_prompt,
             )
-            return MaxStepsReasonResponse.model_validate(json_response)
+            response = MaxStepsReasonResponse.model_validate(json_response)
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            return response
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
             # Check if we have LLM errors even if the summarization failed
@@ -4925,6 +5023,94 @@ class ForgeAgent:
                 reasoning="",
                 errors=[],
             )
+
+    async def _check_workflow_run_step_budget(
+        self,
+        organization: Organization,
+        task: Task,
+    ) -> tuple[int, int] | None:
+        """Returns (total_steps_so_far, max_steps_per_workflow_run) when the org has a
+        run-level cap and this task belongs to a workflow run; otherwise None.
+
+        ``max_steps_per_workflow_run`` is a per-org cap on total step count summed across
+        all task blocks within a single workflow run. Distinct from the per-block
+        ``max_steps_per_run`` ceiling.
+        """
+        if not task.workflow_run_id or not organization.max_steps_per_workflow_run:
+            return None
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(task.workflow_run_id)
+        task_ids = [t.task_id for t in workflow_run_tasks]
+        if not task_ids:
+            return 0, organization.max_steps_per_workflow_run
+        total_steps = await app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids(
+            task_ids=task_ids,
+            organization_id=organization.organization_id,
+        )
+        return total_steps or 0, organization.max_steps_per_workflow_run
+
+    async def _terminate_for_workflow_run_step_budget(
+        self,
+        *,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        total_workflow_run_steps: int,
+        max_steps_per_workflow_run: int,
+        speculative_next_step: Step | None = None,
+    ) -> Step:
+        """Mark ``step`` as the last step of ``task`` and fail the task because the
+        workflow run has hit its total-step budget. Returns the updated last step.
+
+        ``speculative_next_step`` is the parallel-verification path's pre-created next
+        step that must be cancelled when present.
+        """
+        LOG.info(
+            "Step completed but workflow-run max steps reached, marking task as failed",
+            step_order=step.order,
+            step_retry=step.retry_index,
+            workflow_run_id=task.workflow_run_id,
+            total_workflow_run_steps=total_workflow_run_steps,
+            max_steps_per_workflow_run=max_steps_per_workflow_run,
+        )
+        if speculative_next_step is not None:
+            final_status = step.speculative_original_status or StepStatus.completed
+            step.speculative_original_status = None
+            step.status = final_status
+            last_step = await self.update_step(
+                step,
+                status=final_status,
+                output=step.output,
+                is_last=True,
+            )
+        else:
+            last_step = await self.update_step(step, is_last=True)
+
+        failure_reason = (
+            f"Workflow run reached the maximum total steps ({max_steps_per_workflow_run}) set on the organization."
+        )
+        errors = [ReachMaxStepsError().model_dump()]
+        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        LOG.info(
+            "Task failure classified",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            organization_id=task.organization_id,
+            task_status="failed",
+            failure_category=failure_category,
+            primary_failure_category=failure_category[0].get("category") if failure_category else None,
+            failure_category_source="code_level",
+            failure_category_path="max_steps_per_workflow_run",
+        )
+        if speculative_next_step is not None:
+            await self._cancel_speculative_step(speculative_next_step)
+        await self.update_task(
+            task,
+            status=TaskStatus.failed,
+            failure_reason=failure_reason,
+            errors=errors,
+            failure_category=failure_category,
+        )
+        return last_step
 
     async def handle_completed_step(
         self,
@@ -5042,6 +5228,17 @@ class ForgeAgent:
                 status=TaskStatus.completed,
             )
             return True, last_step, None
+
+        workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
+        if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
+            last_step = await self._terminate_for_workflow_run_step_budget(
+                organization=organization,
+                task=task,
+                step=step,
+                total_workflow_run_steps=workflow_run_budget[0],
+                max_steps_per_workflow_run=workflow_run_budget[1],
+            )
+            return False, last_step, None
 
         if step.order + 1 >= max_steps_per_run:
             LOG.info(
@@ -5203,12 +5400,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        # 1. Check navigation payload first for inline OTP.
         otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        # 2. Then try to generate TOTP from credential if payload has no OTP.
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
         if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             workflow_id = workflow_permanent_id = None
             if task.workflow_run_id:
@@ -5225,6 +5417,8 @@ class ForgeAgent:
                 totp_verification_url=task.totp_verification_url,
                 totp_identifier=task.totp_identifier,
             )
+        if not otp_value:
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response
@@ -5256,6 +5450,7 @@ class ForgeAgent:
             step=step,
             screenshots=scraped_page.screenshots,
             prompt_name=prompt_name,
+            system_prompt=task.workflow_system_prompt,
         )
 
     @staticmethod
@@ -5307,6 +5502,8 @@ class ForgeAgent:
         # narrowed to just compute_cache_key + lookup so a downstream log
         # failure can't double-count as a lookup_error.
         workflow_run_id = context.workflow_run_id if context else None
+        # task.workflow_permanent_id is unset on most fetch paths — fall back to context.
+        wpid_for_cache = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
@@ -5323,6 +5520,7 @@ class ForgeAgent:
                 data_extraction_goal=task.data_extraction_goal,
                 extracted_information_schema=post_ceiling_kwargs["data_extraction_schema"],
                 llm_key=None,
+                workflow_system_prompt=task.workflow_system_prompt,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
@@ -5374,11 +5572,80 @@ class ForgeAgent:
                     fallback_reason=lookup_result.fallback_reason,
                     cache_path="agent",
                 )
-            data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
-                prompt=prompt, step=step, prompt_name="data-extraction-summary"
-            )
-            if cache_key and isinstance(data_extraction_summary_resp, dict):
-                extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+
+            cross_run_value: dict[str, Any] | None = None
+            if cache_key is not None:
+                try:
+                    raw = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(wpid_for_cache, cache_key)
+                except Exception:
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache lookup raised",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        exc_info=True,
+                    )
+                    raw = None
+                if raw is not None and not isinstance(raw, dict):
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache hit returned non-dict value; falling through to LLM",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        value_type=type(raw).__name__,
+                        cache_path="agent",
+                    )
+                    raw = None
+                cross_run_value = raw if isinstance(raw, dict) else None
+
+            if cache_key is not None and cross_run_value is not None:
+                LOG.info(
+                    "data-extraction-summary cache hit — skipping LLM call (cross-run)",
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_hit=True,
+                    cache_scope=extraction_cache.SCOPE_WPID,
+                    cache_age_seconds=None,
+                    fallback_reason=None,
+                    cache_path="agent",
+                )
+                try:
+                    extraction_cache.store(workflow_run_id, cache_key, cross_run_value)
+                except Exception:
+                    LOG.warning(
+                        "data-extraction-summary cross-run cache backfill to in-run failed",
+                        exc_info=True,
+                    )
+                data_extraction_summary_resp = cross_run_value
+            else:
+                if cache_key is not None:
+                    LOG.info(
+                        "data-extraction-summary cache miss (cross-run)",
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        cache_hit=False,
+                        cache_scope=extraction_cache.SCOPE_WPID,
+                        cache_age_seconds=None,
+                        fallback_reason="cross_run_miss",
+                        cache_path="agent",
+                    )
+                data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                    prompt=prompt,
+                    step=step,
+                    prompt_name="data-extraction-summary",
+                    system_prompt=task.workflow_system_prompt,
+                )
+                if cache_key and isinstance(data_extraction_summary_resp, dict):
+                    extraction_cache.store(workflow_run_id, cache_key, data_extraction_summary_resp)
+                    try:
+                        await app.AGENT_FUNCTION.store_cross_run_extraction_cache(
+                            wpid_for_cache, cache_key, data_extraction_summary_resp
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "data-extraction-summary cross-run cache store raised; ignoring",
+                            workflow_run_id=workflow_run_id,
+                            cache_key=cache_key,
+                            exc_info=True,
+                        )
 
         if data_extraction_summary_resp is None:
             raise RuntimeError(

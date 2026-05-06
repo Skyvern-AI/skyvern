@@ -37,6 +37,15 @@ def load_js_script() -> str:
 JS_FUNCTION_DEFS = load_js_script()
 
 
+def _load_cursor_overlay_js() -> str:
+    path = f"{SKYVERN_DIR}/webeye/scraper/cursorOverlay.js"
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+_CURSOR_OVERLAY_JS = _load_cursor_overlay_js()
+
+
 class ScreenshotMode(StrEnum):
     LITE = "lite"
     DETAILED = "detailed"
@@ -48,6 +57,11 @@ async def _page_screenshot_helper(
     full_page: bool = False,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
 ) -> bytes:
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
     try:
         return await page.screenshot(
             path=file_path,
@@ -65,6 +79,12 @@ async def _page_screenshot_helper(
             full_page=full_page,
             animations="allow",
         )
+    finally:
+        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
 
 
 async def _current_viewpoint_screenshot_helper(
@@ -281,6 +301,40 @@ class SkyvernFrame:
     @staticmethod
     async def get_url(frame: Page | Frame) -> str:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
+
+    # -- cursor overlay helpers ------------------------------------------------
+
+    @staticmethod
+    async def ensure_cursor_overlay_loaded(page: Page) -> None:
+        """Inject ``cursorOverlay.js`` into *page* if not already present."""
+        is_loaded = await SkyvernFrame.evaluate(page, "() => !!window.__pwCursorInit")
+        if not is_loaded:
+            await SkyvernFrame.evaluate(page, _CURSOR_OVERLAY_JS)
+
+    @staticmethod
+    async def cursor_init(page: Page) -> None:
+        """Create the cursor dot and inject CSS keyframes."""
+        await SkyvernFrame.evaluate(page, "() => __pwCursorInit()")
+
+    @staticmethod
+    async def cursor_move(page: Page, x: float, y: float) -> None:
+        """Move cursor to *(x, y)* and leave interpolated trail dots."""
+        await SkyvernFrame.evaluate(page, "(pos) => __pwCursorMove(pos)", [x, y])
+
+    @staticmethod
+    async def cursor_click_ring(page: Page, x: float, y: float) -> None:
+        """Spawn an expanding ring animation at *(x, y)*."""
+        await SkyvernFrame.evaluate(page, "(pos) => __pwCursorClickRing(pos)", [x, y])
+
+    @staticmethod
+    async def hide_cursor_overlay(page: Page) -> None:
+        """Hide all ``[data-pw-overlay]`` elements (for screenshots)."""
+        await SkyvernFrame.evaluate(page, "() => { if (window.__pwCursorHide) __pwCursorHide(); }")
+
+    @staticmethod
+    async def show_cursor_overlay(page: Page) -> None:
+        """Re-show all ``[data-pw-overlay]`` elements after screenshots."""
+        await SkyvernFrame.evaluate(page, "() => { if (window.__pwCursorShow) __pwCursorShow(); }")
 
     @staticmethod
     @traced(name="skyvern.browser.scrolling_screenshot")

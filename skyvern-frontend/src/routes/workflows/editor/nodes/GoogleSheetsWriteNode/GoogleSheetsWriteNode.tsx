@@ -223,6 +223,7 @@ function GoogleSheetsWriteNode({
                 displayName={effectiveDisplayName}
                 placeholder="Search or paste a spreadsheet URL"
                 allowCreate={true}
+                blockType="google_sheets_write"
                 onChange={(value) => {
                   setSpreadsheetDisplayName(null);
                   const oldId = extractSpreadsheetIdFromUrl(
@@ -348,6 +349,7 @@ function GoogleSheetsWriteNode({
                       value={data.sheetName}
                       placeholder="Sheet1"
                       allowCreate={true}
+                      blockType="google_sheets_write"
                       onChange={(value) => update({ sheetName: value })}
                       onSelect={(tabName) => update({ sheetName: tabName })}
                     />

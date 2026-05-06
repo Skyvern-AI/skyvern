@@ -10,6 +10,8 @@ from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.mcp_tools import mcp
+from tests.unit._mcp_test_helpers import patch_get_workflow_by_id as _patch_get_workflow_by_id
+from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
 
 def _fake_workflow_response() -> SimpleNamespace:
@@ -98,7 +100,7 @@ def _patch_skyvern_http(
     fake_skyvern = SimpleNamespace(
         _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request_mock)),
     )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_skyvern)
+    _patch_skyvern_client(monkeypatch, fake_skyvern)
     return request_mock
 
 
@@ -216,7 +218,7 @@ async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
     definition = _google_sheets_definition(block_type)
 
     result = await workflow_tools.skyvern_workflow_update(
@@ -305,8 +307,6 @@ async def test_workflow_create_preserves_explicit_internal_text_prompt_llm_key(m
 @pytest.mark.parametrize(
     "hallucinated_key",
     [
-        "ANTHROPIC_CLAUDE_3_5_SONNET",  # exact key from the Slack thread
-        "ANTHROPIC_CLAUDE3.5_SONNET",  # the "correct" key Pedro mentioned — still not public
         "ANTHROPIC_CLAUDE_3_5_HAIKU",
         "OPENAI_GPT4_TURBO",
         "VERTEX_GEMINI_2_FLASH",
@@ -452,7 +452,7 @@ async def test_workflow_update_preserves_existing_proxy_when_omitted(monkeypatch
         assert version is None
         return {"proxy_location": "RESIDENTIAL_AU"}
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -490,7 +490,7 @@ async def test_workflow_update_defaults_proxy_when_existing_is_null(monkeypatch:
         assert version is None
         return {"proxy_location": None}
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -743,7 +743,7 @@ async def test_workflow_status_uses_workflow_run_route_for_wr_ids(monkeypatch: p
         get_run=AsyncMock(),
         _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
     )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     result = await workflow_tools.skyvern_workflow_status(run_id="wr_heavy")
 
@@ -773,7 +773,7 @@ async def test_workflow_status_full_preserves_expanded_workflow_details(monkeypa
         get_run=AsyncMock(),
         _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
     )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     result = await workflow_tools.skyvern_workflow_status(run_id="wr_heavy", verbosity="full")
 
@@ -811,7 +811,7 @@ async def test_workflow_status_task_runs_still_use_get_run(monkeypatch: pytest.M
         queued_at=None,
     )
     fake_client = SimpleNamespace(get_run=AsyncMock(return_value=task_run))
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     result = await workflow_tools.skyvern_workflow_status(run_id="tsk_v2_123")
 
@@ -830,7 +830,7 @@ async def test_workflow_status_summary_via_mcp_client(monkeypatch: pytest.Monkey
         get_run=AsyncMock(),
         _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
     )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     async with Client(mcp) as client:
         result = await client.call_tool("skyvern_workflow_status", {"run_id": "wr_heavy"})
@@ -853,7 +853,7 @@ async def test_workflow_status_full_via_mcp_client(monkeypatch: pytest.MonkeyPat
         get_run=AsyncMock(),
         _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
     )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+    _patch_skyvern_client(monkeypatch, fake_client)
 
     async with Client(mcp) as client:
         result = await client.call_tool("skyvern_workflow_status", {"run_id": "wr_heavy", "verbosity": "full"})
@@ -912,7 +912,7 @@ async def test_workflow_update_preserves_credential_parameters_when_omitted(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # The update definition includes the workflow parameter but omits the credential parameter
     definition = {
@@ -992,7 +992,7 @@ async def test_workflow_update_injects_credential_key_into_block_parameter_keys(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude regenerated the login block WITHOUT the credential key in parameter_keys
     definition = {
@@ -1070,7 +1070,7 @@ async def test_workflow_update_injects_credential_key_when_parameter_keys_omitte
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude regenerated the login block WITHOUT parameter_keys at all
     definition = {
@@ -1139,7 +1139,7 @@ async def test_workflow_update_preserves_block_credential_when_param_already_inc
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude included the credential param but omitted it from the block's parameter_keys
     definition = {
@@ -1214,7 +1214,7 @@ async def test_workflow_update_does_not_duplicate_existing_credential_parameter(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # The update definition already includes the credential parameter
     definition = {
@@ -1285,7 +1285,7 @@ async def test_workflow_update_credential_keys_injected_when_login_block_label_r
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude renamed the login block from "login_block" to "login"
     definition = {
@@ -1357,7 +1357,7 @@ async def test_workflow_update_always_replaces_wrong_credential_id(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude includes credential param but with a WRONG credential_id
     definition = {
@@ -1434,7 +1434,7 @@ async def test_workflow_update_correct_credential_still_works(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude includes credential param correctly AND the block references it
     definition = {
@@ -1521,7 +1521,7 @@ async def test_workflow_update_multiple_login_blocks_all_get_credential_keys(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude split the workflow into two login blocks with new labels
     definition = {
@@ -1610,7 +1610,7 @@ async def test_workflow_update_credential_keys_injected_into_login_block_nested_
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude renamed the nested login block inside the for_loop
     definition = {
@@ -1700,7 +1700,7 @@ async def test_workflow_update_login_block_only_gets_credential_type_keys_not_aw
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     # Claude renamed login block and dropped all parameter info
     definition = {
@@ -1792,7 +1792,7 @@ async def test_workflow_update_strips_runtime_fields_from_credential_params(
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -1878,7 +1878,7 @@ async def test_workflow_update_preserves_workflow_credential_id_params_and_injec
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -1970,7 +1970,7 @@ async def test_workflow_update_always_replaces_wrong_workflow_credential_id_defa
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -2045,7 +2045,7 @@ async def test_workflow_update_injects_onepassword_key_into_login_block_paramete
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -2125,7 +2125,7 @@ async def test_workflow_update_injects_bitwarden_login_key_into_login_block_para
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",
@@ -2202,7 +2202,7 @@ async def test_workflow_update_injects_azure_vault_key_into_login_block_paramete
             },
         }
 
-    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
     definition = {
         "title": "Updated workflow",

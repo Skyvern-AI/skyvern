@@ -27,6 +27,8 @@ async def prepare_workflow(
     code_gen: bool | None = None,
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    ignore_inherited_workflow_system_prompt: bool = False,
+    copilot_session_id: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -47,6 +49,8 @@ async def prepare_workflow(
         code_gen=code_gen,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
+        ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+        copilot_session_id=copilot_session_id,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
@@ -87,6 +91,7 @@ async def run_workflow(
     block_outputs: dict[str, t.Any] | None = None,
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    ignore_inherited_workflow_system_prompt: bool = False,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -98,6 +103,7 @@ async def run_workflow(
         request_id=request_id,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
+        ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -145,7 +151,11 @@ async def get_workflow_run_response(
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
         run_with=workflow_run.run_with,
+        ai_fallback=workflow_run.ai_fallback,
+        browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+        script_run=workflow_run.script_run,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,
             title=workflow_run_resp.workflow_title,
@@ -157,7 +167,7 @@ async def get_workflow_run_response(
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             browser_address=workflow_run.browser_address,
             browser_profile_id=workflow_run.browser_profile_id,
-            # TODO: add browser session id
+            browser_session_id=workflow_run.browser_session_id,
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,

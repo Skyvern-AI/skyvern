@@ -32,6 +32,7 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   continueOnFailure: false,
   jsonSchema: "null",
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isFileParserNode(node: AppNode): node is FileParserNode {

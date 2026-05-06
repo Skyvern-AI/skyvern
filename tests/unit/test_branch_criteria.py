@@ -5,31 +5,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, JinjaBranchCriteria
-
-
-class FakeWorkflowRunContext:
-    def __init__(
-        self,
-        *,
-        values: dict,
-        secrets: dict | None = None,
-        include_secrets_in_templates: bool = False,
-        block_metadata: dict[str, dict] | None = None,
-    ) -> None:
-        self.values = dict(values)
-        self.secrets = secrets or {}
-        self.include_secrets_in_templates = include_secrets_in_templates
-        self._block_metadata = block_metadata or {}
-
-        # Minimal workflow identifiers
-        self.workflow_title = "wf-title"
-        self.workflow_id = "wf-id"
-        self.workflow_permanent_id = "wf-perm-id"
-        self.workflow_run_id = "wf-run-id"
-        self.browser_session_id: str | None = None
-
-    def get_block_metadata(self, label: str) -> dict:
-        return dict(self._block_metadata.get(label, {}))
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 
 @pytest.mark.asyncio
@@ -151,4 +127,18 @@ async def test_jinja_branch_criteria_with_variable_comparison():
 
     # Combined logic
     criteria = JinjaBranchCriteria(expression="{{ comment_count > threshold and status == 'active' }}")
+    assert await criteria.evaluate(branch_ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_jinja_while_style_metadata_uses_current_index():
+    fake_ctx = FakeWorkflowRunContext(
+        values={"params": {}},
+        block_metadata={"while_blk": {"current_index": 3, "current_value": None, "current_item": None}},
+    )
+    branch_ctx = BranchEvaluationContext(
+        workflow_run_context=fake_ctx,
+        block_label="while_blk",
+    )
+    criteria = JinjaBranchCriteria(expression="{{ current_index < 5 }}")
     assert await criteria.evaluate(branch_ctx) is True

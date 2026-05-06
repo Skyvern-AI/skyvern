@@ -25,6 +25,7 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
@@ -40,6 +41,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { RunEngine } from "@/api/types";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
@@ -63,6 +65,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<NavigationNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   // Determine if we're in V2 mode (Skyvern 2.0)
   const isV2Mode = data.engine === RunEngine.SkyvernV2;
@@ -198,6 +201,17 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 editable={editable}
                 onDisableCacheChange={(disableCache) => {
                   update({ disableCache });
+                }}
+              />
+              <IgnoreWorkflowSystemPrompt
+                ignoreWorkflowSystemPrompt={
+                  data.ignoreWorkflowSystemPrompt ?? false
+                }
+                editable={editable}
+                onIgnoreWorkflowSystemPromptChange={(
+                  ignoreWorkflowSystemPrompt,
+                ) => {
+                  update({ ignoreWorkflowSystemPrompt });
                 }}
               />
               <Separator />
@@ -440,6 +454,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 }
                 editable={editable}
                 isInsideForLoop={isInsideForLoop}
+                parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                 blockType="navigation"
                 showOptions={{
                   continueOnFailure: true,
@@ -463,6 +478,17 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 editable={editable}
                 onDisableCacheChange={(disableCache) => {
                   update({ disableCache });
+                }}
+              />
+              <IgnoreWorkflowSystemPrompt
+                ignoreWorkflowSystemPrompt={
+                  data.ignoreWorkflowSystemPrompt ?? false
+                }
+                editable={editable}
+                onIgnoreWorkflowSystemPromptChange={(
+                  ignoreWorkflowSystemPrompt,
+                ) => {
+                  update({ ignoreWorkflowSystemPrompt });
                 }}
               />
               <Separator />

@@ -50,6 +50,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   send_email: "sendEmail",
   text_prompt: "textPrompt",
   for_loop: "loop",
+  while_loop: "loop",
   file_url_parser: "fileParser",
   pdf_parser: "pdfParser",
   download_to_s3: "download",
@@ -165,6 +166,8 @@ function getWorkflowElements(version: WorkflowVersion) {
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      version.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor

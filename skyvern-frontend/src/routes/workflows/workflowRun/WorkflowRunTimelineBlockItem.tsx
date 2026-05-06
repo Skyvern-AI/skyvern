@@ -393,7 +393,9 @@ function WorkflowRunTimelineBlockItem({
   // NOTE(jdo): want to put this back; await for now
   const showDuration = false as const;
   const hasNestedChildren = subItems.length > 0;
-  const isLoopBlock = block.block_type === "for_loop";
+  const isForLoopBlock = block.block_type === "for_loop";
+  const isWhileLoopBlock = block.block_type === "while_loop";
+  const isLoopBlock = isForLoopBlock || isWhileLoopBlock;
   const isConditionalBlock = block.block_type === "conditional";
   const [childrenOpen, setChildrenOpen] = useState(true);
 
@@ -474,7 +476,7 @@ function WorkflowRunTimelineBlockItem({
           "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
           getBlockElevation(depth),
           {
-            "ring-white/30":
+            "ring-2 ring-white/55 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/55":
               isWorkflowRunBlock(activeItem) &&
               activeItem.workflow_run_block_id === block.workflow_run_block_id,
           },
@@ -561,7 +563,7 @@ function WorkflowRunTimelineBlockItem({
                 {block.description}
               </div>
             ) : null}
-            {isLoopBlock && (
+            {isForLoopBlock && (
               <div className="min-w-0 space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
                 <div className="text-slate-300">
                   Iterable values:{" "}
@@ -591,6 +593,14 @@ function WorkflowRunTimelineBlockItem({
                     })}
                   </div>
                 )}
+              </div>
+            )}
+            {isWhileLoopBlock && (
+              <div className="min-w-0 rounded bg-slate-elevation5 px-3 py-2 text-xs text-slate-300">
+                Iterations run:{" "}
+                <span className="font-medium text-slate-200">
+                  {loopIterationGroups.length}
+                </span>
               </div>
             )}
             {block.block_type === "conditional" && block.executed_branch_id && (
@@ -771,7 +781,7 @@ function WorkflowRunTimelineBlockItem({
                             <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
                             <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
                           </div>
-                          {isValueTruncated ? (
+                          {isWhileLoopBlock ? null : isValueTruncated ? (
                             <TooltipProvider delayDuration={300}>
                               <Tooltip>
                                 <TooltipTrigger asChild>

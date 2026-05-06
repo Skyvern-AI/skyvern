@@ -1,4 +1,11 @@
-import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+  memo,
+} from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
@@ -10,6 +17,7 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
   WorkflowCopilotProcessingUpdate,
   WorkflowCopilotStreamErrorUpdate,
@@ -18,10 +26,23 @@ import {
   WorkflowCopilotToolResultUpdate,
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
+  WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
+  WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
+import {
+  ToolActivity,
+  applyBlockProgress,
+  applyToolCall,
+  applyToolResult,
+  getActivityDotClass,
+} from "./toolActivity";
+import {
+  shouldQueuePromptForLiveBrowser,
+  shouldWaitForLiveBrowser,
+} from "./browserReadiness";
 
 interface ChatMessage {
   id: string;
@@ -30,6 +51,16 @@ interface ChatMessage {
   timestamp?: string;
 }
 
+type QueuedPrompt = {
+  id: string;
+  content: string;
+};
+
+type SendOptions = {
+  queuedMessageId?: string;
+  skipQueue?: boolean;
+};
+
 type WorkflowCopilotSsePayload =
   | WorkflowCopilotProcessingUpdate
   | WorkflowCopilotStreamResponseUpdate
@@ -37,26 +68,26 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
-  | WorkflowCopilotNarrationUpdate;
-
-interface ToolActivity {
-  tool_name: string;
-  tool_call_id: string;
-  status: "running" | "success" | "error";
-  summary?: string;
-}
+  | WorkflowCopilotNarrationUpdate
+  | WorkflowCopilotBlockProgressUpdate;
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   update_workflow: "Updating workflow",
+  update_and_run_blocks: "Updating & running blocks",
   list_credentials: "Listing credentials",
   get_block_schema: "Looking up block schema",
   validate_block: "Validating block",
   run_blocks_and_collect_debug: "Running blocks",
+  get_run_results: "Getting run results",
   get_browser_screenshot: "Taking screenshot",
   navigate_browser: "Navigating browser",
-  evaluate: "Evaluating JavaScript",
-  click: "Clicking element",
-  type_text: "Typing text",
+  evaluate: "Inspecting the page",
+  click: "Clicking on the page",
+  type_text: "Filling a field",
+  scroll: "Scrolling",
+  console_messages: "Reading console",
+  select_option: "Selecting option",
+  press_key: "Pressing key",
 };
 
 const formatChatTimestamp = (value: string) => {
@@ -101,7 +132,11 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflow: WorkflowApiResponse) => void;
+  // `options.persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
+  onWorkflowUpdate?: (
+    workflow: WorkflowApiResponse,
+    options?: { persisted?: boolean },
+  ) => void;
   onReviewWorkflow?: (
     workflow: WorkflowApiResponse,
     clearPending: () => void,
@@ -110,7 +145,14 @@ interface WorkflowCopilotChatProps {
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
+  liveBrowserSessionId?: string | null;
+  requiresLiveBrowser?: boolean;
+  isLiveBrowserReady?: boolean;
+  initialMessage?: string;
+  onInitialMessageConsumed?: () => void;
 }
+
+const AUTO_SEND_TIMEOUT_MS = 5000;
 
 const DEFAULT_WINDOW_WIDTH = 600;
 const DEFAULT_WINDOW_HEIGHT = 400;
@@ -161,6 +203,11 @@ export function WorkflowCopilotChat({
   onClose,
   onMessageCountChange,
   buttonRef,
+  liveBrowserSessionId,
+  requiresLiveBrowser = false,
+  isLiveBrowserReady = false,
+  initialMessage,
+  onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
@@ -168,12 +215,18 @@ export function WorkflowCopilotChat({
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [processingStatus, setProcessingStatus] = useState<string>("");
   const [latestNarration, setLatestNarration] = useState<string>("");
   const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   const pendingMessageId = useRef<string | null>(null);
+  const pendingCancelToken = useRef<string | null>(null);
+  const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Backend cancel watcher polls Redis: a turn can complete normally between
+  // the cancel POST and the watcher firing, so the frontend must remember it.
+  const cancelInFlightController = useRef<AbortController | null>(null);
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -183,6 +236,15 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
+  useEffect(() => {
+    return () => {
+      streamingAbortController.current?.abort();
+      if (cancelSafetyTimer.current !== null) {
+        clearTimeout(cancelSafetyTimer.current);
+        cancelSafetyTimer.current = null;
+      }
+    };
+  }, []);
   const [size, setSize] = useState({
     width: DEFAULT_WINDOW_WIDTH,
     height: DEFAULT_WINDOW_HEIGHT,
@@ -215,61 +277,144 @@ export function WorkflowCopilotChat({
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
   const hasScrolledOnLoad = useRef(false);
+  const hasAutoSentRef = useRef(false);
+  const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
+    requiresLiveBrowser,
+    isLiveBrowserReady,
+  });
+  const isQueuedPromptWaiting = Boolean(queuedPrompt);
+  // Reset on initialMessage change so a re-arrival of the prop (without a
+  // remount) can fire auto-send again.
+  useEffect(() => {
+    hasAutoSentRef.current = false;
+  }, [initialMessage]);
+  const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
+  useEffect(() => {
+    onInitialMessageConsumedRef.current = onInitialMessageConsumed;
+  }, [onInitialMessageConsumed]);
+  // Pinned per workflow so dep-change re-fires can't clobber locally-pushed
+  // messages, and so auto-send has a synchronous "history loaded" gate.
+  const historyLoadedForRef = useRef<string | null>(null);
 
   const scrollToBottom = (behavior: ScrollBehavior) => {
     messagesEndRef.current?.scrollIntoView({ behavior });
   };
 
-  const adjustTextareaHeight = () => {
+  const adjustTextareaHeight = useCallback(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
 
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
-  };
+  }, []);
 
   useEffect(() => {
     adjustTextareaHeight();
-  }, [inputValue]);
+  }, [adjustTextareaHeight, inputValue]);
 
   const handleNewChat = () => {
     setMessages([]);
+    setQueuedPrompt(null);
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
     hasScrolledOnLoad.current = false;
   };
 
-  const applyWorkflowUpdate = (workflow: WorkflowApiResponse): boolean => {
-    if (!onWorkflowUpdate) {
-      return true;
-    }
-    try {
-      onWorkflowUpdate(workflow);
-      return true;
-    } catch (updateError) {
-      console.error("Failed to update workflow:", updateError);
-      toast({
-        title: "Update failed",
-        description: "Failed to apply workflow changes. Please try again.",
-        variant: "destructive",
-      });
-      return false;
-    }
-  };
+  const applyWorkflowUpdate = useCallback(
+    (
+      workflow: WorkflowApiResponse,
+      options?: { persisted?: boolean },
+    ): boolean => {
+      if (!onWorkflowUpdate) {
+        return true;
+      }
+      try {
+        onWorkflowUpdate(workflow, options);
+        return true;
+      } catch (updateError) {
+        console.error("Failed to update workflow:", updateError);
+        toast({
+          title: "Update failed",
+          description: "Failed to apply workflow changes. Please try again.",
+          variant: "destructive",
+        });
+        return false;
+      }
+    },
+    [onWorkflowUpdate],
+  );
 
-  const handleAcceptWorkflow = (
+  const handleAcceptWorkflow = async (
     workflow: WorkflowApiResponse,
     alwaysAccept: boolean = false,
   ) => {
-    if (!applyWorkflowUpdate(workflow)) {
+    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    if (!chatId) {
+      try {
+        chatId = await fetchLatestChatId();
+      } catch (resolveError) {
+        console.error(
+          "Failed to resolve chat ID before applying proposal:",
+          resolveError,
+        );
+      }
+    }
+
+    if (!chatId) {
+      // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
+      if (!applyWorkflowUpdate(workflow)) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
       return;
     }
-    setProposedWorkflow(null);
-    if (alwaysAccept) {
-      setAutoAccept(true);
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post<WorkflowApiResponse>(
+        "/workflow/copilot/apply-proposed-workflow",
+        {
+          workflow_copilot_chat_id: chatId,
+          auto_accept: alwaysAccept,
+        } as WorkflowCopilotApplyProposedWorkflowRequest,
+      );
+      // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
+      if (!applyWorkflowUpdate(response.data, { persisted: true })) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+    } catch (applyError) {
+      // Atomic accept can fail if the server-side proposal is missing
+      // _copilot_yaml (SKY-9310 — V1 path didn't stash it). Fall back to the
+      // pre-#10568 client-side apply so users aren't blocked while a backend
+      // deploy catches up. Logged so we can still spot regressions.
+      console.error(
+        "Atomic apply failed; falling back to client-side apply:",
+        applyError,
+      );
+      if (!applyWorkflowUpdate(workflow)) {
+        toast({
+          title: "Accept failed",
+          description:
+            "Could not apply the proposed workflow. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
     }
-    void clearProposedWorkflow(alwaysAccept);
   };
 
   const handleRejectWorkflow = () => {
@@ -382,9 +527,15 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     if (!workflowPermanentId) {
       setMessages([]);
+      setQueuedPrompt(null);
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
+      historyLoadedForRef.current = null;
+      return;
+    }
+
+    if (historyLoadedForRef.current === workflowPermanentId) {
       return;
     }
 
@@ -416,6 +567,7 @@ export function WorkflowCopilotChat({
         setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
         setProposedWorkflow(response.data.proposed_workflow ?? null);
         setAutoAccept(response.data.auto_accept ?? false);
+        historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
       } finally {
@@ -432,274 +584,406 @@ export function WorkflowCopilotChat({
     };
   }, [credentialGetter, workflowPermanentId]);
 
+  const cancelSend = useCallback(async () => {
+    // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
+    const controllerAtCancel = streamingAbortController.current;
+    if (!controllerAtCancel) return;
+
+    const cancelToken = pendingCancelToken.current;
+    pendingCancelToken.current = null;
+    if (!cancelToken) return;
+
+    setProcessingStatus("Cancelling...");
+    setLatestNarration("");
+    setToolActivity([]);
+    cancelInFlightController.current = controllerAtCancel;
+
+    const appendCancelledBubble = () => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-cancel`,
+          sender: "ai",
+          content: "Cancelled by user.",
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    };
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post<void>("/workflow/copilot/cancel", {
+        cancel_token: cancelToken,
+      } as WorkflowCopilotCancelRequest);
+      // Safety net: if the SSE channel never resolves, surface a fallback
+      // bubble and abort so handleSend's finally clears "Cancelling...".
+      if (cancelSafetyTimer.current !== null) {
+        clearTimeout(cancelSafetyTimer.current);
+      }
+      cancelSafetyTimer.current = setTimeout(() => {
+        cancelSafetyTimer.current = null;
+        if (streamingAbortController.current !== controllerAtCancel) return;
+        appendCancelledBubble();
+        controllerAtCancel.abort();
+      }, 15_000);
+    } catch (error) {
+      // 503 (Redis disabled) or network failure: client-side abort still
+      // gives the user immediate feedback; the backend will run to
+      // completion in that environment. Log so we can spot it in dev.
+      console.warn("Workflow copilot cancel POST failed", error);
+      controllerAtCancel.abort();
+      appendCancelledBubble();
+    }
+  }, [credentialGetter, setToolActivity]);
+
+  const cancelQueuedPrompt = useCallback(() => {
+    if (!queuedPrompt) {
+      return;
+    }
+
+    setQueuedPrompt(null);
+    setMessages((prev) =>
+      prev.filter((message) => message.id !== queuedPrompt.id),
+    );
+    setInputValue(queuedPrompt.content);
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      adjustTextareaHeight();
+    });
+  }, [adjustTextareaHeight, queuedPrompt]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || !isOpen || !isLoading) {
+      if (event.key !== "Escape" || !isOpen) {
         return;
       }
-      cancelSend();
+      if (queuedPrompt) {
+        cancelQueuedPrompt();
+        return;
+      }
+      if (isLoading) {
+        cancelSend();
+      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isLoading, isOpen]);
+  }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
 
-  const cancelSend = async () => {
-    if (!streamingAbortController.current) return;
-
-    if (pendingMessageId.current) {
-      const messageId = pendingMessageId.current;
-      pendingMessageId.current = null;
-      setMessages((prev) => prev.filter((message) => message.id !== messageId));
-    }
-    setIsLoading(false);
-    setProcessingStatus("");
-    streamingAbortController.current?.abort();
-  };
-
-  const handleSend = async () => {
-    if (!inputValue.trim() || isLoading) return;
-    if (!workflowPermanentId) {
-      toast({
-        title: "Missing workflow",
-        description: "Workflow permanent ID is required to chat.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    const userMessageId = Date.now().toString();
-    const userMessage: ChatMessage = {
-      id: userMessageId,
-      sender: "user",
-      content: inputValue,
-    };
-
-    pendingMessageId.current = userMessageId;
-    setMessages((prev) => [...prev, userMessage]);
-    setProposedWorkflow(null);
-    const messageContent = inputValue;
-    setInputValue("");
-    setIsLoading(true);
-    setProcessingStatus("Starting...");
-    setLatestNarration("");
-    setToolActivity([]);
-
-    const abortController = new AbortController();
-    streamingAbortController.current?.abort();
-    streamingAbortController.current = abortController;
-
-    try {
-      const saveData = getSaveData();
-      const workflowId = saveData?.workflow.workflow_id;
-      let workflowYaml = "";
-
-      if (!workflowId) {
+  const handleSend = useCallback(
+    async (messageOverride?: string, options: SendOptions = {}) => {
+      const candidate = messageOverride ?? inputValue;
+      if (
+        !candidate.trim() ||
+        isLoading ||
+        (queuedPrompt && !options.queuedMessageId)
+      )
+        return;
+      if (!workflowPermanentId) {
         toast({
           title: "Missing workflow",
-          description: "Workflow ID is required to chat.",
+          description: "Workflow permanent ID is required to chat.",
           variant: "destructive",
         });
         return;
       }
-
-      if (saveData) {
-        const extraHttpHeaders: Record<string, string> = {};
-        if (saveData.settings.extraHttpHeaders) {
-          try {
-            const parsedHeaders = JSON.parse(
-              saveData.settings.extraHttpHeaders,
-            );
-            if (
-              parsedHeaders &&
-              typeof parsedHeaders === "object" &&
-              !Array.isArray(parsedHeaders)
-            ) {
-              for (const [key, value] of Object.entries(parsedHeaders)) {
-                if (key && typeof key === "string") {
-                  extraHttpHeaders[key] = String(value);
-                }
-              }
-            }
-          } catch (error) {
-            console.error("Error parsing extra HTTP headers:", error);
-          }
-        }
-
-        const scriptCacheKey = saveData.settings.scriptCacheKey ?? "";
-        const normalizedKey =
-          scriptCacheKey === "" ? "default" : saveData.settings.scriptCacheKey;
-
-        const requestBody: WorkflowCreateYAMLRequest = {
-          title: saveData.title,
-          description: saveData.workflow.description,
-          proxy_location: saveData.settings.proxyLocation,
-          webhook_callback_url: saveData.settings.webhookCallbackUrl,
-          persist_browser_session: saveData.settings.persistBrowserSession,
-          model: saveData.settings.model,
-          max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
-          totp_verification_url: saveData.workflow.totp_verification_url,
-          extra_http_headers: extraHttpHeaders,
-          run_with: saveData.settings.runWith,
-          cache_key: normalizedKey,
-          ai_fallback: saveData.settings.aiFallback ?? true,
-          code_version:
-            saveData.settings.runWith === "code"
-              ? (saveData.settings.codeVersion ?? 2)
-              : undefined,
-          workflow_definition: {
-            version: saveData.workflowDefinitionVersion,
-            parameters: saveData.parameters,
-            blocks: saveData.blocks,
-          },
-          is_saved_task: saveData.workflow.is_saved_task,
-          status: saveData.workflow.status,
-          run_sequentially: saveData.settings.runSequentially,
-          sequential_key: saveData.settings.sequentialKey,
+      if (
+        !options.skipQueue &&
+        shouldQueuePromptForLiveBrowser({
+          requiresLiveBrowser,
+          isLiveBrowserReady,
+          message: candidate,
+        })
+      ) {
+        const queued: QueuedPrompt = {
+          id: `${Date.now()}-queued`,
+          content: candidate,
         };
 
-        workflowYaml = convertToYAML(requestBody);
+        setQueuedPrompt(queued);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: queued.id,
+            sender: "user",
+            content: queued.content,
+          },
+        ]);
+        setProposedWorkflow(null);
+        if (messageOverride === undefined) {
+          setInputValue("");
+        }
+        toast({
+          title: "Prompt queued",
+          description: "Copilot will start once the live browser connects.",
+        });
+        return;
       }
 
-      const handleProcessingUpdate = (
-        payload: WorkflowCopilotProcessingUpdate,
-      ) => {
-        if (payload.status) {
-          setProcessingStatus(payload.status);
-        }
+      const userMessageId = options.queuedMessageId ?? Date.now().toString();
+      const userMessage: ChatMessage = {
+        id: userMessageId,
+        sender: "user",
+        content: candidate,
+      };
 
-        const pendingId = pendingMessageId.current;
-        if (!pendingId || !payload.timestamp) {
+      const cancelToken = crypto.randomUUID();
+      pendingCancelToken.current = cancelToken;
+
+      pendingMessageId.current = userMessageId;
+      if (!options.queuedMessageId) {
+        setMessages((prev) => [...prev, userMessage]);
+      }
+      setProposedWorkflow(null);
+      const messageContent = candidate;
+      if (messageOverride === undefined && !options.queuedMessageId) {
+        setInputValue("");
+      }
+      setIsLoading(true);
+      setProcessingStatus("Starting...");
+      setLatestNarration("");
+      setToolActivity([]);
+
+      const abortController = new AbortController();
+      streamingAbortController.current?.abort();
+      streamingAbortController.current = abortController;
+
+      try {
+        const saveData = getSaveData();
+        const workflowId = saveData?.workflow.workflow_id;
+        let workflowYaml = "";
+
+        if (!workflowId) {
+          toast({
+            title: "Missing workflow",
+            description: "Workflow ID is required to chat.",
+            variant: "destructive",
+          });
           return;
         }
 
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === pendingId
-              ? { ...message, timestamp: payload.timestamp }
-              : message,
-          ),
-        );
-      };
+        if (saveData) {
+          const extraHttpHeaders: Record<string, string> = {};
+          if (saveData.settings.extraHttpHeaders) {
+            try {
+              const parsedHeaders = JSON.parse(
+                saveData.settings.extraHttpHeaders,
+              );
+              if (
+                parsedHeaders &&
+                typeof parsedHeaders === "object" &&
+                !Array.isArray(parsedHeaders)
+              ) {
+                for (const [key, value] of Object.entries(parsedHeaders)) {
+                  if (key && typeof key === "string") {
+                    extraHttpHeaders[key] = String(value);
+                  }
+                }
+              }
+            } catch (error) {
+              console.error("Error parsing extra HTTP headers:", error);
+            }
+          }
 
-      const handleResponse = (
-        response: WorkflowCopilotStreamResponseUpdate,
-      ) => {
-        setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
+          const scriptCacheKey = saveData.settings.scriptCacheKey ?? "";
+          const normalizedKey =
+            scriptCacheKey === ""
+              ? "default"
+              : saveData.settings.scriptCacheKey;
 
-        const aiMessage: ChatMessage = {
-          id: Date.now().toString(),
-          sender: "ai",
-          content: response.message,
-          timestamp: response.response_time,
+          const requestBody: WorkflowCreateYAMLRequest = {
+            title: saveData.title,
+            description: saveData.workflow.description,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            model: saveData.settings.model,
+            max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+            totp_verification_url: saveData.workflow.totp_verification_url,
+            extra_http_headers: extraHttpHeaders,
+            run_with: saveData.settings.runWith,
+            cache_key: normalizedKey,
+            ai_fallback: saveData.settings.aiFallback ?? true,
+            code_version:
+              saveData.settings.runWith === "code"
+                ? (saveData.settings.codeVersion ?? 2)
+                : undefined,
+            workflow_definition: {
+              version: saveData.workflowDefinitionVersion,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+            },
+            is_saved_task: saveData.workflow.is_saved_task,
+            status: saveData.workflow.status,
+            run_sequentially: saveData.settings.runSequentially,
+            sequential_key: saveData.settings.sequentialKey,
+          };
+
+          workflowYaml = convertToYAML(requestBody);
+        }
+
+        const handleProcessingUpdate = (
+          payload: WorkflowCopilotProcessingUpdate,
+        ) => {
+          if (payload.status) {
+            setProcessingStatus(payload.status);
+          }
+
+          const pendingId = pendingMessageId.current;
+          if (!pendingId || !payload.timestamp) {
+            return;
+          }
+
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === pendingId
+                ? { ...message, timestamp: payload.timestamp }
+                : message,
+            ),
+          );
         };
 
-        setMessages((prev) => [...prev, aiMessage]);
-        if (response.updated_workflow && autoAccept) {
-          applyWorkflowUpdate(response.updated_workflow);
-        } else {
-          setProposedWorkflow(response.updated_workflow ?? null);
-        }
-      };
+        const handleResponse = (
+          response: WorkflowCopilotStreamResponseUpdate,
+        ) => {
+          // Stream completed; a Cancel click after this point should no-op.
+          pendingCancelToken.current = null;
+          setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
-      const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+          const aiMessage: ChatMessage = {
+            id: Date.now().toString(),
+            sender: "ai",
+            content: response.message,
+            timestamp: response.response_time,
+          };
+
+          setMessages((prev) => [...prev, aiMessage]);
+          const userCancelledThisTurn =
+            cancelInFlightController.current === abortController;
+          if (
+            response.updated_workflow &&
+            autoAccept &&
+            !response.unvalidated &&
+            !response.cancelled &&
+            !userCancelledThisTurn
+          ) {
+            applyWorkflowUpdate(response.updated_workflow);
+          } else {
+            setProposedWorkflow(response.updated_workflow ?? null);
+          }
+        };
+
+        const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+          pendingCancelToken.current = null;
+          const errorMessage: ChatMessage = {
+            id: Date.now().toString(),
+            sender: "ai",
+            content: payload.error,
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        };
+
+        const client = await getSseClient(credentialGetter);
+        await client.postStreaming<WorkflowCopilotSsePayload>(
+          "/workflow/copilot/chat-post",
+          {
+            workflow_id: workflowId,
+            workflow_permanent_id: workflowPermanentId,
+            workflow_copilot_chat_id: workflowCopilotChatId,
+            workflow_run_id: workflowRunId,
+            browser_session_id: liveBrowserSessionId ?? null,
+            message: messageContent,
+            workflow_yaml: workflowYaml,
+            cancel_token: cancelToken,
+          } as WorkflowCopilotChatRequest,
+          (payload) => {
+            switch (payload.type) {
+              case "processing_update":
+                handleProcessingUpdate(payload);
+                return false;
+              case "tool_call":
+                setProcessingStatus(
+                  TOOL_DISPLAY_NAMES[payload.tool_name] ??
+                    payload.tool_name + "...",
+                );
+                setToolActivity((prev) => applyToolCall(prev, payload));
+                return false;
+              case "tool_result":
+                setToolActivity((prev) => applyToolResult(prev, payload));
+                return false;
+              case "condensing":
+                if (payload.status === "started") {
+                  setProcessingStatus("Condensing context...");
+                }
+                return false;
+              case "narration":
+                if (payload.narration) {
+                  setLatestNarration(payload.narration);
+                }
+                return false;
+              case "block_progress":
+                setToolActivity((prev) => applyBlockProgress(prev, payload));
+                return false;
+              case "response":
+                handleResponse(payload);
+                return true;
+              case "error":
+                handleError(payload);
+                return true;
+              default:
+                return false;
+            }
+          },
+          { signal: abortController.signal },
+        );
+      } catch (error) {
+        if (abortController.signal.aborted) {
+          return;
+        }
+        console.error("Failed to send message:", error);
         const errorMessage: ChatMessage = {
           id: Date.now().toString(),
           sender: "ai",
-          content: payload.error,
+          content: "Sorry, I encountered an error. Please try again.",
         };
         setMessages((prev) => [...prev, errorMessage]);
-      };
-
-      const client = await getSseClient(credentialGetter);
-      await client.postStreaming<WorkflowCopilotSsePayload>(
-        "/workflow/copilot/chat-post",
-        {
-          workflow_id: workflowId,
-          workflow_permanent_id: workflowPermanentId,
-          workflow_copilot_chat_id: workflowCopilotChatId,
-          workflow_run_id: workflowRunId,
-          message: messageContent,
-          workflow_yaml: workflowYaml,
-        } as WorkflowCopilotChatRequest,
-        (payload) => {
-          switch (payload.type) {
-            case "processing_update":
-              handleProcessingUpdate(payload);
-              return false;
-            case "tool_call":
-              setProcessingStatus(
-                TOOL_DISPLAY_NAMES[payload.tool_name] ??
-                  payload.tool_name + "...",
-              );
-              setToolActivity((prev) => [
-                ...prev,
-                {
-                  tool_name: payload.tool_name,
-                  tool_call_id: payload.tool_call_id,
-                  status: "running",
-                },
-              ]);
-              return false;
-            case "tool_result":
-              setToolActivity((prev) =>
-                prev.map((item) =>
-                  item.tool_call_id === payload.tool_call_id
-                    ? {
-                        ...item,
-                        status: payload.success ? "success" : "error",
-                        summary: payload.summary,
-                      }
-                    : item,
-                ),
-              );
-              return false;
-            case "condensing":
-              if (payload.status === "started") {
-                setProcessingStatus("Condensing context...");
-              }
-              return false;
-            case "narration":
-              if (payload.narration) {
-                setLatestNarration(payload.narration);
-              }
-              return false;
-            case "response":
-              handleResponse(payload);
-              return true;
-            case "error":
-              handleError(payload);
-              return true;
-            default:
-              return false;
-          }
-        },
-        { signal: abortController.signal },
-      );
-    } catch (error) {
-      if (abortController.signal.aborted) {
-        return;
+      } finally {
+        if (streamingAbortController.current === abortController) {
+          streamingAbortController.current = null;
+        }
+        if (cancelInFlightController.current === abortController) {
+          cancelInFlightController.current = null;
+        }
+        if (cancelSafetyTimer.current !== null) {
+          clearTimeout(cancelSafetyTimer.current);
+          cancelSafetyTimer.current = null;
+        }
+        pendingMessageId.current = null;
+        pendingCancelToken.current = null;
+        setIsLoading(false);
+        setProcessingStatus("");
+        setLatestNarration("");
+        setToolActivity([]);
       }
-      console.error("Failed to send message:", error);
-      const errorMessage: ChatMessage = {
-        id: Date.now().toString(),
-        sender: "ai",
-        content: "Sorry, I encountered an error. Please try again.",
-      };
-      setMessages((prev) => [...prev, errorMessage]);
-    } finally {
-      if (streamingAbortController.current === abortController) {
-        streamingAbortController.current = null;
-      }
-      pendingMessageId.current = null;
-      setIsLoading(false);
-      setProcessingStatus("");
-      setLatestNarration("");
-      setToolActivity([]);
-    }
-  };
+    },
+    [
+      applyWorkflowUpdate,
+      autoAccept,
+      credentialGetter,
+      getSaveData,
+      inputValue,
+      isLiveBrowserReady,
+      isLoading,
+      liveBrowserSessionId,
+      queuedPrompt,
+      requiresLiveBrowser,
+      workflowCopilotChatId,
+      workflowPermanentId,
+      workflowRunId,
+    ],
+  );
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -707,6 +991,106 @@ export function WorkflowCopilotChat({
       handleSend();
     }
   };
+
+  useEffect(() => {
+    // Drain only when the browser is actually ready (non-null session id from
+    // the parent). If requiresLiveBrowser flips to false without a session
+    // (rate-limit, pane hidden), the queue stays so user intent isn't sent
+    // with browser_session_id=null.
+    if (
+      !queuedPrompt ||
+      !liveBrowserSessionId ||
+      isLoading ||
+      !workflowPermanentId
+    ) {
+      return;
+    }
+
+    const promptToSend = queuedPrompt;
+    setQueuedPrompt(null);
+    handleSend(promptToSend.content, {
+      queuedMessageId: promptToSend.id,
+      skipQueue: true,
+    }).catch((error) => {
+      console.error("Queued send failed:", error);
+    });
+  }, [
+    handleSend,
+    isLoading,
+    liveBrowserSessionId,
+    queuedPrompt,
+    workflowPermanentId,
+  ]);
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory || isLoading || !workflowPermanentId || queuedPrompt) {
+      return;
+    }
+    // Synchronous gate: isLoadingHistory state is stale in this effect's
+    // closure when both effects run in the same commit.
+    if (historyLoadedForRef.current !== workflowPermanentId) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (
+      !saveData?.workflow.workflow_id ||
+      saveData.workflow.workflow_permanent_id !== workflowPermanentId
+    ) {
+      return;
+    }
+    // Trip the guard before any await so the 5s timeout cannot toast over
+    // an in-flight send. handleSend internally routes to the queue when the
+    // live browser isn't ready yet.
+    hasAutoSentRef.current = true;
+    onInitialMessageConsumedRef.current?.();
+    handleSend(initialMessage).catch((error) => {
+      console.error("Auto-send failed:", error);
+    });
+  }, [
+    handleSend,
+    initialMessage,
+    isLoading,
+    isLoadingHistory,
+    queuedPrompt,
+    getSaveData,
+    workflowPermanentId,
+  ]);
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory || isWaitingForLiveBrowser || queuedPrompt) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (!saveData?.workflow.workflow_id) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (hasAutoSentRef.current) return;
+      hasAutoSentRef.current = true;
+      onInitialMessageConsumedRef.current?.();
+      toast({
+        title: "Could not auto-send message",
+        description:
+          "The copilot was not ready in time — please retype your prompt.",
+        variant: "destructive",
+      });
+    }, AUTO_SEND_TIMEOUT_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    initialMessage,
+    isLoadingHistory,
+    isWaitingForLiveBrowser,
+    queuedPrompt,
+    getSaveData,
+  ]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -858,6 +1242,15 @@ export function WorkflowCopilotChat({
     return null;
   }
 
+  const inputDisabled = isLoading || Boolean(queuedPrompt);
+  const queuedPromptWaitingStatus =
+    "Prompt queued. Waiting for live browser...";
+  const browserStatusText = queuedPrompt
+    ? queuedPromptWaitingStatus
+    : isWaitingForLiveBrowser
+      ? "Live browser is starting. Send now to queue your prompt."
+      : null;
+
   return (
     <div
       className="fixed z-50 flex flex-col rounded-lg border border-slate-700 bg-slate-900 shadow-2xl"
@@ -918,12 +1311,19 @@ export function WorkflowCopilotChat({
           {messages.map((message, index) => {
             const isLastMessage = index === messages.length - 1;
             const showProposedPanel = isLastMessage && proposedWorkflow;
+            const showQueuedFooter =
+              isQueuedPromptWaiting && message.id === queuedPrompt?.id;
             return (
               <MessageItem
                 key={message.id}
                 message={message}
                 footer={
-                  showProposedPanel ? (
+                  showQueuedFooter ? (
+                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                      <ReloadIcon className="h-3 w-3 animate-spin" />
+                      <span>{queuedPromptWaitingStatus}</span>
+                    </div>
+                  ) : showProposedPanel ? (
                     <>
                       <button
                         type="button"
@@ -961,7 +1361,7 @@ export function WorkflowCopilotChat({
               />
             );
           })}
-          {isLoading && (
+          {(isLoading || isQueuedPromptWaiting) && (
             <div className="flex items-start gap-3">
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
                 AI
@@ -970,32 +1370,50 @@ export function WorkflowCopilotChat({
                 <div className="flex items-center gap-2 text-sm text-slate-300">
                   <ReloadIcon className="h-4 w-4 animate-spin" />
                   <span>
-                    {latestNarration || processingStatus || "Processing..."}
+                    {isQueuedPromptWaiting
+                      ? queuedPromptWaitingStatus
+                      : latestNarration || processingStatus || "Processing..."}
                   </span>
                 </div>
-                {toolActivity.length > 0 && (
+                {isQueuedPromptWaiting ? (
+                  <div className="mt-2 text-xs text-slate-500">
+                    Copilot will start automatically once the browser is ready.
+                  </div>
+                ) : null}
+                {!isQueuedPromptWaiting && toolActivity.length > 0 && (
                   <div className="mt-2 space-y-1">
-                    {toolActivity.map((activity, index) => (
-                      <div
-                        key={index}
-                        className="flex items-start gap-1.5 text-xs text-slate-500"
-                      >
-                        <span
-                          className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${
-                            activity.status === "running"
-                              ? "animate-pulse bg-blue-400"
-                              : activity.status === "success"
-                                ? "bg-green-400"
-                                : "bg-red-400"
-                          }`}
-                        />
-                        <span className="line-clamp-2 min-w-0 flex-1">
-                          {TOOL_DISPLAY_NAMES[activity.tool_name] ??
-                            activity.tool_name}
-                          {activity.summary ? ` — ${activity.summary}` : ""}
-                        </span>
-                      </div>
-                    ))}
+                    {toolActivity.map((activity) => {
+                      const isRetrySuccess =
+                        activity.status === "success" &&
+                        activity.linkedRecovery === true;
+                      const tooltip = activity.detail ?? activity.summary;
+                      const displayName =
+                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
+                        activity.tool_name;
+                      const containerClass = `flex items-start gap-1.5 text-xs text-slate-500${
+                        activity.linkedRecovery
+                          ? " border-l border-amber-400/40 pl-2"
+                          : ""
+                      }`;
+                      return (
+                        <div
+                          key={activity.tool_call_id}
+                          className={containerClass}
+                        >
+                          <span
+                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
+                          />
+                          <span
+                            className="line-clamp-2 min-w-0 flex-1"
+                            title={tooltip}
+                          >
+                            {isRetrySuccess ? "↻ " : ""}
+                            {displayName}
+                            {activity.summary ? ` — ${activity.summary}` : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1007,14 +1425,23 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-slate-700 p-3">
+        {browserStatusText ? (
+          <div className="mb-2 text-xs text-slate-400">{browserStatusText}</div>
+        ) : null}
         <div className="flex items-end gap-2">
           <textarea
             ref={textareaRef}
-            placeholder="Type your message... (Shift+Enter for new line)"
+            placeholder={
+              queuedPrompt
+                ? "Prompt queued..."
+                : isWaitingForLiveBrowser
+                  ? "Type a prompt to queue..."
+                  : "Type your message... (Shift+Enter for new line)"
+            }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
-            disabled={isLoading}
+            disabled={inputDisabled}
             rows={1}
             className="flex-1 resize-none rounded-md border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
@@ -1023,13 +1450,22 @@ export function WorkflowCopilotChat({
               overflow: "auto",
             }}
           />
-          <button
-            onClick={handleSend}
-            disabled={isLoading}
-            className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Send
-          </button>
+          {isLoading || Boolean(queuedPrompt) ? (
+            <button
+              onClick={isLoading ? cancelSend : cancelQueuedPrompt}
+              title={isLoading ? "Stop Copilot" : "Edit queued prompt"}
+              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              onClick={() => handleSend()}
+              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Send
+            </button>
+          )}
         </div>
       </div>
 

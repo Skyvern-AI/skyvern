@@ -39,6 +39,7 @@ from .url_block_parameters_item import UrlBlockParametersItem
 from .validation_block_data_schema import ValidationBlockDataSchema
 from .validation_block_parameters_item import ValidationBlockParametersItem
 from .wait_block_parameters_item import WaitBlockParametersItem
+from .while_loop_block_condition import WhileLoopBlockCondition
 from .workflow_trigger_block_parameters_item import WorkflowTriggerBlockParametersItem
 
 
@@ -780,6 +781,28 @@ class ForLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class ForLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
+    block_type: typing.Literal["while_loop"] = "while_loop"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
+    condition: WhileLoopBlockCondition
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 
 ForLoopBlockLoopBlocksItem = typing.Union[
@@ -806,6 +829,7 @@ ForLoopBlockLoopBlocksItem = typing.Union[
     ForLoopBlockLoopBlocksItem_UploadToS3,
     ForLoopBlockLoopBlocksItem_Validation,
     ForLoopBlockLoopBlocksItem_Wait,
+    ForLoopBlockLoopBlocksItem_WhileLoop,
     ForLoopBlockLoopBlocksItem_WorkflowTrigger,
 ]
 update_forward_refs(ForLoopBlockLoopBlocksItem_Action)
@@ -823,4 +847,5 @@ update_forward_refs(ForLoopBlockLoopBlocksItem_Task)
 update_forward_refs(ForLoopBlockLoopBlocksItem_TextPrompt)
 update_forward_refs(ForLoopBlockLoopBlocksItem_Validation)
 update_forward_refs(ForLoopBlockLoopBlocksItem_Wait)
+update_forward_refs(ForLoopBlockLoopBlocksItem_WhileLoop)
 update_forward_refs(ForLoopBlockLoopBlocksItem_WorkflowTrigger)

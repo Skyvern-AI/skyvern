@@ -30,6 +30,7 @@ export const extractionNodeDefaultData: ExtractionNodeData = {
   disableCache: false,
   engine: RunEngine.SkyvernV1,
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isExtractionNode(node: Node): node is ExtractionNode {

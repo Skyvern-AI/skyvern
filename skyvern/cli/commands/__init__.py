@@ -30,12 +30,24 @@ register_lazy_command("block", "skyvern.cli.block", "block_app", "Inspect and va
 register_lazy_command(
     "credential", "skyvern.cli.credential", "credential_app", "MCP-parity credential commands (list/get/delete)."
 )
+register_lazy_command(
+    "config",
+    "skyvern.cli.config_command",
+    "config_app",
+    "Read and update organization settings (max_steps_per_run, webhook URL, retries, artifact URL expiry).",
+)
 register_lazy_command("workflow", "skyvern.cli.workflow", "workflow_app", "Workflow management commands.")
 register_lazy_command(
     "browser-profile",
     "skyvern.cli.browser_profile",
     "browser_profile_app",
     "Manage cloud saved-login browser profiles for reusable authenticated state.",
+)
+register_lazy_command(
+    "schedule",
+    "skyvern.cli.schedule_command",
+    "schedule_app",
+    "Manage workflow schedules (list, create, update, enable/disable, delete).",
 )
 register_lazy_command("tasks", "skyvern.cli.tasks", "tasks_app", "Task management commands.")
 register_lazy_command(

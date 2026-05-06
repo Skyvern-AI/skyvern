@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from sqlalchemy import and_, delete, select
+import structlog
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -27,8 +28,11 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.schemas.runs import ProxyLocationInput, RunEngine
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
+from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
+
+LOG = structlog.get_logger()
 
 
 class ObserverRepository(BaseRepository):
@@ -120,6 +124,64 @@ class ObserverRepository(BaseRepository):
             thoughts = (await session.scalars(query)).all()
             return [Thought.model_validate(thought) for thought in thoughts]
 
+    @db_operation("get_thought_cost_sum_by_workflow_run_id")
+    async def get_thought_cost_sum_by_workflow_run_id(self, workflow_run_id: str, organization_id: str) -> float:
+        """Sum `thought_cost` across all thoughts for the given workflow_run_id.
+
+        Returns 0.0 for runs without task_v2 planning.
+        """
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(ThoughtModel.thought_cost), 0))
+                .where(ThoughtModel.workflow_run_id == workflow_run_id)
+                .where(ThoughtModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
+
+    @db_operation("get_block_llm_cost_sum_by_workflow_run_id")
+    async def get_block_llm_cost_sum_by_workflow_run_id(self, workflow_run_id: str, organization_id: str) -> float:
+        """Sum `llm_cost` across all workflow_run_blocks for this workflow_run_id."""
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(WorkflowRunBlockModel.llm_cost), 0))
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
+
+    @db_operation("increment_workflow_run_block_llm_cost")
+    async def increment_workflow_run_block_llm_cost(
+        self,
+        workflow_run_block_id: str,
+        organization_id: str,
+        amount: float,
+    ) -> None:
+        """Atomically add `amount` to `workflow_run_blocks.llm_cost`.
+
+        Single SQL UPDATE so concurrent writers don't lose increments.
+        No-op for non-positive `amount`.
+        """
+        if amount <= 0:
+            return
+        async with self.Session() as session:
+            stmt = (
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_block_id == workflow_run_block_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .values(llm_cost=WorkflowRunBlockModel.llm_cost + amount)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if result.rowcount == 0:
+                LOG.warning(
+                    "Block LLM cost increment matched zero rows — cost dropped",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    amount=amount,
+                )
+
     @db_operation("create_task_v2")
     async def create_task_v2(
         self,
@@ -135,12 +197,15 @@ class ObserverRepository(BaseRepository):
         webhook_callback_url: str | None = None,
         extracted_information_schema: dict | list | str | None = None,
         error_code_mapping: dict | None = None,
+        workflow_system_prompt: str | None = None,
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         run_with: str | None = None,
     ) -> TaskV2:
+        if isinstance(workflow_system_prompt, str):
+            workflow_system_prompt = sanitize_postgres_text(workflow_system_prompt)
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
                 workflow_run_id=workflow_run_id,
@@ -154,6 +219,7 @@ class ObserverRepository(BaseRepository):
                 webhook_callback_url=webhook_callback_url,
                 extracted_information_schema=extracted_information_schema,
                 error_code_mapping=error_code_mapping,
+                workflow_system_prompt=workflow_system_prompt,
                 organization_id=organization_id,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
@@ -489,7 +555,9 @@ class ObserverRepository(BaseRepository):
                 if http_request_follow_redirects is not None:
                     workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 if ai_fallback_triggered is not None:
-                    workflow_run_block.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                    workflow_run_block.script_run = ScriptRunResponse(
+                        ai_fallback_triggered=ai_fallback_triggered
+                    ).model_dump(mode="json")
                 if error_codes is not None:
                     workflow_run_block.error_codes = error_codes
                 # human interaction block fields

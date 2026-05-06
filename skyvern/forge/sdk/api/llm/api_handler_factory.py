@@ -30,11 +30,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
-from skyvern.forge.sdk.api.llm.models import (
-    LLMAllowedFailsPolicy,
-    LLMConfig,
-    LLMRouterConfig,
-)
+from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_image_message,
@@ -50,7 +46,16 @@ from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.schemas.llm import (
+    LLMAllowedFailsPolicy,
+    LLMConfig,
+    LLMRouterConfig,
+)
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
+
+# Keep this server-only side effect out of the package __init__ so the legacy
+# models shim can import without litellm. Legacy LLM calls enter this module.
+configure_litellm_transport()
 
 LOG = structlog.get_logger()
 
@@ -104,6 +109,9 @@ def _enrich_llm_span(
     span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
     span.set_attribute("gen_ai.usage.cached_tokens", cached_tokens)
     span.set_attribute("gen_ai.usage.cost", llm_cost)
+    ctx = skyvern_context.current()
+    if ctx is not None and ctx.copilot_session_id is not None:
+        span.set_attribute("copilot.session_id", ctx.copilot_session_id)
     span.add_event(
         LLM_REQUEST_COMPLETED_EVENT,
         attributes={
@@ -222,13 +230,45 @@ def _normalize_llm_model(model: str | None) -> str | None:
     return model.split("/")[-1]
 
 
-def _assert_step_thought_exclusive(step: Step | None, thought: Thought | None) -> None:
-    # step and thought write the same llm_cost to different tables
-    # (steps.step_cost vs observer_thoughts.thought_cost). int_org_llm_costs
-    # UNION ALLs them, so setting both would double-count cost in
-    # fct_org_margin.llm_cost.
-    if step is not None and thought is not None:
-        raise ValueError("LLM API handler invoked with both step and thought set — these are mutually exclusive")
+def _assert_step_thought_block_exclusive(
+    step: Step | None,
+    thought: Thought | None,
+    workflow_run_block_id: str | None,
+) -> None:
+    # Each LLM call writes cost to exactly one of: steps.step_cost,
+    # observer_thoughts.thought_cost, workflow_run_blocks.llm_cost.
+    # Both the run-level SUM and the int_org_llm_costs dbt model rely on
+    # this exclusivity to avoid double-counting.
+    set_count = sum(1 for x in (step, thought, workflow_run_block_id) if x is not None)
+    if set_count > 1:
+        raise ValueError(
+            "LLM API handler invoked with more than one of step / thought / workflow_run_block_id set — "
+            "these are mutually exclusive"
+        )
+
+
+async def _persist_block_llm_cost(
+    workflow_run_block_id: str,
+    organization_id: str | None,
+    context: skyvern_context.SkyvernContext | None,
+    llm_cost: float,
+    prompt_name: str | None,
+) -> None:
+    """Increment workflow_run_blocks.llm_cost or warn if no org_id resolves."""
+    block_org_id = organization_id or (context.organization_id if context else None)
+    if block_org_id:
+        await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=block_org_id,
+            amount=llm_cost,
+        )
+    else:
+        LOG.warning(
+            "Block LLM cost dropped: workflow_run_block_id set but no organization_id resolved",
+            workflow_run_block_id=workflow_run_block_id,
+            llm_cost=llm_cost,
+            prompt_name=prompt_name,
+        )
 
 
 def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
@@ -410,6 +450,14 @@ class LLMAPIHandlerFactory:
 
     # Anthropic API requires budget_tokens >= 1024
     ANTHROPIC_MIN_THINKING_BUDGET = 1024
+    ADAPTIVE_THINKING_EFFORT = "low"
+
+    @staticmethod
+    def requires_adaptive_thinking(model_name: str | None) -> bool:
+        # Claude Opus 4.7 rejects `thinking.type=enabled` and requires
+        # `thinking.type=adaptive` + `output_config.effort`. Bedrock's translator
+        # does not yet accept the new shape, so gate to direct Anthropic.
+        return model_name == "anthropic/claude-opus-4-7"
 
     @staticmethod
     def _apply_anthropic_thinking_optimization(
@@ -417,6 +465,17 @@ class LLMAPIHandlerFactory:
     ) -> None:
         """Apply thinking optimization for Anthropic/Claude models."""
         model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(model_label):
+            parameters["thinking"] = {"type": "adaptive"}
+            parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            LOG.debug(
+                "Applied thinking budget optimization (adaptive)",
+                prompt_name=prompt_name,
+                effort=LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT,
+                model=model_label,
+            )
+            return
 
         if llm_config.reasoning_effort is not None:
             # Use reasoning_effort if configured in LLM config - always use "low" per LiteLLM constants
@@ -562,6 +621,7 @@ class LLMAPIHandlerFactory:
             task_v2: TaskV2 | None = None,
             thought: Thought | None = None,
             ai_suggestion: AISuggestion | None = None,
+            workflow_run_block_id: str | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
             organization_id: str | None = None,
@@ -584,7 +644,7 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
-            _assert_step_thought_exclusive(step, thought)
+            _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
             start_time = time.perf_counter()
             _llm_span = otel_trace.get_current_span()
             _llm_span.set_attribute("llm_key", llm_key)
@@ -768,6 +828,9 @@ class LLMAPIHandlerFactory:
                     active_params = copy.deepcopy(litellm_params)
                     active_params.update(parameters)
                     active_params["cached_content"] = cache_name
+                    # Deployment-level timeout (flex tiers carry their own) wins; passing `timeout`
+                    # as an explicit kwarg as well would collide with this entry on unpacking.
+                    active_params.setdefault("timeout", settings.LLM_CONFIG_TIMEOUT)
                     request_model = active_params.pop("model", primary_model_dict.get("model_name", main_model_group))
 
                     # Clone messages to avoid modifying original list which is needed for fallback
@@ -798,7 +861,6 @@ class LLMAPIHandlerFactory:
                     response = await litellm.acompletion(
                         model=request_model,
                         messages=active_messages,
-                        timeout=settings.LLM_CONFIG_TIMEOUT,
                         drop_params=True,
                         **active_params,
                     )
@@ -1000,7 +1062,17 @@ class LLMAPIHandlerFactory:
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         last_llm_model=actual_model,
                     )
-                parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                if workflow_run_block_id:
+                    # Atomic UPDATE: description gen (asyncio.create_task in
+                    # execute_safe) races with the block's own execute() calls.
+                    await _persist_block_llm_cost(
+                        workflow_run_block_id, organization_id, context, llm_cost, prompt_name
+                    )
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -1154,6 +1226,7 @@ class LLMAPIHandlerFactory:
             task_v2: TaskV2 | None = None,
             thought: Thought | None = None,
             ai_suggestion: AISuggestion | None = None,
+            workflow_run_block_id: str | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
             organization_id: str | None = None,
@@ -1164,7 +1237,7 @@ class LLMAPIHandlerFactory:
             force_dict: bool = True,
             system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
-            _assert_step_thought_exclusive(step, thought)
+            _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
             start_time = time.perf_counter()
             _llm_span = otel_trace.get_current_span()
             # handler_type distinguishes the three LLM entry points that share
@@ -1527,7 +1600,15 @@ class LLMAPIHandlerFactory:
                         thought_cost=llm_cost,
                         last_llm_model=actual_model,
                     )
-                parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                if workflow_run_block_id:
+                    await _persist_block_llm_cost(
+                        workflow_run_block_id, organization_id, context, llm_cost, prompt_name
+                    )
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -1749,6 +1830,7 @@ class LLMCaller:
         task_v2: TaskV2 | None = None,
         thought: Thought | None = None,
         ai_suggestion: AISuggestion | None = None,
+        workflow_run_block_id: str | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
         organization_id: str | None = None,
@@ -1760,7 +1842,7 @@ class LLMCaller:
         system_prompt: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
-        _assert_step_thought_exclusive(step, thought)
+        _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
         start_time = time.perf_counter()
         _llm_span = otel_trace.get_current_span()
         _llm_span.set_attribute("llm_key", self.llm_key)
@@ -1905,10 +1987,11 @@ class LLMCaller:
 
             t_llm_request = time.perf_counter()
             try:
+                # `timeout` may already live in active_parameters via litellm_params (flex configs
+                # carry their own); passing it explicitly too collides on kwarg unpacking.
                 response = await self._dispatch_llm_call(
                     messages=messages,
                     tools=tools,
-                    timeout=settings.LLM_CONFIG_TIMEOUT,
                     **active_parameters,
                 )
                 if use_message_history:
@@ -1995,6 +2078,12 @@ class LLMCaller:
                     cached_token_count=call_stats.cached_tokens,
                     thought_cost=call_stats.llm_cost,
                     last_llm_model=actual_model,
+                )
+            if workflow_run_block_id and call_stats and call_stats.llm_cost is not None:
+                # call_stats.llm_cost is None when litellm can't compute cost
+                # (volcengine, some OPENAI_COMPATIBLE targets).
+                await _persist_block_llm_cost(
+                    workflow_run_block_id, organization_id, context, call_stats.llm_cost, prompt_name
                 )
 
             organization_id = organization_id or (
@@ -2197,6 +2286,10 @@ class LLMCaller:
         model_name = self.llm_config.model_name.replace("bedrock/", "").replace("anthropic/", "")
         betas = active_parameters.get("betas", NOT_GIVEN)
         thinking = active_parameters.get("thinking", NOT_GIVEN)
+        output_config = active_parameters.get("output_config", NOT_GIVEN)
+        extra_body: dict[str, Any] | None = None
+        if output_config is not NOT_GIVEN:
+            extra_body = {"output_config": output_config}
         LOG.info(
             "Anthropic request",
             model_name=model_name,
@@ -2205,15 +2298,18 @@ class LLMCaller:
             timeout=timeout,
             messages_length=len(messages),
         )
-        response = await app.ANTHROPIC_CLIENT.beta.messages.create(
-            max_tokens=max_tokens,
-            messages=messages,
-            model=model_name,
-            tools=tools or NOT_GIVEN,
-            timeout=timeout,
-            betas=betas,
-            thinking=thinking,
-        )
+        create_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "messages": messages,
+            "model": model_name,
+            "tools": tools or NOT_GIVEN,
+            "timeout": timeout,
+            "betas": betas,
+            "thinking": thinking,
+        }
+        if extra_body is not None:
+            create_kwargs["extra_body"] = extra_body
+        response = await app.ANTHROPIC_CLIENT.beta.messages.create(**create_kwargs)
         LOG.info(
             "Anthropic response",
             model_name=model_name,

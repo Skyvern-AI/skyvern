@@ -20,6 +20,7 @@ import { helpTooltips, placeholders } from "../../helpContent";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -38,6 +39,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
@@ -61,6 +63,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<ExtractionNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -227,6 +230,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                     nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
+                    parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                     blockType="extraction"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
@@ -240,6 +244,17 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                     editable={editable}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
+                    }}
+                  />
+                  <IgnoreWorkflowSystemPrompt
+                    ignoreWorkflowSystemPrompt={
+                      data.ignoreWorkflowSystemPrompt ?? false
+                    }
+                    editable={editable}
+                    onIgnoreWorkflowSystemPromptChange={(
+                      ignoreWorkflowSystemPrompt,
+                    ) => {
+                      update({ ignoreWorkflowSystemPrompt });
                     }}
                   />
                 </div>

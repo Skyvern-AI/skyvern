@@ -23,6 +23,7 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
+  getParentLoopSkipsOnFail,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
@@ -38,6 +39,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
@@ -60,6 +62,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<LoginNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, id);
 
   // Manage flippable facing state
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -303,6 +306,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
+                    parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                     blockType="login"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
@@ -316,6 +320,17 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     editable={editable}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
+                    }}
+                  />
+                  <IgnoreWorkflowSystemPrompt
+                    ignoreWorkflowSystemPrompt={
+                      data.ignoreWorkflowSystemPrompt ?? false
+                    }
+                    editable={editable}
+                    onIgnoreWorkflowSystemPromptChange={(
+                      ignoreWorkflowSystemPrompt,
+                    ) => {
+                      update({ ignoreWorkflowSystemPrompt });
                     }}
                   />
                   <Separator />

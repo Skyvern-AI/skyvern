@@ -24,19 +24,33 @@ default_salt = hashlib.md5(b"deterministic_salt_0123456789", usedforsecurity=Fal
 
 
 class AES(BaseEncryptor):
-    def __init__(self, *, secret_key: str, salt: str | None = None, iv: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        secret_key: str,
+        salt: str | None = None,
+        iv: str | None = None,
+        fallback_decrypt_keys: list[tuple[str, str]] | None = None,
+    ) -> None:
         self.secret_key = hashlib.md5(secret_key.encode("utf-8"), usedforsecurity=False).digest()
         self.salt = hashlib.md5(salt.encode("utf-8"), usedforsecurity=False).digest() if salt else default_salt
         self.iv = hashlib.md5(iv.encode("utf-8")).digest() if iv else default_iv
+        self._fallback_decrypt_params: list[tuple[bytes, bytes]] = [
+            (
+                hashlib.md5(fb_salt.encode("utf-8"), usedforsecurity=False).digest(),
+                hashlib.md5(fb_iv.encode("utf-8")).digest(),
+            )
+            for fb_salt, fb_iv in (fallback_decrypt_keys or [])
+        ]
 
     def method(self) -> EncryptMethod:
         return EncryptMethod.AES
 
-    def _derive_key(self) -> bytes:
+    def _derive_key(self, salt: bytes | None = None) -> bytes:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=self.salt,
+            salt=salt if salt is not None else self.salt,
             iterations=100000,
         )
         return kdf.derive(self.secret_key)
@@ -55,14 +69,24 @@ class AES(BaseEncryptor):
     async def decrypt(self, ciphertext: str) -> str:
         try:
             encrypted_data = base64.b64decode(ciphertext.encode("utf-8"))
-            key = self._derive_key()
-            cipher = Cipher(algorithms.AES(key), modes.CBC(self.iv))
-            decryptor = cipher.decryptor()
-            padded_plaintext = decryptor.update(encrypted_data) + decryptor.finalize()
-            plaintext = self._unpad(padded_plaintext)
-            return plaintext.decode("utf-8")
         except Exception as e:
             raise Exception("Failed to decrypt token") from e
+
+        candidates: list[tuple[bytes, bytes]] = [(self.salt, self.iv), *self._fallback_decrypt_params]
+        last_error: Exception | None = None
+        for salt, iv in candidates:
+            try:
+                key = self._derive_key(salt=salt)
+                cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+                decryptor = cipher.decryptor()
+                padded_plaintext = decryptor.update(encrypted_data) + decryptor.finalize()
+                plaintext = self._unpad(padded_plaintext)
+                return plaintext.decode("utf-8")
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise Exception("Failed to decrypt token") from last_error
 
     def _pad(self, data: bytes) -> bytes:
         block_size = 16
@@ -71,5 +95,15 @@ class AES(BaseEncryptor):
         return data + padding
 
     def _unpad(self, data: bytes) -> bytes:
+        # Strict PKCS#7 validation. Rejecting malformed trailers is what lets the
+        # multi-key decrypt loop in ``decrypt`` distinguish wrong-key garbage from
+        # a legitimate plaintext when no AEAD/HMAC is in play.
+        block_size = 16
+        if not data:
+            raise ValueError("invalid padding: empty data")
         padding_length = data[-1]
+        if padding_length < 1 or padding_length > block_size or padding_length > len(data):
+            raise ValueError("invalid padding: length out of range")
+        if data[-padding_length:] != bytes([padding_length] * padding_length):
+            raise ValueError("invalid padding: trailer mismatch")
         return data[:-padding_length]

@@ -306,6 +306,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        recoverable_marker_id: int | None = None,
         **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
@@ -410,6 +411,7 @@ class SkyvernPage(Page):
                     timeout=timeout,
                     failed_selector=original_selector or "",
                     block_label=self.current_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -422,6 +424,8 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    block_label=self.current_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
 
         if selector:
@@ -490,6 +494,7 @@ class SkyvernPage(Page):
         mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        recoverable_marker_id: int | None = None,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -572,24 +577,26 @@ class SkyvernPage(Page):
 
         return await self._input_text(
             selector=selector,
-            value=value or "",
+            value=value if value is not None else "",
             ai=ai,
             intention=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
+            recoverable_marker_id=recoverable_marker_id,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def type(
         self,
-        selector: str | None,
-        value: str,
+        selector: str | None = None,
+        value: str | None = None,
         ai: str | None = "fallback",
         prompt: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        recoverable_marker_id: int | None = None,
         **kwargs: Any,
     ) -> str:
         # Backward compatibility
@@ -605,13 +612,14 @@ class SkyvernPage(Page):
 
         return await self._input_text(
             selector=selector,
-            value=value,
+            value=value if value is not None else "",
             ai=ai,
             intention=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
+            recoverable_marker_id=recoverable_marker_id,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -921,6 +929,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        recoverable_marker_id: int | None = None,
     ) -> str:
         """Input text into an element identified by ``selector``.
 
@@ -984,6 +993,7 @@ class SkyvernPage(Page):
                     timeout=timeout,
                     failed_selector=original_selector or "",
                     block_label=self.current_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -998,6 +1008,8 @@ class SkyvernPage(Page):
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
                 timeout=timeout,
+                block_label=self.current_label,
+                recoverable_marker_id=recoverable_marker_id,
             )
 
         if not selector:
@@ -1323,6 +1335,9 @@ class SkyvernPage(Page):
         """
         data = kwargs.pop("data", None)
         skip_refresh = kwargs.pop("skip_refresh", False)
+        extra_kwargs: dict[str, Any] = {}
+        if "system_prompt" in kwargs:
+            extra_kwargs["system_prompt"] = kwargs.pop("system_prompt")
         return await self._ai.ai_extract(
             prompt=prompt,
             schema=schema,
@@ -1330,6 +1345,7 @@ class SkyvernPage(Page):
             intention=intention,
             data=data,
             skip_refresh=skip_refresh,
+            **extra_kwargs,
         )
 
     async def validate(

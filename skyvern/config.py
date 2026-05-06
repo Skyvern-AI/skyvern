@@ -100,6 +100,8 @@ class Settings(BaseSettings):
     DISABLE_CONNECTION_POOL: bool = False
     DATABASE_POOL_SIZE: int = 5
     DATABASE_POOL_MAX_OVERFLOW: int = 10
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_RECYCLE: int = 1800
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -109,7 +111,7 @@ class Settings(BaseSettings):
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
-    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 5.0
+    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
@@ -183,6 +185,7 @@ class Settings(BaseSettings):
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
@@ -212,7 +215,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"  # This is the model name
+    LLM_KEY: str = "OPENAI_GPT5_5"  # This is the model name
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
@@ -228,6 +231,8 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -249,9 +254,10 @@ class Settings(BaseSettings):
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
+    OPENAI_CUA_MODEL: str = "computer-use-preview"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
-    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
+    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -419,6 +425,7 @@ class Settings(BaseSettings):
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
+    VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES: int = 3
 
     # Bitwarden Settings
     BITWARDEN_CLIENT_ID: str | None = None
@@ -519,6 +526,32 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+    ENABLE_ENCRYPTION: bool = False
+
+    # Google OAuth settings (used by the Google Sheets connector)
+    GOOGLE_OAUTH_CLIENT_ID: str | None = None
+    GOOGLE_OAUTH_CLIENT_SECRET: str | None = None
+    # Hostnames allowed as the OAuth ``redirect_uri`` sent to Google. Defense-in-depth
+    # alongside Google's own redirect_uri allowlist (which is the real enforcement
+    # gate — it validates the full URI against its registered list). This setting is
+    # intentionally host-only: any path or port on an approved host passes. Empty
+    # list means no redirect_uri may be supplied at all (the route layer rejects
+    # with 400) when CLIENT_ID is set.
+    GOOGLE_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Origins allowed as the bounce-back destination after OAuth callback.
+    # Never sent to Google. Two entry shapes — port handling differs:
+    #   - Exact-match: ``https://host:port`` matches that exact origin (port included).
+    #     ``https://app.example.com`` does NOT match ``https://app.example.com:8443``.
+    #   - Suffix wildcard: ``*.foo.com`` matches any HTTPS hostname ending in ``.foo.com``
+    #     regardless of port (so preview deploys on non-default ports work). Rejects
+    #     bare-suffix spoofs like ``attacker-foo.com``.
+    # Fails closed: an empty list rejects every app_origin, so self-hosted operators
+    # who want to use the bounce-back flow must populate this with at least one entry.
+    GOOGLE_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
+
+    # Google Sheets API runtime tuning
+    GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
+    GOOGLE_SHEETS_API_MAX_RETRIES: int = 3
 
     # Cleanup Cron Settings
     ENABLE_CLEANUP_CRON: bool = False

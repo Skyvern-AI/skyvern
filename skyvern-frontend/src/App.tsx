@@ -7,9 +7,11 @@ import { queryClient } from "./api/QueryClient";
 import { PostHogProvider } from "posthog-js/react";
 import { LoggingContext, loggingStub } from "@/store/LoggingContext";
 import { UserContext } from "@/store/UserContext";
+import { dropNoiseExceptions } from "@/util/posthogNoiseFilter";
 
 const postHogOptions = {
   api_host: "https://app.posthog.com",
+  before_send: dropNoiseExceptions,
 };
 
 const getLogging = () => {

@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRe
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.db.repositories.debug import DebugRepository
 from skyvern.forge.sdk.db.repositories.folders import FoldersRepository
+from skyvern.forge.sdk.db.repositories.google_oauth import GoogleOAuthRepository
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
@@ -78,7 +79,6 @@ def _build_engine(database_string: str) -> AsyncEngine:
 
         return engine
 
-    # PostgreSQL path (unchanged)
     connect_args: dict[str, Any] = {}
     if settings.DISABLE_CONNECTION_POOL:
         if "postgresql+psycopg" in database_string:
@@ -104,6 +104,8 @@ def _build_engine(database_string: str) -> AsyncEngine:
             pool_pre_ping=True,
             pool_size=settings.DATABASE_POOL_SIZE,
             max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+            pool_timeout=settings.DATABASE_POOL_TIMEOUT,
+            pool_recycle=settings.DATABASE_POOL_RECYCLE,
         )
 
 
@@ -131,6 +133,7 @@ class AgentDB(BaseAlchemyDB):
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.scripts = ScriptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(
             self.Session,
             debug_enabled,
@@ -582,9 +585,6 @@ class AgentDB(BaseAlchemyDB):
 
     async def restore_workflow_schedule(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.restore_workflow_schedule(*args, **kwargs)
-
-    async def count_workflow_schedules(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.schedules.count_workflow_schedules(*args, **kwargs)
 
     async def list_organization_schedules(self, *args: Any, **kwargs: Any) -> Any:
         return await self.schedules.list_organization_schedules(*args, **kwargs)

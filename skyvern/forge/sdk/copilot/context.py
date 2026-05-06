@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
+COPILOT_RESPONSE_TYPES: tuple[str, ...] = get_args(ResponseType)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
@@ -113,15 +114,21 @@ class AgentResult:
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
     workflow_was_persisted: bool = False
-    # Feasibility-gate fast-path sets this True so the route can null any
-    # previously-persisted proposed_workflow. Regular in-loop ASK_QUESTION
-    # responses leave it False, preserving in-progress drafts.
+    # Tells the route to null any persisted proposed_workflow. Set by the
+    # feasibility-gate fast-path and by ASK_QUESTION turns.
     clear_proposed_workflow: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
     # silently passing as cheap.
     total_tokens: int | None = None
+    # Set when the agent absorbed an asyncio cancellation initiated by an
+    # explicit user Stop. Lets the route route to a cancel-specific
+    # persistence path (rollback + ``Cancelled by user.`` chat row) without
+    # losing ``workflow_was_persisted`` the way a re-raise would.
+    cancelled: bool = False
+    # The route forces Accept/Reject regardless of ``auto_accept`` when this is True.
+    unvalidated: bool = False
 
 
 @dataclass
@@ -142,6 +149,8 @@ class CopilotContext(AgentContext):
     avoid drift.
     """
 
+    workflow_copilot_chat_id: str | None = None
+
     # Enforcement state
     navigate_called: bool = False
     observation_after_navigate: bool = False
@@ -151,16 +160,16 @@ class CopilotContext(AgentContext):
     post_update_nudge_count: int = 0
     coverage_nudge_count: int = 0
     format_nudge_count: int = 0
+    copilot_total_timeout_exceeded: bool = False
     user_message: str = ""
+    block_goal_main_goal: str = ""
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
 
-    # Token usage summed from raw_responses after each streamed run. None
-    # until the first response that carries a usage object — some providers
-    # (notably non-OpenAI streaming routes) omit usage entirely, and we want
-    # eval cost grading to see "no data" rather than "0 tokens".
+    # ``None`` until usage is observed; ``0`` only when a provider explicitly
+    # reported zero. Distinct values let cost grading flag missing telemetry.
     total_tokens_used: int | None = None
     input_tokens_used: int | None = None
     output_tokens_used: int | None = None
@@ -189,6 +198,15 @@ class CopilotContext(AgentContext):
     # run produces real data. Used to escalate when the agent is stuck
     # retrying extraction against a page that doesn't contain the data.
     null_data_streak_count: int = 0
+    # Consecutive failed runs where navigation completed but the scraper
+    # could not read the page (generic "failed to load the website" template).
+    # Resets on any non-matching run outcome. Streak crosses workflow-shape
+    # changes deliberately — the frontier fingerprint resets each time the
+    # copilot rewrites the workflow, but the underlying site-block pattern is
+    # shape-independent.
+    probable_site_block_streak_count: int = 0
+    probable_site_block_stop_nudge_count: int = 0
+    per_tool_budget_nudge_count: int = 0
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -232,6 +250,11 @@ class CopilotContext(AgentContext):
     last_action_sequence_fingerprint: str | None = None
     pending_action_sequence_fingerprint: str | None = None
     repeated_action_fingerprint_streak_count: int = 0
+
+    copilot_run_start_monotonic: float | None = None
+
+    last_good_workflow: Workflow | None = None
+    last_good_workflow_yaml: str | None = None
 
     # Populated lazily by ``stream_to_sse`` and reused across enforcement
     # iterations so cadence/last-emitted-at survive ``run_with_enforcement``

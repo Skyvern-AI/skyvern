@@ -64,6 +64,15 @@ class TestSystemTemplateSecurity:
         assert "TRUSTED_KB_CONTENT" in rendered
 
 
+class TestAgentTemplateCorrectionRules:
+    def test_agent_template_requires_label_and_title_refresh_on_corrections(self) -> None:
+        rendered = prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+
+        assert "Rename affected block labels and block titles" in rendered
+        assert "Labels become output keys" in rendered
+        assert "Jinja block reference" in rendered
+
+
 class TestUserTemplateCodeFencing:
     """Verify untrusted variables are wrapped in code fences."""
 
@@ -256,6 +265,24 @@ class TestAgentTemplateSecurity:
         assert "CURRENT WORKFLOW YAML:" not in rendered
         assert "PREVIOUS CONTEXT:" not in rendered
         assert "DEBUGGER RUN INFORMATION:" not in rendered
+
+
+class TestAgentTemplateParameterizedRequestsRule:
+    def test_agent_template_has_parameterized_requests_section(self) -> None:
+        rendered = prompt_engine.load_prompt(
+            "workflow-copilot-agent",
+            **_AGENT_TEMPLATE_DEFAULTS,
+        )
+        assert "PARAMETERIZED REQUESTS WITHOUT A SAMPLE VALUE:" in rendered
+
+    def test_agent_template_keeps_sample_anchor_word(self) -> None:
+        # Eval cases with `clarification_must_mention=["sample"]` silently break
+        # if this word is dropped from the prompt; assertion surfaces it locally.
+        rendered = prompt_engine.load_prompt(
+            "workflow-copilot-agent",
+            **_AGENT_TEMPLATE_DEFAULTS,
+        )
+        assert "sample" in rendered.lower()
 
 
 class TestBuildSystemPromptSecurityRules:

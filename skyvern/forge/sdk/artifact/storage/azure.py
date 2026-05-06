@@ -8,6 +8,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.forge import app
 from skyvern.forge.sdk.api.azure import AzureUri, StandardBlobTier
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
@@ -22,6 +23,8 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    _file_infos_from_artifacts,
+    _file_infos_from_download_artifacts,
 )
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -240,16 +243,88 @@ class AzureStorage(BaseStorage):
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
+        """Return Azure URIs of completed downloads. DB-backed; mirrors s3.py."""
+        return await self._list_downloads_for_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            in_progress=False,
+        )
+
+    async def _list_downloads_for_session(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        in_progress: bool,
+    ) -> list[str]:
+        """Shared DB-backed lister with a partial-vs-final discriminator."""
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to list browser-session download artifacts; falling back to Azure LIST",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    in_progress=in_progress,
+                    exc_info=True,
+                )
+                artifacts = None
+            if artifacts is not None:
+                return [a.uri for a in artifacts if a.uri and a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
+
         uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        return [
+        files = [
             f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
             for file in await self.async_client.list_files(uri=uri)
         ]
+        return [f for f in files if f.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
 
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        object_keys = await self.list_downloaded_files_in_browser_session(organization_id, browser_session_id)
+        # Artifact-first when keyring is configured — see s3.py for rationale.
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to look up browser-session download artifacts; falling back to SAS URLs",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                artifacts = []
+            # Filter out in-progress partials — user-facing listing must only
+            # show completed downloads. Mirrors s3.py.
+            artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+            if artifacts:
+                return await _file_infos_from_download_artifacts(artifacts)
+
+        return await self._get_shared_downloaded_files_in_browser_session_via_listing(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+
+    async def _get_shared_downloaded_files_in_browser_session_via_listing(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        # Direct Azure LIST: legacy fallback for sessions pre-cutover.
+        # ``list_downloaded_files_in_browser_session`` is now DB-backed, so
+        # we can't reuse it here.
+        listing_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        object_keys = [
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
+            for file in await self.async_client.list_files(uri=listing_uri)
+            if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+        ]
         if len(object_keys) == 0:
             return []
 
@@ -288,26 +363,65 @@ class AzureStorage(BaseStorage):
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
-        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        files = [
-            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
-            for file in await self.async_client.list_files(uri=uri)
-        ]
-        return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
-
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
-        """List all recording files for a browser session from Azure."""
-        uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
-        return [
-            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
-            for file in await self.async_client.list_files(uri=uri)
-        ]
+        """Return Azure URIs of in-progress (``*.crdownload``) downloads. DB-backed."""
+        return await self._list_downloads_for_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            in_progress=True,
+        )
 
     async def get_shared_recordings_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        """Get recording files with SAS URLs for a browser session."""
-        object_keys = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
+        """Get recording files for a browser session.
+
+        Artifact-first when the keyring is configured — see s3.py for the
+        rationale. Falls back to direct Azure LIST + SAS URLs for legacy
+        sessions and OSS-default deployments.
+        """
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.RECORDING,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to look up browser-session recording artifacts; falling back to SAS URLs",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                artifacts = []
+            artifacts = [
+                a for a in artifacts if a.uri and (a.uri.lower().endswith(".webm") or a.uri.lower().endswith(".mp4"))
+            ]
+            if artifacts:
+                file_infos = await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.RECORDING)
+                file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
+                return file_infos
+
+        # Legacy fallback: keyring unset, DB raised, or session pre-cutover
+        # with no rows at all. SKY-9286: drop entirely after the bake-in
+        # window (target 2026-05-03) — every call here is a billable
+        # ListBlobs request.
+        return await self._get_shared_recordings_in_browser_session_via_listing(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+
+    async def _get_shared_recordings_in_browser_session_via_listing(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        # Direct Azure LIST: legacy fallback for pre-cutover sessions and
+        # OSS deployments without a keyring.
+        # SKY-9286: scheduled for removal once production sessions all have
+        # rows — every call here is a billable ListBlobs request.
+        listing_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
+        object_keys = [
+            f"azure://{settings.AZURE_STORAGE_CONTAINER_ARTIFACTS}/{file}"
+            for file in await self.async_client.list_files(uri=listing_uri)
+        ]
         if len(object_keys) == 0:
             return []
 
@@ -398,23 +512,84 @@ class AzureStorage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
-            LOG.info(
-                "Calculated checksum for file",
-                file=file,
-                checksum=checksum,
-                organization_id=organization_id,
-                storage_tier=tier,
-            )
-            # Upload file with checksum metadata
-            await self.async_client.upload_file_from_path(
-                uri=uri,
-                file_path=fpath,
-                metadata={"sha256_checksum": checksum, "original_filename": file},
-                tier=tier,
-                tags=tags,
-            )
+            # Azure Blob metadata values must be ASCII; preserve the full
+            # filename via the blob path / Artifact URI instead.
+            metadata: dict[str, str] = {"sha256_checksum": checksum}
+            if file.isascii():
+                metadata["original_filename"] = file
+            # Catch upload failures so we never create an Artifact row for
+            # bytes that didn't actually land in storage.
+            try:
+                await self.async_client.upload_file_from_path(
+                    uri=uri,
+                    file_path=fpath,
+                    metadata=metadata,
+                    tier=tier,
+                    tags=tags,
+                )
+            except Exception:
+                LOG.warning(
+                    "Skipping downloaded file — Azure upload failed",
+                    file=file,
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    exc_info=True,
+                )
+                continue
+
+            # Register the file as an Artifact so GET run output can serve it via
+            # the signed /v1/artifacts/{id}/content endpoint (SKY-8861). Persist
+            # the SHA-256 we already computed so retrieval doesn't need an
+            # extra blob HEAD per file.
+            if run_id is not None:
+                try:
+                    await app.ARTIFACT_MANAGER.create_download_artifact(
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        uri=uri,
+                        filename=file,
+                        checksum=checksum,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to register downloaded file as artifact; falling back to SAS URLs for retrieval",
+                        file=file,
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        exc_info=True,
+                    )
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        # Artifact-first — see s3.py::get_downloaded_files for rationale. When
+        # the keyring isn't configured (OSS default) or no artifact rows exist
+        # (legacy run pre-SKY-8861) we fall back to the legacy listing path so
+        # downloaded files remain reachable.
+        if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            if artifacts:
+                return await _file_infos_from_download_artifacts(artifacts)
+
+        return await self._get_downloaded_files_via_blob_listing(organization_id=organization_id, run_id=run_id)
+
+    async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
+        try:
+            return await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                run_id=run_id,
+                organization_id=organization_id,
+                artifact_type=ArtifactType.DOWNLOAD,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to look up download artifacts; falling back to SAS URLs",
+                organization_id=organization_id,
+                run_id=run_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _get_downloaded_files_via_blob_listing(
+        self, *, organization_id: str, run_id: str | None
+    ) -> list[FileInfo]:
         uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
@@ -424,24 +599,22 @@ class AzureStorage(BaseStorage):
         for key in object_keys:
             object_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{key}"
 
-            # Get metadata (including checksum)
             metadata = await self.async_client.get_file_metadata(object_uri, log_exception=False)
-
-            # Create FileInfo object
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
+            display_name = metadata.get("original_filename", filename) if metadata else filename
 
-            # Get SAS URL
             sas_urls = await self.async_client.create_sas_urls([object_uri])
             if not sas_urls:
                 continue
 
-            file_info = FileInfo(
-                url=sas_urls[0],
-                checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
+            file_infos.append(
+                FileInfo(
+                    url=sas_urls[0],
+                    checksum=checksum,
+                    filename=display_name,
+                )
             )
-            file_infos.append(file_info)
 
         return file_infos
 
@@ -526,6 +699,40 @@ class AzureStorage(BaseStorage):
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
         await self.async_client.upload_file_from_path(uri, local_file_path, tier=tier, tags=tags)
+
+        if artifact_type == "downloads":
+            # See s3.py — DB is the single source of truth for the user-facing
+            # listing and the agent's baseline / complete_on_download checks.
+            # Partials get a row with checksum=None; the row is dropped on
+            # Chrome's atomic-rename ``Change.deleted`` event. Exceptions
+            # propagate so the watcher's bounded retry can recover from a
+            # transient DB outage — both ops are idempotent.
+            is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
+            checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                filename=os.path.basename(remote_path),
+                checksum=checksum,
+            )
+        elif artifact_type == "videos":
+            # Recording uploaded once at session close — see s3.py. Artifact-
+            # row creation is best-effort: the only caller swallows
+            # exceptions without retry, so the gated legacy listing fallback
+            # in ``get_shared_recordings_in_browser_session`` is the safety
+            # net for missed writes (when the session has no RECORDING rows
+            # we fall through to the Azure LIST path, so a row-less recording
+            # still surfaces via the legacy SAS URL).
+            checksum = calculate_sha256_for_file(local_file_path)
+            await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                filename=os.path.basename(remote_path),
+                checksum=checksum,
+            )
+
         return uri
 
     async def delete_browser_session_file(
@@ -536,8 +743,29 @@ class AzureStorage(BaseStorage):
         remote_path: str,
         date: str | None = None,
     ) -> None:
-        """Delete a file from browser session storage in Azure."""
+        """Delete a file from browser session storage in Azure.
+
+        For ``downloads``, also drop the matching DOWNLOAD artifact row so a
+        subsequent ``GET /v1/browser_sessions/{id}`` doesn't hand out a signed
+        URL that 404s. Mirrors the S3 implementation.
+        """
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
+        if artifact_type == "downloads":
+            try:
+                await app.DATABASE.artifacts.delete_artifact_for_browser_session(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    uri=uri,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to delete browser-session download artifact row; proceeding with Azure delete",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    remote_path=remote_path,
+                    exc_info=True,
+                )
         await self.async_client.delete_file(uri)
 
     async def browser_session_file_exists(

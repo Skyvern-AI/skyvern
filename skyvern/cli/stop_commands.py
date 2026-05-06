@@ -1,3 +1,4 @@
+import subprocess
 from typing import List
 
 import psutil
@@ -177,3 +178,22 @@ def stop_server(
         console.print(f"[green]Skyvern API server on port {port} stopped successfully.[/green]")
     else:
         console.print(f"[yellow]{not_found_message}[/yellow]")
+
+
+@stop_app.command(name="docker")
+def stop_docker() -> None:
+    """Stop Skyvern Docker Compose services.
+
+    Examples:
+      skyvern stop docker
+    """
+    console.print(Panel("[bold red]Stopping Skyvern Docker Compose...[/bold red]", border_style="red"))
+    try:
+        subprocess.run(["docker", "compose", "down"], check=True)
+        console.print("[green]Skyvern Docker Compose services stopped.[/green]")
+    except FileNotFoundError:
+        console.print("[bold red]Docker is not installed.[/bold red]")
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[bold red]Failed to stop Docker Compose: {e}[/bold red]")
+        raise typer.Exit(1)

@@ -1,24 +1,51 @@
+from __future__ import annotations
+
+import atexit
 import functools
 import importlib.metadata
 import platform
+import threading
 import traceback
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import typer
-from posthog import Posthog
 
 from skyvern._version import __version__ as _build_version
 from skyvern.config import settings
 
+if TYPE_CHECKING:
+    from posthog import Posthog
+
 LOG = structlog.get_logger(__name__)
 
-
-def _build_posthog_client(api_key: str, host: str) -> Posthog:
-    return Posthog(api_key, host=host, disable_geoip=False, timeout=2)
+_FLUSH_TIMEOUT_SECONDS = 2
 
 
-posthog = _build_posthog_client(
+def _load_posthog_class() -> type[Posthog] | None:
+    try:
+        from posthog import Posthog  # noqa: PLC0415
+    except ModuleNotFoundError as exc:
+        if exc.name == "posthog":
+            return None
+        raise
+    return Posthog
+
+
+def _build_posthog_client(api_key: str, host: str) -> Posthog | None:
+    posthog_cls = _load_posthog_class()
+    if posthog_cls is None:
+        return None
+
+    try:
+        client = posthog_cls(api_key, host=host, disable_geoip=False, timeout=2, max_retries=1)
+        atexit.unregister(client.join)
+        return client
+    except Exception:
+        return None
+
+
+posthog: Posthog | None = _build_posthog_client(
     settings.POSTHOG_PROJECT_API_KEY,
     settings.POSTHOG_PROJECT_HOST,
 )
@@ -39,7 +66,7 @@ def get_oss_version() -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def analytics_metadata() -> Dict[str, Any]:
+def analytics_metadata() -> dict[str, Any]:
     # Cached: all fields are process-lifetime constants. Do not add dynamic fields here.
     return {
         "os": platform.system().lower(),
@@ -51,7 +78,7 @@ def analytics_metadata() -> Dict[str, Any]:
     }
 
 
-def dynamic_analytics_metadata() -> Dict[str, Any]:
+def dynamic_analytics_metadata() -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     if settings.ANALYTICS_TEST_ID:
         metadata["analytics_test_id"] = settings.ANALYTICS_TEST_ID
@@ -72,7 +99,7 @@ def reconfigure_posthog_client(
 def _resolve_posthog_client(
     api_key: str | None = None,
     host: str | None = None,
-) -> Posthog:
+) -> Posthog | None:
     if api_key is None and host is None:
         return posthog
 
@@ -82,7 +109,8 @@ def _resolve_posthog_client(
     client = _custom_posthog_clients.get(cache_key)
     if client is None:
         client = _build_posthog_client(resolved_api_key, resolved_host)
-        _custom_posthog_clients[cache_key] = client
+        if client is not None:
+            _custom_posthog_clients[cache_key] = client
     return client
 
 
@@ -90,7 +118,12 @@ def flush(
     api_key: str | None = None,
     host: str | None = None,
 ) -> None:
-    _resolve_posthog_client(api_key=api_key, host=host).flush()
+    client = _resolve_posthog_client(api_key=api_key, host=host)
+    if client is None:
+        return
+    t = threading.Thread(target=client.flush, daemon=True)
+    t.start()
+    t.join(timeout=_FLUSH_TIMEOUT_SECONDS)
 
 
 def capture(
@@ -104,9 +137,11 @@ def capture(
         return
 
     try:
+        client = _resolve_posthog_client(api_key=api_key, host=host)
+        if client is None:
+            return
         resolved_distinct_id = distinct_id or settings.ANALYTICS_ID
         payload: dict[str, Any] = {**dynamic_analytics_metadata(), **(data or {})}
-        client = _resolve_posthog_client(api_key=api_key, host=host)
         client.capture(distinct_id=resolved_distinct_id, event=event, properties=payload)
     except Exception:
         LOG.debug("analytics capture failed", event=event, exc_info=True)
@@ -115,9 +150,9 @@ def capture(
 def capture_setup_event(
     event_name: str,
     success: bool = True,
-    error_type: Optional[str] = None,
-    error_message: Optional[str] = None,
-    extra_data: Optional[dict[str, Any]] = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
 ) -> None:
     """Capture a setup-related analytics event.
 
@@ -145,8 +180,8 @@ def capture_setup_event(
 def capture_setup_error(
     event_name: str,
     error: Exception,
-    error_type: Optional[str] = None,
-    extra_data: Optional[dict[str, Any]] = None,
+    error_type: str | None = None,
+    extra_data: dict[str, Any] | None = None,
 ) -> None:
     """Capture a setup error with exception details.
 

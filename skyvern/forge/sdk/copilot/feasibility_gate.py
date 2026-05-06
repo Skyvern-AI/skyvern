@@ -16,10 +16,8 @@ from typing import Any, Literal
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
-from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -84,8 +82,7 @@ async def run_feasibility_gate(
     workflow_yaml: str,
     chat_history: str,
     global_llm_context: str,
-    distinct_id: str,
-    organization_id: str | None,
+    handler: Any,
 ) -> FeasibilityVerdict:
     """Classify the user's request. Returns FeasibilityVerdict; never raises.
 
@@ -95,9 +92,13 @@ async def run_feasibility_gate(
     if not isinstance(user_message, str) or not user_message.strip():
         return _PROCEED
 
-    # Cap the workflow YAML so the "cheap preflight" call stays cheap. A large
-    # workflow is not useful context for a feasibility decision -- we just need
-    # enough to see whether the user's ask lines up with the current state.
+    if handler is None:
+        LOG.info("feasibility-gate has no LLM handler available, proceeding to main loop")
+        return _PROCEED
+
+    # Cap the workflow YAML: feasibility only needs enough to see whether
+    # the user's ask lines up with the current state, and the prompt fits
+    # within the gate's tight timeout budget.
     truncated_workflow_yaml = (workflow_yaml or "")[:_WORKFLOW_YAML_MAX_CHARS]
 
     try:
@@ -110,28 +111,6 @@ async def run_feasibility_gate(
         )
     except Exception as exc:
         LOG.warning("feasibility-gate prompt render failed, proceeding to main loop", error=str(exc))
-        return _PROCEED
-
-    try:
-        handler = await get_llm_handler_for_prompt_type(PROMPT_TEMPLATE_NAME, distinct_id, organization_id)
-    except Exception as exc:
-        # Touches app.EXPERIMENTATION_PROVIDER; AppHolder raises RuntimeError
-        # pre-startup and the provider can fail on network/payload errors.
-        LOG.warning("feasibility-gate handler lookup failed, falling back", error=str(exc))
-        handler = None
-    if handler is None:
-        # Use direct attribute access (not getattr-with-default) so the
-        # intent of the except clause is unambiguous: the three-arg getattr
-        # default only suppresses AttributeError, which looks like it
-        # handles the AppHolder.__getattr__ RuntimeError but does not.
-        # Catch both explicitly: RuntimeError (AppHolder pre-startup) and
-        # AttributeError (app is some other object, e.g. in tests).
-        try:
-            handler = app.SECONDARY_LLM_API_HANDLER
-        except (RuntimeError, AttributeError):
-            handler = None
-    if handler is None:
-        LOG.info("feasibility-gate has no LLM handler available, proceeding to main loop")
         return _PROCEED
 
     try:
@@ -163,18 +142,18 @@ async def run_feasibility_gate(
             return _PROCEED
 
     verdict = _coerce_verdict(response)
+    # INFO not DEBUG so verdict-rate dashboards work without trace-bisection.
+    # `question` is UI-displayed so safe at INFO; `rationale` stays at DEBUG below
+    # because untrusted LLM output can echo back user content under prompt injection.
+    log_extras: dict[str, Any] = {
+        "verdict": verdict.verdict,
+        "user_message_len": len(user_message),
+        "chat_history_len": len(chat_history or ""),
+        "workflow_yaml_len": len(workflow_yaml or ""),
+    }
+    if verdict.question is not None:
+        log_extras["question"] = verdict.question
+    LOG.info("feasibility-gate verdict", **log_extras)
     if verdict.verdict == "ask_clarification":
-        # `question` is user-facing (displayed in the UI) so logging it at
-        # INFO is fine. `rationale` is the LLM's internal reasoning and can
-        # echo back user content under prompt injection -- drop it to DEBUG
-        # so untrusted model output doesn't ship to every log aggregator.
-        LOG.info(
-            "feasibility-gate classifier asked for clarification",
-            question=verdict.question,
-        )
         LOG.debug("feasibility-gate clarification rationale", rationale=verdict.rationale)
-    else:
-        # Debug-level so latency regressions and skip-rate anomalies are
-        # traceable without adding INFO noise on every copilot message.
-        LOG.debug("feasibility-gate classifier returned proceed")
     return verdict

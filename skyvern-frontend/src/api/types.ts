@@ -205,6 +205,11 @@ export type OrganizationApiResponse = {
   modified_at: string;
   max_retries_per_step: number | null;
   max_steps_per_run: number | null;
+  // Optional because the field is added in a backend image rollout; until
+  // every API host has the new schema this property may be absent from the
+  // response payload.
+  max_steps_per_workflow_run?: number | null;
+  artifact_url_expiry_seconds?: number | null;
   organization_id: string;
   organization_name: string;
   webhook_callback_url: string | null;
@@ -559,6 +564,7 @@ export type TaskRunListItem = {
   finished_at: string | null;
   created_at: string;
   workflow_permanent_id: string | null;
+  workflow_deleted: boolean;
   script_run: boolean;
   searchable_text: string | null;
 };
@@ -577,6 +583,7 @@ export type WorkflowRunStatusApiResponse = {
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
@@ -608,6 +615,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;

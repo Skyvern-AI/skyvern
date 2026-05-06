@@ -6,6 +6,12 @@ _DEFAULT_CLI_LOG_LEVEL = "WARNING"
 _QUIET_CLI_LOGGERS = ("skyvern", "httpx", "litellm", "playwright", "httpcore")
 
 
+def raise_unless_missing_optional_dependency(exc: ImportError, expected_modules: set[str]) -> None:
+    if isinstance(exc, ModuleNotFoundError) and exc.name in expected_modules:
+        return
+    raise exc
+
+
 def _resolve_cli_log_level_name(settings: object) -> str:
     """Honor explicit settings while keeping CLI defaults quiet."""
 

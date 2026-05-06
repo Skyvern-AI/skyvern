@@ -192,6 +192,7 @@ export type Parameter =
 export type WorkflowBlock =
   | TaskBlock
   | ForLoopBlock
+  | WhileLoopBlock
   | ConditionalBlock
   | TextPromptBlock
   | CodeBlock
@@ -220,6 +221,7 @@ export type WorkflowBlock =
 export const WorkflowBlockTypes = {
   Task: "task",
   ForLoop: "for_loop",
+  WhileLoop: "while_loop",
   Conditional: "conditional",
   Code: "code",
   TextPrompt: "text_prompt",
@@ -269,6 +271,12 @@ export function isTaskVariantBlock(item: {
   return scriptableWorkflowBlockTypes.has(item.block_type);
 }
 
+export function isNestedLoopWorkflowBlock(
+  block: WorkflowBlock,
+): block is ForLoopBlock | WhileLoopBlock {
+  return block.block_type === "for_loop" || block.block_type === "while_loop";
+}
+
 export type WorkflowBlockType =
   (typeof WorkflowBlockTypes)[keyof typeof WorkflowBlockTypes];
 
@@ -292,10 +300,12 @@ export type WorkflowBlockBase = {
   next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
   next_block_label?: string | null;
+  ignore_workflow_system_prompt?: boolean;
 };
 
 export const BranchCriteriaTypes = {
   Jinja2Template: "jinja2_template",
+  Prompt: "prompt",
 } as const;
 
 export type BranchCriteriaType =
@@ -359,6 +369,12 @@ export type ForLoopBlock = WorkflowBlockBase & {
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
   data_schema?: Record<string, unknown> | string | null;
+};
+
+export type WhileLoopBlock = WorkflowBlockBase & {
+  block_type: "while_loop";
+  loop_blocks: Array<WorkflowBlock>;
+  condition: BranchCriteria;
 };
 
 export type CodeBlock = WorkflowBlockBase & {
@@ -603,6 +619,7 @@ export type WorkflowDefinition = {
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
+  workflow_system_prompt?: string | null;
 };
 
 export type WorkflowApiResponse = {
@@ -652,6 +669,7 @@ export type WorkflowSettings = {
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

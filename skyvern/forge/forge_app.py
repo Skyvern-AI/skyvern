@@ -24,6 +24,8 @@ from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core.rate_limiter import NoopRateLimiter, RateLimiter
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.aes import AES
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
@@ -56,6 +58,7 @@ class ForgeApp:
     RATE_LIMITER: RateLimiter
     LLM_API_HANDLER: LLMAPIHandler
     OPENAI_CLIENT: AsyncOpenAI | AsyncAzureOpenAI
+    OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
@@ -73,6 +76,8 @@ class ForgeApp:
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
     SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
     ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_FAST_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -113,14 +118,40 @@ def create_forge_app() -> ForgeApp:
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
 
+    if settings.ENABLE_ENCRYPTION:
+        # Fail closed: a deployment that opts into encryption with the placeholder
+        # key would "encrypt" secrets with a public default — strictly worse than
+        # ENABLE_ENCRYPTION=false because operators would believe the data was
+        # protected. Salt/IV defaulting to None falls back to the deterministic
+        # ``default_salt`` / ``default_iv`` in ``aes.py`` — also a public default,
+        # so refuse the same way.
+        if not settings.ENCRYPTOR_AES_SECRET_KEY or settings.ENCRYPTOR_AES_SECRET_KEY == "fillmein":
+            raise RuntimeError(
+                "ENABLE_ENCRYPTION=true requires ENCRYPTOR_AES_SECRET_KEY to be set to a real "
+                "secret; empty values and the default placeholder 'fillmein' both fail closed."
+            )
+        if not settings.ENCRYPTOR_AES_SALT or not settings.ENCRYPTOR_AES_IV:
+            raise RuntimeError(
+                "ENABLE_ENCRYPTION=true requires both ENCRYPTOR_AES_SALT and ENCRYPTOR_AES_IV to "
+                "be configured; unset values fall back to public defaults."
+            )
+        encryptor.add_encrypt_method(
+            AES(
+                secret_key=settings.ENCRYPTOR_AES_SECRET_KEY,
+                salt=settings.ENCRYPTOR_AES_SALT,
+                iv=settings.ENCRYPTOR_AES_IV,
+            )
+        )
+
     app.ARTIFACT_MANAGER = ArtifactManager()
     app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
     app.RATE_LIMITER = NoopRateLimiter()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
+    app.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     app.OPENAI_CLIENT = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY or "",
+        api_key=settings.OPENAI_API_KEY or "dummy",
         http_client=ForgeAsyncHttpxClientWrapper(),
     )
     if settings.ENABLE_AZURE_CUA:
@@ -200,6 +231,16 @@ def create_forge_app() -> ForgeApp:
         LLMAPIHandlerFactory.get_llm_api_handler(settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY)
         if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
         else app.LLM_API_HANDLER
+    )
+    app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_AGENT_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_AGENT_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
+    app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_FAST_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_FAST_LLM_KEY
+        else app.SECONDARY_LLM_API_HANDLER
     )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()

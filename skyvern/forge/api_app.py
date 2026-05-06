@@ -1,3 +1,8 @@
+"""FastAPI application factory for server installs."""
+
+# The server-extra guard must run before FastAPI/Starlette imports.
+# ruff: noqa: E402
+
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -5,11 +10,16 @@ from datetime import datetime
 from typing import Any, AsyncGenerator, Awaitable, Callable
 
 import structlog
+from pydantic import ValidationError
+
+from skyvern.exceptions import require_server_extra_modules
+
+require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
+
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
@@ -24,6 +34,8 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
+from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
@@ -245,6 +257,16 @@ def create_api_app() -> FastAPI:
     fastapi_app.include_router(base_router, prefix="/v1")
     fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
     fastapi_app.include_router(legacy_v2_router, prefix="/api/v2")
+    # Google OAuth is mounted on both the canonical ``/v1`` (matches base_router)
+    # and the legacy ``/api/v1`` (matches legacy_base_router) — same dual-prefix
+    # pattern as internal_auth below. Both registrations are intentional; do not
+    # remove either as a "duplicate". ``include_in_schema=False`` keeps the OAuth
+    # endpoints out of the public OpenAPI/Swagger surface — they're consumed by
+    # the frontend, not by SDK users.
+    fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
+    fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
+    fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
+    fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
 
     # local dev endpoints
     if settings.ENV == "local":

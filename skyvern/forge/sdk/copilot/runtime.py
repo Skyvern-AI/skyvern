@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
+_BROWSER_BOOT_WAIT_SECONDS = 15.0
+_BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 
 
 @dataclass
@@ -49,6 +51,7 @@ class AgentContext:
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    failed_tool_step_tracker: dict[str, int] = field(default_factory=dict)
 
     # Cross-turn agent state accumulated by tools.py as the agent runs.
     # Read back by failure_tracking / loop_detection to detect stuck loops,
@@ -73,6 +76,7 @@ class AgentContext:
     post_update_nudge_count: int = 0
     coverage_nudge_count: int = 0
     format_nudge_count: int = 0
+    copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     null_data_streak_count: int = 0
@@ -90,6 +94,11 @@ class AgentContext:
     workflow_persisted: bool = False
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None
+
+    copilot_run_start_monotonic: float | None = None
+
+    last_good_workflow: Any | None = None
+    last_good_workflow_yaml: str | None = None
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
@@ -184,7 +193,29 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
     """Create a browser session if needed. Returns None on success, error dict on failure."""
     if ctx.browser_session_id:
-        return None
+        # Probe attachability — a stale DB row demotes to auto-create here
+        # instead of bubbling up as a "No browser context" tool failure.
+        try:
+            state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+            if state and state.browser_context:
+                return None
+            LOG.warning(
+                "Supplied browser_session_id is no longer attachable; auto-creating",
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Browser state probe raised for supplied session; auto-creating",
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+        ctx.browser_session_id = None
 
     session = None
     try:
@@ -194,6 +225,19 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
                 timeout_minutes=30,
             )
         ctx.browser_session_id = session.persistent_browser_session_id
+
+        # DefaultPersistentSessionsManager schedules chromium in a background
+        # task and returns from create_session before browser_context is set,
+        # so the next mcp_browser_context lookup raises. Wait for it.
+        async with asyncio.timeout(_BROWSER_BOOT_WAIT_SECONDS):
+            while True:
+                state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    session_id=ctx.browser_session_id,
+                    organization_id=ctx.organization_id,
+                )
+                if state and state.browser_context:
+                    break
+                await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
 
         sc = skyvern_context.current()
         if sc:

@@ -1,12 +1,43 @@
 import asyncio
 import logging
+import socket
 import sys
+import time
 
 import typer
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.cli.console import console
 from skyvern.utils.env_paths import resolve_backend_env_path
+
+
+def wait_for_docker_services(ui_port: int = 8080, api_port: int = 8000, timeout: int = 120) -> bool:
+    """Poll until Docker Compose services are reachable. Returns True if ready."""
+    start = time.monotonic()
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
+    ) as progress:
+        progress.add_task("[bold blue]Waiting for services to start (this may take a minute)...", total=None)
+        while time.monotonic() - start < timeout:
+            api_up = _port_open(api_port)
+            ui_up = _port_open(ui_port)
+            if api_up and ui_up:
+                return True
+            time.sleep(3)
+    return False
+
+
+def _port_open(port: int, host: str = "127.0.0.1") -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    try:
+        sock.connect((host, port))
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+    finally:
+        sock.close()
 
 
 async def start_services(server_only: bool = False) -> None:

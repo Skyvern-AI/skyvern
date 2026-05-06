@@ -12,6 +12,7 @@ export type NodeBaseData = {
   model: WorkflowModel | null;
   showCode?: boolean;
   comparisonColor?: string;
+  ignoreWorkflowSystemPrompt?: boolean;
   /**
    * Optional metadata used for conditional branches.
    * These values are only set on nodes that live within a conditional block.
@@ -53,7 +54,8 @@ export const workflowBlockTitle: {
   extraction: "Extraction",
   file_download: "File Download",
   file_url_parser: "File Parser",
-  for_loop: "Loop",
+  for_loop: "For Loop",
+  while_loop: "While Loop",
   login: "Login",
   navigation: "Browser Task",
   send_email: "Send Email",

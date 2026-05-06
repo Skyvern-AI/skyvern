@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.webeye.utils.page import SkyvernFrame
+
 from .guards import GuardError
 
 
@@ -69,11 +72,23 @@ async def do_screenshot(
     full_page: bool = False,
     selector: str | None = None,
 ) -> ScreenshotResult:
-    if selector:
-        element = page.locator(selector)
-        data = await element.screenshot()
-    else:
-        data = await page.screenshot(full_page=full_page)
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
+    try:
+        if selector:
+            element = page.locator(selector)
+            data = await element.screenshot()
+        else:
+            data = await page.screenshot(full_page=full_page)
+    finally:
+        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
     return ScreenshotResult(data=data, full_page=full_page)
 
 

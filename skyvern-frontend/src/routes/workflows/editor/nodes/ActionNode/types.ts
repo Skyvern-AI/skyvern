@@ -36,6 +36,7 @@ export const actionNodeDefaultData: ActionNodeData = {
   disableCache: false,
   engine: RunEngine.SkyvernV1,
   model: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isActionNode(node: Node): node is ActionNode {

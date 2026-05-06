@@ -38,6 +38,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   engine: RunEngine.SkyvernV1,
   model: null,
   downloadTimeout: null,
+  ignoreWorkflowSystemPrompt: false,
 } as const;
 
 export function isFileDownloadNode(node: Node): node is FileDownloadNode {

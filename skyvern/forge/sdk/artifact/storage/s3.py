@@ -11,6 +11,7 @@ import zstandard as zstd
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
@@ -24,6 +25,8 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    _file_infos_from_artifacts,
+    _file_infos_from_download_artifacts,
 )
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -276,14 +279,110 @@ class S3Storage(BaseStorage):
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
+        """Return S3 URIs of completed downloads in the session.
+
+        DB-backed (artifact rows are the source of truth) — see
+        ``cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md``. Used by the agent
+        for baseline-before / baseline-after diffs to detect newly-downloaded
+        files. Excludes ``*.crdownload`` partials; those go through
+        ``list_downloading_files_in_browser_session`` instead.
+
+        Falls back to S3 LIST when the keyring is unset (OSS default — no
+        artifact rows exist) or when the DB lookup itself raises.
+        """
+        return await self._list_downloads_for_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            in_progress=False,
+        )
+
+    async def _list_downloads_for_session(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        in_progress: bool,
+    ) -> list[str]:
+        """Shared DB-backed lister with a partial-vs-final discriminator.
+
+        Centralizes the keyring-gating + DB-failure-fallback so the two public
+        methods stay parallel.
+        """
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to list browser-session download artifacts; falling back to S3 LIST",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    in_progress=in_progress,
+                    exc_info=True,
+                )
+                artifacts = None
+            if artifacts is not None:
+                # Honour the partial-vs-final discriminator the agent expects.
+                return [a.uri for a in artifacts if a.uri and a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
+
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
         uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        return [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
+        files = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
+        return [f for f in files if f.endswith(BROWSER_DOWNLOADING_SUFFIX) == in_progress]
 
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        object_keys = await self.list_downloaded_files_in_browser_session(organization_id, browser_session_id)
+        # Artifact-first when keyring is configured: query rows scoped to the
+        # session, build short signed /v1/artifacts URLs from them. See
+        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md.
+        #
+        # OSS-default deployments without HMAC signing fall straight to the
+        # legacy listing path so webhook consumers (no API key) can still
+        # fetch the files via presigned URLs.
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to look up browser-session download artifacts; falling back to presigned S3 URLs",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                artifacts = []
+            # Filter out in-progress partials — the user-facing listing must
+            # only show completed downloads. Partials still live as artifact
+            # rows so the agent can detect "still downloading" via DB query.
+            artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+            if artifacts:
+                return await _file_infos_from_download_artifacts(artifacts)
+
+        return await self._get_shared_downloaded_files_in_browser_session_via_listing(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+
+    async def _get_shared_downloaded_files_in_browser_session_via_listing(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        # Direct S3 LIST: legacy fallback for sessions pre-cutover (no artifact
+        # rows) and OSS deployments without a keyring. We can't go through
+        # ``list_downloaded_files_in_browser_session`` here — that now sources
+        # from artifact rows and would short-circuit to [] on legacy sessions.
+        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
+        listing_uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        object_keys = [
+            f"s3://{bucket}/{file}"
+            for file in await self.async_client.list_files(uri=listing_uri)
+            if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+        ]
         if len(object_keys) == 0:
             return []
 
@@ -321,22 +420,75 @@ class S3Storage(BaseStorage):
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
-        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        files = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
-        return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+        """Return S3 URIs of in-progress downloads (``*.crdownload``).
 
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
-        """List all recording files for a browser session from S3."""
-        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
-        return [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
+        DB-backed (artifact rows are the source of truth). The watcher creates
+        a partial artifact row (``checksum=None``) the moment Chrome opens the
+        ``.crdownload`` file; that row is dropped when Chrome's atomic rename
+        fires ``Change.deleted``. Used by ``complete_on_download`` task blocks
+        to wait until in-flight downloads finish.
+        """
+        return await self._list_downloads_for_session(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            in_progress=True,
+        )
 
     async def get_shared_recordings_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        """Get recording files with presigned URLs for a browser session."""
-        object_keys = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
+        """Get recording files for a browser session.
+
+        Artifact-first when the keyring is configured: query RECORDING rows
+        scoped to the session and build short signed ``/v1/artifacts/{id}/content``
+        URLs from them — no S3 round-trip per file. Falls back to direct S3
+        LIST + presigned URLs for legacy sessions and OSS-default deployments
+        without HMAC signing.
+        """
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.RECORDING,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to look up browser-session recording artifacts; falling back to presigned S3 URLs",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                artifacts = []
+            # Defensive extension filter — same as the legacy listing path —
+            # in case a non-recording row sneaks under the same browser_session_id.
+            artifacts = [
+                a for a in artifacts if a.uri and (a.uri.lower().endswith(".webm") or a.uri.lower().endswith(".mp4"))
+            ]
+            if artifacts:
+                file_infos = await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.RECORDING)
+                # Newest first — match the legacy listing path's ordering.
+                file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
+                return file_infos
+
+        # Legacy fallback: keyring unset, DB raised, or session pre-cutover
+        # with no rows at all. SKY-9286: drop entirely after the bake-in
+        # window (target 2026-05-03) — every call here is a billable
+        # ListObjects request.
+        return await self._get_shared_recordings_in_browser_session_via_listing(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+
+    async def _get_shared_recordings_in_browser_session_via_listing(
+        self, *, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        # Direct S3 LIST: legacy fallback for sessions pre-cutover (no
+        # RECORDING artifact rows) and OSS deployments without a keyring.
+        # SKY-9286: scheduled for removal once production sessions all have
+        # rows — every call here is a billable ListObjects request.
+        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
+        listing_uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
+        object_keys = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=listing_uri)]
         if len(object_keys) == 0:
             return []
 
@@ -425,22 +577,91 @@ class S3Storage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
-            LOG.info(
-                "Calculated checksum for file",
-                file=file,
-                checksum=checksum,
-                organization_id=organization_id,
-                storage_class=storage_class,
-            )
-            # Upload file with checksum metadata
-            await self.async_client.upload_file_from_path(
-                uri=uri,
-                file_path=fpath,
-                metadata={"sha256_checksum": checksum, "original_filename": file},
-                storage_class=storage_class,
-            )
+            # S3 object metadata only allows ASCII; non-ASCII filenames (CJK,
+            # emoji) would otherwise raise ParamValidationError at upload time.
+            # The full filename is still preserved in the S3 key and on the
+            # Artifact row's URI.
+            metadata: dict[str, str] = {"sha256_checksum": checksum}
+            if file.isascii():
+                metadata["original_filename"] = file
+            # Upload with raise_exception=True so a partial failure aborts
+            # this iteration and we never create an Artifact row for bytes
+            # that didn't actually land in S3.
+            try:
+                await self.async_client.upload_file_from_path(
+                    uri=uri,
+                    file_path=fpath,
+                    metadata=metadata,
+                    storage_class=storage_class,
+                    raise_exception=True,
+                )
+            except Exception:
+                LOG.warning(
+                    "Skipping downloaded file — S3 upload failed",
+                    file=file,
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    exc_info=True,
+                )
+                continue
+
+            # Register the file as an Artifact so GET run output can serve it via
+            # the signed /v1/artifacts/{id}/content endpoint (SKY-8861). Persist
+            # the SHA-256 we already computed so retrieval doesn't need an
+            # extra S3 HEAD per file.
+            if run_id is not None:
+                try:
+                    await app.ARTIFACT_MANAGER.create_download_artifact(
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        uri=uri,
+                        filename=file,
+                        checksum=checksum,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to register downloaded file as artifact; falling back to S3 listing for retrieval",
+                        file=file,
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        exc_info=True,
+                    )
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        # Artifact-first: when a run has DOWNLOAD artifact rows, return them as
+        # the source of truth — the row carries enough to build a short signed
+        # /v1/artifacts/{id}/content URL plus the SHA-256 we persisted at save
+        # time, so we skip the S3 LIST and per-file HEAD entirely (SKY-8861).
+        #
+        # If HMAC signing isn't configured (self-hosted OSS default), the signed
+        # endpoint requires an API key webhook consumers don't have, so we stay
+        # on the legacy S3-list+presign path even when rows exist.
+        if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            if artifacts:
+                return await _file_infos_from_download_artifacts(artifacts)
+
+        # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
+        # OSS-default deployments without HMAC signing both arrive here.
+        return await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+
+    async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
+        try:
+            return await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                run_id=run_id,
+                organization_id=organization_id,
+                artifact_type=ArtifactType.DOWNLOAD,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to look up download artifacts; falling back to presigned S3 URLs",
+                organization_id=organization_id,
+                run_id=run_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _get_downloaded_files_via_s3_listing(self, *, organization_id: str, run_id: str | None) -> list[FileInfo]:
         bucket = settings.AWS_S3_BUCKET_UPLOADS
         uri = f"s3://{bucket}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
@@ -451,25 +672,22 @@ class S3Storage(BaseStorage):
         for key in object_keys:
             object_uri = f"s3://{bucket}/{key}"
 
-            # Get metadata (including checksum)
             metadata = await self.async_client.get_file_metadata(object_uri, log_exception=False)
-
-            # Create FileInfo object
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
+            display_name = metadata.get("original_filename", filename) if metadata else filename
 
-            # Get presigned URL
             presigned_urls = await self.async_client.create_presigned_urls([object_uri])
             if not presigned_urls:
                 continue
 
-            file_info = FileInfo(
-                url=presigned_urls[0],
-                checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
+            file_infos.append(
+                FileInfo(
+                    url=presigned_urls[0],
+                    checksum=checksum,
+                    filename=display_name,
+                )
             )
-            file_infos.append(file_info)
-
         return file_infos
 
     async def save_legacy_file(
@@ -551,6 +769,58 @@ class S3Storage(BaseStorage):
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         sc = await self._get_storage_class_for_org(organization_id, self.bucket)
         await self.async_client.upload_file_from_path(uri, local_file_path, storage_class=sc)
+
+        if artifact_type == "downloads":
+            # Register a DOWNLOAD Artifact row scoped to the session so the DB
+            # is the single source of truth for both the
+            # ``GET /v1/browser_sessions/{id}`` user-facing listing and the
+            # agent's baseline-before/after / complete_on_download checks.
+            # Partial files (``*.crdownload``) get a row too with
+            # checksum=None — the agent's "still downloading" query reads
+            # URI-suffix from the row. The row is dropped when Chrome's
+            # atomic rename fires ``Change.deleted`` for the partial path.
+            #
+            # Exceptions propagate so the watcher's bounded retry in
+            # ``browser_controller._watch_and_sync_directory`` can recover
+            # from a transient DB outage. Both ``upload_file_from_path`` (S3
+            # overwrite) and ``create_browser_session_download_artifact``
+            # (idempotent on ``(session, uri)``) are safe to retry.
+            is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
+            checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                filename=os.path.basename(remote_path),
+                checksum=checksum,
+            )
+        elif artifact_type == "videos":
+            # Register a RECORDING artifact row so
+            # ``GET /v1/browser_sessions/{id}`` serves the recording via a
+            # short signed ``/v1/artifacts/{id}/content`` URL instead of a
+            # raw S3 presigned URL. Recordings are uploaded once at session
+            # close (Playwright finalizes the file when the browser context
+            # closes — there's no partial / mid-write state to track).
+            #
+            # Artifact-row creation is best-effort here. The only caller
+            # (``DefaultPersistentSessionsManager.close_session``) wraps the
+            # whole final-sync in ``except Exception: LOG.exception(...)``
+            # without retry, so propagating doesn't recover from a missed
+            # write the way the watcher's retry does for downloads. The
+            # safety net is the gated legacy listing fallback in
+            # ``get_shared_recordings_in_browser_session``: when the session
+            # has no RECORDING rows we fall through to the S3 LIST path, so
+            # a row-less recording still surfaces via the legacy presigned
+            # URL until a subsequent close writes the row.
+            checksum = calculate_sha256_for_file(local_file_path)
+            await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                filename=os.path.basename(remote_path),
+                checksum=checksum,
+            )
+
         return uri
 
     async def delete_browser_session_file(
@@ -561,8 +831,31 @@ class S3Storage(BaseStorage):
         remote_path: str,
         date: str | None = None,
     ) -> None:
-        """Delete a file from browser session storage in S3."""
+        """Delete a file from browser session storage in S3.
+
+        For ``downloads``, also drop the matching DOWNLOAD artifact row so a
+        subsequent ``GET /v1/browser_sessions/{id}`` doesn't hand out a signed
+        URL that 404s. The DB delete runs before the S3 delete: if S3 fails
+        we'd rather have an artifact row missing (the listing fallback covers
+        it) than a row pointing at a deleted object.
+        """
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
+        if artifact_type == "downloads":
+            try:
+                await app.DATABASE.artifacts.delete_artifact_for_browser_session(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    uri=uri,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to delete browser-session download artifact row; proceeding with S3 delete",
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    remote_path=remote_path,
+                    exc_info=True,
+                )
         await self.async_client.delete_file(uri, log_exception=True)
 
     async def browser_session_file_exists(

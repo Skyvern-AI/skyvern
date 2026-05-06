@@ -10,6 +10,7 @@ class BrowserProfile(BaseModel):
     organization_id: str
     name: str
     description: str | None = None
+    source_browser_type: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

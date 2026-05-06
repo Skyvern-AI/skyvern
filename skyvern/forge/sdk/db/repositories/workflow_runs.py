@@ -51,6 +51,33 @@ from skyvern.schemas.runs import ProxyLocationInput, RunType
 LOG = structlog.get_logger()
 
 
+def _merge_script_run(
+    existing: dict | None,
+    ai_fallback_triggered: bool | None,
+    script_id: str | None,
+    script_revision_id: str | None,
+) -> dict:
+    """Merge-on-write semantics for `workflow_runs.script_run`.
+
+    Callers update different facets of `script_run` at different points in a
+    run's lifecycle — setup time writes script identity, mid-execution fallback
+    writes `ai_fallback_triggered=True`. A replace-based update would clobber
+    whichever facet the caller didn't touch, so merge preserves the other.
+
+    Pure function for testability (see `tests/unit/db/
+    test_workflow_runs_script_run_merge.py`). None-valued params are skipped;
+    non-None params overwrite the corresponding key in the merged dict.
+    """
+    merged = dict(existing or {})
+    if ai_fallback_triggered is not None:
+        merged["ai_fallback_triggered"] = ai_fallback_triggered
+    if script_id is not None:
+        merged["script_id"] = script_id
+    if script_revision_id is not None:
+        merged["script_revision_id"] = script_revision_id
+    return merged
+
+
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
 
@@ -136,6 +163,8 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        ignore_inherited_workflow_system_prompt: bool = False,
+        copilot_session_id: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -163,6 +192,8 @@ class WorkflowRunsRepository(BaseRepository):
                 code_gen=code_gen,
                 trigger_type=trigger_type.value if trigger_type else None,
                 workflow_schedule_id=workflow_schedule_id,
+                ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+                copilot_session_id=copilot_session_id,
                 **kwargs,
             )
             session.add(workflow_run)
@@ -178,6 +209,8 @@ class WorkflowRunsRepository(BaseRepository):
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
         ai_fallback_triggered: bool | None = None,
+        script_id: str | None = None,
+        script_revision_id: str | None = None,
         job_id: str | None = None,
         run_with: str | None = None,
         sequential_key: str | None = None,
@@ -212,8 +245,13 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
                     workflow_run.webhook_failure_reason = webhook_failure_reason
-                if ai_fallback_triggered is not None:
-                    workflow_run.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                if ai_fallback_triggered is not None or script_id is not None or script_revision_id is not None:
+                    workflow_run.script_run = _merge_script_run(
+                        existing=workflow_run.script_run,
+                        ai_fallback_triggered=ai_fallback_triggered,
+                        script_id=script_id,
+                        script_revision_id=script_revision_id,
+                    )
                 if job_id:
                     workflow_run.job_id = job_id
                 if run_with:
@@ -258,6 +296,29 @@ class WorkflowRunsRepository(BaseRepository):
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    @db_operation("increment_workflow_run_credits")
+    async def increment_workflow_run_credits(
+        self,
+        workflow_run_id: str,
+        credits: int,
+        is_cached: bool = False,
+    ) -> None:
+        col = WorkflowRunModel.cached_credits_used if is_cached else WorkflowRunModel.credits_used
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                .values({col: func.coalesce(col, 0) + credits})
+            )
+            if result.rowcount == 0:
+                LOG.warning(
+                    "increment_workflow_run_credits matched no rows",
+                    workflow_run_id=workflow_run_id,
+                    credits=credits,
+                    is_cached=is_cached,
+                )
+            await session.commit()
 
     @db_operation("update_workflow_run_if_not_final")
     async def update_workflow_run_if_not_final(
@@ -372,6 +433,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
             if not include_debugger_runs:
@@ -454,6 +516,23 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
+            # task_runs.workflow_permanent_id is unreliable on legacy workflow_run rows; the joined
+            # workflow_runs row carries the canonical WPID, so coalesce both before deriving anything.
+            effective_wpid = func.coalesce(
+                TaskRunModel.workflow_permanent_id,
+                WorkflowRunModel.workflow_permanent_id,
+            )
+            # True iff this row's workflow_permanent_id has no active (deleted_at IS NULL) version.
+            workflow_deleted_expr = and_(
+                effective_wpid.isnot(None),
+                ~exists().where(
+                    and_(
+                        WorkflowModel.workflow_permanent_id == effective_wpid,
+                        WorkflowModel.organization_id == TaskRunModel.organization_id,
+                        WorkflowModel.deleted_at.is_(None),
+                    )
+                ),
+            ).label("workflow_deleted")
             query = (
                 select(
                     TaskRunModel.task_run_id.label("task_run_id"),
@@ -464,9 +543,10 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.started_at.label("started_at"),
                     TaskRunModel.finished_at.label("finished_at"),
                     TaskRunModel.created_at.label("created_at"),
-                    TaskRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    effective_wpid.label("workflow_permanent_id"),
                     TaskRunModel.script_run.label("script_run"),
                     TaskRunModel.searchable_text.label("searchable_text"),
+                    workflow_deleted_expr,
                 )
                 .select_from(TaskRunModel)
                 .outerjoin(
@@ -481,6 +561,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(TaskRunModel.status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
                 .filter(TaskRunModel.debug_session_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
             if status:
@@ -491,7 +572,7 @@ class WorkflowRunsRepository(BaseRepository):
                     or_(
                         TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
                         TaskRunModel.run_id.icontains(search_key, autoescape=True),
-                        TaskRunModel.workflow_permanent_id.icontains(search_key, autoescape=True),
+                        effective_wpid.icontains(search_key, autoescape=True),
                     )
                 )
 
@@ -761,6 +842,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
             query = self._apply_search_key_filter(query, search_key)
@@ -878,6 +960,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                 .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                 .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
             query = self._apply_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)
@@ -890,6 +973,33 @@ class WorkflowRunsRepository(BaseRepository):
                 for run, title in workflow_runs_and_titles_tuples
             ]
             return workflow_runs
+
+    @db_operation("get_workflow_runs_for_browser_session")
+    async def get_workflow_runs_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[WorkflowRun]:
+        async with self.Session() as session:
+            db_page = page - 1
+            query = (
+                select(WorkflowRunModel, WorkflowModel.title)
+                .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                .filter(WorkflowRunModel.browser_session_id == browser_session_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(page_size)
+                .offset(db_page * page_size)
+            )
+            workflow_runs_and_titles_tuples = (await session.execute(query)).all()
+            return [
+                convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
+                for run, title in workflow_runs_and_titles_tuples
+            ]
 
     @db_operation("get_workflow_runs_by_parent_workflow_run_id")
     async def get_workflow_runs_by_parent_workflow_run_id(

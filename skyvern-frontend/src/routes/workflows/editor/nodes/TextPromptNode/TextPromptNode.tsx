@@ -17,6 +17,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { editable, label } = data;
@@ -107,6 +108,14 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             update({ jsonSchema: value });
           }}
           suggestionContext={{ current_schema: data.jsonSchema }}
+        />
+        <Separator />
+        <IgnoreWorkflowSystemPrompt
+          ignoreWorkflowSystemPrompt={data.ignoreWorkflowSystemPrompt ?? false}
+          editable={editable}
+          onIgnoreWorkflowSystemPromptChange={(ignoreWorkflowSystemPrompt) => {
+            update({ ignoreWorkflowSystemPrompt });
+          }}
         />
       </div>
     </div>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -8,8 +9,9 @@ import pytest
 from skyvern.cli.core import client as client_mod
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
-from skyvern.cli.core.session_ops import SessionCloseResult
+from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import session as mcp_session
+from skyvern.schemas.runs import GeoTarget, ProxyLocation
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +61,7 @@ def test_get_skyvern_reuses_override_instance_per_api_key(monkeypatch: pytest.Mo
 
     class FakeSkyvern:
         def __init__(self, *args: object, **kwargs: object) -> None:
-            created_keys.append(kwargs["api_key"])
+            created_keys.append(cast(str, kwargs["api_key"]))
 
         @classmethod
         def local(cls) -> FakeSkyvern:
@@ -89,7 +91,7 @@ def test_get_skyvern_override_client_cache_uses_lru_eviction(monkeypatch: pytest
 
     class FakeSkyvern:
         def __init__(self, *args: object, **kwargs: object) -> None:
-            created_keys.append(kwargs["api_key"])
+            created_keys.append(cast(str, kwargs["api_key"]))
 
         @classmethod
         def local(cls) -> FakeSkyvern:
@@ -138,7 +140,7 @@ def test_get_skyvern_override_cache_closes_evicted_client(monkeypatch: pytest.Mo
 
     class FakeSkyvern:
         def __init__(self, *args: object, **kwargs: object) -> None:
-            self.api_key = kwargs["api_key"]
+            self.api_key = cast(str, kwargs["api_key"])
 
         @classmethod
         def local(cls) -> FakeSkyvern:
@@ -549,6 +551,25 @@ async def test_close_current_session_still_closes_browser_when_api_fails(monkeyp
 # ---------------------------------------------------------------------------
 
 
+def test_coerce_proxy_location_rejects_unknown_string_with_context() -> None:
+    with pytest.raises(ValueError, match="Unknown proxy location: 'INVALID'"):
+        coerce_proxy_location("INVALID")
+
+
+def test_coerce_proxy_location_accepts_supported_input_shapes() -> None:
+    geo_target = GeoTarget(country="US", subdivision="CA", city="San Francisco")
+
+    assert coerce_proxy_location(None) is None
+    assert coerce_proxy_location(geo_target) is geo_target
+    assert coerce_proxy_location("RESIDENTIAL") == ProxyLocation.RESIDENTIAL
+    assert coerce_proxy_location('{"country":"US"}') == GeoTarget(country="US")
+
+
+def test_coerce_proxy_location_rejects_non_object_json() -> None:
+    with pytest.raises(ValueError, match="Proxy location JSON must be a GeoTarget object"):
+        coerce_proxy_location('["RESIDENTIAL"]')
+
+
 @pytest.mark.asyncio
 async def test_session_create_stateless_mode_returns_session_without_persisting_browser(
     monkeypatch: pytest.MonkeyPatch,
@@ -570,6 +591,31 @@ async def test_session_create_stateless_mode_returns_session_without_persisting_
     do_session_create.assert_not_awaited()
     assert mcp_session.get_current_session().browser is None
     assert mcp_session.get_current_session().context is None
+
+
+@pytest.mark.asyncio
+async def test_session_create_stateless_mode_accepts_geotarget_proxy_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_manager.set_stateless_http_mode(True)
+    fake_skyvern = MagicMock()
+    fake_skyvern.create_browser_session = AsyncMock(return_value=SimpleNamespace(browser_session_id="pbs_geo"))
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+
+    try:
+        result = await mcp_session.skyvern_browser_session_create(
+            timeout=45,
+            proxy_location={"country": "US", "subdivision": "CA", "city": "San Francisco"},
+        )
+    finally:
+        session_manager.set_stateless_http_mode(False)
+
+    assert result["ok"] is True
+    # Stateless mode sends request payloads, so GeoTarget instances are serialized back to dicts.
+    fake_skyvern.create_browser_session.assert_awaited_once_with(
+        timeout=45,
+        proxy_location={"country": "US", "subdivision": "CA", "city": "San Francisco"},
+    )
 
 
 @pytest.mark.asyncio

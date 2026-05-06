@@ -5,7 +5,7 @@ from typing import Any, cast
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_LOGIN_COMPLETE_CRITERION, DEFAULT_LOGIN_PROMPT
+from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -56,6 +56,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    WhileLoopBlock,
     WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
@@ -86,6 +87,7 @@ from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     BlockType,
     ForLoopBlockYAML,
+    WhileLoopBlockYAML,
     WorkflowDefinitionYAML,
 )
 
@@ -327,6 +329,7 @@ def convert_workflow_definition(
         version=dag_version,
         finally_block_label=workflow_definition_yaml.finally_block_label,
         error_code_mapping=workflow_definition_yaml.error_code_mapping,
+        workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
     )
 
     LOG.info(
@@ -340,11 +343,11 @@ def convert_workflow_definition(
 
 
 def _collect_all_block_labels(block_yamls: list[BLOCK_YAML_TYPES]) -> list[str]:
-    """Recursively collect all block labels including those inside for-loop blocks."""
+    """Recursively collect all block labels including those inside loop blocks."""
     labels = []
     for block_yaml in block_yamls:
         labels.append(block_yaml.label)
-        if isinstance(block_yaml, ForLoopBlockYAML) and block_yaml.loop_blocks:
+        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block_yaml.loop_blocks:
             labels.extend(_collect_all_block_labels(block_yaml.loop_blocks))
     return labels
 
@@ -364,8 +367,8 @@ def _create_all_output_parameters_for_workflow(
             modified_at=datetime.utcnow(),
         )
         output_parameters[block_yaml.label] = output_parameter
-        # Recursively create output parameters for for-loop blocks
-        if isinstance(block_yaml, ForLoopBlockYAML):
+        # Recursively create output parameters for loop blocks
+        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)):
             output_parameters.update(
                 _create_all_output_parameters_for_workflow(workflow_id=workflow_id, block_yamls=block_yaml.loop_blocks)
             )
@@ -383,6 +386,7 @@ def _build_block_kwargs(
         "continue_on_failure": block_yaml.continue_on_failure,
         "next_loop_on_failure": block_yaml.next_loop_on_failure,
         "model": block_yaml.model,
+        "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
 
 
@@ -444,6 +448,35 @@ def block_yaml_to_block(
             loop_blocks=loop_blocks,
             complete_if_empty=block_yaml.complete_if_empty,
             data_schema=block_yaml.data_schema,
+        )
+    elif block_yaml.block_type == BlockType.WHILE_LOOP:
+        loop_blocks = [block_yaml_to_block(loop_block, parameters) for loop_block in block_yaml.loop_blocks]
+
+        condition_yaml = block_yaml.condition
+        criteria_type = condition_yaml.criteria_type
+        if criteria_type == "prompt":
+            condition = PromptBranchCriteria(
+                criteria_type=criteria_type,
+                expression=condition_yaml.expression,
+                description=condition_yaml.description,
+            )
+        elif criteria_type == "jinja2_template":
+            condition = JinjaBranchCriteria(
+                criteria_type=criteria_type,
+                expression=condition_yaml.expression,
+                description=condition_yaml.description,
+            )
+        else:
+            raise InvalidWorkflowDefinition(
+                f"While loop block '{block_yaml.label}' has unsupported condition.criteria_type {criteria_type!r}. "
+                "Conversion accepts only 'prompt' and 'jinja2_template', so new or unexpected YAML values fail here "
+                "instead of being mapped to the wrong criteria type."
+            )
+
+        return WhileLoopBlock(
+            **base_kwargs,
+            loop_blocks=loop_blocks,
+            condition=condition,
         )
     elif block_yaml.block_type == BlockType.CONDITIONAL:
         branch_conditions = []
@@ -646,9 +679,6 @@ def block_yaml_to_block(
         login_navigation_goal = block_yaml.navigation_goal
         if not login_navigation_goal or not login_navigation_goal.strip():
             login_navigation_goal = DEFAULT_LOGIN_PROMPT
-        login_complete_criterion = block_yaml.complete_criterion
-        if not login_complete_criterion or not login_complete_criterion.strip():
-            login_complete_criterion = DEFAULT_LOGIN_COMPLETE_CRITERION
         return LoginBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -662,7 +692,7 @@ def block_yaml_to_block(
             totp_verification_url=block_yaml.totp_verification_url,
             totp_identifier=block_yaml.totp_identifier,
             disable_cache=block_yaml.disable_cache,
-            complete_criterion=login_complete_criterion,
+            complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
         )
@@ -785,7 +815,7 @@ def _collect_undefined_parameters(
     parameters: dict[str, PARAMETER_TYPE],
 ) -> dict[str, list[str]]:
     """
-    Collect all undefined parameters referenced by blocks (including nested blocks in for_loop).
+    Collect all undefined parameters referenced by blocks (including nested blocks in loop blocks).
     Returns a dict mapping block labels to lists of undefined parameter keys.
     """
     undefined_params: dict[str, list[str]] = {}
@@ -796,8 +826,8 @@ def _collect_undefined_parameters(
             if undefined_for_block:
                 undefined_params[block_yaml.label] = undefined_for_block
 
-        # Recursively check nested blocks in for_loop
-        if isinstance(block_yaml, ForLoopBlockYAML) and block_yaml.loop_blocks:
+        # Recursively check nested blocks in loop blocks
+        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block_yaml.loop_blocks:
             nested_undefined = _collect_undefined_parameters(block_yaml.loop_blocks, parameters)
             undefined_params.update(nested_undefined)
 
@@ -816,6 +846,6 @@ def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
     for block_yaml in block_yamls:
         if block_yaml.next_block_label:
             return True
-        if isinstance(block_yaml, ForLoopBlockYAML) and _has_dag_metadata(block_yaml.loop_blocks):
+        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and _has_dag_metadata(block_yaml.loop_blocks):
             return True
     return False

@@ -1,13 +1,25 @@
 """Shared loop detection utilities for copilot tool dispatch.
 
-Detects consecutive same-tool streaks (e.g., A-A-A). Does not detect
-oscillating patterns (e.g., A-B-A-B) — those are left for higher-layer
-enforcement to catch.
+Two independent guards:
+
+* ``detect_tool_loop`` fires on strictly consecutive same-tool streaks
+  (A-A-A). Resets the moment the tool name changes, so oscillating
+  patterns (A-B-A-B) bypass it by design.
+* ``detect_failed_tool_step_loop`` fires on N repeated failures of the
+  same (tool, args) pair, even when other tools dispatch in between.
+  A successful invocation of the same step resets its counter.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Iterable, Mapping, MutableMapping
+from typing import Any
+
 MAX_CONSECUTIVE_SAME_TOOL = 3
+MAX_REPEATED_FAILED_STEP = 3
+LOOP_DETECTED_MARKER = "LOOP DETECTED:"
 
 
 def detect_tool_loop(
@@ -21,7 +33,7 @@ def detect_tool_loop(
     if len(tracker) >= threshold and len(set(tracker[-threshold:])) == 1:
         tracker.clear()
         return (
-            f"LOOP DETECTED: '{tool_name}' has been called "
+            f"{LOOP_DETECTED_MARKER} '{tool_name}' has been called "
             f"{threshold} times consecutively. "
             "This tool will not run again. Use a DIFFERENT tool "
             "to continue, or produce your final JSON response."
@@ -32,3 +44,108 @@ def detect_tool_loop(
         tracker.append(tool_name)
 
     return None
+
+
+def _normalize_step_argument(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _normalize_step_argument(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, list | tuple):
+        return [_normalize_step_argument(item) for item in value]
+    if isinstance(value, frozenset | set):
+        return sorted((_normalize_step_argument(item) for item in value), key=repr)
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return repr(value)
+
+
+def tool_step_identity(tool_name: str, arguments: Mapping[str, Any] | None = None) -> str:
+    normalized = _normalize_step_argument(arguments or {})
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"{tool_name}:{digest}"
+
+
+def detect_failed_tool_step_loop(
+    tracker: MutableMapping[str, int],
+    tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
+    threshold: int = MAX_REPEATED_FAILED_STEP,
+) -> str | None:
+    if not tracker:
+        return None
+
+    identity = tool_step_identity(tool_name, arguments)
+    failure_count = tracker.get(identity, 0)
+    next_attempt = failure_count + 1
+    if next_attempt < threshold:
+        return None
+
+    return (
+        f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
+        f"{failure_count} consecutive times with these arguments; "
+        f"blocking attempt #{next_attempt}. "
+        "Use different arguments, a DIFFERENT tool, ask the user, "
+        "or produce your final JSON response."
+    )
+
+
+def record_tool_step_result(
+    tracker: MutableMapping[str, int],
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+    result: Mapping[str, Any],
+    threshold: int = MAX_REPEATED_FAILED_STEP,
+) -> None:
+    identity = tool_step_identity(tool_name, arguments)
+    if result.get("ok", True):
+        tracker.pop(identity, None)
+        return
+
+    tracker[identity] = min(tracker.get(identity, 0) + 1, threshold)
+
+
+def clear_failed_step_tracker_for_tools(
+    tracker: MutableMapping[str, int],
+    tool_names: Iterable[str],
+) -> None:
+    prefixes = tuple(f"{name}:" for name in tool_names)
+    if not prefixes:
+        return
+    for key in list(tracker):
+        if key.startswith(prefixes):
+            del tracker[key]
+
+
+def _ctx_failed_step_tracker(ctx: Any) -> MutableMapping[str, int] | None:
+    tracker = getattr(ctx, "failed_tool_step_tracker", None)
+    return tracker if isinstance(tracker, dict) else None
+
+
+def detect_failed_tool_step_loop_for_ctx(
+    ctx: Any,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
+) -> str | None:
+    tracker = _ctx_failed_step_tracker(ctx)
+    if tracker is None:
+        return None
+    return detect_failed_tool_step_loop(tracker, tool_name, arguments)
+
+
+def record_tool_step_result_for_ctx(
+    ctx: Any,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+    result: Mapping[str, Any],
+) -> None:
+    tracker = _ctx_failed_step_tracker(ctx)
+    if tracker is None:
+        return
+    record_tool_step_result(tracker, tool_name, arguments, result)
+
+
+def clear_failed_step_tracker_for_tools_in_ctx(ctx: Any, tool_names: Iterable[str]) -> None:
+    tracker = _ctx_failed_step_tracker(ctx)
+    if tracker is None:
+        return
+    clear_failed_step_tracker_for_tools(tracker, tool_names)

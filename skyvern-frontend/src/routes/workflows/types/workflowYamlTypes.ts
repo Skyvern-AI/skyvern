@@ -29,6 +29,7 @@ export type WorkflowDefinitionYAML = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
   finally_block_label?: string | null;
+  workflow_system_prompt?: string | null;
 };
 
 export type ParameterYAML =
@@ -130,6 +131,7 @@ export type BlockYAML =
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
+  | WhileLoopBlockYAML
   | ConditionalBlockYAML
   | ValidationBlockYAML
   | HumanInteractionBlockYAML
@@ -154,6 +156,7 @@ export type BlockYAMLBase = {
   continue_on_failure?: boolean;
   next_loop_on_failure?: boolean;
   next_block_label?: string | null;
+  ignore_workflow_system_prompt?: boolean;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {
@@ -365,6 +368,12 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
   data_schema?: Record<string, unknown> | string | null;
+};
+
+export type WhileLoopBlockYAML = BlockYAMLBase & {
+  block_type: "while_loop";
+  loop_blocks: Array<BlockYAML>;
+  condition: BranchCriteriaYAML;
 };
 
 export type BranchCriteriaYAML = {
