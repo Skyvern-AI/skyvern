@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Lock the --input / --ring CSS-var contract that the Input component, the
 // shadcn dialog/popover/select primitives, and any future ring-using
@@ -12,12 +13,17 @@ import { resolve } from "node:path";
 // :root and .dark prevents a regression where one entrypoint silently
 // drops a token that another entrypoint still ships.
 
+// skyvern-frontend is an ESM package, so __dirname is undefined here.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, "../../../..");
+// cloud/ and eval/ entrypoints only exist in the cloud sync target; in OSS
+// they are absent and must be filtered out so the suite still runs.
 const CSS_FILES = [
   "skyvern-frontend/src/index.css",
   "skyvern-frontend/cloud/index.css",
   "skyvern-frontend/eval/index.css",
-];
+].filter((file) => existsSync(resolve(REPO_ROOT, file)));
 
 function load(file: string): string {
   return readFileSync(resolve(REPO_ROOT, file), "utf-8");
