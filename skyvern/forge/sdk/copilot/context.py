@@ -205,6 +205,8 @@ class CopilotContext(AgentContext):
     # copilot rewrites the workflow, but the underlying site-block pattern is
     # shape-independent.
     probable_site_block_streak_count: int = 0
+    probable_site_block_stop_nudge_count: int = 0
+    per_tool_budget_nudge_count: int = 0
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -248,6 +250,11 @@ class CopilotContext(AgentContext):
     last_action_sequence_fingerprint: str | None = None
     pending_action_sequence_fingerprint: str | None = None
     repeated_action_fingerprint_streak_count: int = 0
+
+    copilot_run_start_monotonic: float | None = None
+
+    last_good_workflow: Workflow | None = None
+    last_good_workflow_yaml: str | None = None
 
     # Populated lazily by ``stream_to_sse`` and reused across enforcement
     # iterations so cadence/last-emitted-at survive ``run_with_enforcement``

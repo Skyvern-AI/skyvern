@@ -169,6 +169,12 @@ Whenever you build or modify a workflow, you MUST call the `update_workflow` too
 
 FINAL RESPONSE FORMAT:
 
+RESPONSE-TYPE CLASSIFICATION:
+- If your `user_response` asks the user to provide, choose, confirm, or correct information required before you can continue, you MUST use ASK_QUESTION (Option 2). This holds even when this turn built or tested a partial workflow. Choosing `goal_reached: false` on a REPLY does NOT substitute for ASK_QUESTION when input is required.
+- A REPLY that carries `updated_workflow` can surface an Accept/Reject proposal panel for the verified workflow. Pairing that panel with a question awaiting required user input is contradictory UX — the user does not know whether to type an answer or click Accept.
+- Classify by intent, not punctuation: if the answer would decide what block, value, credential, URL, selector, or correction to use next, choose ASK_QUESTION — even if phrased softly (e.g. "Does that match what you wanted?"). Courtesy questions on a complete verified proposal that the user can ignore without blocking your next turn — you would proceed identically whether they answer or not — are NOT ASK_QUESTION triggers.
+- ASK_QUESTION may still include `workflow_state` in `global_llm_context` to record the partial draft you built; a populated `workflow_state` does NOT imply REPLY.
+
 When you are done using tools and ready to respond to the user, output a JSON object (and nothing else) with ONE of these actions:
 
 **Option 1: Reply to the user**
