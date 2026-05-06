@@ -479,11 +479,6 @@ def _read_legacy_streamlit_credential() -> str:
     return _read_credential_file(LEGACY_STREAMLIT_CREDENTIALS_FILE)
 
 
-def _compose_uses_generated_credentials_mount() -> bool:
-    compose_file = Path("docker-compose.yml")
-    return compose_file.exists() and ".skyvern" in compose_file.read_text()
-
-
 def _check_api_key_consistency() -> CheckResult:
     """Check that backend and frontend API keys are consistent."""
 
@@ -516,8 +511,6 @@ def _check_api_key_consistency() -> CheckResult:
     mismatches: list[str] = []
     if not backend_key and not generated_key:
         mismatches.append("SKYVERN_API_KEY not set in backend .env")
-    if backend_key and generated_key and generated_key != backend_key:
-        mismatches.append(".skyvern/credentials.toml differs from backend .env")
     if not frontend_env.exists():
         mismatches.append("skyvern-frontend/.env missing")
     elif not frontend_key and not generated_key:
@@ -553,7 +546,7 @@ def _check_legacy_streamlit_secrets() -> CheckResult:
             name="Legacy Streamlit Secrets",
             status="warn",
             detail=".streamlit/secrets.toml exists but no cred value was found",
-            hint="Remove the file, or run `skyvern doctor --fix` to write generated credentials",
+            hint="Remove the file, or run `skyvern doctor --fix` to remove the deprecated file",
         )
 
     if not backend_key:
@@ -561,7 +554,7 @@ def _check_legacy_streamlit_secrets() -> CheckResult:
             name="Legacy Streamlit Secrets",
             status="warn",
             detail=".streamlit/secrets.toml has a legacy API key but backend .env is missing SKYVERN_API_KEY",
-            hint="Run `skyvern doctor --fix` to migrate the key into .env, skyvern-frontend/.env, and .skyvern/credentials.toml",
+            hint="Run `skyvern doctor --fix` to migrate the key into .env and skyvern-frontend/.env",
         )
 
     if legacy_key != backend_key:
@@ -569,14 +562,14 @@ def _check_legacy_streamlit_secrets() -> CheckResult:
             name="Legacy Streamlit Secrets",
             status="warn",
             detail=".streamlit/secrets.toml is deprecated and differs from backend .env",
-            hint="Run `skyvern doctor --fix` to write the canonical key to .skyvern/credentials.toml",
+            hint="Run `skyvern doctor --fix` to remove the deprecated file",
         )
 
     return CheckResult(
         name="Legacy Streamlit Secrets",
-        status="ok",
+        status="warn",
         detail=".streamlit/secrets.toml matches backend .env; deprecated compatibility file only",
-        hint="The generated Docker credential path is .skyvern/credentials.toml",
+        hint="Run `skyvern doctor --fix` to remove the deprecated file",
     )
 
 
@@ -763,9 +756,6 @@ def _fix_api_key_consistency() -> bool:
         backend_env.touch()
 
     set_key(str(backend_env), "SKYVERN_API_KEY", canonical)
-    if GENERATED_CREDENTIALS_FILE.exists() or _compose_uses_generated_credentials_mount():
-        GENERATED_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        GENERATED_CREDENTIALS_FILE.write_text(f'[general]\ncred = "{canonical}"\n')
 
     if not frontend_env.exists() and frontend_example.exists():
         import shutil
@@ -804,10 +794,6 @@ def _fix_legacy_streamlit_secrets() -> bool:
     if not LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
         return False
 
-    canonical = backend_key or legacy_key
-    if not canonical:
-        return False
-
     if not backend_key and legacy_key:
         if not backend_env.exists():
             backend_env.touch()
@@ -816,11 +802,11 @@ def _fix_legacy_streamlit_secrets() -> bool:
             shutil.copy(frontend_example, frontend_env)
         if frontend_env.exists():
             set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", legacy_key)
-        canonical = legacy_key
+        console.print("  [green]✅ Migrated legacy .streamlit API key into .env files[/green]")
 
-    GENERATED_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    GENERATED_CREDENTIALS_FILE.write_text(f'[general]\ncred = "{canonical}"\n')
-    console.print("  [green]✅ Migrated legacy .streamlit API key into .skyvern/credentials.toml[/green]")
+    LEGACY_STREAMLIT_CREDENTIALS_FILE.unlink()
+    console.print("  [green]✅ Removed deprecated .streamlit/secrets.toml[/green]")
+
     return True
 
 
