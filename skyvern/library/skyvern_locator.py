@@ -1,4 +1,9 @@
+# ruff: noqa: E402
 from typing import Any, Pattern
+
+from skyvern.exceptions import require_server_extra_modules
+
+require_server_extra_modules("skyvern.library.skyvern_locator")
 
 from playwright.async_api import Locator
 

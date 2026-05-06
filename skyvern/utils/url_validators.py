@@ -1,7 +1,7 @@
 import ipaddress
+from http import HTTPStatus
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
-from fastapi import status
 from pydantic import HttpUrl, ValidationError
 
 from skyvern.config import settings
@@ -78,7 +78,7 @@ def validate_url(url: str) -> str | None:
         url = prepend_scheme_and_validate_url(url=url)
         v = HttpUrl(url=url)
     except Exception as e:
-        raise SkyvernHTTPException(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
+        raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST)
 
     if not v.host:
         return None
