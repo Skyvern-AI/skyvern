@@ -170,6 +170,7 @@ class OrganizationModel(Base):
     organization_name = Column(String, nullable=False)
     webhook_callback_url = Column(UnicodeText)
     max_steps_per_run = Column(Integer, nullable=True)
+    max_steps_per_workflow_run = Column(Integer, nullable=True)
     max_retries_per_step = Column(Integer, nullable=True)
     domain = Column(String, nullable=True, index=True)
     bw_organization_id = Column(String, nullable=True, default=None)
