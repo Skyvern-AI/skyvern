@@ -33,6 +33,7 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.tools import (
+    PER_TOOL_CALL_BUDGET_SECONDS,
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
     _any_quiet_block_requested,
@@ -250,7 +251,7 @@ async def test_stagnation_error_message_does_not_invite_retry() -> None:
     """The exact SKY-9163 bug: the old copy said "likely stuck repeating
     failing actions" which the LLM read as "try again". The stagnation
     message must explicitly discourage retry."""
-    msg = await _watchdog_error_message("stagnation", _ErrorCtx(), "wr_test", _fake_run())
+    msg = await _watchdog_error_message("stagnation", _ErrorCtx(), "wr_test", _fake_run(), PER_TOOL_CALL_BUDGET_SECONDS)
 
     assert "timed out" not in msg.lower()
     assert "likely stuck repeating" not in msg.lower()
@@ -265,13 +266,34 @@ async def test_ceiling_error_message_advises_splitting() -> None:
     """The ceiling path is rare (a runaway run that keeps making progress
     past 20 min). Its error must tell the LLM to split the workflow, not
     retry — a longer run won't fit either."""
-    msg = await _watchdog_error_message("ceiling", _ErrorCtx(), "wr_test", _fake_run())
+    quiet_budget = RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
+    msg = await _watchdog_error_message("ceiling", _ErrorCtx(), "wr_test", _fake_run(), quiet_budget)
 
     assert "timed out" not in msg.lower()
-    assert str(RUN_BLOCKS_SAFETY_CEILING_SECONDS) in msg
+    assert str(quiet_budget) in msg
     assert "split" in msg.lower()
     assert "Run ID: wr_test" in msg
     assert "get_run_results" in msg
+
+
+@pytest.mark.asyncio
+async def test_per_tool_budget_message_advises_splitting_chain() -> None:
+    """A per-tool-budget trip names the budget value, tells the agent to
+    inspect the cancelled run via ``get_run_results``, then split the chain.
+    Does NOT carry the strict "Do NOT re-invoke block-running tools" gate
+    that the stagnation/ceiling/task_exit_unfinalized paths use — the budget
+    guard clears unconditionally once ``get_run_results`` confirms the row."""
+    msg = await _watchdog_error_message(
+        "per_tool_budget", _ErrorCtx(), "wr_test", _fake_run(), PER_TOOL_CALL_BUDGET_SECONDS
+    )
+
+    assert "timed out" not in msg.lower()
+    assert str(PER_TOOL_CALL_BUDGET_SECONDS) in msg
+    assert "Run ID: wr_test" in msg
+    assert "get_run_results" in msg
+    assert "smaller chain" in msg.lower()
+    assert "verified-prefix" in msg.lower() or "verified prefix" in msg.lower()
+    assert "Do NOT re-invoke block-running tools" not in msg
 
 
 @pytest.mark.asyncio
@@ -280,7 +302,9 @@ async def test_task_exit_unfinalized_message_reports_last_observed_status() -> N
     the error must name the last-observed status so the LLM has a concrete
     anchor for the follow-up ``get_run_results`` call."""
     run = _fake_run(status="running")
-    msg = await _watchdog_error_message("task_exit_unfinalized", _ErrorCtx(), "wr_test", run)
+    msg = await _watchdog_error_message(
+        "task_exit_unfinalized", _ErrorCtx(), "wr_test", run, PER_TOOL_CALL_BUDGET_SECONDS
+    )
 
     assert "timed out" not in msg.lower()
     assert "last observed status: running" in msg
@@ -293,7 +317,9 @@ async def test_task_exit_unfinalized_message_tolerates_unreadable_run() -> None:
     """If the post-drain reread also fails (``run is None``), the message must
     still be well-formed and mention the unreadable state rather than
     crashing on a ``None.status`` access."""
-    msg = await _watchdog_error_message("task_exit_unfinalized", _ErrorCtx(), "wr_test", None)
+    msg = await _watchdog_error_message(
+        "task_exit_unfinalized", _ErrorCtx(), "wr_test", None, PER_TOOL_CALL_BUDGET_SECONDS
+    )
 
     assert "unreadable" in msg.lower()
     assert "Run ID: wr_test" in msg

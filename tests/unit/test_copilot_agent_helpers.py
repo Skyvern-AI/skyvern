@@ -738,3 +738,20 @@ class TestCredentialRefusalReachesAgent:
             assert "redacted from" not in desc, f"{tool.name} still claims redaction"
             assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"
             assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
+
+
+class TestResponseTypeClassificationRuleReachesAgent:
+    """Pin the classifier rule that selects ASK_QUESTION when `user_response` asks the user for required input — the agent.py null-out gate keys on `resp_type == "ASK_QUESTION"` and depends on this prompt text."""
+
+    def test_build_system_prompt_carries_classification_rule(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
+
+        assert "RESPONSE-TYPE CLASSIFICATION" in prompt
+        assert "required before you can continue" in prompt
+        assert "this turn built or tested a partial workflow" in prompt
+        assert "goal_reached: false" in prompt
+        assert "Classify by intent, not punctuation" in prompt
+        assert "does NOT imply REPLY" in prompt
+        assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")

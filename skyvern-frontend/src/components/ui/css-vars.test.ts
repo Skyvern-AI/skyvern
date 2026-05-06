@@ -15,17 +15,21 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "../../../..");
-// Multi-entrypoint layout (cloud / eval / src) exists in the cloud monorepo;
-// the OSS repo syncs only src/. Filter to whatever exists so the contract
-// holds in both contexts without per-repo divergence.
-const ALL_CSS_FILES = [
-  "skyvern-frontend/src/index.css",
-  "skyvern-frontend/cloud/index.css",
-  "skyvern-frontend/eval/index.css",
-];
-const CSS_FILES = ALL_CSS_FILES.filter((f) =>
-  existsSync(resolve(REPO_ROOT, f)),
-);
+// Gate by directory, not file: a deleted index.css inside an existing
+// entrypoint dir is the regression we want to fail loudly on.
+function entrypoint(dir: string): string | null {
+  if (!existsSync(resolve(REPO_ROOT, dir))) {
+    return null;
+  }
+  return `${dir}/index.css`;
+}
+const CSS_FILES = [
+  "skyvern-frontend/src",
+  "skyvern-frontend/cloud",
+  "skyvern-frontend/eval",
+]
+  .map(entrypoint)
+  .filter((f): f is string => f !== null);
 
 function load(file: string): string {
   return readFileSync(resolve(REPO_ROOT, file), "utf-8");
