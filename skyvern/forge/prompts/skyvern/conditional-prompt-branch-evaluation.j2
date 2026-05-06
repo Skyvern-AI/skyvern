@@ -2,6 +2,8 @@ Evaluate if the following condition(s) are TRUE or FALSE.
 
 CRITICAL RULE: If all the data needed to evaluate a condition is already present in the condition text, you MUST evaluate it using ONLY the condition text. Do NOT reference the page content. Only use the page content (screenshot/HTML) when the condition explicitly asks about what is on the page (e.g., "the date in the page", "the column under payments section").
 
+Each condition is ONE expression. If a condition contains "and"/"or" or repeated "if" clauses (e.g., "If A and if B"), evaluate the whole expression using logical operators and return ONE result. Do NOT split a condition into multiple sub-results. You MUST return exactly {{ conditions|length }} {{ 'result' if conditions|length == 1 else 'results' }}, one per numbered condition, in the same order.
+
 {% if conditions|length == 1 %}
 Condition: {{ conditions[0] }}
 {% else %}

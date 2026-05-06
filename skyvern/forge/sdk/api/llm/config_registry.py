@@ -6,7 +6,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMConfigError,
     MissingLLMProviderEnvVarsError,
 )
-from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig, LLMRouterConfig
+from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 

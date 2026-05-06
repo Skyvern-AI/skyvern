@@ -2042,19 +2042,31 @@ class ForgeAgent:
                 "display_width_px": settings.BROWSER_WIDTH,
             }
         ]
-        thinking = {"type": "enabled", "budget_tokens": 1024}
+        thinking: dict[str, Any]
+        output_config: dict[str, Any] | None
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(llm_caller.llm_config.model_name):
+            thinking = {"type": "adaptive"}
+            output_config = {"effort": LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT}
+        else:
+            thinking = {"type": "enabled", "budget_tokens": 1024}
+            output_config = None
         window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
+        call_kwargs: dict[str, Any] = {
+            "step": step,
+            "screenshots": scraped_page.screenshots,
+            "use_message_history": True,
+            "tools": tools,
+            "raw_response": True,
+            "betas": betas,
+            "thinking": thinking,
+            "window_dimension": window_dimension,
+        }
+        if output_config is not None:
+            call_kwargs["output_config"] = output_config
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                use_message_history=True,
-                tools=tools,
-                raw_response=True,
-                betas=betas,
-                thinking=thinking,
-                window_dimension=window_dimension,
+                **call_kwargs,
             )
         else:
             current_context = skyvern_context.ensure_context()
@@ -2071,14 +2083,7 @@ class ForgeAgent:
 
             llm_response = await llm_caller.call(
                 prompt=resp_content,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                use_message_history=True,
-                tools=tools,
-                raw_response=True,
-                betas=betas,
-                thinking=thinking,
-                window_dimension=window_dimension,
+                **call_kwargs,
             )
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
@@ -4564,6 +4569,18 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
 
+        workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
+        if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
+            last_step = await self._terminate_for_workflow_run_step_budget(
+                organization=organization,
+                task=task,
+                step=step,
+                total_workflow_run_steps=workflow_run_budget[0],
+                max_steps_per_workflow_run=workflow_run_budget[1],
+                speculative_next_step=next_step,
+            )
+            return False, last_step, None
+
         if step.order + 1 >= max_steps_per_run:
             LOG.info(
                 "Step completed but max steps reached, marking task as failed",
@@ -5007,6 +5024,94 @@ class ForgeAgent:
                 errors=[],
             )
 
+    async def _check_workflow_run_step_budget(
+        self,
+        organization: Organization,
+        task: Task,
+    ) -> tuple[int, int] | None:
+        """Returns (total_steps_so_far, max_steps_per_workflow_run) when the org has a
+        run-level cap and this task belongs to a workflow run; otherwise None.
+
+        ``max_steps_per_workflow_run`` is a per-org cap on total step count summed across
+        all task blocks within a single workflow run. Distinct from the per-block
+        ``max_steps_per_run`` ceiling.
+        """
+        if not task.workflow_run_id or not organization.max_steps_per_workflow_run:
+            return None
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(task.workflow_run_id)
+        task_ids = [t.task_id for t in workflow_run_tasks]
+        if not task_ids:
+            return 0, organization.max_steps_per_workflow_run
+        total_steps = await app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids(
+            task_ids=task_ids,
+            organization_id=organization.organization_id,
+        )
+        return total_steps or 0, organization.max_steps_per_workflow_run
+
+    async def _terminate_for_workflow_run_step_budget(
+        self,
+        *,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        total_workflow_run_steps: int,
+        max_steps_per_workflow_run: int,
+        speculative_next_step: Step | None = None,
+    ) -> Step:
+        """Mark ``step`` as the last step of ``task`` and fail the task because the
+        workflow run has hit its total-step budget. Returns the updated last step.
+
+        ``speculative_next_step`` is the parallel-verification path's pre-created next
+        step that must be cancelled when present.
+        """
+        LOG.info(
+            "Step completed but workflow-run max steps reached, marking task as failed",
+            step_order=step.order,
+            step_retry=step.retry_index,
+            workflow_run_id=task.workflow_run_id,
+            total_workflow_run_steps=total_workflow_run_steps,
+            max_steps_per_workflow_run=max_steps_per_workflow_run,
+        )
+        if speculative_next_step is not None:
+            final_status = step.speculative_original_status or StepStatus.completed
+            step.speculative_original_status = None
+            step.status = final_status
+            last_step = await self.update_step(
+                step,
+                status=final_status,
+                output=step.output,
+                is_last=True,
+            )
+        else:
+            last_step = await self.update_step(step, is_last=True)
+
+        failure_reason = (
+            f"Workflow run reached the maximum total steps ({max_steps_per_workflow_run}) set on the organization."
+        )
+        errors = [ReachMaxStepsError().model_dump()]
+        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        LOG.info(
+            "Task failure classified",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            organization_id=task.organization_id,
+            task_status="failed",
+            failure_category=failure_category,
+            primary_failure_category=failure_category[0].get("category") if failure_category else None,
+            failure_category_source="code_level",
+            failure_category_path="max_steps_per_workflow_run",
+        )
+        if speculative_next_step is not None:
+            await self._cancel_speculative_step(speculative_next_step)
+        await self.update_task(
+            task,
+            status=TaskStatus.failed,
+            failure_reason=failure_reason,
+            errors=errors,
+            failure_category=failure_category,
+        )
+        return last_step
+
     async def handle_completed_step(
         self,
         organization: Organization,
@@ -5123,6 +5228,17 @@ class ForgeAgent:
                 status=TaskStatus.completed,
             )
             return True, last_step, None
+
+        workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
+        if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
+            last_step = await self._terminate_for_workflow_run_step_budget(
+                organization=organization,
+                task=task,
+                step=step,
+                total_workflow_run_steps=workflow_run_budget[0],
+                max_steps_per_workflow_run=workflow_run_budget[1],
+            )
+            return False, last_step, None
 
         if step.order + 1 >= max_steps_per_run:
             LOG.info(
