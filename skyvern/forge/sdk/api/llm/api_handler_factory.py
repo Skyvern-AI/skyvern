@@ -450,6 +450,14 @@ class LLMAPIHandlerFactory:
 
     # Anthropic API requires budget_tokens >= 1024
     ANTHROPIC_MIN_THINKING_BUDGET = 1024
+    ADAPTIVE_THINKING_EFFORT = "low"
+
+    @staticmethod
+    def requires_adaptive_thinking(model_name: str | None) -> bool:
+        # Claude Opus 4.7 rejects `thinking.type=enabled` and requires
+        # `thinking.type=adaptive` + `output_config.effort`. Bedrock's translator
+        # does not yet accept the new shape, so gate to direct Anthropic.
+        return model_name == "anthropic/claude-opus-4-7"
 
     @staticmethod
     def _apply_anthropic_thinking_optimization(
@@ -457,6 +465,17 @@ class LLMAPIHandlerFactory:
     ) -> None:
         """Apply thinking optimization for Anthropic/Claude models."""
         model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(model_label):
+            parameters["thinking"] = {"type": "adaptive"}
+            parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            LOG.debug(
+                "Applied thinking budget optimization (adaptive)",
+                prompt_name=prompt_name,
+                effort=LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT,
+                model=model_label,
+            )
+            return
 
         if llm_config.reasoning_effort is not None:
             # Use reasoning_effort if configured in LLM config - always use "low" per LiteLLM constants
@@ -2264,6 +2283,10 @@ class LLMCaller:
         model_name = self.llm_config.model_name.replace("bedrock/", "").replace("anthropic/", "")
         betas = active_parameters.get("betas", NOT_GIVEN)
         thinking = active_parameters.get("thinking", NOT_GIVEN)
+        output_config = active_parameters.get("output_config", NOT_GIVEN)
+        extra_body: dict[str, Any] | None = None
+        if output_config is not NOT_GIVEN:
+            extra_body = {"output_config": output_config}
         LOG.info(
             "Anthropic request",
             model_name=model_name,
@@ -2272,15 +2295,18 @@ class LLMCaller:
             timeout=timeout,
             messages_length=len(messages),
         )
-        response = await app.ANTHROPIC_CLIENT.beta.messages.create(
-            max_tokens=max_tokens,
-            messages=messages,
-            model=model_name,
-            tools=tools or NOT_GIVEN,
-            timeout=timeout,
-            betas=betas,
-            thinking=thinking,
-        )
+        create_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "messages": messages,
+            "model": model_name,
+            "tools": tools or NOT_GIVEN,
+            "timeout": timeout,
+            "betas": betas,
+            "thinking": thinking,
+        }
+        if extra_body is not None:
+            create_kwargs["extra_body"] = extra_body
+        response = await app.ANTHROPIC_CLIENT.beta.messages.create(**create_kwargs)
         LOG.info(
             "Anthropic response",
             model_name=model_name,
