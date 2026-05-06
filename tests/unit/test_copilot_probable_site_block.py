@@ -1,13 +1,6 @@
-"""Tests for the probable-site-block-wall detector and stop nudge.
-
-Covers the copilot's response to a scrape-wall pattern where navigation
-reports success but the page is unreadable — a symptom of site blocking
-that the shared anti-bot classifier does not recognise (it routes to
-``DATA_EXTRACTION_FAILURE`` rather than ``ANTI_BOT_DETECTION``). The
-copilot tracks its own shape-independent streak so workflow-shape
-rewrites cannot perpetually reset a repeated-frontier counter while the
-site keeps refusing to load.
-"""
+"""Tests for the probable-site-block-wall detector and stop nudge — the
+copilot's own shape-independent streak for sites that the shared classifier
+routes to ``DATA_EXTRACTION_FAILURE`` rather than ``ANTI_BOT_DETECTION``."""
 
 from __future__ import annotations
 
@@ -17,9 +10,12 @@ import pytest
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES,
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
+    REPEATED_FRONTIER_STREAK_ESCALATE_AT,
     _needs_probable_site_block_stop_nudge,
+    _repeated_frontier_failure_nudge,
 )
 from skyvern.forge.sdk.copilot.tools import (
     _detect_probable_site_block_wall,
@@ -48,9 +44,9 @@ def _scrape_wall_result() -> dict:
         "ok": False,
         "data": {
             "blocks": [
-                {"block_type": "goto_url", "status": "completed"},
+                {"block_type": "GOTO_URL", "status": "completed"},
                 {
-                    "block_type": "extraction",
+                    "block_type": "EXTRACTION",
                     "status": "failed",
                     "failure_reason": _SCRAPE_WALL_REASON,
                 },
@@ -73,9 +69,9 @@ def test_detect_matches_page_navigated_unexpectedly_phrasing() -> None:
         "ok": False,
         "data": {
             "blocks": [
-                {"block_type": "navigation", "status": "completed"},
+                {"block_type": "NAVIGATION", "status": "completed"},
                 {
-                    "block_type": "extraction",
+                    "block_type": "EXTRACTION",
                     "status": "failed",
                     "failure_reason": "We think the page may have navigated unexpectedly during analysis.",
                 },
@@ -91,13 +87,39 @@ def test_detect_returns_false_when_run_ok() -> None:
     assert _detect_probable_site_block_wall(result) is False
 
 
-def test_detect_returns_false_without_completed_nav() -> None:
+def test_detect_matches_nav_only_failure_with_template_reason() -> None:
     result = {
         "ok": False,
         "data": {
             "blocks": [
-                {"block_type": "goto_url", "status": "failed"},
-                {"block_type": "extraction", "status": "failed", "failure_reason": _SCRAPE_WALL_REASON},
+                {
+                    "block_type": "NAVIGATION",
+                    "status": "failed",
+                    "failure_reason": _SCRAPE_WALL_REASON,
+                },
+            ]
+        },
+    }
+    assert _detect_probable_site_block_wall(result) is True
+
+
+def test_detect_returns_false_when_non_retriable_nav() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "blocks": [
+                {
+                    "block_type": "GOTO_URL",
+                    "status": "failed",
+                    "failure_reason": (
+                        "Failed to navigate to url https://x.invalid. Error message: net::ERR_NAME_NOT_RESOLVED"
+                    ),
+                },
+                {
+                    "block_type": "EXTRACTION",
+                    "status": "failed",
+                    "failure_reason": _SCRAPE_WALL_REASON,
+                },
             ]
         },
     }
@@ -109,9 +131,9 @@ def test_detect_returns_false_for_other_failure_reasons() -> None:
         "ok": False,
         "data": {
             "blocks": [
-                {"block_type": "goto_url", "status": "completed"},
+                {"block_type": "GOTO_URL", "status": "completed"},
                 {
-                    "block_type": "extraction",
+                    "block_type": "EXTRACTION",
                     "status": "failed",
                     "failure_reason": "Timeout waiting for selector #submit",
                 },
@@ -140,6 +162,28 @@ def test_streak_increments_on_consecutive_scrape_walls() -> None:
     assert ctx.probable_site_block_streak_count == 2
 
 
+def test_streak_holds_through_intermediate_nav_only_template_failure() -> None:
+    ctx = _fresh_context()
+    _record_run_blocks_result(ctx, _scrape_wall_result())
+    assert ctx.probable_site_block_streak_count == 1
+    nav_only_template_failure = {
+        "ok": False,
+        "data": {
+            "blocks": [
+                {
+                    "block_type": "NAVIGATION",
+                    "status": "failed",
+                    "failure_reason": _SCRAPE_WALL_REASON,
+                },
+            ]
+        },
+    }
+    _record_run_blocks_result(ctx, nav_only_template_failure)
+    assert ctx.probable_site_block_streak_count == 2
+    _record_run_blocks_result(ctx, _scrape_wall_result())
+    assert ctx.probable_site_block_streak_count == 3
+
+
 def test_streak_resets_on_real_success() -> None:
     ctx = _fresh_context()
     _record_run_blocks_result(ctx, _scrape_wall_result())
@@ -149,7 +193,7 @@ def test_streak_resets_on_real_success() -> None:
         "data": {
             "blocks": [
                 {
-                    "block_type": "extraction",
+                    "block_type": "EXTRACTION",
                     "status": "completed",
                     "extracted_data": {"answer": "42"},
                 }
@@ -168,9 +212,9 @@ def test_streak_resets_on_failure_without_pattern() -> None:
         "ok": False,
         "data": {
             "blocks": [
-                {"block_type": "goto_url", "status": "completed"},
+                {"block_type": "GOTO_URL", "status": "completed"},
                 {
-                    "block_type": "extraction",
+                    "block_type": "EXTRACTION",
                     "status": "failed",
                     "failure_reason": "Timeout waiting for selector #submit",
                 },
@@ -193,14 +237,14 @@ def test_streak_stays_zero_when_navigation_itself_failed() -> None:
         "data": {
             "blocks": [
                 {
-                    "block_type": "goto_url",
+                    "block_type": "GOTO_URL",
                     "status": "failed",
                     "failure_reason": (
                         "Failed to navigate to url https://x.invalid. Error message: net::ERR_NAME_NOT_RESOLVED"
                     ),
                 },
                 {
-                    "block_type": "extraction",
+                    "block_type": "EXTRACTION",
                     "status": "failed",
                     "failure_reason": _SCRAPE_WALL_REASON,
                 },
@@ -227,6 +271,27 @@ def test_gate_fires_at_stop_threshold() -> None:
     ctx = _fresh_context()
     ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
     assert _needs_probable_site_block_stop_nudge(ctx)
+
+
+def test_gate_does_not_fire_after_cap_reached() -> None:
+    ctx = _fresh_context()
+    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    ctx.probable_site_block_stop_nudge_count = MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
+    assert not _needs_probable_site_block_stop_nudge(ctx)
+
+
+def test_frontier_warn_defers_to_wall_when_both_apply() -> None:
+    ctx = _fresh_context()
+    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_ESCALATE_AT
+    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    assert _repeated_frontier_failure_nudge(ctx) is None
+
+
+def test_frontier_warn_still_fires_when_wall_below_threshold() -> None:
+    ctx = _fresh_context()
+    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_ESCALATE_AT
+    ctx.probable_site_block_streak_count = 1
+    assert _repeated_frontier_failure_nudge(ctx) is not None
 
 
 def test_nudge_text_is_stop_oriented() -> None:

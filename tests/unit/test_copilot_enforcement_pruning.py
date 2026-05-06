@@ -462,6 +462,8 @@ class TestEnforcement:
         ctx.explore_without_workflow_nudge_count = 0
         ctx.last_test_suspicious_success = False
         ctx.last_test_anti_bot = None
+        ctx.last_failure_category_top = None
+        ctx.per_tool_budget_nudge_count = 0
         for k, v in overrides.items():
             setattr(ctx, k, v)
         return ctx

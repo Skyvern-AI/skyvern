@@ -1,7 +1,15 @@
+from http import HTTPStatus
+
+import pytest
+
 from skyvern.exceptions import (
     SkyvernException,
+    SkyvernExtraNotInstalled,
+    SkyvernHTTPException,
     UnknownErrorWhileCreatingBrowserContext,
     get_user_facing_exception_message,
+    raise_server_extra_required,
+    require_server_extra_modules,
 )
 
 
@@ -33,6 +41,109 @@ def test_get_user_facing_exception_message_for_skyvern_exception() -> None:
 def test_get_user_facing_exception_message_for_generic_exception() -> None:
     message = get_user_facing_exception_message(ValueError("raw error"))
     assert message == "Unexpected error: raw error"
+
+
+def test_skyvern_http_exception_normalizes_status_code_to_plain_int() -> None:
+    error = SkyvernHTTPException("bad request", status_code=HTTPStatus.BAD_REQUEST)
+
+    assert error.status_code == 400
+    assert type(error.status_code) is int
+
+
+def test_raise_server_extra_required_translates_when_server_extra_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None,
+    )
+    missing = ModuleNotFoundError("No module named 'starlette_context'", name="starlette_context")
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+        raise_server_extra_required("skyvern.library.skyvern_browser", missing)
+
+
+def test_raise_server_extra_required_translates_missing_server_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "playwright" else object(),
+    )
+    missing = ModuleNotFoundError("No module named 'playwright'", name="playwright")
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+        raise_server_extra_required("skyvern.library.skyvern_browser", missing)
+
+
+def test_raise_server_extra_required_preserves_installed_marker_submodule_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.exceptions.find_spec", lambda module_name: object())
+    missing = ModuleNotFoundError("No module named 'playwright._impl._broken'", name="playwright._impl._broken")
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        raise_server_extra_required("skyvern.library.skyvern_browser", missing)
+
+    assert exc_info.value is missing
+
+
+def test_raise_server_extra_required_preserves_unknown_missing_dependency_when_server_extra_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "playwright" else object(),
+    )
+    missing = ModuleNotFoundError("No module named 'bogus_internal_dep'", name="bogus_internal_dep")
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        raise_server_extra_required("skyvern.services.script_service", missing)
+
+    assert exc_info.value is missing
+
+
+def test_raise_server_extra_required_preserves_missing_dependency_when_server_markers_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.exceptions.find_spec", lambda module_name: object())
+    missing = ModuleNotFoundError("No module named 'bogus_internal_dep'", name="bogus_internal_dep")
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        raise_server_extra_required("skyvern.services.script_service", missing)
+
+    assert exc_info.value is missing
+
+
+def test_raise_server_extra_required_preserves_internal_skyvern_import_failure_when_server_extra_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "playwright" else object(),
+    )
+    missing = ModuleNotFoundError("No module named 'skyvern.typo'", name="skyvern.typo")
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        raise_server_extra_required("skyvern.services.script_service", missing)
+
+    assert exc_info.value is missing
+
+
+def test_require_server_extra_modules_requires_server_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "sqlalchemy" else object(),
+    )
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+        require_server_extra_modules("skyvern.library.skyvern_browser_page")
+
+
+def test_require_server_extra_modules_catches_partial_server_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "jinja2" else object(),
+    )
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+        require_server_extra_modules("skyvern.library.skyvern_browser_page")
 
 
 def test_browser_connection_error_connect_over_cdp_websocket() -> None:
