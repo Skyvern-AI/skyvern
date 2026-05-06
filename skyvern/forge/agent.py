@@ -2042,19 +2042,31 @@ class ForgeAgent:
                 "display_width_px": settings.BROWSER_WIDTH,
             }
         ]
-        thinking = {"type": "enabled", "budget_tokens": 1024}
+        thinking: dict[str, Any]
+        output_config: dict[str, Any] | None
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(llm_caller.llm_config.model_name):
+            thinking = {"type": "adaptive"}
+            output_config = {"effort": LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT}
+        else:
+            thinking = {"type": "enabled", "budget_tokens": 1024}
+            output_config = None
         window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
+        call_kwargs: dict[str, Any] = {
+            "step": step,
+            "screenshots": scraped_page.screenshots,
+            "use_message_history": True,
+            "tools": tools,
+            "raw_response": True,
+            "betas": betas,
+            "thinking": thinking,
+            "window_dimension": window_dimension,
+        }
+        if output_config is not None:
+            call_kwargs["output_config"] = output_config
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                use_message_history=True,
-                tools=tools,
-                raw_response=True,
-                betas=betas,
-                thinking=thinking,
-                window_dimension=window_dimension,
+                **call_kwargs,
             )
         else:
             current_context = skyvern_context.ensure_context()
@@ -2071,14 +2083,7 @@ class ForgeAgent:
 
             llm_response = await llm_caller.call(
                 prompt=resp_content,
-                step=step,
-                screenshots=scraped_page.screenshots,
-                use_message_history=True,
-                tools=tools,
-                raw_response=True,
-                betas=betas,
-                thinking=thinking,
-                window_dimension=window_dimension,
+                **call_kwargs,
             )
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})

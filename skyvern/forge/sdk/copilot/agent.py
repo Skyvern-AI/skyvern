@@ -325,9 +325,26 @@ def _build_wip_exit_result(
     cancelled: bool = False,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
-    # ``last_test_ok=None`` covers both "test never ran" and "test ran with
-    # ambiguous output"; only the first case earns the carve-out (the REPLY
-    # path is more permissive because its reply text carries the context).
+    # When an unverified edit/run has overwritten ``last_workflow`` since the
+    # last verified shape, prefer the verified shape. ``unvalidated=True``
+    # triggers the route's rollback so auto-accept does not silently keep the
+    # failed/in-flight shape.
+    if (
+        ctx.last_good_workflow is not None
+        and ctx.last_good_workflow_yaml
+        and ctx.last_workflow is not ctx.last_good_workflow
+        and not ctx.last_test_suspicious_success
+    ):
+        return AgentResult(
+            user_response=tested_reply,
+            updated_workflow=ctx.last_good_workflow,
+            global_llm_context=global_llm_context,
+            workflow_yaml=ctx.last_good_workflow_yaml,
+            workflow_was_persisted=ctx.workflow_persisted,
+            total_tokens=ctx.total_tokens_used,
+            unvalidated=True,
+            cancelled=cancelled,
+        )
     if (
         ctx.last_workflow is not None
         and ctx.last_workflow_yaml
@@ -479,11 +496,24 @@ def _translate_to_agent_result(
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
 
+    # An unverified edit/run sits in ``last_workflow`` after a recorded
+    # failure — surface the verified prior shape and skip the failure rewrite
+    # (which would describe the failed-shape block count).
+    salvaged_reply = (
+        resp_type == "REPLY"
+        and ctx.last_good_workflow is not None
+        and ctx.last_good_workflow_yaml
+        and ctx.last_workflow is not ctx.last_good_workflow
+        and bool(ctx.last_failed_workflow_yaml or ctx.last_test_ok is False)
+        and not ctx.last_test_suspicious_success
+    )
+
     # ASK_QUESTION replies carry a specific clarifying question — often the
     # "stop and ask" unblocker the system prompt now requires when the agent
     # cannot test. The generic rewrite would replace it with a vague
-    # "Could you share more context", so skip it for ASK_QUESTION.
-    if resp_type != "ASK_QUESTION":
+    # "Could you share more context", so skip it for ASK_QUESTION (and for
+    # salvaged replies, which already describe the verified prefix).
+    if resp_type != "ASK_QUESTION" and not salvaged_reply:
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # Default-true preserves backwards-compat with stale prompts and missing fields.
@@ -494,6 +524,9 @@ def _translate_to_agent_result(
     unvalidated = False
     if verified_workflow is not None and not agent_admits_incomplete:
         last_workflow, last_workflow_yaml = verified_workflow, verified_yaml
+    elif salvaged_reply:
+        last_workflow, last_workflow_yaml = ctx.last_good_workflow, ctx.last_good_workflow_yaml
+        unvalidated = True
     elif resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml:
         # Failures are often environmental (captcha, transient block); surface the draft so the user can keep iterating.
         last_workflow = ctx.last_workflow
