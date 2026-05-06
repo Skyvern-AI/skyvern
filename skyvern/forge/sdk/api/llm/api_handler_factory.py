@@ -828,6 +828,9 @@ class LLMAPIHandlerFactory:
                     active_params = copy.deepcopy(litellm_params)
                     active_params.update(parameters)
                     active_params["cached_content"] = cache_name
+                    # Deployment-level timeout (flex tiers carry their own) wins; passing `timeout`
+                    # as an explicit kwarg as well would collide with this entry on unpacking.
+                    active_params.setdefault("timeout", settings.LLM_CONFIG_TIMEOUT)
                     request_model = active_params.pop("model", primary_model_dict.get("model_name", main_model_group))
 
                     # Clone messages to avoid modifying original list which is needed for fallback
@@ -858,7 +861,6 @@ class LLMAPIHandlerFactory:
                     response = await litellm.acompletion(
                         model=request_model,
                         messages=active_messages,
-                        timeout=settings.LLM_CONFIG_TIMEOUT,
                         drop_params=True,
                         **active_params,
                     )
@@ -1985,10 +1987,11 @@ class LLMCaller:
 
             t_llm_request = time.perf_counter()
             try:
+                # `timeout` may already live in active_parameters via litellm_params (flex configs
+                # carry their own); passing it explicitly too collides on kwarg unpacking.
                 response = await self._dispatch_llm_call(
                     messages=messages,
                     tools=tools,
-                    timeout=settings.LLM_CONFIG_TIMEOUT,
                     **active_parameters,
                 )
                 if use_message_history:
