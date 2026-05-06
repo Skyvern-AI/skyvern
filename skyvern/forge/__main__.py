@@ -4,6 +4,8 @@ from pathlib import Path
 
 import structlog
 from dotenv import load_dotenv
+from uvicorn.config import Config as _UvicornConfig
+from uvicorn.supervisors.watchfilesreload import FileFilter as _FileFilter
 
 from skyvern import analytics
 from skyvern.config import settings
@@ -26,9 +28,6 @@ def _build_reload_excludes() -> list[str]:
 
 
 def _verify_reload_excludes_cover_artifacts(reload_excludes: list[str]) -> None:
-    from uvicorn.config import Config as _UvicornConfig  # noqa: PLC0415
-    from uvicorn.supervisors.watchfilesreload import FileFilter as _FileFilter  # noqa: PLC0415
-
     # A miss lets watchfiles restart on artifact writes during long browser cleanups,
     # deadlocking the supervisor on Process.join.
     if not settings.ARTIFACT_STORAGE_PATH:
