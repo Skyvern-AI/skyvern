@@ -31,6 +31,8 @@ def _ctx(
     last_workflow_yaml: str | None,
     last_test_ok: bool | None,
     last_test_suspicious_success: bool = False,
+    last_good_workflow: object | None = None,
+    last_good_workflow_yaml: str | None = None,
 ) -> MagicMock:
     ctx = MagicMock()
     ctx.last_workflow = last_workflow
@@ -40,6 +42,8 @@ def _ctx(
     ctx.copilot_total_timeout_exceeded = False
     ctx.workflow_persisted = last_workflow is not None
     ctx.total_tokens_used = None
+    ctx.last_good_workflow = last_good_workflow
+    ctx.last_good_workflow_yaml = last_good_workflow_yaml
     return ctx
 
 

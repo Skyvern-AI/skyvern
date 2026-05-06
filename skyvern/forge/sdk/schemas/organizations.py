@@ -12,6 +12,7 @@ class Organization(BaseModel):
     organization_name: str
     webhook_callback_url: str | None = None
     max_steps_per_run: int | None = None
+    max_steps_per_workflow_run: int | None = None
     max_retries_per_step: int | None = None
     domain: str | None = None
     bw_organization_id: str | None = None
@@ -177,6 +178,16 @@ class GetOrganizationAPIKeysResponse(BaseModel):
 
 class OrganizationUpdate(BaseModel):
     max_steps_per_run: int | None = Field(default=None, ge=1)
+    max_steps_per_workflow_run: int | None = Field(default=None, ge=1)
+    clear_max_steps_per_workflow_run: bool = Field(
+        False,
+        description=(
+            "When true, resets ``max_steps_per_workflow_run`` to NULL — there will be no "
+            "run-level cap, only the per-block ``max_steps_per_run`` ceiling. Mutually "
+            "exclusive with a non-null value in ``max_steps_per_workflow_run`` (the clear "
+            "flag wins)."
+        ),
+    )
     # 0 is a valid "disable retries" value — see ForgeAgent.execute_step.
     max_retries_per_step: int | None = Field(default=None, ge=0)
     webhook_callback_url: str | None = None

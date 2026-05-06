@@ -69,7 +69,6 @@ server = [
     "onepassword-sdk==0.4.0",
     "types-boto3[full]>=1.38.31,<2",
     "lark>=1.2.2,<2",
-    "selectolax>=0.4.7,<0.5",
     "libcst>=1.8.2,<2",
     "curlparser>=0.1.0,<0.2",
     "pandas>=2.3.1,<4",

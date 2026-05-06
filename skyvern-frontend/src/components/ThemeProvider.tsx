@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Theme, ThemeProviderContext } from "./themeProviderContext";
 
+const THEME_STORAGE_KEY = "skyvern-theme";
+
 export type ThemeProviderProps = {
   children: React.ReactNode;
   defaultTheme?: Theme;
@@ -11,7 +13,10 @@ export function ThemeProvider({
   defaultTheme = "system",
   ...props
 }: ThemeProviderProps) {
-  const [theme, setTheme] = useState<Theme>(defaultTheme);
+  const [theme, setTheme] = useState<Theme>(
+    () =>
+      (localStorage.getItem(THEME_STORAGE_KEY) as Theme | null) ?? defaultTheme,
+  );
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -33,6 +38,7 @@ export function ThemeProvider({
   const value = {
     theme,
     setTheme: (theme: Theme) => {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
       setTheme(theme);
     },
   };
