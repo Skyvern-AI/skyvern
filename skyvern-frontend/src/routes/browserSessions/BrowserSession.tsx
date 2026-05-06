@@ -28,10 +28,11 @@ import { browserStreamingMode } from "@/util/env";
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
+import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
 
 const isCdpMode = browserStreamingMode === "cdp";
 
-type TabName = "stream" | "recordings" | "downloads";
+type TabName = "stream" | "recordings" | "downloads" | "runs";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
@@ -40,7 +41,9 @@ function BrowserSession() {
     ? "recordings"
     : location.pathname.endsWith("/downloads")
       ? "downloads"
-      : "stream";
+      : location.pathname.endsWith("/runs")
+        ? "runs"
+        : "stream";
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [vncFailed, setVncFailed] = useState(false);
 
@@ -148,6 +151,7 @@ function BrowserSession() {
               { label: "Stream", to: "stream" },
               { label: "Recordings", to: "recordings" },
               { label: "Downloads", to: "downloads" },
+              { label: "Runs", to: "runs" },
             ]}
           />
 
@@ -235,6 +239,15 @@ function BrowserSession() {
             }}
           >
             <BrowserSessionDownloads />
+          </div>
+          <div
+            className="absolute left-0 top-0 h-full w-full overflow-auto p-1"
+            style={{
+              visibility: activeTab === "runs" ? "visible" : "hidden",
+              pointerEvents: activeTab === "runs" ? "auto" : "none",
+            }}
+          >
+            <BrowserSessionWorkflowRuns />
           </div>
         </div>
       </div>
