@@ -1,3 +1,8 @@
+"""FastAPI application factory for server installs."""
+
+# The server-extra guard must run before FastAPI/Starlette imports.
+# ruff: noqa: E402
+
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -5,11 +10,16 @@ from datetime import datetime
 from typing import Any, AsyncGenerator, Awaitable, Callable
 
 import structlog
+from pydantic import ValidationError
+
+from skyvern.exceptions import require_server_extra_modules
+
+require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
+
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
