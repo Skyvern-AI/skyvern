@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Lock the --input / --ring CSS-var contract that the Input component, the
 // shadcn dialog/popover/select primitives, and any future ring-using
@@ -12,12 +13,19 @@ import { resolve } from "node:path";
 // :root and .dark prevents a regression where one entrypoint silently
 // drops a token that another entrypoint still ships.
 
-const REPO_ROOT = resolve(__dirname, "../../../..");
-const CSS_FILES = [
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(HERE, "../../../..");
+// Multi-entrypoint layout (cloud / eval / src) exists in the cloud monorepo;
+// the OSS repo syncs only src/. Filter to whatever exists so the contract
+// holds in both contexts without per-repo divergence.
+const ALL_CSS_FILES = [
   "skyvern-frontend/src/index.css",
   "skyvern-frontend/cloud/index.css",
   "skyvern-frontend/eval/index.css",
 ];
+const CSS_FILES = ALL_CSS_FILES.filter((f) =>
+  existsSync(resolve(REPO_ROOT, f)),
+);
 
 function load(file: string): string {
   return readFileSync(resolve(REPO_ROOT, file), "utf-8");
