@@ -208,6 +208,7 @@ export type OrganizationApiResponse = {
   // Optional because the field is added in a backend image rollout; until
   // every API host has the new schema this property may be absent from the
   // response payload.
+  max_steps_per_workflow_run?: number | null;
   artifact_url_expiry_seconds?: number | null;
   organization_id: string;
   organization_name: string;
