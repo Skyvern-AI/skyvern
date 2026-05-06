@@ -685,12 +685,17 @@ class WorkflowService:
                 value[i] = await self._refresh_output_urls(item, organization_id, workflow_run_id)
         return value
 
-    async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
-        credential = await app.DATABASE.credentials.get_credential(
-            credential_id, organization_id=organization.organization_id
+    async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> None:
+        if not credential_ids:
+            return
+        unique_ids = list(dict.fromkeys(credential_ids))
+        existing = await app.DATABASE.credentials.get_credentials_by_ids(
+            unique_ids, organization_id=organization.organization_id
         )
-        if credential is None:
-            raise InvalidCredentialId(credential_id)
+        found = {credential.credential_id for credential in existing}
+        missing = [credential_id for credential_id in unique_ids if credential_id not in found]
+        if missing:
+            raise InvalidCredentialId(", ".join(missing))
 
     async def validate_schedule_parameters(
         self,
@@ -717,6 +722,7 @@ class WorkflowService:
             )
 
         missing_parameters: list[str] = []
+        credential_ids_to_validate: list[str] = []
         for workflow_parameter in schedule_parameters:
             if workflow_parameter.key in request_data:
                 request_value = request_data[workflow_parameter.key]
@@ -730,14 +736,14 @@ class WorkflowService:
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     if not isinstance(request_value, str):
                         raise InvalidCredentialId(f"Credential ID must be a string, got {type(request_value).__name__}")
-                    await self._validate_credential_id(request_value, organization)
+                    credential_ids_to_validate.append(request_value)
             elif workflow_parameter.default_value is not None:
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     if not isinstance(workflow_parameter.default_value, str):
                         raise InvalidCredentialId(
                             f"Credential ID must be a string, got {type(workflow_parameter.default_value).__name__}"
                         )
-                    await self._validate_credential_id(workflow_parameter.default_value, organization)
+                    credential_ids_to_validate.append(workflow_parameter.default_value)
             else:
                 missing_parameters.append(workflow_parameter.key)
 
@@ -748,6 +754,8 @@ class WorkflowService:
                     f"Missing schedule parameters for workflow {workflow.workflow_permanent_id}: {missing_keys_str}"
                 )
             )
+
+        await self._validate_credential_ids(credential_ids_to_validate, organization)
 
     async def setup_workflow_run(
         self,
@@ -911,7 +919,6 @@ class WorkflowService:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         if not isinstance(request_body_value, str):
                             raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
-                        await self._validate_credential_id(request_body_value, organization)
                     workflow_parameter_values.append((workflow_parameter, request_body_value))
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
@@ -919,7 +926,6 @@ class WorkflowService:
                             raise InvalidCredentialId(
                                 f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
                             )
-                        await self._validate_credential_id(workflow_parameter.default_value, organization)
                     workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
                 else:
                     missing_parameters.append(workflow_parameter.key)
@@ -931,6 +937,15 @@ class WorkflowService:
                     workflow_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+            await self._validate_credential_ids(
+                [
+                    value
+                    for (workflow_parameter, value) in workflow_parameter_values
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                ],
+                organization,
+            )
 
             if workflow_parameter_values:
                 try:
