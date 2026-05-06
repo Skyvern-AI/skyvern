@@ -57,6 +57,99 @@ def stub_logger(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, An
     return logged
 
 
+def _install_genai_prices_stub(monkeypatch: pytest.MonkeyPatch, calc_price: Any) -> list[Any]:
+    usages: list[Any] = []
+
+    class FakeUsage:
+        def __init__(
+            self,
+            *,
+            input_tokens: int,
+            output_tokens: int,
+            cache_read_tokens: int | None = None,
+        ) -> None:
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+            self.cache_read_tokens = cache_read_tokens
+            usages.append(self)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "genai_prices",
+        SimpleNamespace(Usage=FakeUsage, calc_price=calc_price),
+    )
+    return usages
+
+
+def test_attach_cost_attr_uses_emitted_model_ref_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_calc_price(usage: Any, *, model_ref: str, provider_id: str | None = None) -> Any:
+        calls.append({"usage": usage, "model_ref": model_ref, "provider_id": provider_id})
+        return SimpleNamespace(total_price=0.123)
+
+    _install_genai_prices_stub(monkeypatch, fake_calc_price)
+
+    attrs: dict[str, Any] = {}
+    usage = SimpleNamespace(input_tokens=10, output_tokens=20)
+    tracing_setup._attach_cost_attr(attrs, usage, "gpt-5.5")
+
+    assert attrs["operation.cost"] == 0.123
+    assert len(calls) == 1
+    assert calls[0]["model_ref"] == "gpt-5.5"
+    assert calls[0]["provider_id"] is None
+
+
+def test_attach_cost_attr_uses_litellm_prefix_as_provider_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_calc_price(usage: Any, *, model_ref: str, provider_id: str | None = None) -> Any:
+        calls.append({"usage": usage, "model_ref": model_ref, "provider_id": provider_id})
+        if provider_id is None:
+            raise LookupError(f"unknown {model_ref}")
+        return SimpleNamespace(total_price=0.456)
+
+    usages = _install_genai_prices_stub(monkeypatch, fake_calc_price)
+
+    attrs: dict[str, Any] = {}
+    usage = SimpleNamespace(
+        input_tokens=384702,
+        output_tokens=4666,
+        input_tokens_details=SimpleNamespace(cached_tokens=123),
+    )
+    tracing_setup._attach_cost_attr(attrs, usage, "anthropic/claude-opus-4-7")
+
+    assert attrs["operation.cost"] == 0.456
+    assert calls == [
+        {"usage": usages[0], "model_ref": "anthropic/claude-opus-4-7", "provider_id": None},
+        {"usage": usages[0], "model_ref": "claude-opus-4-7", "provider_id": "anthropic"},
+    ]
+    assert usages[0].cache_read_tokens == 123
+
+
+def test_attach_cost_attr_silently_skips_unknown_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_calc_price(usage: Any, *, model_ref: str, provider_id: str | None = None) -> Any:
+        calls.append({"usage": usage, "model_ref": model_ref, "provider_id": provider_id})
+        raise LookupError(f"unknown {provider_id}/{model_ref}")
+
+    _install_genai_prices_stub(monkeypatch, fake_calc_price)
+
+    attrs: dict[str, Any] = {}
+    usage = SimpleNamespace(input_tokens=10, output_tokens=20)
+    tracing_setup._attach_cost_attr(attrs, usage, "unknown/model")
+
+    assert "operation.cost" not in attrs
+    assert len(calls) == 2
+    assert calls[0]["model_ref"] == "unknown/model"
+    assert calls[0]["provider_id"] is None
+    assert calls[1]["model_ref"] == "model"
+    assert calls[1]["provider_id"] == "unknown"
+
+
 def test_disabled_path(agents_stub: tuple[list[bool], list[Any]]) -> None:
     disabled_calls, processors_calls = agents_stub
 
