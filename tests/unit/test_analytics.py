@@ -6,6 +6,17 @@ from unittest.mock import Mock, patch
 from skyvern import analytics
 
 
+class FakePosthog:
+    def __init__(self, api_key: str, **_: object) -> None:
+        self.api_key = api_key
+
+    def join(self) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+
 def test_capture_includes_dynamic_test_id() -> None:
     original_test_id = analytics.settings.ANALYTICS_TEST_ID
     analytics.settings.ANALYTICS_TEST_ID = "smoke-test-123"
@@ -33,8 +44,10 @@ def test_reconfigure_posthog_client_uses_project_settings() -> None:
     analytics.settings.POSTHOG_PROJECT_HOST = "https://app.posthog.com"
 
     try:
-        analytics.reconfigure_posthog_client()
-        assert analytics.posthog.api_key == "phc_test_project_key"
+        with patch.object(analytics, "_load_posthog_class", return_value=FakePosthog):
+            analytics.reconfigure_posthog_client()
+            assert analytics.posthog is not None
+            assert analytics.posthog.api_key == "phc_test_project_key"
     finally:
         analytics.settings.POSTHOG_PROJECT_API_KEY = original_api_key
         analytics.settings.POSTHOG_PROJECT_HOST = original_host
