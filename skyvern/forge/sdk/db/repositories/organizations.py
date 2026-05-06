@@ -153,6 +153,8 @@ class OrganizationsRepository(BaseRepository):
         organization_name: str | None = None,
         webhook_callback_url: str | None = None,
         max_steps_per_run: int | None = None,
+        max_steps_per_workflow_run: int | None = None,
+        clear_max_steps_per_workflow_run: bool = False,
         max_retries_per_step: int | None = None,
         artifact_url_expiry_seconds: int | None = None,
         clear_artifact_url_expiry_seconds: bool = False,
@@ -170,6 +172,10 @@ class OrganizationsRepository(BaseRepository):
                 organization.webhook_callback_url = webhook_callback_url
             if max_steps_per_run is not None:
                 organization.max_steps_per_run = max_steps_per_run
+            if clear_max_steps_per_workflow_run:
+                organization.max_steps_per_workflow_run = None
+            elif max_steps_per_workflow_run is not None:
+                organization.max_steps_per_workflow_run = max_steps_per_workflow_run
             if max_retries_per_step is not None:
                 organization.max_retries_per_step = max_retries_per_step
             # ``clear_*`` decouples "don't update" (None) from "explicitly clear":

@@ -281,7 +281,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
           {typeof maxStepsPerRun === "number" ? (
             <div className="flex gap-16">
               <div className="w-80">
-                <h1 className="text-lg">Max Steps Per Run</h1>
+                <h1 className="text-lg">Max Steps Per Block</h1>
               </div>
               <Input value={maxStepsPerRun.toString()} readOnly />
             </div>

@@ -182,6 +182,160 @@ async def test_setup_workflow_run_raises_on_non_string_credential_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_setup_workflow_run_batches_credential_validation() -> None:
+    """N credential parameters should issue a single get_credentials_by_ids call, not N get_credential calls."""
+    cred_params = [
+        _make_workflow_parameter(
+            f"cred_param_{i}",
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            default_value=f"cred_id_{i}",
+        )
+        for i in range(3)
+    ]
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=cred_params)
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
+            return_value=[SimpleNamespace(credential_id=f"cred_id_{i}") for i in range(3)]
+        )
+        mock_app.DATABASE.credentials.get_credential = AsyncMock()
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_awaited_once()
+    args, kwargs = mock_app.DATABASE.credentials.get_credentials_by_ids.call_args
+    passed_ids = args[0] if args else kwargs["credential_ids"]
+    assert sorted(passed_ids) == ["cred_id_0", "cred_id_1", "cred_id_2"]
+    mock_app.DATABASE.credentials.get_credential.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_skips_credential_lookup_when_no_credentials() -> None:
+    """Workflows without credential params should not call get_credentials_by_ids at all."""
+    string_param = _make_workflow_parameter("name", default_value="value")
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[string_param])
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_raises_invalid_credential_when_missing() -> None:
+    """A single missing credential should raise InvalidCredentialId."""
+    cred_param = _make_workflow_parameter(
+        "credential",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        default_value="cred_missing",
+    )
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[cred_param])
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        with pytest.raises(InvalidCredentialId) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert "cred_missing" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_surfaces_all_missing_credentials() -> None:
+    """When multiple credentials are missing, the error should mention every missing id."""
+    cred_params = [
+        _make_workflow_parameter(
+            f"cred_param_{i}",
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            default_value=f"cred_id_{i}",
+        )
+        for i in range(3)
+    ]
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=cred_params)
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        # Only cred_id_0 exists; cred_id_1 and cred_id_2 are missing.
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
+            return_value=[SimpleNamespace(credential_id="cred_id_0")]
+        )
+
+        with pytest.raises(InvalidCredentialId) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    error_msg = str(exc_info.value)
+    assert "cred_id_1" in error_msg
+    assert "cred_id_2" in error_msg
+    assert "cred_id_0" not in error_msg
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
+    """Repeated credential ids across params should be deduped before the IN-query."""
+    cred_params = [
+        _make_workflow_parameter(
+            f"cred_param_{i}",
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            default_value="cred_shared",
+        )
+        for i in range(3)
+    ]
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=cred_params)
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
+            return_value=[SimpleNamespace(credential_id="cred_shared")]
+        )
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    args, kwargs = mock_app.DATABASE.credentials.get_credentials_by_ids.call_args
+    passed_ids = args[0] if args else kwargs["credential_ids"]
+    assert passed_ids == ["cred_shared"]
+
+
+@pytest.mark.asyncio
 async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_context() -> None:
     service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
 

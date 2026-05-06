@@ -1,25 +1,31 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import pathlib
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
 from dotenv import load_dotenv
-from playwright.async_api import Playwright, async_playwright
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.client.core import RequestOptions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
-from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
-from skyvern.library.skyvern_browser import SkyvernBrowser
-from skyvern.schemas.run_blocks import CredentialType
-from skyvern.schemas.runs import ProxyLocationInput, RunEngine, RunStatus, proxy_location_to_request
+from skyvern.schemas.credential_type import CredentialType
+from skyvern.schemas.proxy_location import ProxyLocationInput, proxy_location_to_request
+from skyvern.schemas.run_enums import RunEngine, RunStatus
 
 LOG = structlog.get_logger()
+
+if TYPE_CHECKING:
+    from playwright.async_api import Playwright
+
+    from skyvern.library.skyvern_browser import SkyvernBrowser
+    from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 
 def _get_browser_session_url(browser_session_id: str) -> str:
@@ -130,7 +136,7 @@ class Skyvern(AsyncSkyvern):
         llm_config: LLMRouterConfig | LLMConfig | None = None,
         settings: dict[str, Any] | None = None,
         use_in_memory_db: bool | None = None,
-    ) -> "Skyvern":
+    ) -> Skyvern:
         """Local/embedded mode: Run Skyvern locally in-process.
 
         Args:
@@ -171,7 +177,7 @@ class Skyvern(AsyncSkyvern):
                 Example 4 - Custom LLM with environment variables:
                     ```python
                     from skyvern import Skyvern
-                    from skyvern.forge.sdk.api.llm.models import LLMConfig
+                    from skyvern.schemas.llm import LLMConfig
 
                     # Assumes OPENAI_API_KEY is set in your environment
                     skyvern = Skyvern.local(
@@ -215,7 +221,13 @@ class Skyvern(AsyncSkyvern):
         """
         from dotenv import dotenv_values  # noqa: PLC0415
 
-        from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
+        try:
+            from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
+        except ImportError as exc:
+            from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+
+            raise_server_extra_required("Skyvern.local()", exc)
+
         from skyvern.utils.env_paths import resolve_backend_env_path  # noqa: PLC0415
 
         # Auto-detect mode when use_in_memory_db is not explicitly set.
@@ -463,6 +475,8 @@ class Skyvern(AsyncSkyvern):
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
 
+        from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
+
         playwright = await self._get_playwright()
 
         if user_data_dir:
@@ -496,6 +510,8 @@ class Skyvern(AsyncSkyvern):
         Returns:
             SkyvernBrowser: A browser instance connected to the existing browser.
         """
+        from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
+
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
@@ -619,6 +635,8 @@ class Skyvern(AsyncSkyvern):
         if browser_session.browser_address is None:
             raise ValueError(f"Browser address is missing for session {browser_session.browser_session_id}")
 
+        from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
+
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(
             browser_session.browser_address, headers={"x-api-key": self._api_key}
@@ -628,6 +646,15 @@ class Skyvern(AsyncSkyvern):
 
     async def _get_playwright(self) -> Playwright:
         if self._playwright is None:
+            from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+
+            # Cloud-API-only SDK users can instantiate Skyvern without server extras,
+            # so browser startup keeps its own extra hint at the Playwright boundary.
+            try:
+                from playwright.async_api import async_playwright  # noqa: PLC0415
+            except ImportError as exc:
+                raise_server_extra_required("Browser APIs", exc)
+
             self._playwright = await async_playwright().start()
         return self._playwright
 
