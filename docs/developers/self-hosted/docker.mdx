@@ -160,7 +160,7 @@ The `.env` file controls the Skyvern server. Here are the most important variabl
 
 `docker-compose.yml` uses TWO sources for service environment:
 
-1. **Inline `environment:` block** — compose-network values that depend on the docker network topology. Examples: `DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern` (the `postgres` hostname only resolves inside the compose network), `BROWSER_TYPE`, `ENABLE_CODE_BLOCK`.
+1. **Inline `environment:` block** — compose-network values that depend on the docker network topology. Examples: `DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern` (the `postgres` hostname only resolves inside the compose network), `BROWSER_TYPE`, `BROWSER_STREAMING_MODE`, `ENABLE_CODE_BLOCK`.
 
 2. **`env_file: .env`** — user secrets (LLM API keys, etc.).
 
@@ -193,6 +193,9 @@ LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 ```bash
 # Browser mode: chromium-headful (visible) or chromium-headless (no display)
 BROWSER_TYPE=chromium-headful
+
+# Browser livestreaming mode: cdp (default local screencast) or vnc
+BROWSER_STREAMING_MODE=cdp
 
 # Timeout for individual browser actions (milliseconds)
 BROWSER_ACTION_TIMEOUT_MS=5000

@@ -42,3 +42,24 @@ describe("getCredentialParam", () => {
     expect(params.get("token")).toBe("Bearer clerk token");
   });
 });
+
+describe("browserStreamingMode", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("preserves VNC behavior when no streaming mode is configured", async () => {
+    const { browserStreamingMode } = await loadEnv();
+
+    expect(browserStreamingMode).toBe("vnc");
+  });
+
+  it("uses the configured streaming mode when present", async () => {
+    vi.stubEnv("VITE_BROWSER_STREAMING_MODE", "CDP");
+
+    const { browserStreamingMode } = await loadEnv();
+
+    expect(browserStreamingMode).toBe("cdp");
+  });
+});

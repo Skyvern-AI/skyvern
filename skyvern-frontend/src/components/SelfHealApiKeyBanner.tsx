@@ -8,8 +8,12 @@ import {
   AuthStatusValue,
   useAuthDiagnostics,
 } from "@/hooks/useAuthDiagnostics";
+import { useAuthIssueStore } from "@/store/AuthIssueStore";
 
-type BannerStatus = Exclude<AuthStatusValue, "ok"> | "error";
+type BannerStatus =
+  | Exclude<AuthStatusValue, "ok">
+  | "request_auth_error"
+  | "error";
 
 function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
@@ -43,6 +47,12 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
         description:
           "The backend could not find the Skyvern-local organization. Regenerate the key to recreate it.",
       };
+    case "request_auth_error":
+      return {
+        title: "Skyvern API requests are unauthorized",
+        description:
+          "The backend rejected a UI request. This usually means the frontend API key, backend API key, and local Docker database are out of sync.",
+      };
     case "error":
     default:
       return {
@@ -55,6 +65,8 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
 
 function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
+  const authIssue = useAuthIssueStore((state) => state.issue);
+  const clearAuthIssue = useAuthIssueStore((state) => state.clearAuthIssue);
   const { toast } = useToast();
   const [isRepairing, setIsRepairing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -67,7 +79,9 @@ function SelfHealApiKeyBanner() {
     ? "error"
     : rawStatus && rawStatus !== "ok"
       ? rawStatus
-      : null;
+      : authIssue
+        ? "request_auth_error"
+        : null;
 
   if (!bannerStatus && !errorMessage) {
     if (isLoading) {
@@ -103,6 +117,7 @@ function SelfHealApiKeyBanner() {
       }
 
       setApiKeyHeader(apiKey);
+      clearAuthIssue();
 
       const fingerprintSuffix = fingerprint
         ? ` (fingerprint ${fingerprint})`
@@ -171,6 +186,20 @@ function SelfHealApiKeyBanner() {
               ) : null}
               {data?.next_step ? (
                 <p className="text-xs text-slate-300">{data.next_step}</p>
+              ) : null}
+              {authIssue ? (
+                <p className="text-xs text-slate-300">
+                  Last failed request: HTTP {authIssue.statusCode}
+                  {authIssue.path ? ` at ${authIssue.path}` : ""}
+                  {authIssue.detail ? ` (${authIssue.detail})` : ""}
+                </p>
+              ) : null}
+              {bannerStatus === "request_auth_error" ? (
+                <p className="text-yellow-300">
+                  Run <code>skyvern doctor --fix</code> from the cloned Skyvern
+                  directory, then restart Docker Compose if the command asks you
+                  to.
+                </p>
               ) : null}
               {isProductionBuild && (
                 <p className="text-yellow-300">

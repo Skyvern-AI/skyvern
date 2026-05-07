@@ -71,6 +71,12 @@ Connect to an existing Chrome instance running with remote debugging enabled. Us
 - Debugging with Chrome DevTools
 - Running automations on a browser with specific extensions
 
+<Note>
+For the simplest local setup, open `chrome://inspect/#remote-debugging` in
+Chrome and enable remote debugging for the current browser instance. Chrome
+should show `Server running at: 127.0.0.1:9222`.
+</Note>
+
 ---
 
 ## Setting up Use Your Own Chrome
@@ -134,12 +140,22 @@ If port 9222 is already in use (e.g., from a previous session), Skyvern will con
 
 CDP (Chrome DevTools Protocol) lets Skyvern control an external Chrome browser instead of launching its own.
 
-### Step 1: Start Chrome with remote debugging
+### Step 1: Enable Chrome remote debugging
+
+Open `chrome://inspect/#remote-debugging` in Chrome, then turn on
+**Allow remote debugging for this browser instance**. Chrome should show:
+
+```text
+Server running at: 127.0.0.1:9222
+```
+
+If your Chrome version does not show that page, start Chrome manually:
 
 <CodeGroup>
 ```bash macOS
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-port=9222 \
+  --remote-debugging-address=0.0.0.0 \
   --user-data-dir="$HOME/chrome-cdp-profile" \
   --no-first-run \
   --no-default-browser-check
@@ -148,6 +164,7 @@ CDP (Chrome DevTools Protocol) lets Skyvern control an external Chrome browser i
 ```powershell Windows
 "C:\Program Files\Google\Chrome\Application\chrome.exe" `
   --remote-debugging-port=9222 `
+  --remote-debugging-address=0.0.0.0 `
   --user-data-dir="C:\chrome-cdp-profile" `
   --no-first-run `
   --no-default-browser-check
@@ -156,6 +173,7 @@ CDP (Chrome DevTools Protocol) lets Skyvern control an external Chrome browser i
 ```bash Linux
 google-chrome \
   --remote-debugging-port=9222 \
+  --remote-debugging-address=0.0.0.0 \
   --user-data-dir="$HOME/chrome-cdp-profile" \
   --no-first-run \
   --no-default-browser-check
@@ -178,18 +196,35 @@ When running Skyvern in Docker:
 | macOS/Windows | `http://host.docker.internal:9222/` |
 | Linux | `http://172.17.0.1:9222/` |
 
+If Docker Desktop reaches Chrome but Chrome rejects the `host.docker.internal`
+host name, Skyvern retries with the Docker host gateway IPv4 address. You can
+also set `BROWSER_REMOTE_DEBUGGING_URL` directly to that IPv4 address.
+
 ### Step 3: Verify connection
 
-Test that Skyvern can reach Chrome:
+Test that Chrome is listening on port 9222:
 
 ```bash
 curl http://localhost:9222/json/version
 ```
 
-You should see Chrome's version information.
+```powershell Windows
+Invoke-RestMethod http://127.0.0.1:9222/json/version
+```
+
+You should see Chrome's version information and a `webSocketDebuggerUrl`.
+
+<Note>
+If `/json/version` does not return Chrome version information, keep Chrome's
+remote debugging page open and confirm it shows `Server running at:
+127.0.0.1:9222`.
+</Note>
 
 <Warning>
-CDP mode exposes Chrome to network access. Only use this in trusted environments and bind to localhost when possible.
+CDP mode exposes Chrome to network access. The examples use
+`--remote-debugging-address=0.0.0.0` so Docker can reach Chrome on the host.
+Only use this in trusted environments. If Skyvern runs on the same host outside
+Docker, bind to `127.0.0.1` instead.
 </Warning>
 
 ---
