@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -24,6 +25,9 @@ from rich.table import Table
 from skyvern.cli.console import console
 
 doctor_app = typer.Typer(help="Check Skyvern installation health.")
+
+GENERATED_CREDENTIALS_FILE = Path(".skyvern/credentials.toml")
+LEGACY_STREAMLIT_CREDENTIALS_FILE = Path(".streamlit/secrets.toml")
 
 
 @dataclass
@@ -460,9 +464,27 @@ def _check_llm_config() -> CheckResult:
     )
 
 
+def _read_credential_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    m = re.search(r'(?<![A-Za-z0-9_])cred\s*=\s*"([^"]*)"', path.read_text())
+    return m.group(1) if m else ""
+
+
+def _read_generated_credential() -> str:
+    return _read_credential_file(GENERATED_CREDENTIALS_FILE)
+
+
+def _read_legacy_streamlit_credential() -> str:
+    return _read_credential_file(LEGACY_STREAMLIT_CREDENTIALS_FILE)
+
+
 def _check_api_key_consistency() -> CheckResult:
-    """Check that API keys are consistent across backend .env, frontend .env, and secrets.toml."""
-    import re
+    """Check that local API keys are consistent.
+
+    Generated Docker credentials are only a fallback for compose startup; backend .env
+    remains the preferred source when present.
+    """
 
     from dotenv import dotenv_values
 
@@ -470,35 +492,34 @@ def _check_api_key_consistency() -> CheckResult:
 
     backend_env = resolve_backend_env_path()
     frontend_env = Path("skyvern-frontend/.env")
-    secrets_toml = Path(".streamlit/secrets.toml")
 
     backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
     frontend_raw = dotenv_values(frontend_env).get("VITE_SKYVERN_API_KEY", "") if frontend_env.exists() else ""
     frontend_key = "" if frontend_raw in ("", "YOUR_API_KEY") else frontend_raw
+    generated_key = _read_generated_credential()
+    legacy_key = _read_legacy_streamlit_credential()
 
-    secrets_key = ""
-    if secrets_toml.exists():
-        m = re.search(r'cred\s*=\s*"([^"]*)"', secrets_toml.read_text())
-        if m:
-            secrets_key = m.group(1)
-
-    canonical = secrets_key or backend_key
+    # Docker Compose can inject the generated credentials file into the UI
+    # without requiring VITE_SKYVERN_API_KEY in skyvern-frontend/.env.
+    # Legacy installs may only have the API key in the old compatibility file;
+    # treat it as a migration source.
+    canonical = backend_key or generated_key or legacy_key
     if not canonical:
         return CheckResult(
             name="API Key Consistency",
             status="warn",
-            detail="No API key found in backend .env or .streamlit/secrets.toml",
+            detail="No API key found in backend .env or generated credentials",
             hint="Run `skyvern init` or `skyvern quickstart` to generate an API key",
         )
 
     mismatches: list[str] = []
-    if backend_key and backend_key != canonical:
-        mismatches.append("backend .env differs from secrets.toml")
+    if not backend_key and not generated_key:
+        mismatches.append("SKYVERN_API_KEY not set in backend .env")
     if not frontend_env.exists():
         mismatches.append("skyvern-frontend/.env missing")
-    elif not frontend_key:
+    elif not frontend_key and not generated_key:
         mismatches.append("VITE_SKYVERN_API_KEY not set in frontend .env")
-    elif frontend_key != canonical:
+    elif frontend_key and frontend_key != canonical:
         mismatches.append("frontend .env differs from backend")
 
     if mismatches:
@@ -509,7 +530,51 @@ def _check_api_key_consistency() -> CheckResult:
             hint="Run `skyvern doctor --fix` to sync API keys",
         )
 
-    return CheckResult(name="API Key Consistency", status="ok", detail="Keys consistent across all config files")
+    return CheckResult(name="API Key Consistency", status="ok", detail="Backend and frontend API keys are consistent")
+
+
+def _check_legacy_streamlit_secrets() -> CheckResult:
+    if not LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
+        return CheckResult(name="Legacy Streamlit Secrets", status="ok", detail="not present")
+
+    from dotenv import dotenv_values
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    legacy_key = _read_legacy_streamlit_credential()
+
+    if not legacy_key:
+        return CheckResult(
+            name="Legacy Streamlit Secrets",
+            status="warn",
+            detail=".streamlit/secrets.toml exists but no cred value was found",
+            hint="Remove the file, or run `skyvern doctor --fix` to remove the deprecated file",
+        )
+
+    if not backend_key:
+        return CheckResult(
+            name="Legacy Streamlit Secrets",
+            status="warn",
+            detail=".streamlit/secrets.toml has a legacy API key but backend .env is missing SKYVERN_API_KEY",
+            hint="Run `skyvern doctor --fix` to migrate the key into .env and skyvern-frontend/.env",
+        )
+
+    if legacy_key != backend_key:
+        return CheckResult(
+            name="Legacy Streamlit Secrets",
+            status="warn",
+            detail=".streamlit/secrets.toml is deprecated and differs from backend .env",
+            hint="Run `skyvern doctor --fix` to remove the deprecated file",
+        )
+
+    return CheckResult(
+        name="Legacy Streamlit Secrets",
+        status="warn",
+        detail=".streamlit/secrets.toml matches backend .env; deprecated compatibility file only",
+        hint="Run `skyvern doctor --fix` to remove the deprecated file",
+    )
 
 
 def _redact_password(db_string: str) -> str:
@@ -576,6 +641,7 @@ _CHECKS = [
     _check_docker,
     _check_llm_config,
     _check_api_key_consistency,
+    _check_legacy_streamlit_secrets,
     _check_playwright_browser,
     _check_port_8000,
     _check_api_connectivity,
@@ -603,6 +669,8 @@ def _try_fix(result: CheckResult) -> bool:
         return _fix_install_playwright()
     if result.name == "API Key Consistency" and result.status == "error":
         return _fix_api_key_consistency()
+    if result.name == "Legacy Streamlit Secrets" and result.status == "warn":
+        return _fix_legacy_streamlit_secrets()
     if result.name == "Docker" and "not running" in result.detail:
         console.print("  [yellow]→ Please start Docker Desktop manually[/yellow]")
         return False
@@ -671,8 +739,6 @@ def _fix_start_postgres() -> bool:
 
 
 def _fix_api_key_consistency() -> bool:
-    import re
-
     from dotenv import dotenv_values, set_key
 
     from skyvern.utils.env_paths import resolve_backend_env_path
@@ -680,23 +746,22 @@ def _fix_api_key_consistency() -> bool:
     backend_env = resolve_backend_env_path()
     frontend_env = Path("skyvern-frontend/.env")
     frontend_example = Path("skyvern-frontend/.env.example")
-    secrets_toml = Path(".streamlit/secrets.toml")
 
     backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
-    secrets_key = ""
-    if secrets_toml.exists():
-        m = re.search(r'cred\s*=\s*"([^"]*)"', secrets_toml.read_text())
-        if m:
-            secrets_key = m.group(1)
+    generated_key = _read_generated_credential()
+    legacy_key = _read_legacy_streamlit_credential()
 
-    canonical = secrets_key or backend_key
+    canonical = backend_key or generated_key or legacy_key
     if not canonical:
         console.print("  [yellow]→ No source API key found to sync from[/yellow]")
         return False
 
-    if not frontend_env.exists() and frontend_example.exists():
-        import shutil
+    if not backend_env.exists():
+        backend_env.touch()
 
+    set_key(str(backend_env), "SKYVERN_API_KEY", canonical)
+
+    if not frontend_env.exists() and frontend_example.exists():
         shutil.copy(frontend_example, frontend_env)
         console.print("  [cyan]Created skyvern-frontend/.env from .env.example[/cyan]")
 
@@ -705,8 +770,51 @@ def _fix_api_key_consistency() -> bool:
         return False
 
     set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", canonical)
-    source = "secrets.toml" if secrets_key else "backend .env"
-    console.print(f"  [green]✅ Synced VITE_SKYVERN_API_KEY in skyvern-frontend/.env (from {source})[/green]")
+    source = (
+        "backend .env"
+        if backend_key
+        else ".skyvern/credentials.toml"
+        if generated_key
+        else "legacy .streamlit/secrets.toml"
+    )
+    console.print(f"  [green]✅ Synced local API key across backend and frontend (from {source})[/green]")
+    return True
+
+
+def _fix_legacy_streamlit_secrets() -> bool:
+    """Best-effort migration for old .streamlit/secrets.toml installs."""
+    from dotenv import dotenv_values, set_key
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    legacy_key = _read_legacy_streamlit_credential()
+
+    if not LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
+        return False
+
+    if not legacy_key:
+        console.print(
+            "  [yellow]→ Legacy .streamlit/secrets.toml has no cred value; leaving it for inspection[/yellow]"
+        )
+        return False
+
+    if not backend_key and legacy_key:
+        if not backend_env.exists():
+            backend_env.touch()
+        set_key(str(backend_env), "SKYVERN_API_KEY", legacy_key)
+        if not frontend_env.exists() and frontend_example.exists():
+            shutil.copy(frontend_example, frontend_env)
+        if frontend_env.exists():
+            set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", legacy_key)
+        console.print("  [green]✅ Migrated legacy .streamlit API key into .env files[/green]")
+
+    LEGACY_STREAMLIT_CREDENTIALS_FILE.unlink()
+    console.print("  [green]✅ Removed deprecated .streamlit/secrets.toml[/green]")
+
     return True
 
 

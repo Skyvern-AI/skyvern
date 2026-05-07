@@ -29,8 +29,8 @@ spec:
               mountPath: /data/videos
             - name: har
               mountPath: /data/har
-            - name: streamlit
-              mountPath: /app/.streamlit
+            - name: credentials
+              mountPath: /app/.skyvern
       volumes:
         - name: artifacts
           hostPath:
@@ -44,7 +44,7 @@ spec:
           hostPath:
             path: /data/har
             type: DirectoryOrCreate
-        - name: streamlit
+        - name: credentials
           hostPath:
-            path: /app/.streamlit
+            path: /app/.skyvern
             type: DirectoryOrCreate
