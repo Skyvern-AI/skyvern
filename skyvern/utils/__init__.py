@@ -39,16 +39,18 @@ def migrate_db() -> None:
     if not migrations_path.is_dir():
         raise RuntimeError(_MISSING_MIGRATIONS_MESSAGE)
 
+    # Keep these imports lazy: skyvern.config imports skyvern.utils.env_paths
+    # while this module is initializing, and analytics also depends on config.
+    import skyvern.config as skyvern_config
     from alembic import command
     from alembic.config import Config
-
-    # Import here to avoid circular import (config -> utils -> analytics -> config)
     from skyvern.analytics import capture_setup_error, capture_setup_event
     from skyvern.config import Settings, _ensure_sqlite_dir
     from skyvern.forge.sdk.settings_manager import SettingsManager
 
     # Reload settings so env vars set by setup_postgresql() are picked up.
     refreshed = Settings()
+    skyvern_config.settings = refreshed
     SettingsManager.set_settings(refreshed)
     _ensure_sqlite_dir(refreshed.DATABASE_STRING)
 
