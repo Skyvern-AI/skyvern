@@ -116,8 +116,8 @@ def _process_forloop_children(
                     existing_completed = str(existing.status) == "completed"
                     if b_completed and not existing_completed:
                         child_run_blocks_by_label[b.label] = b
-        elif b.block_type == BlockType.FOR_LOOP:
-            # Prefer the nested for-loop iteration that produced grandchildren.
+        elif b.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
+            # Prefer the nested loop iteration that produced grandchildren.
             # On ties, break by total deep-descendant action count so the
             # iteration with usable actions wins even at 3+ nesting levels.
             existing_children = children_by_parent.get(existing.workflow_run_block_id, [])
@@ -188,9 +188,9 @@ def _process_forloop_children(
                     forloop_label=forloop_run_block.label,
                 )
 
-        # Recursively process nested for-loops so their inner blocks
+        # Recursively process nested for / while loops so their inner blocks
         # also get task_id and actions merged (SKY-8757).
-        if child_run_block and child_run_block.block_type == BlockType.FOR_LOOP:
+        if child_run_block and child_run_block.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
             nested_forloop_count += 1
             inner_loop_blocks = loop_block_dump.get("loop_blocks", [])
             if inner_loop_blocks:
@@ -202,7 +202,7 @@ def _process_forloop_children(
                     actions_by_task_id=actions_by_task_id,
                     actions_by_task=actions_by_task,
                 )
-            # Always set run block metadata for the inner for-loop, even when
+            # Always set run block metadata for the inner loop block, even when
             # loop_blocks is empty. generate_script.py needs workflow_run_block_id
             # for script_block creation and label fallback derivation.
             loop_block_dump["workflow_run_block_id"] = child_run_block.workflow_run_block_id
@@ -383,7 +383,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                     task_v2_label=run_block.label,
                 )
 
-        if run_block.block_type == BlockType.FOR_LOOP:
+        if run_block.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
             final_dump["loop_blocks"] = _process_forloop_children(
                 forloop_run_block=run_block,
                 loop_blocks_def=final_dump.get("loop_blocks", []),

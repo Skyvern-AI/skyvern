@@ -173,6 +173,7 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.LOGIN,
     BlockType.FILE_DOWNLOAD,
     BlockType.FOR_LOOP,
+    BlockType.WHILE_LOOP,
 }
 
 

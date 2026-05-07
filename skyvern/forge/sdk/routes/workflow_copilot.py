@@ -50,6 +50,7 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import (
     BlockYAML,
     BranchConditionYAML,
@@ -67,6 +68,51 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_know
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
 
 LOG = structlog.get_logger()
+
+
+def _proxy_location_alias_key(value: str) -> str:
+    return "_".join(value.strip().upper().replace("-", "_").split())
+
+
+def _build_copilot_proxy_location_aliases() -> dict[str, str]:
+    aliases: dict[str, str] = {}
+
+    def add(alias: str, proxy_location: ProxyLocation) -> None:
+        aliases[_proxy_location_alias_key(alias)] = proxy_location.value
+
+    for proxy_location in ProxyLocation:
+        add(proxy_location.name, proxy_location)
+        add(proxy_location.value, proxy_location)
+
+    for proxy_location in ProxyLocation.residential_country_locations():
+        add(ProxyLocation.get_country_code(proxy_location), proxy_location)
+
+    add("USA", ProxyLocation.RESIDENTIAL)
+    add("United States", ProxyLocation.RESIDENTIAL)
+    add("United States of America", ProxyLocation.RESIDENTIAL)
+    add("RESIDENTIAL_US", ProxyLocation.RESIDENTIAL)
+    add("UK", ProxyLocation.RESIDENTIAL_GB)
+    add("United Kingdom", ProxyLocation.RESIDENTIAL_GB)
+
+    return aliases
+
+
+_COPILOT_PROXY_LOCATION_ALIASES = _build_copilot_proxy_location_aliases()
+
+
+def _canonicalize_copilot_proxy_location(parsed_yaml: dict[str, Any]) -> None:
+    if "proxy_location" not in parsed_yaml:
+        return
+
+    proxy_location = parsed_yaml.get("proxy_location")
+    if not isinstance(proxy_location, str):
+        return
+
+    canonical = _COPILOT_PROXY_LOCATION_ALIASES.get(_proxy_location_alias_key(proxy_location))
+    if canonical is None:
+        return
+
+    parsed_yaml["proxy_location"] = canonical
 
 
 async def _resolve_copilot_agent_handler(
@@ -968,6 +1014,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
     if isinstance(parsed_yaml, dict):
         # title is schema-required; coerce rather than force a self-healing round-trip.
         parsed_yaml.setdefault("title", "")
+        _canonicalize_copilot_proxy_location(parsed_yaml)
         workflow_definition = parsed_yaml.get("workflow_definition", None)
         if workflow_definition:
             blocks = workflow_definition.get("blocks", []) or []
