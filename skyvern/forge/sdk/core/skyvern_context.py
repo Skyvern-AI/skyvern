@@ -90,6 +90,8 @@ class SkyvernContext:
     ai_mode_override: str | None = None
     script_llm_call_count: int = 0
     last_classify_result: str | None = None
+    last_classify_meta: dict[str, Any] | None = None
+    current_step_actions: list[dict[str, Any]] | None = None
     skip_complete_verification: bool = False
 
     # magic link handling
