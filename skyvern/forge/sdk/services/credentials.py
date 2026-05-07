@@ -27,7 +27,6 @@ def parse_totp_secret(totp_secret: str) -> str:
     totp_secret_no_dashe = "".join(totp_secret.split("-"))
     totp_secret_no_whitespace = "".join(totp_secret_no_dashe.split())
     try:
-        # to verify if it's a valid TOTP secret
         pyotp.TOTP(totp_secret_no_whitespace).byte_secret()
         return totp_secret_no_whitespace
     except Exception:
@@ -40,8 +39,18 @@ def parse_totp_secret(totp_secret: str) -> str:
     except Exception:
         LOG.warning("Failed to parse TOTP secret key from URI format, going to extract secret by regex", exc_info=True)
         m = re.search(r"(?i)(?:^|[?&])secret=([^&#]+)", unquote(totp_secret_no_whitespace))
-        if m is None:
-            return totp_secret_no_whitespace
-        totp_secret = m.group(1)
-        totp_secret_no_whitespace = "".join(totp_secret.split())
+        if m is not None:
+            totp_secret = m.group(1)
+            totp_secret_no_whitespace = "".join(totp_secret.split())
+
+    # Final validation: ensure the result is valid base32
+    try:
+        pyotp.TOTP(totp_secret_no_whitespace).byte_secret()
         return totp_secret_no_whitespace
+    except Exception:
+        LOG.error(
+            "Invalid TOTP secret, not valid base32, discarding",
+            totp_secret_preview=totp_secret_no_whitespace[:4] + "...",
+            exc_info=True,
+        )
+        return ""
