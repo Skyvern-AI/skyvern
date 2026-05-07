@@ -609,7 +609,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="The Bitwarden collection ID. You can find this in the URL when viewing a collection in Bitwarden (e.g., https://vault.bitwarden.com/#/organizations/.../collections/[COLLECTION_ID])." />
+                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports workflow parameters." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -621,7 +621,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="The Bitwarden item ID. You can find this in the URL when viewing the item in Bitwarden (e.g., https://vault.bitwarden.com/#/vault?itemId=[ITEM_ID])." />
+                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports workflow parameters." />
                 </div>
                 <Input
                   value={bitwardenLoginCredentialItemId}
@@ -641,7 +641,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Required. The Bitwarden collection ID containing the identity item. You can find this in the URL when viewing a collection in Bitwarden." />
+                  <HelpTooltip content="Collection containing the identity, such as {{ parameter_name }}." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -651,7 +651,7 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <div className="flex gap-2">
                   <Label className="text-xs text-slate-300">Identity Key</Label>
-                  <HelpTooltip content="The key used to identify which identity to use from Bitwarden (e.g., the identity name or a custom identifier)." />
+                  <HelpTooltip content="Identity name or identifier, such as {{ parameter_name }}." />
                 </div>
                 <Input
                   value={identityKey}
@@ -682,7 +682,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Required. The Bitwarden collection ID containing the credit card. You can find this in the URL when viewing a collection in Bitwarden." />
+                  <HelpTooltip content="Collection containing the credit card. Supports workflow parameters." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -694,7 +694,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Required. The Bitwarden item ID of the credit card. You can find this in the URL when viewing the item in Bitwarden." />
+                  <HelpTooltip content="Credit card item ID. Supports workflow parameters." />
                 </div>
                 <Input
                   value={sensitiveInformationItemId}
@@ -714,7 +714,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Vault ID
                   </Label>
-                  <HelpTooltip content="You can find the Vault ID in the URL when viewing the vault in 1Password on the web (e.g., https://my.1password.com/vaults/[VAULT_ID])." />
+                  <HelpTooltip content="Find this in the 1Password vault URL. Supports workflow parameters." />
                 </div>
                 <Input
                   value={opVaultId}
@@ -726,7 +726,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Item ID
                   </Label>
-                  <HelpTooltip content="You can find the Item ID in the URL when viewing the item in 1Password on the web. Supports all item types: Logins, Passwords, Credit Cards, Secure Notes, and more." />
+                  <HelpTooltip content="Find this in the 1Password item URL. Supports workflow parameters." />
                 </div>
                 <Input
                   value={opItemId}
