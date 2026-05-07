@@ -262,28 +262,11 @@ def quickstart(
     try:
         # Initialize Skyvern (pip install path)
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        run_local = init_env(no_postgres=no_postgres, database_string=database_string)
-
-        # Skip browser installation if requested
-        if not skip_browser_install:
-            with Progress(
-                SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
-            ) as progress:
-                progress.add_task("[bold blue]Installing Chromium browser...", total=None)
-                try:
-                    subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
-                    console.print("✅ [green]Chromium installation complete.[/green]")
-                    capture_setup_event("playwright-install-complete", success=True)
-                except subprocess.CalledProcessError as e:
-                    capture_setup_event(
-                        "playwright-install-fail",
-                        success=False,
-                        error_type="playwright_install_error",
-                        error_message=e.stderr.strip() if e.stderr else str(e),
-                    )
-                    console.print(f"[yellow]Warning: Failed to install Chromium: {e.stderr}[/yellow]")
-        else:
-            console.print("⏭️ [yellow]Skipping Chromium installation as requested.[/yellow]")
+        run_local = init_env(
+            no_postgres=no_postgres,
+            database_string=database_string,
+            skip_browser_install=skip_browser_install,
+        )
 
         # Start services
         if run_local:
