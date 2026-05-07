@@ -41,6 +41,10 @@ npm install @skyvern/client
 ```
 </CodeGroup>
 
+<Info>
+`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are setting up a local Skyvern server, self-hosted instance, `Skyvern.local()`, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`. For full local setup with migrations and the web UI, use Docker Compose or a source checkout.
+</Info>
+
 <Accordion title="Troubleshooting: Python version errors">
 The Skyvern SDK requires Python 3.11, 3.12, or 3.13. If you encounter version errors, try using pipx:
 
@@ -192,12 +196,13 @@ This is invaluable for debugging and understanding how Skyvern interprets your p
 You can run Skyvern with a browser on your own machine. This is useful for development, debugging, or automating internal tools on your local network.
 
 **Prerequisites:**
-- Skyvern SDK installed (`pip install skyvern`)
+- Skyvern server extra installed (`pip install "skyvern[server]"`)
+- Source checkout or Docker Compose for guided quickstart and database migrations
 - PostgreSQL database (local install or Docker)
 - An LLM API key (OpenAI, Anthropic, Azure OpenAI, Gemini, Ollama, or any OpenAI-compatible provider)
 
 <Note>
-Docker is optional. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically. Use `skyvern init --no-postgres` to skip database setup entirely if you're managing PostgreSQL separately.
+Docker is optional. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically. Use `skyvern init --no-postgres` to skip database setup entirely if you're managing PostgreSQL separately. The PyPI wheel installs the local-server dependencies, but guided quickstart currently needs repository migration files from a source checkout.
 </Note>
 
 ### Set up local Skyvern

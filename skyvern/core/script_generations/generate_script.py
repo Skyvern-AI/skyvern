@@ -13,7 +13,7 @@ import re
 import zlib
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import libcst as cst
 import structlog
@@ -2692,7 +2692,56 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     return for_loop
 
 
+def _while_loop_condition_expression(block: dict[str, Any]) -> str:
+    cond = block.get("condition")
+    if isinstance(cond, dict):
+        return str(cond.get("expression") or "")
+    return ""
+
+
+def _while_loop_condition_criteria_type(block: dict[str, Any]) -> str:
+    """Discriminator for while-loop condition; must match script_service.while_loop(replay)."""
+    cond = block.get("condition")
+    if isinstance(cond, dict):
+        ct = cond.get("criteria_type")
+        if ct is None or ct == "jinja2_template":
+            return "jinja2_template"
+        if ct == "prompt":
+            return "prompt"
+        raise ValueError(
+            f"while_loop codegen: unsupported condition criteria_type {ct!r} (expected 'jinja2_template' or 'prompt')"
+        )
+    return "jinja2_template"
+
+
+def _build_while_loop_statement(block_title: str, block: dict[str, Any]) -> cst.For:
+    """Build `async for ... in skyvern.while_loop(condition=..., criteria_type=..., label=...):`."""
+    loop_blocks = block.get("loop_blocks", [])
+    body_statements = [_build_block_statement(loop_block) for loop_block in loop_blocks]
+    condition_expr = _while_loop_condition_expression(block)
+    criteria_type = _while_loop_condition_criteria_type(block)
+    while_call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("while_loop")),
+        args=[
+            cst.Arg(keyword=cst.Name("condition"), value=_value(condition_expr)),
+            cst.Arg(keyword=cst.Name("criteria_type"), value=_value(criteria_type)),
+            cst.Arg(keyword=cst.Name("label"), value=_value(block_title)),
+        ],
+    )
+    return cst.For(
+        target=cst.Name("current_value"),
+        iter=while_call,
+        body=cst.IndentedBlock(body=body_statements),
+        asynchronous=cst.Asynchronous(),
+        whitespace_after_for=cst.SimpleWhitespace(" "),
+        whitespace_before_in=cst.SimpleWhitespace(" "),
+        whitespace_after_in=cst.SimpleWhitespace(" "),
+        whitespace_before_colon=cst.SimpleWhitespace(""),
+    )
+
+
 _FOR_LOOP_CACHED_CODE_RE = re.compile(r"^async for\b.*\bin\s+skyvern\.loop\s*\(")
+_WHILE_LOOP_CACHED_CODE_RE = re.compile(r"^async for\b.*\bin\s+skyvern\.while_loop\s*\(")
 
 
 def _is_for_loop_cached_code(code: str) -> bool:
@@ -2708,6 +2757,20 @@ def _is_for_loop_cached_code(code: str) -> bool:
             continue
         return _FOR_LOOP_CACHED_CODE_RE.match(stripped) is not None
     return False
+
+
+def _is_while_loop_cached_code(code: str) -> bool:
+    """True if *code* is a bare `async for ... in skyvern.while_loop(...):` (module-invalid)."""
+    for line in code.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _WHILE_LOOP_CACHED_CODE_RE.match(stripped) is not None
+    return False
+
+
+def _is_inline_only_loop_cached_code(code: str) -> bool:
+    return _is_for_loop_cached_code(code) or _is_while_loop_cached_code(code)
 
 
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
@@ -2921,6 +2984,8 @@ def _build_block_statement(
         stmt = _build_wait_statement(block)
     elif block_type == "for_loop":
         stmt = _build_for_loop_statement(block_title, block)
+    elif block_type == "while_loop":
+        stmt = _build_while_loop_statement(block_title, block)
     elif block_type == "goto_url":
         stmt = _build_goto_statement(block, data_variable_name)
     elif block_type == "code":
@@ -3320,203 +3385,210 @@ async def generate_workflow_script_python_code(
 
         append_block_code(block_code)
 
-    # Handle for_loop blocks
-    # ForLoop blocks need script_block entries with run_signature so they can be executed via cached scripts
-    for_loop_blocks = [block for block in blocks if block["block_type"] == "for_loop"]
-    for for_loop_block in for_loop_blocks:
-        for_loop_label = for_loop_block.get("label") or f"for_loop_{for_loop_block.get('workflow_run_block_id')}"
+    # Handle for_loop and while_loop blocks
+    _SCRIPT_LOOP_BUILDERS: list[tuple[str, Callable[[str, dict[str, Any]], cst.For]]] = [
+        ("for_loop", _build_for_loop_statement),
+        ("while_loop", _build_while_loop_statement),
+    ]
+    for sl_type, build_sl_stmt in _SCRIPT_LOOP_BUILDERS:
+        sl_typed_blocks = [block for block in blocks if block["block_type"] == sl_type]
+        sl_prefix = "for_loop" if sl_type == "for_loop" else "while_loop"
+        for sl_block in sl_typed_blocks:
+            sl_label = sl_block.get("label") or f"{sl_prefix}_{sl_block.get('workflow_run_block_id')}"
 
-        cached_source = cached_blocks.get(for_loop_label)
-        use_cached = cached_source is not None and for_loop_label not in updated_block_labels
+            cached_source = cached_blocks.get(sl_label)
+            use_cached = cached_source is not None and sl_label not in updated_block_labels
 
-        block_workflow_run_id = for_loop_block.get("workflow_run_id") or run_id
-        block_workflow_run_block_id = for_loop_block.get("workflow_run_block_id")
+            block_workflow_run_id = sl_block.get("workflow_run_id") or run_id
+            block_workflow_run_block_id = sl_block.get("workflow_run_block_id")
 
-        if use_cached:
-            assert cached_source is not None
-            block_code = cached_source.code
-            run_signature = cached_source.run_signature
-            block_workflow_run_id = cached_source.workflow_run_id
-            block_workflow_run_block_id = cached_source.workflow_run_block_id
-        else:
-            # Build the for loop statement
-            for_loop_stmt = _build_for_loop_statement(for_loop_label, for_loop_block)
-            temp_module = cst.Module(body=[for_loop_stmt])
-            block_code = temp_module.code
-            run_signature = block_code.strip()
-
-        if script_id and script_revision_id and organization_id:
-            ok = await create_or_update_script_block(
-                block_code=block_code,
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                block_label=for_loop_label,
-                update=pending,
-                run_signature=run_signature,
-                workflow_run_id=block_workflow_run_id,
-                workflow_run_block_id=block_workflow_run_block_id,
-                input_fields=None,
-            )
-            if ok:
-                blocks_created += 1
+            if use_cached:
+                assert cached_source is not None
+                block_code = cached_source.code
+                run_signature = cached_source.run_signature
+                block_workflow_run_id = cached_source.workflow_run_id
+                block_workflow_run_block_id = cached_source.workflow_run_block_id
             else:
-                blocks_failed += 1
+                sl_stmt = build_sl_stmt(sl_label, sl_block)
+                temp_module = cst.Module(body=[sl_stmt])
+                block_code = temp_module.code
+                run_signature = block_code.strip()
 
-        # NOTE: Do NOT call append_block_code() for for_loop blocks.
-        # Unlike task blocks (which produce function definitions valid at module level),
-        # for_loop blocks produce bare `async for` statements that cause SyntaxError
-        # at module level ("async for outside async function"). The for-loop code is
-        # already correctly inlined inside run_workflow() via _build_block_statement().
-
-        # Generate cached function bodies for for_loop inner blocks.
-        # Inner blocks (e.g. extraction inside a loop) are nested in loop_blocks and
-        # are NOT in the top-level blocks list, so they need separate processing here.
-        # This follows the same pattern as task_v2 child block handling (lines 2704-2714).
-        # Uses a BFS queue to recursively handle nested for-loops (SKY-8757).
-        # Each queue entry is (block_dict, parent_forloop_label) so cache
-        # invalidation propagates from the correct parent at any depth.
-        loop_block_queue: deque[tuple[dict[str, Any], str]] = deque(
-            (lb, for_loop_label) for lb in for_loop_block.get("loop_blocks", [])
-        )
-        while loop_block_queue:
-            loop_block, parent_fl_label = loop_block_queue.popleft()
-            loop_block_type = loop_block.get("block_type")
-
-            # block_type is a string here (from dict.get on model_dump output),
-            # not a BlockType enum — unlike transform_workflow_run.py which
-            # works with ORM objects. Both compare correctly to string literals.
-            #
-            # Nested for-loop: create script_block for the inner for-loop itself,
-            # then push its children onto the queue for processing.
-            # NOTE: Do NOT call append_block_code() for nested for_loop blocks
-            # (same as top-level for_loops) — they produce bare `async for`
-            # statements that cause SyntaxError at module level.
-            if loop_block_type == "for_loop":
-                nested_label = loop_block.get("label") or f"for_loop_{loop_block.get('workflow_run_block_id')}"
-
-                cached_nested = cached_blocks.get(nested_label)
-                # Force rebuild when the nested label OR its immediate parent
-                # for-loop is marked for regeneration (invalidation propagates
-                # down at every nesting depth, not just from the top-level).
-                use_nested_cached = (
-                    cached_nested is not None
-                    and nested_label not in updated_block_labels
-                    and parent_fl_label not in updated_block_labels
-                )
-
-                nested_wrbi = loop_block.get("workflow_run_block_id")
-                nested_wri = loop_block.get("workflow_run_id") or run_id
-
-                # use_nested_cached already guarantees cached_nested is not None;
-                # the explicit check is retained only for mypy type narrowing.
-                if (
-                    use_nested_cached
-                    and cached_nested is not None
-                    and cached_nested.code
-                    and cached_nested.run_signature
-                ):
-                    nested_code = cached_nested.code
-                    nested_sig = cached_nested.run_signature
-                    nested_wrbi = cached_nested.workflow_run_block_id
-                    nested_wri = cached_nested.workflow_run_id
-                else:
-                    # No usable cache entry (missing, incomplete, or needs update)
-                    # — rebuild from current run data. Mark this label as updated
-                    # so invalidation cascades to deeper descendants.
-                    updated_block_labels.add(nested_label)
-                    nested_stmt = _build_for_loop_statement(nested_label, loop_block)
-                    temp_mod = cst.Module(body=[nested_stmt])
-                    nested_code = temp_mod.code
-                    nested_sig = nested_code.strip()
-
-                if script_id and script_revision_id and organization_id:
-                    ok = await create_or_update_script_block(
-                        block_code=nested_code,
-                        script_revision_id=script_revision_id,
-                        script_id=script_id,
-                        organization_id=organization_id,
-                        block_label=nested_label,
-                        update=pending,
-                        run_signature=nested_sig,
-                        workflow_run_id=nested_wri,
-                        workflow_run_block_id=nested_wrbi,
-                        input_fields=None,
-                    )
-                    if ok:
-                        blocks_created += 1
-                    else:
-                        blocks_failed += 1
-
-                # Push nested for-loop's children with this loop as their parent
-                loop_block_queue.extend((child, nested_label) for child in loop_block.get("loop_blocks", []))
-                continue
-
-            if loop_block_type not in SCRIPT_TASK_BLOCKS:
-                continue
-
-            inner_label = (
-                loop_block.get("label") or loop_block.get("title") or f"block_{loop_block.get('workflow_run_block_id')}"
-            )
-
-            # Check if already cached (for progressive caching)
-            cached_inner = cached_blocks.get(inner_label)
-            use_inner_cached = cached_inner is not None and inner_label not in updated_block_labels
-
-            if use_inner_cached:
-                assert cached_inner is not None
-                inner_block_code = cached_inner.code
-                inner_run_signature = cached_inner.run_signature
-                inner_wrbi = cached_inner.workflow_run_block_id
-                inner_wri = cached_inner.workflow_run_id
-            else:
-                inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
-                if not inner_actions:
-                    # No actions from agent run = can't generate cached function.
-                    # No script_block row is created; the block will be cached on
-                    # a future run when actions become available. This is intentional
-                    # — generating a stub would produce broken code.
-                    continue
-
-                inner_fn_def = _build_block_fn(
-                    loop_block,
-                    inner_actions,
-                    value_to_param=value_to_param,
-                    use_semantic_selectors=use_semantic_selectors,
-                    is_in_for_loop=True,
-                    credential_param_keys=credential_param_keys,
-                )
-                inner_block_code = cst.Module(body=[inner_fn_def]).code
-
-                inner_stmt = _build_block_statement(loop_block, value_to_param=None)
-                inner_run_signature = cst.Module(body=[inner_stmt]).code.strip()
-
-                inner_wrbi = loop_block.get("workflow_run_block_id")
-                inner_wri = loop_block.get("workflow_run_id") or run_id
-
-            # Create script_block entry for preservation across regenerations
             if script_id and script_revision_id and organization_id:
-                inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
-                if not inner_input_fields and cached_inner and cached_inner.input_fields:
-                    inner_input_fields = cached_inner.input_fields
                 ok = await create_or_update_script_block(
-                    block_code=inner_block_code,
+                    block_code=block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
-                    block_label=inner_label,
+                    block_label=sl_label,
                     update=pending,
-                    run_signature=inner_run_signature,
-                    workflow_run_id=inner_wri,
-                    workflow_run_block_id=inner_wrbi,
-                    input_fields=inner_input_fields,
+                    run_signature=run_signature,
+                    workflow_run_id=block_workflow_run_id,
+                    workflow_run_block_id=block_workflow_run_block_id,
+                    input_fields=None,
                 )
                 if ok:
                     blocks_created += 1
                 else:
                     blocks_failed += 1
 
-            append_block_code(inner_block_code)
+            # NOTE: Do NOT call append_block_code() for for_loop / while_loop blocks.
+            # Unlike task blocks (which produce function definitions valid at module level),
+            # loop blocks produce bare `async for` statements that cause SyntaxError
+            # at module level ("async for outside async function"). Loop code is
+            # already correctly inlined inside run_workflow() via _build_block_statement().
+
+            # Generate cached function bodies for inner blocks nested in loop_blocks.
+            # Uses a BFS queue to recursively handle nested loops (SKY-8757).
+            loop_block_queue: deque[tuple[dict[str, Any], str]] = deque(
+                (lb, sl_label) for lb in sl_block.get("loop_blocks", [])
+            )
+            while loop_block_queue:
+                loop_block, parent_fl_label = loop_block_queue.popleft()
+                loop_block_type = loop_block.get("block_type")
+
+                # block_type is a string here (from dict.get on model_dump output),
+                # not a BlockType enum — unlike transform_workflow_run.py which
+                # works with ORM objects. Both compare correctly to string literals.
+                #
+                # Nested for-loop: create script_block for the inner for-loop itself,
+                # then push its children onto the queue for processing.
+                # NOTE: Do NOT call append_block_code() for nested for_loop blocks
+                # (same as top-level for_loops) — they produce bare `async for`
+                # statements that cause SyntaxError at module level.
+                if loop_block_type in ("for_loop", "while_loop"):
+                    nested_prefix = "for_loop" if loop_block_type == "for_loop" else "while_loop"
+                    nested_label = (
+                        loop_block.get("label") or f"{nested_prefix}_{loop_block.get('workflow_run_block_id')}"
+                    )
+                    nested_build: Callable[[str, dict[str, Any]], cst.For] = (
+                        _build_for_loop_statement if loop_block_type == "for_loop" else _build_while_loop_statement
+                    )
+
+                    cached_nested = cached_blocks.get(nested_label)
+                    # Force rebuild when the nested label OR its immediate parent
+                    # loop is marked for regeneration (invalidation propagates
+                    # down at every nesting depth, not just from the top-level).
+                    use_nested_cached = (
+                        cached_nested is not None
+                        and nested_label not in updated_block_labels
+                        and parent_fl_label not in updated_block_labels
+                    )
+
+                    nested_wrbi = loop_block.get("workflow_run_block_id")
+                    nested_wri = loop_block.get("workflow_run_id") or run_id
+
+                    # use_nested_cached already guarantees cached_nested is not None;
+                    # the explicit check is retained only for mypy type narrowing.
+                    if (
+                        use_nested_cached
+                        and cached_nested is not None
+                        and cached_nested.code
+                        and cached_nested.run_signature
+                    ):
+                        nested_code = cached_nested.code
+                        nested_sig = cached_nested.run_signature
+                        nested_wrbi = cached_nested.workflow_run_block_id
+                        nested_wri = cached_nested.workflow_run_id
+                    else:
+                        # No usable cache entry (missing, incomplete, or needs update)
+                        # — rebuild from current run data. Mark this label as updated
+                        # so invalidation cascades to deeper descendants.
+                        updated_block_labels.add(nested_label)
+                        nested_stmt = nested_build(nested_label, loop_block)
+                        temp_mod = cst.Module(body=[nested_stmt])
+                        nested_code = temp_mod.code
+                        nested_sig = nested_code.strip()
+
+                    if script_id and script_revision_id and organization_id:
+                        ok = await create_or_update_script_block(
+                            block_code=nested_code,
+                            script_revision_id=script_revision_id,
+                            script_id=script_id,
+                            organization_id=organization_id,
+                            block_label=nested_label,
+                            update=pending,
+                            run_signature=nested_sig,
+                            workflow_run_id=nested_wri,
+                            workflow_run_block_id=nested_wrbi,
+                            input_fields=None,
+                        )
+                        if ok:
+                            blocks_created += 1
+                        else:
+                            blocks_failed += 1
+
+                    # Push nested loop's children with this loop as their parent
+                    loop_block_queue.extend((child, nested_label) for child in loop_block.get("loop_blocks", []))
+                    continue
+
+                if loop_block_type not in SCRIPT_TASK_BLOCKS:
+                    continue
+
+                inner_label = (
+                    loop_block.get("label")
+                    or loop_block.get("title")
+                    or f"block_{loop_block.get('workflow_run_block_id')}"
+                )
+
+                # Check if already cached (for progressive caching)
+                cached_inner = cached_blocks.get(inner_label)
+                use_inner_cached = cached_inner is not None and inner_label not in updated_block_labels
+
+                if use_inner_cached:
+                    assert cached_inner is not None
+                    inner_block_code = cached_inner.code
+                    inner_run_signature = cached_inner.run_signature
+                    inner_wrbi = cached_inner.workflow_run_block_id
+                    inner_wri = cached_inner.workflow_run_id
+                else:
+                    inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
+                    if not inner_actions:
+                        # No actions from agent run = can't generate cached function.
+                        # No script_block row is created; the block will be cached on
+                        # a future run when actions become available. This is intentional
+                        # — generating a stub would produce broken code.
+                        continue
+
+                    inner_fn_def = _build_block_fn(
+                        loop_block,
+                        inner_actions,
+                        value_to_param=value_to_param,
+                        use_semantic_selectors=use_semantic_selectors,
+                        is_in_for_loop=True,
+                        credential_param_keys=credential_param_keys,
+                    )
+                    inner_block_code = cst.Module(body=[inner_fn_def]).code
+
+                    inner_stmt = _build_block_statement(loop_block, value_to_param=None)
+                    inner_run_signature = cst.Module(body=[inner_stmt]).code.strip()
+
+                    inner_wrbi = loop_block.get("workflow_run_block_id")
+                    inner_wri = loop_block.get("workflow_run_id") or run_id
+
+                # Create script_block entry for preservation across regenerations
+                if script_id and script_revision_id and organization_id:
+                    inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
+                    if not inner_input_fields and cached_inner and cached_inner.input_fields:
+                        inner_input_fields = cached_inner.input_fields
+                    ok = await create_or_update_script_block(
+                        block_code=inner_block_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=inner_label,
+                        update=pending,
+                        run_signature=inner_run_signature,
+                        workflow_run_id=inner_wri,
+                        workflow_run_block_id=inner_wrbi,
+                        input_fields=inner_input_fields,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
+
+                append_block_code(inner_block_code)
 
     # --- agent-required blocks (adaptive caching) -----------------------
     # Structural blocks (conditional, text_prompt, wait) can't be code-generated
@@ -3583,24 +3655,25 @@ async def generate_workflow_script_python_code(
     for task_v2 in task_v2_blocks:
         label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
         processed_labels.add(label)
-    for flb in for_loop_blocks:
-        label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
+    for slb in [b for b in blocks if b["block_type"] in ("for_loop", "while_loop")]:
+        slb_type = slb["block_type"]
+        label = slb.get("label") or (
+            f"for_loop_{slb.get('workflow_run_block_id')}"
+            if slb_type == "for_loop"
+            else f"while_loop_{slb.get('workflow_run_block_id')}"
+        )
         processed_labels.add(label)
-        # Recursively track all inner block labels (including nested for-loops)
-        # to prevent duplication in the "preserve unexecuted branch" section below.
-        # Use the same label derivation as the main code generation loop to ensure
-        # labels match (e.g., for_loop blocks without explicit labels get the
-        # "for_loop_{workflow_run_block_id}" fallback).
-        inner_queue: deque[dict[str, Any]] = deque(flb.get("loop_blocks", []))
+        inner_queue: deque[dict[str, Any]] = deque(slb.get("loop_blocks", []))
         while inner_queue:
             lb = inner_queue.popleft()
             lb_type = lb.get("block_type")
             if lb_type == "for_loop":
                 inner_lbl = lb.get("label") or f"for_loop_{lb.get('workflow_run_block_id')}"
                 inner_queue.extend(lb.get("loop_blocks", []))
+            elif lb_type == "while_loop":
+                inner_lbl = lb.get("label") or f"while_loop_{lb.get('workflow_run_block_id')}"
+                inner_queue.extend(lb.get("loop_blocks", []))
             else:
-                # Use the same 3-fallback chain as the main generation loop
-                # (label → title → block_{wrb_id}) so labels always match.
                 inner_lbl = lb.get("label") or lb.get("title") or f"block_{lb.get('workflow_run_block_id')}"
             if inner_lbl:
                 processed_labels.add(inner_lbl)
@@ -3640,7 +3713,7 @@ async def generate_workflow_script_python_code(
         # async run_workflow body via _build_block_statement — which only happens
         # for for_loops in the current run's `blocks`. Skip appending to main.py
         # for for_loop cached code from unexecuted branches to avoid the error.
-        if _is_for_loop_cached_code(cached_source.code):
+        if _is_inline_only_loop_cached_code(cached_source.code):
             continue
 
         append_block_code(cached_source.code)
@@ -3656,7 +3729,7 @@ async def generate_workflow_script_python_code(
                 if label not in processed_labels
                 and source.code
                 and source.run_signature
-                and not _is_for_loop_cached_code(source.code)
+                and not _is_inline_only_loop_cached_code(source.code)
             ],
         )
 

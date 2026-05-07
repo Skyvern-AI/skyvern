@@ -133,9 +133,9 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
         if template in template_data:
             return template_data[template]
 
-    # Inject for_loop metadata (current_value, current_index, current_item) so
-    # that cached function bodies inside for_loops can resolve {{ current_value }}
-    # in page.goto() and other template-rendered calls.
+    # Inject loop metadata from script `skyvern.loop()` / `skyvern.while_loop()`
+    # (current_value, current_index, current_item) so cached function bodies inside
+    # loops can resolve templates. while_loop yields null current_value; index is set.
     if context and context.loop_metadata:
         for key in ("current_value", "current_index", "current_item"):
             if key in context.loop_metadata:

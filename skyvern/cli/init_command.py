@@ -21,6 +21,7 @@ from .llm_setup import setup_llm_providers, update_or_add_env_var
 def init_env(
     no_postgres: bool = False,
     database_string: str = "",
+    skip_browser_install: bool = False,
 ) -> bool:
     """Interactive initialization command for Skyvern."""
     console.print(
@@ -172,24 +173,27 @@ def init_env(
             )
 
     if run_local:
-        console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
-        capture_setup_event("playwright-install-start")
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
-        ) as progress:
-            progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
-            try:
-                subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
-                capture_setup_event("playwright-install-complete", success=True)
-            except subprocess.CalledProcessError as e:
-                capture_setup_event(
-                    "playwright-install-fail",
-                    success=False,
-                    error_type="playwright_install_error",
-                    error_message=e.stderr.strip() if e.stderr else str(e),
-                )
-                raise
-        console.print("✅ [green]Chromium installation complete.[/green]")
+        if skip_browser_install:
+            console.print("⏭️ [yellow]Skipping Chromium installation as requested.[/yellow]")
+        else:
+            console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
+            capture_setup_event("playwright-install-start")
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
+            ) as progress:
+                progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
+                try:
+                    subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
+                    capture_setup_event("playwright-install-complete", success=True)
+                except subprocess.CalledProcessError as e:
+                    capture_setup_event(
+                        "playwright-install-fail",
+                        success=False,
+                        error_type="playwright_install_error",
+                        error_message=e.stderr.strip() if e.stderr else str(e),
+                    )
+                    raise
+            console.print("✅ [green]Chromium installation complete.[/green]")
 
         console.print("\n🎉 [bold green]Skyvern setup complete![/bold green]")
         capture_setup_event("init-complete", success=True, extra_data={"mode": "local"})

@@ -581,6 +581,7 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml,
         )
+        _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
         created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
 
@@ -1953,6 +1954,41 @@ def _record_banned_block_reject_span(source_tool: str, items: list[tuple[str, st
             "labels": [label for label, _ in items],
             "block_types": sorted({block_type for _, block_type in items}),
             "source_tool": source_tool,
+        },
+    ):
+        pass
+
+
+def _proxy_location_trace_value(proxy_location: Any) -> Any:
+    if proxy_location is None:
+        return None
+    if hasattr(proxy_location, "value"):
+        return proxy_location.value
+    if hasattr(proxy_location, "model_dump"):
+        return proxy_location.model_dump(mode="json")
+    return proxy_location
+
+
+def _raw_yaml_proxy_location(workflow_yaml: str) -> tuple[bool, Any]:
+    try:
+        parsed_yaml = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return False, None
+
+    if not isinstance(parsed_yaml, dict) or "proxy_location" not in parsed_yaml:
+        return False, None
+    return True, _proxy_location_trace_value(parsed_yaml.get("proxy_location"))
+
+
+def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:
+    input_present, input_proxy_location = _raw_yaml_proxy_location(workflow_yaml)
+    effective_proxy_location = _proxy_location_trace_value(workflow.proxy_location)
+    with copilot_span(
+        "workflow_proxy_location_normalized",
+        data={
+            "input_proxy_location_present": input_present,
+            "input_proxy_location": input_proxy_location,
+            "effective_proxy_location": effective_proxy_location,
         },
     ):
         pass

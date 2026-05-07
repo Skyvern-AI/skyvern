@@ -64,6 +64,7 @@ function WorkflowRun() {
   const isEmbedded = embed === "true";
   const active = searchParams.get("active");
   const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowPermanentIdParam = useFirstParam("workflowPermanentId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
@@ -77,7 +78,7 @@ function WorkflowRun() {
 
   const status = (error as AxiosError | undefined)?.response?.status;
   const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflow?.workflow_permanent_id;
+  const workflowPermanentId = workflowPermanentIdParam;
   const cacheKey = workflow?.cache_key ?? "";
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const isWorkflowDeleted = Boolean(workflow?.deleted_at);
