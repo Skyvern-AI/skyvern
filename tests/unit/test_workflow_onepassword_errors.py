@@ -31,14 +31,14 @@ def _make_context() -> WorkflowRunContext:
     )
 
 
-def _make_parameter() -> OnePasswordCredentialParameter:
+def _make_parameter(vault_id: str = "vault123", item_id: str = "item123") -> OnePasswordCredentialParameter:
     now = datetime.now(timezone.utc)
     return OnePasswordCredentialParameter(
         key="op_cred",
         onepassword_credential_parameter_id="opcp_test",
         workflow_id="wf-id",
-        vault_id="vault123",
-        item_id="item123",
+        vault_id=vault_id,
+        item_id=item_id,
         created_at=now,
         modified_at=now,
     )
@@ -146,6 +146,34 @@ async def test_onepassword_generic_error_falls_back_to_get_item_error(mocked_app
 
     assert "something weird happened" in exc_info.value.message
     assert "1Password" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_onepassword_error_includes_resolved_vault_and_item_ids(
+    mocked_app_database,
+    patched_settings_token,
+):
+    ctx = _make_context()
+    ctx.values["vault_param"] = "resolved-vault-id"
+    ctx.values["item_param"] = "resolved-item-id"
+
+    with patch(
+        "skyvern.forge.sdk.workflow.context_manager.OnePasswordClient.authenticate",
+        new_callable=AsyncMock,
+        side_effect=Exception("lookup failed"),
+    ):
+        with pytest.raises(OnePasswordGetItemError) as exc_info:
+            await ctx.register_onepassword_credential_parameter_value(
+                _make_parameter(vault_id="{{ vault_param }}", item_id="{{ item_param }}"),
+                _make_organization(),
+            )
+
+    message = exc_info.value.message
+    assert "vault_id=resolved-vault-id" in message
+    assert "item_id=resolved-item-id" in message
+    assert "{{ vault_param }}" not in message
+    assert "{{ item_param }}" not in message
+    assert "fake-token" not in message
 
 
 @pytest.mark.asyncio

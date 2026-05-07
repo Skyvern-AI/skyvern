@@ -367,3 +367,95 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.root_workflow_run_id == "wr_root"
     assert current_context.loop_internal_state == loop_state
     assert current_context.loop_internal_state is not loop_state
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_opens_one_outer_session() -> None:
+    """setup_workflow_run wraps its body in exactly one outer ``Session()`` context."""
+
+    params = [_make_workflow_parameter("k", default_value="v")]
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=params)
+
+    session_open_count = 0
+
+    class _Counter:
+        async def __aenter__(self) -> _Counter:
+            nonlocal session_open_count
+            session_open_count += 1
+            return self
+
+        async def __aexit__(self, *_a: object) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    request = WorkflowRequestBody(data={"k": "v"})
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.DATABASE.workflow_runs.Session = lambda: _Counter()
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert session_open_count == 1, (
+        f"Expected exactly one outer Session() open in setup_workflow_run, got {session_open_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_rolls_back_outer_session_on_batch_failure() -> None:
+    """When the batched parameter insert raises, the outer session must be rolled back
+    before the per-parameter fallback reuses it - otherwise the fallback runs on a
+    session whose transaction is in error state."""
+
+    params = [
+        _make_workflow_parameter("a", default_value="1"),
+        _make_workflow_parameter("b", default_value="2"),
+    ]
+    batch_error = IntegrityError("INSERT", {}, Exception("constraint failed"))
+
+    fallback_call_index: list[int] = []
+    rollback_index: list[int] = []
+    call_counter = {"n": 0}
+
+    async def _fallback_insert(*, workflow_run_id: str, workflow_parameter: WorkflowParameter, value: object) -> None:
+        call_counter["n"] += 1
+        fallback_call_index.append(call_counter["n"])
+
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=params,
+        batch_side_effect=batch_error,
+    )
+    service.create_workflow_run_parameter = AsyncMock(side_effect=_fallback_insert)  # type: ignore[method-assign]
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_a: object) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            call_counter["n"] += 1
+            rollback_index.append(call_counter["n"])
+
+    request = WorkflowRequestBody(data={"a": "1", "b": "2"})
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.DATABASE.workflow_runs.Session = lambda: _Session()
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert rollback_index, "Expected rollback() to be called on the outer session after batch failure"
+    assert fallback_call_index, "Expected the fallback path to run after rollback"
+    assert rollback_index[0] < fallback_call_index[0], (
+        f"rollback must precede fallback insert; got rollback at {rollback_index} fallback at {fallback_call_index}"
+    )

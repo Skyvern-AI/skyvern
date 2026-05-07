@@ -17,7 +17,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.tools import _detect_new_banned_blocks, _update_workflow
+from skyvern.forge.sdk.copilot.tools import (
+    _detect_new_banned_blocks,
+    _proxy_location_trace_value,
+    _raw_yaml_proxy_location,
+    _update_workflow,
+)
+from skyvern.schemas.runs import ProxyLocation
 
 
 def _yaml(*blocks: dict) -> str:
@@ -25,6 +31,19 @@ def _yaml(*blocks: dict) -> str:
         {"title": "wf", "workflow_definition": {"blocks": list(blocks)}},
         sort_keys=False,
     )
+
+
+def test_raw_yaml_proxy_location_reports_absent_value() -> None:
+    assert _raw_yaml_proxy_location(_yaml({"block_type": "navigation", "label": "n"})) == (False, None)
+
+
+def test_raw_yaml_proxy_location_reports_explicit_values() -> None:
+    assert _raw_yaml_proxy_location("title: wf\nproxy_location: US\n") == (True, "US")
+    assert _raw_yaml_proxy_location("title: wf\nproxy_location: null\n") == (True, None)
+
+
+def test_proxy_location_trace_value_serializes_enum_values() -> None:
+    assert _proxy_location_trace_value(ProxyLocation.RESIDENTIAL) == "RESIDENTIAL"
 
 
 # ---------- Flat shapes ----------
@@ -301,6 +320,7 @@ async def test_update_workflow_preserves_legacy_task_block_under_unchanged_label
 
     with (
         patch("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", return_value=fake_workflow),
+        patch("skyvern.forge.sdk.copilot.tools._record_workflow_proxy_location_span") as mock_proxy_span,
         patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
@@ -308,6 +328,7 @@ async def test_update_workflow_preserves_legacy_task_block_under_unchanged_label
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is True
+    mock_proxy_span.assert_called_once_with(submitted, fake_workflow)
     # The new YAML was accepted and assigned to ctx as the current workflow state.
     assert ctx.workflow_yaml == submitted
 

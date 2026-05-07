@@ -72,9 +72,9 @@ Connect to an existing Chrome instance running with remote debugging enabled. Us
 - Running automations on a browser with specific extensions
 
 <Note>
-For the simplest local setup, open `chrome://inspect/#remote-debugging` in
-Chrome and enable remote debugging for the current browser instance. Chrome
-should show `Server running at: 127.0.0.1:9222`.
+Docker Compose self-host installs default `BROWSER_STREAMING_MODE` to `cdp`.
+Existing installs that already set this variable in `.env` keep their value.
+To opt out of CDP livestreaming, set `BROWSER_STREAMING_MODE=vnc` in `.env`.
 </Note>
 
 ---
@@ -142,14 +142,8 @@ CDP (Chrome DevTools Protocol) lets Skyvern control an external Chrome browser i
 
 ### Step 1: Enable Chrome remote debugging
 
-Open `chrome://inspect/#remote-debugging` in Chrome, then turn on
-**Allow remote debugging for this browser instance**. Chrome should show:
-
-```text
-Server running at: 127.0.0.1:9222
-```
-
-If your Chrome version does not show that page, start Chrome manually:
+When Skyvern runs in Docker, Chrome must listen on an address the container can
+reach. Start Chrome manually with `--remote-debugging-address=0.0.0.0`:
 
 <CodeGroup>
 ```bash macOS
@@ -182,6 +176,18 @@ google-chrome \
 
 The `--user-data-dir` flag creates a separate profile for Skyvern, preserving your main Chrome profile.
 
+`chrome://inspect/#remote-debugging` can be used only when it opens a
+Docker-reachable listener. On Windows, check the listener before using that
+path:
+
+```powershell Windows
+Get-NetTCPConnection -LocalPort 9222 | Select-Object LocalAddress, State
+```
+
+If the listener shows only `127.0.0.1`, Docker Desktop cannot reach it through
+`host.docker.internal`; use the manual launch command above instead. Continue
+only when the listener is `0.0.0.0` or `::`.
+
 ### Step 2: Configure Skyvern
 
 ```bash .env
@@ -200,6 +206,13 @@ If Docker Desktop reaches Chrome but Chrome rejects the `host.docker.internal`
 host name, Skyvern retries with the Docker host gateway IPv4 address. You can
 also set `BROWSER_REMOTE_DEBUGGING_URL` directly to that IPv4 address.
 
+If Windows Defender Firewall blocks the connection from Docker, allow inbound
+TCP traffic on port 9222:
+
+```powershell Windows
+New-NetFirewallRule -DisplayName "Chrome Remote Debug 9222" -Direction Inbound -LocalPort 9222 -Protocol TCP -Action Allow
+```
+
 ### Step 3: Verify connection
 
 Test that Chrome is listening on port 9222:
@@ -215,9 +228,9 @@ Invoke-RestMethod http://127.0.0.1:9222/json/version
 You should see Chrome's version information and a `webSocketDebuggerUrl`.
 
 <Note>
-If `/json/version` does not return Chrome version information, keep Chrome's
-remote debugging page open and confirm it shows `Server running at:
-127.0.0.1:9222`.
+If `/json/version` does not return Chrome version information from inside the
+Skyvern container, verify Chrome is listening on `0.0.0.0:9222` or `::9222` and
+that Windows Firewall allows inbound traffic on port 9222.
 </Note>
 
 <Warning>

@@ -29,6 +29,7 @@ doctor_app = typer.Typer(help="Check Skyvern installation health.")
 
 GENERATED_CREDENTIALS_FILE = Path(".skyvern/credentials.toml")
 LEGACY_STREAMLIT_CREDENTIALS_FILE = Path(".streamlit/secrets.toml")
+_FINGERPRINT_SALT = os.urandom(16)
 
 
 @dataclass
@@ -638,9 +639,14 @@ def _check_legacy_streamlit_secrets() -> CheckResult:
 
 
 def _fingerprint(value: str) -> str:
+    """Return an opaque process-local tag for comparing sensitive values in logs."""
     if not value:
         return "missing"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return hashlib.blake2s(
+        value.encode("utf-8"),
+        digest_size=6,
+        key=_FINGERPRINT_SALT,
+    ).hexdigest()
 
 
 def _run_docker_compose_exec(service: str, script: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -1564,6 +1570,10 @@ asyncio.run(main())
     set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", api_key, quote_mode="never")
     GENERATED_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
     GENERATED_CREDENTIALS_FILE.write_text(f'[general]\ncred = "{api_key}"\n')
+    try:
+        GENERATED_CREDENTIALS_FILE.chmod(0o600)
+    except OSError:
+        pass
     if LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
         LEGACY_STREAMLIT_CREDENTIALS_FILE.unlink()
 

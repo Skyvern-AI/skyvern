@@ -1,3 +1,5 @@
+import os
+import stat
 from pathlib import Path
 import subprocess
 
@@ -212,3 +214,54 @@ def test_docker_local_auth_reports_backend_error_detail(
     assert result.status == "error"
     assert "HTTP error" in result.detail
     assert "Unable to diagnose API key" in result.detail
+
+
+def test_fingerprint_does_not_leak_value() -> None:
+    api_key = "skv_live_abcdef0123456789abcdef0123456789"
+
+    tag = doctor_module._fingerprint(api_key)
+
+    assert len(tag) == 12
+    assert api_key not in tag
+    assert api_key[:8] not in tag
+    assert api_key[-4:] not in tag
+
+
+def test_fingerprint_is_deterministic_within_process() -> None:
+    api_key = "skv_live_abcdef0123456789abcdef0123456789"
+
+    assert doctor_module._fingerprint(api_key) == doctor_module._fingerprint(api_key)
+
+
+def test_fingerprint_missing_sentinel_for_empty_string() -> None:
+    assert doctor_module._fingerprint("") == "missing"
+
+
+def test_fix_docker_local_auth_hardens_generated_credentials_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        doctor_module,
+        "_run_docker_compose_exec",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"api_key": "sk-test", "organization_id": "o_test"}\n',
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(doctor_module, "_recreate_docker_services", lambda _services: True)
+
+    frontend_dir = tmp_path / "skyvern-frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / ".env").write_text("VITE_API_BASE_URL=http://localhost:8000/api/v1\n")
+    credentials_file = tmp_path / ".skyvern" / "credentials.toml"
+    monkeypatch.setattr(doctor_module, "GENERATED_CREDENTIALS_FILE", credentials_file)
+
+    assert doctor_module._fix_docker_local_auth() is True
+    assert 'cred = "sk-test"' in credentials_file.read_text()
+
+    if os.name == "posix":
+        assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600

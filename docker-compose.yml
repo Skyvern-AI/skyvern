@@ -57,12 +57,13 @@ services:
       # .env owns secrets.
       # ─────────────────────────────────────────────────────────────────
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
-      - BROWSER_STREAMING_MODE=cdp
+      - BROWSER_STREAMING_MODE=${BROWSER_STREAMING_MODE:-cdp}
       - BROWSER_TYPE=chromium-headful
       - ENABLE_CODE_BLOCK=true
       # --- Control your own browser (Chrome/Chromium) ---
-      # Open chrome://inspect/#remote-debugging in Chrome and enable remote debugging.
-      # Chrome should show "Server running at: 127.0.0.1:9222".
+      # Start Chrome with --remote-debugging-address=0.0.0.0 so Docker can reach it.
+      # The chrome://inspect/#remote-debugging toggle may bind to 127.0.0.1 only,
+      # which is not reachable from inside Docker Desktop.
       # Then set:
       # - BROWSER_TYPE=cdp-connect
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
@@ -164,7 +165,7 @@ services:
     env_file:
       - skyvern-frontend/.env
     environment:
-      - VITE_BROWSER_STREAMING_MODE=cdp
+      - VITE_BROWSER_STREAMING_MODE=${VITE_BROWSER_STREAMING_MODE:-cdp}
     #  - VITE_ENABLE_CODE_BLOCK=true
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip

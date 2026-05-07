@@ -13,11 +13,15 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+from pydantic import ValidationError
+
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _effective_auto_accept,
     _normalize_copilot_yaml,
     _should_restore_persisted_workflow,
 )
+from skyvern.schemas.runs import ProxyLocation
 
 
 def _agent_result(
@@ -108,3 +112,51 @@ class TestNormalizeCopilotYamlTitleCoercion:
         yaml_str = "title: My Workflow\nworkflow_definition:\n  blocks: []\n  parameters: []\n"
         request = _normalize_copilot_yaml(yaml_str)
         assert request.title == "My Workflow"
+
+
+class TestNormalizeCopilotYamlProxyLocation:
+    def test_missing_proxy_location_is_preserved(self) -> None:
+        yaml_str = "title: Proxy Workflow\nworkflow_definition:\n  blocks: []\n  parameters: []\n"
+
+        request = _normalize_copilot_yaml(yaml_str)
+
+        assert request.proxy_location is None
+
+    def test_explicit_null_proxy_location_is_preserved(self) -> None:
+        yaml_str = "title: Proxy Workflow\nproxy_location: null\nworkflow_definition:\n  blocks: []\n  parameters: []\n"
+
+        request = _normalize_copilot_yaml(yaml_str)
+
+        assert request.proxy_location is None
+
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("US", ProxyLocation.RESIDENTIAL),
+            ("USA", ProxyLocation.RESIDENTIAL),
+            ("RESIDENTIAL_US", ProxyLocation.RESIDENTIAL),
+            ("UK", ProxyLocation.RESIDENTIAL_GB),
+            ("GB", ProxyLocation.RESIDENTIAL_GB),
+            ("CA", ProxyLocation.RESIDENTIAL_CA),
+            ("US_CA", ProxyLocation.US_CA),
+            ("us-ny", ProxyLocation.US_NY),
+        ],
+    )
+    def test_known_proxy_location_shorthands_are_canonicalized(self, raw_value: str, expected: ProxyLocation) -> None:
+        yaml_str = (
+            f"title: Proxy Workflow\n"
+            f"proxy_location: {raw_value}\n"
+            f"workflow_definition:\n"
+            f"  blocks: []\n"
+            f"  parameters: []\n"
+        )
+
+        request = _normalize_copilot_yaml(yaml_str)
+
+        assert request.proxy_location == expected
+
+    def test_unknown_proxy_location_still_fails_validation(self) -> None:
+        yaml_str = "title: Proxy Workflow\nproxy_location: MARS\nworkflow_definition:\n  blocks: []\n  parameters: []\n"
+
+        with pytest.raises(ValidationError):
+            _normalize_copilot_yaml(yaml_str)

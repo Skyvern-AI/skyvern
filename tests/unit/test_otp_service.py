@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pyotp
 import pytest
 
-from skyvern.exceptions import FailedToGetTOTPVerificationCode
+from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.services.otp_service import (
@@ -117,7 +118,7 @@ def _mock_org_token() -> MagicMock:
 
 
 class TestPollOtpValueRetry:
-    """poll_otp_value should tolerate transient FailedToGetTOTPVerificationCode up to max consecutive failures."""
+    """poll_otp_value retries fetch failures across the full wall-clock timeout window."""
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -127,9 +128,8 @@ class TestPollOtpValueRetry:
     async def test_retries_on_transient_failure_then_succeeds(
         self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
     ) -> None:
-        """Fail twice, then return OTP on third attempt. Counter resets, OTP is returned."""
+        """Fail twice, then return OTP on third attempt."""
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
-        mock_settings.VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES = 3
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
 
         otp = OTPValue(value="123456")
@@ -148,58 +148,95 @@ class TestPollOtpValueRetry:
         assert mock_fetch.call_count == 3
 
     @pytest.mark.asyncio
-    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service.app")
-    @patch("skyvern.services.otp_service.settings")
-    async def test_raises_after_max_consecutive_failures(
-        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
-    ) -> None:
-        """After N consecutive failures, re-raise FailedToGetTOTPVerificationCode."""
-        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
-        mock_settings.VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES = 3
-        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+    async def test_does_not_short_circuit_during_extended_outage(self) -> None:
+        """Persistent webhook errors must not exit polling before the wall-clock timeout fires (SKY-9553)."""
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        utcnow_returns = [base] + [base + timedelta(seconds=60 * (i + 1)) for i in range(8)]
 
-        mock_fetch.side_effect = FailedToGetTOTPVerificationCode(reason="connection error")
+        with (
+            patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock) as mock_fetch,
+            patch("skyvern.services.otp_service.app") as mock_app,
+            patch("skyvern.services.otp_service.settings") as mock_settings,
+            patch("skyvern.services.otp_service.datetime") as mock_datetime,
+        ):
+            mock_datetime.utcnow.side_effect = utcnow_returns
+            mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
 
-        with pytest.raises(FailedToGetTOTPVerificationCode):
-            await poll_otp_value(
+            otp = OTPValue(value="424242")
+            mock_fetch.side_effect = [
+                *([FailedToGetTOTPVerificationCode(reason="connection refused")] * 7),
+                otp,
+            ]
+
+            result = await poll_otp_value(
                 organization_id="o_test",
                 task_id="tsk_test",
                 totp_verification_url="https://example.com/mfa",
             )
-        assert mock_fetch.call_count == 3
+            assert result == otp
+            assert mock_fetch.call_count == 8
 
     @pytest.mark.asyncio
-    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service.app")
-    @patch("skyvern.services.otp_service.settings")
-    async def test_counter_resets_after_success(
-        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
-    ) -> None:
-        """Fail twice, succeed (None), fail twice again, then return OTP. Counter resets between failure bursts."""
-        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
-        mock_settings.VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES = 3
-        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
-
-        otp = OTPValue(value="654321")
-        mock_fetch.side_effect = [
-            FailedToGetTOTPVerificationCode(reason="err"),
-            FailedToGetTOTPVerificationCode(reason="err"),
-            None,  # success (no OTP yet, but resets counter)
-            FailedToGetTOTPVerificationCode(reason="err"),
-            FailedToGetTOTPVerificationCode(reason="err"),
-            otp,
+    async def test_raises_failed_with_reason_when_timeout_during_failure_streak(self) -> None:
+        """When the wall-clock timeout fires while the webhook is still failing, surface the underlying reason."""
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        utcnow_returns = [
+            base,  # start_datetime
+            base + timedelta(seconds=30),  # iter 1: not timed out, fetch fails
+            base + timedelta(seconds=60),  # iter 2: not timed out, fetch fails
+            base + timedelta(minutes=16),  # iter 3: timed out
         ]
 
-        result = await poll_otp_value(
-            organization_id="o_test",
-            task_id="tsk_test",
-            totp_verification_url="https://example.com/mfa",
-        )
-        assert result == otp
-        assert mock_fetch.call_count == 6
+        with (
+            patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock) as mock_fetch,
+            patch("skyvern.services.otp_service.app") as mock_app,
+            patch("skyvern.services.otp_service.settings") as mock_settings,
+            patch("skyvern.services.otp_service.datetime") as mock_datetime,
+        ):
+            mock_datetime.utcnow.side_effect = utcnow_returns
+            mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+            mock_fetch.side_effect = FailedToGetTOTPVerificationCode(reason="connection refused")
+
+            with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+                await poll_otp_value(
+                    organization_id="o_test",
+                    task_id="tsk_test",
+                    totp_verification_url="https://example.com/mfa",
+                )
+            assert exc_info.value.reason == "connection refused"
+
+    @pytest.mark.asyncio
+    async def test_raises_no_otp_at_timeout_when_polls_were_clean(self) -> None:
+        """When polling timed out without webhook errors (just no OTP yet), raise NoTOTPVerificationCodeFound."""
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        utcnow_returns = [
+            base,
+            base + timedelta(seconds=30),
+            base + timedelta(minutes=16),
+        ]
+
+        with (
+            patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock) as mock_fetch,
+            patch("skyvern.services.otp_service.app") as mock_app,
+            patch("skyvern.services.otp_service.settings") as mock_settings,
+            patch("skyvern.services.otp_service.datetime") as mock_datetime,
+        ):
+            mock_datetime.utcnow.side_effect = utcnow_returns
+            mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+            mock_fetch.return_value = None
+
+            with pytest.raises(NoTOTPVerificationCodeFound):
+                await poll_otp_value(
+                    organization_id="o_test",
+                    task_id="tsk_test",
+                    totp_verification_url="https://example.com/mfa",
+                )
 
 
 class _FakeWorkflowRunContext:

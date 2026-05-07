@@ -618,13 +618,16 @@ class OnePasswordBaseError(SkyvernException):
 
 
 class OnePasswordServiceUnavailableError(OnePasswordBaseError):
-    def __init__(self, status_code: int | None = None) -> None:
+    def __init__(self, status_code: int | None = None, lookup_context: str | None = None) -> None:
         suffix = f" (HTTP {status_code})" if status_code else ""
-        super().__init__(
+        message = (
             f"1Password is currently unavailable{suffix}. "
             "This is an upstream outage on 1Password's side, not a Skyvern issue. "
             "Please retry in a few minutes."
         )
+        if lookup_context:
+            message = f"{message} {lookup_context}"
+        super().__init__(message)
 
 
 class OnePasswordRateLimitError(OnePasswordBaseError):

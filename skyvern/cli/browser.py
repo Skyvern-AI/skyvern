@@ -148,10 +148,7 @@ def _print_classic_cdp_instructions() -> None:
     console.print(
         Panel(
             "[bold]Enable Chrome remote debugging[/bold]\n\n"
-            "1. Open [cyan]chrome://inspect/#remote-debugging[/cyan] in Chrome\n"
-            "2. Turn on [bold]Allow remote debugging for this browser instance[/bold]\n"
-            "3. Confirm Chrome shows [green]Server running at: 127.0.0.1:9222[/green]\n\n"
-            "If that page is unavailable in your Chrome version, start Chrome manually:\n\n"
+            "Start Chrome manually with a CDP endpoint that Docker can reach:\n\n"
             f"[cyan]{_classic_cdp_launch_command()}[/cyan]",
             border_style="cyan",
         )
