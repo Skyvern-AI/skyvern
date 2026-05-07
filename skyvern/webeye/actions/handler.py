@@ -4363,6 +4363,75 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
+# Sentinel for cached_age_seconds when the cache backend doesn't track per-key
+# write time (Redis tier) or returns a None age. Distinct from 0.0 so Datadog
+# can split "just-cached" from "age unknown" in shadow comparison events.
+_UNKNOWN_CACHE_AGE_SENTINEL = -1.0
+
+
+def _schedule_extraction_shadow_check_for_hit(
+    *,
+    task: Task,
+    workflow_run_id: str,
+    cache_key: str,
+    cached_value: Any,
+    cached_age_seconds: float,
+    scraped_page: ScrapedPage,
+    llm_key_override: str | None,
+    extract_information_prompt: str,
+) -> None:
+    shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+    )
+    shadow_schema = task.extracted_information_schema
+    # Snapshot screenshots at schedule time — scraped_page is mutable
+    # and may be refreshed before the background task runs.
+    shadow_screenshots = list(scraped_page.screenshots)
+
+    async def _shadow_gate() -> bool:
+        # Captures `task` by reference — safe because the cloud override
+        # only reads immutable identifiers (workflow_run_id, organization_id,
+        # workflow_permanent_id, task_id) set at construction.
+        return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+    async def _shadow_llm_call() -> Any:
+        fresh = await shadow_llm_api_handler(
+            prompt=extract_information_prompt,
+            # step=None suppresses both update_step (token/cost accounting)
+            # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
+            # are an observability side-channel — the user-visible request
+            # was served from cache, so they must not inflate step usage,
+            # billing, or artifact counts.
+            step=None,
+            screenshots=shadow_screenshots,
+            # Use the same prompt_name as the miss path so prompt-level
+            # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
+            # cached (tuned) vs fresh (untuned) would diverge for config
+            # reasons unrelated to cache correctness.
+            prompt_name="extract-information",
+            force_dict=False,
+            system_prompt=task.workflow_system_prompt,
+        )
+        # Apply the same post-processing the miss path applies so the
+        # comparison is apples-to-apples against the cached value.
+        if shadow_schema:
+            fresh = validate_and_fill_extraction_result(
+                extraction_result=fresh,
+                schema=shadow_schema,
+            )
+        return fresh
+
+    extraction_shadow.schedule_shadow_check(
+        gate=_shadow_gate,
+        cache_key=cache_key,
+        workflow_run_id=workflow_run_id,
+        cached_value=cached_value,
+        cached_age_seconds=cached_age_seconds,
+        llm_call=_shadow_llm_call,
+        schema=shadow_schema,
+    )
+
+
 async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
@@ -4530,57 +4599,17 @@ async def extract_information_for_navigation_goal(
         # inside the background task so the cache-hit return is not blocked
         # by the flag provider (e.g. PostHog latency on the first hit per run).
         if cache_key is not None and task.workflow_run_id is not None:
-            shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
-            )
-            shadow_schema = task.extracted_information_schema
-            # Snapshot screenshots at schedule time — scraped_page is mutable
-            # and may be refreshed before the background task runs.
-            shadow_screenshots = list(scraped_page.screenshots)
-
-            async def _shadow_gate() -> bool:
-                # Captures `task` by reference — safe because the cloud override
-                # only reads immutable identifiers (workflow_run_id, organization_id,
-                # workflow_permanent_id, task_id) set at construction.
-                return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
-
-            async def _shadow_llm_call() -> Any:
-                fresh = await shadow_llm_api_handler(
-                    prompt=extract_information_prompt,
-                    # step=None suppresses both update_step (token/cost accounting)
-                    # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
-                    # are an observability side-channel — the user-visible request
-                    # was served from cache, so they must not inflate step usage,
-                    # billing, or artifact counts.
-                    step=None,
-                    screenshots=shadow_screenshots,
-                    # Use the same prompt_name as the miss path so prompt-level
-                    # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
-                    # cached (tuned) vs fresh (untuned) would diverge for config
-                    # reasons unrelated to cache correctness.
-                    prompt_name="extract-information",
-                    force_dict=False,
-                    system_prompt=task.workflow_system_prompt,
-                )
-                # Apply the same post-processing the miss path applies so the
-                # comparison is apples-to-apples against the cached value.
-                if shadow_schema:
-                    fresh = validate_and_fill_extraction_result(
-                        extraction_result=fresh,
-                        schema=shadow_schema,
-                    )
-                return fresh
-
-            extraction_shadow.schedule_shadow_check(
-                gate=_shadow_gate,
-                cache_key=cache_key,
+            _schedule_extraction_shadow_check_for_hit(
+                task=task,
                 workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
                 cached_value=lookup_result.value,
-                # -1.0 sentinel marks "age unknown" so it's distinguishable in
-                # Datadog from "just-cached (0.0)".
-                cached_age_seconds=lookup_result.age_seconds if lookup_result.age_seconds is not None else -1.0,
-                llm_call=_shadow_llm_call,
-                schema=shadow_schema,
+                cached_age_seconds=lookup_result.age_seconds
+                if lookup_result.age_seconds is not None
+                else _UNKNOWN_CACHE_AGE_SENTINEL,
+                scraped_page=scraped_page,
+                llm_key_override=llm_key_override,
+                extract_information_prompt=extract_information_prompt,
             )
         return ScrapeResult(scraped_data=lookup_result.value)
     if lookup_result is not None and lookup_result.hit:
@@ -4655,8 +4684,6 @@ async def extract_information_for_navigation_goal(
             cache_key=cache_key,
             cache_hit=True,
             cache_scope=extraction_cache.SCOPE_WPID,
-            # Age tracking in the cross-run tier is a follow-up; emit None so
-            # the field is always present but distinguishable from in-run hits.
             cache_age_seconds=None,
             fallback_reason=None,
             cache_path="handler",
@@ -4670,9 +4697,20 @@ async def extract_information_for_navigation_goal(
                 "extract_information cross-run cache backfill to in-run failed",
                 exc_info=True,
             )
-        # Shadow sampling on cross-run hits is a follow-up — plumbing needs
-        # a cached_age for the comparison event and the current Redis backend
-        # does not track it yet.
+        # Fire-and-forget shadow sampling on cross-run hits. Mirrors the
+        # in-run path above; uses the -1.0 cached_age_seconds sentinel
+        # because the Redis tier does not track per-key write time.
+        if task.workflow_run_id is not None:
+            _schedule_extraction_shadow_check_for_hit(
+                task=task,
+                workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
+                cached_value=cross_run_value,
+                cached_age_seconds=_UNKNOWN_CACHE_AGE_SENTINEL,
+                scraped_page=scraped_page,
+                llm_key_override=llm_key_override,
+                extract_information_prompt=extract_information_prompt,
+            )
         return ScrapeResult(scraped_data=cross_run_value)
 
     # Cross-run miss log — INFO so the wpid-tier hit rate is computable
