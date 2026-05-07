@@ -29,6 +29,7 @@ from skyvern.core.script_generations.script_skyvern_page import script_run_conte
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
+    IllegitCompleteScriptTermination,
     ScriptNotFound,
     ScriptTerminationException,
     StepTerminationError,
@@ -90,6 +91,16 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
+
+# Synthetic failure_reason recorded on a fallback episode when the AI fallback
+# ended `completed` with zero actions taken — i.e. the AI's complete-verify
+# accepted what the script's complete-verify rejected, so the agent didn't
+# actually do anything. Shared between the two episode writers
+# (script_service._fallback_to_ai_run + workflow/service.py:_execute_single_block)
+# so they stay in sync.
+VERIFIER_SWAP_FAILURE_REASON = (
+    "AI fallback ended completed with 0 actions — complete-verify accepted what the script's complete-verify rejected"
+)
 
 # Max wait for any download signal after a cached click; downstream
 # .crdownload polling handles in-progress completion separately. (SKY-9431)
@@ -621,6 +632,43 @@ async def _record_output_parameter_value(
         output_parameter_id=output_parameter.output_parameter_id,
         value=output,
     )
+
+
+async def _handle_script_termination(
+    e: ScriptTerminationException,
+    block_kind: str,
+    workflow_run_block_id: str | None,
+    task_id: str | None,
+    step_id: str | None,
+    cache_key: str,
+) -> None:
+    """Persist the block as failed (verifier-rejected complete) or terminated (intentional terminate).
+
+    StepStatus uses `failed` for both: the enum has no `terminated` value (only created/running/failed/completed/canceled), and `failed` is the existing codebase convention for non-completed steps.
+    """
+    if isinstance(e, IllegitCompleteScriptTermination):
+        LOG.info("Script complete() rejected by verifier", block_kind=block_kind, cache_key=cache_key)
+        block_status = BlockStatus.failed
+        task_status = TaskStatus.failed
+    else:
+        LOG.info(
+            "Script requested termination, not falling back to AI",
+            block_kind=block_kind,
+            cache_key=cache_key,
+        )
+        block_status = BlockStatus.terminated
+        task_status = TaskStatus.terminated
+    if workflow_run_block_id:
+        await _update_workflow_block(
+            workflow_run_block_id,
+            block_status,
+            task_id=task_id,
+            task_status=task_status,
+            step_id=step_id,
+            step_status=StepStatus.failed,
+            label=cache_key,
+            failure_reason=str(e),
+        )
 
 
 async def _update_workflow_block(
@@ -1402,22 +1450,41 @@ async def _fallback_to_ai_run(
         # Update fallback episode with AI execution results
         if fallback_episode_id:
             try:
-                fallback_succeeded = task.status not in [TaskStatus.terminated, TaskStatus.failed]
+                # AI runs on the existing task and may retry across steps
+                # (agent.execute_step recurses on next_step). Exclude the
+                # script's pre-fallback step only — retry-chain actions are
+                # counted. None = unknown (fetch error).
+                agent_action_count: int | None = None
+                action_summaries: list[dict] | None = None
+                try:
+                    all_actions = await app.DATABASE.tasks.get_task_actions(
+                        task_id=task_id,
+                        organization_id=organization_id,
+                    )
+                    ai_actions = [a for a in all_actions if a.step_id != script_step_id]
+                    agent_action_count = len(ai_actions)
+                    action_summaries = build_action_summaries_with_timing(ai_actions)
+                except Exception:
+                    LOG.debug("Could not fetch actions for fallback episode", exc_info=True)
+
+                # Mirrors workflow/service.py's success predicate so the two
+                # episode writers label the same outcome identically.
+                fallback_succeeded = task.status == TaskStatus.completed
+                if fallback_succeeded and agent_action_count == 0:
+                    fallback_succeeded = False
+
                 agent_actions_summary: dict[str, Any] = {
                     "block_status": str(task.status),
                 }
                 if form_fields_snapshot:
                     agent_actions_summary["form_fields"] = form_fields_snapshot
-                if not fallback_succeeded and task.failure_reason:
-                    agent_actions_summary["failure_reason"] = str(task.failure_reason)[:2000]
-                try:
-                    actions = await app.DATABASE.tasks.get_task_actions(
-                        task_id=task_id,
-                        organization_id=organization_id,
-                    )
-                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
-                except Exception:
-                    LOG.debug("Could not fetch actions for fallback episode", exc_info=True)
+                if action_summaries is not None:
+                    agent_actions_summary["actions"] = action_summaries
+                if not fallback_succeeded:
+                    if task.failure_reason:
+                        agent_actions_summary["failure_reason"] = str(task.failure_reason)[:2000]
+                    elif task.status == TaskStatus.completed and agent_action_count == 0:
+                        agent_actions_summary["failure_reason"] = VERIFIER_SWAP_FAILURE_REASON
 
                 await app.DATABASE.scripts.update_fallback_episode(
                     episode_id=fallback_episode_id,
@@ -1809,10 +1876,8 @@ async def run_task(
                 )
             return output
 
-        except ScriptTerminationException:
-            # Explicit termination from script (e.g., target data does not exist).
-            # Do NOT fall back to AI — the script intentionally terminated.
-            LOG.info("Script requested termination. Not falling back to AI.", cache_key=cache_key)
+        except ScriptTerminationException as e:
+            await _handle_script_termination(e, "task block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
@@ -2093,10 +2158,8 @@ async def download(
                     label=cache_key,
                 )
 
-        except ScriptTerminationException:
-            # Explicit termination from script (e.g., target data does not exist).
-            # Do NOT fall back to AI — the script intentionally terminated.
-            LOG.info("Script requested termination in download block. Not falling back to AI.", cache_key=cache_key)
+        except ScriptTerminationException as e:
+            await _handle_script_termination(e, "download block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
             LOG.exception("Failed to run download block. Falling back to AI run.")
@@ -2185,10 +2248,8 @@ async def action(
                     label=cache_key,
                 )
 
-        except ScriptTerminationException:
-            # Explicit termination from script (e.g., target data does not exist).
-            # Do NOT fall back to AI — the script intentionally terminated.
-            LOG.info("Script requested termination in action block. Not falling back to AI.", cache_key=cache_key)
+        except ScriptTerminationException as e:
+            await _handle_script_termination(e, "action block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
             LOG.exception("Failed to run action block. Falling back to AI run.")
@@ -2280,10 +2341,8 @@ async def login(
                     label=cache_key,
                 )
 
-        except ScriptTerminationException:
-            # Explicit termination from script (e.g., target data does not exist).
-            # Do NOT fall back to AI — the script intentionally terminated.
-            LOG.info("Script requested termination in login block. Not falling back to AI.", cache_key=cache_key)
+        except ScriptTerminationException as e:
+            await _handle_script_termination(e, "login block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
             LOG.exception("Failed to run login block")

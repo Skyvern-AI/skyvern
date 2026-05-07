@@ -2406,6 +2406,10 @@ class WorkflowService:
 
                     LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
 
+                    # Pre-init so the success log can reference output_value
+                    # when ScriptTerminationException was caught (terminated
+                    # is now in script_success_statuses).
+                    output_value: Any = None
                     try:
                         exec_code = compile(wrapper_code, "<run_signature>", "exec")
                         exec(exec_code, exec_globals)
@@ -2433,10 +2437,10 @@ class WorkflowService:
                             status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
                             workflow_run_block_id=latest_block.workflow_run_block_id,
                         )
-                        # Terminated is a valid script outcome when generate_script_on_terminal is set
-                        script_success_statuses = {BlockStatus.completed}
-                        if workflow.generate_script_on_terminal:
-                            script_success_statuses.add(BlockStatus.terminated)
+                        # Terminate() is an explicit signal to stop, not a
+                        # failure to retry. `generate_script_on_terminal` is
+                        # orthogonal — it gates script generation, not fallback.
+                        script_success_statuses = {BlockStatus.completed, BlockStatus.terminated}
 
                         block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                         if workflow_run_block_result.status in script_success_statuses:
@@ -2603,34 +2607,11 @@ class WorkflowService:
                 # if the failure is code-fixable.
                 if fallback_episode_id and workflow_run_block_result:
                     try:
-                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
-
-                        # Build agent actions summary for both success and failure
-                        agent_actions_summary: dict = {
-                            "block_status": str(workflow_run_block_result.status),
-                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
-                            if workflow_run_block_result.output_parameter_value
-                            else None,
-                        }
-                        if form_fields_for_episode:
-                            agent_actions_summary["form_fields"] = form_fields_for_episode
-
-                        # For failed fallbacks, capture the failure reason
-                        if not fallback_succeeded:
-                            agent_actions_summary["failure_reason"] = (
-                                str(workflow_run_block_result.failure_reason)[:2000]
-                                if workflow_run_block_result.failure_reason
-                                else None
-                            )
-                            LOG.info(
-                                "AI fallback failed, keeping episode for triage",
-                                episode_id=fallback_episode_id,
-                                block_status=workflow_run_block_result.status,
-                                block_label=block.label,
-                            )
-
-                        # Fetch rich action details from the fallback execution
+                        # None = unknown count (taskless wrb / fetch error);
+                        # only a confirmed zero downgrades fallback_succeeded.
                         fallback_wrb_id = workflow_run_block_result.workflow_run_block_id
+                        agent_action_count: int | None = None
+                        action_summaries: list[dict] | None = None
                         if fallback_wrb_id:
                             try:
                                 wrb = await app.DATABASE.observer.get_workflow_run_block(
@@ -2642,13 +2623,47 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
+                                    agent_action_count = len(actions)
+                                    action_summaries = build_action_summaries_with_timing(actions)
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",
                                     fallback_wrb_id=fallback_wrb_id,
                                     exc_info=True,
                                 )
+
+                        # `completed` with confirmed 0 actions = the agent's
+                        # complete-verify accepting what the script's rejected.
+                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
+                        if fallback_succeeded and agent_action_count == 0:
+                            fallback_succeeded = False
+
+                        # Build agent actions summary for both success and failure
+                        agent_actions_summary: dict = {
+                            "block_status": str(workflow_run_block_result.status),
+                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
+                            if workflow_run_block_result.output_parameter_value
+                            else None,
+                        }
+                        if form_fields_for_episode:
+                            agent_actions_summary["form_fields"] = form_fields_for_episode
+                        if action_summaries is not None:
+                            agent_actions_summary["actions"] = action_summaries
+
+                        if not fallback_succeeded:
+                            if workflow_run_block_result.failure_reason:
+                                agent_actions_summary["failure_reason"] = str(workflow_run_block_result.failure_reason)[
+                                    :2000
+                                ]
+                            elif workflow_run_block_result.status == BlockStatus.completed and agent_action_count == 0:
+                                agent_actions_summary["failure_reason"] = script_service.VERIFIER_SWAP_FAILURE_REASON
+                            LOG.info(
+                                "AI fallback failed, keeping episode for triage",
+                                episode_id=fallback_episode_id,
+                                block_status=workflow_run_block_result.status,
+                                block_label=block.label,
+                                agent_action_count=agent_action_count,
+                            )
 
                         await app.DATABASE.scripts.update_fallback_episode(
                             episode_id=fallback_episode_id,

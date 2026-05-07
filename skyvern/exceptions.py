@@ -1143,6 +1143,10 @@ class ScriptTerminationException(SkyvernException):
         super().__init__(reason)
 
 
+class IllegitCompleteScriptTermination(ScriptTerminationException):
+    """Raised when a cached script's page.complete() is rejected by the verifier; distinct from plain ScriptTerminationException, which is an intentional terminate()."""
+
+
 class InvalidSchemaError(SkyvernException):
     def __init__(self, message: str, validation_errors: list[str] | None = None):
         self.message = message
