@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.agent import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.tools import (
+    MIN_BLOCK_RUNNING_REMAINING_SECONDS,
     PER_TOOL_CALL_BUDGET_SECONDS,
     _record_run_blocks_result,
     _tool_loop_error,
@@ -53,23 +54,27 @@ def test_tool_loop_error_blocks_run_when_budget_low_after_failure() -> None:
 
 def test_tool_loop_error_no_guard_when_budget_sufficient() -> None:
     ctx = _ctx_after_failure_with_verified_prefix(
-        elapsed_seconds=TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS + 60)
+        elapsed_seconds=TOTAL_TIMEOUT_SECONDS - (MIN_BLOCK_RUNNING_REMAINING_SECONDS + 30)
     )
     assert _tool_loop_error(ctx, "update_and_run_blocks") is None
 
 
-def test_tool_loop_error_no_guard_on_first_call() -> None:
+def test_tool_loop_error_blocks_first_call_when_turn_budget_is_too_low() -> None:
     ctx = _fresh_context()
     ctx.copilot_run_start_monotonic = time.monotonic() - (TOTAL_TIMEOUT_SECONDS - 10)
-    assert _tool_loop_error(ctx, "update_and_run_blocks") is None
+    msg = _tool_loop_error(ctx, "update_and_run_blocks")
+    assert msg is not None
+    assert "Do NOT start another block-running tool call" in msg
 
 
-def test_tool_loop_error_no_guard_when_no_good_workflow_exists() -> None:
+def test_tool_loop_error_blocks_failed_retry_when_no_good_workflow_exists() -> None:
     ctx = _fresh_context()
     ctx.copilot_run_start_monotonic = time.monotonic() - (TOTAL_TIMEOUT_SECONDS - 10)
     ctx.last_test_ok = False
     ctx.last_failed_workflow_yaml = "yaml-failed"
-    assert _tool_loop_error(ctx, "update_and_run_blocks") is None
+    msg = _tool_loop_error(ctx, "update_and_run_blocks")
+    assert msg is not None
+    assert "Do NOT retry" in msg
 
 
 def test_tool_loop_error_no_guard_for_non_block_running_tools() -> None:
