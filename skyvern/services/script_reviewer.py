@@ -68,6 +68,10 @@ async def load_filtered_run_param_values(workflow_run_id: str) -> dict[str, str]
     return result
 
 
+class AutoFixMissingElseGoalError(ValueError):
+    """Raised when an auto-injected else-branch element_fallback would need a navigation_goal but none exists."""
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockReviewResult:
     """Result of reviewing a single block, carrying the code and LLM artifacts."""
@@ -1090,9 +1094,9 @@ class ScriptReviewer:
                 marker_ids=[c.marker_id for c in recoverable_candidates[:10]],
             )
 
-        # Use provided navigation goal, or fall back to a generic description
-        if not navigation_goal:
-            navigation_goal = "Complete the navigation task for this block"
+        # Empty string is safe for downstream re.findall / prompt rendering;
+        # ``_auto_fix_missing_else`` raises if a real goal is actually required.
+        navigation_goal_for_prompt = navigation_goal or ""
 
         # Infer function signature from existing code
         function_signature = self._extract_function_signature(existing_code)
@@ -1127,7 +1131,7 @@ class ScriptReviewer:
 
         # Extract parameter keys from {{ param }} placeholders in the navigation goal
         # and merge with workflow-level parameter keys for a complete list.
-        goal_param_keys = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", navigation_goal))
+        goal_param_keys = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", navigation_goal_for_prompt))
         parameter_keys = sorted(goal_param_keys | set(all_parameter_keys or []))
         # The filter strips `<block_label>_output` from the valid set so the
         # validator's primary mode rejects any ref to the current block's own
@@ -1165,7 +1169,7 @@ class ScriptReviewer:
         # Build the reviewer prompt
         reviewer_prompt = prompt_engine.load_prompt(
             template=template,
-            navigation_goal=navigation_goal,
+            navigation_goal=navigation_goal_for_prompt,
             existing_code=existing_code,
             episodes=[
                 {
@@ -1326,8 +1330,18 @@ class ScriptReviewer:
                 # Validate classify handling (every classify must have an else branch)
                 classify_error = self._validate_classify_handling(updated_code)
                 if classify_error is not None:
-                    # Try auto-fixing by injecting missing else branches
-                    fixed_code = self._auto_fix_missing_else(updated_code, navigation_goal or "")
+                    # Try auto-fixing by injecting missing else branches.
+                    fixed_code: str | None
+                    try:
+                        fixed_code = self._auto_fix_missing_else(updated_code, navigation_goal)
+                    except AutoFixMissingElseGoalError as exc:
+                        LOG.warning(
+                            "ScriptReviewer: skipped auto-fix-else for goal-less block",
+                            block_label=block_label,
+                            script_revision_id=script_revision_id,
+                            reason=str(exc),
+                        )
+                        fixed_code = None
                     revalidation_error = (
                         self._validate_classify_handling(fixed_code) if fixed_code else "auto-fix returned None"
                     )
@@ -2917,12 +2931,13 @@ class ScriptReviewer:
             + " Each return statement must use a next_block_label and branch_index from the branch definitions."
         )
 
-    def _auto_fix_missing_else(self, code: str, navigation_goal: str) -> str | None:
-        """Auto-inject missing `else` branches after page.classify() if/elif chains.
+    def _auto_fix_missing_else(self, code: str, navigation_goal: str | None) -> str | None:
+        """Auto-inject missing ``else`` branches after page.classify() if/elif chains.
 
-        When the LLM generates a classify with if/elif but no else, this inserts
-        an else branch with element_fallback. Returns the fixed code, or None
-        if the code structure is too complex to safely auto-fix.
+        Returns the fixed code, or None when no injection is performed (no
+        classify calls present, or the structure is too complex to safely
+        auto-fix). Raises ``AutoFixMissingElseGoalError`` if injection is
+        needed but no ``navigation_goal`` is available.
         """
         lines = code.split("\n")
         classify_line_indices = []
@@ -2932,6 +2947,14 @@ class ScriptReviewer:
 
         if not classify_line_indices:
             return None
+
+        # Defer the goal check to injection sites — classify-already-has-else short-circuits without it.
+        def _require_goal() -> str:
+            if not navigation_goal or not navigation_goal.strip():
+                raise AutoFixMissingElseGoalError(
+                    "Cannot auto-inject else-branch element_fallback: block has no navigation_goal."
+                )
+            return navigation_goal
 
         # Process in reverse order so line insertions don't shift earlier indices
         for classify_line_idx in reversed(classify_line_indices):
@@ -2973,8 +2996,9 @@ class ScriptReviewer:
                             if last_branch_body_end is not None:
                                 indent_str = " " * if_indent
                                 body_indent = " " * (if_indent + 4)
+                                _goal_str = _require_goal()
                                 goal = (
-                                    navigation_goal.replace("\\", "\\\\")
+                                    _goal_str.replace("\\", "\\\\")
                                     .replace('"', '\\"')
                                     .replace("\n", " ")
                                     .replace("\r", " ")[:200]
@@ -2992,8 +3016,9 @@ class ScriptReviewer:
                         if if_indent is not None and last_branch_body_end is not None:
                             indent_str = " " * if_indent
                             body_indent = " " * (if_indent + 4)
+                            _goal_str = _require_goal()
                             goal = (
-                                navigation_goal.replace("\\", "\\\\")
+                                _goal_str.replace("\\", "\\\\")
                                 .replace('"', '\\"')
                                 .replace("\n", " ")
                                 .replace("\r", " ")[:200]
@@ -3010,11 +3035,9 @@ class ScriptReviewer:
                 if if_indent is not None and last_branch_body_end is not None:
                     indent_str = " " * if_indent
                     body_indent = " " * (if_indent + 4)
+                    _goal_str = _require_goal()
                     goal = (
-                        navigation_goal.replace("\\", "\\\\")
-                        .replace('"', '\\"')
-                        .replace("\n", " ")
-                        .replace("\r", " ")[:200]
+                        _goal_str.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")[:200]
                     )
                     else_block = [
                         f"{indent_str}else:",
