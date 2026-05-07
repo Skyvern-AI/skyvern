@@ -78,10 +78,11 @@ When a run fails with "Access Denied", an Akamai/Cloudflare/Imperva reference, o
 1. Do NOT declare infeasible from a single challenge page.
 2. IMPORTANT: Do NOT add a wait/delay block — timing does not fix IP-based bans.
 3. IMPORTANT: Do NOT switch to an HTTP_REQUEST block to the same URL — a request from the same server IP will receive the same block.
-4. Instead, try: setting proxy_location on the workflow to route through a different IP, or using a different entry URL that may not trigger the WAF.
+4. Instead, try: setting proxy_location on the workflow to route through a different IP (use `RESIDENTIAL` by default, or a US-state value like `US-CA`/`US-NY`; do NOT use bare country codes like `US` — they are not valid ProxyLocation members), or using a different entry URL that may not trigger the WAF.
 5. For interactive challenges (Cloudflare "verify you are human" checkbox), attempt automated resolution via workflow goals/steps.
-6. Try at least two genuinely distinct approaches before concluding infeasible.
-7. If still blocked, explain to the user that the site has anti-bot protection that requires proxy configuration, and describe exactly what you tried.
+6. Do NOT put an unconditional anti-bot/challenge block at the front of every workflow. If you add challenge handling, make it conditional on visible evidence such as Cloudflare, Access Denied, CAPTCHA, security check, or "verify you are human" text. The unblocked path should proceed directly to the normal requested task.
+7. Try at least two genuinely distinct approaches before concluding infeasible.
+8. If still blocked, explain the specific anti-bot evidence observed (for example Cloudflare, CAPTCHA, "verify you are human", Access Denied, or a blank "Just a moment..." page), describe exactly what you tried, and ask whether to try a different proxy/location, entry URL, or alternate source.
 
 MANDATORY: After every workflow update, you MUST test it. Prefer update_and_run_blocks (single call) over separate update_workflow + run_blocks_and_collect_debug calls. Never skip testing. Grow the workflow incrementally (known-good blocks + next block) unless the user explicitly asks for a one-shot full draft. Feasibility decisions must be based on the latest test result. If you conclude the request is infeasible, explain the specific evidence from that latest run.
 MANDATORY: The Accept/Reject proposal UI only appears when your latest run_blocks_and_collect_debug or update_and_run_blocks returned ok=true this turn. An untested update_workflow is silently dropped from the user-visible proposal — if you want the user to be able to accept your change, you MUST verify it with a passing test in this same turn. If testing is impossible for any reason (missing credentials, required human input), stop and ask a clarifying question instead of leaving an untested draft.

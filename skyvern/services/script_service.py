@@ -45,6 +45,8 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.context_manager import BlockMetadata
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     filter_downloaded_files_for_current_iteration as _filter_downloaded_files_for_current_iteration,
 )
@@ -52,6 +54,7 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
     to_downloaded_file_signature as _to_downloaded_file_signature,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    DEFAULT_MAX_LOOP_ITERATIONS,
     ActionBlock,
     CodeBlock,
     ExtractionBlock,
@@ -60,14 +63,17 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileUploadBlock,
     ForLoopBlock,
     HttpRequestBlock,
+    JinjaBranchCriteria,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
+    PromptBranchCriteria,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
     UrlBlock,
     ValidationBlock,
+    WhileLoopBlock,
     WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
@@ -2687,9 +2693,9 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             template_data.update(workflow_run_context.values)
             if template in template_data:
                 return template_data[template]
-        # Inject for_loop metadata (current_value, current_index, current_item) so
-        # that cached function bodies inside for_loops can resolve {{ current_value }}
-        # in page.goto() and other template-rendered calls.
+        # Inject for_loop / while_loop metadata (current_value, current_index, current_item) so
+        # that cached function bodies inside script loops can resolve {{ current_value }}
+        # in page.goto() and other template-rendered calls. while_loop only sets current_index.
         if context.loop_metadata:
             for key in ("current_value", "current_index", "current_item"):
                 if key in context.loop_metadata:
@@ -3197,7 +3203,150 @@ async def loop(
                 output=block_validation_output.context.loop_output_values,
                 label=label,
             )
-        raise e
+        raise
+    finally:
+        block_validation_output.context.parent_workflow_run_block_id = None
+        block_validation_output.context.loop_metadata = None
+        block_validation_output.context.loop_internal_state = None
+        block_validation_output.context.loop_output_values = None
+
+
+def _while_loop_branch_criteria(
+    condition: str, criteria_type: str | None
+) -> JinjaBranchCriteria | PromptBranchCriteria:
+    """Rehydrate persisted branch criteria for cached script replay (must match workflow definition)."""
+    ct = "jinja2_template" if criteria_type is None else criteria_type
+    if ct == "jinja2_template":
+        return JinjaBranchCriteria(expression=condition)
+    if ct == "prompt":
+        return PromptBranchCriteria(expression=condition)
+    raise ValueError(
+        f"skyvern.while_loop: unsupported criteria_type {criteria_type!r} (expected 'jinja2_template' or 'prompt')"
+    )
+
+
+async def while_loop(
+    condition: str,
+    label: str | None = None,
+    *,
+    criteria_type: str | None = None,
+) -> AsyncGenerator[SkyvernLoopItem, None]:
+    workflow_run_block_id, _, _ = await _create_workflow_block_run_and_task(
+        block_type=BlockType.WHILE_LOOP,
+        label=label,
+    )
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    workflow_run_id = block_validation_output.workflow_run_id
+    organization_id = block_validation_output.organization_id
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    while_block = WhileLoopBlock(
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        condition=_while_loop_branch_criteria(condition, criteria_type),
+        loop_blocks=[],
+    )
+
+    block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
+    block_validation_output.context.loop_output_values = []
+
+    loop_idx = 0
+    try:
+        while True:
+            condition_metadata: BlockMetadata = {
+                "current_index": loop_idx,
+                "current_value": None,
+                "current_item": None,
+            }
+            workflow_run_context.update_block_metadata(block_validation_output.label, condition_metadata)
+
+            try:
+                should_continue = await while_block._evaluate_condition(
+                    workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id or "",
+                    organization_id=organization_id,
+                    browser_session_id=block_validation_output.browser_session_id,
+                )
+            except (FailedToFormatJinjaStyleParameter, MissingJinjaVariables) as exc:
+                if workflow_run_block_id:
+                    await _update_workflow_block(
+                        workflow_run_block_id,
+                        BlockStatus.failed,
+                        failure_reason=f"Failed to evaluate while-loop condition: {exc}",
+                        output=block_validation_output.context.loop_output_values,
+                        label=label,
+                    )
+                raise Exception(f"Failed to evaluate while-loop condition: {exc}") from exc
+
+            if not should_continue:
+                break
+
+            if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
+                failure_reason = f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}"
+                if workflow_run_block_id:
+                    await _update_workflow_block(
+                        workflow_run_block_id,
+                        BlockStatus.failed,
+                        failure_reason=failure_reason,
+                        output=block_validation_output.context.loop_output_values,
+                        label=label,
+                    )
+                raise Exception(failure_reason)
+
+            downloaded_file_signatures_before_iteration: list[tuple[str | None, str | None, str | None]] = []
+            baseline_timed_out = False
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    downloaded_file_signatures_before_iteration = [
+                        _to_downloaded_file_signature(file_info)
+                        for file_info in await app.STORAGE.get_downloaded_files(
+                            organization_id=organization_id or "",
+                            run_id=workflow_run_id,
+                        )
+                    ]
+            except asyncio.TimeoutError:
+                baseline_timed_out = True
+                LOG.warning(
+                    "Timeout getting baseline downloaded files for while loop iteration",
+                    workflow_run_id=workflow_run_id,
+                    loop_index=loop_idx,
+                )
+
+            loop_metadata: BlockMetadata = {
+                "current_index": loop_idx,
+                "current_value": None,
+                "current_item": None,
+            }
+            block_validation_output.context.loop_metadata = loop_metadata
+            if baseline_timed_out:
+                block_validation_output.context.loop_internal_state = None
+            else:
+                block_validation_output.context.loop_internal_state = {
+                    "downloaded_file_signatures_before_iteration": downloaded_file_signatures_before_iteration,
+                }
+            workflow_run_context.update_block_metadata(block_validation_output.label, loop_metadata)
+
+            yield SkyvernLoopItem(loop_idx, None)
+            loop_idx += 1
+
+        if workflow_run_block_id:
+            await _update_workflow_block(
+                workflow_run_block_id,
+                BlockStatus.completed,
+                output=block_validation_output.context.loop_output_values,
+                label=label,
+            )
+    except Exception as e:
+        if workflow_run_block_id:
+            await _update_workflow_block(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                failure_reason=str(e),
+                output=block_validation_output.context.loop_output_values,
+                label=label,
+            )
+        raise
     finally:
         block_validation_output.context.parent_workflow_run_block_id = None
         block_validation_output.context.loop_metadata = None
