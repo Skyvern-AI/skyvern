@@ -693,6 +693,7 @@ class WorkflowRunContext:
 
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
+        lookup_context = self._format_resolved_lookup_context("1Password", vault_id=vault_id, item_id=item_id)
         try:
             client = await OnePasswordClient.authenticate(
                 auth=token,
@@ -701,21 +702,24 @@ class WorkflowRunContext:
             )
             item = await client.items.get(vault_id, item_id)
         except RateLimitExceededException as e:
-            raise OnePasswordRateLimitError(str(e)) from e
+            raise OnePasswordRateLimitError(f"{str(e)} {lookup_context}") from e
         except DesktopSessionExpiredException as e:
-            raise OnePasswordSessionExpiredError(str(e)) from e
+            raise OnePasswordSessionExpiredError(f"{str(e)} {lookup_context}") from e
         except Exception as e:
             raw = str(e)
             match = _ONEPASSWORD_5XX_PATTERN.search(raw)
             if match:
                 status_digits = match.group(1) or match.group(2)
-                raise OnePasswordServiceUnavailableError(status_code=int(status_digits)) from e
-            raise OnePasswordGetItemError(raw) from e
+                raise OnePasswordServiceUnavailableError(
+                    status_code=int(status_digits),
+                    lookup_context=lookup_context,
+                ) from e
+            raise OnePasswordGetItemError(f"{raw} {lookup_context}") from e
 
         # Check if item is None
         if item is None:
-            LOG.error(f"No item found for vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
-            raise ValueError(f"1Password item not found: vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
+            LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
+            raise ValueError(f"1Password item not found. {lookup_context}")
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -910,6 +914,11 @@ class WorkflowRunContext:
 
         collection_id = self._resolve_parameter_value(parameter.bitwarden_collection_id)
         item_id = self._resolve_parameter_value(parameter.bitwarden_item_id)
+        lookup_context = self._format_resolved_lookup_context(
+            "Bitwarden",
+            collection_id=collection_id,
+            item_id=item_id,
+        )
 
         async def fetch_secret_credentials(
             client_id: str | None,
@@ -968,6 +977,7 @@ class WorkflowRunContext:
                     self.values[parameter.key]["totp"] = totp_secret_id
 
         except BitwardenBaseError as e:
+            self._append_lookup_context_to_exception(e, lookup_context)
             LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
             raise e
 
@@ -1025,13 +1035,18 @@ class WorkflowRunContext:
         parameter: BitwardenSensitiveInformationParameter,
         organization: Organization,
     ) -> None:
-        bitwarden_identity_key = parameter.bitwarden_identity_key
-        if self.has_parameter(parameter.bitwarden_identity_key) and self.has_value(parameter.bitwarden_identity_key):
-            bitwarden_identity_key = self.values[parameter.bitwarden_identity_key]
-
-        collection_id = parameter.bitwarden_collection_id
-        if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(parameter.bitwarden_collection_id):
-            collection_id = self.values[parameter.bitwarden_collection_id]
+        bitwarden_identity_key = self._resolve_required_parameter_value(
+            parameter.bitwarden_identity_key,
+            "Bitwarden Identity Key",
+        )
+        collection_id = self._resolve_required_parameter_value(
+            parameter.bitwarden_collection_id,
+            "Bitwarden Collection ID",
+        )
+        lookup_context = self._format_resolved_lookup_context(
+            "Bitwarden",
+            collection_id=collection_id,
+        )
 
         async def fetch_sensitive_values(
             client_id: str | None,
@@ -1078,6 +1093,7 @@ class WorkflowRunContext:
                     self.values[parameter.key][key] = secret_id
 
         except BitwardenBaseError as e:
+            self._append_lookup_context_to_exception(e, lookup_context)
             LOG.error(f"Failed to get sensitive information from Bitwarden. Error: {e}")
             raise e
 
@@ -1086,15 +1102,19 @@ class WorkflowRunContext:
         parameter: BitwardenCreditCardDataParameter,
         organization: Organization,
     ) -> None:
-        if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
-            item_id = self.values[parameter.bitwarden_item_id]
-        else:
-            item_id = parameter.bitwarden_item_id
-
-        if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(parameter.bitwarden_collection_id):
-            collection_id = self.values[parameter.bitwarden_collection_id]
-        else:
-            collection_id = parameter.bitwarden_collection_id
+        item_id = self._resolve_required_parameter_value(
+            parameter.bitwarden_item_id,
+            "Bitwarden Item ID",
+        )
+        collection_id = self._resolve_required_parameter_value(
+            parameter.bitwarden_collection_id,
+            "Bitwarden Collection ID",
+        )
+        lookup_context = self._format_resolved_lookup_context(
+            "Bitwarden",
+            collection_id=collection_id,
+            item_id=item_id,
+        )
 
         async def fetch_credit_card_data(
             client_id: str | None,
@@ -1121,7 +1141,7 @@ class WorkflowRunContext:
             )
             client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
-                raise ValueError("Credit card data not found in Bitwarden")
+                raise ValueError(f"Credit card data not found in Bitwarden. {lookup_context}")
 
             self.secrets[BitwardenConstants.CLIENT_ID] = client_id
             self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
@@ -1157,6 +1177,7 @@ class WorkflowRunContext:
             self.parameters[parameter.key] = parameter
 
         except BitwardenBaseError as e:
+            self._append_lookup_context_to_exception(e, lookup_context)
             LOG.error(f"Failed to get credit card data from Bitwarden. Error: {e}")
             raise e
 
@@ -1371,6 +1392,21 @@ class WorkflowRunContext:
                 if field_value == secret_id:
                     return parameter_key
         return None
+
+    @staticmethod
+    def _format_resolved_lookup_context(provider: str, **identifiers: str | None) -> str:
+        resolved_identifiers = ", ".join(
+            f"{key}={sanitize_credential_for_error(value) if value else '<not provided>'}"
+            for key, value in identifiers.items()
+        )
+        return f"Resolved {provider} credential identifiers: {resolved_identifiers}."
+
+    @staticmethod
+    def _append_lookup_context_to_exception(error: SkyvernException, lookup_context: str) -> None:
+        message = error.message if error.message is not None else str(error)
+        if lookup_context not in message:
+            error.message = f"{message} {lookup_context}"
+            error.args = (error.message,)
 
     def _resolve_required_parameter_value(self, parameter_value: str | None, name: str) -> str:
         result = self._resolve_parameter_value(parameter_value)
