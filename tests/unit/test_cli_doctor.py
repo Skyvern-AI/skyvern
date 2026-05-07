@@ -53,8 +53,8 @@ def test_legacy_streamlit_fix_migrates_only_parseable_key(tmp_path: Path, monkey
     assert "backend .env is missing" in result.detail
     assert doctor._fix_legacy_streamlit_secrets() is True
     assert not legacy.exists()
-    assert "SKYVERN_API_KEY='legacy-key'" in (tmp_path / ".env").read_text()
-    assert "VITE_SKYVERN_API_KEY='legacy-key'" in (tmp_path / "skyvern-frontend" / ".env").read_text()
+    assert "SKYVERN_API_KEY=legacy-key" in (tmp_path / ".env").read_text()
+    assert "VITE_SKYVERN_API_KEY=legacy-key" in (tmp_path / "skyvern-frontend" / ".env").read_text()
 
 
 def test_legacy_streamlit_fix_removes_matching_deprecated_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
