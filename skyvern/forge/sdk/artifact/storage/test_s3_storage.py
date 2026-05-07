@@ -1,4 +1,6 @@
+import asyncio
 import io
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Generator
@@ -461,6 +463,334 @@ class TestS3StorageBrowserSessionFiles:
     async def test_storage_type_property(self, s3_storage: S3Storage) -> None:
         """Test storage_type returns 's3'."""
         assert s3_storage.storage_type == "s3"
+
+    async def test_get_shared_downloaded_files_returns_all(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Listing many downloaded files returns one FileInfo per object with a presigned URL."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        session_id = "bs_returns_all_test"
+        for i in range(5):
+            test_file = tmp_path / f"invoice_{i}.csv"
+            test_file.write_bytes(f"row,{i}\n".encode())
+            await s3_storage.sync_browser_session_file(
+                organization_id=TEST_ORGANIZATION_ID,
+                browser_session_id=session_id,
+                artifact_type="downloads",
+                local_file_path=str(test_file),
+                remote_path=f"invoice_{i}.csv",
+                date=None,
+            )
+
+        file_infos = await s3_storage.get_shared_downloaded_files_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+        )
+        assert len(file_infos) == 5
+        assert {fi.filename for fi in file_infos} == {f"invoice_{i}.csv" for i in range(5)}
+        for fi in file_infos:
+            assert fi.url and "Signature=" in fi.url
+
+    async def test_get_shared_downloaded_files_empty(
+        self, s3_storage: S3Storage, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty directory returns an empty list, no head_object/presign work."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        file_infos = await s3_storage.get_shared_downloaded_files_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id="bs_no_files",
+        )
+        assert file_infos == []
+
+    async def test_get_shared_downloaded_files_runs_concurrently(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """head_object calls overlap rather than running sequentially."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        session_id = "bs_concurrent_test"
+        for i in range(8):
+            test_file = tmp_path / f"f_{i}.csv"
+            test_file.write_bytes(b"x")
+            await s3_storage.sync_browser_session_file(
+                organization_id=TEST_ORGANIZATION_ID,
+                browser_session_id=session_id,
+                artifact_type="downloads",
+                local_file_path=str(test_file),
+                remote_path=f"f_{i}.csv",
+                date=None,
+            )
+
+        original = s3_storage.async_client.get_object_info
+        per_call_delay = 0.1
+        in_flight = 0
+        max_in_flight = 0
+
+        async def slow_get_object_info(uri: str) -> dict:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                await asyncio.sleep(per_call_delay)
+                return await original(uri)
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(s3_storage.async_client, "get_object_info", slow_get_object_info)
+
+        file_infos = await s3_storage.get_shared_downloaded_files_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+        )
+
+        assert len(file_infos) == 8
+        # max_in_flight > 1 directly proves head_object overlapped; wall-clock bounds flake under CI load.
+        assert max_in_flight > 1, "expected overlapping head_object calls"
+
+    async def test_get_shared_downloaded_files_caps_concurrency(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """head_object fan-out is bounded by the instance-level semaphore."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        # Replace the instance semaphore with a tighter one so the cap is
+        # hit with a small file count.
+        monkeypatch.setattr(s3_storage, "_head_object_semaphore", asyncio.Semaphore(3))
+        session_id = "bs_cap_test"
+        file_count = 12
+        for i in range(file_count):
+            test_file = tmp_path / f"f_{i}.csv"
+            test_file.write_bytes(b"x")
+            await s3_storage.sync_browser_session_file(
+                organization_id=TEST_ORGANIZATION_ID,
+                browser_session_id=session_id,
+                artifact_type="downloads",
+                local_file_path=str(test_file),
+                remote_path=f"f_{i}.csv",
+                date=None,
+            )
+
+        original = s3_storage.async_client.get_object_info
+        in_flight = 0
+        max_in_flight = 0
+
+        async def tracked_get_object_info(uri: str) -> dict:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await original(uri)
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(s3_storage.async_client, "get_object_info", tracked_get_object_info)
+
+        file_infos = await s3_storage.get_shared_downloaded_files_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+        )
+
+        assert len(file_infos) == file_count
+        assert max_in_flight <= 3, f"head_object exceeded the cap (max_in_flight={max_in_flight})"
+
+    async def test_head_concurrency_cap_is_shared_across_concurrent_calls(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Concurrent listing calls (the /browser_sessions/history fanout) share one cap."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        # Tight cap so the test can prove the limit holds across callers.
+        monkeypatch.setattr(s3_storage, "_head_object_semaphore", asyncio.Semaphore(3))
+
+        session_ids = ["bs_share_a", "bs_share_b", "bs_share_c"]
+        for session_id in session_ids:
+            for i in range(4):
+                test_file = tmp_path / f"{session_id}_f_{i}.csv"
+                test_file.write_bytes(b"x")
+                await s3_storage.sync_browser_session_file(
+                    organization_id=TEST_ORGANIZATION_ID,
+                    browser_session_id=session_id,
+                    artifact_type="downloads",
+                    local_file_path=str(test_file),
+                    remote_path=f"f_{i}.csv",
+                    date=None,
+                )
+
+        original = s3_storage.async_client.get_object_info
+        in_flight = 0
+        max_in_flight = 0
+
+        async def tracked_get_object_info(uri: str) -> dict:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await original(uri)
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(s3_storage.async_client, "get_object_info", tracked_get_object_info)
+
+        results = await asyncio.gather(
+            *[
+                s3_storage.get_shared_downloaded_files_in_browser_session(
+                    organization_id=TEST_ORGANIZATION_ID, browser_session_id=session_id
+                )
+                for session_id in session_ids
+            ]
+        )
+
+        for file_infos in results:
+            assert len(file_infos) == 4
+        # Without a shared semaphore, 3 sessions x 4 files = 12 head_objects could overlap.
+        assert max_in_flight <= 3, f"shared semaphore breached the cap (max_in_flight={max_in_flight})"
+
+    async def test_get_shared_downloaded_files_falls_back_when_batch_presign_fails(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When batch presign returns None, fall back to per-key signing rather than dropping all files."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        session_id = "bs_batch_fail_test"
+        for i in range(3):
+            test_file = tmp_path / f"f_{i}.csv"
+            test_file.write_bytes(b"x")
+            await s3_storage.sync_browser_session_file(
+                organization_id=TEST_ORGANIZATION_ID,
+                browser_session_id=session_id,
+                artifact_type="downloads",
+                local_file_path=str(test_file),
+                remote_path=f"f_{i}.csv",
+                date=None,
+            )
+
+        original_create = s3_storage.async_client.create_presigned_urls
+
+        async def flaky_create(uris: list[str]) -> list[str] | None:
+            if len(uris) > 1:
+                return None  # simulate batch failure
+            return await original_create(uris)
+
+        monkeypatch.setattr(s3_storage.async_client, "create_presigned_urls", flaky_create)
+
+        file_infos = await s3_storage.get_shared_downloaded_files_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+        )
+        # Per-key fallback should preserve all 3 URLs.
+        assert len(file_infos) == 3
+        assert all(fi.url and "Signature=" in fi.url for fi in file_infos)
+
+    async def test_get_shared_downloaded_files_per_key_partial_failure(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Per-key fallback skips only the failing key, preserving the rest."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        session_id = "bs_partial_fail_test"
+        for i in range(3):
+            test_file = tmp_path / f"f_{i}.csv"
+            test_file.write_bytes(b"x")
+            await s3_storage.sync_browser_session_file(
+                organization_id=TEST_ORGANIZATION_ID,
+                browser_session_id=session_id,
+                artifact_type="downloads",
+                local_file_path=str(test_file),
+                remote_path=f"f_{i}.csv",
+                date=None,
+            )
+
+        original_create = s3_storage.async_client.create_presigned_urls
+
+        async def flaky_create(uris: list[str]) -> list[str] | None:
+            if len(uris) > 1:
+                return None  # force per-key fallback
+            if uris[0].endswith("f_1.csv"):
+                return None  # one key fails
+            return await original_create(uris)
+
+        monkeypatch.setattr(s3_storage.async_client, "create_presigned_urls", flaky_create)
+
+        file_infos = await s3_storage.get_shared_downloaded_files_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+        )
+        names = {fi.filename for fi in file_infos}
+        assert names == {"f_0.csv", "f_2.csv"}
+
+    async def test_get_shared_recordings_skips_zero_byte_before_presign(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Zero-byte recordings are filtered before they consume a presign slot."""
+        monkeypatch.setattr(settings, "AWS_S3_BUCKET_ARTIFACTS", TEST_BUCKET)
+        # Force the legacy listing path (DB-first path is exercised in test_browser_session_recording_artifacts).
+        monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", None)
+        session_id = "bs_zero_byte_test"
+
+        good_file = tmp_path / "good.webm"
+        good_file.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+        await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+            artifact_type="videos",
+            local_file_path=str(good_file),
+            remote_path="good.webm",
+            date="2025-01-15",
+        )
+
+        empty_file = tmp_path / "empty.webm"
+        empty_file.write_bytes(b"")
+        await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+            artifact_type="videos",
+            local_file_path=str(empty_file),
+            remote_path="empty.webm",
+            date="2025-01-15",
+        )
+
+        original_create = s3_storage.async_client.create_presigned_urls
+        seen_keys: list[list[str]] = []
+
+        async def tracking_create(uris: list[str]) -> list[str] | None:
+            seen_keys.append(list(uris))
+            return await original_create(uris)
+
+        monkeypatch.setattr(s3_storage.async_client, "create_presigned_urls", tracking_create)
+
+        file_infos = await s3_storage.get_shared_recordings_in_browser_session(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=session_id,
+        )
+        assert {fi.filename for fi in file_infos} == {"good.webm"}
+        # The empty.webm key must never be passed to create_presigned_urls.
+        passed_basenames = [os.path.basename(uri) for batch in seen_keys for uri in batch]
+        assert "empty.webm" not in passed_basenames
 
 
 CONTENT_TYPE_TEST_CASES = [
