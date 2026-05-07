@@ -207,6 +207,7 @@ class CopilotContext(AgentContext):
     probable_site_block_streak_count: int = 0
     probable_site_block_stop_nudge_count: int = 0
     per_tool_budget_nudge_count: int = 0
+    effective_workflow_proxy_location: Any | None = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —

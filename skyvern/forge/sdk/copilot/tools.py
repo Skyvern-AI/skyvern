@@ -61,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -2498,6 +2499,7 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     wf = result["_workflow"]
     copilot_ctx.last_workflow = wf
     copilot_ctx.last_workflow_yaml = copilot_ctx.workflow_yaml or None
+    copilot_ctx.effective_workflow_proxy_location = getattr(wf, "proxy_location", None) or ProxyLocation.RESIDENTIAL
     data = result.get("data")
     if isinstance(data, dict):
         block_count = data.get("block_count")

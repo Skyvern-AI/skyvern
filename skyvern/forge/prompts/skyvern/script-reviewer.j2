@@ -122,8 +122,26 @@ The cached code failed and the AI agent took over. Here is what happened:
 - **Fallback Type**: {{ episode.fallback_type }}
 - **Error**: {{ episode.error_message or "N/A" }}
 - **Classify Result**: {{ episode.classify_result or "N/A" }}
-{% if episode.classify_result and episode.classify_result != "N/A" %}
+{% if episode.classify_result == "UNKNOWN" %}
+  ⚠️ `page.classify()` returned UNKNOWN — the runtime LLM rejected every named option. This is the signal to ADD a new option/branch covering this page state. Use the rejection reasoning and candidate options below as the seed for the new option's description, and prefer URL/text patterns derived from the **Page URL at failure** and **Page Text at failure** fields below for deterministic dispatch.
+{% elif episode.classify_result and episode.classify_result != "N/A" %}
   ⚠️ The classify matched `{{ episode.classify_result }}` but its branch actions STILL FAILED. Update selectors for this branch using the episode data below.
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.classify_rejection is defined %}
+- **Why the runtime LLM rejected the options** (verbatim mini-LLM reasoning at classify time):
+  > {{ episode.agent_actions.classify_rejection.reasoning or "(no reasoning recorded)" }}
+{% if episode.agent_actions.classify_rejection.confidence is defined %}
+  Confidence in rejection: {{ "%.2f"|format(episode.agent_actions.classify_rejection.confidence) }}.
+{% endif %}
+{% if episode.agent_actions.classify_rejection.candidate_options %}
+  Options the LLM was given (and rejected):
+{%- for opt_key, opt_desc in episode.agent_actions.classify_rejection.candidate_options.items() %}
+  - `{{ opt_key }}`: {{ opt_desc }}
+{%- endfor %}
+{% endif %}
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.exception_summary is defined and episode.agent_actions.exception_summary %}
+- **Recovery agent crashed mid-fallback**: `{{ episode.agent_actions.exception_summary }}` — treat the partial action trace below as a best-effort hint, not a complete recovery recipe.
 {% endif %}
 - **Page URL at failure**: {{ episode.page_url or "N/A" }}
 - **Page Text at failure** (use this to derive text_patterns):
@@ -250,7 +268,15 @@ If the existing code already has a `page.wait()` and it still failed, increase t
 ## What to do
 
 {% for episode in episodes %}
-{% if episode.classify_result and episode.classify_result != "N/A" and episode.classify_result != "UNKNOWN" %}
+{% if episode.classify_result == "UNKNOWN" %}
+### Adding a new branch for this novel page state
+The classify returned UNKNOWN — its candidate options (shown above) didn't fit the page. Add a new option that DOES fit:
+1. **Prefer adding** a new `elif` branch with a `text_patterns` or `url_patterns` entry over rewording an existing option's description. The mini-LLM tier is brittle; URL/text matching is deterministic.
+2. **Seed the new option's description** from the rejection reasoning shown above ("Why the runtime LLM rejected the options"). It already explains what page state is actually present.
+3. **Derive the pattern** from the recorded **Page URL at failure** (URL fragments unique to this state) or **Page Text at failure** (a substring that uniquely identifies the page). Add the pattern to the `text_patterns=` or `url_patterns=` argument of the existing `page.classify()` call AND add the matching option to `options=`.
+4. **Translate the recorded agent actions** into the new branch body, using selector/element data per the rules below.
+5. **Do NOT remove the `else` branch.** It still needs to call `await page.element_fallback(navigation_goal="...")` to catch any genuinely-new states the new branch doesn't cover.
+{% elif episode.classify_result and episode.classify_result != "N/A" %}
 ### Handling episode with existing branch `{{ episode.classify_result }}`
 The classify routed to `{{ episode.classify_result }}` but its actions failed. Update the branch's selectors:
 1. Keep existing selectors — ADD new label variants with comma-separated CSS selectors.

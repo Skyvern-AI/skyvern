@@ -255,7 +255,7 @@ POST_PER_TOOL_BUDGET_NUDGE = (
     "navigation_goal scope, or reply with a blocker explanation."
 )
 
-POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
+_PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
     "STOP — the target site has failed to scrape on every attempt across "
     "multiple workflow shapes. Every run navigated successfully but the "
     'scraper could not read the page ("failed to load the website" / '
@@ -265,9 +265,13 @@ POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
     "Do NOT retry with another workflow variation. Do NOT call "
     "update_and_run_blocks or run_blocks_and_collect_debug again.\n"
     "Reply to the user now: state that the site could not be loaded after "
-    "multiple attempts, quote the last failure_reason verbatim, and ask "
-    "whether to try a different URL, configure a proxy, or provide an "
-    "alternate entry point."
+    "multiple attempts, quote the last failure_reason verbatim, keep the "
+    "message concise, and ask "
+)
+
+POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
+    _PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX
+    + "whether to try a different URL, configure a proxy, or provide an alternate entry point."
 )
 
 POST_ANTI_BOT_FAILED_TEST_NUDGE = (
@@ -315,6 +319,76 @@ def _is_progress_narration(user_response: Any) -> bool:
     if not isinstance(user_response, str) or not user_response:
         return False
     return any(pattern.search(user_response) for pattern in _PROGRESS_NARRATION_PATTERNS)
+
+
+def _normalized_proxy_label(proxy_location: Any) -> str | None:
+    if proxy_location is None:
+        return None
+    raw_value = getattr(proxy_location, "value", proxy_location)
+    if isinstance(raw_value, dict):
+        country = raw_value.get("country")
+        subdivision = raw_value.get("subdivision")
+        city = raw_value.get("city")
+        parts = [str(part).strip() for part in (country, subdivision, city) if part]
+        return "-".join(parts) if parts else None
+    value = str(raw_value).strip()
+    if not value or value.upper() in {"NONE", "NULL", "NO_PROXY"}:
+        return None
+    return value
+
+
+def _effective_proxy_label(ctx: Any) -> str | None:
+    effective_raw = getattr(ctx, "effective_workflow_proxy_location", None)
+    if effective_raw is not None:
+        return _normalized_proxy_label(effective_raw)
+    workflow = getattr(ctx, "last_workflow", None)
+    if workflow is None:
+        return None
+    return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
+
+
+def _probable_site_block_proxy_options(ctx: Any, *, include_whether: bool = True) -> str:
+    proxy_label = _effective_proxy_label(ctx)
+    if proxy_label is None:
+        options = "try a different URL, configure a proxy, or provide an alternate entry point."
+        return f"whether to {options}" if include_whether else options
+    if proxy_label == "RESIDENTIAL":
+        options = (
+            "try a different proxy location (for example US-CA or US-NY), use a different "
+            "residential/ISP option if supported, or provide an alternate entry point."
+        )
+        return f"whether to {options}" if include_whether else options
+    options = (
+        f"try a different proxy/location than {proxy_label}, use a different residential/ISP option if supported, "
+        "or provide an alternate entry point."
+    )
+    return f"whether to {options}" if include_whether else options
+
+
+def _probable_site_block_stop_nudge(ctx: Any) -> str:
+    return _PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX + _probable_site_block_proxy_options(ctx)
+
+
+def _single_line_failure_reason(ctx: Any) -> str:
+    reason = getattr(ctx, "last_test_failure_reason", None)
+    if not isinstance(reason, str) or not reason.strip():
+        return "Skyvern failed to load the website."
+    return " ".join(reason.split())
+
+
+def build_probable_site_block_user_question(ctx: Any) -> str | None:
+    """Return a concise user-facing blocker question after the site-block stop nudge."""
+    if _get_int(ctx, "probable_site_block_stop_nudge_count") <= 0:
+        return None
+
+    failure_reason = _single_line_failure_reason(ctx)
+    options = _probable_site_block_proxy_options(ctx, include_whether=False)
+    return (
+        "The site could not be loaded after repeated attempts. "
+        f'The latest failure_reason was: "{failure_reason}". '
+        "Repeating the same IP/workflow shape is unlikely to help, so I should stop retrying that path.\n\n"
+        f"Would you like me to {options}"
+    )
 
 
 class CopilotTotalTimeoutError(Exception):
@@ -630,7 +704,7 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
     # failed_test_nudge_count slot.
     if _needs_probable_site_block_stop_nudge(ctx):
         ctx.probable_site_block_stop_nudge_count = getattr(ctx, "probable_site_block_stop_nudge_count", 0) + 1
-        return POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
+        return _probable_site_block_stop_nudge(ctx)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
@@ -938,6 +1012,12 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
 }
 
 
+def _nudge_type_for_log(nudge: str) -> str:
+    if nudge.startswith(_PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX):
+        return "probable_site_block_stop"
+    return _NUDGE_TYPE_BY_MESSAGE.get(nudge, "intermediate_success")
+
+
 def _strip_input_images(current_input: str | list) -> tuple[str | list, bool]:
     """Replace ``input_image`` parts in *current_input* with a text placeholder.
 
@@ -1234,7 +1314,7 @@ async def run_with_enforcement(
                 return result
             ctx.post_update_nudge_count += 1
 
-        nudge_type = _NUDGE_TYPE_BY_MESSAGE.get(nudge, "intermediate_success")
+        nudge_type = _nudge_type_for_log(nudge)
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
         # OpenAI rejects images in tool messages, so a queued post-run
