@@ -258,6 +258,15 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     return user_response
 
 
+def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str:
+    from skyvern.forge.sdk.copilot.enforcement import build_probable_site_block_user_question
+
+    site_block_question = build_probable_site_block_user_question(ctx)
+    if site_block_question is not None:
+        return site_block_question
+    return user_response
+
+
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     """Surface a proposal only when it passed a test this turn AND yaml is on hand."""
     if ctx.last_workflow is not None and ctx.last_workflow_yaml and ctx.last_test_ok is True:
@@ -519,7 +528,9 @@ def _translate_to_agent_result(
     # cannot test. The generic rewrite would replace it with a vague
     # "Could you share more context", so skip it for ASK_QUESTION (and for
     # salvaged replies, which already describe the verified prefix).
-    if resp_type != "ASK_QUESTION" and not salvaged_reply:
+    if resp_type == "ASK_QUESTION":
+        user_response = _shape_ask_question_response(str(user_response), ctx)
+    elif not salvaged_reply:
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # Default-true preserves backwards-compat with stale prompts and missing fields.

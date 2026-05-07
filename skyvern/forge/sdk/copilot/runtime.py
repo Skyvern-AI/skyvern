@@ -94,6 +94,7 @@ class AgentContext:
     workflow_persisted: bool = False
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None
+    effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None
 
