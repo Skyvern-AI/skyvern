@@ -432,6 +432,40 @@ workflow_definition:
         assert agent_result.unvalidated is False
         assert agent_result.response_type == "ASK_QUESTION"
 
+    def test_probable_site_block_ask_question_is_concise_and_proxy_aware(self) -> None:
+        ctx = _ctx(
+            last_test_ok=False,
+            last_test_failure_reason="Skyvern failed to load the website. The page may have navigated unexpectedly.",
+            probable_site_block_stop_nudge_count=1,
+            effective_workflow_proxy_location="RESIDENTIAL",
+        )
+        verbose_response = (
+            "Diagnostic recap:\n"
+            "- I tried several workflow shapes with the same browser state.\n"
+            '- global_llm_context: {"workflow_state": "many internal details"}\n'
+            "- The final failure_reason was: Skyvern failed to load the website. "
+            "The page may have navigated unexpectedly.\n"
+            "- More implementation details that should not be user-facing.\n"
+            "Would you like me to configure a proxy?"
+        )
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": verbose_response})
+
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert len(agent_result.user_response.splitlines()) <= 8
+        assert "global_llm_context" not in agent_result.user_response
+        assert "configure a proxy" not in agent_result.user_response.lower()
+        assert "Would you like me to whether" not in agent_result.user_response
+        assert "different proxy location" in agent_result.user_response.lower()
+        assert "US-CA" in agent_result.user_response
+        assert "Skyvern failed to load the website. The page may have navigated unexpectedly." in (
+            agent_result.user_response
+        )
+        assert "same IP/workflow shape" in agent_result.user_response
+
     def test_reply_still_rewrites_after_failed_test(self) -> None:
         ctx = _ctx(
             last_update_block_count=2,

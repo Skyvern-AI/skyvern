@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
     REPEATED_FRONTIER_STREAK_ESCALATE_AT,
+    _check_enforcement,
     _needs_probable_site_block_stop_nudge,
     _repeated_frontier_failure_nudge,
 )
@@ -343,6 +344,32 @@ def test_nudge_text_is_stop_oriented() -> None:
     # Sanity-check the stop nudge tells the agent not to retry.
     assert "STOP" in POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
     assert "Do NOT" in POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
+
+
+def test_stop_nudge_uses_different_proxy_advice_when_effective_proxy_is_active() -> None:
+    ctx = _fresh_context()
+    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    ctx.effective_workflow_proxy_location = "RESIDENTIAL"
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge is not None
+    assert "configure a proxy" not in nudge.lower()
+    assert "different proxy location" in nudge.lower()
+    assert "US-CA" in nudge
+    assert "US-NY" in nudge
+    assert "residential/ISP" in nudge
+
+
+def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
+    ctx = _fresh_context()
+    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    ctx.effective_workflow_proxy_location = "NONE"
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge is not None
+    assert "configure a proxy" in nudge.lower()
 
 
 def test_detects_challenge_named_wait_block() -> None:
