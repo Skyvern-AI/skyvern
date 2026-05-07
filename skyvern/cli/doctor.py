@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import hashlib
 import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,7 +29,7 @@ doctor_app = typer.Typer(help="Check Skyvern installation health.")
 
 GENERATED_CREDENTIALS_FILE = Path(".skyvern/credentials.toml")
 LEGACY_STREAMLIT_CREDENTIALS_FILE = Path(".streamlit/secrets.toml")
-_FINGERPRINT_SALT = os.urandom(16)
+_FINGERPRINT_TAGS: dict[str, str] = {}
 
 
 @dataclass
@@ -642,11 +642,20 @@ def _fingerprint(value: str) -> str:
     """Return an opaque process-local tag for comparing sensitive values in logs."""
     if not value:
         return "missing"
-    return hashlib.blake2s(
-        value.encode("utf-8"),
-        digest_size=6,
-        key=_FINGERPRINT_SALT,
-    ).hexdigest()
+    if value not in _FINGERPRINT_TAGS:
+        _FINGERPRINT_TAGS[value] = secrets.token_hex(6)
+    return _FINGERPRINT_TAGS[value]
+
+
+def _write_generated_credentials_file(api_key: str) -> None:
+    """Write generated local credentials with private file permissions from creation."""
+    GENERATED_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(GENERATED_CREDENTIALS_FILE, flags, 0o600)
+    try:
+        os.write(fd, f'[general]\ncred = "{api_key}"\n'.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _run_docker_compose_exec(service: str, script: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -1568,12 +1577,7 @@ asyncio.run(main())
 
     set_key(str(backend_env), "SKYVERN_API_KEY", api_key, quote_mode="never")
     set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", api_key, quote_mode="never")
-    GENERATED_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    GENERATED_CREDENTIALS_FILE.write_text(f'[general]\ncred = "{api_key}"\n')
-    try:
-        GENERATED_CREDENTIALS_FILE.chmod(0o600)
-    except OSError:
-        pass
+    _write_generated_credentials_file(api_key)
     if LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
         LEGACY_STREAMLIT_CREDENTIALS_FILE.unlink()
 
