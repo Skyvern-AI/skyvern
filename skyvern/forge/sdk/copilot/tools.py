@@ -113,6 +113,8 @@ PER_TOOL_CALL_BUDGET_SECONDS = 240
 # false-positives on healthy runs.
 RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 
+MIN_BLOCK_RUNNING_REMAINING_SECONDS = PER_TOOL_CALL_BUDGET_SECONDS + RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
+
 # 5 s balances responsiveness (18 samples inside the stagnation window) against
 # DB load (240 polls worst case at the safety ceiling).
 RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
@@ -388,6 +390,47 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
+def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
+    started_at = getattr(ctx, "copilot_run_start_monotonic", None)
+    if not isinstance(started_at, int | float):
+        return None
+    return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
+
+
+def _late_block_running_call_error(ctx: AgentContext) -> str | None:
+    remaining = _copilot_seconds_remaining(ctx)
+    if remaining is None or remaining >= MIN_BLOCK_RUNNING_REMAINING_SECONDS:
+        return None
+
+    last_failed_workflow_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
+    last_good_workflow_yaml = getattr(ctx, "last_good_workflow_yaml", None)
+    if (
+        isinstance(last_failed_workflow_yaml, str)
+        and last_failed_workflow_yaml
+        and isinstance(last_good_workflow_yaml, str)
+        and last_good_workflow_yaml
+    ):
+        return (
+            f"Wall-clock budget too low to retry: about {int(max(0.0, remaining))}s remain of the "
+            f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified workflow exists from before the failure. "
+            "Do NOT call update_and_run_blocks or run_blocks_and_collect_debug again. REPLY now: summarize "
+            "what worked, name the block that failed, and tell the user they can keep the verified prefix or discard."
+        )
+
+    if isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
+        return (
+            f"Less than {MIN_BLOCK_RUNNING_REMAINING_SECONDS} seconds remain in this Copilot turn "
+            "after the previous workflow run failed. Do NOT retry block-running tools; reply to the user "
+            "with the failure evidence gathered so far and make clear that any draft workflow is unverified."
+        )
+
+    return (
+        f"Less than {MIN_BLOCK_RUNNING_REMAINING_SECONDS} seconds remain in this Copilot turn. "
+        "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
+        "progress gathered so far, and make clear which parts have not been verified end-to-end."
+    )
+
+
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:
@@ -457,26 +500,9 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 "explaining the failure and asking them to verify the URL."
             )
 
-        # Gate on ``last_failed_workflow_yaml`` (sticky across
-        # ``update_workflow``) rather than ``last_test_ok``: otherwise the
-        # agent can sandwich an ``update_workflow`` call between the failure
-        # and the retry to clear ``last_test_ok=None`` and slip past.
-        start_ts = getattr(ctx, "copilot_run_start_monotonic", None)
-        last_failed_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
-        last_good_yaml = getattr(ctx, "last_good_workflow_yaml", None)
-        if start_ts is not None and last_failed_yaml and last_good_yaml:
-            remaining = TOTAL_TIMEOUT_SECONDS - (time.monotonic() - start_ts)
-            if remaining < PER_TOOL_CALL_BUDGET_SECONDS:
-                return (
-                    f"Wall-clock budget too low to retry: about "
-                    f"{int(max(0.0, remaining))}s remain of the "
-                    f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified "
-                    "workflow exists from before the failure. Do NOT call "
-                    "update_and_run_blocks or run_blocks_and_collect_debug "
-                    "again. REPLY now: summarize what worked, name the "
-                    "block that failed, and tell the user they can keep "
-                    "the verified prefix or discard."
-                )
+        late_block_running_error = _late_block_running_call_error(ctx)
+        if late_block_running_error is not None:
+            return late_block_running_error
     return None
 
 
