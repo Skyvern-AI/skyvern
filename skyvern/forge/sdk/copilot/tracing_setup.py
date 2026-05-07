@@ -125,6 +125,16 @@ def _usage_field(obj: Any, *keys: str) -> Any:
     return None
 
 
+def _calculate_price(calc_price: Any, usage: Any, model: str) -> Any:
+    try:
+        return calc_price(usage, model_ref=model)
+    except Exception:
+        provider, separator, model_ref = model.partition("/")
+        if not separator or not provider or not model_ref:
+            raise
+        return calc_price(usage, model_ref=model_ref, provider_id=provider)
+
+
 def _attach_cost_attr(attrs: dict[str, Any], usage: Any, model: str | None) -> None:
     """Stamp ``operation.cost`` (USD) on a GenerationSpanData span.
 
@@ -144,19 +154,18 @@ def _attach_cost_attr(attrs: dict[str, Any], usage: Any, model: str | None) -> N
         _usage_field(usage, "input_tokens_details", "prompt_tokens_details"),
         "cached_tokens",
     )
+    if cached is None:
+        cached = _usage_field(usage, "cache_read_input_tokens")
     cache_read = int(cached) if isinstance(cached, (int, float)) and cached > 0 else None
     try:
         from genai_prices import Usage, calc_price
 
-        price = calc_price(
-            Usage(
-                input_tokens=int(input_tokens),
-                output_tokens=int(output_tokens),
-                cache_read_tokens=cache_read,
-            ),
-            model_ref=model,
-            provider_id="openai",
+        price_usage = Usage(
+            input_tokens=int(input_tokens),
+            output_tokens=int(output_tokens),
+            cache_read_tokens=cache_read,
         )
+        price = _calculate_price(calc_price, price_usage, model)
     except Exception:
         return
     attrs["operation.cost"] = float(price.total_price)

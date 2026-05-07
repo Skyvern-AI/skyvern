@@ -16,7 +16,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScriptTerminationException
+from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException
 
 
 def create_mock_page():
@@ -200,7 +200,8 @@ async def test_wait_for_page_ready_attribute_access_regression():
     source = inspect.getsource(ScriptSkyvernPage._wait_for_page_ready_before_action)
 
     # The fixed code should use self.page
-    assert "self.page" in source, "Method should access self.page"
+    # nosemgrep false positive: "self.page" is an attribute name, not a URL.
+    assert "self.page" in source, "Method should access self.page"  # nosemgrep: incomplete-url-substring-sanitization
 
     # The fixed code should NOT use self._page (except in comments)
     # Remove comments and docstrings first
@@ -560,6 +561,87 @@ async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_
             mock_handler.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_complete_raises_illegit_complete_subclass_when_handler_rejects(mock_scraped_page, mock_ai):
+    """
+    When handle_complete_action returns an ActionFailure (verifier rejected the
+    completion), complete() must raise IllegitCompleteScriptTermination — the
+    subclass — not the parent ScriptTerminationException. The script_service
+    catch sites distinguish the two: subclass → BlockStatus.failed (fallback
+    fires), parent → BlockStatus.terminated (no fallback).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+        mock_context.skip_complete_verification = False
+        mock_context.code_version = 1
+        mock_context.is_static_script = False
+        mock_context.script_mode = False
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        rejected_result = MagicMock(success=False)
+        rejected_result.exception_message = (
+            "Illegit complete, data={'error': 'Goal not achieved — page still on landing'}"
+        )
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch.object(
+                ScriptSkyvernPage,
+                "_update_step_output_before_complete",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                ScriptSkyvernPage,
+                "_create_final_screenshot",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_complete_action",
+                new_callable=AsyncMock,
+                return_value=[rejected_result],
+            ),
+        ):
+            # The subclass is what the catch sites in script_service.py key off of
+            # to record BlockStatus.failed (so AI fallback fires). If complete()
+            # regresses to raising plain ScriptTerminationException, the parent
+            # arm catches it and the block is recorded as terminated — no
+            # fallback fires for what is genuinely a failure.
+            with pytest.raises(IllegitCompleteScriptTermination, match="Illegit complete"):
+                await script_page.complete()
+
+
 # =============================================================================
 # Tests for fill() proactive upgrade when value=None + prompt
 # =============================================================================
@@ -858,3 +940,245 @@ class TestWaitMethod:
         assert seconds_param.default is None, (
             f"seconds should default to None so timeout_ms can be used instead, got default={seconds_param.default}"
         )
+
+
+class TestActionSubclassPersistence:
+    """Regression for SKY-9513: cached script execution must persist the correct
+    Action subclass with subclass-specific fields populated.
+
+    Before the fix, `_create_action_and_result_after_execution` constructed a
+    base `Action(...)` for every action type, silently dropping fields like
+    MoveAction.x/y and ScrollAction.scroll_x/scroll_y. After the fix, the
+    function dispatches via `ACTION_TYPE_TO_CLASS` and pulls subclass fields
+    from kwargs.
+    """
+
+    @staticmethod
+    def _build_script_page(mock_scraped_page, mock_ai):
+        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+
+        with patch(
+            "skyvern.core.script_generations.skyvern_page.Page.__init__",
+            return_value=None,
+        ):
+            return ScriptSkyvernPage(
+                scraped_page=mock_scraped_page,
+                page=create_mock_page(),
+                ai=mock_ai,
+            )
+
+    @staticmethod
+    def _build_context():
+        ctx = MagicMock()
+        ctx.organization_id = "o_test"
+        ctx.workflow_run_id = "wr_test"
+        ctx.task_id = "tsk_test"
+        ctx.step_id = "stp_test"
+        ctx.action_order = 0
+        ctx.script_mode = True
+        ctx.sensitive_values = set()
+        return ctx
+
+    @staticmethod
+    async def _invoke(script_page, action_type, kwargs, ctx, captured):
+        async def fake_create_action(action):
+            captured.append(action)
+            action.action_id = "act_test"
+            return action
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=ctx,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.create_action",
+                new=AsyncMock(side_effect=fake_create_action),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.update_action_reasoning",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager.get_run_context",
+                return_value=None,
+            ),
+        ):
+            return await script_page._create_action_and_result_after_execution(
+                action_type=action_type,
+                kwargs=kwargs,
+            )
+
+    @pytest.mark.asyncio
+    async def test_move_persists_x_and_y(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import MoveAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+        await self._invoke(
+            script_page,
+            ActionType.MOVE,
+            {"x": 100, "y": 200},
+            self._build_context(),
+            captured,
+        )
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert isinstance(action, MoveAction)
+        assert action.x == 100
+        assert action.y == 200
+
+    @pytest.mark.asyncio
+    async def test_scroll_persists_scroll_x_and_scroll_y(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import ScrollAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+        await self._invoke(
+            script_page,
+            ActionType.SCROLL,
+            {"scroll_x": 0, "scroll_y": 500},
+            self._build_context(),
+            captured,
+        )
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert isinstance(action, ScrollAction)
+        assert action.scroll_x == 0
+        assert action.scroll_y == 500
+
+    @pytest.mark.asyncio
+    async def test_drag_persists_start_coords_and_path(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import DragAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+        await self._invoke(
+            script_page,
+            ActionType.DRAG,
+            {"start_x": 10, "start_y": 20, "path": [(30, 40), (50, 60)]},
+            self._build_context(),
+            captured,
+        )
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert isinstance(action, DragAction)
+        assert action.start_x == 10
+        assert action.start_y == 20
+        assert action.path == [(30, 40), (50, 60)]
+
+    @pytest.mark.asyncio
+    async def test_keypress_persists_keys(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import KeypressAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+        await self._invoke(
+            script_page,
+            ActionType.KEYPRESS,
+            {"keys": ["Enter"], "hold": False, "duration": 0},
+            self._build_context(),
+            captured,
+        )
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert isinstance(action, KeypressAction)
+        assert action.keys == ["Enter"]
+
+    @pytest.mark.asyncio
+    async def test_extract_still_maps_prompt_and_schema(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import ExtractAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+        await self._invoke(
+            script_page,
+            ActionType.EXTRACT,
+            {"prompt": "Extract the price", "schema": {"type": "object"}},
+            self._build_context(),
+            captured,
+        )
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert isinstance(action, ExtractAction)
+        assert action.data_extraction_goal == "Extract the price"
+        assert action.data_extraction_schema == {"type": "object"}
+
+    @pytest.mark.asyncio
+    async def test_click_records_subclass_and_xpath(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import ClickAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+
+        async def fake_create_action(action):
+            captured.append(action)
+            action.action_id = "act_test"
+            return action
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=self._build_context(),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.create_action",
+                new=AsyncMock(side_effect=fake_create_action),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.update_action_reasoning",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager.get_run_context",
+                return_value=None,
+            ),
+        ):
+            await script_page._create_action_and_result_after_execution(
+                action_type=ActionType.CLICK,
+                kwargs={"selector": "[name='foo']"},
+                call_result="status=ok xpath=//div[@id='foo']",
+            )
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert isinstance(action, ClickAction)
+        assert action.xpath == "//div[@id='foo']"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_base_action_on_validation_error(self, mock_scraped_page, mock_ai):
+        """If a subclass has a required field that isn't provided, fall back to base
+        Action rather than crash. Mirrors the defensive pattern in hydrate_action
+        from PR #10894 (SKY-9512)."""
+        from skyvern.webeye.actions.action_types import ActionType
+        from skyvern.webeye.actions.actions import Action, VerificationCodeAction
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        captured: list = []
+        await self._invoke(
+            script_page,
+            ActionType.VERIFICATION_CODE,
+            # VerificationCodeAction requires `verification_code: str` — not present
+            # in script kwargs (the script-side method only takes `prompt`).
+            {"prompt": "Enter the OTP"},
+            self._build_context(),
+            captured,
+        )
+
+        assert len(captured) == 1
+        action = captured[0]
+        # Falls back to base Action; not VerificationCodeAction.
+        assert isinstance(action, Action)
+        assert not isinstance(action, VerificationCodeAction)
+        assert action.action_type == ActionType.VERIFICATION_CODE

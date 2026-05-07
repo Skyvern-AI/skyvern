@@ -685,12 +685,17 @@ class WorkflowService:
                 value[i] = await self._refresh_output_urls(item, organization_id, workflow_run_id)
         return value
 
-    async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
-        credential = await app.DATABASE.credentials.get_credential(
-            credential_id, organization_id=organization.organization_id
+    async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> None:
+        if not credential_ids:
+            return
+        unique_ids = list(dict.fromkeys(credential_ids))
+        existing = await app.DATABASE.credentials.get_credentials_by_ids(
+            unique_ids, organization_id=organization.organization_id
         )
-        if credential is None:
-            raise InvalidCredentialId(credential_id)
+        found = {credential.credential_id for credential in existing}
+        missing = [credential_id for credential_id in unique_ids if credential_id not in found]
+        if missing:
+            raise InvalidCredentialId(", ".join(missing))
 
     async def validate_schedule_parameters(
         self,
@@ -717,6 +722,7 @@ class WorkflowService:
             )
 
         missing_parameters: list[str] = []
+        credential_ids_to_validate: list[str] = []
         for workflow_parameter in schedule_parameters:
             if workflow_parameter.key in request_data:
                 request_value = request_data[workflow_parameter.key]
@@ -730,14 +736,14 @@ class WorkflowService:
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     if not isinstance(request_value, str):
                         raise InvalidCredentialId(f"Credential ID must be a string, got {type(request_value).__name__}")
-                    await self._validate_credential_id(request_value, organization)
+                    credential_ids_to_validate.append(request_value)
             elif workflow_parameter.default_value is not None:
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     if not isinstance(workflow_parameter.default_value, str):
                         raise InvalidCredentialId(
                             f"Credential ID must be a string, got {type(workflow_parameter.default_value).__name__}"
                         )
-                    await self._validate_credential_id(workflow_parameter.default_value, organization)
+                    credential_ids_to_validate.append(workflow_parameter.default_value)
             else:
                 missing_parameters.append(workflow_parameter.key)
 
@@ -748,6 +754,8 @@ class WorkflowService:
                     f"Missing schedule parameters for workflow {workflow.workflow_permanent_id}: {missing_keys_str}"
                 )
             )
+
+        await self._validate_credential_ids(credential_ids_to_validate, organization)
 
     async def setup_workflow_run(
         self,
@@ -911,7 +919,6 @@ class WorkflowService:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         if not isinstance(request_body_value, str):
                             raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
-                        await self._validate_credential_id(request_body_value, organization)
                     workflow_parameter_values.append((workflow_parameter, request_body_value))
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
@@ -919,7 +926,6 @@ class WorkflowService:
                             raise InvalidCredentialId(
                                 f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
                             )
-                        await self._validate_credential_id(workflow_parameter.default_value, organization)
                     workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
                 else:
                     missing_parameters.append(workflow_parameter.key)
@@ -931,6 +937,15 @@ class WorkflowService:
                     workflow_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+            await self._validate_credential_ids(
+                [
+                    value
+                    for (workflow_parameter, value) in workflow_parameter_values
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                ],
+                organization,
+            )
 
             if workflow_parameter_values:
                 try:
@@ -2391,6 +2406,10 @@ class WorkflowService:
 
                     LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
 
+                    # Pre-init so the success log can reference output_value
+                    # when ScriptTerminationException was caught (terminated
+                    # is now in script_success_statuses).
+                    output_value: Any = None
                     try:
                         exec_code = compile(wrapper_code, "<run_signature>", "exec")
                         exec(exec_code, exec_globals)
@@ -2418,10 +2437,10 @@ class WorkflowService:
                             status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
                             workflow_run_block_id=latest_block.workflow_run_block_id,
                         )
-                        # Terminated is a valid script outcome when generate_script_on_terminal is set
-                        script_success_statuses = {BlockStatus.completed}
-                        if workflow.generate_script_on_terminal:
-                            script_success_statuses.add(BlockStatus.terminated)
+                        # Terminate() is an explicit signal to stop, not a
+                        # failure to retry. `generate_script_on_terminal` is
+                        # orthogonal — it gates script generation, not fallback.
+                        script_success_statuses = {BlockStatus.completed, BlockStatus.terminated}
 
                         block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                         if workflow_run_block_result.status in script_success_statuses:
@@ -2588,34 +2607,11 @@ class WorkflowService:
                 # if the failure is code-fixable.
                 if fallback_episode_id and workflow_run_block_result:
                     try:
-                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
-
-                        # Build agent actions summary for both success and failure
-                        agent_actions_summary: dict = {
-                            "block_status": str(workflow_run_block_result.status),
-                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
-                            if workflow_run_block_result.output_parameter_value
-                            else None,
-                        }
-                        if form_fields_for_episode:
-                            agent_actions_summary["form_fields"] = form_fields_for_episode
-
-                        # For failed fallbacks, capture the failure reason
-                        if not fallback_succeeded:
-                            agent_actions_summary["failure_reason"] = (
-                                str(workflow_run_block_result.failure_reason)[:2000]
-                                if workflow_run_block_result.failure_reason
-                                else None
-                            )
-                            LOG.info(
-                                "AI fallback failed, keeping episode for triage",
-                                episode_id=fallback_episode_id,
-                                block_status=workflow_run_block_result.status,
-                                block_label=block.label,
-                            )
-
-                        # Fetch rich action details from the fallback execution
+                        # None = unknown count (taskless wrb / fetch error);
+                        # only a confirmed zero downgrades fallback_succeeded.
                         fallback_wrb_id = workflow_run_block_result.workflow_run_block_id
+                        agent_action_count: int | None = None
+                        action_summaries: list[dict] | None = None
                         if fallback_wrb_id:
                             try:
                                 wrb = await app.DATABASE.observer.get_workflow_run_block(
@@ -2627,13 +2623,47 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
+                                    agent_action_count = len(actions)
+                                    action_summaries = build_action_summaries_with_timing(actions)
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",
                                     fallback_wrb_id=fallback_wrb_id,
                                     exc_info=True,
                                 )
+
+                        # `completed` with confirmed 0 actions = the agent's
+                        # complete-verify accepting what the script's rejected.
+                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
+                        if fallback_succeeded and agent_action_count == 0:
+                            fallback_succeeded = False
+
+                        # Build agent actions summary for both success and failure
+                        agent_actions_summary: dict = {
+                            "block_status": str(workflow_run_block_result.status),
+                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
+                            if workflow_run_block_result.output_parameter_value
+                            else None,
+                        }
+                        if form_fields_for_episode:
+                            agent_actions_summary["form_fields"] = form_fields_for_episode
+                        if action_summaries is not None:
+                            agent_actions_summary["actions"] = action_summaries
+
+                        if not fallback_succeeded:
+                            if workflow_run_block_result.failure_reason:
+                                agent_actions_summary["failure_reason"] = str(workflow_run_block_result.failure_reason)[
+                                    :2000
+                                ]
+                            elif workflow_run_block_result.status == BlockStatus.completed and agent_action_count == 0:
+                                agent_actions_summary["failure_reason"] = script_service.VERIFIER_SWAP_FAILURE_REASON
+                            LOG.info(
+                                "AI fallback failed, keeping episode for triage",
+                                episode_id=fallback_episode_id,
+                                block_status=workflow_run_block_result.status,
+                                block_label=block.label,
+                                agent_action_count=agent_action_count,
+                            )
 
                         await app.DATABASE.scripts.update_fallback_episode(
                             episode_id=fallback_episode_id,

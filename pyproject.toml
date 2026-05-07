@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.31"
+version = "1.0.33"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -22,13 +22,18 @@ dependencies = [
 server = [
     "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
+    # Plain pip sees LiteLLM's exact openai pin and therefore resolves this
+    # range to openai-agents 0.10.x. Cloud/source installs include the cloud
+    # group below, where uv overrides let the newer 0.14.x SDK resolve.
+    "openai-agents>=0.10.5,<0.15",
+    "python-dotenv==1.2.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
-    "aiohttp>=3.13.5,<4",
+    "aiohttp>=3.13.4,<4",
     "python-multipart>=0.0.22,<1",
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.35.0",
-    "litellm>=1.83.7",
+    "litellm==1.83.14",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
@@ -59,7 +64,6 @@ server = [
     "pypdf>=6.7.5,<7",
     "pdfplumber>=0.11.0,<0.12",
     "fastmcp>=3.2.0,<4",
-    "openai-agents>=0.14.4,<0.15",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
     "anthropic>=0.96.0,<0.97",
@@ -74,7 +78,7 @@ server = [
     "pandas>=2.3.1,<4",
     "azure-identity>=1.24.0,<2",
     "azure-keyvault-secrets>=4.2.0,<5",
-    "jsonschema>=4.25.1",
+    "jsonschema>=4.23.0",
     "python-calamine>=0.6.1",
     "python-docx>=1.1.0",
     "urllib3>=2.6.3",
@@ -91,6 +95,10 @@ server = [
 
 [dependency-groups]
 cloud = [
+    # Keep workflow-copilot on the newer Agents SDK for cloud/source installs.
+    # uv's override-dependencies below relax LiteLLM's exact transitive pins,
+    # but those overrides do not ship in public wheel metadata.
+    "openai-agents>=0.14.4,<0.15",
     "stripe>=9.7.0,<10",
     "temporalio[opentelemetry]>=1.6.0,<2",
     "temporalio>=1.6.0,<2",

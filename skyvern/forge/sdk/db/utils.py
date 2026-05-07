@@ -1,6 +1,7 @@
 import json
 import typing
 
+import pydantic
 import pydantic.json
 import structlog
 
@@ -818,12 +819,55 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
             if value is not None:
                 action_data[key] = value
 
-    # Get the appropriate action class and instantiate it
+    # Get the appropriate action class and instantiate it. Fall back to base Action on
+    # validation/lookup failure so a single malformed row never poisons list endpoints
+    # like the workflow run timeline (SKY-9512).
     action_class = ACTION_TYPE_TO_CLASS.get(action_model.action_type)
     if action_class is None:
-        raise ValueError(f"Unsupported action type: {action_model.action_type}")
+        LOG.warning(
+            "Unknown action_type in DB, hydrating as base Action",
+            action_id=action_model.action_id,
+            action_type=action_model.action_type,
+        )
+        return _hydrate_as_base_action(action_data, action_model)
 
-    return action_class(**action_data)
+    try:
+        return action_class(**action_data)
+    except pydantic.ValidationError as exc:
+        LOG.warning(
+            "Failed to hydrate action as typed subclass, falling back to base Action",
+            action_id=action_model.action_id,
+            action_type=action_model.action_type,
+            errors=exc.errors(),
+        )
+        return _hydrate_as_base_action(action_data, action_model)
+
+
+def _hydrate_as_base_action(action_data: dict[str, typing.Any], action_model: ActionModel) -> Action:
+    """Construct a base Action, dropping fields the base model rejects.
+
+    The action_json may contain subclass-only fields (e.g. MoveAction.x) or values that
+    fail validation against the base Action schema. Strip anything the base model can't
+    accept so we always return *something* renderable for the UI.
+    """
+    try:
+        return Action(**action_data)
+    except pydantic.ValidationError:
+        minimal: dict[str, typing.Any] = {
+            "action_type": action_model.action_type,
+            "status": action_model.status,
+            "action_id": action_model.action_id,
+            "organization_id": action_model.organization_id,
+            "workflow_run_id": action_model.workflow_run_id,
+            "task_id": action_model.task_id,
+            "step_id": action_model.step_id,
+            "created_at": action_model.created_at,
+            "modified_at": action_model.modified_at,
+        }
+        try:
+            return Action(**minimal)
+        except pydantic.ValidationError:
+            return Action.model_construct(**minimal)
 
 
 def convert_to_workflow_schedule(
