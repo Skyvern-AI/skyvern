@@ -125,7 +125,7 @@ dev = [
     "isort>=5.13.2",
     "mypy>=1.18.2,<2",
     "types-requests>=2.31.0.2,<3",
-    "pytest>=7.4.0,<8",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=0.21.1,<0.22",
     # Needed by tests/unit/test_llm_handler_tracing.py which exercises the LLM
     # chokepoint's OTEL instrumentation. Cloud runtime also uses this via
@@ -137,7 +137,7 @@ dev = [
     "pydevd-pycharm>=233.6745.319,<234",
     "ipython>=8.17.2,<9",
     "ipykernel>=6.26.0,<8",
-    "notebook>=7.0.6,<8",
+    "notebook>=7.5.6,<8",
     "freezegun>=1.2.2,<2",
     "fpdf>=1.7.2,<2",
     "twine>=6.1.0,<7",
