@@ -218,17 +218,30 @@ async def poll_otp_value(
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
     )
-    max_consecutive_failures = settings.VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES
     consecutive_failures = 0
+    last_error_reason: str | None = None
     while True:
         await asyncio.sleep(10)
-        # check timeout
         if datetime.utcnow() > timeout_datetime:
+            if consecutive_failures > 0 and last_error_reason is not None:
+                LOG.warning(
+                    "Polling otp value timed out while webhook was still failing",
+                    consecutive_failures=consecutive_failures,
+                    last_error_reason=last_error_reason,
+                )
+                raise FailedToGetTOTPVerificationCode(
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow_id or workflow_permanent_id,
+                    totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
+                    reason=last_error_reason,
+                )
             LOG.warning("Polling otp value timed out")
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
-                workflow_id=workflow_permanent_id,
+                workflow_id=workflow_id or workflow_permanent_id,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
             )
@@ -250,21 +263,21 @@ async def poll_otp_value(
                     workflow_id=workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
                 )
-        except FailedToGetTOTPVerificationCode:
+        except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
+            last_error_reason = e.reason
             LOG.warning(
-                "OTP fetch failed, will retry",
+                "OTP fetch failed, will retry until wall-clock timeout",
                 consecutive_failures=consecutive_failures,
-                max_consecutive_failures=max_consecutive_failures,
+                last_error_reason=e.reason,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
             )
-            if consecutive_failures >= max_consecutive_failures:
-                raise
             continue
-        consecutive_failures = 0  # reset on any non-exception poll, even if otp_value is None
+        consecutive_failures = 0
+        last_error_reason = None
         if otp_value:
             LOG.info("Got otp value", otp_value=otp_value)
             return otp_value
