@@ -14,8 +14,7 @@ from skyvern.forge.sdk.copilot.agent import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.tools import (
-    MIN_BLOCK_RUNNING_REMAINING_SECONDS,
-    PER_TOOL_CALL_BUDGET_SECONDS,
+    COPILOT_FINAL_REPLY_RESERVE_SECONDS,
     _record_run_blocks_result,
     _tool_loop_error,
 )
@@ -45,7 +44,7 @@ def _ctx_after_failure_with_verified_prefix(*, elapsed_seconds: float) -> Copilo
 
 
 def test_tool_loop_error_blocks_run_when_budget_low_after_failure() -> None:
-    elapsed = TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS - 30)
+    elapsed = TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS - 10)
     ctx = _ctx_after_failure_with_verified_prefix(elapsed_seconds=elapsed)
     for tool in ("update_and_run_blocks", "run_blocks_and_collect_debug"):
         msg = _tool_loop_error(ctx, tool)
@@ -54,7 +53,7 @@ def test_tool_loop_error_blocks_run_when_budget_low_after_failure() -> None:
 
 def test_tool_loop_error_no_guard_when_budget_sufficient() -> None:
     ctx = _ctx_after_failure_with_verified_prefix(
-        elapsed_seconds=TOTAL_TIMEOUT_SECONDS - (MIN_BLOCK_RUNNING_REMAINING_SECONDS + 30)
+        elapsed_seconds=TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS + 30)
     )
     assert _tool_loop_error(ctx, "update_and_run_blocks") is None
 
@@ -78,7 +77,7 @@ def test_tool_loop_error_blocks_failed_retry_when_no_good_workflow_exists() -> N
 
 
 def test_tool_loop_error_no_guard_for_non_block_running_tools() -> None:
-    elapsed = TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS - 30)
+    elapsed = TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS - 10)
     ctx = _ctx_after_failure_with_verified_prefix(elapsed_seconds=elapsed)
     for tool in ("update_workflow", "list_credentials", "get_run_results"):
         assert _tool_loop_error(ctx, tool) is None, tool
@@ -87,7 +86,7 @@ def test_tool_loop_error_no_guard_for_non_block_running_tools() -> None:
 def test_tool_loop_error_guard_persists_through_update_workflow() -> None:
     # ``last_test_ok`` flips to None on every ``update_workflow``, but
     # ``last_failed_workflow_yaml`` stays — so the guard must still fire.
-    elapsed = TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS - 30)
+    elapsed = TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS - 10)
     ctx = _ctx_after_failure_with_verified_prefix(elapsed_seconds=elapsed)
     ctx.last_test_ok = None
     ctx.last_workflow = SimpleNamespace(workflow_id="wf-edited")

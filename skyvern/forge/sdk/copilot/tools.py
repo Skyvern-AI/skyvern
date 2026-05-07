@@ -114,7 +114,8 @@ PER_TOOL_CALL_BUDGET_SECONDS = 240
 # false-positives on healthy runs.
 RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 
-MIN_BLOCK_RUNNING_REMAINING_SECONDS = PER_TOOL_CALL_BUDGET_SECONDS + RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
+# Reserve final-reply room; active block runs shrink their own budget near the deadline.
+COPILOT_FINAL_REPLY_RESERVE_SECONDS = 90
 
 # 5 s balances responsiveness (18 samples inside the stagnation window) against
 # DB load (240 polls worst case at the safety ceiling).
@@ -398,9 +399,17 @@ def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
     return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
 
 
+def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
+    remaining = _copilot_seconds_remaining(ctx)
+    if remaining is None:
+        return PER_TOOL_CALL_BUDGET_SECONDS
+    remaining_after_reply_reserve = remaining - COPILOT_FINAL_REPLY_RESERVE_SECONDS
+    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining_after_reply_reserve)))
+
+
 def _late_block_running_call_error(ctx: AgentContext) -> str | None:
     remaining = _copilot_seconds_remaining(ctx)
-    if remaining is None or remaining >= MIN_BLOCK_RUNNING_REMAINING_SECONDS:
+    if remaining is None or remaining > COPILOT_FINAL_REPLY_RESERVE_SECONDS:
         return None
 
     last_failed_workflow_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
@@ -420,13 +429,13 @@ def _late_block_running_call_error(ctx: AgentContext) -> str | None:
 
     if isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
         return (
-            f"Less than {MIN_BLOCK_RUNNING_REMAINING_SECONDS} seconds remain in this Copilot turn "
+            f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn "
             "after the previous workflow run failed. Do NOT retry block-running tools; reply to the user "
             "with the failure evidence gathered so far and make clear that any draft workflow is unverified."
         )
 
     return (
-        f"Less than {MIN_BLOCK_RUNNING_REMAINING_SECONDS} seconds remain in this Copilot turn. "
+        f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn. "
         "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
         "progress gathered so far, and make clear which parts have not been verified end-to-end."
     )
@@ -1595,7 +1604,7 @@ async def _run_blocks_and_collect_debug(
     # indefinitely.
     budget_exit_reason: WatchdogExitReason
     if stagnation_enabled:
-        budget_seconds = max(1, PER_TOOL_CALL_BUDGET_SECONDS)
+        budget_seconds = _active_block_run_budget_seconds(ctx)
         budget_exit_reason = "per_tool_budget"
     else:
         budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
