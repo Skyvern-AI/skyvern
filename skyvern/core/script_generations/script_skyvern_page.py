@@ -19,7 +19,7 @@ from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ActionCall, ActionMetadata, RunContext, SkyvernPage
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import ScriptTerminationException, WorkflowRunNotFound
+from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -1076,7 +1076,9 @@ class ScriptSkyvernPage(SkyvernPage):
             # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
-                raise ScriptTerminationException(result[-1].exception_message)
+                # Coerce empty/None messages so downstream str(e) is meaningful.
+                msg = result[-1].exception_message or "complete-verify rejected without a message"
+                raise IllegitCompleteScriptTermination(msg)
 
         # Capture final full-page screenshot at block completion
         await self._create_final_screenshot()
