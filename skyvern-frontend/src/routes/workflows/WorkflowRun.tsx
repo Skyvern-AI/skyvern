@@ -78,7 +78,8 @@ function WorkflowRun() {
 
   const status = (error as AxiosError | undefined)?.response?.status;
   const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflowPermanentIdParam;
+  const workflowPermanentId =
+    workflowPermanentIdParam ?? workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const isWorkflowDeleted = Boolean(workflow?.deleted_at);
