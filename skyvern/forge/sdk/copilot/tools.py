@@ -24,7 +24,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import PROBABLE_SITE_BLOCK_STREAK_STOP_AT, TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
@@ -591,6 +591,10 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
     stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
     if stale_metadata:
         return {"ok": False, "error": _stale_block_metadata_message(stale_metadata)}
+
+    wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
+    if wait_block_error:
+        return {"ok": False, "error": wait_block_error}
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -2091,6 +2095,65 @@ def _detect_new_banned_blocks(
     prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
     prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [])}
     return [(label, block_type) for label, block_type in submitted_items if label not in prior_labels]
+
+
+_CHALLENGE_WAIT_PATTERN = re.compile(
+    r"\b(anti[-_\s]?bot|bot[-_\s]?block|captcha|challenge|cloudflare|ip[-_\s]?block|waf)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_confirmed_waf_or_site_block(ctx: Any) -> bool:
+    if getattr(ctx, "last_test_anti_bot", None):
+        return True
+    return _get_int_attr(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+
+
+def _get_int_attr(ctx: Any, name: str, default: int = 0) -> int:
+    value = getattr(ctx, name, default)
+    return value if isinstance(value, int) else default
+
+
+def _block_challenge_wait_text(block: dict[str, Any]) -> str:
+    values = []
+    for key in ("label", "title", "description", "navigation_goal", "complete_criterion"):
+        value = block.get(key)
+        if isinstance(value, str):
+            values.append(value)
+    return " ".join(values)
+
+
+def _detect_timing_only_challenge_wait_blocks(submitted_yaml: str | None) -> list[str]:
+    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
+    if submitted_blocks is None:
+        return []
+    labels: list[str] = []
+    for block in _iter_yaml_blocks(submitted_blocks):
+        raw_type = block.get("block_type")
+        if not isinstance(raw_type, str) or raw_type.strip().lower() != "wait":
+            continue
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        if _CHALLENGE_WAIT_PATTERN.search(_block_challenge_wait_text(block)):
+            labels.append(label)
+    return labels
+
+
+def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | None) -> str | None:
+    if not _has_confirmed_waf_or_site_block(ctx):
+        return None
+    labels = _detect_timing_only_challenge_wait_blocks(submitted_yaml)
+    if not labels:
+        return None
+    labels_text = ", ".join(sorted(set(labels)))
+    return (
+        "Workflow validation failed: timing-only challenge wait blocks are not allowed after confirmed "
+        "anti-bot/WAF or repeated site-block evidence. "
+        f"Offending labels: [{labels_text}]. "
+        "Do not add wait/delay-only blocks for this blocker; use a conditional challenge check that takes a "
+        "real action, try a materially different proxy/source if allowed, or stop and explain the blocker."
+    )
 
 
 async def _get_block_schema_pre_hook(
