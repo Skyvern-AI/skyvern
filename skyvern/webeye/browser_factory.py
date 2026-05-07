@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, cast
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse
 
 import psutil
 import structlog
@@ -751,15 +751,16 @@ def _resolve_host_docker_internal_url(remote_browser_url: str) -> str | None:
     if not address_info:
         return None
 
-    resolved_host = address_info[0][4][0]
-    if not resolved_host:
+    sockaddr = address_info[0][4]
+    resolved_host = sockaddr[0]
+    if not isinstance(resolved_host, str) or not resolved_host:
         return None
 
-    netloc = resolved_host
+    netloc: str = resolved_host
     if parsed.port:
         netloc = f"{resolved_host}:{parsed.port}"
 
-    return urlunparse(parsed._replace(netloc=netloc))
+    return parsed._replace(netloc=netloc).geturl()
 
 
 def _build_cdp_configuration_error(
