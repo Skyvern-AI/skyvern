@@ -452,8 +452,14 @@ def _translate_to_agent_result(
                 _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
                 _stale_block_metadata_message,
+                _timing_only_challenge_wait_reject_message,
             )
 
+            wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
+            if wait_block_error:
+                user_response = f"{user_response}\n\n(Note: {wait_block_error})"
+                ctx.last_test_ok = None
+                workflow_yaml = ""
             banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
