@@ -1,3 +1,4 @@
+import asyncio
 import io
 import os
 import shutil
@@ -42,10 +43,21 @@ S3_ZSTD_COMPRESSED_SUFFIX = ".zst"
 
 class S3Storage(BaseStorage):
     _PATH_VERSION = "v1"
+    # Cap concurrent head_object fan-out in the legacy listing fallback.
+    # /browser_sessions/history gathers across up to page_size=100 sessions
+    # in parallel, so a per-call semaphore would still allow sessions x cap
+    # in-flight requests. The semaphore is held on the instance so every
+    # legacy listing call sharing this S3Storage shares the same cap.
+    _LEGACY_LISTING_HEAD_CONCURRENCY = 32
 
     def __init__(self, bucket: str | None = None, endpoint_url: str | None = None) -> None:
         self.async_client = AsyncAWSClient(endpoint_url=endpoint_url)
         self.bucket = bucket or settings.AWS_S3_BUCKET_ARTIFACTS
+        # asyncio.Semaphore is event-loop-bound; constructing it eagerly is
+        # safe in 3.10+ (binds lazily on first acquire). The forge/cloud apps
+        # run a single asyncio loop, so one instance-level semaphore is
+        # enough to enforce a request-wide cap across the outer fanout.
+        self._head_object_semaphore = asyncio.Semaphore(self._LEGACY_LISTING_HEAD_CONCURRENCY)
 
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
@@ -369,6 +381,54 @@ class S3Storage(BaseStorage):
             organization_id=organization_id, browser_session_id=browser_session_id
         )
 
+    async def _safe_get_object_info(self, uri: str) -> dict | None:
+        try:
+            return await self.async_client.get_object_info(uri)
+        except Exception:
+            LOG.exception("Object info retrieval failed", uri=uri)
+            return None
+
+    async def _bounded_get_object_infos(self, keys: list[str]) -> list[dict | None]:
+        """Fan out head_object across keys under the instance-wide cap.
+
+        Uses ``self._head_object_semaphore`` so concurrent callers on the same
+        ``S3Storage`` (e.g. the per-session fanout inside
+        ``/browser_sessions/history``) share one limit instead of each getting
+        its own — otherwise page_size x cap could blow past S3 client limits.
+        """
+        if not keys:
+            return []
+
+        async def _bounded(uri: str) -> dict | None:
+            async with self._head_object_semaphore:
+                return await self._safe_get_object_info(uri)
+
+        return await asyncio.gather(*[_bounded(key) for key in keys])
+
+    async def _resilient_presign(self, keys: list[str]) -> list[str | None]:
+        """Batch presign with per-key fallback so one failure does not drop every URL."""
+        if not keys:
+            return []
+        batched = await self.async_client.create_presigned_urls(keys)
+        if batched is not None and len(batched) == len(keys):
+            return list(batched)
+
+        LOG.warning(
+            "Batch presign failed or returned wrong length; falling back to per-key signing",
+            requested=len(keys),
+            returned=(len(batched) if batched is not None else None),
+        )
+
+        async def _sign_one(uri: str) -> str | None:
+            try:
+                signed = await self.async_client.create_presigned_urls([uri])
+                return signed[0] if signed else None
+            except Exception:
+                LOG.exception("Per-key presign failed", uri=uri)
+                return None
+
+        return await asyncio.gather(*[_sign_one(key) for key in keys])
+
     async def _get_shared_downloaded_files_in_browser_session_via_listing(
         self, *, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
@@ -386,34 +446,29 @@ class S3Storage(BaseStorage):
         if len(object_keys) == 0:
             return []
 
-        file_infos: list[FileInfo] = []
-        for key in object_keys:
-            metadata = {}
-            modified_at: datetime | None = None
-            # Get metadata (including checksum)
-            try:
-                object_info = await self.async_client.get_object_info(key)
-                metadata = object_info.get("Metadata", {})
-                modified_at = object_info.get("LastModified")
-            except Exception:
-                LOG.exception("Object info retrieval failed", uri=key)
+        object_infos, presigned_urls = await asyncio.gather(
+            self._bounded_get_object_infos(object_keys),
+            self._resilient_presign(object_keys),
+        )
 
-            # Create FileInfo object
+        file_infos: list[FileInfo] = []
+        for key, object_info, url in zip(object_keys, object_infos, presigned_urls):
+            if url is None:
+                continue
+            metadata = (object_info or {}).get("Metadata") or {}
+            modified_at: datetime | None = (object_info or {}).get("LastModified")
+
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
-            # Get presigned URL
-            presigned_urls = await self.async_client.create_presigned_urls([key])
-            if not presigned_urls:
-                continue
-
-            file_info = FileInfo(
-                url=presigned_urls[0],
-                checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
-                modified_at=modified_at,
+            file_infos.append(
+                FileInfo(
+                    url=url,
+                    checksum=checksum,
+                    filename=metadata.get("original_filename", filename) if metadata else filename,
+                    modified_at=modified_at,
+                )
             )
-            file_infos.append(file_info)
 
         return file_infos
 
@@ -488,56 +543,58 @@ class S3Storage(BaseStorage):
         # rows — every call here is a billable ListObjects request.
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
         listing_uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
-        object_keys = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=listing_uri)]
-        if len(object_keys) == 0:
+        all_keys = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=listing_uri)]
+        if len(all_keys) == 0:
             return []
 
-        file_infos: list[FileInfo] = []
-        for key in object_keys:
-            # Playwright's record_video_dir should only contain .webm files.
-            # Filter defensively in case of unexpected files.
+        # Playwright's record_video_dir should only contain .webm files; filter defensively.
+        candidate_keys: list[str] = []
+        for key in all_keys:
             key_lower = key.lower()
-            if not (key_lower.endswith(".webm") or key_lower.endswith(".mp4")):
+            if key_lower.endswith(".webm") or key_lower.endswith(".mp4"):
+                candidate_keys.append(key)
+            else:
                 LOG.warning(
                     "Skipping recording file with unsupported extension",
                     uri=key,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                 )
+        if not candidate_keys:
+            return []
+
+        # Defer presign until zero-byte uploads are filtered out so we never sign discards.
+        candidate_infos = await self._bounded_get_object_infos(candidate_keys)
+        kept: list[tuple[str, dict | None]] = []
+        for key, info in zip(candidate_keys, candidate_infos):
+            if info is not None and info.get("ContentLength") == 0:
                 continue
+            kept.append((key, info))
+        if not kept:
+            return []
 
-            metadata = {}
-            modified_at: datetime | None = None
-            content_length: int | None = None
-            # Get metadata (including checksum)
-            try:
-                object_info = await self.async_client.get_object_info(key)
-                metadata = object_info.get("Metadata", {})
-                modified_at = object_info.get("LastModified")
-                content_length = object_info.get("ContentLength")
-            except Exception:
-                LOG.exception("Recording object info retrieval failed", uri=key)
+        object_keys = [key for key, _ in kept]
+        object_infos = [info for _, info in kept]
+        presigned_urls = await self._resilient_presign(object_keys)
 
-            # Skip zero-byte objects (if any incompleted uploads)
-            if content_length == 0:
+        file_infos: list[FileInfo] = []
+        for key, object_info, url in zip(object_keys, object_infos, presigned_urls):
+            if url is None:
                 continue
+            metadata = (object_info or {}).get("Metadata") or {}
+            modified_at: datetime | None = (object_info or {}).get("LastModified")
 
-            # Create FileInfo object
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
-            # Get presigned URL
-            presigned_urls = await self.async_client.create_presigned_urls([key])
-            if not presigned_urls:
-                continue
-
-            file_info = FileInfo(
-                url=presigned_urls[0],
-                checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
-                modified_at=modified_at,
+            file_infos.append(
+                FileInfo(
+                    url=url,
+                    checksum=checksum,
+                    filename=metadata.get("original_filename", filename) if metadata else filename,
+                    modified_at=modified_at,
+                )
             )
-            file_infos.append(file_info)
 
         # Prefer the newest recording first (S3 list order is not guaranteed).
         # Treat None as "oldest".
