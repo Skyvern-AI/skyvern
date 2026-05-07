@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.33"
+version = "1.0.34"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -166,10 +166,14 @@ exclude = [
     "skyvern-frontend/node_modules",
     "skyvern-frontend/dist",
 ]
+[tool.hatch.build.targets.sdist.force-include]
+"alembic" = "alembic"
 [tool.hatch.build.targets.wheel]
 include = [
     "skyvern",
 ]
+[tool.hatch.build.targets.wheel.force-include]
+"alembic" = "alembic"
 
 [tool.uv]
 # Supply chain quarantine: block packages published less than 7 days ago.
