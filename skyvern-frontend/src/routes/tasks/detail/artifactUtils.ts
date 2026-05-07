@@ -2,13 +2,16 @@ import { ArtifactApiResponse, TaskApiResponse } from "@/api/types";
 import { artifactApiBaseUrl } from "@/util/env";
 
 export function getImageURL(artifact: ArtifactApiResponse): string {
-  if (artifact.signed_url) {
-    return artifact.signed_url;
+  const url = artifact.signed_url || artifact.uri;
+
+  if (url.startsWith("file://")) {
+    const path = url.slice(7);
+    const query = new URLSearchParams({ path }).toString();
+
+    return `${artifactApiBaseUrl}/artifact/image?${query}`;
   }
-  if (artifact.uri.startsWith("file://")) {
-    return `${artifactApiBaseUrl}/artifact/image?path=${artifact.uri.slice(7)}`;
-  }
-  return artifact.uri;
+
+  return url;
 }
 
 export function getScreenshotURL(task: TaskApiResponse) {
