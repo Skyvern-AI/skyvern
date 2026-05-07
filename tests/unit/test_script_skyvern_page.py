@@ -16,7 +16,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScriptTerminationException
+from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException
 
 
 def create_mock_page():
@@ -200,7 +200,8 @@ async def test_wait_for_page_ready_attribute_access_regression():
     source = inspect.getsource(ScriptSkyvernPage._wait_for_page_ready_before_action)
 
     # The fixed code should use self.page
-    assert "self.page" in source, "Method should access self.page"
+    # nosemgrep false positive: "self.page" is an attribute name, not a URL.
+    assert "self.page" in source, "Method should access self.page"  # nosemgrep: incomplete-url-substring-sanitization
 
     # The fixed code should NOT use self._page (except in comments)
     # Remove comments and docstrings first
@@ -558,6 +559,87 @@ async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_
                 await script_page.terminate(errors=["handler error"])
 
             mock_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_illegit_complete_subclass_when_handler_rejects(mock_scraped_page, mock_ai):
+    """
+    When handle_complete_action returns an ActionFailure (verifier rejected the
+    completion), complete() must raise IllegitCompleteScriptTermination — the
+    subclass — not the parent ScriptTerminationException. The script_service
+    catch sites distinguish the two: subclass → BlockStatus.failed (fallback
+    fires), parent → BlockStatus.terminated (no fallback).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+        mock_context.skip_complete_verification = False
+        mock_context.code_version = 1
+        mock_context.is_static_script = False
+        mock_context.script_mode = False
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        rejected_result = MagicMock(success=False)
+        rejected_result.exception_message = (
+            "Illegit complete, data={'error': 'Goal not achieved — page still on landing'}"
+        )
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch.object(
+                ScriptSkyvernPage,
+                "_update_step_output_before_complete",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                ScriptSkyvernPage,
+                "_create_final_screenshot",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_complete_action",
+                new_callable=AsyncMock,
+                return_value=[rejected_result],
+            ),
+        ):
+            # The subclass is what the catch sites in script_service.py key off of
+            # to record BlockStatus.failed (so AI fallback fires). If complete()
+            # regresses to raising plain ScriptTerminationException, the parent
+            # arm catches it and the block is recorded as terminated — no
+            # fallback fires for what is genuinely a failure.
+            with pytest.raises(IllegitCompleteScriptTermination, match="Illegit complete"):
+                await script_page.complete()
 
 
 # =============================================================================
