@@ -1,10 +1,12 @@
 """Tests for browser launch error classification in browser_factory.py."""
 
 from skyvern.webeye.browser_factory import (
-    _build_cdp_configuration_error,
     _is_browser_profile_corruption_error,
     _is_display_server_error,
-    _parse_cdp_discovery_error,
+)
+from skyvern.webeye.cdp_connection import (
+    build_cdp_configuration_error,
+    parse_cdp_discovery_error,
 )
 
 # -- _is_display_server_error ------------------------------------------------
@@ -122,7 +124,7 @@ class TestCdpConnectionDiagnostics:
             "DevTools server, try connecting via ws://."
         )
 
-        assert _parse_cdp_discovery_error(error) == (
+        assert parse_cdp_discovery_error(error) == (
             404,
             "http://192.168.65.254:9222/json/version/",
         )
@@ -134,7 +136,7 @@ class TestCdpConnectionDiagnostics:
             "DevTools server, try connecting via ws://."
         )
 
-        configuration_error = _build_cdp_configuration_error(
+        configuration_error = build_cdp_configuration_error(
             "http://192.168.65.254:9222/",
             error,
         )
@@ -152,7 +154,7 @@ class TestCdpConnectionDiagnostics:
             "DevTools server, try connecting via ws://."
         )
 
-        configuration_error = _build_cdp_configuration_error(
+        configuration_error = build_cdp_configuration_error(
             "http://host.docker.internal:9222/",
             error,
         )
@@ -166,7 +168,7 @@ class TestCdpConnectionDiagnostics:
         error = Exception("WebSocket was closed before the connection was established")
 
         assert (
-            _build_cdp_configuration_error(
+            build_cdp_configuration_error(
                 "ws://127.0.0.1:9222/devtools/browser/abc",
                 error,
             )
