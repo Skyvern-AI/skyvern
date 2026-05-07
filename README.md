@@ -67,7 +67,9 @@ Choose your preferred setup method:
 
 > **Database default**: As of skyvern 1.0.31+, `skyvern run server` defaults to a SQLite database at `~/.skyvern/data.db` so it works out of the box with no Postgres setup. To use Postgres instead, set `DATABASE_STRING` in `.env` or pass `--database-string` to `skyvern quickstart`. Docker Compose always uses the bundled Postgres service.
 
-### Option A: pip install (Recommended)
+### Option A: pip install (Python server setup)
+
+Use this option for local Python server and CLI workflows. It installs the server extra, which is required for the API server, local browser runtime, local MCP, and local UI commands. For a full self-hosted setup with the web UI, Docker Compose is the safest path because it starts the API, browser runtime, Postgres, and UI together.
 
 Dependencies needed:
 - [Python 3.11.x](https://www.python.org/downloads/), works with 3.12, not ready yet for 3.13
@@ -80,7 +82,7 @@ Additionally, for Windows:
 #### 1. Install Skyvern
 
 ```bash
-pip install skyvern
+pip install "skyvern[server]"
 ```
 
 #### 2. Run Skyvern
@@ -115,14 +117,14 @@ Use this option if you want everything containerized (Postgres, API, UI) and don
 
 ```bash
 rm ~/.skyvern/data.db   # remove the leftover SQLite file
-pip install --upgrade skyvern   # 1.0.33+ contains the fix
+pip install --upgrade "skyvern[server]"   # 1.0.33+ contains the dependency fix
 skyvern quickstart
 ```
 
 If you are still on 1.0.31 and cannot upgrade, install via uv instead:
 
 ```bash
-uv pip install skyvern
+uv pip install "skyvern[server]"
 ```
 
 **`pip install skyvern` fails with ResolutionImpossible (litellm / fastmcp)** — You hit a dependency-resolution conflict in 1.0.31 or 1.0.32. Upgrade to 1.0.33+.
@@ -132,7 +134,8 @@ uv pip install skyvern
 **Skyvern is a Playwright extension that adds AI-powered browser automation.** It gives you the full power of Playwright with additional AI capabilities—use natural language prompts to interact with elements, extract data, and automate complex multi-step workflows.
 
 **Installation:**
-- Python: `pip install skyvern` then run `skyvern quickstart` for local setup
+- Python SDK for Skyvern Cloud / remote API usage: `pip install skyvern`
+- Local server, self-hosting, `skyvern quickstart`, `Skyvern.local()`, local browser, or local MCP: `pip install "skyvern[server]"`
 - TypeScript: `npm install @skyvern/client`
 
 ### AI-Powered Page Commands
@@ -202,9 +205,10 @@ summary = await page.prompt("Summarize what's on this page")
 
 **Run via UI:**
 ```bash
+pip install "skyvern[server]"
 skyvern run all
 ```
-Navigate to http://localhost:8080 to run tasks through the web interface.
+Navigate to http://localhost:8080 to run tasks through the web interface. For self-hosted UI installs, Docker Compose is recommended because it includes the UI service and backend services together.
 
 **Python SDK:**
 ```python
@@ -534,7 +538,7 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) installed.
 1. Run this to create your virtual environment (`.venv`)
     ```bash
-    uv sync --group dev
+    uv sync --extra server --group dev
     ```
 2. Perform initial server configuration
     ```bash
