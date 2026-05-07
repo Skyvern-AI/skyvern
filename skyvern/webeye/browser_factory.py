@@ -718,11 +718,7 @@ def is_valid_chromium_user_data_dir(directory: str) -> bool:
     default_dir = os.path.join(directory, "Default")
     preferences_file = os.path.join(default_dir, "Preferences")
 
-    return (
-        os.path.isdir(directory)
-        and os.path.isdir(default_dir)
-        and os.path.isfile(preferences_file)
-    )
+    return os.path.isdir(directory) and os.path.isdir(default_dir) and os.path.isfile(preferences_file)
 
 
 def _parse_cdp_discovery_error(error: Exception) -> tuple[int, str] | None:

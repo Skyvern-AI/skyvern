@@ -1,7 +1,7 @@
 import os
 import stat
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -140,9 +140,7 @@ def test_compose_database_connection_can_satisfy_database_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text(
-        "DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@localhost:5432/skyvern\n"
-    )
+    (tmp_path / ".env").write_text("DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@localhost:5432/skyvern\n")
 
     def fake_run(*_args, **_kwargs):
         return subprocess.CompletedProcess(

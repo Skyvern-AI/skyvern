@@ -653,7 +653,7 @@ def _write_generated_credentials_file(api_key: str) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     fd = os.open(GENERATED_CREDENTIALS_FILE, flags, 0o600)
     try:
-        os.write(fd, f'[general]\ncred = "{api_key}"\n'.encode("utf-8"))
+        os.write(fd, f'[general]\ncred = "{api_key}"\n'.encode())
     finally:
         os.close(fd)
 
@@ -733,9 +733,7 @@ def _check_local_streaming_mode() -> CheckResult:
     if frontend_env.exists():
         problems.extend(_validate_streaming_mode_value(str(frontend_raw or ""), "skyvern-frontend/.env"))
         if _normalize_streaming_mode(str(frontend_raw or "")) != LOCAL_STREAMING_MODE:
-            problems.append(
-                f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR} should be {LOCAL_STREAMING_MODE}"
-            )
+            problems.append(f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR} should be {LOCAL_STREAMING_MODE}")
     else:
         problems.append("skyvern-frontend/.env is missing")
 
@@ -933,9 +931,7 @@ console.log(JSON.stringify({
             detail=f"could not parse skyvern-ui env diagnostic output: {result.stdout.strip()[:200]}",
         )
 
-    container_values = {
-        name: str((payload.get("values") or {}).get(name) or "") for name in FRONTEND_RUNTIME_URL_VARS
-    }
+    container_values = {name: str((payload.get("values") or {}).get(name) or "") for name in FRONTEND_RUNTIME_URL_VARS}
     container_problems = _validate_frontend_runtime_url_values(container_values, "running skyvern-ui")
     container_problems.extend(
         _validate_streaming_mode_value(
@@ -949,8 +945,7 @@ console.log(JSON.stringify({
             status="error",
             detail="; ".join(container_problems),
             hint=(
-                "Recreate the UI after fixing skyvern-frontend/.env: "
-                "`docker compose up -d --force-recreate skyvern-ui`"
+                "Recreate the UI after fixing skyvern-frontend/.env: `docker compose up -d --force-recreate skyvern-ui`"
             ),
         )
 
@@ -1463,9 +1458,7 @@ def _fix_local_streaming_mode() -> bool:
 
     frontend_env = _ensure_frontend_env_exists()
     set_key(str(frontend_env), FRONTEND_STREAMING_MODE_VAR, LOCAL_STREAMING_MODE, quote_mode="never")
-    console.print(
-        f"  [cyan]Set {FRONTEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in skyvern-frontend/.env[/cyan]"
-    )
+    console.print(f"  [cyan]Set {FRONTEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in skyvern-frontend/.env[/cyan]")
 
     if _docker_compose_available():
         return _recreate_docker_services(["skyvern", "skyvern-ui"])
