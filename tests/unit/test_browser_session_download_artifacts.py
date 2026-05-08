@@ -44,6 +44,7 @@ def _make_artifact(
     browser_session_id: str = "pbs_1",
     run_id: str | None = None,
     checksum: str | None = None,
+    file_size: int | None = None,
     created_at: str = "2026-04-25T00:00:00Z",
 ) -> Artifact:
     return Artifact(
@@ -54,6 +55,7 @@ def _make_artifact(
         run_id=run_id,
         browser_session_id=browser_session_id,
         checksum=checksum,
+        file_size=file_size,
         created_at=created_at,
         modified_at=created_at,
     )
@@ -94,6 +96,7 @@ async def test_create_browser_session_download_artifact_inserts_when_no_existing
             uri="s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/downloads/file.pdf",
             filename="file.pdf",
             checksum="sha-xyz",
+            file_size=1234,
         )
 
     assert artifact_id.startswith("a_")
@@ -103,6 +106,7 @@ async def test_create_browser_session_download_artifact_inserts_when_no_existing
     assert kwargs["browser_session_id"] == "pbs_1"
     assert kwargs["organization_id"] == "o_1"
     assert kwargs["checksum"] == "sha-xyz"
+    assert kwargs["file_size"] == 1234
     # No run_id at write time — claim happens at run finalization.
     assert kwargs.get("run_id") is None
 
@@ -160,6 +164,7 @@ async def test_sync_browser_session_file_registers_download_artifact():
     with (
         patch.object(storage, "_get_storage_class_for_org", new=AsyncMock(return_value=MagicMock())),
         patch("skyvern.forge.sdk.artifact.storage.s3.calculate_sha256_for_file", return_value="sha-1"),
+        patch("skyvern.forge.sdk.artifact.storage.s3._safe_get_file_size", return_value=4321),
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as app_module,
     ):
         app_module.ARTIFACT_MANAGER = mock_artifact_manager
@@ -177,6 +182,7 @@ async def test_sync_browser_session_file_registers_download_artifact():
     assert kwargs["browser_session_id"] == "pbs_1"
     assert kwargs["filename"] == "file.pdf"
     assert kwargs["checksum"] == "sha-1"
+    assert kwargs["file_size"] == 4321
     assert kwargs["uri"].startswith("s3://") and "browser_sessions/pbs_1/downloads/" in kwargs["uri"]
 
 
@@ -261,6 +267,7 @@ async def test_sync_browser_session_file_creates_partial_artifact_with_null_chec
     with (
         patch.object(storage, "_get_storage_class_for_org", new=AsyncMock(return_value=MagicMock())),
         patch("skyvern.forge.sdk.artifact.storage.s3.calculate_sha256_for_file", mock_checksum),
+        patch("skyvern.forge.sdk.artifact.storage.s3._safe_get_file_size") as mock_file_size,
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as app_module,
     ):
         app_module.ARTIFACT_MANAGER = mock_artifact_manager
@@ -275,9 +282,11 @@ async def test_sync_browser_session_file_creates_partial_artifact_with_null_chec
     mock_create.assert_awaited_once()
     _, kwargs = mock_create.call_args
     assert kwargs["checksum"] is None
+    assert kwargs["file_size"] is None
     assert kwargs["uri"].endswith(BROWSER_DOWNLOADING_SUFFIX)
     # Partial files: checksum computation skipped — file is mid-write.
     mock_checksum.assert_not_called()
+    mock_file_size.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +305,7 @@ async def test_get_shared_downloaded_files_in_browser_session_uses_artifact_urls
         "a_42",
         "s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/downloads/invoice.pdf",
         checksum="sha-from-db",
+        file_size=2048,
     )
     mock_list = AsyncMock(return_value=[artifact])
     build_url = MagicMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
@@ -312,6 +322,7 @@ async def test_get_shared_downloaded_files_in_browser_session_uses_artifact_urls
     assert len(result) == 1
     assert result[0].url.startswith("https://api.skyvern.com/v1/artifacts/a_42/content")
     assert result[0].checksum == "sha-from-db"
+    assert result[0].file_size == 2048
     storage.async_client.list_files.assert_not_awaited()
     storage.async_client.create_presigned_urls.assert_not_awaited()
 
@@ -327,6 +338,7 @@ async def test_get_shared_downloaded_files_in_browser_session_falls_back_to_pres
         return_value={
             "Metadata": {"sha256_checksum": "sha-old", "original_filename": "legacy.pdf"},
             "LastModified": None,
+            "ContentLength": 1024,
         }
     )
     storage.async_client.create_presigned_urls = AsyncMock(
@@ -346,6 +358,7 @@ async def test_get_shared_downloaded_files_in_browser_session_falls_back_to_pres
 
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
+    assert result[0].file_size == 1024
     build_url.assert_not_called()
 
 
@@ -474,7 +487,7 @@ async def test_get_shared_downloaded_files_in_browser_session_keyring_unset_skip
     object_uri = "s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/downloads/legacy.pdf"
     storage.async_client.list_files = AsyncMock(return_value=[object_uri.split("/", 3)[-1]])
     storage.async_client.get_object_info = AsyncMock(
-        return_value={"Metadata": {"sha256_checksum": "sha-x"}, "LastModified": None}
+        return_value={"Metadata": {"sha256_checksum": "sha-x"}, "LastModified": None, "ContentLength": 2048}
     )
     storage.async_client.create_presigned_urls = AsyncMock(
         return_value=["https://skyvern-artifacts.s3.amazonaws.com/...?sig=fallback"]
@@ -493,6 +506,7 @@ async def test_get_shared_downloaded_files_in_browser_session_keyring_unset_skip
 
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
+    assert result[0].file_size == 2048
     mock_list.assert_not_awaited()
 
 

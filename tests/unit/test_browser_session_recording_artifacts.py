@@ -38,6 +38,7 @@ def _make_recording_artifact(
     *,
     browser_session_id: str = "pbs_1",
     checksum: str | None = "sha-r",
+    file_size: int | None = None,
     created_at: str = "2026-04-26T00:00:00Z",
 ) -> Artifact:
     return Artifact(
@@ -47,6 +48,7 @@ def _make_recording_artifact(
         organization_id="o_1",
         browser_session_id=browser_session_id,
         checksum=checksum,
+        file_size=file_size,
         created_at=created_at,
         modified_at=created_at,
     )
@@ -87,6 +89,7 @@ async def test_create_browser_session_recording_artifact_inserts_when_no_existin
             uri="s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/videos/2026-04-26/recording.webm",
             filename="recording.webm",
             checksum="sha-r",
+            file_size=4096,
         )
 
     assert artifact_id.startswith("a_")
@@ -96,6 +99,7 @@ async def test_create_browser_session_recording_artifact_inserts_when_no_existin
     assert kwargs["browser_session_id"] == "pbs_1"
     assert kwargs["organization_id"] == "o_1"
     assert kwargs["checksum"] == "sha-r"
+    assert kwargs["file_size"] == 4096
     # Recordings are session-scoped, not run-scoped.
     assert kwargs.get("run_id") is None
 
@@ -139,11 +143,13 @@ async def test_create_browser_session_recording_artifact_is_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_sync_browser_session_file_registers_recording_artifact():
+async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
     """A successful 'videos' sync must create a RECORDING artifact row."""
     storage = S3Storage()
     storage.async_client = MagicMock()
     storage.async_client.upload_file_from_path = AsyncMock()
+    recording_file = tmp_path / "recording.webm"
+    recording_file.write_bytes(b"fake-video")
 
     mock_create = AsyncMock(return_value="a_new")
     mock_artifact_manager = MagicMock()
@@ -159,7 +165,7 @@ async def test_sync_browser_session_file_registers_recording_artifact():
             organization_id="o_1",
             browser_session_id="pbs_1",
             artifact_type="videos",
-            local_file_path="/tmp/recording.webm",
+            local_file_path=str(recording_file),
             remote_path="recording.webm",
             date="2026-04-26",
         )
@@ -170,6 +176,7 @@ async def test_sync_browser_session_file_registers_recording_artifact():
     assert kwargs["browser_session_id"] == "pbs_1"
     assert kwargs["filename"] == "recording.webm"
     assert kwargs["checksum"] == "sha-r"
+    assert kwargs["file_size"] == recording_file.stat().st_size
     assert kwargs["uri"].startswith("s3://") and "/browser_sessions/pbs_1/videos/" in kwargs["uri"]
 
 
@@ -226,6 +233,7 @@ async def test_get_shared_recordings_returns_short_signed_urls(keyring_configure
     artifact = _make_recording_artifact(
         "a_42",
         "s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/videos/2026-04-26/recording.webm",
+        file_size=16384,
     )
     mock_list = AsyncMock(return_value=[artifact])
     build_url = MagicMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
@@ -244,6 +252,7 @@ async def test_get_shared_recordings_returns_short_signed_urls(keyring_configure
     assert len(result) == 1
     assert result[0].url.startswith("https://api.skyvern.com/v1/artifacts/a_42/content")
     assert result[0].artifact_id == "a_42"
+    assert result[0].file_size == 16384
     storage.async_client.list_files.assert_not_awaited()
     storage.async_client.create_presigned_urls.assert_not_awaited()
 
@@ -340,6 +349,7 @@ async def test_get_shared_recordings_falls_back_to_presigned_for_legacy_session(
 
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
+    assert result[0].file_size == 1024
     build_url.assert_not_called()
 
 
@@ -373,4 +383,5 @@ async def test_get_shared_recordings_keyring_unset_skips_artifact_lookup():
 
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
+    assert result[0].file_size == 1024
     mock_list.assert_not_awaited()
