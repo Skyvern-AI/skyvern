@@ -30,6 +30,26 @@ def test_read_masked_line_backspace_removes_last_character() -> None:
     assert "".join(output) == "***\b \b*\n"
 
 
+def test_read_masked_line_ignores_bracketed_paste_markers() -> None:
+    chars = iter("\x1b[200~sk-abc\x1b[201~\n")
+    output: list[str] = []
+
+    result = _read_masked_line(lambda: next(chars), output.append)
+
+    assert result == "sk-abc"
+    assert "".join(output) == "******\n"
+
+
+def test_read_masked_line_ignores_arrow_key_sequences() -> None:
+    chars = iter("ab\x1b[D\n")
+    output: list[str] = []
+
+    result = _read_masked_line(lambda: next(chars), output.append)
+
+    assert result == "ab"
+    assert "".join(output) == "**\n"
+
+
 def test_ask_secret_reads_stream_without_echoing_secret() -> None:
     stream = StringIO("secret-value\n")
     output = StringIO()

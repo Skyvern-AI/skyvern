@@ -15,6 +15,45 @@ _BACKSPACE_CHARS = {"\b", "\x7f"}
 _CTRL_C = "\x03"
 _CTRL_D = "\x04"
 _CTRL_U = "\x15"
+_ESCAPE = "\x1b"
+_OSC_TERMINATOR = "\x07"
+
+
+def _is_csi_final_byte(char: str) -> bool:
+    return "\x40" <= char <= "\x7e"
+
+
+def _consume_escape_sequence(read_char: Callable[[], str]) -> str | None:
+    """Consume a terminal escape sequence and return a newline if one ended it."""
+    char = read_char()
+    if char == "":
+        raise EOFError
+    if char in {"\r", "\n"}:
+        return char
+
+    if char == "[":
+        while True:
+            char = read_char()
+            if char == "":
+                raise EOFError
+            if char in {"\r", "\n"}:
+                return char
+            if _is_csi_final_byte(char):
+                return None
+
+    if char == "]":
+        previous_char = ""
+        while True:
+            char = read_char()
+            if char == "":
+                raise EOFError
+            if char in {"\r", "\n"}:
+                return char
+            if char == _OSC_TERMINATOR or (previous_char == _ESCAPE and char == "\\"):
+                return None
+            previous_char = char
+
+    return None
 
 
 def _read_masked_line(
@@ -28,6 +67,11 @@ def _read_masked_line(
 
     while True:
         char = read_char()
+        if char == _ESCAPE:
+            escaped_char = _consume_escape_sequence(read_char)
+            if escaped_char is None:
+                continue
+            char = escaped_char
         if char == "":
             raise EOFError
         if char in {"\r", "\n"}:
@@ -92,10 +136,12 @@ def _read_masked_tty_unix(output: TextIO, *, mask: str) -> str:
 def _read_masked_tty_windows(output: TextIO, *, mask: str) -> str:
     import msvcrt
 
+    get_wide_char: Callable[[], str] = getattr(msvcrt, "getwch")
+
     def read_char() -> str:
-        char = msvcrt.getwch()
+        char = get_wide_char()
         if char in {"\x00", "\xe0"}:
-            msvcrt.getwch()
+            get_wide_char()
             return "\x00"
         return char
 
