@@ -145,7 +145,8 @@ class TestCdpConnectionDiagnostics:
         message = str(configuration_error)
         assert "/json/version returns JSON with webSocketDebuggerUrl" in message
         assert "chrome://inspect/#remote-debugging" in message
-        assert "MCP-style remote debugging server is not compatible" in message
+        assert "DevToolsActivePort" in message
+        assert "windows_chrome_inspect_cdp.ps1" in message
 
     def test_host_docker_internal_guidance_mentions_gateway_ip(self) -> None:
         error = Exception(

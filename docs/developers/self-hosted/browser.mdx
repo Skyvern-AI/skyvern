@@ -64,6 +64,7 @@ Useful for:
 ```bash .env
 BROWSER_TYPE=cdp-connect
 BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
+BROWSER_CDP_CONNECT_TIMEOUT_MS=120000
 ```
 
 Connect to an existing Chrome instance running with remote debugging enabled. Useful for:
@@ -176,23 +177,43 @@ google-chrome \
 
 The `--user-data-dir` flag creates a separate profile for Skyvern, preserving your main Chrome profile.
 
-`chrome://inspect/#remote-debugging` can be used only when it opens a
-Docker-reachable listener. On Windows, check the listener before using that
-path:
+#### Windows Docker Desktop with `chrome://inspect`
+
+Chrome's `chrome://inspect/#remote-debugging` toggle can bind its debugging
+server to host loopback only. Docker Desktop cannot connect to that listener
+directly through `host.docker.internal`. Skyvern includes a Windows helper that
+bridges Docker to Chrome and writes the exact WebSocket URL from Chrome's
+`DevToolsActivePort` file.
+
+Open Chrome, go to `chrome://inspect/#remote-debugging`, enable remote
+debugging, then run this from an Administrator PowerShell in the Skyvern repo:
 
 ```powershell Windows
-Get-NetTCPConnection -LocalPort 9222 | Select-Object LocalAddress, State
+.\scripts\windows_chrome_inspect_cdp.ps1 -UpdateEnv
+docker compose up -d --force-recreate skyvern
 ```
 
-If the listener shows only `127.0.0.1`, Docker Desktop cannot reach it through
-`host.docker.internal`; use the manual launch command above instead. Continue
-only when the listener is `0.0.0.0` or `::`.
+The helper creates a Windows port proxy from `0.0.0.0:9223` to Chrome's
+loopback debugging port, adds a matching firewall rule, reads the full browser
+WebSocket path, and writes:
+
+```bash .env
+BROWSER_TYPE=cdp-connect
+BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9223/devtools/browser/<id>
+BROWSER_STREAMING_MODE=cdp
+BROWSER_CDP_CONNECT_TIMEOUT_MS=120000
+```
+
+Chrome may prompt you to allow the remote debugging connection the first time
+Skyvern connects. Click **Allow** and retry the browser session if the first
+attempt times out.
 
 ### Step 2: Configure Skyvern
 
 ```bash .env
 BROWSER_TYPE=cdp-connect
 BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
+BROWSER_CDP_CONNECT_TIMEOUT_MS=120000
 ```
 
 When running Skyvern in Docker:
@@ -215,7 +236,7 @@ New-NetFirewallRule -DisplayName "Chrome Remote Debug 9222" -Direction Inbound -
 
 ### Step 3: Verify connection
 
-Test that Chrome is listening on port 9222:
+For a classic HTTP CDP endpoint, test that Chrome is listening on port 9222:
 
 ```bash
 curl http://localhost:9222/json/version
@@ -226,6 +247,10 @@ Invoke-RestMethod http://127.0.0.1:9222/json/version
 ```
 
 You should see Chrome's version information and a `webSocketDebuggerUrl`.
+
+If you used the Windows `chrome://inspect` helper, the configured URL is a
+direct `ws://.../devtools/browser/<id>` endpoint. In that mode, verify by
+starting a Skyvern browser session after restarting the backend.
 
 <Note>
 If `/json/version` does not return Chrome version information from inside the

@@ -799,7 +799,11 @@ async def _connect_to_cdp_browser(
     )
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
-    browser = await _connect_over_cdp_with_diagnostics(playwright, remote_browser_url)
+    browser = await _connect_over_cdp_with_diagnostics(
+        playwright,
+        remote_browser_url,
+        timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
+    )
 
     if apply_download_behaviour:
         await _apply_download_behaviour(browser)

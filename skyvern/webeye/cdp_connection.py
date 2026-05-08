@@ -12,6 +12,7 @@ from playwright.async_api import Browser, Playwright
 from skyvern.exceptions import CdpConnectionConfigurationError
 
 LOG = structlog.get_logger()
+DEFAULT_CDP_CONNECT_TIMEOUT_MS = 120_000
 
 _CDP_DISCOVERY_ERROR_RE = re.compile(
     r"Unexpected status (?P<status>\d+) when connecting to (?P<url>https?://\S+/json/version/?)"
@@ -62,38 +63,6 @@ def resolve_host_docker_internal_url(remote_browser_url: str) -> str | None:
     return parsed._replace(netloc=netloc).geturl()
 
 
-def build_chrome_inspect_ws_url(remote_browser_url: str) -> str | None:
-    """Return the chrome://inspect WebSocket endpoint candidate for a CDP HTTP URL."""
-    parsed = urlparse(remote_browser_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return None
-
-    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
-    return parsed._replace(scheme=ws_scheme, path="/devtools/browser", params="", query="", fragment="").geturl()
-
-
-def _host_header_for_chrome_loopback(remote_browser_url: str) -> dict[str, str] | None:
-    """Build a loopback Host header for Chrome's DevTools host-header allowlist."""
-    parsed = urlparse(remote_browser_url)
-    if parsed.hostname != "host.docker.internal":
-        return None
-
-    port = parsed.port or 9222
-    return {"Host": f"127.0.0.1:{port}"}
-
-
-def _merge_headers(
-    base_headers: dict[str, str] | None,
-    candidate_headers: dict[str, str] | None,
-) -> dict[str, str] | None:
-    if not base_headers and not candidate_headers:
-        return None
-
-    headers = dict(base_headers or {})
-    headers.update(candidate_headers or {})
-    return headers
-
-
 def build_cdp_connection_candidates(
     remote_browser_url: str,
     headers: dict[str, str] | None = None,
@@ -106,30 +75,6 @@ def build_cdp_connection_candidates(
             label="resolved host.docker.internal IPv4",
             headers=headers,
         )
-
-    ws_url = build_chrome_inspect_ws_url(remote_browser_url)
-    if ws_url:
-        host_header = _host_header_for_chrome_loopback(ws_url)
-        if host_header:
-            yield CdpConnectionCandidate(
-                url=ws_url,
-                label="chrome://inspect WebSocket endpoint with loopback Host header",
-                headers=_merge_headers(headers, host_header),
-            )
-
-        yield CdpConnectionCandidate(
-            url=ws_url,
-            label="chrome://inspect WebSocket endpoint",
-            headers=headers,
-        )
-
-        resolved_ws_url = resolve_host_docker_internal_url(ws_url)
-        if resolved_ws_url:
-            yield CdpConnectionCandidate(
-                url=resolved_ws_url,
-                label="resolved chrome://inspect WebSocket endpoint",
-                headers=headers,
-            )
 
 
 def build_cdp_configuration_error(
@@ -150,10 +95,10 @@ def build_cdp_configuration_error(
         f"{discovery_url} returned HTTP {status_code}. Skyvern cdp-connect requires "
         "Chrome's classic DevTools Protocol endpoint, where /json/version returns JSON "
         "with webSocketDebuggerUrl. If you enabled chrome://inspect/#remote-debugging, "
-        "that MCP-style remote debugging server is not compatible with cdp-connect. "
-        "Start Chrome with --remote-debugging-port=9222 and a non-default "
-        "--user-data-dir, or set BROWSER_REMOTE_DEBUGGING_URL to the direct "
-        "ws://.../devtools/browser/... URL from /json/version."
+        "set BROWSER_REMOTE_DEBUGGING_URL to the direct full "
+        "ws://.../devtools/browser/... URL from Chrome's DevToolsActivePort file. "
+        "On Windows Docker Desktop, run scripts/windows_chrome_inspect_cdp.ps1 to "
+        "bridge Chrome's loopback-only listener before connecting."
     )
 
     if parsed.hostname == "host.docker.internal":
@@ -170,11 +115,12 @@ async def connect_over_cdp_with_diagnostics(
     playwright: Playwright,
     remote_browser_url: str,
     headers: dict[str, str] | None = None,
+    timeout_ms: int = DEFAULT_CDP_CONNECT_TIMEOUT_MS,
 ) -> Browser:
     async def connect(url: str, attempt_headers: dict[str, str] | None = None) -> Browser:
         if attempt_headers is None:
-            return await playwright.chromium.connect_over_cdp(url)
-        return await playwright.chromium.connect_over_cdp(url, headers=attempt_headers)
+            return await playwright.chromium.connect_over_cdp(url, timeout=timeout_ms)
+        return await playwright.chromium.connect_over_cdp(url, timeout=timeout_ms, headers=attempt_headers)
 
     try:
         return await connect(remote_browser_url, headers)
