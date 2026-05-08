@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.client.core import RequestOptions
+from skyvern.client.types.extensions import Extensions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
@@ -544,6 +545,7 @@ class Skyvern(AsyncSkyvern):
         *,
         timeout: int | None = None,
         proxy_location: ProxyLocationInput = None,
+        extensions: list[Extensions] | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -554,15 +556,19 @@ class Skyvern(AsyncSkyvern):
                 Must be between 5 and 1440. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
+            extensions: Browser extensions to install in the session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
         """
         self._ensure_cloud_environment()
-        browser_session = await self.create_browser_session(
-            timeout=timeout,
-            proxy_location=proxy_location_to_request(proxy_location),
-        )
+        create_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "proxy_location": proxy_location_to_request(proxy_location),
+        }
+        if extensions is not None:
+            create_kwargs["extensions"] = extensions
+        browser_session = await self.create_browser_session(**create_kwargs)
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(
                 "Launched new cloud browser session",
