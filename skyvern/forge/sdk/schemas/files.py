@@ -9,6 +9,7 @@ class FileInfo(BaseModel):
     url: str = Field(..., description="URL to access the file")
     checksum: str | None = Field(None, description="SHA-256 checksum of the file")
     filename: str | None = Field(None, description="Original filename")
+    file_size: int | None = Field(None, description="Size of the file in bytes")
     modified_at: datetime | None = Field(None, description="Modified time of the file")
     # Optional: when the FileInfo is built from a DOWNLOAD Artifact row, the
     # row's id is carried through so persisted snapshots (e.g. block outputs)

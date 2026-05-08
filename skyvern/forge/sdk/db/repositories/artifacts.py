@@ -49,6 +49,7 @@ class ArtifactsRepository(BaseRepository):
         thought_id: str | None = None,
         ai_suggestion_id: str | None = None,
         checksum: str | None = None,
+        file_size: int | None = None,
         browser_session_id: str | None = None,
     ) -> Artifact:
         async with self.Session() as session:
@@ -66,6 +67,7 @@ class ArtifactsRepository(BaseRepository):
                 ai_suggestion_id=ai_suggestion_id,
                 organization_id=organization_id,
                 checksum=checksum,
+                file_size=file_size,
                 browser_session_id=browser_session_id,
             )
             session.add(new_artifact)

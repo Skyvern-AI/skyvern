@@ -388,6 +388,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         uri=artifact_model.uri,
         bundle_key=artifact_model.bundle_key,
         checksum=artifact_model.checksum,
+        file_size=artifact_model.file_size,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,

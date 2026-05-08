@@ -41,6 +41,14 @@ LOG = structlog.get_logger()
 S3_ZSTD_COMPRESSED_SUFFIX = ".zst"
 
 
+def _safe_get_file_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        LOG.warning("Failed to get file size", path=path, exc_info=True)
+        return None
+
+
 class S3Storage(BaseStorage):
     _PATH_VERSION = "v1"
     # Cap concurrent head_object fan-out in the legacy listing fallback.
@@ -385,7 +393,7 @@ class S3Storage(BaseStorage):
         try:
             return await self.async_client.get_object_info(uri)
         except Exception:
-            LOG.exception("Object info retrieval failed", uri=uri)
+            LOG.warning("Object info retrieval failed", uri=uri, exc_info=True)
             return None
 
     async def _bounded_get_object_infos(self, keys: list[str]) -> list[dict | None]:
@@ -457,6 +465,7 @@ class S3Storage(BaseStorage):
                 continue
             metadata = (object_info or {}).get("Metadata") or {}
             modified_at: datetime | None = (object_info or {}).get("LastModified")
+            content_length: int | None = (object_info or {}).get("ContentLength")
 
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
@@ -466,6 +475,7 @@ class S3Storage(BaseStorage):
                     url=url,
                     checksum=checksum,
                     filename=metadata.get("original_filename", filename) if metadata else filename,
+                    file_size=content_length,
                     modified_at=modified_at,
                 )
             )
@@ -583,6 +593,7 @@ class S3Storage(BaseStorage):
                 continue
             metadata = (object_info or {}).get("Metadata") or {}
             modified_at: datetime | None = (object_info or {}).get("LastModified")
+            content_length: int | None = (object_info or {}).get("ContentLength")
 
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
@@ -592,6 +603,7 @@ class S3Storage(BaseStorage):
                     url=url,
                     checksum=checksum,
                     filename=metadata.get("original_filename", filename) if metadata else filename,
+                    file_size=content_length,
                     modified_at=modified_at,
                 )
             )
@@ -634,6 +646,7 @@ class S3Storage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
+            file_size = _safe_get_file_size(fpath)
             # S3 object metadata only allows ASCII; non-ASCII filenames (CJK,
             # emoji) would otherwise raise ParamValidationError at upload time.
             # The full filename is still preserved in the S3 key and on the
@@ -674,6 +687,7 @@ class S3Storage(BaseStorage):
                         uri=uri,
                         filename=file,
                         checksum=checksum,
+                        file_size=file_size,
                     )
                 except Exception:
                     LOG.warning(
@@ -729,7 +743,14 @@ class S3Storage(BaseStorage):
         for key in object_keys:
             object_uri = f"s3://{bucket}/{key}"
 
-            metadata = await self.async_client.get_file_metadata(object_uri, log_exception=False)
+            metadata = {}
+            content_length: int | None = None
+            try:
+                object_info = await self.async_client.get_object_info(object_uri)
+                metadata = object_info.get("Metadata", {})
+                content_length = object_info.get("ContentLength")
+            except Exception:
+                LOG.warning("Object info retrieval failed", uri=object_uri, exc_info=True)
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
             display_name = metadata.get("original_filename", filename) if metadata else filename
@@ -743,6 +764,7 @@ class S3Storage(BaseStorage):
                     url=presigned_urls[0],
                     checksum=checksum,
                     filename=display_name,
+                    file_size=content_length,
                 )
             )
         return file_infos
@@ -844,12 +866,14 @@ class S3Storage(BaseStorage):
             # (idempotent on ``(session, uri)``) are safe to retry.
             is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
             checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            file_size = None if is_partial else _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
                 checksum=checksum,
+                file_size=file_size,
             )
         elif artifact_type == "videos":
             # Register a RECORDING artifact row so
@@ -870,12 +894,14 @@ class S3Storage(BaseStorage):
             # a row-less recording still surfaces via the legacy presigned
             # URL until a subsequent close writes the row.
             checksum = calculate_sha256_for_file(local_file_path)
+            file_size = _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
                 checksum=checksum,
+                file_size=file_size,
             )
 
         return uri

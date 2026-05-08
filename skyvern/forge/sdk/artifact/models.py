@@ -86,6 +86,7 @@ class Artifact(BaseModel):
     uri: str
     bundle_key: str | None = None
     checksum: str | None = None
+    file_size: int | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_run_id: str | None = None
