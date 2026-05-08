@@ -42,7 +42,7 @@ npm install @skyvern/client
 </CodeGroup>
 
 <Info>
-`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are setting up a local Skyvern server, self-hosted instance, `Skyvern.local()`, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`. For full local setup with migrations and the web UI, use Docker Compose or a source checkout.
+`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are using embedded local mode with `Skyvern.local()` or `launch_local_browser()`, install the local extra: `pip install "skyvern[local]"`. For a local Skyvern server, self-hosted instance, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`. For full local setup with migrations and the web UI, use Docker Compose or a source checkout.
 </Info>
 
 <Accordion title="Troubleshooting: Python version errors">
@@ -191,7 +191,7 @@ This is invaluable for debugging and understanding how Skyvern interprets your p
 
 ---
 
-## Run with a local browser
+## Run with a local server
 
 You can run Skyvern with a browser on your own machine. This is useful for development, debugging, or automating internal tools on your local network.
 

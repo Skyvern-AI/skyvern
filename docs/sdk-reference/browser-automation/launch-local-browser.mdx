@@ -5,6 +5,13 @@ slug: sdk-reference/browser-automation/launch-local-browser
 
 Launch a local Chromium browser with CDP enabled. Only available in embedded mode (`Skyvern.local()`).
 
+Install the local extra and Playwright's Chromium browser before launching:
+
+```bash
+pip install "skyvern[local]"
+python -m playwright install chromium
+```
+
 ```python
 skyvern = Skyvern.local()
 browser = await skyvern.launch_local_browser(headless=False)
