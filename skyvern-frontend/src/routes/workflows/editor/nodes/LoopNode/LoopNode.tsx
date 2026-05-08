@@ -20,7 +20,6 @@ import { dataSchemaExampleValue } from "../types";
 import type { LoopNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import {
   inferBranchCriteriaTypeFromExpression,
@@ -145,40 +144,49 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               totpUrl={null}
               type={headerBlockType}
             />
-            <Tabs
-              value={loopKind}
-              onValueChange={(v) => {
-                if (!data.editable) {
-                  return;
-                }
-                if (v !== "for_each" && v !== "while") {
-                  return;
-                }
-                if (v === "while") {
-                  const expr =
-                    data.whileConditionExpression.trim() === ""
-                      ? "{{ true }}"
-                      : data.whileConditionExpression;
-                  update({
-                    loopKind: "while",
-                    whileConditionExpression: expr,
-                    whileConditionCriteriaType:
-                      inferBranchCriteriaTypeFromExpression(expr),
-                  });
-                } else {
-                  update({ loopKind: "for_each" });
-                }
-              }}
+            <div
+              role="tablist"
+              aria-label="Loop type"
+              className="grid h-9 w-full grid-cols-2 rounded-lg bg-muted p-1 text-muted-foreground"
             >
-              <TabsList className="grid h-9 w-full grid-cols-2">
-                <TabsTrigger value="for_each" disabled={!data.editable}>
-                  For each
-                </TabsTrigger>
-                <TabsTrigger value="while" disabled={!data.editable}>
-                  While
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
+              {(["for_each", "while"] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="tab"
+                  aria-selected={loopKind === value}
+                  disabled={!data.editable}
+                  className={cn(
+                    "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
+                    {
+                      "bg-background text-foreground shadow":
+                        loopKind === value,
+                    },
+                  )}
+                  onClick={() => {
+                    if (!data.editable || value === loopKind) {
+                      return;
+                    }
+                    if (value === "while") {
+                      const expr =
+                        data.whileConditionExpression.trim() === ""
+                          ? "{{ true }}"
+                          : data.whileConditionExpression;
+                      update({
+                        loopKind: "while",
+                        whileConditionExpression: expr,
+                        whileConditionCriteriaType:
+                          inferBranchCriteriaTypeFromExpression(expr),
+                      });
+                    } else {
+                      update({ loopKind: "for_each" });
+                    }
+                  }}
+                >
+                  {value === "for_each" ? "For each" : "While"}
+                </button>
+              ))}
+            </div>
             {loopKind === "for_each" ? (
               <>
                 <div className="space-y-2">
