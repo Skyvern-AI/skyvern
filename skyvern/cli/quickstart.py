@@ -47,6 +47,15 @@ Self-hosted local server
     console.print(Panel(Text(message), title="Skyvern Quickstart", border_style="cyan"))
 
 
+def _browser_install_blocks_startup(init_result: object) -> bool:
+    browser_install = getattr(init_result, "browser_install", None)
+    return bool(
+        getattr(init_result, "run_local", False)
+        and getattr(browser_install, "required", False)
+        and not getattr(browser_install, "ready", True)
+    )
+
+
 def _run_server_quickstart(
     *,
     no_postgres: bool,
@@ -60,16 +69,35 @@ def _run_server_quickstart(
 
         # Initialize Skyvern (pip install path)
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        run_local = init_env(
+        init_result = init_env(
             no_postgres=no_postgres,
             database_string=database_string,
             skip_browser_install=skip_browser_install,
+            return_result=True,
         )
+        run_local = bool(init_result)
         if run_local:
             _configure_cdp_livestreaming_defaults()
 
         # Start services
         if run_local:
+            if _browser_install_blocks_startup(init_result):
+                console.print(
+                    Panel(
+                        "[bold yellow]Skyvern setup is saved, but the browser install is incomplete.[/bold yellow]\n\n"
+                        "Quickstart will not start services yet because the selected browser mode launches "
+                        "Playwright-managed Chromium.\n\n"
+                        "Finish the browser install, then start Skyvern:\n"
+                        "[cyan]playwright install chromium[/cyan]\n"
+                        "[cyan]skyvern run server[/cyan]\n\n"
+                        "If you want to use an existing Chrome over CDP instead, rerun quickstart and choose "
+                        "Local browser -> Use actual browser, or pass [cyan]--skip-browser-install[/cyan] "
+                        "after configuring CDP.",
+                        border_style="yellow",
+                    )
+                )
+                return
+
             start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
             if start_now:
                 console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")

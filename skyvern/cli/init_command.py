@@ -2,6 +2,9 @@ import asyncio
 import os
 import subprocess
 import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal, overload
 
 import typer
 from rich.padding import Padding
@@ -18,12 +21,153 @@ from .database import setup_postgresql
 from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .masked_prompt import ask_secret
 
+PLAYWRIGHT_CHROMIUM_BROWSER_TYPES = {"chromium-headful", "chromium-headless"}
+
+
+@dataclass
+class BrowserInstallStatus:
+    """Status for the optional Playwright-managed Chromium install step."""
+
+    required: bool
+    ready: bool
+    skipped: bool = False
+    already_installed: bool = False
+    attempted: bool = False
+    reason: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class InitEnvResult:
+    """Result of the interactive initialization flow."""
+
+    run_local: bool
+    browser_type: str | None = None
+    browser_install: BrowserInstallStatus = field(
+        default_factory=lambda: BrowserInstallStatus(required=False, ready=True)
+    )
+
+    def __bool__(self) -> bool:
+        """Preserve bool-like behavior for existing callers."""
+        return self.run_local
+
+
+def _browser_type_requires_playwright_chromium(browser_type: str | None) -> bool:
+    return browser_type in PLAYWRIGHT_CHROMIUM_BROWSER_TYPES
+
+
+def _playwright_chromium_executable_path() -> Path | None:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path)
+    except Exception:
+        return None
+
+
+def _is_playwright_chromium_installed() -> bool:
+    executable_path = _playwright_chromium_executable_path()
+    return executable_path is not None and executable_path.exists()
+
+
+def _format_subprocess_error(error: subprocess.CalledProcessError) -> str:
+    stderr = (error.stderr or "").strip()
+    if stderr:
+        return stderr
+    stdout = (error.stdout or "").strip()
+    if stdout:
+        return stdout
+    return str(error)
+
+
+def _ensure_playwright_chromium(browser_type: str | None, skip_browser_install: bool) -> BrowserInstallStatus:
+    """Install Playwright Chromium when the selected browser mode needs it."""
+    if not _browser_type_requires_playwright_chromium(browser_type):
+        reason = f"browser mode is {browser_type or 'not set'}"
+        console.print(f"[green]Skipping Chromium installation because {reason}.[/green]")
+        return BrowserInstallStatus(required=False, ready=True, skipped=True, reason=reason)
+
+    if _is_playwright_chromium_installed():
+        console.print("[green]Playwright Chromium is already installed. Skipping download.[/green]")
+        return BrowserInstallStatus(required=True, ready=True, skipped=True, already_installed=True)
+
+    if skip_browser_install:
+        console.print("⏭️ [yellow]Skipping Chromium installation as requested.[/yellow]")
+        return BrowserInstallStatus(
+            required=True,
+            ready=False,
+            skipped=True,
+            reason="--skip-browser-install was provided",
+        )
+
+    console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
+    capture_setup_event("playwright-install-start")
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
+    ) as progress:
+        progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
+        try:
+            subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
+            capture_setup_event("playwright-install-complete", success=True)
+            console.print("✅ [green]Chromium installation complete.[/green]")
+            return BrowserInstallStatus(required=True, ready=True, attempted=True)
+        except subprocess.CalledProcessError as e:
+            error_message = _format_subprocess_error(e)
+            capture_setup_event(
+                "playwright-install-fail",
+                success=False,
+                error_type="playwright_install_error",
+                error_message=error_message,
+            )
+            console.print(
+                Panel(
+                    "[bold yellow]Chromium installation did not complete.[/bold yellow]\n\n"
+                    "The rest of your Skyvern setup has been saved. Browser modes that launch "
+                    "Playwright-managed Chromium will not be ready until this is fixed.\n\n"
+                    "Run this command to finish the browser install:\n"
+                    "[cyan]playwright install chromium[/cyan]",
+                    border_style="yellow",
+                )
+            )
+            return BrowserInstallStatus(
+                required=True,
+                ready=False,
+                attempted=True,
+                error=error_message,
+            )
+
+
+def _init_return_value(result: InitEnvResult, return_result: bool) -> bool | InitEnvResult:
+    if return_result:
+        return result
+    return result.run_local
+
+
+@overload
+def init_env(
+    no_postgres: bool = False,
+    database_string: str = "",
+    skip_browser_install: bool = False,
+    return_result: Literal[False] = False,
+) -> bool: ...
+
+
+@overload
+def init_env(
+    no_postgres: bool = False,
+    database_string: str = "",
+    skip_browser_install: bool = False,
+    return_result: Literal[True] = True,
+) -> InitEnvResult: ...
+
 
 def init_env(
     no_postgres: bool = False,
     database_string: str = "",
     skip_browser_install: bool = False,
-) -> bool:
+    return_result: bool = False,
+) -> bool | InitEnvResult:
     """Interactive initialization command for Skyvern."""
     console.print(
         Panel(
@@ -40,6 +184,7 @@ def init_env(
     )
 
     run_local = infra_choice == "local"
+    result = InitEnvResult(run_local=run_local)
 
     if run_local:
         if database_string:
@@ -84,6 +229,7 @@ def init_env(
 
         console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
         browser_type, browser_location, remote_debugging_url = setup_browser_config()
+        result.browser_type = browser_type
         update_or_add_env_var("BROWSER_TYPE", browser_type)
         if browser_location:
             update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
@@ -138,7 +284,7 @@ def init_env(
                 api_key = ask_secret("Please re-enter your Skyvern API key")
                 if not api_key:
                     console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
-                    return False
+                    return _init_return_value(result, return_result)
             update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
         console.print(
@@ -175,34 +321,14 @@ def init_env(
             )
 
     if run_local:
-        if skip_browser_install:
-            console.print("⏭️ [yellow]Skipping Chromium installation as requested.[/yellow]")
-        else:
-            console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
-            capture_setup_event("playwright-install-start")
-            with Progress(
-                SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
-            ) as progress:
-                progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
-                try:
-                    subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
-                    capture_setup_event("playwright-install-complete", success=True)
-                except subprocess.CalledProcessError as e:
-                    capture_setup_event(
-                        "playwright-install-fail",
-                        success=False,
-                        error_type="playwright_install_error",
-                        error_message=e.stderr.strip() if e.stderr else str(e),
-                    )
-                    raise
-            console.print("✅ [green]Chromium installation complete.[/green]")
+        result.browser_install = _ensure_playwright_chromium(result.browser_type, skip_browser_install)
 
         console.print("\n🎉 [bold green]Skyvern setup complete![/bold green]")
         capture_setup_event("init-complete", success=True, extra_data={"mode": "local"})
         console.print("[bold]To start using Skyvern, run:[/bold]")
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
 
-    return run_local
+    return _init_return_value(result, return_result)
 
 
 def init_app_factory() -> typer.Typer:
@@ -257,21 +383,4 @@ def init_browser() -> None:
     )
     console.print("✅ [green]Browser configuration complete.[/green]")
 
-    console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
-    capture_setup_event("playwright-install-start")
-    with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
-    ) as progress:
-        progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
-        try:
-            subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
-            capture_setup_event("playwright-install-complete", success=True)
-        except subprocess.CalledProcessError as e:
-            capture_setup_event(
-                "playwright-install-fail",
-                success=False,
-                error_type="playwright_install_error",
-                error_message=e.stderr.strip() if e.stderr else str(e),
-            )
-            raise
-    console.print("✅ [green]Chromium installation complete.[/green]")
+    _ensure_playwright_chromium(browser_type, skip_browser_install=False)
