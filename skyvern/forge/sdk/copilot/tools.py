@@ -61,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -113,7 +114,8 @@ PER_TOOL_CALL_BUDGET_SECONDS = 240
 # false-positives on healthy runs.
 RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 
-MIN_BLOCK_RUNNING_REMAINING_SECONDS = PER_TOOL_CALL_BUDGET_SECONDS + RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
+# Reserve final-reply room; active block runs shrink their own budget near the deadline.
+COPILOT_FINAL_REPLY_RESERVE_SECONDS = 90
 
 # 5 s balances responsiveness (18 samples inside the stagnation window) against
 # DB load (240 polls worst case at the safety ceiling).
@@ -124,6 +126,7 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 # retrieved" warning cannot fire — each task adds a done-callback that logs
 # exceptions and removes itself from this set.
 _DETACHED_CLEANUP_TASKS: set[asyncio.Task] = set()
+_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 
 
 async def _cancel_run_task_if_not_final(
@@ -174,6 +177,129 @@ def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
     exc = task.exception() if task.done() and not task.cancelled() else None
     if exc is not None:
         LOG.warning("Detached cancel fallback failed", exc_info=exc)
+
+
+def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
+    found: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            found.extend(_CREDENTIAL_ID_RE.findall(item))
+        elif isinstance(item, dict):
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, (list, tuple, set)):
+            for nested in item:
+                visit(nested)
+        elif hasattr(item, "model_dump"):
+            try:
+                visit(item.model_dump(mode="json"))
+            except Exception:
+                return
+
+    visit(value)
+    return list(dict.fromkeys(found))
+
+
+def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[str]:
+    if not isinstance(parameters, list):
+        return []
+
+    found: list[str] = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+
+        parameter_type = str(parameter.get("parameter_type") or "").lower()
+        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+        if parameter_type == "credential":
+            found.extend(_extract_credential_ids_from_tool_value(parameter.get("credential_id")))
+        elif parameter_type == "workflow" and workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID.value:
+            found.extend(_extract_credential_ids_from_tool_value(parameter.get("default_value")))
+
+    return list(dict.fromkeys(found))
+
+
+def _workflow_definition_as_dict(workflow_definition: Any) -> dict[str, Any]:
+    if workflow_definition is None:
+        return {}
+    if isinstance(workflow_definition, dict):
+        return workflow_definition
+    if hasattr(workflow_definition, "model_dump"):
+        try:
+            dumped = workflow_definition.model_dump(mode="json")
+        except Exception:
+            return {}
+        return dumped if isinstance(dumped, dict) else {}
+    return {}
+
+
+def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -> list[str]:
+    definition = _workflow_definition_as_dict(workflow_definition)
+    return _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
+
+
+def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> list[str]:
+    if not workflow_yaml:
+        return []
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return []
+    return _extract_credential_ids_from_workflow_parameters(workflow_definition.get("parameters"))
+
+
+def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) -> str:
+    formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
+    id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
+    was_word = "was" if len(missing_credential_ids) == 1 else "were"
+    return (
+        f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
+        "Stop before creating, updating, or running the workflow. Ask the user to provide/select a valid "
+        "credential ID, create the credential in the Credentials UI and return with its ID, or explicitly "
+        "choose an unvalidated draft workflow that will not be run until credentials are available."
+    )
+
+
+async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
+    if not credential_ids:
+        return None
+    try:
+        existing_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+            credential_ids,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Copilot tool failed to validate credential IDs",
+            organization_id=ctx.organization_id,
+            credential_ids=credential_ids,
+            exc_info=True,
+        )
+        return (
+            "Credential ID validation failed, so the workflow cannot be created, updated, or run safely. "
+            "Ask the user to provide/select a valid credential ID or explicitly choose an unvalidated draft "
+            "workflow that will not be run until credentials are available."
+        )
+
+    found_ids = {credential.credential_id for credential in existing_credentials}
+    missing_ids = [credential_id for credential_id in credential_ids if credential_id not in found_ids]
+    if not missing_ids:
+        return None
+    return _missing_credential_reference_tool_error(missing_ids)
+
+
+async def _credential_reference_validation_error(value: Any, ctx: AgentContext) -> str | None:
+    if isinstance(value, str):
+        credential_ids = _extract_credential_ids_from_workflow_yaml(value)
+    else:
+        credential_ids = _extract_credential_ids_from_tool_value(value)
+    return await _credential_ids_validation_error(credential_ids, ctx)
 
 
 async def _safe_read_workflow_run(
@@ -397,9 +523,17 @@ def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
     return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
 
 
+def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
+    remaining = _copilot_seconds_remaining(ctx)
+    if remaining is None:
+        return PER_TOOL_CALL_BUDGET_SECONDS
+    remaining_after_reply_reserve = remaining - COPILOT_FINAL_REPLY_RESERVE_SECONDS
+    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining_after_reply_reserve)))
+
+
 def _late_block_running_call_error(ctx: AgentContext) -> str | None:
     remaining = _copilot_seconds_remaining(ctx)
-    if remaining is None or remaining >= MIN_BLOCK_RUNNING_REMAINING_SECONDS:
+    if remaining is None or remaining > COPILOT_FINAL_REPLY_RESERVE_SECONDS:
         return None
 
     last_failed_workflow_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
@@ -419,13 +553,13 @@ def _late_block_running_call_error(ctx: AgentContext) -> str | None:
 
     if isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
         return (
-            f"Less than {MIN_BLOCK_RUNNING_REMAINING_SECONDS} seconds remain in this Copilot turn "
+            f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn "
             "after the previous workflow run failed. Do NOT retry block-running tools; reply to the user "
             "with the failure evidence gathered so far and make clear that any draft workflow is unverified."
         )
 
     return (
-        f"Less than {MIN_BLOCK_RUNNING_REMAINING_SECONDS} seconds remain in this Copilot turn. "
+        f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn. "
         "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
         "progress gathered so far, and make clear which parts have not been verified end-to-end."
     )
@@ -581,8 +715,20 @@ def _parameter_binding_invariant_error(
     )
 
 
-async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+async def _update_workflow(
+    params: dict[str, Any],
+    ctx: AgentContext,
+    *,
+    allow_missing_credentials: bool | None = None,
+) -> dict[str, Any]:
     workflow_yaml = params["workflow_yaml"]
+    if allow_missing_credentials is None:
+        allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
+    if not allow_missing_credentials:
+        credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
+        if credential_error is not None:
+            return {"ok": False, "error": credential_error}
+
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
     # LLM actually saw, not the turn-start persisted state.
@@ -1460,6 +1606,16 @@ async def _run_blocks_and_collect_debug(
     if not workflow:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
 
+    credential_ids = list(
+        dict.fromkeys(
+            _extract_credential_ids_from_tool_value(params.get("parameters") or {})
+            + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
+        )
+    )
+    credential_error = await _credential_ids_validation_error(credential_ids, ctx)
+    if credential_error is not None:
+        return {"ok": False, "error": credential_error}
+
     for label in block_labels:
         if not workflow.get_output_parameter(label):
             return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
@@ -1594,7 +1750,7 @@ async def _run_blocks_and_collect_debug(
     # indefinitely.
     budget_exit_reason: WatchdogExitReason
     if stagnation_enabled:
-        budget_seconds = max(1, PER_TOOL_CALL_BUDGET_SECONDS)
+        budget_seconds = _active_block_run_budget_seconds(ctx)
         budget_exit_reason = "per_tool_budget"
     else:
         budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
@@ -2498,6 +2654,7 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     wf = result["_workflow"]
     copilot_ctx.last_workflow = wf
     copilot_ctx.last_workflow_yaml = copilot_ctx.workflow_yaml or None
+    copilot_ctx.effective_workflow_proxy_location = getattr(wf, "proxy_location", None) or ProxyLocation.RESIDENTIAL
     data = result.get("data")
     if isinstance(data, dict):
         block_count = data.get("block_count")
@@ -2728,7 +2885,11 @@ async def update_workflow_tool(
         return json.dumps({"ok": False, "error": loop_error})
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow(arguments, copilot_ctx)
+        result = await _update_workflow(
+            arguments,
+            copilot_ctx,
+            allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
+        )
         _record_workflow_update_result(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
@@ -2922,7 +3083,11 @@ async def update_and_run_blocks_tool(
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        update_result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        update_result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml},
+            copilot_ctx,
+            allow_missing_credentials=False,
+        )
         _record_workflow_update_result(copilot_ctx, update_result)
 
     if not update_result.get("ok"):

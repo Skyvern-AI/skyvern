@@ -655,6 +655,17 @@ class TestEnforcement:
         assert nudge != POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
         assert ctx.explore_without_workflow_nudge_count == 0
 
+    def test_update_without_test_allowed_for_explicit_untested_draft(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _check_enforcement
+
+        ctx = self._make_ctx(
+            allow_untested_workflow_draft=True,
+            update_workflow_called=True,
+            test_after_update_done=False,
+        )
+
+        assert _check_enforcement(ctx) is None
+
     def test_explore_without_workflow_not_when_test_done(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE, _check_enforcement
 

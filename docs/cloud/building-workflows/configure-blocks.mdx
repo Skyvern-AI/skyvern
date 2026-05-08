@@ -1,13 +1,14 @@
 ---
 title: Block Types and Configuration
 subtitle: Reference for every block available in the workflow editor
-description: Reference guide for every workflow block type in the Skyvern Cloud UI, including Browser Task, Extraction, Login, Loop, Conditional, Code, HTTP Request, and more.
+description: Reference guide for every workflow block type in the Skyvern Cloud UI, including Browser Task, Extraction, Login, Loop, While Loop, Conditional, Code, HTTP Request, and more.
 slug: cloud/configure-blocks
 keywords:
   - navigation block
   - action block
   - extract block
   - loop block
+  - while loop block
   - code block
   - HTTP request block
   - text prompt block
@@ -31,7 +32,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
 | [Data and Extraction](#data-and-extraction) | Text Prompt, File Parser |
-| [Control Flow](#control-flow) | Loop, Conditional, AI Validation, Code, Wait |
+| [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
 | [Files](#files) | File Download, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction |
 
@@ -245,6 +246,21 @@ Inside loop blocks, use these [reserved variables](/cloud/building-workflows/add
 <Frame>
 <img width="400" src="/images/cloud/block-loop-config.png" alt="Loop block configuration" />
 </Frame>
+
+Use Loop when the item list is already known before the loop starts, such as rows extracted from a table, files uploaded by a user, or URLs passed as workflow parameters.
+
+### While Loop
+
+Repeat a sequence of blocks while a condition remains true. Child blocks are placed inside the loop on the canvas.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Condition** | expression | Jinja2 template or natural-language prompt evaluated before each iteration |
+
+Inside while-loop blocks, use these [reserved variables](/cloud/building-workflows/add-parameters#reserved-variables):
+- `{{ current_index }}`: the iteration number (0-based)
+
+Use While Loop for flows where the number of iterations is discovered during the run, such as pagination, polling, or retrying until a recoverable page state clears. For pagination, a common pattern is to extract a `has_next_page` boolean inside the loop, click Next, and let the next condition check decide whether to continue.
 
 ### Conditional
 

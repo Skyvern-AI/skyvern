@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,7 +27,11 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
-from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
+from skyvern.forge.sdk.copilot.output_utils import (
+    extract_final_text,
+    looks_like_workflow_delivery_claim,
+    parse_final_response,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -34,6 +39,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.utils.strings import escape_code_fences
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
@@ -42,6 +48,20 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 )
 
 MAX_TURNS = 25
+_USER_SUPPLIED_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+_UNTESTED_DRAFT_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"without\s+testing|"
+    r"without\s+(?:a\s+)?test(?:\s+run)?|"
+    r"do\s+not\s+test|"
+    r"don['’]?t\s+test|"
+    r"skip\s+(?:the\s+)?test(?:ing)?|"
+    r"no\s+test(?:ing)?|"
+    r"untested\s+draft|"
+    r"draft\s+only"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _BLOCK_GOAL_CONTEXT_PREAMBLE = (
     "Interpret the latest user message in the context of the prior conversation. If it is a correction, "
@@ -182,11 +202,183 @@ def _build_user_context(
     return prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml or ""),
+        workflow_summary=escape_code_fences(_build_workflow_summary(workflow_yaml)),
         chat_history=escape_code_fences(chat_history_text),
         global_llm_context=escape_code_fences(global_llm_context or ""),
         debug_run_info=escape_code_fences(debug_run_info_text),
         user_message=escape_code_fences(user_message),
     )
+
+
+def _extract_user_supplied_credential_ids(user_message: str) -> list[str]:
+    return list(dict.fromkeys(_USER_SUPPLIED_CREDENTIAL_ID_RE.findall(user_message or "")))
+
+
+def _user_requests_untested_workflow_draft(user_message: str) -> bool:
+    return bool(_UNTESTED_DRAFT_REQUEST_RE.search(user_message or ""))
+
+
+def _missing_credential_ids_result(
+    missing_credential_ids: list[str],
+    global_llm_context: str | None,
+) -> AgentResult:
+    formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
+    id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
+    was_word = "was" if len(missing_credential_ids) == 1 else "were"
+    structured = StructuredContext.from_json_str(global_llm_context)
+    structured.decisions_made.append(
+        f"credential reference validation blocked missing ids: {', '.join(missing_credential_ids)}"
+    )
+    return AgentResult(
+        user_response=(
+            f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
+            "Please choose one of these paths: provide/select a valid credential ID, create the credential "
+            "in the Credentials UI and return with its ID, or explicitly tell me to continue with an "
+            "unvalidated draft workflow that will not be run until credentials are available."
+        ),
+        updated_workflow=None,
+        global_llm_context=structured.to_json_str(),
+        response_type="ASK_QUESTION",
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+    )
+
+
+def _credential_lookup_failed_result(global_llm_context: str | None) -> AgentResult:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    structured.decisions_made.append("credential reference validation failed before workflow build")
+    return AgentResult(
+        user_response=(
+            "I couldn't verify the supplied credential ID against this organization, so I can't build or run "
+            "the workflow with it yet. Please provide/select a valid credential ID, create the credential in "
+            "the Credentials UI and return with its ID, or explicitly tell me to continue with an unvalidated "
+            "draft workflow that will not be run until credentials are available."
+        ),
+        updated_workflow=None,
+        global_llm_context=structured.to_json_str(),
+        response_type="ASK_QUESTION",
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+    )
+
+
+async def _credential_validation_result_for_user_message(
+    *,
+    user_message: str,
+    organization_id: str,
+    global_llm_context: str | None,
+    allow_untested_workflow_draft: bool = False,
+) -> AgentResult | None:
+    if allow_untested_workflow_draft:
+        return None
+
+    credential_ids = _extract_user_supplied_credential_ids(user_message)
+    if not credential_ids:
+        return None
+
+    try:
+        existing_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+            credential_ids,
+            organization_id=organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Copilot failed to validate user-supplied credential IDs",
+            organization_id=organization_id,
+            credential_ids=credential_ids,
+            exc_info=True,
+        )
+        return _credential_lookup_failed_result(global_llm_context)
+
+    found_ids = {credential.credential_id for credential in existing_credentials}
+    missing_ids = [credential_id for credential_id in credential_ids if credential_id not in found_ids]
+    if not missing_ids:
+        return None
+    return _missing_credential_ids_result(missing_ids, global_llm_context)
+
+
+def _truncate_summary_text(value: Any, max_chars: int = 240) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _block_summary_lines(blocks: list[Any], *, depth: int = 0) -> list[str]:
+    lines: list[str] = []
+    indent = "  " * depth
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+
+        label = block.get("label") or "(unlabeled)"
+        block_type = block.get("block_type") or "unknown"
+        line_parts = [f"{indent}- {label} ({block_type})"]
+        next_label = block.get("next_block_label")
+        if next_label:
+            line_parts.append(f"next={next_label}")
+
+        error_code_mapping = block.get("error_code_mapping")
+        if isinstance(error_code_mapping, dict) and error_code_mapping:
+            mappings = [f"{code}: {_truncate_summary_text(reason)}" for code, reason in error_code_mapping.items()]
+            line_parts.append("error_code_mapping={" + "; ".join(mappings) + "}")
+
+        branch_conditions = block.get("branch_conditions")
+        if isinstance(branch_conditions, list) and branch_conditions:
+            branch_targets = []
+            for branch in branch_conditions:
+                if not isinstance(branch, dict):
+                    continue
+                target = branch.get("next_block_label")
+                if target:
+                    prefix = "default -> " if branch.get("is_default") else "branch -> "
+                    branch_targets.append(prefix + str(target))
+            if branch_targets:
+                line_parts.append("branches=[" + ", ".join(branch_targets) + "]")
+
+        lines.append("; ".join(line_parts))
+
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list) and loop_blocks:
+            lines.extend(_block_summary_lines(loop_blocks, depth=depth + 1))
+
+    return lines
+
+
+def _build_workflow_summary(workflow_yaml: str | None) -> str:
+    """Return a compact block index for the model before the full YAML.
+
+    The full workflow YAML remains the source of truth, but large block goals
+    can bury later labels and per-block error mappings. This summary gives
+    block-specific debug turns a cheap index so an existing label like
+    ``block_2`` is not missed before the model inspects details in the YAML.
+    """
+    if not workflow_yaml:
+        return ""
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return ""
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return ""
+
+    lines = _block_summary_lines(blocks)
+    if not lines:
+        return ""
+    summary = "\n".join(lines)
+    max_summary_chars = 12_000
+    if len(summary) > max_summary_chars:
+        return summary[: max_summary_chars - 80].rstrip() + "\n... workflow summary truncated ..."
+    return summary
 
 
 def _build_tool_usage_guide(tool_names_and_descriptions: list[tuple[str, str]]) -> str:
@@ -245,6 +437,11 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         )
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
+        if ctx.allow_untested_workflow_draft:
+            return (
+                "I drafted the workflow without testing it, as requested. "
+                "You can accept it to save, but it has not been verified end-to-end."
+            )
         if has_keepable_draft:
             return (
                 "I drafted an update but wasn't able to verify it this turn. "
@@ -255,6 +452,15 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             "Could you share more context about what you'd like me to do?"
         )
 
+    return user_response
+
+
+def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str:
+    from skyvern.forge.sdk.copilot.enforcement import build_probable_site_block_user_question
+
+    site_block_question = build_probable_site_block_user_question(ctx)
+    if site_block_question is not None:
+        return site_block_question
     return user_response
 
 
@@ -313,6 +519,10 @@ _CANCEL_REPLY_UNVALIDATED = (
     "(note: it hasn't been verified end-to-end), or discard."
 )
 _CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
+_UNBACKED_WORKFLOW_DELIVERY_REPLY = (
+    "I wasn't able to produce a workflow proposal in this turn. Please try again, or provide the missing details "
+    "so I can build and test it."
+)
 
 
 def _build_wip_exit_result(
@@ -519,7 +729,9 @@ def _translate_to_agent_result(
     # cannot test. The generic rewrite would replace it with a vague
     # "Could you share more context", so skip it for ASK_QUESTION (and for
     # salvaged replies, which already describe the verified prefix).
-    if resp_type != "ASK_QUESTION" and not salvaged_reply:
+    if resp_type == "ASK_QUESTION":
+        user_response = _shape_ask_question_response(str(user_response), ctx)
+    elif not salvaged_reply:
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # Default-true preserves backwards-compat with stale prompts and missing fields.
@@ -544,6 +756,17 @@ def _translate_to_agent_result(
     if resp_type == "ASK_QUESTION":
         last_workflow = None
         last_workflow_yaml = None
+
+    last_update_block_count = ctx.last_update_block_count
+    last_test_ok = ctx.last_test_ok
+    if (
+        resp_type == "REPLY"
+        and last_workflow is None
+        and last_update_block_count is None
+        and last_test_ok is None
+        and looks_like_workflow_delivery_claim(user_response)
+    ):
+        user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
 
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)
@@ -613,6 +836,16 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
 ) -> AgentResult:
+    allow_untested_workflow_draft = _user_requests_untested_workflow_draft(chat_request.message)
+    credential_validation_result = await _credential_validation_result_for_user_message(
+        user_message=chat_request.message,
+        organization_id=organization_id,
+        global_llm_context=global_llm_context,
+        allow_untested_workflow_draft=allow_untested_workflow_draft,
+    )
+    if credential_validation_result is not None:
+        return credential_validation_result
+
     # Preflight feasibility classifier — fires on every turn so mid-session pivots
     # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
@@ -683,6 +916,7 @@ async def run_copilot_agent(
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
+        allow_untested_workflow_draft=allow_untested_workflow_draft,
         block_goal_main_goal=_build_block_goal_main_goal(
             user_message=chat_request.message,
             chat_history_text=chat_history_text,

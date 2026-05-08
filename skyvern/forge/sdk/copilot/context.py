@@ -160,9 +160,11 @@ class CopilotContext(AgentContext):
     post_update_nudge_count: int = 0
     coverage_nudge_count: int = 0
     format_nudge_count: int = 0
+    no_workflow_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
     user_message: str = ""
     block_goal_main_goal: str = ""
+    allow_untested_workflow_draft: bool = False
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
@@ -207,6 +209,7 @@ class CopilotContext(AgentContext):
     probable_site_block_streak_count: int = 0
     probable_site_block_stop_nudge_count: int = 0
     per_tool_budget_nudge_count: int = 0
+    effective_workflow_proxy_location: Any | None = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —

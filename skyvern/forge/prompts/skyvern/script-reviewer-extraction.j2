@@ -86,6 +86,22 @@ The cached code failed and the AI agent took over. Here is what happened:
 - **Fallback Type**: {{ episode.fallback_type }}
 - **Error**: {{ episode.error_message or "N/A" }}
 - **Classify Result**: {{ episode.classify_result or "N/A" }}
+{% if episode.classify_result == "UNKNOWN" %}
+  ⚠️ `page.classify()` returned UNKNOWN — the runtime LLM rejected every named option. Add a new branch with URL/text patterns derived from the page data below.
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.classify_rejection is defined %}
+- **Why the runtime LLM rejected the options**:
+  > {{ episode.agent_actions.classify_rejection.reasoning or "(no reasoning recorded)" }}
+{% if episode.agent_actions.classify_rejection.candidate_options %}
+  Options the LLM was given:
+{%- for opt_key, opt_desc in episode.agent_actions.classify_rejection.candidate_options.items() %}
+  - `{{ opt_key }}`: {{ opt_desc }}
+{%- endfor %}
+{% endif %}
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.exception_summary is defined and episode.agent_actions.exception_summary %}
+- **Recovery agent crashed mid-fallback**: `{{ episode.agent_actions.exception_summary }}`
+{% endif %}
 - **Page URL at failure**: {{ episode.page_url or "N/A" }}
 - **Page Text at failure** (use this to derive text_patterns):
 ```
