@@ -58,7 +58,8 @@ services:
       # ─────────────────────────────────────────────────────────────────
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_STREAMING_MODE=${BROWSER_STREAMING_MODE:-cdp}
-      - BROWSER_TYPE=chromium-headful
+      - BROWSER_TYPE=${BROWSER_TYPE:-chromium-headful}
+      - BROWSER_REMOTE_DEBUGGING_URL=${BROWSER_REMOTE_DEBUGGING_URL:-http://127.0.0.1:9222}
       - ENABLE_CODE_BLOCK=true
       # --- Control your own browser (Chrome/Chromium) ---
       # Start Chrome with --remote-debugging-address=0.0.0.0 so Docker can reach it.
