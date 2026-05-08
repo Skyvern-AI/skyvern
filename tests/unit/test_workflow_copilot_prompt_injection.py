@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.copilot.agent import _build_system_prompt, _build_user_context
+from skyvern.forge.sdk.copilot.agent import _build_system_prompt, _build_user_context, _build_workflow_summary
 from skyvern.forge.sdk.routes.workflow_copilot import copilot_call_llm
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.utils.strings import escape_code_fences
@@ -360,6 +360,34 @@ class TestBuildUserContext:
         # Exactly zero literal fence-breakouts survive; every occurrence
         # must be escaped by escape_code_fences().
         assert "``` injected ```" not in rendered
+
+    def test_workflow_summary_indexes_block_labels_and_error_mappings(self) -> None:
+        workflow_yaml = """
+title: Invoice workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: file_download
+      label: block_2
+      navigation_goal: Download the invoice for {{ invoice_date }}
+      error_code_mapping:
+        DATA_UNAVAILABLE: only if the account exists but the invoice for {{ invoice_date }} is missing
+"""
+
+        summary = _build_workflow_summary(workflow_yaml)
+        rendered = _build_user_context(
+            workflow_yaml=workflow_yaml,
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="why did block_2 not trigger DATA_UNAVAILABLE?",
+        )
+
+        assert "- block_2 (file_download)" in summary
+        assert "DATA_UNAVAILABLE: only if the account exists" in summary
+        assert "Workflow block summary:" in rendered
+        assert "- block_2 (file_download)" in rendered
+        assert "Use this summary as a block-label index" in rendered
 
 
 class TestUserTemplateCodeFencingNewCopilot:
