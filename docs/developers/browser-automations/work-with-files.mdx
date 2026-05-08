@@ -111,6 +111,7 @@ Each file in `downloaded_files` has:
 | `url` | `str` | Presigned URL to download the file. Valid for a limited time. |
 | `filename` | `str \| None` | Saved filename. Reflects `download_suffix` if you set one, otherwise system-generated. |
 | `checksum` | `str \| None` | SHA-256 checksum for integrity verification |
+| `file_size` | `int \| None` | Size of the file in bytes |
 | `modified_at` | `datetime \| None` | Last-modified timestamp if the source provides one |
 
 ---
