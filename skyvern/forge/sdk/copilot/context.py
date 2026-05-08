@@ -163,6 +163,7 @@ class CopilotContext(AgentContext):
     copilot_total_timeout_exceeded: bool = False
     user_message: str = ""
     block_goal_main_goal: str = ""
+    allow_untested_workflow_draft: bool = False
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
