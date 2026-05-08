@@ -19,6 +19,11 @@ services:
       retries: 5
   skyvern:
     image: public.ecr.aws/skyvern/skyvern:latest
+    # For local backend development, replace the image line above with:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    # Or keep the public image and uncomment the source mounts below.
     restart: on-failure
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -28,7 +33,6 @@ services:
     ports:
       - 8000:8000
       - 6080:6080 # for VNC WebSocket streaming
-      - 9222:9222 # for cdp browser forwarding
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -53,14 +57,20 @@ services:
       # .env owns secrets.
       # ─────────────────────────────────────────────────────────────────
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
-      - BROWSER_TYPE=chromium-headful
+      - BROWSER_STREAMING_MODE=${BROWSER_STREAMING_MODE:-cdp}
+      - BROWSER_TYPE=${BROWSER_TYPE:-chromium-headful}
+      - BROWSER_REMOTE_DEBUGGING_URL=${BROWSER_REMOTE_DEBUGGING_URL:-http://127.0.0.1:9222}
+      - BROWSER_REMOTE_DEBUGGING_HOST_HEADER=${BROWSER_REMOTE_DEBUGGING_HOST_HEADER:-}
+      - BROWSER_CDP_CONNECT_TIMEOUT_MS=${BROWSER_CDP_CONNECT_TIMEOUT_MS:-120000}
       - ENABLE_CODE_BLOCK=true
-      # --- Control your own browser (Chrome) ---
-      # 1. Open Chrome and navigate to: chrome://inspect/#remote-debugging
-      # 2. Click "Enable" to start the debugging server
-      # 3. Uncomment the two lines below:
+      # --- Control your own browser (Chrome/Chromium) ---
+      # Start Chrome with --remote-debugging-address=0.0.0.0 so Docker can reach it.
+      # On Windows, scripts/windows_chrome_inspect_cdp.ps1 can bridge a
+      # chrome://inspect/#remote-debugging listener and write the full ws:// URL.
+      # Then set:
       # - BROWSER_TYPE=cdp-connect
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
+      # See docs/developers/self-hosted/browser.mdx for Windows/Docker Desktop notes.
     # =========================
     #       LLM Settings - Use `skyvern init llm` for interactive setup
     # =========================
@@ -138,6 +148,10 @@ services:
       start_period: 180s
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
+    # For local UI development/testing, replace the image line above with:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.ui
     restart: on-failure
     ports:
       - 8080:8080
@@ -148,11 +162,13 @@ services:
       - ./har:/data/har
       # Generated credentials allow the UI to pick up the local API key on first startup.
       - ./.skyvern:/app/.skyvern
-    # User secrets and frontend config live in skyvern-frontend/.env
-    # (loaded via env_file). No inline environment for the UI service.
+    # User secrets and most frontend config live in skyvern-frontend/.env
+    # (loaded via env_file). CDP streaming is inline so local livestreaming is
+    # enabled even if an older frontend .env is present.
     env_file:
       - skyvern-frontend/.env
-    environment: {}
+    environment:
+      - VITE_BROWSER_STREAMING_MODE=${VITE_BROWSER_STREAMING_MODE:-cdp}
     #  - VITE_ENABLE_CODE_BLOCK=true
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip

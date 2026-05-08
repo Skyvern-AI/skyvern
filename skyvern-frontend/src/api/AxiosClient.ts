@@ -5,6 +5,7 @@ import {
   persistRuntimeApiKey,
   clearRuntimeApiKey,
 } from "@/util/env";
+import { useAuthIssueStore } from "@/store/AuthIssueStore";
 import axios from "axios";
 
 type ApiVersion = "sans-api-v1" | "v1" | "v2";
@@ -50,6 +51,39 @@ const artifactApiClient = axios.create({
 });
 
 const clients = [client, v2Client, clientSansApiV1] as const;
+
+function getResponseDetail(data: unknown): string | undefined {
+  if (data && typeof data === "object" && "detail" in data) {
+    const detail = (data as { detail?: unknown }).detail;
+    return typeof detail === "string" ? detail : undefined;
+  }
+  return undefined;
+}
+
+clients.forEach((instance) => {
+  instance.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (axios.isAxiosError(error)) {
+        const statusCode = error.response?.status;
+        const detail = getResponseDetail(error.response?.data);
+        const isAuthFailure =
+          statusCode === 401 ||
+          statusCode === 403 ||
+          (statusCode === 404 && detail === "Organization not found");
+
+        if (statusCode && isAuthFailure) {
+          useAuthIssueStore.getState().reportAuthIssue({
+            statusCode,
+            detail,
+            path: error.config?.url,
+          });
+        }
+      }
+      return Promise.reject(error);
+    },
+  );
+});
 
 function setHeaderForAllClients(header: string, value: string) {
   clients.forEach((instance) => {

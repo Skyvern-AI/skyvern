@@ -12,7 +12,7 @@ from rich.prompt import Confirm
 from skyvern.analytics import capture_setup_error, capture_setup_event
 
 # Import console after skyvern.cli to ensure proper initialization
-from skyvern.cli.browser import _open_chrome_inspect
+from skyvern.cli.browser import _print_classic_cdp_instructions
 from skyvern.cli.console import console
 from skyvern.cli.init_command import init_env  # init is used directly
 from skyvern.cli.llm_setup import setup_llm_providers
@@ -70,6 +70,27 @@ def check_postgres_container_conflict() -> bool:
         return False
 
 
+def _configure_cdp_livestreaming_defaults() -> None:
+    """Enable local CDP livestreaming for self-hosted quickstart paths."""
+    from dotenv import set_key
+
+    from skyvern.cli.llm_setup import update_or_add_env_var
+
+    update_or_add_env_var("BROWSER_STREAMING_MODE", "cdp")
+
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        import shutil
+
+        frontend_env.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(frontend_example, frontend_env)
+        console.print("✅ [green]Created skyvern-frontend/.env from .env.example[/green]")
+
+    if frontend_env.exists():
+        set_key(str(frontend_env), "VITE_BROWSER_STREAMING_MODE", "cdp", quote_mode="never")
+
+
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
@@ -108,15 +129,7 @@ def run_docker_compose_setup() -> None:
     # Configure LLM provider
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
     setup_llm_providers()
-
-    # Ensure frontend .env exists (docker-compose.yml references it via env_file)
-    frontend_env = Path("skyvern-frontend/.env")
-    frontend_example = Path("skyvern-frontend/.env.example")
-    if not frontend_env.exists() and frontend_example.exists():
-        import shutil
-
-        shutil.copy(frontend_example, frontend_env)
-        console.print("✅ [green]Created skyvern-frontend/.env from .env.example[/green]")
+    _configure_cdp_livestreaming_defaults()
 
     # Run docker compose up
     console.print("\n[bold blue]Step 2: Starting Docker Compose...[/bold blue]")
@@ -171,19 +184,11 @@ def run_docker_compose_setup() -> None:
         default=False,
     )
     if use_own_browser:
-        console.print(
-            Panel(
-                "[bold]Enable Remote Debugging in Chrome[/bold]\n\n"
-                "1. We'll open [cyan]chrome://inspect/#remote-debugging[/cyan] in your browser\n"
-                "2. Click [bold]Enable[/bold] to start the debugging server\n"
-                "3. You should see: [green]Server running at: 127.0.0.1:9222[/green]",
-                border_style="cyan",
-            )
+        _print_classic_cdp_instructions()
+        confirmed = Confirm.ask(
+            "Have you enabled remote debugging in Chrome?",
+            default=False,
         )
-        open_page = Confirm.ask("Open chrome://inspect/#remote-debugging now?", default=True)
-        if open_page:
-            _open_chrome_inspect()
-        confirmed = Confirm.ask("Have you enabled remote debugging in Chrome?", default=False)
         if confirmed:
             from skyvern.cli.llm_setup import update_or_add_env_var
 
@@ -193,7 +198,9 @@ def run_docker_compose_setup() -> None:
             console.print("  [cyan]docker compose up -d[/cyan]")
         else:
             console.print(
-                "[yellow]No problem — you can enable it later by navigating to chrome://inspect/#remote-debugging in Chrome.[/yellow]"
+                "[yellow]No problem - you can configure it later by setting "
+                "BROWSER_TYPE=cdp-connect and starting Chrome with a Docker-reachable "
+                "remote debugging address.[/yellow]"
             )
 
 
@@ -267,6 +274,8 @@ def quickstart(
             database_string=database_string,
             skip_browser_install=skip_browser_install,
         )
+        if run_local:
+            _configure_cdp_livestreaming_defaults()
 
         # Start services
         if run_local:

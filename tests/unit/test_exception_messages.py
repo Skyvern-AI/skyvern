@@ -3,6 +3,7 @@ from http import HTTPStatus
 import pytest
 
 from skyvern.exceptions import (
+    CdpConnectionConfigurationError,
     SkyvernException,
     SkyvernExtraNotInstalled,
     SkyvernHTTPException,
@@ -31,6 +32,20 @@ def test_unknown_error_while_creating_browser_context_strips_call_log() -> None:
     assert "timed out after 180 seconds" in message
     assert "Please try re-running." in message
     assert "support@skyvern.com" in message
+
+
+def test_unknown_error_preserves_cdp_configuration_guidance() -> None:
+    inner_exception = CdpConnectionConfigurationError(
+        "Skyvern reached the configured CDP address, but /json/version returned HTTP 404. "
+        "Start Chrome with --remote-debugging-port=9222."
+    )
+
+    error = UnknownErrorWhileCreatingBrowserContext("cdp-connect", inner_exception)
+    message = str(error)
+
+    assert "CdpConnectionConfigurationError" in message
+    assert "/json/version returned HTTP 404" in message
+    assert "--remote-debugging-port=9222" in message
 
 
 def test_get_user_facing_exception_message_for_skyvern_exception() -> None:

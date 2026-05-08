@@ -88,6 +88,7 @@ def init_env(
             update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
         if remote_debugging_url:
             update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+        update_or_add_env_var("BROWSER_STREAMING_MODE", "cdp")
         console.print("✅ [green]Browser configuration complete.[/green]")
 
         console.print("🌐 [bold blue]Setting Skyvern Base URL to: http://localhost:8000[/bold blue]")
@@ -247,6 +248,7 @@ def init_browser() -> None:
         update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
     if remote_debugging_url:
         update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+    update_or_add_env_var("BROWSER_STREAMING_MODE", "cdp")
     capture_setup_event(
         "browser-config-complete",
         success=True,

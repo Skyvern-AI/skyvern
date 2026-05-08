@@ -4,6 +4,10 @@ from skyvern.webeye.browser_factory import (
     _is_browser_profile_corruption_error,
     _is_display_server_error,
 )
+from skyvern.webeye.cdp_connection import (
+    build_cdp_configuration_error,
+    parse_cdp_discovery_error,
+)
 
 # -- _is_display_server_error ------------------------------------------------
 
@@ -105,3 +109,69 @@ class TestIsBrowserProfileCorruptionError:
     def test_unrelated_error_is_not_corruption(self) -> None:
         error = Exception("network timeout after 30 seconds")
         assert _is_browser_profile_corruption_error(error) is False
+
+
+# -- CDP connection diagnostics ---------------------------------------------
+
+
+class TestCdpConnectionDiagnostics:
+    """Detect non-CDP listeners on a configured CDP HTTP endpoint."""
+
+    def test_parse_playwright_http_discovery_status_error(self) -> None:
+        error = Exception(
+            "BrowserType.connect_over_cdp: Unexpected status 404 when connecting to "
+            "http://192.168.65.254:9222/json/version/. This does not look like a "
+            "DevTools server, try connecting via ws://."
+        )
+
+        assert parse_cdp_discovery_error(error) == (
+            404,
+            "http://192.168.65.254:9222/json/version/",
+        )
+
+    def test_builds_mcp_style_remote_debugging_guidance(self) -> None:
+        error = Exception(
+            "BrowserType.connect_over_cdp: Unexpected status 404 when connecting to "
+            "http://192.168.65.254:9222/json/version/. This does not look like a "
+            "DevTools server, try connecting via ws://."
+        )
+
+        configuration_error = build_cdp_configuration_error(
+            "http://192.168.65.254:9222/",
+            error,
+        )
+
+        assert configuration_error is not None
+        message = str(configuration_error)
+        assert "/json/version returns JSON with webSocketDebuggerUrl" in message
+        assert "chrome://inspect/#remote-debugging" in message
+        assert "DevToolsActivePort" in message
+        assert "windows_chrome_inspect_cdp.ps1" in message
+
+    def test_host_docker_internal_guidance_mentions_gateway_ip(self) -> None:
+        error = Exception(
+            "BrowserType.connect_over_cdp: Unexpected status 500 when connecting to "
+            "http://host.docker.internal:9222/json/version/. This does not look like a "
+            "DevTools server, try connecting via ws://."
+        )
+
+        configuration_error = build_cdp_configuration_error(
+            "http://host.docker.internal:9222/",
+            error,
+        )
+
+        assert configuration_error is not None
+        message = str(configuration_error)
+        assert "host.docker.internal" in message
+        assert "Docker host gateway IPv4" in message
+
+    def test_direct_websocket_errors_are_not_rewritten(self) -> None:
+        error = Exception("WebSocket was closed before the connection was established")
+
+        assert (
+            build_cdp_configuration_error(
+                "ws://127.0.0.1:9222/devtools/browser/abc",
+                error,
+            )
+            is None
+        )

@@ -10,8 +10,9 @@ if (!environment) {
   console.warn("environment environment variable was not set");
 }
 
-const browserStreamingMode =
-  (import.meta.env.VITE_BROWSER_STREAMING_MODE as string) ?? "vnc";
+const browserStreamingMode = (
+  (import.meta.env.VITE_BROWSER_STREAMING_MODE as string | undefined) || "vnc"
+).toLowerCase();
 
 const buildTimeApiKey: string | null =
   typeof import.meta.env.VITE_SKYVERN_API_KEY === "string"

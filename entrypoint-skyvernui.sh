@@ -6,6 +6,7 @@ set -e
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://localhost:8000/api/v1}"
 VITE_WSS_BASE_URL="${VITE_WSS_BASE_URL:-ws://localhost:8000/api/v1}"
 VITE_ARTIFACT_API_BASE_URL="${VITE_ARTIFACT_API_BASE_URL:-http://localhost:9090}"
+VITE_BROWSER_STREAMING_MODE="${VITE_BROWSER_STREAMING_MODE:-vnc}"
 
 # Priority for VITE_SKYVERN_API_KEY:
 # 1. Environment variable (from .env file or docker-compose environment),
@@ -31,6 +32,7 @@ find /app/dist -name "*.js" -exec sed -i \
     -e "s|__VITE_WSS_BASE_URL_PLACEHOLDER__|${VITE_WSS_BASE_URL}|g" \
     -e "s|__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__|${VITE_ARTIFACT_API_BASE_URL}|g" \
     -e "s|__SKYVERN_API_KEY_PLACEHOLDER__|${VITE_SKYVERN_API_KEY}|g" \
+    -e "s|__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__|${VITE_BROWSER_STREAMING_MODE}|g" \
     {} \;
 
 # Start the servers (no rebuild needed)

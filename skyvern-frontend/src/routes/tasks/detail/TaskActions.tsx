@@ -7,7 +7,7 @@ import { toast } from "@/components/ui/use-toast";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getCredentialParam } from "@/util/env";
+import { browserStreamingMode, getCredentialParam } from "@/util/env";
 import {
   keepPreviousData,
   useQuery,
@@ -70,10 +70,12 @@ function TaskActions() {
   const taskIsNotFinalized = task && statusIsNotFinalized(task);
   const taskIsRunningOrQueued = task && statusIsRunningOrQueued(task);
   const browserSessionId = task?.browser_session_id;
+  const shouldUseCdpStream = browserStreamingMode === "cdp";
 
   useEffect(() => {
-    // Skip screenshot WebSocket if VNC streaming is available via browser_session_id
-    if (browserSessionId) {
+    // In VNC mode, BrowserStream handles live sessions. In CDP mode, this
+    // screenshot WebSocket is the live stream.
+    if (browserSessionId && !shouldUseCdpStream) {
       return;
     }
 
@@ -149,6 +151,7 @@ function TaskActions() {
     taskId,
     taskIsRunningOrQueued,
     queryClient,
+    shouldUseCdpStream,
   ]);
 
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
@@ -204,7 +207,8 @@ function TaskActions() {
 
   function getStream() {
     // Use VNC streaming via BrowserStream when browser_session_id is available
-    if (browserSessionId) {
+    // and CDP local livestreaming is not enabled.
+    if (browserSessionId && !shouldUseCdpStream) {
       return (
         <AspectRatio ratio={16 / 9}>
           <BrowserStream

@@ -382,6 +382,10 @@ class UnknownBrowserType(SkyvernException):
         super().__init__(f"Unknown browser type {browser_type}")
 
 
+class CdpConnectionConfigurationError(SkyvernException):
+    """Raised when a configured CDP endpoint is reachable but not usable by Skyvern."""
+
+
 class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
     SUPPORT_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
@@ -392,6 +396,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, CdpConnectionConfigurationError):
+            return exception.message or str(exception)
+
         raw_message = str(exception).strip()
         raw_lower = raw_message.lower()
 

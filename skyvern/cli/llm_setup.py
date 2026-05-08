@@ -37,6 +37,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "GEMINI_API_KEY": "",
             "LLM_KEY": "",
             "SECONDARY_LLM_KEY": "",
+            "BROWSER_STREAMING_MODE": "cdp",
             "BROWSER_TYPE": "chromium-headful",
             "MAX_SCRAPING_RETRIES": "0",
             "VIDEO_PATH": "./videos",
