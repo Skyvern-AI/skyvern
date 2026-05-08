@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,20 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 )
 
 MAX_TURNS = 25
+_USER_SUPPLIED_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+_UNTESTED_DRAFT_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"without\s+testing|"
+    r"without\s+(?:a\s+)?test(?:\s+run)?|"
+    r"do\s+not\s+test|"
+    r"don['’]?t\s+test|"
+    r"skip\s+(?:the\s+)?test(?:ing)?|"
+    r"no\s+test(?:ing)?|"
+    r"untested\s+draft|"
+    r"draft\s+only"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _BLOCK_GOAL_CONTEXT_PREAMBLE = (
     "Interpret the latest user message in the context of the prior conversation. If it is a correction, "
@@ -189,6 +204,95 @@ def _build_user_context(
     )
 
 
+def _extract_user_supplied_credential_ids(user_message: str) -> list[str]:
+    return list(dict.fromkeys(_USER_SUPPLIED_CREDENTIAL_ID_RE.findall(user_message or "")))
+
+
+def _user_requests_untested_workflow_draft(user_message: str) -> bool:
+    return bool(_UNTESTED_DRAFT_REQUEST_RE.search(user_message or ""))
+
+
+def _missing_credential_ids_result(
+    missing_credential_ids: list[str],
+    global_llm_context: str | None,
+) -> AgentResult:
+    formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
+    id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
+    was_word = "was" if len(missing_credential_ids) == 1 else "were"
+    structured = StructuredContext.from_json_str(global_llm_context)
+    structured.decisions_made.append(
+        f"credential reference validation blocked missing ids: {', '.join(missing_credential_ids)}"
+    )
+    return AgentResult(
+        user_response=(
+            f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
+            "Please choose one of these paths: provide/select a valid credential ID, create the credential "
+            "in the Credentials UI and return with its ID, or explicitly tell me to continue with an "
+            "unvalidated draft workflow that will not be run until credentials are available."
+        ),
+        updated_workflow=None,
+        global_llm_context=structured.to_json_str(),
+        response_type="ASK_QUESTION",
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+    )
+
+
+def _credential_lookup_failed_result(global_llm_context: str | None) -> AgentResult:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    structured.decisions_made.append("credential reference validation failed before workflow build")
+    return AgentResult(
+        user_response=(
+            "I couldn't verify the supplied credential ID against this organization, so I can't build or run "
+            "the workflow with it yet. Please provide/select a valid credential ID, create the credential in "
+            "the Credentials UI and return with its ID, or explicitly tell me to continue with an unvalidated "
+            "draft workflow that will not be run until credentials are available."
+        ),
+        updated_workflow=None,
+        global_llm_context=structured.to_json_str(),
+        response_type="ASK_QUESTION",
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+    )
+
+
+async def _credential_validation_result_for_user_message(
+    *,
+    user_message: str,
+    organization_id: str,
+    global_llm_context: str | None,
+    allow_untested_workflow_draft: bool = False,
+) -> AgentResult | None:
+    if allow_untested_workflow_draft:
+        return None
+
+    credential_ids = _extract_user_supplied_credential_ids(user_message)
+    if not credential_ids:
+        return None
+
+    try:
+        existing_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+            credential_ids,
+            organization_id=organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Copilot failed to validate user-supplied credential IDs",
+            organization_id=organization_id,
+            credential_ids=credential_ids,
+            exc_info=True,
+        )
+        return _credential_lookup_failed_result(global_llm_context)
+
+    found_ids = {credential.credential_id for credential in existing_credentials}
+    missing_ids = [credential_id for credential_id in credential_ids if credential_id not in found_ids]
+    if not missing_ids:
+        return None
+    return _missing_credential_ids_result(missing_ids, global_llm_context)
+
+
 def _build_tool_usage_guide(tool_names_and_descriptions: list[tuple[str, str]]) -> str:
     if not tool_names_and_descriptions:
         return ""
@@ -245,6 +349,11 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         )
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
+        if ctx.allow_untested_workflow_draft:
+            return (
+                "I drafted the workflow without testing it, as requested. "
+                "You can accept it to save, but it has not been verified end-to-end."
+            )
         if has_keepable_draft:
             return (
                 "I drafted an update but wasn't able to verify it this turn. "
@@ -624,6 +733,16 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
 ) -> AgentResult:
+    allow_untested_workflow_draft = _user_requests_untested_workflow_draft(chat_request.message)
+    credential_validation_result = await _credential_validation_result_for_user_message(
+        user_message=chat_request.message,
+        organization_id=organization_id,
+        global_llm_context=global_llm_context,
+        allow_untested_workflow_draft=allow_untested_workflow_draft,
+    )
+    if credential_validation_result is not None:
+        return credential_validation_result
+
     # Preflight feasibility classifier — fires on every turn so mid-session pivots
     # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
@@ -694,6 +813,7 @@ async def run_copilot_agent(
         stream=stream,
         api_key=api_key,
         user_message=chat_request.message,
+        allow_untested_workflow_draft=allow_untested_workflow_draft,
         block_goal_main_goal=_build_block_goal_main_goal(
             user_message=chat_request.message,
             chat_history_text=chat_history_text,

@@ -7,6 +7,8 @@ Two independent guards:
   patterns (A-B-A-B) bypass it by design.
 * ``detect_failed_tool_step_loop`` fires on N repeated failures of the
   same (tool, args) pair, even when other tools dispatch in between.
+  Block-running credential/config failures are keyed by failure category
+  instead, because draft arguments can change while the init failure does not.
   A successful invocation of the same step resets its counter.
 """
 
@@ -17,9 +19,13 @@ import json
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
+from skyvern.forge.failure_classifier import classify_from_failure_reason
+
 MAX_CONSECUTIVE_SAME_TOOL = 3
 MAX_REPEATED_FAILED_STEP = 3
 LOOP_DETECTED_MARKER = "LOOP DETECTED:"
+ARGUMENT_INSENSITIVE_FAILURE_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES = frozenset({"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"})
 
 
 def detect_tool_loop(
@@ -65,6 +71,73 @@ def tool_step_identity(tool_name: str, arguments: Mapping[str, Any] | None = Non
     return f"{tool_name}:{digest}"
 
 
+def _failure_category_identity(tool_name: str, category: str) -> str:
+    return f"{tool_name}:failure_category:{category}"
+
+
+def _argument_insensitive_failure_category(result: Mapping[str, Any]) -> str | None:
+    data = result.get("data")
+    if isinstance(data, Mapping):
+        raw_categories = data.get("failure_categories")
+        if isinstance(raw_categories, list):
+            for raw_category in raw_categories:
+                if not isinstance(raw_category, Mapping):
+                    continue
+                category = raw_category.get("category")
+                if isinstance(category, str) and category in ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES:
+                    return category
+
+        failure_reason = data.get("failure_reason")
+        if isinstance(failure_reason, str):
+            categories = classify_from_failure_reason(failure_reason)
+            for raw_category in categories or []:
+                category = raw_category.get("category")
+                if isinstance(category, str) and category in ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES:
+                    return category
+
+    error = result.get("error")
+    if isinstance(error, str):
+        categories = classify_from_failure_reason(error)
+        for raw_category in categories or []:
+            category = raw_category.get("category")
+            if isinstance(category, str) and category in ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES:
+                return category
+
+    return None
+
+
+def _argument_insensitive_failure_identity(tool_name: str, result: Mapping[str, Any]) -> str | None:
+    if tool_name not in ARGUMENT_INSENSITIVE_FAILURE_TOOLS:
+        return None
+    category = _argument_insensitive_failure_category(result)
+    return _failure_category_identity(tool_name, category) if category else None
+
+
+def _clear_argument_insensitive_failure_identities(tracker: MutableMapping[str, int], tool_name: str) -> None:
+    prefix = f"{tool_name}:failure_category:"
+    for key in list(tracker):
+        if key.startswith(prefix):
+            del tracker[key]
+
+
+def _detect_argument_insensitive_failed_tool_loop(
+    tracker: MutableMapping[str, int],
+    tool_name: str,
+    threshold: int,
+) -> tuple[str, int] | None:
+    if tool_name not in ARGUMENT_INSENSITIVE_FAILURE_TOOLS:
+        return None
+
+    prefix = f"{tool_name}:failure_category:"
+    for key, failure_count in tracker.items():
+        if not key.startswith(prefix):
+            continue
+        next_attempt = failure_count + 1
+        if next_attempt >= threshold:
+            return key.removeprefix(prefix), failure_count
+    return None
+
+
 def detect_failed_tool_step_loop(
     tracker: MutableMapping[str, int],
     tool_name: str,
@@ -73,6 +146,17 @@ def detect_failed_tool_step_loop(
 ) -> str | None:
     if not tracker:
         return None
+
+    category_failure = _detect_argument_insensitive_failed_tool_loop(tracker, tool_name, threshold)
+    if category_failure is not None:
+        category, failure_count = category_failure
+        next_attempt = failure_count + 1
+        return (
+            f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
+            f"{failure_count} times with {category}; blocking attempt #{next_attempt}. "
+            "This failure is not tied to the draft arguments. Fix the credential/configuration, "
+            "ask the user, or produce your final JSON response."
+        )
 
     identity = tool_step_identity(tool_name, arguments)
     failure_count = tracker.get(identity, 0)
@@ -99,8 +183,10 @@ def record_tool_step_result(
     identity = tool_step_identity(tool_name, arguments)
     if result.get("ok", True):
         tracker.pop(identity, None)
+        _clear_argument_insensitive_failure_identities(tracker, tool_name)
         return
 
+    identity = _argument_insensitive_failure_identity(tool_name, result) or identity
     tracker[identity] = min(tracker.get(identity, 0) + 1, threshold)
 
 
