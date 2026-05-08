@@ -23,11 +23,13 @@ from skyvern.cli.console import console
 # Module-level lazy command registry
 # ---------------------------------------------------------------------------
 
-_LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {}
-"""Mapping of command_name -> (module_path, attr_name, help_text)."""
+_LAZY_COMMANDS: dict[str, tuple[str, str, str, str]] = {}
+"""Mapping of command_name -> (module_path, attr_name, help_text, install_extra)."""
 
 
-def register_lazy_command(name: str, module_path: str, attr_name: str, help_text: str) -> None:
+def register_lazy_command(
+    name: str, module_path: str, attr_name: str, help_text: str, *, install_extra: str = "server"
+) -> None:
     """Register a command/sub-app for deferred import.
 
     Parameters
@@ -40,13 +42,15 @@ def register_lazy_command(name: str, module_path: str, attr_name: str, help_text
         Attribute to import from *module_path* (e.g. ``"run_app"``).
     help_text:
         Short help shown in ``--help`` without importing the module.
+    install_extra:
+        Optional dependency extra required when the lazy import is unavailable.
     """
-    _LAZY_COMMANDS[name] = (module_path, attr_name, help_text)
+    _LAZY_COMMANDS[name] = (module_path, attr_name, help_text, install_extra)
 
 
 def _resolve_lazy_command(name: str) -> click.BaseCommand:
     """Import the module and resolve the Typer app (or Click command) for *name*."""
-    module_path, attr_name, _help = _LAZY_COMMANDS[name]
+    module_path, attr_name, _help, _install_extra = _LAZY_COMMANDS[name]
     mod = importlib.import_module(module_path)
     obj = getattr(mod, attr_name)
 
@@ -80,7 +84,8 @@ def _resolve_lazy_command(name: str) -> click.BaseCommand:
 class _LazyPlaceholder(click.Command):
     """A lightweight stand-in that renders help text without importing anything."""
 
-    def __init__(self, name: str, help_text: str) -> None:
+    def __init__(self, name: str, help_text: str, install_extra: str) -> None:
+        self.install_extra = install_extra
         super().__init__(
             name=name,
             help=help_text,
@@ -94,7 +99,7 @@ class _LazyPlaceholder(click.Command):
         try:
             real = _resolve_lazy_command(self.name or "")
         except ImportError as exc:
-            _handle_missing_dep(exc)
+            _handle_missing_dep(exc, install_extra=self.install_extra)
             raise  # unreachable — _handle_missing_dep raises typer.Exit, but satisfies linters
         return real.invoke(ctx)
 
@@ -131,8 +136,8 @@ class LazyTyperGroup(typer.core.TyperGroup):
                 return resolved
             except ImportError:
                 # Missing dep — return placeholder so --help doesn't crash.
-                _, _, help_text = _LAZY_COMMANDS[cmd_name]
-                return _LazyPlaceholder(cmd_name, help_text)
+                _, _, help_text, install_extra = _LAZY_COMMANDS[cmd_name]
+                return _LazyPlaceholder(cmd_name, help_text, install_extra)
 
         return None
 
@@ -147,8 +152,8 @@ class LazyTyperGroup(typer.core.TyperGroup):
                     continue
                 commands.append((name, cmd))
             elif name in _LAZY_COMMANDS:
-                _, _, help_text = _LAZY_COMMANDS[name]
-                commands.append((name, _LazyPlaceholder(name, help_text)))
+                _, _, help_text, install_extra = _LAZY_COMMANDS[name]
+                commands.append((name, _LazyPlaceholder(name, help_text, install_extra)))
 
         if not commands:
             return
@@ -169,14 +174,15 @@ class LazyTyperGroup(typer.core.TyperGroup):
 # ---------------------------------------------------------------------------
 
 
-def _handle_missing_dep(exc: ImportError) -> None:
+def _handle_missing_dep(exc: ImportError, *, install_extra: str = "server") -> None:
     """Show a user-friendly error when a required dependency is missing."""
     dep_name = exc.name or str(exc)
+    install_cmd = escape(f'pip install "skyvern[{install_extra}]"')
     console.print(
         Panel(
             f"[bold red]This command requires a dependency that is not installed.[/bold red]\n\n"
             f"Missing: [yellow]{dep_name}[/yellow]\n"
-            f"Run: [green]{escape('pip install skyvern[server]')}[/green]",
+            f"Run: [green]{install_cmd}[/green]",
             title="Missing Dependency",
             border_style="red",
         )

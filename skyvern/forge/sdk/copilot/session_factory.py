@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -146,7 +147,18 @@ def copilot_session_input_callback(
     return [history_items[0]] + pruned_middle + list(recent) + list(new_items)
 
 
+def make_copilot_call_model_input_filter(token_budget: int) -> Callable[[CallModelData[Any]], ModelInputData]:
+    def _filter(data: CallModelData[Any]) -> ModelInputData:
+        return _copilot_call_model_input_filter(data, token_budget=token_budget)
+
+    return _filter
+
+
 def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
+    return _copilot_call_model_input_filter(data, token_budget=TOKEN_BUDGET)
+
+
+def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     """Token-budget enforcement applied just before each model call.
 
     Graduated pruning:
@@ -173,7 +185,7 @@ def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
     items = _compact_tool_items(items)
 
     est = estimate_tokens(items)
-    if est <= TOKEN_BUDGET:
+    if est <= token_budget:
         LOG.info("Within budget after tool trim", tokens=est)
         return ModelInputData(input=items, instructions=model_data.instructions)
 
@@ -187,7 +199,7 @@ def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
         ]
 
     est = estimate_tokens(items)
-    if est <= TOKEN_BUDGET:
+    if est <= token_budget:
         LOG.info("Within budget after screenshot drop", tokens=est)
         return ModelInputData(input=items, instructions=model_data.instructions)
 
@@ -195,12 +207,12 @@ def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
     items = [_truncate_tool_output(item, TOOL_OUTPUT_TRUNCATE_EMERGENCY) for item in items]
 
     est = estimate_tokens(items)
-    if est <= TOKEN_BUDGET:
+    if est <= token_budget:
         LOG.info("Within budget after emergency truncation", tokens=est)
         return ModelInputData(input=items, instructions=model_data.instructions)
 
     # Layer 4: Aggressive prune as last resort
-    LOG.warning("Aggressive prune needed", tokens=est, budget=TOKEN_BUDGET)
+    LOG.warning("Aggressive prune needed", tokens=est, budget=token_budget)
     items = aggressive_prune(items)
 
     est = estimate_tokens(items)

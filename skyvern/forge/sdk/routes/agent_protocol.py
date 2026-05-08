@@ -146,6 +146,8 @@ from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
 
+FORCE_TASK_V1_MAX_STEPS = 25
+
 _create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
 
 
@@ -187,6 +189,33 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+
+    if (
+        run_request.engine == RunEngine.skyvern_v2
+        and not run_request.publish_workflow
+        and await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "FORCE_TASK_V1",
+            current_org.organization_id,
+            properties={"organization_id": current_org.organization_id},
+        )
+    ):
+        cap = FORCE_TASK_V1_MAX_STEPS
+        if current_org.max_steps_per_run is not None:
+            cap = min(cap, current_org.max_steps_per_run)
+        log_extra: dict[str, Any] = {}
+        if run_request.run_with:
+            log_extra["dropped_run_with"] = run_request.run_with
+        LOG.info(
+            "FORCE_TASK_V1 flag set; routing to v1 engine",
+            organization_id=current_org.organization_id,
+            requested_max_steps=run_request.max_steps,
+            org_max_steps_per_run=current_org.max_steps_per_run,
+            effective_cap=cap,
+            **log_extra,
+        )
+        run_request.engine = RunEngine.skyvern_v1
+        if not run_request.max_steps or run_request.max_steps > cap:
+            run_request.max_steps = cap
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1

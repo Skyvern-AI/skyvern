@@ -14,7 +14,9 @@ from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteE
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -478,6 +480,9 @@ class AgentFunction:
         """
         return AgentDB(database_string, debug_enabled=debug_enabled)
 
+    def build_azure_client_factory(self, factory: AzureClientFactory) -> AzureClientFactory:
+        return factory
+
     def resolve_mcp_oauth_org_lookups(self, db: object) -> tuple[Any, Any] | None:
         """Return ``(get_organization_entities, get_valid_org_auth_token)`` callables
         bound to the cloud DB's nested organizations repository.
@@ -622,6 +627,15 @@ class AgentFunction:
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
+
+    async def release_proxy_session_for_owner(self, owner_id: str) -> None:
+        """Release any proxy lease held by ``owner_id``.
+
+        OSS no-op. Cloud overrides this to release the lease back to the
+        proxy-session pool so workflow/task cleanup doesn't have to
+        import cloud-only modules from the OSS-synced ``skyvern/`` tree.
+        """
+        return None
 
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
         """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
@@ -1012,6 +1026,10 @@ class AgentFunction:
         OSS returns empty string (no hardening).
         """
         return ""
+
+    def get_copilot_config(self) -> CopilotConfig | None:
+        """Return an optional workflow copilot config override."""
+        return None
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.

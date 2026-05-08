@@ -3937,6 +3937,14 @@ class ForgeAgent:
             await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
             )
+        try:
+            await app.AGENT_FUNCTION.release_proxy_session_for_owner(task.task_id)
+        except Exception:
+            LOG.warning(
+                "Failed to release proxy session for task",
+                exc_info=True,
+                task_id=task.task_id,
+            )
 
         # Wait for all tasks to complete before generating the links for the artifacts
         with _tracer.start_as_current_span("skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:

@@ -225,9 +225,9 @@ class Skyvern(AsyncSkyvern):
         try:
             from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
         except ImportError as exc:
-            from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+            from skyvern.exceptions import raise_local_extra_required  # noqa: PLC0415
 
-            raise_server_extra_required("Skyvern.local()", exc)
+            raise_local_extra_required("Skyvern.local()", exc)
 
         from skyvern.utils.env_paths import resolve_backend_env_path  # noqa: PLC0415
 
@@ -652,14 +652,14 @@ class Skyvern(AsyncSkyvern):
 
     async def _get_playwright(self) -> Playwright:
         if self._playwright is None:
-            from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+            from skyvern.exceptions import raise_local_extra_required  # noqa: PLC0415
 
             # Cloud-API-only SDK users can instantiate Skyvern without server extras,
             # so browser startup keeps its own extra hint at the Playwright boundary.
             try:
                 from playwright.async_api import async_playwright  # noqa: PLC0415
             except ImportError as exc:
-                raise_server_extra_required("Browser APIs", exc)
+                raise_local_extra_required("Browser APIs", exc)
 
             self._playwright = await async_playwright().start()
         return self._playwright

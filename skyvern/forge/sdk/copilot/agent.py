@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
@@ -47,7 +48,6 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "skyvern" / "workflow_knowledge_base.txt"
 )
 
-MAX_TURNS = 25
 _USER_SUPPLIED_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _UNTESTED_DRAFT_REQUEST_RE = re.compile(
     r"\b(?:"
@@ -170,15 +170,18 @@ def _build_block_goal_main_goal(
 
 def _build_system_prompt(
     tool_usage_guide: str,
-    security_rules: str = "",
+    config: CopilotConfig | None = None,
+    security_rules: str | None = None,
 ) -> str:
+    copilot_config = config or CopilotConfig(security_rules=security_rules or "")
+    template = copilot_config.prompt_template.removesuffix(".j2")
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
     return prompt_engine.load_prompt(
-        template="workflow-copilot-agent",
+        template=template,
         workflow_knowledge_base=workflow_knowledge_base,
         current_datetime=datetime.now(timezone.utc).isoformat(),
         tool_usage_guide=tool_usage_guide,
-        security_rules=security_rules,
+        security_rules=copilot_config.security_rules,
     )
 
 
@@ -841,6 +844,60 @@ def _build_feasibility_clarification_result(
     )
 
 
+_RETRIABLE_LLM_ERROR_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "APIError",
+    "InternalServerError",
+    "RateLimitError",
+    "ServiceUnavailableError",
+    "Timeout",
+}
+_RETRIABLE_LLM_ERROR_TEXT = (
+    "rate limit",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+    "service unavailable",
+    "connection error",
+    "connection reset",
+    "internal server error",
+    "server error",
+    "overloaded",
+)
+_LLM_ERROR_MODULE_MARKERS = ("openai", "litellm", "anthropic")
+
+
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _is_retriable_llm_error(exc: BaseException) -> bool:
+    for item in _iter_exception_chain(exc):
+        module = type(item).__module__.lower()
+        name = type(item).__name__
+        text = str(item).lower()
+        if name in _RETRIABLE_LLM_ERROR_NAMES and any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS):
+            return True
+        if any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS) and any(
+            phrase in text for phrase in _RETRIABLE_LLM_ERROR_TEXT
+        ):
+            return True
+    return False
+
+
+def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None:
+    fallback_key = config.fallback_llm_key
+    if not fallback_key or fallback_key == current_llm_key:
+        return None
+    return fallback_key
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -851,7 +908,9 @@ async def run_copilot_agent(
     llm_api_handler: LLMAPIHandler | None,
     api_key: str | None = None,
     security_rules: str = "",
+    config: CopilotConfig | None = None,
 ) -> AgentResult:
+    copilot_config = config or CopilotConfig(security_rules=security_rules)
     allow_untested_workflow_draft = _user_requests_untested_workflow_draft(chat_request.message)
     credential_validation_result = await _credential_validation_result_for_user_message(
         user_message=chat_request.message,
@@ -941,20 +1000,15 @@ async def run_copilot_agent(
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
     )
 
-    model_name, run_config, llm_key, supports_vision = resolve_model_config(llm_api_handler)
+    model_name, run_config, llm_key, supports_vision = resolve_model_config(
+        llm_api_handler,
+        copilot_config=copilot_config,
+    )
     ctx.supports_vision = supports_vision
     ensure_tracing_initialized()
 
     alias_map = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
-
-    mcp_server = SkyvernOverlayMCPServer(
-        transport=skyvern_mcp,
-        overlays=overlays,
-        alias_map=alias_map,
-        allowlist=frozenset(alias_map.values()),
-        context_provider=lambda: ctx,
-    )
 
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in NATIVE_TOOLS]
     tool_info.extend((name, overlay.description or "") for name, overlay in overlays.items())
@@ -962,15 +1016,7 @@ async def run_copilot_agent(
     tool_usage_guide = _build_tool_usage_guide(tool_info)
     system_prompt = _build_system_prompt(
         tool_usage_guide=tool_usage_guide,
-        security_rules=security_rules,
-    )
-
-    agent = Agent(
-        name="workflow-copilot",
-        instructions=system_prompt,
-        tools=list(NATIVE_TOOLS),
-        mcp_servers=[mcp_server],
-        model=model_name,
+        config=copilot_config,
     )
 
     user_message = _build_user_context(
@@ -1002,23 +1048,77 @@ async def run_copilot_agent(
         )
 
     chat_id = chat_request.workflow_copilot_chat_id or chat_request.workflow_permanent_id
-    session = create_copilot_session(chat_id)
-    model_token = _copilot_model_name.set(model_name)
+
+    async def _run_attempt(
+        attempt_model_name: str,
+        attempt_run_config: Any,
+        attempt_llm_key: str,
+    ) -> RunResultStreaming:
+        mcp_server = SkyvernOverlayMCPServer(
+            transport=skyvern_mcp,
+            overlays=overlays,
+            alias_map=alias_map,
+            allowlist=frozenset(alias_map.values()),
+            context_provider=lambda: ctx,
+        )
+        agent = Agent(
+            name="workflow-copilot",
+            instructions=system_prompt,
+            tools=list(NATIVE_TOOLS),
+            mcp_servers=[mcp_server],
+            model=attempt_model_name,
+        )
+        session = create_copilot_session(chat_id)
+        model_token = _copilot_model_name.set(attempt_model_name)
+        try:
+            async with MCPServerManager([mcp_server]) as manager:
+                agent.mcp_servers = list(manager.active_servers)
+                result = await run_with_enforcement(
+                    agent=agent,
+                    initial_input=user_message,
+                    ctx=ctx,
+                    stream=stream,
+                    max_turns=copilot_config.max_turns,
+                    hooks=CopilotRunHooks(ctx),
+                    run_config=attempt_run_config,
+                    session=session,
+                    copilot_config=copilot_config,
+                )
+            LOG.info(
+                "Copilot agent model attempt succeeded",
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                llm_key=attempt_llm_key,
+            )
+            return result
+        finally:
+            _copilot_model_name.reset(model_token)
+            session.close()
+
     try:
         with trace_context:
             try:
-                async with MCPServerManager([mcp_server]) as manager:
-                    agent.mcp_servers = list(manager.active_servers)
-                    result = await run_with_enforcement(
-                        agent=agent,
-                        initial_input=user_message,
-                        ctx=ctx,
-                        stream=stream,
-                        max_turns=MAX_TURNS,
-                        hooks=CopilotRunHooks(ctx),
-                        run_config=run_config,
-                        session=session,
+                try:
+                    result = await _run_attempt(model_name, run_config, llm_key)
+                except Exception as primary_error:
+                    fallback_llm_key = _fallback_llm_key(copilot_config, llm_key)
+                    if fallback_llm_key is None or not _is_retriable_llm_error(primary_error):
+                        raise
+                    LOG.warning(
+                        "Copilot agent model attempt failed; retrying fallback model",
+                        workflow_permanent_id=chat_request.workflow_permanent_id,
+                        primary_llm_key=llm_key,
+                        fallback_llm_key=fallback_llm_key,
+                        error_type=type(primary_error).__name__,
                     )
+                    fallback_model_name, fallback_run_config, fallback_resolved_key, fallback_supports_vision = (
+                        resolve_model_config(
+                            llm_api_handler,
+                            copilot_config=copilot_config,
+                            llm_key_override=fallback_llm_key,
+                        )
+                    )
+                    ctx.supports_vision = fallback_supports_vision
+                    result = await _run_attempt(fallback_model_name, fallback_run_config, fallback_resolved_key)
                 return _translate_to_agent_result(
                     result,
                     ctx,
@@ -1058,6 +1158,3 @@ async def run_copilot_agent(
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
         return _build_unexpected_error_exit_result(ctx, global_llm_context)
-    finally:
-        _copilot_model_name.reset(model_token)
-        session.close()

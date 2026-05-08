@@ -23,6 +23,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.core import skyvern_context
@@ -1330,7 +1331,7 @@ async def _new_copilot_chat_post(
                 )
                 return
 
-            security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
+            copilot_config = app.AGENT_FUNCTION.get_copilot_config() or CopilotConfig()
 
             # Spawn the cancel watcher only after the chat row exists; cancels
             # that land during pre-agent setup are not user-cancellable
@@ -1360,7 +1361,7 @@ async def _new_copilot_chat_post(
                     debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
                     api_key=api_key,
-                    security_rules=security_rules,
+                    config=copilot_config,
                 )
 
             if getattr(agent_result, "cancelled", False):
