@@ -108,7 +108,7 @@ async def test_connect_over_cdp_retries_resolved_host_with_headers(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_connect_over_cdp_accepts_direct_websocket_with_timeout() -> None:
+async def test_connect_over_cdp_accepts_direct_websocket_with_default_timeout() -> None:
     expected_browser = object()
 
     class FakeChromium:
@@ -134,12 +134,11 @@ async def test_connect_over_cdp_accepts_direct_websocket_with_timeout() -> None:
     browser = await connect_over_cdp_with_diagnostics(
         cast(Playwright, fake_playwright),
         "ws://host.docker.internal:9223/devtools/browser/abc",
-        timeout_ms=120000,
     )
 
     assert browser is expected_browser
     assert fake_playwright.chromium.calls == [
-        ("ws://host.docker.internal:9223/devtools/browser/abc", 120000, None),
+        ("ws://host.docker.internal:9223/devtools/browser/abc", 30_000, None),
     ]
 
 

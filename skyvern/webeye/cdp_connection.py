@@ -12,7 +12,7 @@ from playwright.async_api import Browser, Playwright
 from skyvern.exceptions import CdpConnectionConfigurationError
 
 LOG = structlog.get_logger()
-DEFAULT_CDP_CONNECT_TIMEOUT_MS = 120_000
+DEFAULT_CDP_CONNECT_TIMEOUT_MS = 30_000
 
 _CDP_DISCOVERY_ERROR_RE = re.compile(
     r"Unexpected status (?P<status>\d+) when connecting to (?P<url>https?://\S+/json/version/?)"
@@ -124,13 +124,12 @@ async def connect_over_cdp_with_diagnostics(
     headers: dict[str, str] | None = None,
     timeout_ms: int = DEFAULT_CDP_CONNECT_TIMEOUT_MS,
 ) -> Browser:
-    async def connect(url: str, attempt_headers: dict[str, str] | None = None) -> Browser:
-        if attempt_headers is None:
-            return await playwright.chromium.connect_over_cdp(url, timeout=timeout_ms)
-        return await playwright.chromium.connect_over_cdp(url, timeout=timeout_ms, headers=attempt_headers)
-
     try:
-        return await connect(remote_browser_url, headers)
+        return await playwright.chromium.connect_over_cdp(
+            remote_browser_url,
+            timeout=timeout_ms,
+            headers=headers,
+        )
     except Exception as first_error:
         errors: list[tuple[str, Exception]] = [(remote_browser_url, first_error)]
         for candidate in build_cdp_connection_candidates(remote_browser_url, headers):
@@ -146,7 +145,11 @@ async def connect_over_cdp_with_diagnostics(
                 fallback_url=candidate.url,
             )
             try:
-                return await connect(candidate.url, candidate.headers)
+                return await playwright.chromium.connect_over_cdp(
+                    candidate.url,
+                    timeout=timeout_ms,
+                    headers=candidate.headers,
+                )
             except Exception as candidate_error:
                 errors.append((candidate.url, candidate_error))
 
