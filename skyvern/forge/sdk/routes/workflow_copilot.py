@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1076,6 +1077,118 @@ def _process_workflow_yaml(
     )
 
 
+def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
+    if not workflow_yaml:
+        return 0
+    try:
+        parsed_yaml = safe_load_no_dates(workflow_yaml)
+    except Exception:
+        return 0
+    if not isinstance(parsed_yaml, dict):
+        return 0
+
+    workflow_definition = parsed_yaml.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return 0
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return 0
+    return len(blocks)
+
+
+def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
+    cleaned = deepcopy(block)
+    cleaned.pop("output_parameter", None)
+    cleaned.pop("workflow_system_prompt", None)
+
+    parameters = cleaned.pop("parameters", None)
+    if isinstance(parameters, list) and "parameter_keys" not in cleaned:
+        parameter_keys = [
+            parameter.get("key")
+            for parameter in parameters
+            if isinstance(parameter, dict)
+            and parameter.get("key")
+            and parameter.get("parameter_type") != ParameterType.OUTPUT.value
+        ]
+        if parameter_keys:
+            cleaned["parameter_keys"] = parameter_keys
+
+    loop_over = cleaned.pop("loop_over", None)
+    if isinstance(loop_over, dict) and "loop_over_parameter_key" not in cleaned:
+        loop_over_parameter_key = loop_over.get("key")
+        if loop_over_parameter_key:
+            cleaned["loop_over_parameter_key"] = loop_over_parameter_key
+
+    loop_blocks = cleaned.get("loop_blocks")
+    if isinstance(loop_blocks, list):
+        cleaned["loop_blocks"] = [
+            _strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
+            for loop_block in loop_blocks
+        ]
+    return cleaned
+
+
+def _workflow_to_copilot_yaml(workflow: Workflow) -> str:
+    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
+    workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
+
+    parameters = workflow_definition.get("parameters")
+    if isinstance(parameters, list):
+        workflow_definition["parameters"] = [
+            parameter
+            for parameter in parameters
+            if not (isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.OUTPUT.value)
+        ]
+
+    blocks = workflow_definition.get("blocks")
+    if isinstance(blocks, list):
+        workflow_definition["blocks"] = [
+            _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
+        ]
+
+    request_data = {
+        key: workflow_data[key]
+        for key in WorkflowCreateYAMLRequest.model_fields
+        if key != "workflow_definition" and key in workflow_data
+    }
+    request_data["workflow_definition"] = workflow_definition
+
+    try:
+        workflow_request = WorkflowCreateYAMLRequest.model_validate(request_data)
+        yaml_data = workflow_request.model_dump(mode="json", exclude_none=True)
+    except ValidationError:
+        LOG.warning(
+            "Persisted workflow did not round-trip through copilot YAML schema; using best-effort workflow dump",
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            exc_info=True,
+        )
+        yaml_data = request_data
+    return yaml.safe_dump(yaml_data, sort_keys=False)
+
+
+def _ensure_copilot_workflow_yaml(chat_request: WorkflowCopilotChatRequest, original_workflow: Workflow) -> None:
+    if _workflow_yaml_block_count(chat_request.workflow_yaml) > 0:
+        return
+    workflow_definition = original_workflow.workflow_definition
+    if workflow_definition is None or not workflow_definition.blocks:
+        return
+
+    persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+    if not persisted_workflow_yaml:
+        return
+
+    LOG.warning(
+        "Copilot V2 chat request had no workflow blocks; using persisted workflow YAML",
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        workflow_id=original_workflow.workflow_id,
+        submitted_workflow_yaml_length=len(chat_request.workflow_yaml or ""),
+        persisted_workflow_yaml_length=len(persisted_workflow_yaml),
+        persisted_block_count=len(workflow_definition.blocks),
+    )
+    chat_request.workflow_yaml = persisted_workflow_yaml
+
+
 async def _new_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
@@ -1190,6 +1303,7 @@ async def _new_copilot_chat_post(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
 
             chat_request.workflow_id = original_workflow.workflow_id
+            _ensure_copilot_workflow_yaml(chat_request, original_workflow)
 
             llm_api_handler = await _resolve_copilot_agent_handler(
                 chat_request.workflow_permanent_id, organization.organization_id

@@ -648,6 +648,29 @@ workflow_definition:
         assert agent_result.workflow_yaml is None
         assert agent_result.unvalidated is False
 
+    def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
+        ctx = _ctx(last_test_ok=None)
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "here's the workflow" not in agent_result.user_response.lower()
+        assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_unbacked_workflow_claim_not_rewritten_when_proposal_exists(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="title: drafted", last_test_ok=True)
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.user_response == "Here's the workflow."
+        assert agent_result.updated_workflow is wf
+
     def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
         # Failed-test path already routes to unvalidated WIP. A redundant
         # ``goal_reached: false`` from the agent must not change the outcome

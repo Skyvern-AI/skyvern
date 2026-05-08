@@ -10,6 +10,16 @@ The user's current workflow definition is:
 The user is starting with an empty workflow.
 {% endif %}
 
+{% if workflow_summary is defined and workflow_summary %}
+Workflow block summary:
+
+```
+{{ workflow_summary }}
+```
+
+Use this summary as a block-label index, then inspect the full workflow definition above for exact block details.
+{% endif %}
+
 PREVIOUS CONTEXT:
 
 {% if chat_history %}
