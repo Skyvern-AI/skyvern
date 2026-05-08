@@ -54,6 +54,7 @@ class SchemaOverlay:
 
 
 LOG = structlog.get_logger()
+_INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 
 
 def _apply_schema_overlay(
@@ -89,7 +90,7 @@ def _transform_args(
     arguments: dict[str, Any],
     overlay: SchemaOverlay,
 ) -> dict[str, Any]:
-    mcp_args = {k: v for k, v in arguments.items() if k not in overlay.hide_params}
+    mcp_args = {k: v for k, v in arguments.items() if k not in overlay.hide_params | _INTERNAL_TOOL_ARG_KEYS}
 
     for copilot_param, mcp_param in overlay.arg_transforms.items():
         if copilot_param in mcp_args:
@@ -195,6 +196,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             raise RuntimeError("Not connected — call connect() first")
 
         arguments = arguments or {}
+        arguments = {k: v for k, v in arguments.items() if k not in _INTERNAL_TOOL_ARG_KEYS}
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
 
