@@ -33,7 +33,13 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     compute_failure_signature,
 )
-from skyvern.forge.sdk.copilot.tools import _maybe_clear_reconciliation_flag, _record_run_blocks_result
+from skyvern.forge.sdk.copilot.tools import (
+    _maybe_clear_reconciliation_flag,
+    _record_per_tool_budget_problem_blocks_from_results,
+    _record_run_blocks_result,
+    _record_workflow_update_result,
+    _tool_loop_error,
+)
 
 
 def _fresh_context() -> CopilotContext:
@@ -281,6 +287,126 @@ def test_reconciliation_does_not_clear_when_run_id_mismatches() -> None:
     _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_other", "canceled"))
 
     assert ctx.pending_reconciliation_run_id == "wr_1"
+
+
+def test_get_run_results_arms_problem_navigation_label_for_budget_run() -> None:
+    ctx = _fresh_context()
+    ctx.pending_reconciliation_run_id = "wr_1"
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+    _record_per_tool_budget_problem_blocks_from_results(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "canceled",
+                "blocks": [
+                    {"label": "open_results", "block_type": "GOTO_URL", "status": "completed"},
+                    {"label": "apply_filters", "block_type": "NAVIGATION", "status": "canceled"},
+                    {"label": "extract_results", "block_type": "EXTRACTION", "status": "created"},
+                ],
+            },
+        },
+    )
+
+    assert ctx.per_tool_budget_problem_block_labels == ["apply_filters"]
+
+
+def test_get_run_results_does_not_arm_problem_label_for_different_run() -> None:
+    ctx = _fresh_context()
+    ctx.pending_reconciliation_run_id = "wr_1"
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+    _record_per_tool_budget_problem_blocks_from_results(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_other",
+                "overall_status": "canceled",
+                "blocks": [{"label": "apply_filters", "block_type": "NAVIGATION", "status": "canceled"}],
+            },
+        },
+    )
+
+    assert ctx.per_tool_budget_problem_block_labels == []
+
+
+def test_tool_loop_error_blocks_rerun_of_problem_navigation_label() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+
+    msg = _tool_loop_error(
+        ctx,
+        "run_blocks_and_collect_debug",
+        {"block_labels": ["apply_filters"], "parameters": {}},
+    )
+
+    assert msg is not None
+    assert "apply_filters" in msg
+    assert "Do NOT rerun" in msg
+    assert "code or validation" in msg
+
+
+def test_tool_loop_error_treats_missing_labels_as_rerun_all() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+
+    msg = _tool_loop_error(ctx, "run_blocks_and_collect_debug", {"parameters": {}})
+
+    assert msg is not None
+    assert "apply_filters" in msg
+
+
+def test_tool_loop_error_allows_new_smaller_label_after_budget_problem() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+
+    assert (
+        _tool_loop_error(
+            ctx,
+            "run_blocks_and_collect_debug",
+            {"block_labels": ["click_parking"], "parameters": {}},
+        )
+        is None
+    )
+
+
+def test_successful_workflow_update_keeps_problem_label_while_still_navigation() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = "updated yaml"
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+    workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(block_type="navigation", label="apply_filters"),
+                SimpleNamespace(block_type="extraction", label="extract_results"),
+            ]
+        )
+    )
+
+    _record_workflow_update_result(ctx, {"ok": True, "_workflow": workflow, "data": {"block_count": 2}})
+
+    assert ctx.per_tool_budget_problem_block_labels == ["apply_filters"]
+
+
+def test_successful_workflow_update_clears_problem_label_changed_away_from_navigation() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = "updated yaml"
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+    workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(block_type="code", label="apply_filters"),
+                SimpleNamespace(block_type="navigation", label="click_parking"),
+            ]
+        )
+    )
+
+    _record_workflow_update_result(ctx, {"ok": True, "_workflow": workflow, "data": {"block_count": 2}})
+
+    assert ctx.per_tool_budget_problem_block_labels == []
 
 
 def test_nudge_counter_resets_on_success() -> None:

@@ -219,7 +219,7 @@ class TestSchemaOverlay:
             arg_transforms={"clear_first": "clear"},
             forced_args={"inline": True},
         )
-        args = {"clear_first": True, "text": "hello"}
+        args = {"clear_first": True, "text": "hello", "_summarized": "older tool call"}
         result = _transform_args(args, overlay)
         assert result == {"clear": True, "text": "hello", "inline": True}
         assert "clear_first" not in result
