@@ -16,6 +16,9 @@ from skyvern.cli.core.guards import (
     validate_wait_until,
 )
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
+from skyvern.client.types.extensions import Extensions
+
+CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
 # ---------------------------------------------------------------------------
 # guards.py
@@ -203,6 +206,28 @@ async def test_do_session_create_cloud() -> None:
     browser, result = await do_session_create(skyvern, timeout=30)
     assert result.session_id == "pbs_123"
     assert result.timeout_minutes == 30
+
+
+@pytest.mark.asyncio
+async def test_do_session_create_cloud_forwards_extensions() -> None:
+    skyvern = MagicMock()
+    browser_mock = MagicMock()
+    browser_mock.browser_session_id = "pbs_ext"
+    skyvern.launch_cloud_browser = AsyncMock(return_value=browser_mock)
+
+    browser, result = await do_session_create(
+        skyvern,
+        timeout=30,
+        extensions=[CAPTCHA_SOLVER_EXTENSION],
+    )
+
+    assert browser is browser_mock
+    assert result.session_id == "pbs_ext"
+    skyvern.launch_cloud_browser.assert_awaited_once_with(
+        timeout=30,
+        proxy_location=None,
+        extensions=[CAPTCHA_SOLVER_EXTENSION],
+    )
 
 
 @pytest.mark.asyncio
