@@ -775,6 +775,7 @@ class WorkflowService:
         workflow_schedule_id: str | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        llm_api_key: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -882,6 +883,7 @@ class WorkflowService:
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     max_steps_override=max_steps_override,
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
+                    llm_api_key=llm_api_key,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
                 )

@@ -143,6 +143,7 @@ class TaskRequest(TaskBase):
     totp_verification_url: str | None = None
     browser_session_id: str | None = None
     model: dict[str, Any] | None = None
+    llm_api_key: str | None = None
 
     @model_validator(mode="after")
     def validate_url(self) -> Self:

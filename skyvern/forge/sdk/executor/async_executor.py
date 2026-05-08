@@ -17,6 +17,7 @@ class AsyncExecutor(abc.ABC):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
+        llm_api_key: str | None = None,
         **kwargs: dict,
     ) -> None:
         pass
