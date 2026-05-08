@@ -8,6 +8,7 @@ from skyvern.analytics import capture_setup_event
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
+from .masked_prompt import ask_secret
 
 DEFAULT_POSTGRES_DATABASE_STRING = "postgresql+psycopg://skyvern@localhost:5432/skyvern"
 
@@ -70,7 +71,7 @@ def setup_llm_providers() -> None:
     console.print("To enable OpenAI, you must have an OpenAI API key.")
     enable_openai = Confirm.ask("Do you want to enable OpenAI?")
     if enable_openai:
-        openai_api_key = Prompt.ask("Enter your OpenAI API key", password=True)
+        openai_api_key = ask_secret("Enter your OpenAI API key")
         if not openai_api_key:
             console.print("[red]Error: OpenAI API key is required. OpenAI will not be enabled.[/red]")
         else:
@@ -91,7 +92,7 @@ def setup_llm_providers() -> None:
     console.print("To enable Anthropic, you must have an Anthropic API key.")
     enable_anthropic = Confirm.ask("Do you want to enable Anthropic?")
     if enable_anthropic:
-        anthropic_api_key = Prompt.ask("Enter your Anthropic API key", password=True)
+        anthropic_api_key = ask_secret("Enter your Anthropic API key")
         if not anthropic_api_key:
             console.print("[red]Error: Anthropic API key is required. Anthropic will not be enabled.[/red]")
         else:
@@ -115,7 +116,7 @@ def setup_llm_providers() -> None:
     enable_azure = Confirm.ask("Do you want to enable Azure?")
     if enable_azure:
         azure_deployment = Prompt.ask("Enter your Azure deployment name")
-        azure_api_key = Prompt.ask("Enter your Azure API key", password=True)
+        azure_api_key = ask_secret("Enter your Azure API key")
         azure_api_base = Prompt.ask("Enter your Azure API base URL")
         azure_api_version = Prompt.ask("Enter your Azure API version")
         if not all([azure_deployment, azure_api_key, azure_api_base, azure_api_version]):
@@ -135,7 +136,7 @@ def setup_llm_providers() -> None:
     console.print("To enable Gemini, you must have a Gemini API key.")
     enable_gemini = Confirm.ask("Do you want to enable Gemini?")
     if enable_gemini:
-        gemini_api_key = Prompt.ask("Enter your Gemini API key", password=True)
+        gemini_api_key = ask_secret("Enter your Gemini API key")
         if not gemini_api_key:
             console.print("[red]Error: Gemini API key is required. Gemini will not be enabled.[/red]")
         else:

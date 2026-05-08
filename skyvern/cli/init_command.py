@@ -16,6 +16,7 @@ from .browser import setup_browser_config
 from .console import console
 from .database import setup_postgresql
 from .llm_setup import setup_llm_providers, update_or_add_env_var
+from .masked_prompt import ask_secret
 
 
 def init_env(
@@ -131,10 +132,10 @@ def init_env(
             console.print("1. Create an account at [link]https://app.skyvern.com[/link]")
             console.print("2. Go to [bold cyan]Settings[/bold cyan]")
             console.print("3. [bold green]Copy your API key[/bold green]")
-            api_key = Prompt.ask("Enter your Skyvern API key", password=True)
+            api_key = ask_secret("Enter your Skyvern API key")
             if not api_key:
                 console.print("[red]API key is required.[/red]")
-                api_key = Prompt.ask("Please re-enter your Skyvern API key", password=True)
+                api_key = ask_secret("Please re-enter your Skyvern API key")
                 if not api_key:
                     console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
                     return False
