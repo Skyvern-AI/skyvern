@@ -552,6 +552,49 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.unvalidated is True
+        assert "review" in agent_result.user_response.lower()
+        assert "accept" in agent_result.user_response.lower()
+        assert "reject" in agent_result.user_response.lower()
+        assert "discard" in agent_result.user_response.lower()
+
+    def test_unvalidated_wip_reply_adds_proposal_affordance(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=None,
+            last_test_ok=None,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Please provide credentials before I continue."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+        assert "Please provide credentials before I continue." in agent_result.user_response
+        assert "review" in agent_result.user_response.lower()
+        assert "accept" in agent_result.user_response.lower()
+        assert "reject" in agent_result.user_response.lower()
+        assert "discard" in agent_result.user_response.lower()
+
+    def test_unvalidated_wip_reply_keeps_existing_ui_affordance(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=None,
+            last_test_ok=None,
+        )
+        response = "I have a draft proposal. Use Review to inspect it, Accept to save it, or Reject it."
+        result = _fake_run_result({"type": "REPLY", "user_response": response})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.user_response == response
+        assert agent_result.updated_workflow is wf
 
     def test_goal_reached_false_flips_validated_proposal_to_unvalidated(self) -> None:
         # Agent-emitted goal_reached=False must override last_test_ok=True so
@@ -656,6 +699,23 @@ workflow_definition:
         )
 
         assert "here's the workflow" not in agent_result.user_response.lower()
+        assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_initial_part_workflow_claim_is_rewritten_without_proposal(self) -> None:
+        ctx = _ctx(last_test_ok=None)
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
+            }
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "initial part of your workflow" not in agent_result.user_response.lower()
         assert "wasn't able to produce a workflow proposal" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
