@@ -10,6 +10,7 @@ SKYVERN_VARIANT="${SKYVERN_VARIANT:-server}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-init)   SKYVERN_RUN_INIT=0; shift ;;
+        --run-init|--run-setup) SKYVERN_RUN_INIT=1; shift ;;
         --version)   SKYVERN_VERSION="${2:?--version requires a value}"; shift 2 ;;
         --version=*) SKYVERN_VERSION="${1#--version=}"; shift ;;
         --variant)   SKYVERN_VARIANT="${2:?--variant requires a value}"; shift 2 ;;
@@ -23,28 +24,31 @@ Skyvern installer.
 Usage:
   curl -LsSf https://install.skyvern.com | sh
   curl -LsSf https://install.skyvern.com | sh -s -- --no-init
-  curl -LsSf https://install.skyvern.com | sh -s -- --version 1.0.31
+  curl -LsSf https://install.skyvern.com | sh -s -- --run-setup
+  curl -LsSf https://install.skyvern.com | sh -s -- --version 1.0.35
   curl -LsSf https://install.skyvern.com | sh -s -- --variant server
 
 Flags:
-  --variant V    install variant (default: server). Other variants
-                 (sdk, mcp, all) are reserved for the upcoming SDK
-                 package split — currently only 'server' is accepted.
-  --no-init      skip 'skyvern init' (the Chromium browser install).
-  --version X    pin a specific PyPI version (e.g., 1.0.31).
+  --variant V    install variant (default: server). This curl installer is
+                 intentionally for the self-hosted CLI/server path. For SDKs,
+                 use pip inside your project: 'skyvern' or 'skyvern[local]'.
+  --run-setup    run the setup wizard after install (requires a terminal).
+  --run-init     alias for --run-setup.
+  --no-init      skip the post-install setup wizard.
+  --version X    pin a specific PyPI version (e.g., 1.0.35).
 
 Environment overrides:
   SKYVERN_VARIANT=V    same as --variant
   SKYVERN_RUN_INIT=0   same as --no-init
+  SKYVERN_RUN_INIT=1   same as --run-setup
   SKYVERN_VERSION=X    same as --version
 
 What this does:
   1. Bootstraps 'uv' if missing — uv manages Python so the host
      doesn't need one preinstalled.
-  2. Installs the variant's PyPI package as an isolated tool
+  2. Installs the self-hosted PyPI package as an isolated tool
      ('skyvern' on PATH).
-  3. For variants that need a browser, runs 'skyvern init' to fetch
-     Chromium (~150MB; skip with --no-init).
+  3. Prints the next setup command. Use --run-setup to run it immediately.
 EOF
             exit 0
             ;;
@@ -86,19 +90,28 @@ if ! command -v uv >/dev/null 2>&1; then
     fi
 fi
 
-# Variant policy: each variant sets the PyPI spec, the Python range to pin,
-# whether 'skyvern init' runs by default, and the success-message hint.
-# Today only 'server' is accepted; new variants get added at SDK split time.
+# Variant policy: the curl installer is for isolated CLI/server installs.
+# SDK installs belong in the user's project environment, not a uv tool venv.
 case "$SKYVERN_VARIANT" in
     server)
-        PKG_SPEC="skyvern"
+        PKG_SPEC="skyvern[server]"
         PYTHON_SPEC=">=3.11,<3.14"
-        DEFAULT_RUN_INIT=1
-        SUCCESS_HINT="Try: skyvern --help"
+        DEFAULT_RUN_INIT=0
+        SUCCESS_HINT="Next: skyvern quickstart"
         ;;
-    sdk|mcp|all)
-        printf "ERROR: --variant '%s' is reserved for the upcoming SDK package split\n" "$SKYVERN_VARIANT" >&2
-        printf "       and is not yet available. Use --variant server (the default) for now.\n" >&2
+    sdk|cloud|base)
+        printf "ERROR: --variant '%s' is not installed by this curl installer.\n" "$SKYVERN_VARIANT" >&2
+        printf "       Use 'pip install skyvern' inside your Python project instead.\n" >&2
+        exit 2
+        ;;
+    local|embedded)
+        printf "ERROR: --variant '%s' is not installed by this curl installer.\n" "$SKYVERN_VARIANT" >&2
+        printf "       Use 'pip install \"skyvern[local]\"' inside your Python project instead.\n" >&2
+        exit 2
+        ;;
+    mcp|all)
+        printf "ERROR: --variant '%s' is not available from this installer.\n" "$SKYVERN_VARIANT" >&2
+        printf "       Use --variant server for the self-hosted CLI/server tool.\n" >&2
         exit 2
         ;;
     *)
@@ -108,6 +121,13 @@ case "$SKYVERN_VARIANT" in
 esac
 
 [ -n "$SKYVERN_RUN_INIT" ] || SKYVERN_RUN_INIT="$DEFAULT_RUN_INIT"
+case "$SKYVERN_RUN_INIT" in
+    0|1) ;;
+    *)
+        printf "ERROR: SKYVERN_RUN_INIT must be 0 or 1.\n" >&2
+        exit 2
+        ;;
+esac
 
 PKG_SPEC_INSTALL="$PKG_SPEC"
 if [ -n "$SKYVERN_VERSION" ]; then
@@ -121,13 +141,22 @@ printf 'installing %s via uv tool install...\n' "$PKG_SPEC_INSTALL"
 # upstream `requires-python` shifts — does NOT auto-track.
 uv tool install --python "$PYTHON_SPEC" --force "$PKG_SPEC_INSTALL"
 
+SETUP_COMMAND="skyvern quickstart"
+if skyvern quickstart --help 2>/dev/null | grep -q -- "--install-type"; then
+    SETUP_COMMAND="skyvern quickstart --install-type server"
+fi
+SUCCESS_HINT="Next: $SETUP_COMMAND"
+
 if [ "$SKYVERN_RUN_INIT" = "1" ]; then
-    printf "\nrunning 'skyvern init' (installs Chromium, ~150MB)...\n"
-    if ! skyvern init; then
-        # Chromium download is best-effort: corp proxies often block it. The
-        # CLI is installed regardless; surface a recovery hint and continue.
-        printf "\nWARN: 'skyvern init' did not complete. The CLI is installed;\n" >&2
-        printf "      re-run 'skyvern init' once your network/proxy is sorted.\n" >&2
+    if [ ! -t 0 ]; then
+        printf "\nWARN: not running setup because stdin is not an interactive terminal.\n" >&2
+        printf "      Run '%s' from your shell when ready.\n" "$SETUP_COMMAND" >&2
+    else
+        printf "\nrunning '%s'...\n" "$SETUP_COMMAND"
+        if ! sh -c "$SETUP_COMMAND"; then
+            printf "\nWARN: '%s' did not complete. The CLI is installed;\n" "$SETUP_COMMAND" >&2
+            printf "      re-run '%s' once the issue is sorted.\n" "$SETUP_COMMAND" >&2
+        fi
     fi
 fi
 

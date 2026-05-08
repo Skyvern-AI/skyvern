@@ -3,7 +3,7 @@
 #
 # Usage:
 #   scripts/test-install.sh                # default matrix, --no-init
-#   scripts/test-install.sh --with-init    # full e2e (downloads Chromium)
+#   scripts/test-install.sh --with-init    # run post-install setup when possible
 #   IMAGES="ubuntu:22.04" scripts/test-install.sh   # subset
 #
 # Requires Docker on the host.
@@ -16,7 +16,8 @@ WITH_INIT=0
 DEFAULT_IMAGES="ubuntu:22.04 ubuntu:24.04 debian:12-slim python:3.11-slim python:3.13-slim"
 IMAGES="${IMAGES:-$DEFAULT_IMAGES}"
 
-# Today only 'server' is valid; append other variants when they exist.
+# This installer is intentionally server-only; SDK/local installs belong in a
+# project environment via pip, not a uv tool venv.
 DEFAULT_VARIANTS="server"
 VARIANTS="${VARIANTS:-$DEFAULT_VARIANTS}"
 
