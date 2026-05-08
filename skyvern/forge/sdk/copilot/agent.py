@@ -27,7 +27,11 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
-from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
+from skyvern.forge.sdk.copilot.output_utils import (
+    extract_final_text,
+    looks_like_workflow_delivery_claim,
+    parse_final_response,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -515,6 +519,10 @@ _CANCEL_REPLY_UNVALIDATED = (
     "(note: it hasn't been verified end-to-end), or discard."
 )
 _CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
+_UNBACKED_WORKFLOW_DELIVERY_REPLY = (
+    "I wasn't able to produce a workflow proposal in this turn. Please try again, or provide the missing details "
+    "so I can build and test it."
+)
 
 
 def _build_wip_exit_result(
@@ -748,6 +756,17 @@ def _translate_to_agent_result(
     if resp_type == "ASK_QUESTION":
         last_workflow = None
         last_workflow_yaml = None
+
+    last_update_block_count = ctx.last_update_block_count
+    last_test_ok = ctx.last_test_ok
+    if (
+        resp_type == "REPLY"
+        and last_workflow is None
+        and last_update_block_count is None
+        and last_test_ok is None
+        and looks_like_workflow_delivery_claim(user_response)
+    ):
+        user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
 
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)
