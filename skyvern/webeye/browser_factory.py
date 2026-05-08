@@ -35,6 +35,7 @@ from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.cdp_connection import build_cdp_connect_headers
 from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics as _connect_over_cdp_with_diagnostics
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.dialog_handler import set_dialog_handler
@@ -802,6 +803,7 @@ async def _connect_to_cdp_browser(
     browser = await _connect_over_cdp_with_diagnostics(
         playwright,
         remote_browser_url,
+        headers=build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER),
         timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
     )
 

@@ -89,10 +89,12 @@ if (-not $NoFirewall) {
 }
 
 $remoteUrl = "ws://host.docker.internal:$ProxyPort$browserPath"
+$hostHeader = "127.0.0.1:$chromePort"
 
 if ($UpdateEnv) {
     Set-EnvValue -Path $EnvPath -Name "BROWSER_TYPE" -Value "cdp-connect"
     Set-EnvValue -Path $EnvPath -Name "BROWSER_REMOTE_DEBUGGING_URL" -Value $remoteUrl
+    Set-EnvValue -Path $EnvPath -Name "BROWSER_REMOTE_DEBUGGING_HOST_HEADER" -Value $hostHeader
     Set-EnvValue -Path $EnvPath -Name "BROWSER_STREAMING_MODE" -Value "cdp"
     Set-EnvValue -Path $EnvPath -Name "BROWSER_CDP_CONNECT_TIMEOUT_MS" -Value "120000"
     Write-Host "Updated $EnvPath for Skyvern Docker Compose." -ForegroundColor Green
@@ -101,6 +103,7 @@ if ($UpdateEnv) {
 Write-Host ""
 Write-Host "Use this Skyvern setting:" -ForegroundColor Green
 Write-Host "BROWSER_REMOTE_DEBUGGING_URL=$remoteUrl"
+Write-Host "BROWSER_REMOTE_DEBUGGING_HOST_HEADER=$hostHeader"
 Write-Host ""
 Write-Host "Restart the backend after changing .env:"
 Write-Host "docker compose up -d --force-recreate skyvern"

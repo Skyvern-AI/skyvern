@@ -26,6 +26,13 @@ class CdpConnectionCandidate:
     headers: dict[str, str] | None = None
 
 
+def build_cdp_connect_headers(host_header: str | None) -> dict[str, str] | None:
+    normalized_host_header = host_header.strip() if host_header else ""
+    if not normalized_host_header:
+        return None
+    return {"Host": normalized_host_header}
+
+
 def parse_cdp_discovery_error(error: Exception) -> tuple[int, str] | None:
     """Return the HTTP status and discovery URL from a Playwright CDP discovery error."""
     match = _CDP_DISCOVERY_ERROR_RE.search(str(error))

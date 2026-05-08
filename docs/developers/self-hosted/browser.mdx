@@ -200,6 +200,7 @@ WebSocket path, and writes:
 ```bash .env
 BROWSER_TYPE=cdp-connect
 BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9223/devtools/browser/<id>
+BROWSER_REMOTE_DEBUGGING_HOST_HEADER=127.0.0.1:<chrome-port>
 BROWSER_STREAMING_MODE=cdp
 BROWSER_CDP_CONNECT_TIMEOUT_MS=120000
 ```
