@@ -207,6 +207,12 @@ class TestCredentialError:
         categories = [r["category"] for r in result]
         assert "CREDENTIAL_ERROR" in categories
 
+    def test_key_lookup_failure(self) -> None:
+        result = classify_from_failure_reason("Credential username not found by key: login")
+        assert result is not None
+        categories = [r["category"] for r in result]
+        assert "CREDENTIAL_ERROR" in categories
+
     def test_exception_type_bitwarden(self) -> None:
         class BitwardenVaultError(Exception):
             pass
