@@ -44,6 +44,7 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
                 url=url,
                 checksum=artifact.checksum,
                 filename=filename,
+                file_size=artifact.file_size,
                 modified_at=artifact.created_at,
                 artifact_id=artifact.artifact_id,
             )

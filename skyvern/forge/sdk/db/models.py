@@ -259,6 +259,7 @@ class ArtifactModel(Base):
     run_id = Column(String, nullable=True)
     browser_session_id = Column(String, nullable=True)
     checksum = Column(String, nullable=True)
+    file_size = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

@@ -308,13 +308,14 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
         return await self.list_blobs(parsed.container, parsed.blob_path)
 
     async def get_object_info(self, uri: str) -> dict | None:
-        """Get object info including metadata. Returns dict with Metadata and LastModified keys."""
+        """Get object info including metadata, last-modified time, and size."""
         props = await self.get_blob_properties(uri)
         if props is None:
             return None
         return {
             "Metadata": props.get("metadata", {}),
             "LastModified": props.get("last_modified"),
+            "ContentLength": props.get("size"),
         }
 
     async def delete_file(self, uri: str) -> None:
