@@ -252,7 +252,9 @@ def _setup_local_browser_actual() -> tuple[str, Optional[str], Optional[str]]:
     # Step 2: Guide the user to enable Chrome remote debugging.
     _print_classic_cdp_instructions()
 
-    console.print("\n[bold yellow]Enable or start remote debugging in Chrome, then press Enter to continue...[/bold yellow]")
+    console.print(
+        "\n[bold yellow]Enable or start remote debugging in Chrome, then press Enter to continue...[/bold yellow]"
+    )
     Prompt.ask("Press Enter when ready", default="")
 
     # Step 3: Auto-discover the debugging server with retries
