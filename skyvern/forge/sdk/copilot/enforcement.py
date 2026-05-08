@@ -14,7 +14,11 @@ from agents.run import Runner
 
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
-from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
+from skyvern.forge.sdk.copilot.output_utils import (
+    extract_final_text,
+    looks_like_workflow_delivery_claim,
+    parse_final_response,
+)
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.utils.token_counter import count_tokens
@@ -31,6 +35,7 @@ MAX_POST_UPDATE_NUDGES = 2
 MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
+MAX_NO_WORKFLOW_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # Stops the suspicious-success nudge from re-firing forever when the agent has
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
@@ -257,6 +262,15 @@ POST_PER_TOOL_BUDGET_NUDGE = (
     "navigation_goal scope, or reply with a blocker explanation."
 )
 
+POST_NO_WORKFLOW_DELIVERY_NUDGE = (
+    "STOP — you are telling the user you created or are showing a workflow, "
+    "but no workflow update tool has succeeded in this turn. The user will see "
+    "an empty proposal. You MUST either call update_and_run_blocks with a real "
+    "workflow and test it, or respond with ASK_QUESTION if required input is "
+    'missing. Do NOT say "Here\'s the workflow" until there is an actual '
+    "workflow proposal behind the response."
+)
+
 _PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
     "STOP — the target site has failed to scrape on every attempt across "
     "multiple workflow shapes. Every run navigated successfully but the "
@@ -480,6 +494,16 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any]) -> str | None:
     response_type = parsed.get("type")
     if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
         return None
+
+    if (
+        response_type == "REPLY"
+        and not getattr(ctx, "update_workflow_called", False)
+        and looks_like_workflow_delivery_claim(parsed.get("user_response"))
+    ):
+        nudge_count = getattr(ctx, "no_workflow_nudge_count", 0)
+        if nudge_count < MAX_NO_WORKFLOW_NUDGES:
+            ctx.no_workflow_nudge_count = nudge_count + 1
+            return POST_NO_WORKFLOW_DELIVERY_NUDGE
 
     workflow_tested_ok = (
         getattr(ctx, "last_test_ok", None) is True
@@ -1013,6 +1037,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE: "probable_site_block_stop",
     POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
+    POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
 }

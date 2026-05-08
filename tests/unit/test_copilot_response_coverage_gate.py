@@ -17,8 +17,10 @@ from typing import Any
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_FORMAT_NUDGES,
     MAX_INTERMEDIATE_NUDGES,
+    MAX_NO_WORKFLOW_NUDGES,
     POST_FORMAT_NUDGE,
     POST_INTERMEDIATE_SUCCESS_NUDGE,
+    POST_NO_WORKFLOW_DELIVERY_NUDGE,
     _check_enforcement,
     _is_progress_narration,
     _response_coverage_nudge,
@@ -37,6 +39,7 @@ class _Ctx:
         self.post_update_nudge_count = 0
         self.coverage_nudge_count = 0
         self.format_nudge_count = 0
+        self.no_workflow_nudge_count = 0
         self.user_message = ""
         self.last_update_block_count = None
         self.last_test_ok = None
@@ -123,6 +126,31 @@ def test_reply_before_any_successful_test_passes_through() -> None:
     ctx.user_message = "go to X and download Y"
     # last_test_ok is None — no successful test yet.
     parsed = {"type": "REPLY", "user_response": "Working on it."}
+    assert _response_coverage_nudge(ctx, parsed) is None
+
+
+def test_reply_claiming_workflow_without_update_fires_nudge() -> None:
+    ctx = _Ctx()
+    parsed = {"type": "REPLY", "user_response": "Here's the workflow."}
+
+    assert _response_coverage_nudge(ctx, parsed) == POST_NO_WORKFLOW_DELIVERY_NUDGE
+    assert ctx.no_workflow_nudge_count == 1
+
+
+def test_no_workflow_delivery_nudge_respects_counter_cap() -> None:
+    ctx = _Ctx()
+    parsed = {"type": "REPLY", "user_response": "I created a workflow for this."}
+
+    for _ in range(MAX_NO_WORKFLOW_NUDGES):
+        assert _response_coverage_nudge(ctx, parsed) == POST_NO_WORKFLOW_DELIVERY_NUDGE
+    assert _response_coverage_nudge(ctx, parsed) is None
+
+
+def test_no_workflow_delivery_nudge_ignores_existing_update_path() -> None:
+    ctx = _Ctx()
+    ctx.update_workflow_called = True
+    parsed = {"type": "REPLY", "user_response": "Here's the workflow."}
+
     assert _response_coverage_nudge(ctx, parsed) is None
 
 
