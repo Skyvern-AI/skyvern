@@ -9,6 +9,7 @@ from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.session_ops import coerce_proxy_location, do_session_close, do_session_create, do_session_list
+from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import proxy_location_to_request
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
@@ -47,6 +48,10 @@ async def skyvern_browser_session_create(
                 '{"country":"US","subdivision":"CA","city":"San Francisco"}.'
             )
         ),
+    ] = None,
+    extensions: Annotated[
+        list[Extensions] | None,
+        Field(description='Browser extensions to install, for example ["captcha-solver"].'),
     ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
@@ -100,7 +105,10 @@ async def skyvern_browser_session_create(
             skyvern = get_skyvern()
             if is_stateless_http_mode():
                 proxy = proxy_location_to_request(coerce_proxy_location(proxy_location))
-                session = await skyvern.create_browser_session(timeout=timeout or 60, proxy_location=proxy)
+                create_kwargs: dict[str, Any] = {"timeout": timeout or 60, "proxy_location": proxy}
+                if extensions is not None:
+                    create_kwargs["extensions"] = extensions
+                session = await skyvern.create_browser_session(**create_kwargs)
                 timer.mark("sdk")
                 ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
                 return make_result(
@@ -117,6 +125,7 @@ async def skyvern_browser_session_create(
                 skyvern,
                 timeout=timeout or 60,
                 proxy_location=coerce_proxy_location(proxy_location),
+                extensions=extensions,
                 local=local,
                 headless=headless,
             )

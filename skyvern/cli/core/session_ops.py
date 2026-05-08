@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
 
@@ -61,6 +62,7 @@ async def do_session_create(
     skyvern: Any,
     timeout: int = 60,
     proxy_location: ProxyLocationInput | str | None = None,
+    extensions: list[Extensions] | None = None,
     local: bool = False,
     headless: bool = False,
 ) -> tuple[Any, SessionCreateResult]:
@@ -70,7 +72,10 @@ async def do_session_create(
         return browser, SessionCreateResult(session_id=None, local=True, headless=headless)
 
     proxy = coerce_proxy_location(proxy_location)
-    browser = await skyvern.launch_cloud_browser(timeout=timeout, proxy_location=proxy)
+    launch_kwargs: dict[str, Any] = {"timeout": timeout, "proxy_location": proxy}
+    if extensions is not None:
+        launch_kwargs["extensions"] = extensions
+    browser = await skyvern.launch_cloud_browser(**launch_kwargs)
     return browser, SessionCreateResult(
         session_id=browser.browser_session_id,
         timeout_minutes=timeout,
