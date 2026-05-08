@@ -210,6 +210,12 @@ class CopilotContext(AgentContext):
     probable_site_block_stop_nudge_count: int = 0
     per_tool_budget_nudge_count: int = 0
     effective_workflow_proxy_location: Any | None = None
+    # Labels of navigation blocks that were canceled/failed inside a
+    # PER_TOOL_BUDGET run. Armed after get_run_results inspects the budgeted
+    # run, and cleared only when a workflow update removes or changes the
+    # label away from navigation. Prevents rerunning the same oversized
+    # navigation block unchanged.
+    per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
