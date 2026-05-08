@@ -149,6 +149,36 @@ class TestModelResolver:
         assert run_config.model_settings.temperature == 0.5
         assert run_config.model_settings.max_tokens == 4096
 
+    def test_llm_key_override_wins_for_fallback_attempt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.schemas.llm import LLMConfig
+
+        seen_keys: list[str] = []
+
+        def fake_get_config(key: str) -> LLMConfig:
+            seen_keys.append(key)
+            return LLMConfig(
+                model_name=f"openai/{key.lower()}",
+                required_env_vars=[],
+                supports_vision=True,
+                add_assistant_prefix=False,
+            )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
+            fake_get_config,
+        )
+
+        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+
+        handler = MagicMock()
+        handler.llm_key = "PRIMARY_KEY"
+
+        model_name, _, llm_key, _ = resolve_model_config(handler, llm_key_override="FALLBACK_KEY")
+
+        assert model_name == "openai/fallback_key"
+        assert llm_key == "FALLBACK_KEY"
+        assert seen_keys == ["FALLBACK_KEY"]
+
     def test_maps_basic_config_with_tracing_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.schemas.llm import LLMConfig
 

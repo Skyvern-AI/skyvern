@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 
 
 def _ctx(**overrides):
@@ -1147,3 +1148,104 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert "explicitly asks for an untested draft" in prompt
         assert "workflow was drafted without testing as requested" in prompt
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
+
+
+class TestCopilotConfig:
+    def test_system_prompt_uses_custom_security_rules(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            config=CopilotConfig(security_rules="CUSTOM SECURITY RULE"),
+        )
+
+        assert "CUSTOM SECURITY RULE" in prompt
+
+    def test_retriable_llm_error_detects_openai_rate_limit(self) -> None:
+        class FakeRateLimitError(Exception):
+            pass
+
+        FakeRateLimitError.__module__ = "openai"
+
+        assert agent_module._is_retriable_llm_error(FakeRateLimitError("rate limit"))
+
+    def test_fallback_key_skips_missing_or_same_key(self) -> None:
+        assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key=None), "PRIMARY") is None
+        assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="PRIMARY"), "PRIMARY") is None
+        assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="SECONDARY"), "PRIMARY") == "SECONDARY"
+
+    @pytest.mark.asyncio
+    async def test_run_copilot_agent_retries_retriable_failure_with_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeRateLimitError(Exception):
+            pass
+
+        FakeRateLimitError.__module__ = "openai"
+
+        async def fake_feasibility_gate(**_kwargs):
+            return SimpleNamespace(verdict="proceed", question=None, rationale=None)
+
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        resolved_keys: list[str] = []
+
+        def fake_resolve_model_config(_handler, *, copilot_config=None, llm_key_override=None):
+            del copilot_config
+            key = llm_key_override or "PRIMARY"
+            resolved_keys.append(key)
+            return f"model-{key}", object(), key, True
+
+        run_with_enforcement = AsyncMock(
+            side_effect=[
+                FakeRateLimitError("rate limit"),
+                _fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True}),
+            ]
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.feasibility_gate.run_feasibility_gate",
+            fake_feasibility_gate,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=SimpleNamespace(
+                message="build it",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_yaml="",
+                browser_session_id=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            debug_run_info_text="",
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        )
+
+        assert result.user_response == "ok"
+        assert resolved_keys == ["PRIMARY", "SECONDARY"]
+        assert run_with_enforcement.await_count == 2
