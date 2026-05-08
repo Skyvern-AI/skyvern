@@ -123,7 +123,16 @@ def classify_from_failure_reason(
         )
 
     # Credential error
-    if "Bitwarden" in exc_name or any(kw in reason for kw in ["credential not found", "missing credential"]):
+    if "Bitwarden" in exc_name or any(
+        kw in reason
+        for kw in [
+            "credential not found",
+            "missing credential",
+            "username not found by key",
+            "password not found by key",
+            "secret not found by key",
+        ]
+    ):
         categories.append(
             {
                 "category": "CREDENTIAL_ERROR",

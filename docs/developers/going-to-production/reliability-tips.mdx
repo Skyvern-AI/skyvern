@@ -211,9 +211,11 @@ if result.output["submitted_email"] != expected_email:
 
 ---
 
-## ForLoop reliability
+## Loop reliability
 
 Loops are especially prone to cascading failures: when one iteration fails, it can leave the browser in an unexpected state that breaks subsequent iterations. For example, if iteration 3 navigates to an error page and fails, iteration 4 starts from that error page instead of the expected list view, causing it to fail too. One bad item can take down your entire loop.
+
+Use a For Loop when you have a known list of items before the loop begins. Use a While Loop when the workflow should keep running until page state changes, such as paginating while a Next button is enabled or polling until a status changes. While loops need an especially clear exit condition because the number of iterations is discovered at run time.
 
 ### Always set `continue_on_failure`
 
@@ -242,6 +244,34 @@ loop_blocks:
     label: process_item
     navigation_goal: "Find and process: {{ process_item.current_value }}"
 ```
+
+For While Loop pagination, each pass should leave the page ready for the next condition check. Extract the state that controls the loop, then advance the page:
+
+```yaml
+- block_type: while_loop
+  label: paginate_results
+  condition:
+    criteria_type: jinja2_template
+    expression: "{{ current_index == 0 or extract_page.has_next_page }}"
+  loop_blocks:
+    - block_type: extraction
+      label: extract_page
+      data_extraction_goal: Extract rows on this page and whether the Next button is enabled
+      data_schema:
+        type: object
+        properties:
+          rows:
+            type: array
+            items:
+              type: object
+          has_next_page:
+            type: boolean
+    - block_type: action
+      label: click_next
+      navigation_goal: "Click Next if it is enabled. COMPLETE after one click or if Next is disabled."
+```
+
+The first condition check uses `current_index == 0` to enter the loop before `extract_page` exists. Later checks use the previous extraction output so the loop exits naturally when no next page is available.
 
 ### Include termination criteria per iteration
 

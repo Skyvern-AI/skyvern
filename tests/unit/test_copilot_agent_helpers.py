@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 
@@ -110,6 +112,22 @@ class TestFailedTestResponseNormalization:
         original = "Let me know what you want to build."
         assert _rewrite_failed_test_response(original, ctx) == original
 
+    def test_rewrite_untested_draft_request_surfaces_explicit_unverified_copy(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            allow_untested_workflow_draft=True,
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+        )
+        rewritten = _rewrite_failed_test_response("Done.", ctx)
+
+        assert "without testing it, as requested" in rewritten
+        assert "not been verified end-to-end" in rewritten
+        assert "successful" not in rewritten.lower()
+
     def test_rewrite_appends_keep_draft_affordance_when_draft_on_hand(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
 
@@ -173,6 +191,21 @@ class TestVerifiedWorkflowOrNone:
             last_test_suspicious_success=True,
         )
         assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+class TestUntestedDraftRequest:
+    def test_detects_explicit_skip_testing_request(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _user_requests_untested_workflow_draft
+
+        assert _user_requests_untested_workflow_draft("Can you just make a workflow without testing it?")
+        assert _user_requests_untested_workflow_draft("Draft only please; do not test.")
+        assert _user_requests_untested_workflow_draft("Skip testing and create the workflow.")
+
+    def test_does_not_detect_routine_testing_mentions(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _user_requests_untested_workflow_draft
+
+        assert not _user_requests_untested_workflow_draft("Build and test this workflow.")
+        assert not _user_requests_untested_workflow_draft("Test the login step before you finish.")
 
 
 class TestShouldRestorePersistedWorkflow:
@@ -774,6 +807,246 @@ class TestCredentialRefusalReachesAgent:
             assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
 
 
+class TestUserSuppliedCredentialIdValidation:
+    def test_extracts_unique_credential_ids_from_latest_message(self) -> None:
+        ids = agent_module._extract_user_supplied_credential_ids(
+            "Use cred_123456789, then cred_abc-DEF_42. Also repeat cred_123456789."
+        )
+
+        assert ids == ["cred_123456789", "cred_abc-DEF_42"]
+
+    def test_ignores_non_credential_secret_text(self) -> None:
+        ids = agent_module._extract_user_supplied_credential_ids(
+            "My username is alice@example.com and my password is hunter2."
+        )
+
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_missing_user_supplied_credential_ids_return_ask_question(self, monkeypatch) -> None:
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        result = await agent_module._credential_validation_result_for_user_message(
+            user_message="Please build it with cred_valid and cred_missing.",
+            organization_id="org-1",
+            global_llm_context=None,
+        )
+
+        assert result is not None
+        assert result.response_type == "ASK_QUESTION"
+        assert result.updated_workflow is None
+        assert result.workflow_yaml is None
+        assert result.workflow_was_persisted is False
+        assert result.clear_proposed_workflow is True
+        assert "cred_missing" in result.user_response
+        assert "not found in this organization" in result.user_response
+        assert "unvalidated draft workflow" in result.user_response
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_missing_user_supplied_credential_ids_continue_for_explicit_untested_draft(self, monkeypatch) -> None:
+        get_credentials_by_ids = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        result = await agent_module._credential_validation_result_for_user_message(
+            user_message="Build an untested draft with cred_missing.",
+            organization_id="org-1",
+            global_llm_context=None,
+            allow_untested_workflow_draft=True,
+        )
+
+        assert result is None
+        get_credentials_by_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_user_supplied_credential_ids_continue_normally(self, monkeypatch) -> None:
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        result = await agent_module._credential_validation_result_for_user_message(
+            user_message="Please build it with cred_valid.",
+            organization_id="org-1",
+            global_llm_context=None,
+        )
+
+        assert result is None
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+
+    def test_translate_untested_draft_request_surfaces_unvalidated_workflow(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            allow_untested_workflow_draft=True,
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=4,
+            last_test_ok=None,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
+
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+        assert "without testing it, as requested" in agent_result.user_response
+
+
+class TestNativeToolCredentialIdValidation:
+    def test_extracts_credential_ids_from_nested_tool_values(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _extract_credential_ids_from_tool_value
+
+        ids = _extract_credential_ids_from_tool_value(
+            {
+                "workflow_yaml": "credential_id: cred_valid",
+                "parameters": {"login": "cred_missing", "note": "repeat cred_valid"},
+            }
+        )
+
+        assert ids == ["cred_valid", "cred_missing"]
+
+    def test_workflow_yaml_extraction_ignores_credential_like_parameter_keys(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _extract_credential_ids_from_workflow_yaml
+
+        ids = _extract_credential_ids_from_workflow_yaml(
+            """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: cred_param
+      default_value: cred_valid
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: cred_not_an_id
+      default_value: cred_also_not_an_id
+"""
+        )
+
+        assert ids == ["cred_valid"]
+
+    @pytest.mark.asyncio
+    async def test_missing_tool_credential_reference_returns_blocking_error(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _credential_reference_validation_error
+
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        error = await _credential_reference_validation_error(
+            """
+workflow_definition:
+  parameters:
+    - parameter_type: credential
+      key: credentials
+      credential_id: cred_valid
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: backup_credentials
+      default_value: cred_missing
+""",
+            _ctx(),
+        )
+
+        assert error is not None
+        assert "cred_missing" in error
+        assert "not found in this organization" in error
+        assert "Stop before creating, updating, or running the workflow" in error
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_valid_tool_credential_reference_allows_tool_path(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _credential_reference_validation_error
+
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        error = await _credential_reference_validation_error({"credential_id": "cred_valid"}, _ctx())
+
+        assert error is None
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_allows_missing_credentials_for_explicit_untested_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _update_workflow
+
+        ctx = _ctx(allow_untested_workflow_draft=True)
+
+        workflow = MagicMock()
+        workflow.title = "Untested Draft"
+        workflow.description = ""
+        workflow.workflow_definition = MagicMock()
+        workflow.workflow_definition.blocks = []
+        workflow.proxy_location = None
+        workflow.webhook_callback_url = None
+        workflow.persist_browser_session = False
+        workflow.model = None
+        workflow.max_screenshot_scrolls = None
+        workflow.extra_http_headers = None
+        workflow.run_with = None
+        workflow.ai_fallback = None
+        workflow.cache_key = None
+        workflow.run_sequentially = False
+        workflow.sequential_key = None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            lambda **kwargs: workflow,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.resolve_copilot_created_by_stamp",
+            AsyncMock(return_value="copilot"),
+        )
+        workflow_service = MagicMock()
+        workflow_service.update_workflow_definition = AsyncMock()
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE", workflow_service)
+        get_credentials_by_ids = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_missing
+  blocks: []
+"""
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        get_credentials_by_ids.assert_not_called()
+
+
 class TestResponseTypeClassificationRuleReachesAgent:
     """Pin the classifier rule that selects ASK_QUESTION when `user_response` asks the user for required input — the agent.py null-out gate keys on `resp_type == "ASK_QUESTION"` and depends on this prompt text."""
 
@@ -788,4 +1061,6 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert "goal_reached: false" in prompt
         assert "Classify by intent, not punctuation" in prompt
         assert "does NOT imply REPLY" in prompt
+        assert "explicitly asks for an untested draft" in prompt
+        assert "workflow was drafted without testing as requested" in prompt
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")

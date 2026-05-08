@@ -92,7 +92,9 @@ POST_UPDATE_NUDGE = (
     "You updated the workflow but did not test it. "
     "You MUST call run_blocks_and_collect_debug (or update_and_run_blocks next time) "
     "to test at least the first block before responding to the user. "
-    "This verifies the workflow actually works."
+    "This verifies the workflow actually works. "
+    "Exception: if the latest user message explicitly asked for an untested draft, "
+    "respond with an unvalidated draft instead of testing."
 )
 
 POST_NAVIGATE_NUDGE = (
@@ -669,7 +671,11 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
         ctx.explore_without_workflow_nudge_count += 1
         return POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
 
-    if ctx.update_workflow_called and not ctx.test_after_update_done:
+    if (
+        ctx.update_workflow_called
+        and not ctx.test_after_update_done
+        and getattr(ctx, "allow_untested_workflow_draft", False) is not True
+    ):
         return POST_UPDATE_NUDGE
 
     # A budget-trip is a structural problem (chain too long), not a
