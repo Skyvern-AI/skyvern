@@ -98,7 +98,9 @@ result = await client.run_task(
 
 Chain task blocks, loops, conditionals, data extraction, and file operations into reusable automations.
 
-**Block types:** NavigationBlock, ActionBlock, ExtractBlock, LoopBlock, TextPromptBlock, LoginBlock, FileDownloadBlock, FileParseBlock, UploadBlock, EmailBlock, WebhookBlock, ValidationBlock, WaitBlock, CodeBlock, ForLoopBlock, FileURLParsingBlock, DownloadToS3Block, SendEmailBlock.
+**Block types:** NavigationBlock, ActionBlock, ExtractBlock, LoopBlock, TextPromptBlock, LoginBlock, FileDownloadBlock, FileParseBlock, UploadBlock, EmailBlock, WebhookBlock, ValidationBlock, WaitBlock, CodeBlock, ForLoopBlock, WhileLoopBlock, FileURLParsingBlock, DownloadToS3Block, SendEmailBlock.
+
+Use a `ForLoopBlock` when the workflow already has a fixed list to iterate over, such as extracted rows, uploaded files, or user-provided URLs. Use a `WhileLoopBlock` when the workflow should keep repeating until a condition changes, such as paginating while a Next button remains enabled, polling until a status is complete, or retrying while a recoverable page state is visible.
 
 ```python
 workflow = await client.create_workflow(
