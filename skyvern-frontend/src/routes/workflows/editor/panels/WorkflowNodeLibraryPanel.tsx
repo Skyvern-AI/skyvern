@@ -1,5 +1,6 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import * as React from "react";
 import { useState, useRef, useEffect } from "react";
 import {
   Cross2Icon,
@@ -17,7 +18,7 @@ const enableCodeBlock =
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
-  icon: JSX.Element;
+  icon: React.JSX.Element;
   title: string;
   description: string;
 }> = [
