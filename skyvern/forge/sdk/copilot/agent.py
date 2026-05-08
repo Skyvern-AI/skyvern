@@ -523,6 +523,20 @@ _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
     "I wasn't able to produce a workflow proposal in this turn. Please try again, or provide the missing details "
     "so I can build and test it."
 )
+_PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re.IGNORECASE)
+_PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
+_UNVALIDATED_PROPOSAL_AFFORDANCE = (
+    "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
+    "It has not been verified end-to-end."
+)
+
+
+def _ensure_unvalidated_proposal_affordance(user_response: str) -> str:
+    if _PROPOSAL_ACCEPT_UI_ACTION_RE.search(user_response) and _PROPOSAL_REJECT_UI_ACTION_RE.search(user_response):
+        return user_response
+    if user_response.strip():
+        return f"{user_response}\n\n{_UNVALIDATED_PROPOSAL_AFFORDANCE}"
+    return _UNVALIDATED_PROPOSAL_AFFORDANCE
 
 
 def _build_wip_exit_result(
@@ -767,6 +781,8 @@ def _translate_to_agent_result(
         and looks_like_workflow_delivery_claim(user_response)
     ):
         user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
+    if resp_type == "REPLY" and last_workflow is not None and unvalidated:
+        user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
 
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)

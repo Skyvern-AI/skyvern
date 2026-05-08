@@ -198,7 +198,10 @@ def test_translate_to_agent_result_salvages_last_good_on_failed_reply() -> None:
     assert agent_result.unvalidated is True
     # Failure rewrite would have replaced the agent's text with one based on
     # ``last_update_block_count=5``; salvage must skip the rewrite.
-    assert agent_result.user_response == agent_text
+    assert agent_result.user_response.startswith(agent_text)
+    assert "Use Review to inspect it" in agent_result.user_response
+    assert "Accept to save it" in agent_result.user_response
+    assert "Reject to discard it" in agent_result.user_response
 
 
 def test_translate_to_agent_result_salvages_after_failure_then_update_workflow() -> None:
@@ -220,7 +223,10 @@ def test_translate_to_agent_result_salvages_after_failure_then_update_workflow()
     )
     assert agent_result.updated_workflow is ctx.last_good_workflow
     assert agent_result.unvalidated is True
-    assert agent_result.user_response == agent_text
+    assert agent_result.user_response.startswith(agent_text)
+    assert "Use Review to inspect it" in agent_result.user_response
+    assert "Accept to save it" in agent_result.user_response
+    assert "Reject to discard it" in agent_result.user_response
 
 
 def test_translate_to_agent_result_does_not_salvage_on_standalone_edit() -> None:

@@ -137,6 +137,17 @@ def test_reply_claiming_workflow_without_update_fires_nudge() -> None:
     assert ctx.no_workflow_nudge_count == 1
 
 
+def test_initial_part_workflow_claim_without_update_fires_nudge() -> None:
+    ctx = _Ctx()
+    parsed = {
+        "type": "REPLY",
+        "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
+    }
+
+    assert _response_coverage_nudge(ctx, parsed) == POST_NO_WORKFLOW_DELIVERY_NUDGE
+    assert ctx.no_workflow_nudge_count == 1
+
+
 def test_no_workflow_delivery_nudge_respects_counter_cap() -> None:
     ctx = _Ctx()
     parsed = {"type": "REPLY", "user_response": "I created a workflow for this."}
