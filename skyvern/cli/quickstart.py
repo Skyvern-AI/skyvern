@@ -262,7 +262,10 @@ def run_docker_compose_setup() -> None:
         from skyvern.cli.browser import _print_classic_cdp_instructions  # noqa: PLC0415
 
         _print_classic_cdp_instructions()
-        confirmed = Confirm.ask("Have you enabled remote debugging in Chrome?", default=False)
+        confirmed = Confirm.ask(
+            "Have you enabled remote debugging in Chrome or started the isolated CDP profile?",
+            default=False,
+        )
         if confirmed:
             from skyvern.cli.llm_setup import update_or_add_env_var
 
@@ -273,8 +276,9 @@ def run_docker_compose_setup() -> None:
         else:
             console.print(
                 "[yellow]No problem - you can configure it later by setting "
-                "BROWSER_TYPE=cdp-connect and starting Chrome with a Docker-reachable "
-                "remote debugging address.[/yellow]"
+                "BROWSER_TYPE=cdp-connect and enabling Chrome remote debugging from "
+                "chrome://inspect/#remote-debugging. If Docker cannot reach that listener, "
+                "start an isolated Chrome profile with a Docker-reachable debugging address.[/yellow]"
             )
 
 

@@ -148,7 +148,11 @@ def _print_classic_cdp_instructions() -> None:
     console.print(
         Panel(
             "[bold]Enable Chrome remote debugging[/bold]\n\n"
-            "Start Chrome manually with a CDP endpoint that Docker can reach:\n\n"
+            "Recommended for your existing Chrome profile:\n"
+            "1. Open [cyan]chrome://inspect/#remote-debugging[/cyan] in Chrome.\n"
+            "2. Enable remote debugging for this browser instance.\n\n"
+            "If Skyvern runs in Docker and cannot reach that listener, start an isolated "
+            "Chrome profile with a Docker-reachable CDP endpoint instead:\n\n"
             f"[cyan]{_classic_cdp_launch_command()}[/cyan]",
             border_style="cyan",
         )
@@ -248,7 +252,7 @@ def _setup_local_browser_actual() -> tuple[str, Optional[str], Optional[str]]:
     # Step 2: Guide the user to enable Chrome remote debugging.
     _print_classic_cdp_instructions()
 
-    console.print("\n[bold yellow]Enable remote debugging in Chrome, then press Enter to continue...[/bold yellow]")
+    console.print("\n[bold yellow]Enable or start remote debugging in Chrome, then press Enter to continue...[/bold yellow]")
     Prompt.ask("Press Enter when ready", default="")
 
     # Step 3: Auto-discover the debugging server with retries
