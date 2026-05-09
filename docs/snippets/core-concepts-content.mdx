@@ -291,7 +291,7 @@ result = await skyvern.run_task(
 
 print(result.recording_url)      # Full video of execution
 print(result.screenshot_urls)    # List of screenshot URLs
-print(result.downloaded_files)   # [{"url": "...", "checksum": "..."}]
+print(result.downloaded_files)   # [{"url": "...", "checksum": "...", "filename": "...", "file_size": 1024}]
 ```
 
 In the Skyvern UI, go to **Runs**, click a run, and view the **Actions** and **Recording** tabs.
