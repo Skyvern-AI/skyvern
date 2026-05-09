@@ -2,7 +2,7 @@ import asyncio
 import copy
 import hashlib
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import httpx
 import structlog
@@ -30,6 +30,9 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
 LOG = structlog.get_logger()
 
@@ -441,6 +444,29 @@ class AgentFunction:
     OSS Skyvern has no scheduling backend wired up by default, so the routes return 501.
     Cloud overrides this to True and provides the Temporal-backed implementations below.
     """
+
+    def get_flex_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
+
+        Cloud overrides this with the Gemini family → flex+GPT-5-fallback mapping.
+        OSS no-op so self-hosted users without flex routers see no behavior change.
+        """
+        return None
+
+    async def should_use_flex_llm_routing(
+        self,
+        *,
+        trigger_type: "WorkflowRunTriggerType | None",
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+    ) -> bool:
+        """Decide whether a given workflow run is eligible for flex-tier LLM routing.
+
+        Cloud overrides this to consult its experimentation provider; OSS has no flex
+        routers so the default returns False.
+        """
+        return False
 
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.

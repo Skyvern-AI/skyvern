@@ -140,6 +140,26 @@ def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
         return response.model_dump_json(indent=indent)
 
 
+def _consume_prompt_breakdown(context: SkyvernContext | None) -> dict[str, Any]:
+    """Pop the per-prompt token breakdown stashed by prompt_engine / agent.py.
+
+    Returns a flat dict suitable for `**` expansion into the LLM duration log
+    call. Empty dict when no breakdown was set (covers prompts that don't
+    render an HTML element tree). Always clears the stash so the next call
+    can't inherit a stale value (SKY-9718).
+    """
+    if context is None or context.last_prompt_breakdown is None:
+        return {}
+    breakdown = context.last_prompt_breakdown
+    context.last_prompt_breakdown = None
+    return {
+        "html_token_count": breakdown.get("html_token_count"),
+        "html_pct": breakdown.get("html_pct"),
+        "total_tokens_local": breakdown.get("total_tokens_local"),
+        "prompt_template_name": breakdown.get("template_name"),
+    }
+
+
 @runtime_checkable
 class RouterWithModelList(Protocol):
     model_list: list[dict[str, Any]]
@@ -568,8 +588,87 @@ class LLMAPIHandlerFactory:
         )
 
     @staticmethod
+    def _maybe_get_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
+        """Return a flex-tier handler if context says we should flex-route the given default,
+        or None to indicate the caller should use the default handler unchanged.
+
+        Centralizes the flex routing decision so both `get_override_llm_api_handler`
+        (override-aware callers) and `wrap_for_flex_routing` (direct-caller protection
+        for `app.LLM_API_HANDLER` etc.) consult the same logic and tag the same span.
+        """
+        ctx = skyvern_context.current()
+        if ctx is None or not ctx.use_flex_llm_routing:
+            return None
+        # Cached handlers carry .llm_key (set in get_llm_api_handler /
+        # get_llm_api_handler_with_router). For LLMCaller-backed handlers (openrouter,
+        # GitHub Copilot via OPENAI_COMPATIBLE) the returned handler is `llm_caller.call`
+        # — a bound method whose .__self__ is the LLMCaller instance carrying .llm_key.
+        # Fall back to settings.LLM_KEY for stub handlers (e.g. dummy_llm_api_handler).
+        effective_key = (
+            getattr(default, "llm_key", None)
+            or getattr(getattr(default, "__self__", None), "llm_key", None)
+            or settings.LLM_KEY
+        )
+        flex_key = app.AGENT_FUNCTION.get_flex_llm_key(effective_key)
+        # is_registered() check makes the gate a clean no-op on deploys where flex routers
+        # weren't registered (e.g. ENABLE_AZURE_GPT5=false). Without it every eligible call
+        # would log a warning and pay the cost of an exception just to fall through.
+        if not flex_key or not LLMConfigRegistry.is_registered(flex_key):
+            return None
+        try:
+            flex_handler = LLMAPIHandlerFactory.get_llm_api_handler(flex_key)
+            # get_current_span() returns a NonRecordingSpan when no span is active;
+            # set_attribute is a no-op on that, so no None check needed.
+            span = otel_trace.get_current_span()
+            span.set_attribute("flex_routing_applied", True)
+            span.set_attribute("flex_routing_resolved_key", flex_key)
+            return flex_handler
+        except Exception:
+            LOG.warning(
+                "Failed to get flex LLM API handler, falling back to non-flex resolution.",
+                flex_key=flex_key,
+                effective_key=effective_key,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def wrap_for_flex_routing(handler: LLMAPIHandler) -> LLMAPIHandler:
+        """Wrap a default LLM handler so it applies flex routing when context says so.
+
+        Use this for handlers stored on `app.*` that direct callers might invoke without
+        going through get_override_llm_api_handler (e.g. task_v2_service uses
+        `await app.LLM_API_HANDLER(...)` directly for metadata/summary calls). The
+        wrapper preserves .llm_key so other code that introspects handlers still works.
+        """
+
+        async def flex_aware_handler(*args: Any, **kwargs: Any) -> Any:
+            flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(handler)
+            target = flex_handler if flex_handler is not None else handler
+            return await target(*args, **kwargs)
+
+        # Preserve .llm_key on the wrapper so introspection (incl. _maybe_get_flex_handler
+        # and observability tags) still finds the underlying default's key. For bound-method
+        # handlers (LLMCaller.call from openrouter / OPENAI_COMPATIBLE paths), the key lives
+        # on __self__ rather than the bound method itself — surface it directly so downstream
+        # _maybe_get_flex_handler doesn't fall through to settings.LLM_KEY (which could route
+        # the call to the wrong model family).
+        flex_aware_handler.llm_key = (  # type: ignore[attr-defined]
+            getattr(handler, "llm_key", None) or getattr(getattr(handler, "__self__", None), "llm_key", None)
+        )
+        return flex_aware_handler
+
+    @staticmethod
     def get_override_llm_api_handler(override_llm_key: str | None, *, default: LLMAPIHandler) -> LLMAPIHandler:
-        if not override_llm_key:
+        # Cloud flex routing applies only on the default-handler path (no explicit override).
+        # Block/task-level `llm_key` overrides represent a deliberate caller choice — including
+        # the GPT-4.1 fallback variants — and the existing contract on this method (see comment
+        # below) is that explicit overrides honor the exact model choice. We respect that.
+        # Flex routing is treated as default-path tier optimization, not a model rewriter.
+        if override_llm_key is None:
+            flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(default)
+            if flex_handler is not None:
+                return flex_handler
             return default
         try:
             # Explicit overrides should honor the exact model choice and skip experimentation reroutes.
@@ -591,17 +690,21 @@ class LLMAPIHandlerFactory:
         if not isinstance(llm_config, LLMRouterConfig):
             raise InvalidLLMConfigError(llm_key)
 
+        fallback_groups: list[str]
+        if not llm_config.fallback_model_group:
+            fallback_groups = []
+        elif isinstance(llm_config.fallback_model_group, str):
+            fallback_groups = [llm_config.fallback_model_group]
+        else:
+            fallback_groups = list(llm_config.fallback_model_group)
+
         router = litellm.Router(
             model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
-            fallbacks=(
-                [{llm_config.main_model_group: [llm_config.fallback_model_group]}]
-                if llm_config.fallback_model_group
-                else []
-            ),
+            fallbacks=([{llm_config.main_model_group: fallback_groups}] if fallback_groups else []),
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
             disable_cooldowns=llm_config.disable_cooldowns,
@@ -1126,6 +1229,7 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                    **_consume_prompt_breakdown(context),
                 )
 
                 _enrich_llm_span(
@@ -1662,6 +1766,7 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                    **_consume_prompt_breakdown(context),
                 )
 
                 # actual_model is the response's model normalized by _normalize_llm_model.
@@ -2109,6 +2214,7 @@ class LLMCaller:
                 else None,
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+                **_consume_prompt_breakdown(context),
             )
 
             # See comment on the non-router _enrich_llm_span call — same reasoning

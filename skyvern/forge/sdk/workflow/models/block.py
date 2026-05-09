@@ -5707,6 +5707,9 @@ class TaskV2Block(Block):
         )
         loop_internal_state = copy.deepcopy(current_context.loop_internal_state) if current_context else None
         try:
+            # TaskV2Block child runs inherit the parent run's trigger_type so non-UI parents
+            # don't silently drop flex-routing eligibility for their TaskV2 children.
+            inherited_v2_trigger_type = current_context.trigger_type if current_context else None
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=organization,
                 user_prompt=resolved_prompt,
@@ -5717,6 +5720,7 @@ class TaskV2Block(Block):
                 totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
                 workflow_system_prompt=self.workflow_system_prompt,
+                trigger_type=inherited_v2_trigger_type,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -8001,11 +8005,13 @@ class WorkflowTriggerBlock(Block):
             # setup_workflow_run() can replace the current context without
             # flushing the parent's pending workflow_feature_flags summary.
             parent_context = skyvern_context.current()
+            inherited_trigger_type = parent_context.trigger_type if parent_context else None
             with skyvern_context.scoped(
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
                     copilot_session_id=parent_context.copilot_session_id if parent_context else None,
+                    trigger_type=inherited_trigger_type,
                 )
             ):
                 try:
@@ -8016,6 +8022,7 @@ class WorkflowTriggerBlock(Block):
                         organization=organization,
                         parent_workflow_run_id=workflow_run_id,
                         ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
+                        trigger_type=inherited_trigger_type,
                     )
                 except Exception as e:
                     error_msg = get_user_facing_exception_message(e)
@@ -8107,6 +8114,8 @@ class WorkflowTriggerBlock(Block):
                 # separately; the worker reads it back from the DB inside
                 # ``execute_workflow``. Symmetric with the sync branch above
                 # — the flag is written once, at spawn time, for both paths.
+                async_parent_context = skyvern_context.current()
+                async_inherited_trigger_type = async_parent_context.trigger_type if async_parent_context else None
                 triggered_workflow_run = await run_workflow(
                     workflow_id=resolved_workflow_permanent_id,
                     organization=organization,
@@ -8115,6 +8124,7 @@ class WorkflowTriggerBlock(Block):
                     background_tasks=None,
                     parent_workflow_run_id=workflow_run_id,
                     ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
+                    trigger_type=async_inherited_trigger_type,
                 )
             except Exception as e:
                 error_msg = get_user_facing_exception_message(e)

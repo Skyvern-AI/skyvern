@@ -13,6 +13,8 @@ from skyvern.config import settings
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
 
+    from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+
 LOG = structlog.get_logger()
 
 # Cap on entries kept in `recent_dialog_messages` so a chatty page (e.g. validation
@@ -72,6 +74,15 @@ class SkyvernContext:
     enable_speed_optimizations: bool = False
     use_artifact_bundling: bool = False
 
+    # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
+    # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
+    # without taking a dependency on the public-API request shape.
+    trigger_type: WorkflowRunTriggerType | None = None
+    # When true, downstream LLM handler selection may swap the resolved handler to a
+    # flex-tier router. Cloud sets this at run boot via a PostHog flag for non-UI runs;
+    # OSS keeps it False because OSS has no flex routers registered.
+    use_flex_llm_routing: bool = False
+
     # script run context
     code_version: int | None = None
     script_id: str | None = None
@@ -126,6 +137,13 @@ class SkyvernContext:
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
     recent_dialog_messages: list[DialogEntry] = field(default_factory=list)
+
+    # Per-step prompt token breakdown (SKY-9718). Written by prompt-build sites
+    # (prompt_engine.load_prompt_with_elements_tracked + the cached extract-action
+    # path in agent.py); read + cleared by the LLM API handler when emitting the
+    # "LLM API handler duration metrics" log so html_token_count / html_pct land
+    # alongside the existing input_tokens / llm_cost on the same row.
+    last_prompt_breakdown: dict[str, Any] | None = None
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id}, copilot_session_id={self.copilot_session_id})"

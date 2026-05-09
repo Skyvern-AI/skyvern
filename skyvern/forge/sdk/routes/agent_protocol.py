@@ -29,6 +29,7 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
+from skyvern.constants import SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import (
     MissingBrowserAddressError,
     SkyvernHTTPException,
@@ -303,6 +304,9 @@ async def run_task(
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
+        v2_trigger_type = (
+            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+        )
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=current_org,
@@ -312,6 +316,7 @@ async def run_task(
                 totp_verification_url=run_request.totp_url,
                 webhook_callback_url=run_request.webhook_url,
                 proxy_location=run_request.proxy_location,
+                trigger_type=v2_trigger_type,
                 publish_workflow=run_request.publish_workflow,
                 extracted_information_schema=run_request.data_extraction_schema,
                 error_code_mapping=run_request.error_code_mapping,
@@ -1856,6 +1861,7 @@ async def run_block(
     user_id: str = Depends(org_auth_service.get_current_user_id),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
     """
     Kick off the execution of one or more blocks in a workflow. Returns the
@@ -1875,11 +1881,15 @@ async def run_block(
             block_labels=block_run_request.block_labels,
         )
 
+        block_trigger_type = (
+            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+        )
         workflow_run = await block_service.ensure_workflow_run(
             organization=organization,
             template=template,
             workflow_permanent_id=block_run_request.workflow_id,
             block_run_request=block_run_request,
+            trigger_type=block_trigger_type,
         )
 
         browser_session_id = block_run_request.browser_session_id
@@ -3432,6 +3442,7 @@ async def run_task_v2(
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
@@ -3442,6 +3453,9 @@ async def run_task_v2(
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
+    legacy_v2_trigger_type = (
+        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+    )
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
@@ -3459,6 +3473,7 @@ async def run_task_v2(
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
             browser_address=data.browser_address,
+            trigger_type=legacy_v2_trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

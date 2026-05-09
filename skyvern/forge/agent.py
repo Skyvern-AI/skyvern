@@ -3432,7 +3432,21 @@ class ForgeAgent:
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
-                if count_tokens(combined_prompt) > PROMPT_HARD_CEILING_TOKENS:
+                combined_token_count = count_tokens(combined_prompt)
+
+                # SKY-9718: stash html-token breakdown on the cached split-template path
+                # too — load_prompt_with_elements_tracked never sees this prompt, so the
+                # downstream LLM API handler would otherwise log nothing for it.
+                html_tokens = count_tokens(elements_for_prompt) if elements_for_prompt else 0
+                html_pct = (html_tokens / combined_token_count) if combined_token_count else None
+                context.last_prompt_breakdown = {
+                    "html_token_count": html_tokens,
+                    "total_tokens_local": combined_token_count,
+                    "html_pct": round(html_pct, 4) if html_pct is not None else None,
+                    "template_name": f"{template}-cached",
+                }
+
+                if combined_token_count > PROMPT_HARD_CEILING_TOKENS:
                     # The cached split-template path renders static+dynamic separately,
                     # so the load_prompt_with_elements ceiling logic never sees this
                     # prompt. Raise the dedicated sentinel to trigger the except below,
