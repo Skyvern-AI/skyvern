@@ -72,6 +72,23 @@ class TestAgentTemplateCorrectionRules:
         assert "Labels become output keys" in rendered
         assert "Jinja block reference" in rendered
 
+    def test_agent_template_extends_commit_early_to_additive_edits(self) -> None:
+        rendered = prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+
+        assert "existing workflow draft needs a well-scoped additive edit" in rendered
+        assert "clear condition plus action target" in rendered
+        assert "update_and_run_blocks" in rendered
+        assert "prose-only block outline" in rendered
+
+    def test_agent_template_prefers_prompt_criteria_for_extraction_conditionals(self) -> None:
+        rendered = prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+
+        assert "conditional branches that depend on prior extraction output" in rendered
+        assert "criteria_type: prompt" in rendered
+        assert "Do NOT write pure Jinja" in rendered
+        assert "inspect_table.output.extracted_information.has_match" in rendered
+        assert "safe snapshot of prior extraction results" in rendered
+
 
 class TestUserTemplateCodeFencing:
     """Verify untrusted variables are wrapped in code fences."""
