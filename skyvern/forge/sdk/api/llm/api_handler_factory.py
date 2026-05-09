@@ -665,7 +665,8 @@ class LLMAPIHandlerFactory:
         # the GPT-4.1 fallback variants — and the existing contract on this method (see comment
         # below) is that explicit overrides honor the exact model choice. We respect that.
         # Flex routing is treated as default-path tier optimization, not a model rewriter.
-        if override_llm_key is None:
+        # Treat empty string as "no override" — block models persist `llm_key=""` rather than NULL.
+        if not override_llm_key:
             flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(default)
             if flex_handler is not None:
                 return flex_handler
