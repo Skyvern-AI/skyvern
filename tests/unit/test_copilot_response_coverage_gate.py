@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -41,6 +42,7 @@ class _Ctx:
         self.format_nudge_count = 0
         self.no_workflow_nudge_count = 0
         self.user_message = ""
+        self.request_policy = None
         self.last_update_block_count = None
         self.last_test_ok = None
         self.last_test_failure_reason = None
@@ -96,6 +98,15 @@ def test_reply_with_coverage_gap_fires_nudge() -> None:
     nudge = _response_coverage_nudge(ctx, parsed)
     assert nudge == POST_INTERMEDIATE_SUCCESS_NUDGE
     assert ctx.coverage_nudge_count == 1
+
+
+def test_reply_after_success_with_request_policy_completion_contract_passes_through() -> None:
+    ctx = _post_success_ctx("Go to https://example.com/contact. Fill out the contact form and submit it.")
+    ctx.request_policy = SimpleNamespace(completion_contract="confirmation banner appears")
+    parsed = {"type": "REPLY", "user_response": "I created and tested the workflow."}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
+    assert ctx.coverage_nudge_count == 0
 
 
 def test_coverage_nudge_respects_counter_cap() -> None:

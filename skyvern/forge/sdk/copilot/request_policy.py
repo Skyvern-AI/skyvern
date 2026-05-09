@@ -44,6 +44,7 @@ class RequestPolicy:
     allow_run_blocks: bool = True
     allow_missing_credentials_in_draft: bool = False
     user_response_policy: str = "proceed"
+    completion_contract: str | None = None
     resolved_credentials: list[Credential] = field(default_factory=list)
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
@@ -57,6 +58,7 @@ class RequestPolicy:
             "allow_run_blocks": self.allow_run_blocks,
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "resolved_credential_count": len(self.resolved_credentials),
+            "completion_contract": self.completion_contract,
             "raw_secret_detected": self.raw_secret_detected,
         }
 
@@ -68,6 +70,8 @@ class RequestPolicy:
             f"allow_run_blocks: {self.allow_run_blocks}",
             f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
         ]
+        if self.completion_contract:
+            lines.append(f"completion_contract: {self.completion_contract}")
         if self.resolved_credentials:
             lines += [
                 "resolved_credentials:",
@@ -104,14 +108,29 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         return RequestPolicy()
     testing_intent = raw.get("testing_intent")
     credential_input_kind = raw.get("credential_input_kind")
+    completion_contract_raw = raw.get("completion_contract")
+    completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
+        completion_contract=completion_contract or None,
     )
     return policy
+
+
+def _ground_completion_contract(user_message: str, value: str | None) -> str | None:
+    if not value or not value.strip():
+        return None
+
+    contract = value.strip()
+    message = user_message or ""
+    if contract.lower() in message.lower():
+        return contract
+
+    return None
 
 
 async def _classify_request(
@@ -143,8 +162,11 @@ async def _classify_request(
         return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
 
     policy = _classification_from_raw(raw)
+    policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
     policy.credential_refs = _clean_list(policy.credential_refs + ids)
-    if ids and policy.credential_input_kind != "raw_secret":
+    if policy.testing_intent == "skip_test" and policy.completion_contract:
+        policy.testing_intent = "unspecified"
+    if ids and policy.credential_input_kind in ("none", "placeholder"):
         policy.credential_input_kind = "credential_id"
     return policy
 
