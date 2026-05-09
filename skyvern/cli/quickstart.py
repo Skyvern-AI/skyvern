@@ -1,6 +1,8 @@
 """Quickstart command for Skyvern CLI."""
 
 import asyncio
+import importlib
+import importlib.metadata
 import subprocess
 import sys
 from enum import Enum
@@ -8,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
@@ -17,6 +20,46 @@ from skyvern.cli.console import console
 from skyvern.utils.env_paths import EnvScope, parse_env_scope, resolve_frontend_env_path
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
+
+_SKYVERN_COMPOSE_SERVICES = {"postgres", "skyvern", "skyvern-ui"}
+
+
+def _server_extra_install_target() -> str:
+    cwd = Path.cwd()
+    if (cwd / "pyproject.toml").is_file() and (cwd / "skyvern").is_dir():
+        return ".[server]"
+
+    try:
+        version = importlib.metadata.version("skyvern")
+    except importlib.metadata.PackageNotFoundError:
+        return "skyvern[server]"
+    return f"skyvern[server]=={version}"
+
+
+def _install_server_extra_for_quickstart() -> bool:
+    target = _server_extra_install_target()
+    console.print(
+        Panel(
+            "Local quickstart needs the server dependencies.\n\n"
+            f"Install [cyan]{escape(target)}[/cyan] into the current Python environment now?",
+            title="Missing Local Server Dependency",
+            border_style="yellow",
+        )
+    )
+    if not Confirm.ask("Install the missing server dependencies now?", default=True):
+        _print_server_guidance()
+        return False
+
+    console.print(f"📦 [bold blue]Installing {escape(target)}...[/bold blue]")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", target], check=True)
+    except subprocess.CalledProcessError as install_error:
+        console.print(f"[bold red]Failed to install {target}: {install_error}[/bold red]")
+        _print_server_guidance()
+        return False
+
+    importlib.invalidate_caches()
+    return True
 
 
 def capture_setup_event(
@@ -299,6 +342,8 @@ def _run_server_quickstart(
         )
         console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
         raise typer.Exit(0)
+    except typer.Exit:
+        raise
     except Exception as e:
         capture_setup_error("quickstart-fail", e, error_type="quickstart_error")
         console.print(f"[bold red]Error during quickstart: {str(e)}[/bold red]")
@@ -340,18 +385,154 @@ def check_docker_compose_file() -> bool:
     return Path("docker-compose.yml").exists() or Path("docker-compose.yaml").exists()
 
 
-def check_postgres_container_conflict() -> bool:
-    """Check if postgresql-container exists and is using port 5432."""
+def _run_docker_command(args: list[str]) -> subprocess.CompletedProcess[str] | None:
     try:
-        result = subprocess.run(
-            ["docker", "ps", "-a", "--filter", "name=postgresql-container", "--format", "{{.Names}}"],
+        return subprocess.run(
+            args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        return "postgresql-container" in result.stdout
     except (FileNotFoundError, subprocess.SubprocessError):
-        return False
+        return None
+
+
+def get_postgres_container_state() -> str | None:
+    """Return the standalone quickstart Postgres container state when it exists."""
+    result = _run_docker_command(["docker", "inspect", "--format", "{{.State.Status}}", "postgresql-container"])
+    if result is None or result.returncode != 0:
+        return None
+    return result.stdout.strip() or "unknown"
+
+
+def check_postgres_container_conflict() -> bool:
+    """Check if the standalone quickstart Postgres container exists."""
+    return get_postgres_container_state() is not None
+
+
+def _running_skyvern_compose_services() -> list[str]:
+    """Return running services from the current Skyvern Docker Compose project."""
+    result = _run_docker_command(["docker", "compose", "ps", "--services", "--status", "running"])
+    if result is None or result.returncode != 0:
+        return []
+
+    services = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return [service for service in services if service in _SKYVERN_COMPOSE_SERVICES]
+
+
+def _handle_running_compose_stack() -> None:
+    services = _running_skyvern_compose_services()
+    if not services:
+        return
+
+    capture_setup_event(
+        "docker-compose-existing-detected",
+        success=True,
+        extra_data={"services": services},
+    )
+    console.print(
+        Panel(
+            "[bold yellow]Skyvern Docker Compose is already running.[/bold yellow]\n\n"
+            f"Running services: [cyan]{', '.join(services)}[/cyan]\n\n"
+            "If you changed configuration during quickstart, restarting the compose stack "
+            "avoids stale containers and port conflicts.",
+            border_style="yellow",
+        )
+    )
+    if not Confirm.ask("Run [cyan]docker compose down[/cyan] before continuing?", default=True):
+        console.print("[yellow]Continuing with the existing Docker Compose stack.[/yellow]")
+        capture_setup_event(
+            "docker-compose-existing-keep",
+            success=True,
+            extra_data={"services": services},
+        )
+        return
+
+    try:
+        subprocess.run(
+            ["docker", "compose", "down"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        capture_setup_event(
+            "docker-compose-down-fail",
+            success=False,
+            error_type="docker_compose_down_error",
+            error_message=e.stderr.strip() if e.stderr else str(e),
+        )
+        console.print(f"[bold red]Error stopping Docker Compose: {e.stderr}[/bold red]")
+        raise typer.Exit(1)
+
+    console.print("✅ [green]Stopped existing Skyvern Docker Compose services.[/green]")
+    capture_setup_event(
+        "docker-compose-existing-stopped",
+        success=True,
+        extra_data={"services": services},
+    )
+
+
+def _handle_postgres_container_conflict() -> None:
+    container_state = get_postgres_container_state()
+    if container_state is None:
+        return
+
+    capture_setup_event(
+        "docker-postgres-container-detected",
+        success=True,
+        extra_data={"state": container_state},
+    )
+    console.print(
+        Panel(
+            "[bold yellow]Standalone PostgreSQL container detected.[/bold yellow]\n\n"
+            "A container named [cyan]postgresql-container[/cyan] already exists "
+            f"([cyan]{container_state}[/cyan]). This is the standalone Postgres container "
+            "created by the local quickstart path and can conflict with Docker Compose "
+            "setups that bind Postgres to the host.\n\n"
+            "Docker Compose will create and manage its own [cyan]postgres[/cyan] service.",
+            border_style="yellow",
+        )
+    )
+    remove_container = Confirm.ask(
+        "Remove [cyan]postgresql-container[/cyan] before continuing?",
+        default=False,
+    )
+    if not remove_container:
+        console.print(
+            "[yellow]Continuing without removing postgresql-container. "
+            "If Docker Compose reports a Postgres conflict, rerun quickstart and remove it.[/yellow]"
+        )
+        capture_setup_event(
+            "docker-postgres-container-keep",
+            success=True,
+            extra_data={"state": container_state},
+        )
+        return
+
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", "postgresql-container"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        capture_setup_event(
+            "docker-postgres-container-remove-fail",
+            success=False,
+            error_type="docker_rm_error",
+            error_message=e.stderr.strip() if e.stderr else str(e),
+        )
+        console.print(f"[bold red]Failed to remove postgresql-container: {e.stderr}[/bold red]")
+        raise typer.Exit(1)
+
+    console.print("✅ [green]Removed standalone postgresql-container.[/green]")
+    capture_setup_event(
+        "docker-postgres-container-removed",
+        success=True,
+        extra_data={"state": container_state},
+    )
 
 
 def _configure_cdp_livestreaming_defaults() -> None:
@@ -382,35 +563,8 @@ def run_docker_compose_setup() -> None:
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
     capture_setup_event("docker-compose-start")
 
-    # Check for postgres container conflict
-    if check_postgres_container_conflict():
-        capture_setup_event(
-            "docker-port-conflict",
-            success=False,
-            error_type="port_conflict",
-            error_message="PostgreSQL container 'postgresql-container' already exists on port 5432",
-            extra_data={"port": 5432},
-        )
-        console.print(
-            Panel(
-                "[bold yellow]Warning: Existing PostgreSQL container detected![/bold yellow]\n\n"
-                "A container named 'postgresql-container' already exists, which may conflict\n"
-                "with the PostgreSQL service in Docker Compose (both use port 5432).\n\n"
-                "To avoid conflicts, remove the existing container first:\n"
-                "[cyan]docker rm -f postgresql-container[/cyan]",
-                border_style="yellow",
-            )
-        )
-        proceed = Confirm.ask("Do you want to continue anyway?", default=False)
-        if not proceed:
-            console.print("[yellow]Aborting Docker Compose setup. Please remove the container and try again.[/yellow]")
-            capture_setup_event(
-                "docker-compose-abort",
-                success=False,
-                error_type="user_abort",
-                error_message="User aborted due to port conflict",
-            )
-            raise typer.Exit(0)
+    _handle_running_compose_stack()
+    _handle_postgres_container_conflict()
 
     # Configure LLM provider
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
@@ -622,9 +776,9 @@ def quickstart(
             run_docker_compose_setup()
             return
 
-    if not has_server_extra:
-        _print_server_guidance()
-        raise typer.Exit(0)
+    if not _has_server_quickstart_extra():
+        if not _install_server_extra_for_quickstart() or not _has_server_quickstart_extra():
+            raise typer.Exit(1)
 
     _run_server_quickstart(
         no_postgres=no_postgres,

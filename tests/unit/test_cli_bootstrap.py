@@ -13,16 +13,21 @@ from skyvern.utils.env_paths import BACKEND_ENV_INTENT_ENV_VAR, EnvIntent
 def test_bootstrap_defaults_to_warning_without_explicit_log_level(monkeypatch) -> None:
     monkeypatch.delenv("LOG_LEVEL", raising=False)
 
-    logger_names = ("", "skyvern", "httpx", "litellm", "playwright", "httpcore")
+    logger_names = ("", "skyvern", "httpx", "litellm", "playwright", "httpcore", "posthog")
     previous_levels = {name: logging.getLogger(name).level for name in logger_names}
+    previous_propagate = {name: logging.getLogger(name).propagate for name in logger_names}
     try:
         cli_bootstrap.configure_cli_bootstrap_logging()
         assert "LOG_LEVEL" not in cli_bootstrap.os.environ
-        for name in logger_names:
+        for name in ("", "skyvern", "httpx", "litellm", "playwright", "httpcore"):
             assert logging.getLogger(name).level == logging.WARNING
+        assert logging.getLogger("posthog").level > logging.CRITICAL
+        assert logging.getLogger("posthog").propagate is False
     finally:
         for name, level in previous_levels.items():
             logging.getLogger(name).setLevel(level)
+        for name, propagate in previous_propagate.items():
+            logging.getLogger(name).propagate = propagate
 
 
 def test_bootstrap_honors_explicit_log_level(monkeypatch) -> None:

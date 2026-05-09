@@ -31,11 +31,22 @@ def command_exists(command: str) -> bool:
 def run_command(command: str, check: bool = True) -> tuple[Optional[str], Optional[int]]:
     try:
         result = subprocess.run(command, shell=True, check=check, capture_output=True, text=True)
-        return result.stdout.strip(), result.returncode
+        output = result.stdout.strip() or result.stderr.strip()
+        return output, result.returncode
     except subprocess.CalledProcessError as e:
+        stdout = (e.stdout or "").strip()
+        stderr = (e.stderr or "").strip()
         console.print(f"[red]Error executing command: [bold]{command}[/bold][/red]", style="red")
-        console.print(f"[red]Stderr: {e.stderr.strip()}[/red]", style="red")
-        return None, e.returncode
+        console.print(f"[red]Stderr: {stderr}[/red]", style="red")
+        return stdout or stderr, e.returncode
+
+
+def _subprocess_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(part for part in ((result.stdout or "").strip(), (result.stderr or "").strip()) if part)
+
+
+def _already_exists(result: subprocess.CompletedProcess[str]) -> bool:
+    return "already exists" in _subprocess_output(result).lower()
 
 
 def is_postgres_running() -> bool:
@@ -78,29 +89,40 @@ def create_database_and_user() -> None:
         console.print("✅ [green]Role 'skyvern' already exists.[/green]")
     else:
         console.print("  Creating role 'skyvern'...")
-        _, code = run_command("createuser skyvern", check=False)
-        if code != 0:
+        result = subprocess.run(["createuser", "skyvern"], check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            console.print("  ✅ [green]Role 'skyvern' created.[/green]")
+        elif _already_exists(result):
+            console.print("✅ [green]Role 'skyvern' already exists.[/green]")
+        else:
             console.print(
                 "[red]Failed to create role 'skyvern'. "
                 "You may need to create it manually:[/red]\n"
                 "  [bold]createuser skyvern[/bold]"
             )
             raise SystemExit(1)
-        console.print("  ✅ [green]Role 'skyvern' created.[/green]")
 
     if _database_exists_via_catalog("skyvern"):
         console.print("✅ [green]Database 'skyvern' already exists.[/green]")
     else:
         console.print("  Creating database 'skyvern'...")
-        _, code = run_command("createdb skyvern -O skyvern", check=False)
-        if code != 0:
+        result = subprocess.run(
+            ["createdb", "skyvern", "-O", "skyvern"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            console.print("  ✅ [green]Database 'skyvern' created.[/green]")
+        elif _already_exists(result):
+            console.print("✅ [green]Database 'skyvern' already exists.[/green]")
+        else:
             console.print(
                 "[red]Failed to create database 'skyvern'. "
                 "You may need to create it manually:[/red]\n"
                 "  [bold]createdb skyvern -O skyvern[/bold]"
             )
             raise SystemExit(1)
-        console.print("  ✅ [green]Database 'skyvern' created.[/green]")
 
     console.print("✅ [bold green]Database and user are ready.[/bold green]")
 
@@ -191,18 +213,24 @@ def setup_postgresql(no_postgres: bool = False, *, env_path: Path | str | None =
         if not is_postgres_container_exists():
             with console.status("[bold blue]Pulling and starting PostgreSQL container...[/bold blue]"):
                 output, code = run_command(
-                    "docker run --name postgresql-container -e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14"
+                    "docker run --name postgresql-container "
+                    "-e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14",
+                    check=False,
                 )
                 if code != 0:
-                    capture_setup_event(
-                        "database-container-fail",
-                        success=False,
-                        error_type="docker_run_error",
-                        error_message=output or "Failed to start PostgreSQL container",
-                    )
-                    console.print(
-                        "[red]Warning: Failed to start PostgreSQL container. Check Docker logs for details.[/red]"
-                    )
+                    if is_postgres_container_exists():
+                        run_command("docker start postgresql-container", check=False)
+                        console.print("✅ [green]Existing PostgreSQL container started.[/green]")
+                    else:
+                        capture_setup_event(
+                            "database-container-fail",
+                            success=False,
+                            error_type="docker_run_error",
+                            error_message=output or "Failed to start PostgreSQL container",
+                        )
+                        console.print(
+                            "[red]Warning: Failed to start PostgreSQL container. Check Docker logs for details.[/red]"
+                        )
                 else:
                     console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
         else:
