@@ -23,6 +23,10 @@ _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_sto
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _RAW_SECRET_PATTERNS = (
     re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
+    re.compile(
+        r"\b(?:otp|totp|mfa|2fa|verification|auth(?:entication)? code)(?:\s+code)?\s*(?:is|[:=])?\s*\d{6,8}\b",
+        re.I,
+    ),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -140,7 +144,7 @@ async def _classify_request(
 
     policy = _classification_from_raw(raw)
     policy.credential_refs = _clean_list(policy.credential_refs + ids)
-    if ids and policy.credential_input_kind in ("none", "placeholder"):
+    if ids and policy.credential_input_kind != "raw_secret":
         policy.credential_input_kind = "credential_id"
     return policy
 

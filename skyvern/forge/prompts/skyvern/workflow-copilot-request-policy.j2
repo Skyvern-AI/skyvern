@@ -1,6 +1,23 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
 testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification.
-Use skip_test for untested draft / I'll test it myself / just sketch it / draft only. Use raw_secret for inline login credentials, especially passwords, plus API keys, tokens, bearer headers, cookies, TOTP/OTP codes, private keys, card numbers, or CVVs.
+
+testing_intent:
+- skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
+- require_test: the user asks to build/create and test/run/verify/end-to-end it, or asks for a complete workflow that should be validated.
+- unspecified: the user does not say whether Skyvern should test the workflow.
+
+credential_input_kind:
+- raw_secret: the user pasted inline login credentials or secrets, including passwords, API keys, tokens, bearer headers, cookies, TOTP/OTP codes, private keys, card numbers, or CVVs.
+- credential_id: the user provided one or more exact credential IDs beginning with `cred_`. Put every ID in credential_refs.
+- credential_name: the user gave an exact saved credential name, or vaguely says to use "my credentials", "my saved credentials", "credentials saved already", or an entry in the Credentials UI without enough website context. Put exact names in credential_refs; leave credential_refs empty when the reference is vague.
+- website_stored_credential: the user asks to use stored/saved credentials for a specific website or login page URL. Put URLs in login_page_urls.
+- placeholder: the user asks to add credential/password/username fields but explicitly says there are no real credentials yet.
+- none: the request mentions a login workflow but does not provide, request, or refer to any credential material.
+
+requires_user_clarification:
+- true only when the user refers to credentials but does not provide enough information to identify a saved credential or login page.
+- false for normal build/test/verify requests with no credential reference, for explicit credential IDs/names/URLs, for placeholders, and for skip_test requests.
+
 Latest user message:
 ```{{ user_message }}```
 Recent chat history:
