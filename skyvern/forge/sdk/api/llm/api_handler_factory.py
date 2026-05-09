@@ -140,6 +140,26 @@ def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
         return response.model_dump_json(indent=indent)
 
 
+def _consume_prompt_breakdown(context: SkyvernContext | None) -> dict[str, Any]:
+    """Pop the per-prompt token breakdown stashed by prompt_engine / agent.py.
+
+    Returns a flat dict suitable for `**` expansion into the LLM duration log
+    call. Empty dict when no breakdown was set (covers prompts that don't
+    render an HTML element tree). Always clears the stash so the next call
+    can't inherit a stale value (SKY-9718).
+    """
+    if context is None or context.last_prompt_breakdown is None:
+        return {}
+    breakdown = context.last_prompt_breakdown
+    context.last_prompt_breakdown = None
+    return {
+        "html_token_count": breakdown.get("html_token_count"),
+        "html_pct": breakdown.get("html_pct"),
+        "total_tokens_local": breakdown.get("total_tokens_local"),
+        "prompt_template_name": breakdown.get("template_name"),
+    }
+
+
 @runtime_checkable
 class RouterWithModelList(Protocol):
     model_list: list[dict[str, Any]]
@@ -1209,6 +1229,7 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                    **_consume_prompt_breakdown(context),
                 )
 
                 _enrich_llm_span(
@@ -1745,6 +1766,7 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                    **_consume_prompt_breakdown(context),
                 )
 
                 # actual_model is the response's model normalized by _normalize_llm_model.
@@ -2192,6 +2214,7 @@ class LLMCaller:
                 else None,
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+                **_consume_prompt_breakdown(context),
             )
 
             # See comment on the non-router _enrich_llm_span call — same reasoning
