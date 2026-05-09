@@ -50,21 +50,6 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "skyvern" / "workflow_knowledge_base.txt"
 )
 
-_USER_SUPPLIED_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
-_UNTESTED_DRAFT_REQUEST_RE = re.compile(
-    r"\b(?:"
-    r"without\s+testing|"
-    r"without\s+(?:a\s+)?test(?:\s+run)?|"
-    r"do\s+not\s+test|"
-    r"don['’]?t\s+test|"
-    r"skip\s+(?:the\s+)?test(?:ing)?|"
-    r"no\s+test(?:ing)?|"
-    r"untested\s+draft|"
-    r"draft\s+only"
-    r")\b",
-    re.IGNORECASE,
-)
-
 
 def _resolve_request_policy_handler(fallback_handler: Any) -> Any:
     with contextlib.suppress(RuntimeError, AttributeError):
@@ -223,95 +208,6 @@ def _build_user_context(
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
     )
-
-
-def _extract_user_supplied_credential_ids(user_message: str) -> list[str]:
-    return list(dict.fromkeys(_USER_SUPPLIED_CREDENTIAL_ID_RE.findall(user_message or "")))
-
-
-def _user_requests_untested_workflow_draft(user_message: str) -> bool:
-    return bool(_UNTESTED_DRAFT_REQUEST_RE.search(user_message or ""))
-
-
-def _missing_credential_ids_result(
-    missing_credential_ids: list[str],
-    global_llm_context: str | None,
-) -> AgentResult:
-    formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
-    id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
-    was_word = "was" if len(missing_credential_ids) == 1 else "were"
-    structured = StructuredContext.from_json_str(global_llm_context)
-    structured.decisions_made.append(
-        f"credential reference validation blocked missing ids: {', '.join(missing_credential_ids)}"
-    )
-    return AgentResult(
-        user_response=(
-            f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
-            "Please choose one of these paths: provide/select a valid credential ID, create the credential "
-            "in the Credentials UI and return with its ID, or explicitly tell me to continue with an "
-            "unvalidated draft workflow that will not be run until credentials are available."
-        ),
-        updated_workflow=None,
-        global_llm_context=structured.to_json_str(),
-        response_type="ASK_QUESTION",
-        workflow_yaml=None,
-        workflow_was_persisted=False,
-        clear_proposed_workflow=True,
-    )
-
-
-def _credential_lookup_failed_result(global_llm_context: str | None) -> AgentResult:
-    structured = StructuredContext.from_json_str(global_llm_context)
-    structured.decisions_made.append("credential reference validation failed before workflow build")
-    return AgentResult(
-        user_response=(
-            "I couldn't verify the supplied credential ID against this organization, so I can't build or run "
-            "the workflow with it yet. Please provide/select a valid credential ID, create the credential in "
-            "the Credentials UI and return with its ID, or explicitly tell me to continue with an unvalidated "
-            "draft workflow that will not be run until credentials are available."
-        ),
-        updated_workflow=None,
-        global_llm_context=structured.to_json_str(),
-        response_type="ASK_QUESTION",
-        workflow_yaml=None,
-        workflow_was_persisted=False,
-        clear_proposed_workflow=True,
-    )
-
-
-async def _credential_validation_result_for_user_message(
-    *,
-    user_message: str,
-    organization_id: str,
-    global_llm_context: str | None,
-    allow_untested_workflow_draft: bool = False,
-) -> AgentResult | None:
-    if allow_untested_workflow_draft:
-        return None
-
-    credential_ids = _extract_user_supplied_credential_ids(user_message)
-    if not credential_ids:
-        return None
-
-    try:
-        existing_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids,
-            organization_id=organization_id,
-        )
-    except Exception:
-        LOG.warning(
-            "Copilot failed to validate user-supplied credential IDs",
-            organization_id=organization_id,
-            credential_ids=credential_ids,
-            exc_info=True,
-        )
-        return _credential_lookup_failed_result(global_llm_context)
-
-    found_ids = {credential.credential_id for credential in existing_credentials}
-    missing_ids = [credential_id for credential_id in credential_ids if credential_id not in found_ids]
-    if not missing_ids:
-        return None
-    return _missing_credential_ids_result(missing_ids, global_llm_context)
 
 
 def _truncate_summary_text(value: Any, max_chars: int = 240) -> str:
