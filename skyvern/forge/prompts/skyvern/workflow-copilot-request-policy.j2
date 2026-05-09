@@ -1,0 +1,10 @@
+Classify the latest Workflow Copilot request. Return only JSON with keys:
+testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification.
+Use skip_test for untested draft / I'll test it myself / just sketch it / draft only. Use raw_secret for inline login credentials, especially passwords, plus API keys, tokens, bearer headers, cookies, TOTP/OTP codes, private keys, card numbers, or CVVs.
+Latest user message:
+```{{ user_message }}```
+Recent chat history:
+```{{ chat_history }}```
+Current workflow YAML:
+```{{ workflow_yaml }}```
+Global context: ```{{ global_llm_context }}```

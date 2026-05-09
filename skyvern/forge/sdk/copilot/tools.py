@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -742,6 +743,25 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     return None
 
 
+def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+    policy = getattr(ctx, "request_policy", None)
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if tool_name == "update_workflow" and not policy.allow_update_workflow:
+        return (
+            "Request policy blocks workflow updates for the latest user message. "
+            "Ask the user for safe stored credential metadata instead."
+        )
+    if tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
+        if policy.testing_intent == "skip_test":
+            return "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+        return (
+            "Request policy blocks block-running tools for the latest user message. "
+            "Ask the user for the required safe credential or clarification before testing."
+        )
+    return None
+
+
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
     WorkflowParameterType.STRING: "",
     WorkflowParameterType.INTEGER: 0,
@@ -823,6 +843,10 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
 ) -> dict[str, Any]:
+    policy_error = _request_policy_tool_error(ctx, "update_workflow")
+    if policy_error is not None:
+        return {"ok": False, "error": policy_error}
+
     workflow_yaml = params["workflow_yaml"]
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
@@ -3669,6 +3693,10 @@ async def run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
+    policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if policy_error:
+        return json.dumps({"ok": False, "error": policy_error})
+
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -3779,6 +3807,10 @@ async def update_and_run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
+    if policy_error:
+        return json.dumps({"ok": False, "error": policy_error})
+
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
