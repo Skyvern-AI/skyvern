@@ -6,7 +6,6 @@ type Props = {
   debugSessionId?: string;
 };
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const debugSessionStatuses = ["created", "completed"] as const;
 
 type DebugSessionStatus = (typeof debugSessionStatuses)[number];
