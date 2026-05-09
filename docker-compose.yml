@@ -64,9 +64,11 @@ services:
       - BROWSER_CDP_CONNECT_TIMEOUT_MS=${BROWSER_CDP_CONNECT_TIMEOUT_MS:-120000}
       - ENABLE_CODE_BLOCK=true
       # --- Control your own browser (Chrome/Chromium) ---
-      # Start Chrome with --remote-debugging-address=0.0.0.0 so Docker can reach it.
+      # Prefer Chrome's chrome://inspect/#remote-debugging flow for an existing profile.
       # On Windows, scripts/windows_chrome_inspect_cdp.ps1 can bridge a
       # chrome://inspect/#remote-debugging listener and write the full ws:// URL.
+      # If Docker cannot reach that listener, start an isolated Chrome profile
+      # with --remote-debugging-address=0.0.0.0 and a non-default --user-data-dir.
       # Then set:
       # - BROWSER_TYPE=cdp-connect
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
