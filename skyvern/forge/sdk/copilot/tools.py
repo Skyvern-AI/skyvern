@@ -25,7 +25,12 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import PROBABLE_SITE_BLOCK_STREAK_STOP_AT, TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import (
+    POST_INTERMEDIATE_SUCCESS_NUDGE,
+    PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
+    TOTAL_TIMEOUT_SECONDS,
+    _goal_likely_needs_more_blocks,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
@@ -3370,6 +3375,33 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
 
 
+def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
+    block_count = getattr(copilot_ctx, "last_update_block_count", None)
+    if not isinstance(block_count, int):
+        return None
+
+    user_message = getattr(copilot_ctx, "user_message", "")
+    request_policy = getattr(copilot_ctx, "request_policy", None)
+    completion_contract = getattr(request_policy, "completion_contract", None)
+    if isinstance(completion_contract, str):
+        completion_contract = completion_contract.strip() or None
+    else:
+        completion_contract = None
+
+    if not _goal_likely_needs_more_blocks(user_message, block_count, completion_contract):
+        return None
+
+    nudge_count = getattr(copilot_ctx, "coverage_nudge_count", 0)
+    if nudge_count >= 1:
+        return None
+    copilot_ctx.coverage_nudge_count = nudge_count + 1
+    return (
+        f"{POST_INTERMEDIATE_SUCCESS_NUDGE} The workflow was saved with {block_count} block"
+        f"{'' if block_count == 1 else 's'}, but it has not been run because the request-policy "
+        "completion contract still leaves distinct requested actions uncovered."
+    )
+
+
 def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
     """Single-pass analysis of run result blocks.
 
@@ -3841,6 +3873,20 @@ async def update_and_run_blocks_tool(
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
+
+    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
+    if coverage_error:
+        result = {
+            "ok": False,
+            "error": coverage_error,
+            "data": {
+                "block_count": copilot_ctx.last_update_block_count,
+                "workflow_updated": True,
+                "workflow_run_skipped": True,
+            },
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        return json.dumps(result)
 
     # Step 2: Compute frontier and run the blocks
     new_definition = None

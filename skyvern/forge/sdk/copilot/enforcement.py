@@ -262,22 +262,32 @@ _ACTION_CATEGORIES: list[list[str]] = [
 _SEQUENTIAL_CONNECTORS = [" and then ", " then ", " after that ", " next ", " followed by ", " afterward "]
 
 
+def _request_completion_contract(ctx: Any) -> str | None:
+    request_policy = getattr(ctx, "request_policy", None)
+    completion_contract = getattr(request_policy, "completion_contract", None)
+    if isinstance(completion_contract, str) and completion_contract.strip():
+        return completion_contract.strip()
+    return None
+
+
 def _nudge(config: CopilotConfig | None, key: str) -> str:
     if config is None:
         return DEFAULT_ENFORCEMENT_NUDGES[key]
     return config.nudge(key)
 
 
-def _goal_likely_needs_more_blocks(user_message: Any, block_count: int) -> bool:
+def _goal_likely_needs_more_blocks(user_message: Any, block_count: int, completion_contract: str | None = None) -> bool:
     """Return True when the goal likely requires more blocks than currently exist."""
     if block_count >= MIN_BLOCKS_FOR_AUTO_COMPLETE:
         return False
     if not isinstance(user_message, str):
         return False
     text = user_message.lower()
+    has_sequential = any(conn in text for conn in _SEQUENTIAL_CONNECTORS)
+    if block_count >= 1 and completion_contract:
+        return has_sequential and block_count < 2
 
     matched_categories = sum(1 for category in _ACTION_CATEGORIES if any(keyword in text for keyword in category))
-    has_sequential = any(conn in text for conn in _SEQUENTIAL_CONNECTORS)
 
     estimated_min_blocks = max(matched_categories, 2) if has_sequential else matched_categories
     return block_count < estimated_min_blocks
@@ -314,7 +324,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
         # ctx.user_message is set by the agent orchestrator in a later stack PR
         # (06c). The getattr default keeps this gate working on partial stacks.
         user_message = getattr(ctx, "user_message", "")
-        if isinstance(block_count, int) and _goal_likely_needs_more_blocks(user_message, block_count):
+        completion_contract = _request_completion_contract(ctx)
+        if isinstance(block_count, int) and _goal_likely_needs_more_blocks(
+            user_message, block_count, completion_contract
+        ):
             nudge_count = getattr(ctx, "coverage_nudge_count", 0)
             if nudge_count < MAX_INTERMEDIATE_NUDGES:
                 ctx.coverage_nudge_count = nudge_count + 1

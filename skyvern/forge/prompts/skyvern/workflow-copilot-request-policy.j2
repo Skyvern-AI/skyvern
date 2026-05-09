@@ -1,10 +1,11 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification.
+testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; completion_contract.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
 - require_test: the user asks to build/create and test/run/verify/end-to-end it, or asks for a complete workflow that should be validated.
 - unspecified: the user does not say whether Skyvern should test the workflow.
+- Do not use skip_test for a "done when", "complete when", or success-condition sentence; that is a completion_contract.
 
 credential_input_kind:
 - raw_secret: the user pasted inline login credentials or secrets, including passwords, API keys, tokens, bearer headers, cookies, TOTP/OTP codes, private keys, card numbers, or CVVs.
@@ -17,6 +18,11 @@ credential_input_kind:
 requires_user_clarification:
 - true only when the user refers to credentials but does not provide enough information to identify a saved credential or login page.
 - false for normal build/test/verify requests with no credential reference, for explicit credential IDs/names/URLs, for placeholders, and for skip_test requests.
+
+completion_contract:
+- Set to the user's explicit done/complete/success condition when they provide one.
+- The value must be an exact span copied from the latest user message. Do not paraphrase, summarize, or infer a completion condition.
+- Set to null when the user does not provide an explicit completion condition.
 
 Latest user message:
 ```{{ user_message }}```
