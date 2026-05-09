@@ -969,6 +969,39 @@ class TestUserSuppliedCredentialIdValidation:
         assert result is None
         get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
 
+    @pytest.mark.asyncio
+    async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.co.uk/login")
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(**kwargs):
+            return handler.response
+
+        args = dict(workflow_yaml="", global_llm_context="", organization_id="org-1", handler=handler)
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://evil.co.uk/login"],
+        }
+        url_policy = await build_request_policy(user_message="use the saved login", chat_history="", **args)
+        assert url_policy.user_response_policy == "ask_clarification" and not url_policy.resolved_credentials
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["azure_credentials"],
+            "requires_user_clarification": True,
+        }
+        skip_policy = await build_request_policy(
+            user_message="just draft without testing", chat_history="user: use azure_credentials", **args
+        )
+        assert skip_policy.user_response_policy == "proceed"
+        assert skip_policy.allow_update_workflow and not skip_policy.allow_run_blocks
+        assert skip_policy.allow_missing_credentials_in_draft
+
     def test_translate_untested_draft_request_surfaces_unvalidated_workflow(self) -> None:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
