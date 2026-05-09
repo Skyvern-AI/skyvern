@@ -46,6 +46,35 @@ class TestFailedTestResponseNormalization:
         assert "test failed" in rewritten.lower()
         assert "Call log:" not in rewritten
 
+    def test_pre_run_coverage_guard_uses_completion_contract(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Go to https://the-internet.herokuapp.com/download and then download the first file.",
+            request_policy=SimpleNamespace(completion_contract="complete when the download starts"),
+            last_update_block_count=1,
+            coverage_nudge_count=0,
+        )
+
+        error = _pre_run_workflow_coverage_error(ctx)
+
+        assert error is not None
+        assert "has not been run" in error
+        assert ctx.coverage_nudge_count == 1
+
+    def test_pre_run_coverage_guard_allows_single_final_action_contract(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Click Delete. Your goal is complete when the Delete button disappears.",
+            request_policy=SimpleNamespace(completion_contract="complete when the Delete button disappears"),
+            last_update_block_count=1,
+            coverage_nudge_count=0,
+        )
+
+        assert _pre_run_workflow_coverage_error(ctx) is None
+        assert ctx.coverage_nudge_count == 0
+
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
 
@@ -1062,6 +1091,59 @@ class TestRequestPolicyCredentialResolution:
         assert skip_policy.user_response_policy == "proceed"
         assert skip_policy.allow_update_workflow and not skip_policy.allow_run_blocks
         assert skip_policy.allow_missing_credentials_in_draft
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "completion_contract": "complete when the page says your message has been sent",
+        }
+        completion_not_skip_policy = await build_request_policy(
+            user_message=(
+                "Fill out the contact form and submit it. "
+                "Your goal is complete when the page says your message has been sent."
+            ),
+            chat_history="",
+            **args,
+        )
+        assert completion_not_skip_policy.testing_intent == "unspecified"
+        assert completion_not_skip_policy.allow_run_blocks
+        assert (
+            completion_not_skip_policy.completion_contract == "complete when the page says your message has been sent"
+        )
+
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://bank.co.uk/login"],
+        }
+        stored_credential_with_id_policy = await build_request_policy(
+            user_message="use the saved login for https://bank.co.uk/login, credential id cred_bank",
+            chat_history="",
+            **args,
+        )
+        assert stored_credential_with_id_policy.credential_input_kind == "website_stored_credential"
+        assert stored_credential_with_id_policy.credential_refs == ["cred_bank"]
+        assert stored_credential_with_id_policy.resolved_credentials == [credential]
+
+        handler.response = {
+            "completion_contract": "confirmation banner appears",
+        }
+        no_completion_condition_policy = await build_request_policy(
+            user_message="submit the contact form and report whether it worked",
+            chat_history="",
+            **args,
+        )
+        assert no_completion_condition_policy.completion_contract is None
+
+        handler.response = {
+            "completion_contract": "confirmation banner appears",
+        }
+        paraphrased_completion_policy = await build_request_policy(
+            user_message="submit the contact form until the requested success state is reached",
+            chat_history="",
+            **args,
+        )
+        assert paraphrased_completion_policy.completion_contract is None
+        assert "completion_contract:" not in paraphrased_completion_policy.prompt_summary()
+        assert paraphrased_completion_policy.to_trace_data()["completion_contract"] is None
 
     def test_translate_untested_draft_request_surfaces_unvalidated_workflow(self) -> None:
         wf = SimpleNamespace(name="drafted")
