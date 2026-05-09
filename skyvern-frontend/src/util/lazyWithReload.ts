@@ -1,6 +1,6 @@
 import React from "react";
 
-const CHUNK_LOAD_PATTERNS = [
+export const CHUNK_LOAD_PATTERNS = [
   /Failed to fetch dynamically imported module/i,
   /Importing a module script failed/i,
   /error loading dynamically imported module/i,

@@ -8,17 +8,90 @@ import typer
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm
+from rich.text import Text
 
 from skyvern.analytics import capture_setup_error, capture_setup_event
-
-# Import console after skyvern.cli to ensure proper initialization
-from skyvern.cli.browser import _print_classic_cdp_instructions
 from skyvern.cli.console import console
-from skyvern.cli.init_command import init_env  # init is used directly
-from skyvern.cli.llm_setup import setup_llm_providers
-from skyvern.cli.utils import start_services
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
+
+
+def _has_server_quickstart_extra() -> bool:
+    from skyvern.exceptions import SkyvernExtraNotInstalled, require_server_extra_modules  # noqa: PLC0415
+
+    try:
+        require_server_extra_modules("skyvern quickstart", ("uvicorn",))
+    except SkyvernExtraNotInstalled:
+        return False
+    return True
+
+
+def _print_install_path_guidance() -> None:
+    message = """Choose the Skyvern path for what you want to do:
+
+Cloud/API SDK
+  You already have this with `pip install skyvern`.
+  No quickstart is required. Use `Skyvern(api_key=...)` or run `skyvern setup` for cloud MCP.
+
+Embedded local Python SDK
+  Install: pip install "skyvern[local]"
+  Then: python -m playwright install chromium
+  Use: Skyvern.local(use_in_memory_db=True)
+  This path does not require Postgres, Docker, migrations, or `skyvern run server`.
+
+Self-hosted local server
+  Install: pip install "skyvern[server]"
+  Then rerun: skyvern quickstart
+  This path sets up the local server, database, local API key, MCP, and optional UI.
+"""
+    console.print(Panel(Text(message), title="Skyvern Quickstart", border_style="cyan"))
+
+
+def _run_server_quickstart(
+    *,
+    no_postgres: bool,
+    database_string: str,
+    skip_browser_install: bool,
+    server_only: bool,
+) -> None:
+    try:
+        from skyvern.cli.init_command import init_env  # noqa: PLC0415
+        from skyvern.cli.utils import start_services  # noqa: PLC0415
+
+        # Initialize Skyvern (pip install path)
+        console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
+        run_local = init_env(
+            no_postgres=no_postgres,
+            database_string=database_string,
+            skip_browser_install=skip_browser_install,
+        )
+        if run_local:
+            _configure_cdp_livestreaming_defaults()
+
+        # Start services
+        if run_local:
+            start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
+            if start_now:
+                console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
+                asyncio.run(start_services(server_only=server_only))
+            else:
+                console.print(
+                    "\n[yellow]Skipping service startup. You can start services later with 'skyvern run all'[/yellow]"
+                )
+
+    except KeyboardInterrupt:
+        capture_setup_event(
+            "quickstart-interrupt",
+            success=False,
+            error_type="user_interrupt",
+            error_message="Quickstart interrupted by user",
+        )
+        console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
+        raise typer.Exit(0)
+    except Exception as e:
+        capture_setup_error("quickstart-fail", e, error_type="quickstart_error")
+        console.print(f"[bold red]Error during quickstart: {str(e)}[/bold red]")
+        raise typer.Exit(1)
 
 
 def check_docker() -> bool:
@@ -93,6 +166,8 @@ def _configure_cdp_livestreaming_defaults() -> None:
 
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
+    from skyvern.cli.llm_setup import setup_llm_providers  # noqa: PLC0415
+
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
     capture_setup_event("docker-compose-start")
 
@@ -184,11 +259,10 @@ def run_docker_compose_setup() -> None:
         default=False,
     )
     if use_own_browser:
+        from skyvern.cli.browser import _print_classic_cdp_instructions  # noqa: PLC0415
+
         _print_classic_cdp_instructions()
-        confirmed = Confirm.ask(
-            "Have you enabled remote debugging in Chrome?",
-            default=False,
-        )
+        confirmed = Confirm.ask("Have you enabled remote debugging in Chrome?", default=False)
         if confirmed:
             from skyvern.cli.llm_setup import update_or_add_env_var
 
@@ -266,38 +340,13 @@ def quickstart(
             run_docker_compose_setup()
             return
 
-    try:
-        # Initialize Skyvern (pip install path)
-        console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        run_local = init_env(
-            no_postgres=no_postgres,
-            database_string=database_string,
-            skip_browser_install=skip_browser_install,
-        )
-        if run_local:
-            _configure_cdp_livestreaming_defaults()
-
-        # Start services
-        if run_local:
-            start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
-            if start_now:
-                console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
-                asyncio.run(start_services(server_only=server_only))
-            else:
-                console.print(
-                    "\n[yellow]Skipping service startup. You can start services later with 'skyvern run all'[/yellow]"
-                )
-
-    except KeyboardInterrupt:
-        capture_setup_event(
-            "quickstart-interrupt",
-            success=False,
-            error_type="user_interrupt",
-            error_message="Quickstart interrupted by user",
-        )
-        console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
+    if not _has_server_quickstart_extra():
+        _print_install_path_guidance()
         raise typer.Exit(0)
-    except Exception as e:
-        capture_setup_error("quickstart-fail", e, error_type="quickstart_error")
-        console.print(f"[bold red]Error during quickstart: {str(e)}[/bold red]")
-        raise typer.Exit(1)
+
+    _run_server_quickstart(
+        no_postgres=no_postgres,
+        database_string=database_string,
+        skip_browser_install=skip_browser_install,
+        server_only=server_only,
+    )

@@ -1,9 +1,9 @@
 # ruff: noqa: E402
 from typing import TYPE_CHECKING, Any
 
-from skyvern.exceptions import require_server_extra_modules
+from skyvern.exceptions import require_local_extra_modules
 
-require_server_extra_modules("skyvern.library.skyvern_browser")
+require_local_extra_modules("skyvern.library.skyvern_browser")
 
 from playwright.async_api import BrowserContext, Page
 

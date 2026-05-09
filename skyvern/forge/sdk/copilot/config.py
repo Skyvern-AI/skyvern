@@ -1,0 +1,296 @@
+"""Injectable workflow copilot configuration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from skyvern.config import settings
+
+DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
+DEFAULT_MAX_TURNS = 25
+DEFAULT_TOKEN_BUDGET = 90_000
+
+SCREENSHOT_DROPPED_NUDGE = (
+    "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
+    "Do NOT reason about the page from memory. Re-take the screenshot "
+    "(get_browser_screenshot) or call evaluate before deciding your next step."
+)
+
+POST_UPDATE_NUDGE = (
+    "You updated the workflow but did not test it. "
+    "You MUST call run_blocks_and_collect_debug (or update_and_run_blocks next time) "
+    "to test at least the first block before responding to the user. "
+    "This verifies the workflow actually works. "
+    "Exception: if the latest user message explicitly asked for an untested draft, "
+    "respond with an unvalidated draft instead of testing."
+)
+
+POST_NAVIGATE_NUDGE = (
+    "You navigated to a page but did not observe its content. "
+    "You MUST use evaluate, get_browser_screenshot, click, type_text, "
+    "scroll, select_option, press_key, or console_messages "
+    "to inspect the page before responding. Do NOT answer from memory."
+)
+
+POST_INTERMEDIATE_SUCCESS_NUDGE = (
+    "STOP — do NOT respond to the user yet. "
+    "Your workflow only covers a subset of what the user asked for. "
+    "You MUST add the next block now: call update_and_run_blocks with the current "
+    "block chain. The tool preserves verified prefix state and reruns only the "
+    "invalidated frontier, so passing the full chain is cheap. "
+    "Only respond to the user when every distinct action they requested is covered "
+    "by a workflow block, or you have clear evidence that continuing is infeasible."
+)
+
+POST_FAILED_TEST_NUDGE = (
+    "STOP — your last test run FAILED. Do NOT respond to the user yet.\n"
+    "1. First, call get_run_results — pass the workflow_run_id from the prior "
+    "update_and_run_blocks or run_blocks_and_collect_debug response to make the "
+    "lookup unambiguous. That returns per-block failure_reason, output, and any "
+    "failed-block screenshots, which is the diagnostic data you need.\n"
+    "2. Then decide: if the failure looks fixable (wrong goal wording, popup "
+    "blocking, timeout, element not found), adjust the workflow with a DIFFERENT "
+    "approach and call update_and_run_blocks again — the tool will rerun from "
+    "the earliest invalidated block so only the changed part is retested.\n"
+    "3. If you have now failed multiple times with genuinely different approaches "
+    "and the evidence strongly suggests the site cannot satisfy the request, "
+    "respond explaining exactly what you tried and what blocked you.\n"
+    "Do NOT resubmit the same workflow — you must change something substantive."
+)
+
+POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE = (
+    "STOP — you explored the page using direct browser tools but did NOT engage "
+    "the workflow path. You MUST follow the WORKFLOW-FIRST EXECUTION PATH:\n"
+    "1. If no workflow exists yet, call update_workflow with at least a navigation "
+    "block for the target URL.\n"
+    "2. If a workflow already exists, call run_blocks_and_collect_debug to test it.\n"
+    "3. Use the test results to decide next steps.\n"
+    "Do NOT make feasibility judgments from browser exploration alone — "
+    "build and test workflow blocks first."
+)
+
+POST_SUSPICIOUS_SUCCESS_NUDGE = (
+    "STOP — your last test run completed (status=completed) but data-producing "
+    "blocks (extraction/text_prompt) produced no meaningful output "
+    "(missing, empty, or all-null fields). This is NOT a success.\n"
+    "1. Call get_run_results to inspect what each block actually returned.\n"
+    "2. If the extraction/text_prompt block returned empty, all-null, or "
+    "irrelevant data, the upstream block likely fetched an error page "
+    "(e.g. 403, CAPTCHA, 'no results'), landed on the wrong page, or the "
+    "data is rendered differently than expected.\n"
+    "3. Use get_browser_screenshot or evaluate to inspect what the workflow "
+    "browser actually sees — do NOT just retry extraction with a different prompt.\n"
+    "4. Fix the root cause — do NOT declare the workflow working based on "
+    "status alone. Verify the actual extracted data answers the user's question."
+)
+
+POST_REPEATED_NULL_DATA_NUDGE = (
+    "STOP — you have now produced multiple consecutive test runs where "
+    "extraction/text_prompt blocks returned all-null or empty data. "
+    "Re-prompting the extractor is not working — the problem is almost "
+    "certainly NOT how the extraction goal is worded.\n"
+    "You MUST now do ONE of the following before another update_workflow call:\n"
+    "1. Call get_browser_screenshot on the workflow's browser session to see "
+    "exactly what page the workflow is actually loading (it may differ from "
+    "what you expect — e.g. a 'no results' fallback, cookie wall, or bot block).\n"
+    "2. Call evaluate with JavaScript that searches for the expected content "
+    "on the workflow's browser — confirm whether the data is even present.\n"
+    "3. If the page the workflow loads genuinely does not contain the data, "
+    "pivot to a different URL or source entirely — do NOT keep retrying "
+    "extraction against the same failing page.\n"
+    "Do NOT call update_and_run_blocks again until you have concrete evidence "
+    "about what the workflow browser is actually seeing."
+)
+
+POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE = (
+    "STOP — this is the second run with the same frontier and the same failure "
+    "signature. Re-running the same change again is unlikely to help.\n"
+    "Before another update_and_run_blocks call, you MUST:\n"
+    "1. Call get_run_results to inspect the full failure evidence (per-block "
+    "failure_reason, action_trace, and any failed-block screenshots).\n"
+    "2. If the evidence is still ambiguous, use get_browser_screenshot or evaluate "
+    "to check what the workflow browser is actually seeing.\n"
+    "3. Then make a materially different change — different block ordering, a "
+    "different selector strategy, a different entry URL, or different parameters. "
+    "Changes to wording of the same prompt do not count as materially different."
+)
+
+POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE = (
+    "STOP — you have now attempted the same frontier with the same failure "
+    "signature THREE times without making progress. Do NOT call "
+    "update_and_run_blocks or run_blocks_and_collect_debug again on this "
+    "frontier.\n"
+    "Choose ONE:\n"
+    "A) Finalize now with a clear blocker explanation that references the "
+    "specific failure_reason and failure_categories you observed.\n"
+    "B) If required user input is missing (credential, ambiguous goal, "
+    "site-specific detail), respond with an ASK_QUESTION instead. Do not "
+    "retry the same repair again."
+)
+
+POST_PARAMETER_BINDING_WARN_NUDGE = (
+    "STOP — your last test run failed with a PARAMETER_BINDING_ERROR. "
+    "This is an INTERNAL workflow configuration mismatch, not a site or "
+    "selector problem.\n"
+    "The workflow definition references a parameter (by Jinja key) that is "
+    "not in the top-level workflow parameters list, or the list declares a "
+    "parameter the blocks do not use.\n"
+    "Do NOT retry with different selectors, URLs, or navigation changes — "
+    "those will not help. Instead:\n"
+    "1. Reconcile the workflow's top-level parameters with what the blocks "
+    "actually reference via {{ parameters.<key> }}.\n"
+    "2. Inline one-off literals rather than adding a parameter for each.\n"
+    "3. Then call update_and_run_blocks again with a corrected YAML and, "
+    "for any remaining parameters, concrete values passed via the "
+    "`parameters` argument."
+)
+
+POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE = (
+    "STOP — the target URL is unreachable and further retries cannot succeed. "
+    "The navigation failed with a permanent error (DNS resolution, SSL/cert, "
+    "or invalid URL). Do NOT retry and do NOT edit the workflow. Reply to the "
+    "user now: state that the URL could not be reached, quote the exact error "
+    "message from the last failure_reason, and ask them to verify the URL."
+)
+
+POST_PARAMETER_BINDING_STOP_NUDGE = (
+    "STOP — you have retried the same PARAMETER_BINDING_ERROR multiple times "
+    "without reconciling the workflow configuration. Do NOT call "
+    "update_and_run_blocks or run_blocks_and_collect_debug again until the "
+    "workflow parameters list matches the block references.\n"
+    "Choose ONE:\n"
+    "A) Finalize now with a blocker explanation that names the specific "
+    "parameter keys that are out of sync.\n"
+    "B) If you need missing values from the user (credential, identifier) "
+    "to decide what belongs in the parameters list, respond with an "
+    "ASK_QUESTION instead. Do not resubmit a workflow that still has the "
+    "same parameter-binding drift."
+)
+
+POST_PER_TOOL_BUDGET_NUDGE = (
+    "STOP — your last update_and_run_blocks call exceeded the per-tool-call "
+    "time budget while still making progress. This is NOT a site failure or "
+    "a wording problem — the chain you submitted is too long to complete in a "
+    "single tool call.\n"
+    "Do NOT retry the same chain. Do NOT change navigation_goal wording or "
+    "selectors hoping it will run faster.\n"
+    "1. Call get_run_results for the budgeted run. If it shows a navigation "
+    "block was canceled or failed, do NOT run that same label again unchanged; "
+    "split or replace it first.\n"
+    "2. Shrink the requested block_labels list to the first 1-2 unverified "
+    "blocks. The verified-prefix optimization will replay any earlier blocks "
+    "from cached state without re-running the browser, so passing a smaller "
+    "frontier is cheap.\n"
+    "3. For page-state work, prefer a code or validation block to verify DOM "
+    "state, active chips, checked controls, field values, or URL deltas. Use a "
+    "navigation block only when missing state must be changed through the UI, "
+    "and keep it to one atomic action.\n"
+    "4. Test the smaller frontier. If it succeeds, extend by one block at a "
+    "time on subsequent calls.\n"
+    "5. If your workflow only has 1-2 blocks and one block is still hitting "
+    "the budget, the single block is too ambitious — either narrow its scope, "
+    "replace it with DOM/state verification plus smaller actions, or reply "
+    "with a blocker explanation."
+)
+
+POST_NO_WORKFLOW_DELIVERY_NUDGE = (
+    "STOP — you are telling the user you created or are showing a workflow, "
+    "but no workflow update tool has succeeded in this turn. The user will see "
+    "an empty proposal. You MUST either call update_and_run_blocks with a real "
+    "workflow and test it, or respond with ASK_QUESTION if required input is "
+    'missing. Do NOT say "Here\'s the workflow" until there is an actual '
+    "workflow proposal behind the response."
+)
+
+PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
+    "STOP — the target site has failed to scrape on every attempt across "
+    "multiple workflow shapes. Every run navigated successfully but the "
+    'scraper could not read the page ("failed to load the website" / '
+    '"page may have navigated unexpectedly"). This pattern indicates the '
+    "site is either blocking automated access, genuinely unresponsive in "
+    "this environment, or rendering content Skyvern cannot read reliably.\n"
+    "Do NOT retry with another workflow variation. Do NOT call "
+    "update_and_run_blocks or run_blocks_and_collect_debug again.\n"
+    "Reply to the user now: state that the site could not be loaded after "
+    "multiple attempts, quote the last failure_reason verbatim, keep the "
+    "message concise, and ask "
+)
+
+POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
+    PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX
+    + "whether to try a different URL, configure a proxy, or provide an alternate entry point."
+)
+
+POST_ANTI_BOT_FAILED_TEST_NUDGE = (
+    "STOP — your last test run failed due to an anti-bot/WAF block "
+    "(Access Denied, Cloudflare, Akamai, etc.).\n"
+    "IMPORTANT: An HTTP_REQUEST or navigation block from the SAME server IP "
+    "will almost certainly receive the same block. Do NOT retry with:\n"
+    "- A simple wait/delay block (timing does not fix IP bans)\n"
+    "- A raw HTTP_REQUEST to the same URL (same IP = same block)\n"
+    "Instead, try:\n"
+    "1. Set proxy_location on the workflow to route through a different IP "
+    "(use `RESIDENTIAL` by default, or a US-state value like `US-CA`/`US-NY`; "
+    "do NOT use bare country codes like `US` — they are not valid "
+    "ProxyLocation members).\n"
+    "2. If you add anti-bot handling blocks, make them conditional on visible "
+    "challenge evidence (for example Cloudflare, Access Denied, CAPTCHA, or "
+    "verify-you-are-human text). Do NOT assume every run starts on a challenge "
+    "page; normal, unblocked runs should proceed directly to the requested task.\n"
+    "3. If still blocked, explain the specific anti-bot evidence observed "
+    "(for example Cloudflare, CAPTCHA, verify-you-are-human text, Access "
+    "Denied, or a blank Just-a-moment page); describe exactly what you tried; "
+    "and ask whether to try a different proxy/location, entry URL, or "
+    "alternate source.\n"
+    "Do NOT resubmit the same workflow with trivial changes."
+)
+
+POST_FORMAT_NUDGE = (
+    "Your reply reads as a progress report, not a completed proposal. "
+    "If you are not ready to finalize, emit ASK_QUESTION with a specific question. "
+    "Otherwise, finish the workflow and present it as a completed proposal."
+)
+
+
+DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
+    "screenshot_dropped": SCREENSHOT_DROPPED_NUDGE,
+    "post_update": POST_UPDATE_NUDGE,
+    "post_navigate": POST_NAVIGATE_NUDGE,
+    "post_intermediate_success": POST_INTERMEDIATE_SUCCESS_NUDGE,
+    "post_failed_test": POST_FAILED_TEST_NUDGE,
+    "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
+    "post_suspicious_success": POST_SUSPICIOUS_SUCCESS_NUDGE,
+    "post_repeated_null_data": POST_REPEATED_NULL_DATA_NUDGE,
+    "post_repeated_frontier_failure_warn": POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
+    "post_repeated_frontier_failure_stop": POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
+    "post_parameter_binding_warn": POST_PARAMETER_BINDING_WARN_NUDGE,
+    "post_non_retriable_nav_error_stop": POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
+    "post_parameter_binding_stop": POST_PARAMETER_BINDING_STOP_NUDGE,
+    "post_per_tool_budget": POST_PER_TOOL_BUDGET_NUDGE,
+    "post_no_workflow_delivery": POST_NO_WORKFLOW_DELIVERY_NUDGE,
+    "post_probable_site_block_stop_prefix": PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX,
+    "post_probable_site_block_stop": POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
+    "post_anti_bot_failed_test": POST_ANTI_BOT_FAILED_TEST_NUDGE,
+    "post_format": POST_FORMAT_NUDGE,
+}
+
+
+def _default_enforcement_nudges() -> dict[str, str]:
+    return dict(DEFAULT_ENFORCEMENT_NUDGES)
+
+
+def _default_fallback_llm_key() -> str | None:
+    return settings.SECONDARY_LLM_KEY
+
+
+@dataclass(slots=True)
+class CopilotConfig:
+    prompt_template: str = DEFAULT_PROMPT_TEMPLATE
+    max_turns: int = DEFAULT_MAX_TURNS
+    token_budget: int = DEFAULT_TOKEN_BUDGET
+    security_rules: str = ""
+    enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
+    fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
+
+    def nudge(self, key: str) -> str:
+        return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

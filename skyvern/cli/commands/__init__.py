@@ -59,7 +59,13 @@ register_lazy_command(
     "quickstart_app",
     "One-command setup and start for Skyvern (combines init and run).",
 )
-register_lazy_command("browser", "skyvern.cli.commands.browser", "browser_app", "Browser automation commands.")
+register_lazy_command(
+    "browser",
+    "skyvern.cli.commands.browser",
+    "browser_app",
+    "Browser automation commands.",
+    install_extra="local",
+)
 register_lazy_command(
     "mcp", "skyvern.cli.mcp_commands", "mcp_app", "Switch local MCP client configs and manage optional saved profiles."
 )

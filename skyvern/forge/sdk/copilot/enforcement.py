@@ -12,6 +12,28 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from agents.run import Runner
 
+from skyvern.forge.sdk.copilot import config as copilot_config_defaults
+from skyvern.forge.sdk.copilot.config import (
+    DEFAULT_ENFORCEMENT_NUDGES,
+    DEFAULT_TOKEN_BUDGET,
+    POST_ANTI_BOT_FAILED_TEST_NUDGE,
+    POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
+    POST_FAILED_TEST_NUDGE,
+    POST_NAVIGATE_NUDGE,
+    POST_NO_WORKFLOW_DELIVERY_NUDGE,
+    POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
+    POST_PARAMETER_BINDING_STOP_NUDGE,
+    POST_PARAMETER_BINDING_WARN_NUDGE,
+    POST_PER_TOOL_BUDGET_NUDGE,
+    POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
+    POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
+    POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
+    POST_REPEATED_NULL_DATA_NUDGE,
+    POST_SUSPICIOUS_SUCCESS_NUDGE,
+    POST_UPDATE_NUDGE,
+    SCREENSHOT_DROPPED_NUDGE,
+    CopilotConfig,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -30,6 +52,9 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
+
+POST_FORMAT_NUDGE = copilot_config_defaults.POST_FORMAT_NUDGE
+POST_INTERMEDIATE_SUCCESS_NUDGE = copilot_config_defaults.POST_INTERMEDIATE_SUCCESS_NUDGE
 
 MAX_POST_UPDATE_NUDGES = 2
 MAX_INTERMEDIATE_NUDGES = 8
@@ -70,12 +95,7 @@ MAX_ITERATIONS = 50
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
-SCREENSHOT_DROPPED_NUDGE = (
-    "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
-    "Do NOT reason about the page from memory. Re-take the screenshot "
-    "(get_browser_screenshot) or call evaluate before deciding your next step."
-)
-TOKEN_BUDGET = 90_000
+TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 # OpenAI detail=high cost per resized image. If we support other providers,
 # pull from model config — this value will silently over/undercount otherwise.
 # See screenshot_utils.resize_screenshot_b64 for the dimension contract this
@@ -92,241 +112,6 @@ _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 # module-level constant so session_factory can import the same string and
 # the two paths stay in sync if the wording ever changes.
 _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX = "\n... [truncated]"
-
-POST_UPDATE_NUDGE = (
-    "You updated the workflow but did not test it. "
-    "You MUST call run_blocks_and_collect_debug (or update_and_run_blocks next time) "
-    "to test at least the first block before responding to the user. "
-    "This verifies the workflow actually works. "
-    "Exception: if the latest user message explicitly asked for an untested draft, "
-    "respond with an unvalidated draft instead of testing."
-)
-
-POST_NAVIGATE_NUDGE = (
-    "You navigated to a page but did not observe its content. "
-    "You MUST use evaluate, get_browser_screenshot, click, type_text, "
-    "scroll, select_option, press_key, or console_messages "
-    "to inspect the page before responding. Do NOT answer from memory."
-)
-
-POST_INTERMEDIATE_SUCCESS_NUDGE = (
-    "STOP — do NOT respond to the user yet. "
-    "Your workflow only covers a subset of what the user asked for. "
-    "You MUST add the next block now: call update_and_run_blocks with the current "
-    "block chain. The tool preserves verified prefix state and reruns only the "
-    "invalidated frontier, so passing the full chain is cheap. "
-    "Only respond to the user when every distinct action they requested is covered "
-    "by a workflow block, or you have clear evidence that continuing is infeasible."
-)
-
-POST_FAILED_TEST_NUDGE = (
-    "STOP — your last test run FAILED. Do NOT respond to the user yet.\n"
-    "1. First, call get_run_results — pass the workflow_run_id from the prior "
-    "update_and_run_blocks or run_blocks_and_collect_debug response to make the "
-    "lookup unambiguous. That returns per-block failure_reason, output, and any "
-    "failed-block screenshots, which is the diagnostic data you need.\n"
-    "2. Then decide: if the failure looks fixable (wrong goal wording, popup "
-    "blocking, timeout, element not found), adjust the workflow with a DIFFERENT "
-    "approach and call update_and_run_blocks again — the tool will rerun from "
-    "the earliest invalidated block so only the changed part is retested.\n"
-    "3. If you have now failed multiple times with genuinely different approaches "
-    "and the evidence strongly suggests the site cannot satisfy the request, "
-    "respond explaining exactly what you tried and what blocked you.\n"
-    "Do NOT resubmit the same workflow — you must change something substantive."
-)
-
-POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE = (
-    "STOP — you explored the page using direct browser tools but did NOT engage "
-    "the workflow path. You MUST follow the WORKFLOW-FIRST EXECUTION PATH:\n"
-    "1. If no workflow exists yet, call update_workflow with at least a navigation "
-    "block for the target URL.\n"
-    "2. If a workflow already exists, call run_blocks_and_collect_debug to test it.\n"
-    "3. Use the test results to decide next steps.\n"
-    "Do NOT make feasibility judgments from browser exploration alone — "
-    "build and test workflow blocks first."
-)
-
-POST_SUSPICIOUS_SUCCESS_NUDGE = (
-    "STOP — your last test run completed (status=completed) but data-producing "
-    "blocks (extraction/text_prompt) produced no meaningful output "
-    "(missing, empty, or all-null fields). This is NOT a success.\n"
-    "1. Call get_run_results to inspect what each block actually returned.\n"
-    "2. If the extraction/text_prompt block returned empty, all-null, or "
-    "irrelevant data, the upstream block likely fetched an error page "
-    "(e.g. 403, CAPTCHA, 'no results'), landed on the wrong page, or the "
-    "data is rendered differently than expected.\n"
-    "3. Use get_browser_screenshot or evaluate to inspect what the workflow "
-    "browser actually sees — do NOT just retry extraction with a different prompt.\n"
-    "4. Fix the root cause — do NOT declare the workflow working based on "
-    "status alone. Verify the actual extracted data answers the user's question."
-)
-
-POST_REPEATED_NULL_DATA_NUDGE = (
-    "STOP — you have now produced multiple consecutive test runs where "
-    "extraction/text_prompt blocks returned all-null or empty data. "
-    "Re-prompting the extractor is not working — the problem is almost "
-    "certainly NOT how the extraction goal is worded.\n"
-    "You MUST now do ONE of the following before another update_workflow call:\n"
-    "1. Call get_browser_screenshot on the workflow's browser session to see "
-    "exactly what page the workflow is actually loading (it may differ from "
-    "what you expect — e.g. a 'no results' fallback, cookie wall, or bot block).\n"
-    "2. Call evaluate with JavaScript that searches for the expected content "
-    "on the workflow's browser — confirm whether the data is even present.\n"
-    "3. If the page the workflow loads genuinely does not contain the data, "
-    "pivot to a different URL or source entirely — do NOT keep retrying "
-    "extraction against the same failing page.\n"
-    "Do NOT call update_and_run_blocks again until you have concrete evidence "
-    "about what the workflow browser is actually seeing."
-)
-
-POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE = (
-    "STOP — this is the second run with the same frontier and the same failure "
-    "signature. Re-running the same change again is unlikely to help.\n"
-    "Before another update_and_run_blocks call, you MUST:\n"
-    "1. Call get_run_results to inspect the full failure evidence (per-block "
-    "failure_reason, action_trace, and any failed-block screenshots).\n"
-    "2. If the evidence is still ambiguous, use get_browser_screenshot or evaluate "
-    "to check what the workflow browser is actually seeing.\n"
-    "3. Then make a materially different change — different block ordering, a "
-    "different selector strategy, a different entry URL, or different parameters. "
-    "Changes to wording of the same prompt do not count as materially different."
-)
-
-POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE = (
-    "STOP — you have now attempted the same frontier with the same failure "
-    "signature THREE times without making progress. Do NOT call "
-    "update_and_run_blocks or run_blocks_and_collect_debug again on this "
-    "frontier.\n"
-    "Choose ONE:\n"
-    "A) Finalize now with a clear blocker explanation that references the "
-    "specific failure_reason and failure_categories you observed.\n"
-    "B) If required user input is missing (credential, ambiguous goal, "
-    "site-specific detail), respond with an ASK_QUESTION instead. Do not "
-    "retry the same repair again."
-)
-
-POST_PARAMETER_BINDING_WARN_NUDGE = (
-    "STOP — your last test run failed with a PARAMETER_BINDING_ERROR. "
-    "This is an INTERNAL workflow configuration mismatch, not a site or "
-    "selector problem.\n"
-    "The workflow definition references a parameter (by Jinja key) that is "
-    "not in the top-level workflow parameters list, or the list declares a "
-    "parameter the blocks do not use.\n"
-    "Do NOT retry with different selectors, URLs, or navigation changes — "
-    "those will not help. Instead:\n"
-    "1. Reconcile the workflow's top-level parameters with what the blocks "
-    "actually reference via {{ parameters.<key> }}.\n"
-    "2. Inline one-off literals rather than adding a parameter for each.\n"
-    "3. Then call update_and_run_blocks again with a corrected YAML and, "
-    "for any remaining parameters, concrete values passed via the "
-    "`parameters` argument."
-)
-
-POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE = (
-    "STOP — the target URL is unreachable and further retries cannot succeed. "
-    "The navigation failed with a permanent error (DNS resolution, SSL/cert, "
-    "or invalid URL). Do NOT retry and do NOT edit the workflow. Reply to the "
-    "user now: state that the URL could not be reached, quote the exact error "
-    "message from the last failure_reason, and ask them to verify the URL."
-)
-
-POST_PARAMETER_BINDING_STOP_NUDGE = (
-    "STOP — you have retried the same PARAMETER_BINDING_ERROR multiple times "
-    "without reconciling the workflow configuration. Do NOT call "
-    "update_and_run_blocks or run_blocks_and_collect_debug again until the "
-    "workflow parameters list matches the block references.\n"
-    "Choose ONE:\n"
-    "A) Finalize now with a blocker explanation that names the specific "
-    "parameter keys that are out of sync.\n"
-    "B) If you need missing values from the user (credential, identifier) "
-    "to decide what belongs in the parameters list, respond with an "
-    "ASK_QUESTION instead. Do not resubmit a workflow that still has the "
-    "same parameter-binding drift."
-)
-
-POST_PER_TOOL_BUDGET_NUDGE = (
-    "STOP — your last update_and_run_blocks call exceeded the per-tool-call "
-    "time budget while still making progress. This is NOT a site failure or "
-    "a wording problem — the chain you submitted is too long to complete in a "
-    "single tool call.\n"
-    "Do NOT retry the same chain. Do NOT change navigation_goal wording or "
-    "selectors hoping it will run faster.\n"
-    "1. Call get_run_results for the budgeted run. If it shows a navigation "
-    "block was canceled or failed, do NOT run that same label again unchanged; "
-    "split or replace it first.\n"
-    "2. Shrink the requested block_labels list to the first 1-2 unverified "
-    "blocks. The verified-prefix optimization will replay any earlier blocks "
-    "from cached state without re-running the browser, so passing a smaller "
-    "frontier is cheap.\n"
-    "3. For page-state work, prefer a code or validation block to verify DOM "
-    "state, active chips, checked controls, field values, or URL deltas. Use a "
-    "navigation block only when missing state must be changed through the UI, "
-    "and keep it to one atomic action.\n"
-    "4. Test the smaller frontier. If it succeeds, extend by one block at a "
-    "time on subsequent calls.\n"
-    "5. If your workflow only has 1-2 blocks and one block is still hitting "
-    "the budget, the single block is too ambitious — either narrow its scope, "
-    "replace it with DOM/state verification plus smaller actions, or reply "
-    "with a blocker explanation."
-)
-
-POST_NO_WORKFLOW_DELIVERY_NUDGE = (
-    "STOP — you are telling the user you created or are showing a workflow, "
-    "but no workflow update tool has succeeded in this turn. The user will see "
-    "an empty proposal. You MUST either call update_and_run_blocks with a real "
-    "workflow and test it, or respond with ASK_QUESTION if required input is "
-    'missing. Do NOT say "Here\'s the workflow" until there is an actual '
-    "workflow proposal behind the response."
-)
-
-_PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
-    "STOP — the target site has failed to scrape on every attempt across "
-    "multiple workflow shapes. Every run navigated successfully but the "
-    'scraper could not read the page ("failed to load the website" / '
-    '"page may have navigated unexpectedly"). This pattern indicates the '
-    "site is either blocking automated access, genuinely unresponsive in "
-    "this environment, or rendering content Skyvern cannot read reliably.\n"
-    "Do NOT retry with another workflow variation. Do NOT call "
-    "update_and_run_blocks or run_blocks_and_collect_debug again.\n"
-    "Reply to the user now: state that the site could not be loaded after "
-    "multiple attempts, quote the last failure_reason verbatim, keep the "
-    "message concise, and ask "
-)
-
-POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
-    _PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX
-    + "whether to try a different URL, configure a proxy, or provide an alternate entry point."
-)
-
-POST_ANTI_BOT_FAILED_TEST_NUDGE = (
-    "STOP — your last test run failed due to an anti-bot/WAF block "
-    "(Access Denied, Cloudflare, Akamai, etc.).\n"
-    "IMPORTANT: An HTTP_REQUEST or navigation block from the SAME server IP "
-    "will almost certainly receive the same block. Do NOT retry with:\n"
-    "- A simple wait/delay block (timing does not fix IP bans)\n"
-    "- A raw HTTP_REQUEST to the same URL (same IP = same block)\n"
-    "Instead, try:\n"
-    "1. Set proxy_location on the workflow to route through a different IP "
-    "(use `RESIDENTIAL` by default, or a US-state value like `US-CA`/`US-NY`; "
-    "do NOT use bare country codes like `US` — they are not valid "
-    "ProxyLocation members).\n"
-    "2. If you add anti-bot handling blocks, make them conditional on visible "
-    "challenge evidence (for example Cloudflare, Access Denied, CAPTCHA, or "
-    "verify-you-are-human text). Do NOT assume every run starts on a challenge "
-    "page; normal, unblocked runs should proceed directly to the requested task.\n"
-    "3. If still blocked, explain the specific anti-bot evidence observed "
-    "(for example Cloudflare, CAPTCHA, verify-you-are-human text, Access "
-    "Denied, or a blank Just-a-moment page); describe exactly what you tried; "
-    "and ask whether to try a different proxy/location, entry URL, or "
-    "alternate source.\n"
-    "Do NOT resubmit the same workflow with trivial changes."
-)
-
-POST_FORMAT_NUDGE = (
-    "Your reply reads as a progress report, not a completed proposal. "
-    "If you are not ready to finalize, emit ASK_QUESTION with a specific question. "
-    "Otherwise, finish the workflow and present it as a completed proposal."
-)
 
 # A REPLY matching any of these is almost certainly the agent leaking internal
 # iteration state instead of finalizing or asking a specific question.
@@ -389,8 +174,8 @@ def _probable_site_block_proxy_options(ctx: Any, *, include_whether: bool = True
     return f"whether to {options}" if include_whether else options
 
 
-def _probable_site_block_stop_nudge(ctx: Any) -> str:
-    return _PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX + _probable_site_block_proxy_options(ctx)
+def _probable_site_block_stop_nudge(ctx: Any, config: CopilotConfig | None = None) -> str:
+    return _nudge(config, "post_probable_site_block_stop_prefix") + _probable_site_block_proxy_options(ctx)
 
 
 def _single_line_failure_reason(ctx: Any) -> str:
@@ -477,6 +262,12 @@ _ACTION_CATEGORIES: list[list[str]] = [
 _SEQUENTIAL_CONNECTORS = [" and then ", " then ", " after that ", " next ", " followed by ", " afterward "]
 
 
+def _nudge(config: CopilotConfig | None, key: str) -> str:
+    if config is None:
+        return DEFAULT_ENFORCEMENT_NUDGES[key]
+    return config.nudge(key)
+
+
 def _goal_likely_needs_more_blocks(user_message: Any, block_count: int) -> bool:
     """Return True when the goal likely requires more blocks than currently exist."""
     if block_count >= MIN_BLOCKS_FOR_AUTO_COMPLETE:
@@ -492,7 +283,7 @@ def _goal_likely_needs_more_blocks(user_message: Any, block_count: int) -> bool:
     return block_count < estimated_min_blocks
 
 
-def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any]) -> str | None:
+def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotConfig | None = None) -> str | None:
     """Peek at the model's final output and return a nudge for coverage gaps
     or progress-narration format. ASK_QUESTION is always let through so the
     agent can request missing credentials or disambiguation.
@@ -511,7 +302,7 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any]) -> str | None:
         nudge_count = getattr(ctx, "no_workflow_nudge_count", 0)
         if nudge_count < MAX_NO_WORKFLOW_NUDGES:
             ctx.no_workflow_nudge_count = nudge_count + 1
-            return POST_NO_WORKFLOW_DELIVERY_NUDGE
+            return _nudge(config, "post_no_workflow_delivery")
 
     workflow_tested_ok = (
         getattr(ctx, "last_test_ok", None) is True
@@ -527,13 +318,13 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any]) -> str | None:
             nudge_count = getattr(ctx, "coverage_nudge_count", 0)
             if nudge_count < MAX_INTERMEDIATE_NUDGES:
                 ctx.coverage_nudge_count = nudge_count + 1
-                return POST_INTERMEDIATE_SUCCESS_NUDGE
+                return _nudge(config, "post_intermediate_success")
 
     if _is_progress_narration(parsed.get("user_response")):
         nudge_count = getattr(ctx, "format_nudge_count", 0)
         if nudge_count < MAX_FORMAT_NUDGES:
             ctx.format_nudge_count = nudge_count + 1
-            return POST_FORMAT_NUDGE
+            return _nudge(config, "post_format")
 
     return None
 
@@ -639,7 +430,7 @@ def _get_int(ctx: Any, name: str, default: int = 0) -> int:
     return value if isinstance(value, int) else default
 
 
-def _repeated_frontier_failure_nudge(ctx: Any) -> str | None:
+def _repeated_frontier_failure_nudge(ctx: Any, config: CopilotConfig | None = None) -> str | None:
     """Emit each escalation level at most once per streak. The streak itself
     keeps climbing on further identical failures (incremented elsewhere by
     update_repeated_failure_state), so the stop nudge fires naturally on the
@@ -659,16 +450,26 @@ def _repeated_frontier_failure_nudge(ctx: Any) -> str | None:
     is_param_binding = top_category == "PARAMETER_BINDING_ERROR"
 
     if streak >= REPEATED_FRONTIER_STREAK_STOP_AT and emitted < REPEATED_FRONTIER_STREAK_STOP_AT:
-        return POST_PARAMETER_BINDING_STOP_NUDGE if is_param_binding else POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
+        return _nudge(
+            config,
+            "post_parameter_binding_stop" if is_param_binding else "post_repeated_frontier_failure_stop",
+        )
     if streak >= REPEATED_FRONTIER_STREAK_ESCALATE_AT and emitted < REPEATED_FRONTIER_STREAK_ESCALATE_AT:
-        return POST_PARAMETER_BINDING_WARN_NUDGE if is_param_binding else POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE
+        return _nudge(
+            config,
+            "post_parameter_binding_warn" if is_param_binding else "post_repeated_frontier_failure_warn",
+        )
     return None
 
 
-_STOP_LEVEL_FRONTIER_NUDGES = frozenset({POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE, POST_PARAMETER_BINDING_STOP_NUDGE})
+def _is_stop_level_frontier_nudge(nudge: str, config: CopilotConfig | None = None) -> bool:
+    return nudge in {
+        _nudge(config, "post_repeated_frontier_failure_stop"),
+        _nudge(config, "post_parameter_binding_stop"),
+    }
 
 
-def _non_retriable_nav_error_nudge(ctx: Any) -> tuple[str, str] | None:
+def _non_retriable_nav_error_nudge(ctx: Any, config: CopilotConfig | None = None) -> tuple[str, str] | None:
     """Emit POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE at most once per distinct
     non-retriable nav-error signature. Returns ``(nudge, signature)`` when it
     should fire, ``None`` otherwise. Signature normalization is shared with
@@ -681,15 +482,19 @@ def _non_retriable_nav_error_nudge(ctx: Any) -> tuple[str, str] | None:
     last_emitted = getattr(ctx, "non_retriable_nav_error_last_emitted_signature", None)
     if signature == last_emitted:
         return None
-    return POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE, signature
+    return _nudge(config, "post_non_retriable_nav_error_stop"), signature
 
 
-def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> str | None:
+def _check_enforcement(
+    ctx: Any,
+    result: RunResultStreaming | None = None,
+    config: CopilotConfig | None = None,
+) -> str | None:
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
     # workflow against the same bad URL, so let it speak first.
-    non_retriable = _non_retriable_nav_error_nudge(ctx)
+    non_retriable = _non_retriable_nav_error_nudge(ctx, config)
     if non_retriable is not None:
         nudge_msg, signature = non_retriable
         ctx.non_retriable_nav_error_last_emitted_signature = signature
@@ -697,32 +502,32 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
 
     if ctx.navigate_called and not ctx.observation_after_navigate and not ctx.navigate_enforcement_done:
         ctx.navigate_enforcement_done = True
-        return POST_NAVIGATE_NUDGE
+        return _nudge(config, "post_navigate")
 
     if _needs_explore_without_workflow_nudge(ctx):
         ctx.explore_without_workflow_nudge_count += 1
-        return POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
+        return _nudge(config, "post_explore_without_workflow")
 
     if (
         ctx.update_workflow_called
         and not ctx.test_after_update_done
         and getattr(ctx, "allow_untested_workflow_draft", False) is not True
     ):
-        return POST_UPDATE_NUDGE
+        return _nudge(config, "post_update")
 
     # A budget-trip is a structural problem (chain too long), not a
     # workflow-shape problem — emit the targeted "split the chain" advice
     # before the generic repeated-frontier and failed-test paths can fire.
     if _needs_per_tool_budget_nudge(ctx):
         ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
-        return POST_PER_TOOL_BUDGET_NUDGE
+        return _nudge(config, "post_per_tool_budget")
 
-    repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx)
+    repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx, config)
     if repeated_frontier_nudge is not None:
         # Latch the emitted level so each escalation fires at most once per streak.
         ctx.repeated_failure_nudge_emitted_at_streak = (
             REPEATED_FRONTIER_STREAK_STOP_AT
-            if repeated_frontier_nudge in _STOP_LEVEL_FRONTIER_NUDGES
+            if _is_stop_level_frontier_nudge(repeated_frontier_nudge, config)
             else REPEATED_FRONTIER_STREAK_ESCALATE_AT
         )
         return repeated_frontier_nudge
@@ -731,31 +536,31 @@ def _check_enforcement(ctx: Any, result: RunResultStreaming | None = None) -> st
     # resets it on every new run; if the agent ignores the nudge and answers
     # without rerunning, we want _check_enforcement to re-emit the nudge.
     if _needs_repeated_null_data_nudge(ctx):
-        return POST_REPEATED_NULL_DATA_NUDGE
+        return _nudge(config, "post_repeated_null_data")
 
     if _needs_suspicious_success_nudge(ctx):
         ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
-        return POST_SUSPICIOUS_SUCCESS_NUDGE
+        return _nudge(config, "post_suspicious_success")
 
     # Checked before the generic failed-test nudge so a scrape-wall streak
     # emits the specific STOP text and does not also consume a
     # failed_test_nudge_count slot.
     if _needs_probable_site_block_stop_nudge(ctx):
         ctx.probable_site_block_stop_nudge_count = getattr(ctx, "probable_site_block_stop_nudge_count", 0) + 1
-        return _probable_site_block_stop_nudge(ctx)
+        return _probable_site_block_stop_nudge(ctx, config)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
         if getattr(ctx, "last_test_anti_bot", None):
-            return POST_ANTI_BOT_FAILED_TEST_NUDGE
-        return POST_FAILED_TEST_NUDGE
+            return _nudge(config, "post_anti_bot_failed_test")
+        return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
     # (always allowed) from a REPLY with a coverage gap or progress-narration.
     # Only runs when no state-based nudge fired.
     if result is not None:
         parsed = parse_final_response(extract_final_text(result))
-        return _response_coverage_nudge(ctx, parsed)
+        return _response_coverage_nudge(ctx, parsed, config)
 
     return None
 
@@ -1051,9 +856,36 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
 }
 
 
-def _nudge_type_for_log(nudge: str) -> str:
-    if nudge.startswith(_PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX):
+_NUDGE_TYPE_BY_KEY: dict[str, str] = {
+    "post_update": "post_update",
+    "post_navigate": "post_navigate",
+    "post_explore_without_workflow": "explore_without_workflow",
+    "post_suspicious_success": "suspicious_success",
+    "post_repeated_null_data": "repeated_null_data",
+    "post_repeated_frontier_failure_warn": "repeated_frontier_failure_warn",
+    "post_repeated_frontier_failure_stop": "repeated_frontier_failure_stop",
+    "post_non_retriable_nav_error_stop": "non_retriable_nav_error_stop",
+    "post_parameter_binding_warn": "parameter_binding_warn",
+    "post_parameter_binding_stop": "parameter_binding_stop",
+    "post_anti_bot_failed_test": "anti_bot_block",
+    "post_probable_site_block_stop": "probable_site_block_stop",
+    "post_probable_site_block_stop_prefix": "probable_site_block_stop",
+    "post_per_tool_budget": "per_tool_budget_split",
+    "post_no_workflow_delivery": "no_workflow_delivery",
+    "post_failed_test": "post_failed_test",
+    "screenshot_dropped": "screenshot_dropped_on_recovery",
+    "post_intermediate_success": "intermediate_success",
+    "post_format": "format",
+}
+
+
+def _nudge_type_for_log(nudge: str, config: CopilotConfig | None = None) -> str:
+    nudge_by_key = config.enforcement_nudges if config is not None else DEFAULT_ENFORCEMENT_NUDGES
+    if nudge.startswith(nudge_by_key["post_probable_site_block_stop_prefix"]):
         return "probable_site_block_stop"
+    for key, value in nudge_by_key.items():
+        if value == nudge:
+            return _NUDGE_TYPE_BY_KEY.get(key, key)
     return _NUDGE_TYPE_BY_MESSAGE.get(nudge, "intermediate_success")
 
 
@@ -1224,6 +1056,7 @@ async def run_with_enforcement(
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
     session = runner_kwargs.pop("session", None)
+    copilot_config = runner_kwargs.pop("copilot_config", None) or CopilotConfig()
     current_input: str | list = initial_input
     start_time = time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
@@ -1250,8 +1083,12 @@ async def run_with_enforcement(
         if isinstance(current_input, list):
             est = estimate_tokens(current_input)
             LOG.info("Token estimate before model call", tokens=est, iteration=iteration)
-            if est > TOKEN_BUDGET:
-                LOG.warning("Token estimate exceeds budget, aggressively pruning", tokens=est, budget=TOKEN_BUDGET)
+            if est > copilot_config.token_budget:
+                LOG.warning(
+                    "Token estimate exceeds budget, aggressively pruning",
+                    tokens=est,
+                    budget=copilot_config.token_budget,
+                )
                 current_input = aggressive_prune(current_input)
 
         tracked_stream = _SendTrackingStream(stream)
@@ -1300,7 +1137,7 @@ async def run_with_enforcement(
                 if images_stripped:
                     # The agent could otherwise reason about the page from
                     # memory on the next turn; warn it explicitly.
-                    pending_recovery_nudge = SCREENSHOT_DROPPED_NUDGE
+                    pending_recovery_nudge = _nudge(copilot_config, "screenshot_dropped")
                 tracked_stream = _SendTrackingStream(stream)
                 try:
                     result = await _run_streamed_with_deadline(
@@ -1336,13 +1173,13 @@ async def run_with_enforcement(
             nudge: str | None = pending_recovery_nudge
             pending_recovery_nudge = None
         else:
-            nudge = _check_enforcement(ctx, result)
+            nudge = _check_enforcement(ctx, result, copilot_config)
         if nudge is None:
             _consume_pending_screenshots(ctx)
             _maybe_raise_non_retriable_nav(ctx)
             return result
 
-        if nudge == POST_UPDATE_NUDGE:
+        if nudge == _nudge(copilot_config, "post_update"):
             if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:
                 LOG.warning(
                     "Enforcement exhausted post-update nudges, allowing response",
@@ -1353,7 +1190,7 @@ async def run_with_enforcement(
                 return result
             ctx.post_update_nudge_count += 1
 
-        nudge_type = _nudge_type_for_log(nudge)
+        nudge_type = _nudge_type_for_log(nudge, copilot_config)
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
         # OpenAI rejects images in tool messages, so a queued post-run

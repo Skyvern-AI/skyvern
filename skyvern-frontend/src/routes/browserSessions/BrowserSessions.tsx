@@ -444,9 +444,7 @@ function BrowserSessions() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="default">
-                        Default (Microsoft Edge)
-                      </SelectItem>
+                      <SelectItem value="default">Default</SelectItem>
                       {BROWSER_TYPE_OPTIONS.map((browserType) => (
                         <SelectItem
                           key={browserType.value}

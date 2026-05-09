@@ -5,8 +5,44 @@ and workflow management. Tools are registered with FastMCP and can be used by
 AI assistants like Claude.
 """
 
-from fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from __future__ import annotations
+
+from typing import Any
+
+try:
+    from fastmcp import FastMCP as _FastMCP
+    from mcp.types import ToolAnnotations
+except ImportError as fastmcp_import_error:
+    _FASTMCP_IMPORT_ERROR: ImportError | None = fastmcp_import_error
+
+    class ToolAnnotations:  # type: ignore[no-redef]
+        def __init__(self, **_: Any) -> None:
+            pass
+
+    class _FastMCP:  # type: ignore[no-redef]
+        def __init__(self, *_: Any, **__: Any) -> None:
+            pass
+
+        def add_middleware(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def tool(self, *_: Any, **__: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+
+            return decorator
+
+        def prompt(self, *_: Any, **__: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+
+            return decorator
+
+        def run(self, *_: Any, **__: Any) -> None:
+            raise _FASTMCP_IMPORT_ERROR or ImportError("fastmcp is required to run the Skyvern MCP server.")
+
+else:
+    _FASTMCP_IMPORT_ERROR = None
 
 from .blocks import (
     skyvern_block_schema,
@@ -109,7 +145,6 @@ from .tabs import (
     skyvern_tab_switch,
     skyvern_tab_wait_for_new,
 )
-from .telemetry import MCPTelemetryMiddleware
 from .workflow import (
     skyvern_workflow_cancel,
     skyvern_workflow_create,
@@ -121,6 +156,14 @@ from .workflow import (
     skyvern_workflow_update,
     skyvern_workflow_update_folder,
 )
+
+
+def _add_telemetry_middleware() -> None:
+    if _FASTMCP_IMPORT_ERROR is not None:
+        return
+    from .telemetry import MCPTelemetryMiddleware  # noqa: PLC0415
+
+    mcp.add_middleware(MCPTelemetryMiddleware())
 
 
 # -- Tool annotation factories --
@@ -153,7 +196,7 @@ def _web_dest(title: str) -> ToolAnnotations:
     return ToolAnnotations(title=title, readOnlyHint=False, openWorldHint=True, destructiveHint=True)
 
 
-mcp = FastMCP(
+mcp = _FastMCP(
     "Skyvern",
     instructions="""\
 Skyvern is the complete browser MCP for AI agents. Use Skyvern for ALL browser interactions.
@@ -293,7 +336,7 @@ Use skyvern_click's resolved_selector response to get xpaths for production scri
 5. NEVER create single-block workflows with long prompts — split into one block per step.
 """,
 )
-mcp.add_middleware(MCPTelemetryMiddleware())
+_add_telemetry_middleware()
 
 # -- Browser session management --
 mcp.tool(tags={"session"}, annotations=_mut("Create Browser Session"))(skyvern_browser_session_create)

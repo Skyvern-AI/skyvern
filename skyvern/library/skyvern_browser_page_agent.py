@@ -4,9 +4,9 @@ from typing import Any, Literal, overload
 
 import structlog
 
-from skyvern.exceptions import require_server_extra_modules
+from skyvern.exceptions import require_local_extra_modules
 
-require_server_extra_modules("skyvern.library.skyvern_browser_page_agent")
+require_local_extra_modules("skyvern.library.skyvern_browser_page_agent")
 
 from playwright.async_api import Page  # noqa: E402
 
