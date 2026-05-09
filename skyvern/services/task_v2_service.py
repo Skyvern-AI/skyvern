@@ -26,7 +26,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
@@ -261,6 +261,7 @@ async def initialize_task_v2(
     extra_http_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
     run_with: str | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
@@ -313,6 +314,7 @@ async def initialize_task_v2(
             version=None,
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
+            trigger_type=trigger_type,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
@@ -484,6 +486,9 @@ async def run_task_v2(
     workflow, workflow_run = None, None
     parent_context = skyvern_context.current()
     current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
+    # Carry trigger_type + use_flex_llm_routing forward from the parent context (set in
+    # scripts/run_task_v2.py at worker boot) so flex routing eligibility persists into the
+    # scoped TaskV2 execution context.
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
@@ -493,6 +498,8 @@ async def run_task_v2(
         request_id=request_id,
         browser_session_id=browser_session_id,
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
+        trigger_type=parent_context.trigger_type if parent_context else None,
+        use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to

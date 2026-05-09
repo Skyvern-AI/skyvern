@@ -6,6 +6,7 @@ from fastapi import BackgroundTasks, Request
 from skyvern.exceptions import OutputParameterNotFound, WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -44,6 +45,7 @@ async def ensure_workflow_run(
     workflow_permanent_id: str,
     block_run_request: BlockRunRequest,
     x_max_steps_override: int | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
 ) -> WorkflowRun:
     context = skyvern_context.ensure_context()
 
@@ -69,6 +71,7 @@ async def ensure_workflow_run(
         request_id=context.request_id,
         debug_session_id=block_run_request.debug_session_id,
         code_gen=block_run_request.code_gen,
+        trigger_type=trigger_type,
     )
 
     return workflow_run

@@ -13,6 +13,8 @@ from skyvern.config import settings
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
 
+    from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+
 LOG = structlog.get_logger()
 
 # Cap on entries kept in `recent_dialog_messages` so a chatty page (e.g. validation
@@ -71,6 +73,15 @@ class SkyvernContext:
     prompt_caching_settings: dict[str, bool] | None = None
     enable_speed_optimizations: bool = False
     use_artifact_bundling: bool = False
+
+    # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
+    # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
+    # without taking a dependency on the public-API request shape.
+    trigger_type: WorkflowRunTriggerType | None = None
+    # When true, downstream LLM handler selection may swap the resolved handler to a
+    # flex-tier router. Cloud sets this at run boot via a PostHog flag for non-UI runs;
+    # OSS keeps it False because OSS has no flex routers registered.
+    use_flex_llm_routing: bool = False
 
     # script run context
     code_version: int | None = None

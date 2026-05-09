@@ -884,6 +884,7 @@ class WorkflowService:
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
+                    trigger_type=trigger_type,
                 )
             )
 
@@ -906,6 +907,17 @@ class WorkflowService:
                 except Exception:
                     LOG.warning("Failed to check USE_ARTIFACT_BUNDLING flag for workflow", exc_info=True)
                     new_context.use_artifact_bundling = False
+
+                # Resolve flex routing eligibility once per run boot. Site B
+                # (scripts/run_workflow.py) re-resolves in the Temporal worker — both go
+                # through the same AgentFunction hook so the cloud side is the single
+                # owner of the flag name and property shape.
+                new_context.use_flex_llm_routing = await app.AGENT_FUNCTION.should_use_flex_llm_routing(
+                    trigger_type=trigger_type,
+                    organization_id=organization.organization_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)

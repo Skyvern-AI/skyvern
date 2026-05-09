@@ -37,7 +37,7 @@ from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
@@ -568,6 +568,7 @@ async def test_login(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=current_org,
             max_steps_override=None,
+            trigger_type=WorkflowRunTriggerType.api,
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -759,6 +760,7 @@ async def test_credential(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=current_org,
             max_steps_override=None,
+            trigger_type=WorkflowRunTriggerType.api,
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
