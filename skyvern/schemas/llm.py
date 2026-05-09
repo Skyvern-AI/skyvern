@@ -126,7 +126,7 @@ class LLMRouterConfig(LLMConfigBase):
     redis_host: str | None = None
     redis_port: int | None = None
     redis_password: str | None = None
-    fallback_model_group: str | None = None
+    fallback_model_group: str | list[str] | None = None
     routing_strategy: Literal[
         "simple-shuffle",
         "least-busy",

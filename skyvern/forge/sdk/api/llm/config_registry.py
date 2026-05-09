@@ -18,6 +18,11 @@ class LLMConfigRegistry:
     def is_router_config(llm_key: str) -> bool:
         return isinstance(LLMConfigRegistry.get_config(llm_key), LLMRouterConfig)
 
+    @classmethod
+    def is_registered(cls, llm_key: str) -> bool:
+        """True if `llm_key` has been explicitly registered (no synthesis fallbacks)."""
+        return llm_key in cls._configs
+
     @staticmethod
     def validate_config(llm_key: str, config: LLMRouterConfig | LLMConfig) -> None:
         missing_env_vars = config.get_missing_env_vars()
