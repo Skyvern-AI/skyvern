@@ -16,6 +16,7 @@ COPILOT_RESPONSE_TYPES: tuple[str, ...] = get_args(ResponseType)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
+    from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
 
 class UrlVisit(BaseModel):
@@ -165,6 +166,7 @@ class CopilotContext(AgentContext):
     user_message: str = ""
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False
+    request_policy: RequestPolicy | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)

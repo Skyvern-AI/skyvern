@@ -42,6 +42,10 @@ Overall goal (long-term memory):
 No previous context available.
 {% endif %}
 
+{% if request_policy_summary is defined and request_policy_summary %}
+REQUEST POLICY: {{ request_policy_summary }}
+Follow this policy. If `allow_run_blocks` is false, do not call block-running tools. If `resolved_credentials` are present, use those `credential_id` values.
+{% endif %}
 DEBUGGER RUN INFORMATION:
 
 {% if debug_run_info %}

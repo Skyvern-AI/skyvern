@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 import structlog
 import yaml
+from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from pydantic import ValidationError
 
 from skyvern.forge import app
@@ -33,6 +34,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     parse_final_response,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy, redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -62,6 +64,13 @@ _UNTESTED_DRAFT_REQUEST_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+def _resolve_request_policy_handler(fallback_handler: Any) -> Any:
+    with contextlib.suppress(RuntimeError, AttributeError):
+        return app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER or fallback_handler
+    return fallback_handler
+
 
 _BLOCK_GOAL_CONTEXT_PREAMBLE = (
     "Interpret the latest user message in the context of the prior conversation. If it is a correction, "
@@ -191,6 +200,7 @@ def _build_user_context(
     global_llm_context: str,
     debug_run_info_text: str,
     user_message: str,
+    request_policy_summary: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -202,14 +212,16 @@ def _build_user_context(
     copilot path in ``workflow_copilot.py`` and ``feasibility_gate.py``
     both apply the same guard.
     """
+    workflow_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
     return prompt_engine.load_prompt(
         template="workflow-copilot-user",
-        workflow_yaml=escape_code_fences(workflow_yaml or ""),
+        workflow_yaml=escape_code_fences(workflow_yaml),
         workflow_summary=escape_code_fences(_build_workflow_summary(workflow_yaml)),
-        chat_history=escape_code_fences(chat_history_text),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
-        debug_run_info=escape_code_fences(debug_run_info_text),
-        user_message=escape_code_fences(user_message),
+        chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history_text)),
+        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)),
+        debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
+        request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
+        user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
     )
 
 
@@ -898,6 +910,25 @@ def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None
     return fallback_key
 
 
+def _build_request_policy_clarification_result(
+    policy: RequestPolicy,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult:
+    structured = StructuredContext.from_json_str(prior_global_llm_context)
+    structured.decisions_made.append(f"request-policy clarification required: {policy.credential_input_kind}")
+    return AgentResult(
+        user_response=policy.clarification_question
+        or "I need one more detail before I can build and test this workflow safely.",
+        updated_workflow=None,
+        global_llm_context=structured.to_json_str(),
+        response_type="ASK_QUESTION",
+        workflow_yaml=prior_workflow_yaml or None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+    )
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -911,32 +942,52 @@ async def run_copilot_agent(
     config: CopilotConfig | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
-    allow_untested_workflow_draft = _user_requests_untested_workflow_draft(chat_request.message)
-    credential_validation_result = await _credential_validation_result_for_user_message(
+    chat_history_text = _format_chat_history(chat_history)
+    safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
+    safe_workflow_yaml = redact_raw_secrets_for_prompt(chat_request.workflow_yaml or "")
+    safe_global_llm_context = redact_raw_secrets_for_prompt(global_llm_context or "")
+    request_policy = await build_request_policy(
         user_message=chat_request.message,
+        workflow_yaml=safe_workflow_yaml,
+        chat_history=safe_chat_history_text,
+        global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
-        global_llm_context=global_llm_context,
-        allow_untested_workflow_draft=allow_untested_workflow_draft,
+        handler=_resolve_request_policy_handler(llm_api_handler),
     )
-    if credential_validation_result is not None:
-        return credential_validation_result
+    if request_policy.user_response_policy == "ask_clarification":
+        return _build_request_policy_clarification_result(
+            request_policy,
+            prior_global_llm_context=global_llm_context,
+            prior_workflow_yaml=chat_request.workflow_yaml,
+        )
+
+    allow_untested_workflow_draft = request_policy.testing_intent == "skip_test"
+    agent_user_message = chat_request.message
+    if allow_untested_workflow_draft and len(agent_user_message) < 160:
+        previous_user_messages = [msg.content for msg in chat_history if msg.sender == "user"]
+        if previous_user_messages:
+            agent_user_message = (
+                f"{agent_user_message}\n\nDraft the workflow requested earlier:\n"
+                f"{redact_raw_secrets_for_prompt(previous_user_messages[-1])}"
+            )
+            safe_chat_history_text = ""
 
     # Preflight feasibility classifier — fires on every turn so mid-session pivots
     # to impossible targets are caught the same as first-turn structural mismatches.
     from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
 
     feasibility_verdict = await run_feasibility_gate(
-        user_message=chat_request.message,
-        workflow_yaml=chat_request.workflow_yaml or "",
-        chat_history=_format_chat_history(chat_history),
-        global_llm_context=global_llm_context or "",
+        user_message=agent_user_message,
+        workflow_yaml=safe_workflow_yaml,
+        chat_history=safe_chat_history_text,
+        global_llm_context=safe_global_llm_context,
         handler=llm_api_handler,
     )
     if feasibility_verdict.verdict == "ask_clarification" and feasibility_verdict.question:
         return _build_feasibility_clarification_result(
             question=feasibility_verdict.question,
             rationale=feasibility_verdict.rationale,
-            user_message=chat_request.message,
+            user_message=agent_user_message,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
         )
@@ -980,7 +1031,6 @@ async def run_copilot_agent(
     )
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
-    chat_history_text = _format_chat_history(chat_history)
 
     ctx = CopilotContext(
         organization_id=organization_id,
@@ -990,12 +1040,13 @@ async def run_copilot_agent(
         browser_session_id=validated_browser_session_id,
         stream=stream,
         api_key=api_key,
-        user_message=chat_request.message,
+        user_message=agent_user_message,
         allow_untested_workflow_draft=allow_untested_workflow_draft,
+        request_policy=request_policy,
         block_goal_main_goal=_build_block_goal_main_goal(
-            user_message=chat_request.message,
-            chat_history_text=chat_history_text,
-            global_llm_context=global_llm_context,
+            user_message=agent_user_message,
+            chat_history_text=safe_chat_history_text,
+            global_llm_context=safe_global_llm_context,
         ),
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
     )
@@ -1020,11 +1071,12 @@ async def run_copilot_agent(
     )
 
     user_message = _build_user_context(
-        workflow_yaml=chat_request.workflow_yaml or "",
-        chat_history_text=chat_history_text,
-        global_llm_context=global_llm_context or "",
-        debug_run_info_text=debug_run_info_text,
-        user_message=chat_request.message,
+        workflow_yaml=safe_workflow_yaml,
+        chat_history_text=safe_chat_history_text,
+        global_llm_context=safe_global_llm_context,
+        debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
+        user_message=agent_user_message,
+        request_policy_summary=request_policy.prompt_summary(),
     )
 
     LOG.info(
@@ -1044,6 +1096,7 @@ async def run_copilot_agent(
                 "organization_id": organization_id,
                 "llm_key": llm_key,
                 "user_message_len": str(len(user_message)),
+                **{f"request_policy_{key}": str(value) for key, value in request_policy.to_trace_data().items()},
             },
         )
 
@@ -1073,17 +1126,30 @@ async def run_copilot_agent(
         try:
             async with MCPServerManager([mcp_server]) as manager:
                 agent.mcp_servers = list(manager.active_servers)
-                result = await run_with_enforcement(
-                    agent=agent,
-                    initial_input=user_message,
-                    ctx=ctx,
-                    stream=stream,
-                    max_turns=copilot_config.max_turns,
-                    hooks=CopilotRunHooks(ctx),
-                    run_config=attempt_run_config,
-                    session=session,
-                    copilot_config=copilot_config,
-                )
+                attempts = 2 if ctx.allow_untested_workflow_draft else 1
+                for attempt in range(attempts):
+                    try:
+                        result = await run_with_enforcement(
+                            agent=agent,
+                            initial_input=user_message,
+                            ctx=ctx,
+                            stream=stream,
+                            max_turns=copilot_config.max_turns,
+                            hooks=CopilotRunHooks(ctx),
+                            run_config=attempt_run_config,
+                            session=session,
+                            copilot_config=copilot_config,
+                        )
+                        break
+                    except Exception as exc:
+                        if (
+                            attempt + 1 < attempts
+                            and ctx.last_workflow is None
+                            and isinstance(exc, LiteLLMNotFoundError)
+                        ):
+                            LOG.warning("Retrying untested draft agent loop after model lookup failure")
+                            continue
+                        raise
             LOG.info(
                 "Copilot agent model attempt succeeded",
                 workflow_permanent_id=chat_request.workflow_permanent_id,
