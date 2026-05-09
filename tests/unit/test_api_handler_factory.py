@@ -330,3 +330,23 @@ def test_aiohttp_transport_disabled_for_per_request_timeouts() -> None:
     """Importing the LLM package disables litellm's aiohttp transport so per-request `timeout` is honored."""
     assert litellm.disable_aiohttp_transport is True
     assert api_handler_factory.litellm.disable_aiohttp_transport is True
+
+
+@pytest.mark.parametrize("override", [None, ""])
+def test_get_override_llm_api_handler_treats_empty_as_no_override(
+    override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty override_llm_key must return default — not the dummy handler.
+
+    Block models persist `llm_key=""` rather than NULL when the user hasn't picked a
+    model; SKY-9674 narrowed the gate to `is None`, which routed those calls to
+    `dummy_llm_api_handler` and broke text_prompt blocks on staging.
+    """
+
+    async def default_handler(*_: object, **__: object) -> dict[str, str]:
+        return {"ok": True}
+
+    monkeypatch.setattr(LLMAPIHandlerFactory, "_maybe_get_flex_handler", staticmethod(lambda _default: None))
+
+    resolved = LLMAPIHandlerFactory.get_override_llm_api_handler(override, default=default_handler)
+    assert resolved is default_handler
