@@ -12,23 +12,21 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, cast
+from typing import Any, Callable, cast
 from urllib.parse import urlparse
 
 import json5
 import typer
 import yaml
-from dotenv import load_dotenv
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from skyvern.analytics import capture_setup_event
 from skyvern.cli.auth_command import run_signup
 from skyvern.cli.console import console
 from skyvern.cli.skill_commands import get_skill_dirs
 from skyvern.utils import detect_os, get_windows_appdata_roaming
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import EnvIntent, load_backend_env_files
 
 # NOTE: These helpers back both `skyvern setup ...` commands and the
 # interactive MCP step used by `skyvern init` / `skyvern quickstart`, plus
@@ -56,10 +54,8 @@ _JSON5_SINGLE_QUOTED_STRING_RE = re.compile(r"(^|[:[{,]\s*)'(?:[^'\\]|\\.)*'", r
 
 
 def _get_env_credentials() -> tuple[str, str]:
-    """Read SKYVERN_API_KEY and SKYVERN_BASE_URL from environment or .env."""
-    backend_env = resolve_backend_env_path()
-    if backend_env.exists():
-        load_dotenv(backend_env, override=False)
+    """Read cloud SKYVERN_API_KEY and SKYVERN_BASE_URL from environment or scoped env files."""
+    load_backend_env_files(intent=EnvIntent.CLOUD)
 
     api_key = os.environ.get("SKYVERN_API_KEY", "")
     base_url = os.environ.get("SKYVERN_BASE_URL", "https://api.skyvern.com")
@@ -67,14 +63,31 @@ def _get_env_credentials() -> tuple[str, str]:
 
 
 def _get_local_env_credentials() -> tuple[str, str]:
-    """Read local SKYVERN_API_KEY and SKYVERN_BASE_URL from environment or .env."""
-    backend_env = resolve_backend_env_path()
-    if backend_env.exists():
-        load_dotenv(backend_env, override=False)
+    """Read local SKYVERN_API_KEY and SKYVERN_BASE_URL from legacy server env."""
+    load_backend_env_files(intent=EnvIntent.SERVER)
 
     api_key = os.environ.get("SKYVERN_API_KEY", "")
     base_url = os.environ.get("SKYVERN_BASE_URL", "")
     return api_key, base_url
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    """Capture setup analytics only after setup env intent has been selected."""
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(
+        event_name=event_name,
+        success=success,
+        error_type=error_type,
+        error_message=error_message,
+        extra_data=extra_data,
+    )
 
 
 def _build_remote_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
@@ -1265,13 +1278,10 @@ def setup_hermes(
     url: str | None = _url_opt,
 ) -> None:
     """Register Skyvern MCP with Hermes (remote by default, --local for stdio)."""
-    env_key, env_base_url = _get_env_credentials()
-    resolved_key = api_key or env_key
-
     if local:
         # Local stdio mode: Hermes spawns `skyvern run mcp` as a child process
         local_key, local_base_url = _get_local_env_credentials()
-        resolved_local_key = api_key or local_key or resolved_key or ""
+        resolved_local_key = api_key or local_key or ""
         resolved_base_url = local_base_url or ""
         if not resolved_base_url:
             console.print(
@@ -1292,8 +1302,11 @@ def setup_hermes(
         }
         if local_entry.get("env"):
             hermes_entry["env"] = local_entry["env"]
+        resolved_key = resolved_local_key
     else:
         # Remote HTTP mode: Hermes connects to hosted MCP server
+        env_key, _ = _get_env_credentials()
+        resolved_key = api_key or env_key
         if not resolved_key:
             console.print(
                 "[red]No API key found. Run [bold]skyvern login[/bold] or set "

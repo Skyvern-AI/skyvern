@@ -6,6 +6,7 @@ import socket
 import threading
 import urllib.parse
 import webbrowser
+from pathlib import Path
 
 import typer
 
@@ -109,11 +110,14 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
 def run_signup(
     base_url: str = _DEFAULT_FRONTEND_URL,
     timeout: int = _CALLBACK_TIMEOUT,
+    env_path: Path | str | None = None,
 ) -> str | None:
     """Core signup logic. Called by both the Typer command and init_command.
 
     Returns the API key on success, or None if signup failed before saving.
     """
+    from skyvern.utils.env_paths import EnvIntent, resolve_backend_env_path
+
     from .llm_setup import update_or_add_env_var
 
     bound_socket = _find_free_port()
@@ -153,15 +157,20 @@ def run_signup(
 
     api_base_url = _derive_api_base_url(base_url)
 
-    update_or_add_env_var("SKYVERN_API_KEY", api_key)
-    update_or_add_env_var("SKYVERN_BASE_URL", api_base_url)
+    saved_env_path = (
+        Path(env_path).expanduser()
+        if env_path is not None
+        else resolve_backend_env_path(intent=EnvIntent.CLOUD, for_write=True)
+    )
+    update_or_add_env_var("SKYVERN_API_KEY", api_key, env_path=saved_env_path)
+    update_or_add_env_var("SKYVERN_BASE_URL", api_base_url, env_path=saved_env_path)
 
     console.print("\n[bold green]Signup successful![/bold green]")
     if email:
         console.print(f"Email: {email}")
     if organization_id:
         console.print(f"Organization: {organization_id}")
-    console.print("API key saved to .env")
+    console.print(f"API key saved to {saved_env_path}")
     console.print(f"Base URL: {api_base_url}")
 
     return api_key

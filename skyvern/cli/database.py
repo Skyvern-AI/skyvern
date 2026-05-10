@@ -1,16 +1,27 @@
 import shutil
 import subprocess
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm
 
-from skyvern.analytics import capture_setup_event
-
 from .console import console
 from .llm_setup import DEFAULT_POSTGRES_DATABASE_STRING, update_or_add_env_var
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
 
 
 def command_exists(command: str) -> bool:
@@ -111,7 +122,7 @@ def is_postgres_container_exists() -> bool:
     return code == 0
 
 
-def setup_postgresql(no_postgres: bool = False) -> None:
+def setup_postgresql(no_postgres: bool = False, *, env_path: Path | str | None = None) -> None:
     """Set up PostgreSQL database for Skyvern."""
     console.print(Panel("[bold cyan]PostgreSQL Setup[/bold cyan]", border_style="blue"))
     capture_setup_event("database-start")
@@ -123,7 +134,7 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database and user exist.[/green]")
         else:
             create_database_and_user()
-        update_or_add_env_var("DATABASE_STRING", DEFAULT_POSTGRES_DATABASE_STRING)
+        update_or_add_env_var("DATABASE_STRING", DEFAULT_POSTGRES_DATABASE_STRING, env_path=env_path)
         capture_setup_event("database-complete", success=True, extra_data={"source": "local"})
         return
 
@@ -264,5 +275,5 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             else:
                 console.print("✅ [green]Database and user created successfully.[/green]")
 
-    update_or_add_env_var("DATABASE_STRING", DEFAULT_POSTGRES_DATABASE_STRING)
+    update_or_add_env_var("DATABASE_STRING", DEFAULT_POSTGRES_DATABASE_STRING, env_path=env_path)
     capture_setup_event("database-complete", success=True, extra_data={"source": "docker"})

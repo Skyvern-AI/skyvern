@@ -5,15 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 import typer
-from dotenv import load_dotenv
 
-from skyvern.config import settings
+from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationUpdate
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import run_tool
-from .mcp_tools.org import skyvern_org_get as tool_org_get
-from .mcp_tools.org import skyvern_org_update as tool_org_update
 
 _SETTABLE_KEYS: frozenset[str] = frozenset(OrganizationUpdate.model_fields)
 # ``clear_*`` keys are write-only verbs (reset to NULL); not surfaced by ``get``.
@@ -28,6 +25,18 @@ config_app = typer.Typer(
 )
 
 
+async def tool_org_get() -> dict[str, Any]:
+    from .mcp_tools.org import skyvern_org_get  # noqa: PLC0415
+
+    return await skyvern_org_get()
+
+
+async def tool_org_update(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.org import skyvern_org_update  # noqa: PLC0415
+
+    return await skyvern_org_update(**kwargs)
+
+
 @config_app.callback()
 def config_callback(
     api_key: str | None = typer.Option(
@@ -38,8 +47,10 @@ def config_callback(
     ),
 ) -> None:
     """Load env and apply the optional API key override."""
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
     if api_key:
+        from skyvern.config import settings  # noqa: PLC0415
+
         settings.SKYVERN_API_KEY = api_key
 
 

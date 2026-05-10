@@ -5,6 +5,7 @@ import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.panel import Panel
@@ -12,11 +13,33 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 
-from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.cli.console import console
-from skyvern.utils.env_paths import resolve_frontend_env_path
+from skyvern.utils.env_paths import EnvScope, parse_env_scope, resolve_frontend_env_path
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
+
+
+def capture_setup_error(
+    event_name: str,
+    error: Exception,
+    error_type: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_error as _capture_setup_error  # noqa: PLC0415
+
+    _capture_setup_error(event_name, error, error_type, extra_data)
 
 
 class QuickstartPath(str, Enum):
@@ -153,6 +176,13 @@ def _server_quickstart_flags_requested(
 ) -> bool:
     """Return whether the user supplied options for the Python server setup path."""
     return no_postgres or bool(database_string) or skip_browser_install or server_only
+
+
+def _parse_quickstart_env_scope(value: str) -> EnvScope:
+    try:
+        return parse_env_scope(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _print_cloud_guidance() -> None:
@@ -479,11 +509,17 @@ def quickstart(
         callback=_validate_install_type,
         help="Choose quickstart path: cloud, local, or server.",
     ),
+    env_scope: str | None = typer.Option(
+        None,
+        "--env-scope",
+        help="Backend env location for setup writes: legacy/current, project, or global.",
+    ),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
     install_type_value = install_type if isinstance(install_type, str) else None
+    env_scope_value = env_scope if isinstance(env_scope, str) else None
 
     has_server_extra = _has_server_quickstart_extra()
     # The server extra is a superset of the local embedded runtime dependencies.
@@ -508,6 +544,16 @@ def quickstart(
                 )
             )
             raise typer.Exit(1)
+        if env_scope_value is not None and _parse_quickstart_env_scope(env_scope_value) is not EnvScope.LEGACY:
+            console.print(
+                Panel(
+                    "[bold red]Conflicting quickstart options.[/bold red]\n"
+                    "Docker Compose uses the source checkout `.env` file. "
+                    "Use `--env-scope legacy` or omit `--env-scope`.",
+                    border_style="red",
+                )
+            )
+            raise typer.Exit(1)
     elif install_type_value is None and server_flags_requested:
         selected_path = QuickstartPath.SERVER
     else:
@@ -522,6 +568,16 @@ def quickstart(
     if selected_path is QuickstartPath.LOCAL:
         _print_local_guidance(has_local_extra=has_local_extra)
         raise typer.Exit(0)
+    if env_scope_value is not None and _parse_quickstart_env_scope(env_scope_value) is not EnvScope.LEGACY:
+        console.print(
+            Panel(
+                "[bold red]Conflicting quickstart options.[/bold red]\n"
+                "Self-hosted local server setup writes ./.env. "
+                "Project/global scopes are for cloud/API config.",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(1)
 
     # Check if Docker Compose option was explicitly requested or offer choice
     docker_compose_available = check_docker_compose_file()

@@ -6,12 +6,11 @@ import json
 import os
 
 import typer
-from dotenv import load_dotenv
 from rich.panel import Panel
 
+from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.client import Skyvern
-from skyvern.config import settings
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import output, output_error
 from .console import console
@@ -36,7 +35,9 @@ def tasks_callback(
 
 def _get_client(api_key: str | None = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
+    from skyvern.config import settings  # noqa: PLC0415
+
     key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 

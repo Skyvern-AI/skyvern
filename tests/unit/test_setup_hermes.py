@@ -102,6 +102,61 @@ def test_setup_hermes_local_fails_without_base_url(hermes_home: Path, monkeypatc
     assert "SKYVERN_BASE_URL" in result.output
 
 
+def test_setup_hermes_local_uses_legacy_env_when_cloud_scope_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("skyvern.cli.setup_commands.Path.home", lambda: tmp_path)
+    for key in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_FILE", "SKYVERN_ENV_INTENT"):
+        monkeypatch.delenv(key, raising=False)
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    _save_yaml_config(hermes_home / "config.yaml", {})
+
+    local_env = tmp_path / ".env"
+    cloud_env = tmp_path / ".skyvern" / ".env"
+    cloud_env.parent.mkdir(parents=True)
+    local_env.write_text("SKYVERN_API_KEY=local-key\nSKYVERN_BASE_URL=http://localhost:8000\n")
+    cloud_env.write_text("SKYVERN_API_KEY=cloud-key\nSKYVERN_BASE_URL=https://api.skyvern.com\n")
+
+    result = runner.invoke(setup_app, ["hermes", "--local", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    data = _load_yaml_config(hermes_home / "config.yaml")
+    assert data is not None
+    entry = data["mcp_servers"]["skyvern"]
+    assert entry["env"]["SKYVERN_API_KEY"] == "local-key"
+    assert entry["env"]["SKYVERN_BASE_URL"] == "http://localhost:8000"
+
+
+def test_setup_hermes_local_does_not_pair_cloud_key_with_legacy_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("skyvern.cli.setup_commands.Path.home", lambda: tmp_path)
+    for key in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_FILE", "SKYVERN_ENV_INTENT"):
+        monkeypatch.delenv(key, raising=False)
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    _save_yaml_config(hermes_home / "config.yaml", {})
+
+    local_env = tmp_path / ".env"
+    cloud_env = tmp_path / ".skyvern" / ".env"
+    cloud_env.parent.mkdir(parents=True)
+    local_env.write_text("SKYVERN_BASE_URL=http://localhost:8000\n")
+    cloud_env.write_text("SKYVERN_API_KEY=cloud-key\nSKYVERN_BASE_URL=https://api.skyvern.com\n")
+
+    result = runner.invoke(setup_app, ["hermes", "--local", "--yes"])
+
+    assert result.exit_code == 1
+    assert "No API key found" in result.output
+    data = _load_yaml_config(hermes_home / "config.yaml")
+    assert data is not None
+    assert "mcp_servers" not in data
+
+
 def test_setup_hermes_dry_run_masks_secrets(hermes_home: Path) -> None:
     """Dry-run output does not contain raw API keys."""
     result = runner.invoke(setup_app, ["hermes", "--dry-run"])

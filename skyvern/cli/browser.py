@@ -1,14 +1,12 @@
 import json
 import platform
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests  # type: ignore
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
-
-from skyvern.analytics import capture_setup_event
 
 from .console import console
 from .core.browser_launcher import (
@@ -19,6 +17,18 @@ from .core.browser_launcher import (
 
 # Ports to scan when auto-discovering a CDP debugging server
 _CDP_SCAN_PORTS = [9222, 9223, 9224, 9225, 9226, 9229]
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
 
 
 def _check_cdp_ws(port: int) -> Optional[dict]:
