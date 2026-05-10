@@ -1,9 +1,7 @@
 import typer
-from dotenv import load_dotenv
 
 from skyvern._cli_bootstrap import configure_cli_bootstrap_logging as _configure_cli_bootstrap_logging
 from skyvern.cli.lazy import LazyTyperGroup, register_lazy_command
-from skyvern.utils.env_paths import resolve_backend_env_path
 
 _cli_logging_configured = False
 
@@ -241,5 +239,4 @@ def _walk_command_tree(cmd: object, prefix: str = "", max_depth: int = 1, _curre
 
 
 if __name__ == "__main__":  # pragma: no cover - manual CLI invocation
-    load_dotenv(resolve_backend_env_path())
     cli_app()

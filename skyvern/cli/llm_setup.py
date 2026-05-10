@@ -1,11 +1,12 @@
 import os
+from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
-from skyvern.analytics import capture_setup_event
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import EnvIntent, EnvScope, resolve_backend_env_path
 
 from .console import console
 from .masked_prompt import ask_secret
@@ -13,11 +14,35 @@ from .masked_prompt import ask_secret
 DEFAULT_POSTGRES_DATABASE_STRING = "postgresql+psycopg://skyvern@localhost:5432/skyvern"
 
 
-def update_or_add_env_var(key: str, value: str) -> None:
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
+
+
+def update_or_add_env_var(
+    key: str,
+    value: str,
+    *,
+    env_path: Path | str | None = None,
+    intent: EnvIntent | str = EnvIntent.AUTO,
+    scope: EnvScope | str | None = None,
+) -> None:
     """Update or add environment variable in .env file."""
-    env_path = resolve_backend_env_path()
-    if not env_path.exists():
-        env_path.touch()
+    resolved_env_path = (
+        Path(env_path).expanduser()
+        if env_path is not None
+        else resolve_backend_env_path(intent=intent, scope=scope, for_write=True)
+    )
+    if not resolved_env_path.exists():
+        resolved_env_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_env_path.touch()
         defaults = {
             "ENV": "local",
             "ENABLE_OPENAI": "false",
@@ -52,15 +77,19 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "ENABLE_LOG_ARTIFACTS": "false",
         }
         for k, v in defaults.items():
-            set_key(env_path, k, v)
+            set_key(resolved_env_path, k, v)
 
-    load_dotenv(env_path)
-    set_key(env_path, key, value)
+    load_dotenv(resolved_env_path)
+    set_key(resolved_env_path, key, value)
     os.environ[key] = value
 
 
-def setup_llm_providers() -> None:
+def setup_llm_providers(env_path: Path | str | None = None) -> None:
     """Configure Large Language Model (LLM) Providers."""
+
+    def set_env_var(key: str, value: str) -> None:
+        update_or_add_env_var(key, value, env_path=env_path)
+
     console.print(Panel("[bold magenta]LLM Provider Configuration[/bold magenta]", border_style="purple"))
     console.print("[italic]Note: All information provided here will be stored only on your local machine.[/italic]")
     capture_setup_event("llm-start")
@@ -75,8 +104,8 @@ def setup_llm_providers() -> None:
         if not openai_api_key:
             console.print("[red]Error: OpenAI API key is required. OpenAI will not be enabled.[/red]")
         else:
-            update_or_add_env_var("OPENAI_API_KEY", openai_api_key)
-            update_or_add_env_var("ENABLE_OPENAI", "true")
+            set_env_var("OPENAI_API_KEY", openai_api_key)
+            set_env_var("ENABLE_OPENAI", "true")
             enabled_providers.append("openai")
             model_options.extend(
                 [
@@ -86,7 +115,7 @@ def setup_llm_providers() -> None:
                 ]
             )
     else:
-        update_or_add_env_var("ENABLE_OPENAI", "false")
+        set_env_var("ENABLE_OPENAI", "false")
 
     console.print("\n[bold blue]--- Anthropic Configuration ---[/bold blue]")
     console.print("To enable Anthropic, you must have an Anthropic API key.")
@@ -96,8 +125,8 @@ def setup_llm_providers() -> None:
         if not anthropic_api_key:
             console.print("[red]Error: Anthropic API key is required. Anthropic will not be enabled.[/red]")
         else:
-            update_or_add_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
-            update_or_add_env_var("ENABLE_ANTHROPIC", "true")
+            set_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
+            set_env_var("ENABLE_ANTHROPIC", "true")
             enabled_providers.append("anthropic")
             model_options.extend(
                 [
@@ -109,7 +138,7 @@ def setup_llm_providers() -> None:
                 ]
             )
     else:
-        update_or_add_env_var("ENABLE_ANTHROPIC", "false")
+        set_env_var("ENABLE_ANTHROPIC", "false")
 
     console.print("\n[bold blue]--- Azure Configuration ---[/bold blue]")
     console.print("To enable Azure, you must have an Azure deployment name, API key, base URL, and API version.")
@@ -122,15 +151,15 @@ def setup_llm_providers() -> None:
         if not all([azure_deployment, azure_api_key, azure_api_base, azure_api_version]):
             console.print("[red]Error: All Azure fields must be populated. Azure will not be enabled.[/red]")
         else:
-            update_or_add_env_var("AZURE_DEPLOYMENT", azure_deployment)
-            update_or_add_env_var("AZURE_API_KEY", azure_api_key)
-            update_or_add_env_var("AZURE_API_BASE", azure_api_base)
-            update_or_add_env_var("AZURE_API_VERSION", azure_api_version)
-            update_or_add_env_var("ENABLE_AZURE", "true")
+            set_env_var("AZURE_DEPLOYMENT", azure_deployment)
+            set_env_var("AZURE_API_KEY", azure_api_key)
+            set_env_var("AZURE_API_BASE", azure_api_base)
+            set_env_var("AZURE_API_VERSION", azure_api_version)
+            set_env_var("ENABLE_AZURE", "true")
             enabled_providers.append("azure")
             model_options.append("AZURE_OPENAI")
     else:
-        update_or_add_env_var("ENABLE_AZURE", "false")
+        set_env_var("ENABLE_AZURE", "false")
 
     console.print("\n[bold blue]--- Gemini Configuration ---[/bold blue]")
     console.print("To enable Gemini, you must have a Gemini API key.")
@@ -140,8 +169,8 @@ def setup_llm_providers() -> None:
         if not gemini_api_key:
             console.print("[red]Error: Gemini API key is required. Gemini will not be enabled.[/red]")
         else:
-            update_or_add_env_var("GEMINI_API_KEY", gemini_api_key)
-            update_or_add_env_var("ENABLE_GEMINI", "true")
+            set_env_var("GEMINI_API_KEY", gemini_api_key)
+            set_env_var("ENABLE_GEMINI", "true")
             enabled_providers.append("gemini")
             model_options.extend(
                 [
@@ -154,7 +183,7 @@ def setup_llm_providers() -> None:
                 ]
             )
     else:
-        update_or_add_env_var("ENABLE_GEMINI", "false")
+        set_env_var("ENABLE_GEMINI", "false")
 
     console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
     console.print("Use any locally-running model via Ollama (e.g. gemma4, qwen3, deepseek-r1).")
@@ -172,14 +201,14 @@ def setup_llm_providers() -> None:
             console.print("[red]Error: Model name is required. Ollama will not be enabled.[/red]")
         else:
             ollama_vision = Confirm.ask("Does this model support vision?", default=False)
-            update_or_add_env_var("OLLAMA_SERVER_URL", ollama_server_url)
-            update_or_add_env_var("OLLAMA_MODEL", ollama_model)
-            update_or_add_env_var("OLLAMA_SUPPORTS_VISION", str(ollama_vision).lower())
-            update_or_add_env_var("ENABLE_OLLAMA", "true")
+            set_env_var("OLLAMA_SERVER_URL", ollama_server_url)
+            set_env_var("OLLAMA_MODEL", ollama_model)
+            set_env_var("OLLAMA_SUPPORTS_VISION", str(ollama_vision).lower())
+            set_env_var("ENABLE_OLLAMA", "true")
             enabled_providers.append("ollama")
             model_options.append("OLLAMA")
     else:
-        update_or_add_env_var("ENABLE_OLLAMA", "false")
+        set_env_var("ENABLE_OLLAMA", "false")
 
     if not model_options:
         capture_setup_event(
@@ -208,7 +237,7 @@ def setup_llm_providers() -> None:
         )
         chosen_model = model_options[int(chosen_model_idx) - 1]
         console.print(f"🎉 [bold green]Chosen LLM Model: {chosen_model}[/bold green]")
-        update_or_add_env_var("LLM_KEY", chosen_model)
+        set_env_var("LLM_KEY", chosen_model)
         capture_setup_event(
             "llm-complete",
             success=True,

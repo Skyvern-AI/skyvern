@@ -5,16 +5,25 @@ from __future__ import annotations
 from typing import Any
 
 import typer
-from dotenv import load_dotenv
 
-from skyvern.config import settings
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import resolve_inline_or_file, run_tool
-from .mcp_tools.blocks import skyvern_block_schema as tool_block_schema
-from .mcp_tools.blocks import skyvern_block_validate as tool_block_validate
 
 block_app = typer.Typer(help="Workflow block schema and validation commands.", no_args_is_help=True)
+
+
+async def tool_block_schema(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.blocks import skyvern_block_schema  # noqa: PLC0415
+
+    return await skyvern_block_schema(**kwargs)
+
+
+async def tool_block_validate(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.blocks import skyvern_block_validate  # noqa: PLC0415
+
+    return await skyvern_block_validate(**kwargs)
 
 
 @block_app.callback()
@@ -27,8 +36,10 @@ def block_callback(
     ),
 ) -> None:
     """Load environment and optional API key override."""
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
     if api_key:
+        from skyvern.config import settings  # noqa: PLC0415
+
         settings.SKYVERN_API_KEY = api_key
 
 
