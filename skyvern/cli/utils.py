@@ -5,11 +5,12 @@ import sys
 import time
 
 import typer
+from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.cli.console import console
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 
 def wait_for_docker_services(ui_port: int = 8080, api_port: int = 8000, timeout: int = 120) -> bool:
@@ -46,8 +47,22 @@ async def start_services(server_only: bool = False) -> None:
     Args:
         server_only: If True, only start the server, not the UI.
     """
-    capture_setup_event("services-start", extra_data={"server_only": server_only})
     try:
+        frontend_env_path = None if server_only else resolve_frontend_env_path()
+        if not server_only and frontend_env_path is None:
+            server_only = True
+            console.print(
+                Panel(
+                    "[yellow]No Skyvern frontend runtime was found in this install.[/yellow]\n\n"
+                    "Starting the backend API server only. Wheel installs do not include the UI app; "
+                    "use a source checkout or Docker Compose when you need the local UI.",
+                    title="Backend-only install",
+                    border_style="yellow",
+                )
+            )
+
+        capture_setup_event("services-start", extra_data={"server_only": server_only})
+
         # Start server in the background
         server_process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "skyvern.cli.commands", "run", "server"
@@ -62,7 +77,10 @@ async def start_services(server_only: bool = False) -> None:
 
         capture_setup_event("services-running", success=True, extra_data={"server_only": server_only})
         console.print("\n🎉 [bold green]Skyvern is now running![/bold green]")
-        console.print("🌐 [bold]Access the UI at:[/bold] [cyan]http://localhost:8080[/cyan]")
+        if server_only:
+            console.print("🔌 [bold]API server:[/bold] [cyan]http://localhost:8000[/cyan]")
+        else:
+            console.print("🌐 [bold]Access the UI at:[/bold] [cyan]http://localhost:8080[/cyan]")
         console.print(f"🔑 [bold]Your API key is in {resolve_backend_env_path()} as SKYVERN_API_KEY[/bold]")
 
         # Wait for processes to complete (they won't unless killed)
