@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -11,7 +11,7 @@ import structlog
 from skyvern.config import settings
 
 if TYPE_CHECKING:
-    from playwright.async_api import Frame, Page
+    from playwright.async_api import FileChooser, Frame, Page
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
@@ -29,6 +29,22 @@ class DialogEntry(TypedDict):
     type: str
     message: str
     count: int
+
+
+@dataclass
+class PendingFileChooserListener:
+    page: Page
+    file_paths: list[str] | str
+    handler: Callable[[FileChooser], Any] | None = None
+    triggered: bool = False
+
+    def cleanup(self) -> None:
+        if self.handler is not None:
+            try:
+                self.page.remove_listener("filechooser", self.handler)
+            except Exception:
+                LOG.debug("Failed to remove filechooser listener during cleanup", exc_info=True)
+            self.handler = None
 
 
 @dataclass
@@ -144,6 +160,17 @@ class SkyvernContext:
     # "LLM API handler duration metrics" log so html_token_count / html_pct land
     # alongside the existing input_tokens / llm_cost on the same row.
     last_prompt_breakdown: dict[str, Any] | None = None
+
+    # Deferred file chooser listener — survives across steps so a popup-intercepted upload
+    # can be completed when a subsequent click triggers the actual file chooser.
+    pending_file_chooser: PendingFileChooserListener | None = None
+
+    def cleanup_pending_file_chooser(self) -> None:
+        if self.pending_file_chooser is not None:
+            if not self.pending_file_chooser.triggered:
+                LOG.warning("Cleaning up unconsumed pending file chooser listener")
+            self.pending_file_chooser.cleanup()
+            self.pending_file_chooser = None
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id}, copilot_session_id={self.copilot_session_id})"
@@ -292,13 +319,16 @@ def replace(context: SkyvernContext) -> None:
     Returns:
         None
     """
-    _flush_feature_flags_if_needed(current())
+    _cleanup_outgoing_context(current())
     _context.set(context)
 
 
-def _flush_feature_flags_if_needed(context: SkyvernContext | None) -> None:
-    if context is not None and context.feature_flag_entries:
+def _cleanup_outgoing_context(context: SkyvernContext | None) -> None:
+    if context is None:
+        return
+    if context.feature_flag_entries:
         context.flush_feature_flags()
+    context.cleanup_pending_file_chooser()
 
 
 def _restore(token: Token[SkyvernContext | None]) -> None:
@@ -311,7 +341,7 @@ def _restore(token: Token[SkyvernContext | None]) -> None:
     Returns:
         None
     """
-    _flush_feature_flags_if_needed(current())
+    _cleanup_outgoing_context(current())
     _context.reset(token)
 
 
@@ -340,5 +370,5 @@ def reset() -> None:
     Returns:
         None
     """
-    _flush_feature_flags_if_needed(current())
+    _cleanup_outgoing_context(current())
     _context.set(None)

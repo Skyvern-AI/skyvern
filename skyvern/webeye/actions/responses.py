@@ -14,6 +14,7 @@ class ActionResult(BaseModel):
     step_retry_number: int | None = None
     step_order: int | None = None
     download_triggered: bool | None = None
+    upload_file_triggered: bool | None = None
     downloaded_files: list[str] | None = None  # Actual file names that were downloaded
     # None is used for old data so that we can differentiate between old and new data which only has boolean
     interacted_with_sibling: bool | None = None
@@ -34,6 +35,8 @@ class ActionResult(BaseModel):
             results.append(f"step_retry_number={self.step_retry_number}")
         if self.download_triggered is not None:
             results.append(f"download_triggered={self.download_triggered}")
+        if self.upload_file_triggered is not None:
+            results.append(f"upload_file_triggered={self.upload_file_triggered}")
         if self.downloaded_files is not None:
             results.append(f"downloaded_files={self.downloaded_files}")
         if self.interacted_with_sibling is not None:
