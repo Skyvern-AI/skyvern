@@ -869,12 +869,19 @@ class RealSkyvernPageAi(SkyvernPageAi):
         self,
         navigation_goal: str,
         max_steps: int = 5,
+        validate_first: bool = False,
     ) -> None:
         """Drive an AI agent from the current page state toward ``navigation_goal``.
 
         Records one fallback episode per invocation regardless of exit path; pops
         any preceding classify metadata at entry so subsequent fallbacks cannot
         inherit it.
+
+        ``validate_first=True`` re-enables the legacy pre-act validate on
+        iteration 0 for defensive callers that may invoke this when the page
+        already satisfies the goal; the default (False) skips that validate
+        because the documented call site (classify-UNKNOWN / selector-failure
+        fallback) cannot be on the success state.
         """
         context = skyvern_context.current()
         if not context or not context.organization_id:
@@ -906,17 +913,19 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         try:
             for step_num in range(max_steps):
-                is_complete = await self.ai_validate(
-                    prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
-                )
-                if is_complete:
-                    LOG.info(
-                        "page.element_fallback: goal achieved",
-                        step_num=step_num,
-                        navigation_goal=navigation_goal,
+                # Skip iteration-0 validate; opt in via validate_first for defensive callers.
+                if step_num > 0 or validate_first:
+                    is_complete = await self.ai_validate(
+                        prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
                     )
-                    completed = True
-                    break
+                    if is_complete:
+                        LOG.info(
+                            "page.element_fallback: goal achieved",
+                            step_num=step_num,
+                            navigation_goal=navigation_goal,
+                        )
+                        completed = True
+                        break
 
                 LOG.info(
                     "page.element_fallback: executing step",
@@ -941,6 +950,20 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         "actions": actions_this_step[:10],
                     }
                 )
+            else:
+                # All max_steps acts ran without an early break — final validate
+                # so max_steps=1 can succeed when the lone act completed the goal.
+                if max_steps > 0:
+                    is_complete = await self.ai_validate(
+                        prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
+                    )
+                    if is_complete:
+                        LOG.info(
+                            "page.element_fallback: goal achieved",
+                            step_num=max_steps,
+                            navigation_goal=navigation_goal,
+                        )
+                        completed = True
         except Exception as exc:
             exception_summary = f"{type(exc).__name__}: {exc!s}"[:500]
             captured_exception = exc

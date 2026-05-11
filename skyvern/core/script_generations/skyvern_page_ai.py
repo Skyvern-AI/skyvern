@@ -124,11 +124,16 @@ class SkyvernPageAi(Protocol):
         self,
         navigation_goal: str,
         max_steps: int = 5,
+        validate_first: bool = False,
     ) -> None:
         """Activate the AI agent from the CURRENT page position to achieve a navigation goal.
 
         This is a mid-block fallback that picks up from the current page state
         instead of re-running the entire block from scratch.
+
+        ``validate_first=True`` re-enables the legacy pre-act validate on
+        iteration 0 for defensive callers that may invoke this when the page
+        already satisfies the goal.
         """
         ...
 
