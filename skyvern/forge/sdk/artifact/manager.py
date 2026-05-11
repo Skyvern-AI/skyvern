@@ -1090,61 +1090,59 @@ class ArtifactManager:
         return f"{path}?{urlencode(extra)}" if extra else path
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        if artifact.bundle_key:
-            expiry_seconds = await self.resolve_artifact_url_expiry_seconds(artifact.organization_id)
-            return self._bundle_content_url(
+        """Return a Skyvern-origin signed ``/v1/artifacts/{id}/content`` URL.
+
+        SKY-8861: every customer-visible artifact URL goes through the content
+        endpoint — short, our origin, per-org TTL, no S3/Azure presigned URLs
+        leaking into webhooks or API responses. Bundled and non-bundled
+        artifacts share the same path; the content endpoint already serves
+        either (``retrieve_artifact`` handles bundle extraction transparently).
+        """
+        expiry_seconds = await self.resolve_artifact_url_expiry_seconds(artifact.organization_id)
+        return self._bundle_content_url(
+            artifact.artifact_id,
+            artifact_name=artifact.bundle_key,
+            artifact_type=artifact.artifact_type,
+            expiry_seconds=expiry_seconds,
+        )
+
+    async def get_share_links(self, artifacts: list[Artifact]) -> list[str | None]:
+        """Return signed content URLs for a batch of artifacts."""
+        return await self.get_share_links_with_bundle_support(artifacts)
+
+    async def get_share_links_with_bundle_support(self, artifacts: list[Artifact]) -> list[str | None]:
+        """Mint a signed ``/v1/artifacts/{id}/content`` URL for every artifact.
+
+        Bundled vs non-bundled used to branch here — bundled went through the
+        content endpoint, non-bundled fell through to ``STORAGE.get_share_links``
+        and leaked S3 presigned / Azure SAS URLs into webhooks and customer
+        API responses. SKY-8861: unify on the signed origin URL for both.
+
+        The per-org TTL is resolved once per batch (callers look up by
+        run/workflow scope so all artifacts share an org).
+        """
+        if not artifacts:
+            return []
+
+        organization_id = artifacts[0].organization_id
+        expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
+
+        result: list[str | None] = [
+            self._bundle_content_url(
                 artifact.artifact_id,
                 artifact_name=artifact.bundle_key,
                 artifact_type=artifact.artifact_type,
                 expiry_seconds=expiry_seconds,
             )
-        return await app.STORAGE.get_share_link(artifact)
-
-    async def get_share_links(self, artifacts: list[Artifact]) -> list[str | None]:
-        """Return share links for a list of artifacts, with bundle support.
-
-        Bundled artifacts (those with a bundle_key) return a backend content-endpoint URL
-        rather than a presigned S3 URL, which would 403 because the underlying S3 object is
-        a ZIP that cannot be accessed directly.
-        """
-        return await self.get_share_links_with_bundle_support(artifacts)
-
-    async def get_share_links_with_bundle_support(self, artifacts: list[Artifact]) -> list[str | None]:
-        """Get share links; bundled artifacts return an absolute backend content-endpoint URL instead of a presigned URL."""
-        result: list[str | None] = [None] * len(artifacts)
-        non_bundle_indices: list[int] = []
-        non_bundle_artifacts: list[Artifact] = []
-
-        # Resolve the per-org TTL once. All artifacts in a single batch share an
-        # org (callers always look up by run/workflow scope), so one DB hit
-        # covers every bundled URL we mint below.
-        organization_id = artifacts[0].organization_id if artifacts else None
-        bundled_expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
-
-        for i, artifact in enumerate(artifacts):
-            if artifact.bundle_key:
-                result[i] = self._bundle_content_url(
-                    artifact.artifact_id,
-                    artifact_name=artifact.bundle_key,
-                    artifact_type=artifact.artifact_type,
-                    expiry_seconds=bundled_expiry_seconds,
-                )
-            else:
-                non_bundle_indices.append(i)
-                non_bundle_artifacts.append(artifact)
+            for artifact in artifacts
+        ]
 
         LOG.debug(
             "get_share_links_with_bundle_support",
             total=len(artifacts),
-            bundled=len(artifacts) - len(non_bundle_artifacts),
-            non_bundled=len(non_bundle_artifacts),
+            bundled=sum(1 for a in artifacts if a.bundle_key),
+            non_bundled=sum(1 for a in artifacts if not a.bundle_key),
         )
-
-        if non_bundle_artifacts:
-            signed_urls = await app.STORAGE.get_share_links(non_bundle_artifacts)
-            if signed_urls:
-                for idx, url in zip(non_bundle_indices, signed_urls):
-                    result[idx] = url
 
         return result
 
