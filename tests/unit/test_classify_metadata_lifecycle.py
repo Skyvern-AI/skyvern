@@ -5,7 +5,7 @@ and the consume-at-entry invariant in ``ai_element_fallback``.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -173,3 +173,123 @@ async def test_ai_element_fallback_consumes_meta_when_ai_act_raises(
         await page_ai.ai_element_fallback(navigation_goal="real goal", max_steps=2)
 
     assert fallback_ctx.last_classify_meta is None
+
+
+@pytest.mark.asyncio
+async def test_ai_element_fallback_skips_validate_on_first_iteration(
+    fallback_ctx: skyvern_context.SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Caller invokes element_fallback only when the cached path needs help, so
+    the goal cannot already be achieved on entry — the iteration-0 validate is
+    a guaranteed-False LLM call that should be skipped.
+    """
+    page = _make_page_stub()
+    page_ai = _make_page_ai_stub(page)
+
+    validate_mock = AsyncMock(return_value=True)
+    act_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(page_ai, "ai_validate", validate_mock)
+    monkeypatch.setattr(page_ai, "ai_act", act_mock)
+    monkeypatch.setattr(app.DATABASE.scripts, "create_fallback_episode", AsyncMock(return_value=None))
+
+    await page_ai.ai_element_fallback(navigation_goal="real goal", max_steps=3)
+
+    assert act_mock.await_count == 1
+    assert validate_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_element_fallback_validates_after_act_on_subsequent_iterations(
+    fallback_ctx: skyvern_context.SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the first act, every iteration validates before acting again so a
+    completed goal short-circuits the loop without a stale extra act. The
+    relative call ordering (act → validate → act → validate, then break) is
+    asserted against a parent mock manager to prevent regressions.
+    """
+    page = _make_page_stub()
+    page_ai = _make_page_ai_stub(page)
+
+    parent = MagicMock()
+    validate_mock = AsyncMock(side_effect=[False, True])
+    act_mock = AsyncMock(return_value=None)
+    parent.attach_mock(validate_mock, "validate")
+    parent.attach_mock(act_mock, "act")
+
+    monkeypatch.setattr(page_ai, "ai_validate", validate_mock)
+    monkeypatch.setattr(page_ai, "ai_act", act_mock)
+    monkeypatch.setattr(app.DATABASE.scripts, "create_fallback_episode", AsyncMock(return_value=None))
+
+    await page_ai.ai_element_fallback(navigation_goal="real goal", max_steps=5)
+
+    call_names = [c[0] for c in parent.mock_calls]
+    assert call_names == ["act", "validate", "act", "validate"]
+
+
+@pytest.mark.asyncio
+async def test_ai_element_fallback_validate_first_true_preserves_legacy_check(
+    fallback_ctx: skyvern_context.SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defensive callers that may invoke element_fallback on a possibly-complete
+    page can opt back into the pre-act validate via ``validate_first=True``;
+    when the page already satisfies the goal the loop must exit without acting.
+    """
+    page = _make_page_stub()
+    page_ai = _make_page_ai_stub(page)
+
+    validate_mock = AsyncMock(return_value=True)
+    act_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(page_ai, "ai_validate", validate_mock)
+    monkeypatch.setattr(page_ai, "ai_act", act_mock)
+    monkeypatch.setattr(app.DATABASE.scripts, "create_fallback_episode", AsyncMock(return_value=None))
+
+    await page_ai.ai_element_fallback(navigation_goal="real goal", max_steps=3, validate_first=True)
+
+    assert act_mock.await_count == 0
+    assert validate_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_element_fallback_max_steps_one_can_succeed(
+    fallback_ctx: skyvern_context.SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``max_steps=1`` must be able to succeed when the single act completes the
+    goal — guaranteed by a final post-loop validate that runs when the loop
+    exhausts without an early break.
+    """
+    page = _make_page_stub()
+    page_ai = _make_page_ai_stub(page)
+
+    validate_mock = AsyncMock(return_value=True)
+    act_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(page_ai, "ai_validate", validate_mock)
+    monkeypatch.setattr(page_ai, "ai_act", act_mock)
+    monkeypatch.setattr(app.DATABASE.scripts, "create_fallback_episode", AsyncMock(return_value=None))
+
+    await page_ai.ai_element_fallback(navigation_goal="real goal", max_steps=1)
+
+    assert act_mock.await_count == 1
+    assert validate_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_element_fallback_raises_when_max_steps_exhausted_without_completion(
+    fallback_ctx: skyvern_context.SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If every act runs and the final validate still says incomplete, the
+    method raises rather than silently succeeding.
+    """
+    page = _make_page_stub()
+    page_ai = _make_page_ai_stub(page)
+
+    validate_mock = AsyncMock(return_value=False)
+    act_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(page_ai, "ai_validate", validate_mock)
+    monkeypatch.setattr(page_ai, "ai_act", act_mock)
+    monkeypatch.setattr(app.DATABASE.scripts, "create_fallback_episode", AsyncMock(return_value=None))
+
+    with pytest.raises(Exception, match="did not complete within 2 steps"):
+        await page_ai.ai_element_fallback(navigation_goal="real goal", max_steps=2)
+
+    assert act_mock.await_count == 2
+    assert validate_mock.await_count == 2
