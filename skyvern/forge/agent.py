@@ -83,7 +83,7 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.cache import extraction_cache
+from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -256,6 +256,45 @@ class ActionLinkedNode:
     def __init__(self, action: Action) -> None:
         self.action = action
         self.next: ActionLinkedNode | None = None
+
+
+def _schedule_summary_shadow_check_for_hit(
+    *,
+    task: Task,
+    workflow_run_id: str,
+    cache_key: str,
+    cached_value: Any,
+    cached_age_seconds: float,
+    summary_prompt: str,
+) -> None:
+    """Mirrors the miss-path LLM invocation exactly so the comparison can't
+    diverge for non-cache reasons."""
+
+    async def _shadow_gate() -> bool:
+        return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+    async def _shadow_llm_call() -> Any:
+        return await app.EXTRACTION_LLM_API_HANDLER(
+            prompt=summary_prompt,
+            step=None,
+            prompt_name="data-extraction-summary",
+            system_prompt=task.workflow_system_prompt,
+        )
+
+    shadow_logger = structlog.get_logger().bind(
+        prompt_name="data-extraction-summary",
+        cache_path="agent",
+    )
+    extraction_shadow.schedule_shadow_check(
+        gate=_shadow_gate,
+        cache_key=cache_key,
+        workflow_run_id=workflow_run_id,
+        cached_value=cached_value,
+        cached_age_seconds=cached_age_seconds,
+        llm_call=_shadow_llm_call,
+        schema=None,
+        logger=shadow_logger,
+    )
 
 
 class ForgeAgent:
@@ -5635,6 +5674,15 @@ class ForgeAgent:
                     LOG.warning(
                         "data-extraction-summary cross-run cache backfill to in-run failed",
                         exc_info=True,
+                    )
+                if workflow_run_id is not None:
+                    _schedule_summary_shadow_check_for_hit(
+                        task=task,
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        cached_value=cross_run_value,
+                        cached_age_seconds=extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
+                        summary_prompt=prompt,
                     )
                 data_extraction_summary_resp = cross_run_value
             else:
