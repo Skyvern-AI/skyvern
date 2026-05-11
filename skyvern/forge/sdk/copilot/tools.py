@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlparse
 
 import structlog
 import yaml
-from agents import function_tool
+from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData, function_tool
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
@@ -47,6 +47,11 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
+from skyvern.forge.sdk.copilot.output_policy import (
+    evaluate_output_policy,
+    format_output_policy_tool_error,
+    output_policy_verdict_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     build_run_blocks_response,
@@ -271,6 +276,47 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
         "credential ID, create the credential in the Credentials UI and return with its ID, or explicitly "
         "choose an unvalidated draft workflow that will not be run until credentials are available."
     )
+
+
+def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    tool_context = data.context
+    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    if not raw_arguments:
+        LOG.warning(
+            "workflow YAML output policy guardrail received no tool arguments",
+            tool_name=getattr(tool_context, "tool_name", None),
+            tool_call_id=getattr(tool_context, "tool_call_id", None),
+        )
+    try:
+        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
+    except json.JSONDecodeError:
+        parsed_arguments = {}
+    tool_arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
+    workflow_yaml_value = tool_arguments.get("workflow_yaml")
+    workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
+    verdict = evaluate_output_policy(
+        request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=tool_arguments or raw_arguments,
+    )
+    trace_data = output_policy_verdict_to_trace_data(
+        verdict,
+        surface="tool_input",
+        tool_name=getattr(tool_context, "tool_name", None),
+    )
+    LOG.info("copilot output policy tool guardrail verdict", **trace_data)
+    if not verdict.allowed:
+        return ToolGuardrailFunctionOutput.reject_content(
+            format_output_policy_tool_error(verdict),
+            output_info=trace_data,
+        )
+    return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
+
+
+_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
+    guardrail_function=_workflow_yaml_output_policy_guardrail,
+    name="workflow_yaml_output_policy_guardrail",
+)
 
 
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
@@ -859,6 +905,22 @@ async def _update_workflow(
         credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
         if credential_error is not None:
             return {"ok": False, "error": credential_error}
+
+    output_policy_verdict = evaluate_output_policy(
+        request_policy=getattr(ctx, "request_policy", None),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=params,
+    )
+    if not output_policy_verdict.allowed:
+        LOG.info(
+            "copilot output policy tool body verdict",
+            **output_policy_verdict_to_trace_data(
+                output_policy_verdict,
+                surface="tool_body",
+                tool_name="update_workflow",
+            ),
+        )
+        return {"ok": False, "error": format_output_policy_tool_error(output_policy_verdict)}
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
@@ -3595,7 +3657,10 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     update_repeated_failure_state(copilot_ctx, result)
 
 
-@function_tool(name_override="update_workflow")
+@function_tool(
+    name_override="update_workflow",
+    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
+)
 async def update_workflow_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
@@ -3795,6 +3860,7 @@ async def get_run_results_tool(
     name_override="update_and_run_blocks",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
+    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
