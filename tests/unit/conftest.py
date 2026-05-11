@@ -1,15 +1,23 @@
 """Shared pytest fixtures and setup for unit tests."""
 
 # -- begin speed up unit tests
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from tests.unit.force_stub_app import start_forge_stub_app
+
+# Wire structlog through stdlib so caplog can capture log records in tests.
+structlog.configure(
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
 
 # NOTE(jdo): uncomment below to run tests faster, if you're targetting smth
 # that does not need the full app context
