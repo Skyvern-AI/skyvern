@@ -1,7 +1,6 @@
 import ast
 import asyncio
 import base64
-import copy
 import hashlib
 import importlib.util
 import json
@@ -605,15 +604,15 @@ async def _record_output_parameter_value(
     organization_id: str,
     output: dict[str, Any] | list | str | None,
     label: str | None = None,
-) -> None:
+) -> OutputParameter | None:
     if not label:
-        return
+        return None
     # TODO support this in the future
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     # get the workflow
     workflow = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
     if not workflow:
-        return
+        return None
 
     # get the output_paramter
     output_parameter = workflow.get_output_parameter(label)
@@ -638,6 +637,7 @@ async def _record_output_parameter_value(
         output_parameter_id=output_parameter.output_parameter_id,
         value=output,
     )
+    return output_parameter
 
 
 async def _handle_script_termination(
@@ -816,7 +816,7 @@ async def _update_workflow_block(
             ai_fallback_triggered=ai_fallback_triggered,
         )
 
-        await _record_output_parameter_value(
+        recorded_output_parameter = await _record_output_parameter_value(
             context.workflow_run_id,
             context.workflow_id,
             context.organization_id,
@@ -831,7 +831,7 @@ async def _update_workflow_block(
             and context.parent_workflow_run_block_id
             and workflow_run_block_id != context.parent_workflow_run_block_id
         ):
-            _append_to_loop_output(final_output, label)
+            _append_to_loop_output(final_output, label, output_parameter=recorded_output_parameter)
 
     except Exception as e:
         LOG.warning(
@@ -848,31 +848,53 @@ async def _run_cached_function(cached_fn: Callable) -> Any:
     return await cached_fn(page=run_context.page, context=run_context)
 
 
-def _append_to_loop_output(output: Any, label: str | None = None) -> None:
-    """If executing inside a for_loop, collect this block's output for loop aggregation"""
+def _append_to_loop_output(
+    output: Any,
+    label: str | None = None,
+    output_parameter: OutputParameter | None = None,
+) -> None:
+    """If executing inside a for_loop, collect this block's output for loop aggregation.
+
+    Emits the legacy ``List[List[{loop_value, output_parameter, output_value}]]`` shape so
+    cached-path webhook payloads match the agentic ForLoopBlock.execute contract that
+    downstream consumers parse against. When ``output_parameter`` is provided we preserve
+    the real persisted ID; otherwise we synthesize a key-only fallback.
+    """
     context = skyvern_context.current()
     if not context or context.loop_output_values is None or context.loop_metadata is None:
         return
-    # Read the current loop item's raw value from loop metadata
-    loop_value = context.loop_metadata.get("current_value")
-    current_value: Any = loop_value
-    # If the loop value is a dictionary, we'll create a safe copy so we can
-    # enrich it with block output data without mutating the original object.
-    # Only copy downloaded_files here — extracted_information is already present
-    # in output_value and copying it into current_value causes duplication when
-    # _collect_extracted_information recursively walks both fields.
-    if isinstance(loop_value, dict):
-        current_value = copy.deepcopy(loop_value)
-        if isinstance(output, dict):
-            if "downloaded_files" in output:
-                current_value["downloaded_files"] = output.get("downloaded_files")
+    if not label:
+        # No label = no output_parameter.key to route on; emit a warning so the
+        # drop is visible (callers passing label="" defensively still get logged).
+        LOG.warning("Skipping loop output append: missing block label")
+        return
 
-    context.loop_output_values.append(
+    loop_value = context.loop_metadata.get("current_value")
+
+    if output_parameter is None:
+        # Fallback when the caller can't hand us the workflow's persisted
+        # OutputParameter. Synthesizes the same key the legacy path uses so
+        # consumers that read .key still match; consumers that read
+        # output_parameter_id get a fresh UUID rather than the persisted one.
+        output_parameter = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"{label}_output",
+            workflow_id=context.workflow_id or "",
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+        )
+
+    # Defensive: the loop generator should have appended the current iteration's
+    # sub-list before yielding, but if an inner block calls this before that
+    # happened, fall back to creating one rather than raising IndexError.
+    if not context.loop_output_values:
+        context.loop_output_values.append([])
+    context.loop_output_values[-1].append(
         {
             "loop_value": loop_value,
-            "current_value": current_value,
+            "output_parameter": output_parameter,
             "output_value": output,
-            "label": label,
         }
     )
 
@@ -1924,7 +1946,11 @@ async def run_task(
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
-        _append_to_loop_output(block_output.output_parameter_value, label)
+        _append_to_loop_output(
+            block_output.output_parameter_value,
+            label,
+            output_parameter=block_validation_output.output_parameter,
+        )
         return block_output.output_parameter_value
 
 
@@ -2464,7 +2490,11 @@ async def extract(
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
-        _append_to_loop_output(block_result.output_parameter_value, label)
+        _append_to_loop_output(
+            block_result.output_parameter_value,
+            label,
+            output_parameter=block_validation_output.output_parameter,
+        )
         return block_result.output_parameter_value
 
 
@@ -2568,7 +2598,11 @@ async def execute_validation(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
-    _append_to_loop_output(result.output_parameter_value, label)
+    _append_to_loop_output(
+        result.output_parameter_value,
+        label,
+        output_parameter=block_validation_output.output_parameter,
+    )
     return result
 
 
@@ -2797,7 +2831,11 @@ async def run_code(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
-    _append_to_loop_output(block_result.output_parameter_value, label)
+    _append_to_loop_output(
+        block_result.output_parameter_value,
+        label,
+        output_parameter=block_validation_output.output_parameter,
+    )
     return cast(dict[str, Any], block_result.output_parameter_value)
 
 
@@ -3040,7 +3078,11 @@ async def trigger_workflow(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
-    _append_to_loop_output(result.output_parameter_value, label)
+    _append_to_loop_output(
+        result.output_parameter_value,
+        label,
+        output_parameter=block_validation_output.output_parameter,
+    )
     return result.output_parameter_value
 
 
@@ -3067,7 +3109,11 @@ async def prompt(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
-    _append_to_loop_output(result.output_parameter_value, label)
+    _append_to_loop_output(
+        result.output_parameter_value,
+        label,
+        output_parameter=block_validation_output.output_parameter,
+    )
     return result.output_parameter_value
 
 
@@ -3182,6 +3228,11 @@ async def loop(
                     "downloaded_file_signatures_before_iteration": downloaded_file_signatures_before_iteration,
                 }
             workflow_run_context.update_block_metadata(block_validation_output.label, loop_metadata)
+            # Open a fresh per-iteration sub-list so inner blocks aggregate into it,
+            # matching ForLoopBlock.execute's outputs_with_loop_values shape.
+            # Invariant: loop_output_values was just set to [] above (step 5 setup).
+            assert block_validation_output.context.loop_output_values is not None
+            block_validation_output.context.loop_output_values.append([])
             # Build the SkyvernLoopItem for this loop
             yield SkyvernLoopItem(index, value)
 
@@ -3327,6 +3378,11 @@ async def while_loop(
                 }
             workflow_run_context.update_block_metadata(block_validation_output.label, loop_metadata)
 
+            # Open a fresh per-iteration sub-list so inner blocks aggregate into it,
+            # matching ForLoopBlock.execute's outputs_with_loop_values shape.
+            # Invariant: loop_output_values was set to [] before the while True loop.
+            assert block_validation_output.context.loop_output_values is not None
+            block_validation_output.context.loop_output_values.append([])
             yield SkyvernLoopItem(loop_idx, None)
             loop_idx += 1
 
