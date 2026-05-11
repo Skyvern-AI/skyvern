@@ -577,6 +577,8 @@ class ObservedElement:
     tag: str
     value: str | None = None
     options: list[str] | None = None
+    match_index: int = 0
+    needs_disambiguation: bool = False
 
 
 @dataclass
@@ -635,9 +637,19 @@ async def do_observe(
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
 
     total = len(all_elements)
+
+    # Compute group sizes against the FULL filtered list (pre-cap) so that
+    # kept elements colliding with off-cap siblings still get disambiguated.
+    full_group_size: dict[tuple[str, str], int] = {}
+    for elem in all_elements:
+        full_group_size[(elem.get("role", ""), elem.get("name", ""))] = (
+            full_group_size.get((elem.get("role", ""), elem.get("name", "")), 0) + 1
+        )
+
     capped = all_elements[:max_elements]
 
     observed: list[ObservedElement] = []
+    group_counts: dict[tuple[str, str], int] = {}
     for i, elem in enumerate(capped):
         role = elem.get("role", "")
         name = elem.get("name", "")
@@ -647,6 +659,10 @@ async def do_observe(
         if value and _is_password_field(role, name):
             value = "***"
 
+        key = (role, name)
+        match_index = group_counts.get(key, 0)
+        group_counts[key] = match_index + 1
+
         observed.append(
             ObservedElement(
                 ref=f"e{i}",
@@ -655,6 +671,8 @@ async def do_observe(
                 tag=_ROLE_TO_TAG.get(role, ""),
                 value=value,
                 options=_extract_options(elem),
+                match_index=match_index,
+                needs_disambiguation=full_group_size[key] > 1,
             )
         )
 
@@ -669,21 +687,20 @@ async def do_observe(
 
 def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
     """Serialize observed elements to dicts, filtering empty display fields."""
-    return [
-        {
-            k: v
-            for k, v in {
-                "ref": e.ref,
-                "role": e.role,
-                "name": e.name,
-                "tag": e.tag,
-                "value": e.value,
-                "options": e.options,
-            }.items()
-            if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")
+    result: list[dict[str, Any]] = []
+    for e in elements:
+        fields: dict[str, Any] = {
+            "ref": e.ref,
+            "role": e.role,
+            "name": e.name,
+            "tag": e.tag,
+            "value": e.value,
+            "options": e.options,
         }
-        for e in elements
-    ]
+        if e.needs_disambiguation:
+            fields["match_index"] = e.match_index
+        result.append({k: v for k, v in fields.items() if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")})
+    return result
 
 
 def ref_to_selector(elem: dict[str, Any]) -> str:
@@ -692,8 +709,12 @@ def ref_to_selector(elem: dict[str, Any]) -> str:
     name = elem.get("name", "")
     if name:
         escaped = name.replace('"', '\\"')
-        return f'role={role}[name="{escaped}"]'
-    return f"role={role}"
+        base = f'role={role}[name="{escaped}"]'
+    else:
+        base = f"role={role}"
+    if "match_index" in elem:
+        return f"{base} >> nth={elem['match_index']}"
+    return base
 
 
 # ---------------------------------------------------------------------------
