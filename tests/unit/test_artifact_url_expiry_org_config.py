@@ -266,10 +266,146 @@ class TestGetShareLinksWithBundleSupport:
         _ = resolve  # mark used
 
 
+# ---------------------------------------------------------------------------
+# Non-bundled artifacts are served via the signed content URL too.
+# Migrating customer-visible URL surfaces (task / workflow / artifact-listing
+# responses) off raw S3 presigned URLs onto short ``/v1/artifacts/{id}/content``
+# URLs. Single fix point: the ArtifactManager helpers stop branching on
+# ``bundle_key`` and always mint the Skyvern-origin signed URL.
+# ---------------------------------------------------------------------------
+
+
+def _make_artifact(
+    artifact_id: str,
+    *,
+    bundle_key: str | None = None,
+    artifact_type: "ArtifactType | None" = None,  # type: ignore[name-defined]  # noqa: F821
+) -> "Artifact":  # type: ignore[name-defined]  # noqa: F821
+    from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+
+    now = datetime.now(timezone.utc)
+    return Artifact(
+        artifact_id=artifact_id,
+        artifact_type=artifact_type or ArtifactType.SCREENSHOT_FINAL,
+        uri=f"s3://artifacts/{artifact_id}.png",
+        bundle_key=bundle_key,
+        organization_id="o_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+class TestGetShareLinkAlwaysUsesSignedContentUrl:
+    """Every call into ``get_share_link[s]`` must mint a Skyvern-origin signed
+    URL — bundled or not. STORAGE.get_share_link must not be called."""
+
+    @pytest.mark.asyncio
+    async def test_get_share_link_non_bundled_uses_signed_content_url(self) -> None:
+        manager = ArtifactManager()
+        artifact = _make_artifact("a_42")  # no bundle_key
+
+        resolve = AsyncMock(return_value=12 * 3600)
+        with (
+            patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
+            patch.object(
+                manager, "_bundle_content_url", return_value="https://api/v1/artifacts/a_42/content?sig=x"
+            ) as bundle,
+            patch("skyvern.forge.sdk.artifact.manager.app") as app,
+        ):
+            app.STORAGE.get_share_link = AsyncMock(return_value="https://bucket.s3.amazonaws.com/legacy?sig=y")
+            url = await manager.get_share_link(artifact)
+
+        assert url == "https://api/v1/artifacts/a_42/content?sig=x"
+        bundle.assert_called_once()
+        # The fallback path must not be used — we never want to leak presigned URLs.
+        app.STORAGE.get_share_link.assert_not_awaited()
+        resolve.assert_awaited_once_with("o_1")
+
+    @pytest.mark.asyncio
+    async def test_get_share_link_bundled_still_uses_signed_content_url(self) -> None:
+        """Bundled path was already correct. Don't regress it."""
+        manager = ArtifactManager()
+        artifact = _make_artifact("a_b", bundle_key="step.json")
+
+        resolve = AsyncMock(return_value=12 * 3600)
+        with (
+            patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
+            patch.object(
+                manager, "_bundle_content_url", return_value="https://api/v1/artifacts/a_b/content?sig=x"
+            ) as bundle,
+            patch("skyvern.forge.sdk.artifact.manager.app") as app,
+        ):
+            app.STORAGE.get_share_link = AsyncMock()
+            url = await manager.get_share_link(artifact)
+
+        assert url == "https://api/v1/artifacts/a_b/content?sig=x"
+        bundle.assert_called_once()
+        # bundle_key passed as artifact_name (existing behaviour preserved)
+        assert bundle.call_args.kwargs["artifact_name"] == "step.json"
+        app.STORAGE.get_share_link.assert_not_awaited()
+
+
+class TestGetShareLinksWithBundleSupportAlwaysUsesSignedContentUrl:
+    """The list helper must mint signed URLs for every artifact regardless of
+    ``bundle_key``. STORAGE.get_share_links must not be called."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_all_use_signed_content_url(self) -> None:
+        manager = ArtifactManager()
+        artifacts = [
+            _make_artifact("a_plain"),  # non-bundled
+            _make_artifact("a_bundled", bundle_key="step.json"),
+            _make_artifact("a_plain2"),
+        ]
+
+        resolve = AsyncMock(return_value=2 * 3600)
+        with (
+            patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
+            patch.object(
+                manager,
+                "_bundle_content_url",
+                side_effect=lambda artifact_id, **_: f"https://api/v1/artifacts/{artifact_id}/content",
+            ) as bundle,
+            patch("skyvern.forge.sdk.artifact.manager.app") as app,
+        ):
+            app.STORAGE.get_share_links = AsyncMock(return_value=["https://bucket.s3.amazonaws.com/leak"])
+            result = await manager.get_share_links_with_bundle_support(artifacts)
+
+        assert result == [
+            "https://api/v1/artifacts/a_plain/content",
+            "https://api/v1/artifacts/a_bundled/content",
+            "https://api/v1/artifacts/a_plain2/content",
+        ]
+        # One mint per artifact, one expiry resolution for the batch.
+        assert bundle.call_count == 3
+        assert resolve.await_count == 1
+        app.STORAGE.get_share_links.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_per_org_expiry_propagates_to_non_bundled(self) -> None:
+        """The per-org TTL override must reach non-bundled artifacts too — they
+        used to bypass the resolver entirely on the presigned-URL path."""
+        manager = ArtifactManager()
+        artifacts = [_make_artifact("a_1")]
+
+        resolve = AsyncMock(return_value=3 * 3600)
+        with (
+            patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
+            patch.object(manager, "_bundle_content_url", return_value="https://x") as bundle,
+            patch("skyvern.forge.sdk.artifact.manager.app") as app,
+        ):
+            app.STORAGE.get_share_links = AsyncMock()
+            await manager.get_share_links_with_bundle_support(artifacts)
+
+        assert bundle.call_args.kwargs["expiry_seconds"] == 3 * 3600
+
+
 __all__ = [
     "TestArtifactContentResponseHeaders",
     "TestBuildSignedContentUrl",
+    "TestGetShareLinkAlwaysUsesSignedContentUrl",
     "TestGetShareLinksWithBundleSupport",
+    "TestGetShareLinksWithBundleSupportAlwaysUsesSignedContentUrl",
     "TestOrganizationUpdateSchema",
     "TestResolveArtifactUrlExpirySeconds",
 ]
