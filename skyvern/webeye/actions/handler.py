@@ -4422,12 +4422,6 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
-# Sentinel for cached_age_seconds when the cache backend doesn't track per-key
-# write time (Redis tier) or returns a None age. Distinct from 0.0 so Datadog
-# can split "just-cached" from "age unknown" in shadow comparison events.
-_UNKNOWN_CACHE_AGE_SENTINEL = -1.0
-
-
 def _schedule_extraction_shadow_check_for_hit(
     *,
     task: Task,
@@ -4480,6 +4474,12 @@ def _schedule_extraction_shadow_check_for_hit(
             )
         return fresh
 
+    # Bind prompt_name + cache_path so Datadog can split the shared
+    # extract_information.shadow_comparison stream by call site.
+    shadow_logger = structlog.get_logger().bind(
+        prompt_name="extract-information",
+        cache_path="handler",
+    )
     extraction_shadow.schedule_shadow_check(
         gate=_shadow_gate,
         cache_key=cache_key,
@@ -4488,6 +4488,7 @@ def _schedule_extraction_shadow_check_for_hit(
         cached_age_seconds=cached_age_seconds,
         llm_call=_shadow_llm_call,
         schema=shadow_schema,
+        logger=shadow_logger,
     )
 
 
@@ -4665,7 +4666,7 @@ async def extract_information_for_navigation_goal(
                 cached_value=lookup_result.value,
                 cached_age_seconds=lookup_result.age_seconds
                 if lookup_result.age_seconds is not None
-                else _UNKNOWN_CACHE_AGE_SENTINEL,
+                else extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
                 scraped_page=scraped_page,
                 llm_key_override=llm_key_override,
                 extract_information_prompt=extract_information_prompt,
@@ -4765,7 +4766,7 @@ async def extract_information_for_navigation_goal(
                 workflow_run_id=task.workflow_run_id,
                 cache_key=cache_key,
                 cached_value=cross_run_value,
-                cached_age_seconds=_UNKNOWN_CACHE_AGE_SENTINEL,
+                cached_age_seconds=extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
                 scraped_page=scraped_page,
                 llm_key_override=llm_key_override,
                 extract_information_prompt=extract_information_prompt,
