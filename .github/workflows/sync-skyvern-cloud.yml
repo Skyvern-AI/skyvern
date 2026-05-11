@@ -70,6 +70,11 @@ jobs:
               echo "GIT_EMAIL=andrew@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=andrewneilson" >> $GITHUB_OUTPUT
               ;;
+            trevor-cheung)
+              echo "GH_PAT=${{ secrets.TREVOR_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=trevor@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=trevor-cheung" >> $GITHUB_OUTPUT
+              ;;
             claude\[bot\])
               echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=209825114+claude[bot]@users.noreply.github.com" >> $GITHUB_OUTPUT

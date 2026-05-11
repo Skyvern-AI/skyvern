@@ -9,7 +9,7 @@ permissions:
 jobs:
   auto-merge:
     if: >
-      contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && contains('suchintan,wintonzheng,LawyZheng,pedrohsdb,marcmuon,celalzamanoglu,AronPerez,andrewneilson,claude[bot],copilot-swe-agent[bot]', github.event.pull_request.user.login)
+      contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && contains('suchintan,wintonzheng,LawyZheng,pedrohsdb,marcmuon,celalzamanoglu,AronPerez,andrewneilson,trevor-cheung,claude[bot],copilot-swe-agent[bot]', github.event.pull_request.user.login)
 
     runs-on: ubuntu-latest
     steps:
@@ -45,6 +45,9 @@ jobs:
               ;;
             andrewneilson)
               echo "GH_PAT=${{ secrets.ANDREW_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            trevor-cheung)
+              echo "GH_PAT=${{ secrets.TREVOR_GH_PAT }}" >> $GITHUB_OUTPUT
               ;;
             AronPerez)
               echo "GH_PAT=${{ secrets.AARON_GH_PAT }}" >> $GITHUB_OUTPUT
