@@ -3230,6 +3230,7 @@ class SkyvernPage(Page):
         self,
         navigation_goal: str,
         max_steps: int = 5,
+        validate_first: bool = False,
     ) -> None:
         """Activate the AI agent from the CURRENT page position to achieve a goal.
 
@@ -3240,6 +3241,11 @@ class SkyvernPage(Page):
         Args:
             navigation_goal: The goal for the AI agent to achieve from the current page.
             max_steps: Maximum number of agent steps before giving up. Defaults to 5.
+            validate_first: When True, run an AI validation before the first
+                action to short-circuit if the page already satisfies the goal.
+                Defaults to False because the documented call site (else branch
+                of ``classify``) cannot be on the success state — pass True for
+                defensive calls that may invoke this on a possibly-complete page.
 
         Raises:
             Exception: If the element fallback fails or exceeds max_steps.
@@ -3260,6 +3266,7 @@ class SkyvernPage(Page):
         return await self._ai.ai_element_fallback(
             navigation_goal=navigation_goal,
             max_steps=max_steps,
+            validate_first=validate_first,
         )
 
     async def prompt(
