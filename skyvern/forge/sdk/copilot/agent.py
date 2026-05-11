@@ -438,12 +438,26 @@ _PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re
 _PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
 _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
-    "It has not been verified end-to-end."
+    "It has not been tested or verified end-to-end."
+)
+_UNVALIDATED_DISCLOSURE_PHRASES = (
+    "not tested",
+    "not been tested",
+    "not verified",
+    "not been verified",
+    "hasn't been tested",
+    "hasn't been verified",
+    "unvalidated",
 )
 
 
 def _ensure_unvalidated_proposal_affordance(user_response: str) -> str:
-    if _PROPOSAL_ACCEPT_UI_ACTION_RE.search(user_response) and _PROPOSAL_REJECT_UI_ACTION_RE.search(user_response):
+    lower = user_response.lower()
+    has_ui_affordance = bool(
+        _PROPOSAL_ACCEPT_UI_ACTION_RE.search(user_response) and _PROPOSAL_REJECT_UI_ACTION_RE.search(user_response)
+    )
+    has_unvalidated_disclosure = any(phrase in lower for phrase in _UNVALIDATED_DISCLOSURE_PHRASES)
+    if has_ui_affordance and has_unvalidated_disclosure:
         return user_response
     if user_response.strip():
         return f"{user_response}\n\n{_UNVALIDATED_PROPOSAL_AFFORDANCE}"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
@@ -11,6 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -20,6 +21,33 @@ LOG = structlog.get_logger()
 PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
+ClarificationReason = Literal[
+    "none",
+    "raw_secret",
+    "credential_name_unresolved",
+    "credential_invention_requested",
+    "ambiguous_loop_edit",
+    "missing_conditional_condition",
+    "missing_target_context",
+]
+_VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
+_PRE_RESOLUTION_CLARIFICATION_REASONS = {
+    "credential_invention_requested",
+    "ambiguous_loop_edit",
+    "missing_conditional_condition",
+    "missing_target_context",
+}
+_REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
+    "ambiguous_loop_edit",
+    "missing_conditional_condition",
+    "missing_target_context",
+}
+_RAW_SECRET_QUESTION = (
+    "Please do not paste raw login credentials or secrets in chat because they can enter model telemetry and execution traces. "
+    "Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD."
+)
+_SAVED_CREDENTIAL_NAME_QUESTION = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
+_STORED_CREDENTIAL_URL_QUESTION = "Which website or login page should I use to look up the stored credential?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _RAW_SECRET_PATTERNS = (
     re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
@@ -31,6 +59,8 @@ _RAW_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
+# Reused by output-policy guardrails as syntactic leak backstops.
+RAW_SECRET_PATTERNS = _RAW_SECRET_PATTERNS
 
 
 @dataclass
@@ -49,11 +79,13 @@ class RequestPolicy:
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
     raw_secret_detected: bool = False
+    clarification_reason: ClarificationReason = "none"
 
     def to_trace_data(self) -> dict[str, Any]:
         return {
             "testing_intent": self.testing_intent,
             "credential_input_kind": self.credential_input_kind,
+            "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
@@ -66,6 +98,7 @@ class RequestPolicy:
         lines = [
             f"testing_intent: {self.testing_intent}",
             f"credential_input_kind: {self.credential_input_kind}",
+            f"clarification_reason: {self.clarification_reason}",
             f"allow_update_workflow: {self.allow_update_workflow}",
             f"allow_run_blocks: {self.allow_run_blocks}",
             f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
@@ -94,6 +127,12 @@ def _raw_secret_detected(text: str) -> bool:
     return any(pattern.search(text or "") for pattern in _RAW_SECRET_PATTERNS)
 
 
+def _coerce_clarification_reason(value: Any) -> ClarificationReason:
+    if value in _VALID_CLARIFICATION_REASONS:
+        return cast(ClarificationReason, value)
+    return "none"
+
+
 def redact_raw_secrets_for_prompt(text: str) -> str:
     redacted = text or ""
     for pattern in _RAW_SECRET_PATTERNS:
@@ -117,7 +156,10 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
+        clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
     )
+    if policy.credential_input_kind == "raw_secret":
+        policy.clarification_reason = "raw_secret"
     return policy
 
 
@@ -138,7 +180,12 @@ async def _classify_request(
 ) -> RequestPolicy:
     ids = _credential_ids(user_message)
     if _raw_secret_detected(user_message):
-        return RequestPolicy(credential_input_kind="raw_secret", credential_refs=ids, raw_secret_detected=True)
+        return RequestPolicy(
+            credential_input_kind="raw_secret",
+            credential_refs=ids,
+            raw_secret_detected=True,
+            clarification_reason="raw_secret",
+        )
     if handler is None:
         return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
 
@@ -188,10 +235,18 @@ def _safe_label(credential: Credential) -> str:
     return " - ".join(parts)
 
 
-def _block(policy: RequestPolicy, question: str, candidates: list[Credential] | None = None) -> None:
+def _block(
+    policy: RequestPolicy,
+    question: str,
+    candidates: list[Credential] | None = None,
+    *,
+    reason: ClarificationReason | None = None,
+) -> None:
     policy.requires_user_clarification = True
     policy.user_response_policy = "ask_clarification"
     policy.allow_update_workflow = policy.allow_run_blocks = False
+    if reason is not None:
+        policy.clarification_reason = reason
     if candidates:
         question += "\n\nSafe matches:\n" + "\n".join(f"- {_safe_label(candidate)}" for candidate in candidates)
     policy.clarification_question = question
@@ -223,11 +278,72 @@ def _match_by_url(credentials: list[Credential], urls: list[str]) -> list[Creden
 
 
 def _clarification_question(policy: RequestPolicy) -> str:
+    if policy.clarification_reason == "raw_secret":
+        return _RAW_SECRET_QUESTION
+    if policy.clarification_reason == "credential_name_unresolved":
+        if policy.credential_input_kind == "website_stored_credential":
+            return _STORED_CREDENTIAL_URL_QUESTION
+        return _SAVED_CREDENTIAL_NAME_QUESTION
+    if policy.clarification_reason == "credential_invention_requested":
+        return (
+            "I cannot invent a credential ID. Please provide a valid saved credential ID, "
+            "select an existing credential, or create one in the Credentials UI."
+        )
+    if policy.clarification_reason == "ambiguous_loop_edit":
+        return "Which block or blocks should go inside the loop, and what should the loop iterate over or stop on?"
+    if policy.clarification_reason == "missing_conditional_condition":
+        return "What condition should trigger this conditional route?"
+    if policy.clarification_reason == "missing_target_context":
+        if policy.credential_input_kind == "website_stored_credential":
+            return _STORED_CREDENTIAL_URL_QUESTION
+        return "Which page or URL should the workflow go to?"
     if policy.credential_input_kind == "credential_name":
-        return "Which saved credential name should I use? Please provide the exact credential name or a credential ID beginning with cred_."
+        return _SAVED_CREDENTIAL_NAME_QUESTION
     if policy.credential_input_kind == "website_stored_credential":
-        return "Which website or login page should I use to look up stored credentials?"
+        return _STORED_CREDENTIAL_URL_QUESTION
     return "I need one more detail before I can build and test this workflow safely."
+
+
+def _has_resolvable_credential_scope(policy: RequestPolicy) -> bool:
+    if policy.credential_input_kind == "credential_id":
+        return any(ref.startswith("cred_") for ref in policy.credential_refs)
+    if policy.credential_input_kind == "credential_name":
+        return bool(policy.credential_refs)
+    if policy.credential_input_kind == "website_stored_credential":
+        return bool(policy.login_page_urls)
+    return False
+
+
+def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
+    if policy.credential_input_kind not in ("credential_id", "credential_name"):
+        return
+    if not policy.credential_refs:
+        return
+    if policy.clarification_reason not in _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS:
+        return
+    policy.clarification_reason = "credential_name_unresolved"
+
+
+def _previous_credential_clarification_was_asked(global_llm_context: str) -> bool:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return any(
+        decision.startswith("request-policy clarification required:") and "/credential_name_unresolved" in decision
+        for decision in structured.decisions_made
+    )
+
+
+def _can_defer_unresolved_credential_name_for_draft(
+    policy: RequestPolicy,
+    *,
+    global_llm_context: str,
+) -> bool:
+    if policy.clarification_reason != "credential_name_unresolved":
+        return False
+    if _has_resolvable_credential_scope(policy):
+        return True
+    if _previous_credential_clarification_was_asked(global_llm_context):
+        return True
+    return False
 
 
 async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> None:
@@ -244,6 +360,7 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
             _block(
                 policy,
                 f"The credential ID(s) {formatted} were not found in this organization. Please provide a valid saved credential ID or explicitly ask for an unvalidated draft that will not be run yet.",
+                reason="credential_name_unresolved",
             )
         elif policy.invalid_credential_ids:
             policy.allow_run_blocks = False
@@ -251,13 +368,21 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
         return
 
     if policy.credential_input_kind == "credential_name" and not policy.credential_refs:
+        if policy.testing_intent == "skip_test" and policy.allow_missing_credentials_in_draft:
+            policy.allow_run_blocks = False
+            return
         _block(
             policy,
-            "Which saved credential name should I use? Please provide the exact credential name or a credential ID beginning with cred_.",
+            _SAVED_CREDENTIAL_NAME_QUESTION,
+            reason="credential_name_unresolved",
         )
         return
     if policy.credential_input_kind == "website_stored_credential" and not policy.login_page_urls:
-        _block(policy, "Which website or login page should I use to look up stored credentials?")
+        _block(
+            policy,
+            _STORED_CREDENTIAL_URL_QUESTION,
+            reason="missing_target_context",
+        )
         return
     if policy.credential_input_kind not in ("credential_name", "website_stored_credential"):
         return
@@ -270,7 +395,10 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
                 policy.resolved_credentials.append(matches[0])
             elif matches:
                 _block(
-                    policy, "I found multiple stored credentials with that exact name. Which one should I use?", matches
+                    policy,
+                    "I found multiple stored credentials with that exact name. Which one should I use?",
+                    matches,
+                    reason="credential_name_unresolved",
                 )
                 return
             elif policy.testing_intent == "skip_test":
@@ -279,6 +407,7 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
                 _block(
                     policy,
                     f"I could not find a stored credential named `{ref}`. Please choose an existing credential by exact name or a credential ID beginning with cred_.",
+                    reason="credential_name_unresolved",
                 )
                 return
         return
@@ -287,11 +416,17 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
     if len(matches) == 1:
         policy.resolved_credentials = matches
     elif matches:
-        _block(policy, "I found multiple stored credentials for that login page. Which one should I use?", matches)
+        _block(
+            policy,
+            "I found multiple stored credentials for that login page. Which one should I use?",
+            matches,
+            reason="credential_name_unresolved",
+        )
     else:
         _block(
             policy,
             "I could not find a stored credential for that login page. Please select a saved credential by exact name or a credential ID beginning with cred_, or create one in the Credentials UI.",
+            reason="credential_name_unresolved",
         )
 
 
@@ -306,21 +441,42 @@ async def build_request_policy(
 ) -> RequestPolicy:
     policy = await _classify_request(user_message, workflow_yaml, chat_history, global_llm_context, handler)
     policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
+    _prioritize_credential_clarification(policy)
     if policy.testing_intent == "skip_test":
         policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
-        if policy.credential_input_kind != "raw_secret":
-            policy.requires_user_clarification = False
+        if (
+            policy.credential_input_kind != "raw_secret"
+            and policy.clarification_reason not in _PRE_RESOLUTION_CLARIFICATION_REASONS
+        ):
+            if (
+                policy.clarification_reason == "credential_name_unresolved"
+                and not _can_defer_unresolved_credential_name_for_draft(
+                    policy,
+                    global_llm_context=global_llm_context,
+                )
+            ):
+                policy.requires_user_clarification = True
+                policy.allow_update_workflow = False
+            else:
+                policy.requires_user_clarification = False
+                policy.allow_missing_credentials_in_draft = True
 
     if policy.raw_secret_detected:
         _block(
             policy,
-            "Please do not paste raw login credentials or secrets in chat because they can enter model telemetry and execution traces. Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD.",
+            _RAW_SECRET_QUESTION,
+            reason="raw_secret",
         )
-    elif policy.requires_user_clarification:
+    elif policy.requires_user_clarification and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+        _block(policy, _clarification_question(policy))
+    elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy):
         _block(policy, _clarification_question(policy))
     else:
         try:
+            # A resolvable credential scope can override the classifier's
+            # conservative clarification flag; _resolve_credentials will block
+            # again if the lookup is missing or ambiguous.
+            policy.requires_user_clarification = False
             await _resolve_credentials(policy, organization_id)
         except Exception:
             LOG.warning(
