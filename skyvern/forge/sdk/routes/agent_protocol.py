@@ -191,12 +191,18 @@ async def run_task(
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
+    skyvern_ctx = skyvern_context.current()
+    # Per-request distinct_id makes the TTLCache effectively single-use here; that's the
+    # price of true %-rollout randomization on a flag that's only checked once per request.
+    force_task_v1_distinct_id = (
+        skyvern_ctx.request_id if skyvern_ctx and skyvern_ctx.request_id else current_org.organization_id
+    )
     if (
         run_request.engine == RunEngine.skyvern_v2
         and not run_request.publish_workflow
         and await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "FORCE_TASK_V1",
-            current_org.organization_id,
+            force_task_v1_distinct_id,
             properties={"organization_id": current_org.organization_id},
         )
     ):
