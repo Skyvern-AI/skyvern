@@ -190,6 +190,7 @@ dev = [
     "types-requests>=2.31.0.2,<3",
     "pytest>=7.4.0,<8",
     "pytest-asyncio>=0.21.1,<0.22",
+    "pytest-split>=0.10.0,<1",
     # Needed by tests/unit/test_llm_handler_tracing.py which exercises the LLM
     # chokepoint's OTEL instrumentation. Cloud runtime also uses this via
     # cloud/observability/, but that ships via the `cloud` group's transitive
