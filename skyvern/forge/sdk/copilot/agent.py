@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,9 +30,20 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
+from skyvern.forge.sdk.copilot.output_policy import (
+    UNVALIDATED_DISCLOSURE_PHRASES,
+    WORKFLOW_PRESENT_SENTINEL,
+    CopilotOutputKind,
+    OutputPolicyReason,
+    OutputPolicyVerdict,
+    derive_output_kind,
+    evaluate_output_policy,
+    hard_block_output_policy_verdict,
+    output_policy_verdict_from_trace_data,
+    output_policy_verdict_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
-    looks_like_workflow_delivery_claim,
     parse_final_response,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy, redact_raw_secrets_for_prompt
@@ -440,15 +452,6 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
-_UNVALIDATED_DISCLOSURE_PHRASES = (
-    "not tested",
-    "not been tested",
-    "not verified",
-    "not been verified",
-    "hasn't been tested",
-    "hasn't been verified",
-    "unvalidated",
-)
 
 
 def _ensure_unvalidated_proposal_affordance(user_response: str) -> str:
@@ -456,7 +459,7 @@ def _ensure_unvalidated_proposal_affordance(user_response: str) -> str:
     has_ui_affordance = bool(
         _PROPOSAL_ACCEPT_UI_ACTION_RE.search(user_response) and _PROPOSAL_REJECT_UI_ACTION_RE.search(user_response)
     )
-    has_unvalidated_disclosure = any(phrase in lower for phrase in _UNVALIDATED_DISCLOSURE_PHRASES)
+    has_unvalidated_disclosure = any(phrase in lower for phrase in UNVALIDATED_DISCLOSURE_PHRASES)
     if has_ui_affordance and has_unvalidated_disclosure:
         return user_response
     if user_response.strip():
@@ -591,10 +594,29 @@ def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
-            # REPLACE_WORKFLOW bypasses _update_workflow, so the post-emission
-            # reject has to run here too. Skip processing on detection; leave
-            # last_workflow / last_workflow_yaml at their pre-REPLACE values so
-            # the rejected YAML does not latch onto ctx.
+            inline_policy_verdict = hard_block_output_policy_verdict(
+                evaluate_output_policy(
+                    request_policy=ctx.request_policy,
+                    response_type=resp_type,
+                    user_response=str(user_response),
+                    workflow_yaml=workflow_yaml,
+                    tool_arguments=action_data,
+                    has_workflow_proposal=True,
+                    output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+                )
+            )
+            if not inline_policy_verdict.allowed:
+                return _build_output_policy_blocked_result(
+                    ctx,
+                    inline_policy_verdict,
+                    prior_global_llm_context=global_llm_context,
+                    prior_workflow_yaml=chat_request.workflow_yaml,
+                )
+            # REPLACE_WORKFLOW bypasses the update_workflow tool guardrail, so
+            # policy and post-emission rejects run here before YAML processing.
+            # The final-output policy pass still runs below; leave last_workflow
+            # / last_workflow_yaml unchanged until this candidate survives the
+            # inline checks.
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
                 _detect_new_banned_blocks,
@@ -696,19 +718,6 @@ def _translate_to_agent_result(
         last_workflow = None
         last_workflow_yaml = None
 
-    last_update_block_count = ctx.last_update_block_count
-    last_test_ok = ctx.last_test_ok
-    if (
-        resp_type == "REPLY"
-        and last_workflow is None
-        and last_update_block_count is None
-        and last_test_ok is None
-        and looks_like_workflow_delivery_claim(user_response)
-    ):
-        user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
-    if resp_type == "REPLY" and last_workflow is not None and unvalidated:
-        user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
-
     llm_context_raw = action_data.get("global_llm_context")
     structured = StructuredContext.from_json_str(global_llm_context)
     if isinstance(llm_context_raw, dict):
@@ -720,6 +729,51 @@ def _translate_to_agent_result(
         structured = StructuredContext.from_json_str(llm_context_raw)
     structured.merge_turn_summary(ctx.tool_activity)
     enriched_context = structured.to_json_str()
+    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    output_kind = derive_output_kind(
+        response_type=resp_type,
+        request_policy=ctx.request_policy,
+        updated_workflow=last_workflow,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        unvalidated=unvalidated,
+    )
+
+    output_policy_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type=resp_type,
+        user_response=str(user_response),
+        global_llm_context=enriched_context,
+        workflow_yaml=last_workflow_yaml,
+        has_workflow_proposal=last_workflow is not None,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        unvalidated=unvalidated,
+        output_kind=output_kind,
+    )
+    if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
+        user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
+        output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
+    if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
+        output_policy_verdict.remove(OutputPolicyReason.MISSING_PROPOSAL_STATE)
+    if OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in output_policy_verdict.reason_codes:
+        user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
+        output_policy_verdict.remove(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
+    LOG.info(
+        "copilot output policy final verdict",
+        **output_policy_verdict_to_trace_data(
+            output_policy_verdict,
+            surface="final_translation",
+            response_type=resp_type,
+        ),
+    )
+    if not output_policy_verdict.allowed:
+        return _build_output_policy_blocked_result(
+            ctx,
+            output_policy_verdict,
+            prior_global_llm_context=global_llm_context,
+            prior_workflow_yaml=chat_request.workflow_yaml,
+        )
 
     return AgentResult(
         user_response=str(user_response),
@@ -826,7 +880,9 @@ def _build_request_policy_clarification_result(
     prior_workflow_yaml: str | None,
 ) -> AgentResult:
     structured = StructuredContext.from_json_str(prior_global_llm_context)
-    structured.decisions_made.append(f"request-policy clarification required: {policy.credential_input_kind}")
+    structured.decisions_made.append(
+        f"request-policy clarification required: {policy.credential_input_kind}/{policy.clarification_reason}"
+    )
     return AgentResult(
         user_response=policy.clarification_question
         or "I need one more detail before I can build and test this workflow safely.",
@@ -835,6 +891,172 @@ def _build_request_policy_clarification_result(
         response_type="ASK_QUESTION",
         workflow_yaml=prior_workflow_yaml or None,
         workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+    )
+
+
+def _agent_output_to_text(agent_output: Any) -> str:
+    if isinstance(agent_output, str):
+        return agent_output
+    if hasattr(agent_output, "model_dump"):
+        try:
+            return json.dumps(agent_output.model_dump())
+        except Exception:
+            return str(agent_output)
+    try:
+        return json.dumps(agent_output, default=str)
+    except TypeError:
+        return str(agent_output)
+
+
+def _evaluate_copilot_final_output_policy(
+    ctx: CopilotContext,
+    agent_output: Any,
+) -> tuple[OutputPolicyVerdict, str]:
+    text = _agent_output_to_text(agent_output)
+    action_data = parse_final_response(text)
+    response_type = action_data.get("type", "REPLY")
+    if response_type not in COPILOT_RESPONSE_TYPES:
+        response_type = "REPLY"
+
+    workflow_yaml = None
+    if response_type == "REPLACE_WORKFLOW" and isinstance(action_data.get("workflow_yaml"), str):
+        workflow_yaml = action_data["workflow_yaml"]
+    elif isinstance(getattr(ctx, "last_workflow_yaml", None), str):
+        workflow_yaml = ctx.last_workflow_yaml
+
+    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    updated_workflow_for_kind = (
+        ctx.last_workflow if ctx.last_workflow is not None else WORKFLOW_PRESENT_SENTINEL if workflow_yaml else None
+    )
+    output_kind = derive_output_kind(
+        response_type=response_type,
+        request_policy=ctx.request_policy,
+        updated_workflow=updated_workflow_for_kind,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        # SDK output guardrails enforce hard blocks only; the final translation
+        # path handles soft unvalidated-proposal affordance rewrites.
+        unvalidated=False,
+    )
+    verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type=response_type,
+        user_response=str(action_data.get("user_response") or text),
+        global_llm_context=action_data.get("global_llm_context"),
+        workflow_yaml=workflow_yaml,
+        tool_arguments={"final_output": text},
+        has_workflow_proposal=bool(workflow_yaml or ctx.last_workflow is not None),
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        output_kind=output_kind,
+    )
+    return hard_block_output_policy_verdict(verdict), response_type
+
+
+def _build_copilot_input_guardrails(
+    InputGuardrailCls: Any,
+    GuardrailFunctionOutputCls: Any,
+) -> list[Any]:
+    # Guardrail classes are injected after importing the optional Agents SDK in
+    # run_copilot_agent, keeping module import safe when the SDK is unavailable.
+    def request_policy_guardrail(context: Any, _agent: Any, _input: Any) -> Any:
+        policy = getattr(getattr(context, "context", None), "request_policy", None)
+        blocked = isinstance(policy, RequestPolicy) and policy.user_response_policy == "ask_clarification"
+        if isinstance(policy, RequestPolicy):
+            trace_data = {
+                "surface": "agent_input",
+                "blocked": blocked,
+                "user_response_policy": policy.user_response_policy,
+                **policy.to_trace_data(),
+            }
+        else:
+            trace_data = {"surface": "agent_input", "blocked": False, "policy_present": False}
+        LOG.info("copilot request policy input guardrail verdict", **trace_data)
+        return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=blocked)
+
+    return [
+        InputGuardrailCls(
+            guardrail_function=request_policy_guardrail,
+            name="request_policy_guardrail",
+            run_in_parallel=False,
+        )
+    ]
+
+
+def _build_copilot_output_guardrails(
+    OutputGuardrailCls: Any,
+    GuardrailFunctionOutputCls: Any,
+) -> list[Any]:
+    # See _build_copilot_input_guardrails for why SDK classes are passed in.
+    def copilot_output_policy_guardrail(context: Any, _agent: Any, agent_output: Any) -> Any:
+        ctx = getattr(context, "context", None)
+        if not isinstance(ctx, CopilotContext):
+            LOG.warning("copilot output guardrail missing CopilotContext", context_type=type(ctx).__name__)
+            verdict = OutputPolicyVerdict(
+                allowed=False,
+                reason_codes=[OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING],
+            )
+            response_type = "REPLY"
+        else:
+            verdict, response_type = _evaluate_copilot_final_output_policy(ctx, agent_output)
+        trace_data = output_policy_verdict_to_trace_data(
+            verdict,
+            surface="agent_output",
+            response_type=response_type,
+        )
+        LOG.info("copilot output policy guardrail verdict", **trace_data)
+        return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=not verdict.allowed)
+
+    return [
+        OutputGuardrailCls(
+            guardrail_function=copilot_output_policy_guardrail,
+            name="copilot_output_policy_guardrail",
+        )
+    ]
+
+
+def _output_policy_verdict_from_guardrail_exception(exc: BaseException) -> OutputPolicyVerdict:
+    guardrail_result = getattr(exc, "guardrail_result", None)
+    guardrail_output = getattr(guardrail_result, "output", None)
+    return output_policy_verdict_from_trace_data(getattr(guardrail_output, "output_info", None))
+
+
+def _build_output_policy_blocked_result(
+    ctx: CopilotContext,
+    verdict: OutputPolicyVerdict,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult:
+    structured = StructuredContext.from_json_str(prior_global_llm_context)
+    structured.decisions_made.append(
+        "output-policy blocked final output: " + ", ".join(reason.value for reason in verdict.reason_codes)
+    )
+    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if (
+        request_policy is not None
+        and request_policy.clarification_question
+        and OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
+    ):
+        user_response = request_policy.clarification_question
+    elif OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
+        user_response = (
+            "I can't show or save that output because it appears to include raw credentials or secrets. "
+            "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
+            "credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD."
+        )
+    else:
+        user_response = "I could not safely return that Copilot output. Please adjust the request and try again."
+    return AgentResult(
+        user_response=user_response,
+        updated_workflow=None,
+        global_llm_context=structured.to_json_str(),
+        response_type="ASK_QUESTION",
+        workflow_yaml=prior_workflow_yaml or None,
+        workflow_was_persisted=ctx.workflow_persisted,
+        total_tokens=ctx.total_tokens_used,
+        # Policy blocks invalidate any currently staged proposal. The prior
+        # YAML is retained for context, but the accept UI should not stay armed.
         clear_proposed_workflow=True,
     )
 
@@ -903,8 +1125,12 @@ async def run_copilot_agent(
         )
 
     try:
-        from agents import Agent, trace
-        from agents.exceptions import MaxTurnsExceeded
+        from agents import Agent, GuardrailFunctionOutput, InputGuardrail, OutputGuardrail, trace
+        from agents.exceptions import (
+            InputGuardrailTripwireTriggered,
+            MaxTurnsExceeded,
+            OutputGuardrailTripwireTriggered,
+        )
         from agents.mcp import MCPServerManager
     except ModuleNotFoundError as e:
         if e.name == "agents":
@@ -967,6 +1193,8 @@ async def run_copilot_agent(
     )
     ctx.supports_vision = supports_vision
     ensure_tracing_initialized()
+    input_guardrails = _build_copilot_input_guardrails(InputGuardrail, GuardrailFunctionOutput)
+    output_guardrails = _build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
 
     alias_map = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
@@ -1030,6 +1258,8 @@ async def run_copilot_agent(
             tools=list(NATIVE_TOOLS),
             mcp_servers=[mcp_server],
             model=attempt_model_name,
+            input_guardrails=input_guardrails,
+            output_guardrails=output_guardrails,
         )
         session = create_copilot_session(chat_id)
         model_token = _copilot_model_name.set(attempt_model_name)
@@ -1107,6 +1337,19 @@ async def run_copilot_agent(
                 # and skip its ``workflow_was_persisted`` rollback decision.
                 LOG.info("Copilot run cancelled")
                 return _build_cancelled_exit_result(ctx, global_llm_context)
+            except InputGuardrailTripwireTriggered:
+                return _build_request_policy_clarification_result(
+                    request_policy,
+                    prior_global_llm_context=global_llm_context,
+                    prior_workflow_yaml=chat_request.workflow_yaml,
+                )
+            except OutputGuardrailTripwireTriggered as exc:
+                return _build_output_policy_blocked_result(
+                    ctx,
+                    _output_policy_verdict_from_guardrail_exception(exc),
+                    prior_global_llm_context=global_llm_context,
+                    prior_workflow_yaml=chat_request.workflow_yaml,
+                )
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
