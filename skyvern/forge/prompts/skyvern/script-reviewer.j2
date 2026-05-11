@@ -266,6 +266,13 @@ If the existing code already has a `page.wait()` and it still failed, increase t
    await page.fill_form(context.parameters, prompt='...')
    ```
 
+4. **Before `fill_form()`/`fill_multipage_form()` when 0 fields are mapped** — If the error message says "fill_form mapped 0 of N form fields despite K data keys provided" or "fill_multipage_form mapped 0 of N form fields", the page rendered some fields but not the ones the script expects to fill (or with different labels). Add `await page.wait(timeout_ms=5000)` **before** the form-fill call to let the right structure render:
+   ```python
+   await page.goto(url)
+   await page.wait(timeout_ms=5000)  # wait for the expected form inputs to render
+   await page.fill_form(context.parameters, prompt='...')
+   ```
+
 ## What to do
 
 {% for episode in episodes %}

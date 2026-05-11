@@ -1984,11 +1984,19 @@ class SkyvernPage(Page):
         if not form_fields:
             raise RuntimeError(
                 "fill_form found 0 form fields on the page. "
-                "The page may not have finished rendering — try adding "
+                "The page may not have finished rendering - try adding "
                 "await page.wait(timeout_ms=5000) before fill_form()."
             )
 
         mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
+
+        if data and not mapping:
+            raise RuntimeError(
+                f"fill_form mapped 0 of {len(form_fields)} form fields despite "
+                f"{len(data)} data keys provided. The field labels may not match the data keys, "
+                "or the form may not have finished rendering - try adding "
+                "await page.wait(timeout_ms=5000) before fill_form()."
+            )
 
         if not await self.validate_mapping(form_fields, mapping, prompt):
             raise ScriptTerminationException("fill_form validation failed: user termination conditions not met")
@@ -2038,6 +2046,7 @@ class SkyvernPage(Page):
         start_time = time.monotonic()
         pages_filled = 0
         prev_field_signature: str | None = None
+        prev_unmapped_optional_page = False
         consecutive_validation_failures = 0
 
         for page_num in range(max_pages):
@@ -2078,6 +2087,11 @@ class SkyvernPage(Page):
             # next-button click didn't navigate. Stop to avoid infinite loop.
             field_sig = "|".join((f.get("label") or f.get("name") or f.get("placeholder") or "") for f in fillable)
             if field_sig and field_sig == prev_field_signature:
+                if prev_unmapped_optional_page:
+                    raise RuntimeError(
+                        f"fill_multipage_form mapped 0 form fields on the previous optional page despite "
+                        f"{len(data)} data keys provided, and the next click did not advance to a new page."
+                    )
                 LOG.warning(
                     "fill_multipage_form: same fields detected, page did not advance — stopping",
                     page_num=page_num,
@@ -2105,6 +2119,24 @@ class SkyvernPage(Page):
             await self._dump_html(debug_dir, f"p{page_num}_00_before_fill")
 
             mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
+
+            required_fillable = [f for f in fillable if f.get("required")]
+            has_file_field = any(f.get("type") == "file" for f in fillable)
+            unmapped_optional_page = bool(data and not mapping and not required_fillable and not has_file_field)
+            if data and not mapping and required_fillable:
+                raise RuntimeError(
+                    f"fill_multipage_form mapped 0 of {len(form_fields)} form fields on page {page_num} despite "
+                    f"{len(data)} data keys provided. The field labels may not match the data keys, "
+                    "or the form may not have finished rendering - try adding "
+                    "await page.wait(timeout_ms=5000) before fill_multipage_form()."
+                )
+            if unmapped_optional_page:
+                LOG.info(
+                    "fill_multipage_form: no fields mapped on optional page, continuing",
+                    page_num=page_num,
+                    field_count=len(form_fields),
+                    data_key_count=len(data),
+                )
 
             # Skip validation on intermediate pages — validate_mapping checks user
             # instructions like "do not submit" which only apply to the final page.
@@ -2140,12 +2172,14 @@ class SkyvernPage(Page):
                 if new_mapping:
                     await self.fill_from_mapping(rescan_fields, new_mapping, data=data)
                     await self._dump_html(debug_dir, f"p{page_num}_02_after_rescan_fill")
+                    unmapped_optional_page = False
                 # Update field signature to use the new fields for stuck detection
                 fillable = rescan_fillable
                 form_fields = rescan_fields
                 prev_field_signature = "|".join(
                     (f.get("label") or f.get("name") or f.get("placeholder") or "") for f in fillable
                 )
+            prev_unmapped_optional_page = unmapped_optional_page
 
             # Try to click the next/continue button
             try:
@@ -2159,6 +2193,11 @@ class SkyvernPage(Page):
                     "fill_multipage_form: next button not found, stopping",
                     page_num=page_num,
                 )
+                if unmapped_optional_page:
+                    raise RuntimeError(
+                        f"fill_multipage_form mapped 0 of {len(form_fields)} form fields on page {page_num} "
+                        f"despite {len(data)} data keys provided, and could not advance to another page."
+                    )
                 break
 
             await self._dump_html(debug_dir, f"p{page_num}_03_after_click_next")
