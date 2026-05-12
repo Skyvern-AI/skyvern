@@ -65,6 +65,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.browser_state import BrowserState
@@ -2095,7 +2096,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        resp = await app.AGENT_FUNCTION.deliver_webhook(
+        resp = await deliver_webhook_with_retries(
             url=task_v2.webhook_callback_url,
             payload=payload,
             headers=headers,

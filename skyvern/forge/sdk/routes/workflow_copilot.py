@@ -1351,6 +1351,9 @@ async def _new_copilot_chat_post(
                         )
                     )
 
+            # Count from the full message log; chat_history below is truncated.
+            turn_index = sum(1 for m in chat_messages if m.sender == WorkflowCopilotChatSender.USER) + 1
+
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -1362,6 +1365,7 @@ async def _new_copilot_chat_post(
                     llm_api_handler=llm_api_handler,
                     api_key=api_key,
                     config=copilot_config,
+                    turn_index=turn_index,
                 )
 
             if getattr(agent_result, "cancelled", False):

@@ -113,6 +113,7 @@ from skyvern.services.otp_service import (
     poll_otp_value,
     try_generate_totp_from_credential,
 )
+from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
     PROMPT_HARD_CEILING_TOKENS,
@@ -4013,6 +4014,7 @@ class ForgeAgent:
         self,
         task: Task,
         api_key: str | None,
+        enable_retries: bool = True,
     ) -> None:
         if not api_key:
             LOG.warning(
@@ -4060,13 +4062,14 @@ class ForgeAgent:
                 headers=signed_data.headers,
             )
 
-            resp = await app.AGENT_FUNCTION.deliver_webhook(
+            resp = await deliver_webhook_with_retries(
                 url=task.webhook_callback_url,
                 payload=signed_data.signed_payload,
                 headers=signed_data.headers,
                 timeout_seconds=30.0,
                 organization_id=task.organization_id,
                 run_id=task.task_id,
+                max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
             )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(

@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
+
+from skyvern.config import settings
 
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
@@ -35,3 +38,9 @@ def _json_finalize(value: Any) -> Any:
 
 jinja_json_finalize_env = SandboxedEnvironment(finalize=_json_finalize)
 jinja_json_finalize_env.filters["json"] = _json_type_filter
+
+if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+    jinja_json_finalize_strict_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)
+else:
+    jinja_json_finalize_strict_env = SandboxedEnvironment(finalize=_json_finalize)
+jinja_json_finalize_strict_env.filters["json"] = _json_type_filter

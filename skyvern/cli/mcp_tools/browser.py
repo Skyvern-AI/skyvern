@@ -1451,13 +1451,29 @@ async def skyvern_run_task(
                 timeout=timeout_seconds,
             )
             timer.mark("sdk")
+        except asyncio.TimeoutError:
+            return make_result(
+                "skyvern_run_task",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.TIMEOUT,
+                    f"Task did not reach a final status within {timeout_seconds}s. It may still be running.",
+                    "Check the run in the Skyvern dashboard, or retry with a larger timeout_seconds.",
+                ),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_run_task",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Check the prompt, URL, and timeout settings"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    str(e) or type(e).__name__,
+                    "Check the prompt, URL, and timeout settings",
+                ),
             )
 
     return make_result(
@@ -1596,6 +1612,20 @@ async def skyvern_login(
                     **_common_kwargs,
                 )
             timer.mark("sdk")
+        except asyncio.TimeoutError:
+            return make_result(
+                "skyvern_login",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.TIMEOUT,
+                    f"Login workflow did not reach a final status within {timeout_seconds}s. "
+                    "The login may still be running or may have already completed.",
+                    "Check the run in the Skyvern dashboard, or retry with a larger timeout_seconds. "
+                    "Use skyvern_observe to confirm the post-login page state.",
+                ),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_login",
@@ -1604,7 +1634,7 @@ async def skyvern_login(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    str(e),
+                    str(e) or type(e).__name__,
                     "Check credential_type and required fields for your credential provider",
                 ),
             )

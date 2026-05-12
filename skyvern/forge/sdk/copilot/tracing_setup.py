@@ -100,7 +100,12 @@ def ensure_tracing_initialized() -> None:
             service_name="skyvern-copilot",
             environment=settings.ENV,
         )
-        logfire.instrument_openai_agents()
+        try:
+            logfire.instrument_openai_agents()
+        except ImportError as exc:
+            # `instrument_openai_agents` imports the optional `agents` SDK at call time;
+            # self-hosted installs without it still need to boot under COPILOT_TRACING_ENABLED.
+            LOG.warning("Copilot tracing requested but openai-agents SDK not installed", error=repr(exc))
         _patch_agent_span_attributes()
         # Logfire instruments via OpenTelemetry independently of the SDK's
         # built-in trace processors.  Clear the default OpenAI exporter so it
