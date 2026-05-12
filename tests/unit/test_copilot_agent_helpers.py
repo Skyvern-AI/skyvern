@@ -230,6 +230,97 @@ class TestSupersededAgentIntentGates:
         assert not hasattr(agent_module, "_credential_validation_result_for_user_message")
 
 
+class TestRequestPolicyInputGuardrail:
+    @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            testing_intent="skip_test",
+            credential_input_kind="credential_name",
+            credential_refs=["Saved Login"],
+            allow_run_blocks=False,
+        )
+        build_request_policy = AsyncMock(return_value=policy)
+        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="just draft without testing",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="user: build the login workflow",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=object(),
+            previous_user_message="build the login workflow",
+        )
+
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert ctx.allow_untested_workflow_draft is True
+        assert "Draft the workflow requested earlier" in ctx.user_message
+        assert "build the login workflow" in ctx.user_message
+        assert result.output.output_info["policy_present"] is True
+        assert result.output.output_info["testing_intent"] == "skip_test"
+        assert "completion_contract" not in result.output.output_info
+        build_request_policy.assert_awaited_once_with(
+            user_message="just draft without testing",
+            workflow_yaml="workflow: yaml",
+            chat_history="user: build the login workflow",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=policy_inputs.handler,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            credential_input_kind="raw_secret",
+            user_response_policy="ask_clarification",
+            allow_update_workflow=False,
+            allow_run_blocks=False,
+            raw_secret_detected=True,
+            clarification_reason="raw_secret",
+            clarification_question="Do not paste raw credentials.",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message="use password=hunter2",
+                workflow_yaml="",
+                chat_history_text="",
+                global_llm_context="",
+                organization_id="org-1",
+                handler=None,
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is True
+        assert ctx.request_policy is policy
+        assert result.output.output_info["credential_input_kind"] == "raw_secret"
+        assert result.output.output_info["blocked"] is True
+        assert "hunter2" not in str(result.output.output_info)
+
+
 class TestShouldRestorePersistedWorkflow:
     """SKY-9143: auto_accept=True must still restore when no proposal shipped."""
 
@@ -878,7 +969,7 @@ class TestCredentialRefusalReachesAgent:
     """Prove the SKY-9189 refusal rule is actually delivered to the agent.
 
     `run_copilot_agent` constructs the openai-agents SDK `Agent(...)` with
-    `instructions=_build_system_prompt(...)` and `tools=list(NATIVE_TOOLS)`.
+    dynamic instructions derived from `_build_system_prompt(...)` and `tools=list(NATIVE_TOOLS)`.
     A behavior test would require patching the agent loop and is fragile; a
     construction test (rule text flows through the exact helpers the route
     uses) is deterministic and catches both prompt and tool-surface drift.
@@ -1324,7 +1415,7 @@ class TestRequestPolicyCredentialResolution:
         )
         assert paraphrased_completion_policy.completion_contract is None
         assert "completion_contract:" not in paraphrased_completion_policy.prompt_summary()
-        assert paraphrased_completion_policy.to_trace_data()["completion_contract"] is None
+        assert paraphrased_completion_policy.to_trace_data()["has_completion_contract"] is False
 
     @pytest.mark.asyncio
     async def test_request_policy_noncredential_clarification_uses_specific_copy(self, monkeypatch) -> None:
@@ -1720,3 +1811,5 @@ class TestCopilotConfig:
         assert result.user_response == "ok"
         assert resolved_keys == ["PRIMARY", "SECONDARY"]
         assert run_with_enforcement.await_count == 2
+        for call in run_with_enforcement.await_args_list:
+            assert not getattr(call.kwargs["agent"], "input_guardrails", None)
