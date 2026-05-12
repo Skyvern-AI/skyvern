@@ -11,6 +11,7 @@ import type { Edge } from "@xyflow/react";
 import { usePostHog } from "posthog-js/react";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { captureRecordBrowserUndoAfterRecordingIfRecent } from "@/util/recordBrowserTelemetry";
 import type { AppNode } from "../nodes";
 import {
   canRedo as historyCanRedo,
@@ -331,11 +332,16 @@ export function useWorkflowHistory({
     if (latestNodesRef.current.some((n) => n.dragging)) return;
     // Flush first so an edit still pending in the debounce window isn't dropped.
     flushPendingCapture();
+    const presentBeforeUndo = historyRef.current.present;
+    const nodesBeforeUndo = presentBeforeUndo?.nodes.length ?? 0;
     const result = historyUndo(historyRef.current);
     if (result === null) return;
     historyRef.current = result.state;
     applySnapshot(result.applied.nodes, result.applied.edges);
     refreshFlags();
+    captureRecordBrowserUndoAfterRecordingIfRecent(
+      nodesBeforeUndo - result.applied.nodes.length,
+    );
     posthog.capture("builder.undo_redo.used", {
       action: "undo",
       node_count: result.applied.nodes.length,
