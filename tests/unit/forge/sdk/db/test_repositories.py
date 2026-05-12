@@ -111,6 +111,8 @@ def test_browser_sessions_repository_instantiation():
     assert repo.Session is mock_session
     assert hasattr(repo, "create_browser_profile")
     assert hasattr(repo, "get_browser_profile")
+    assert hasattr(repo, "update_browser_profile")
+    assert hasattr(repo, "delete_browser_profile")
 
 
 # ── Cross-dependency repositories ──

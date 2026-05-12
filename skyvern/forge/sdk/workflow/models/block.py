@@ -57,6 +57,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -110,6 +111,7 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
 from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
+    jinja_json_finalize_strict_env,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -777,6 +779,19 @@ class Block(BaseModel, abc.ABC):
         pass
 
 
+def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
+    categories = task.failure_category
+    if categories:
+        return any(c.get("category") == "ANTI_BOT_DETECTION" for c in categories)
+
+    if task.failure_reason:
+        result = classify_from_failure_reason(task.failure_reason)
+        if result and any(c.get("category") == "ANTI_BOT_DETECTION" for c in result):
+            return True
+
+    return False
+
+
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
@@ -1368,6 +1383,19 @@ class BaseTaskBlock(Block):
             else:
                 current_retry += 1
                 will_retry = current_retry <= self.max_retries
+                if will_retry and _should_skip_retry_on_anti_bot_detection(updated_task):
+                    LOG.warning(
+                        "Skipping retry - task failed due to anti-bot detection",
+                        task_id=updated_task.task_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_id=workflow.workflow_id,
+                        organization_id=workflow_run.organization_id,
+                        current_retry=current_retry,
+                        max_retries=self.max_retries,
+                        failure_reason=updated_task.failure_reason,
+                        failure_category=updated_task.failure_category,
+                    )
+                    will_retry = False
                 retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
                 downloaded_files = []
                 try:
@@ -7789,7 +7817,9 @@ class WorkflowTriggerBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> Any:
         """Render a single Jinja2 template string, handling the | json filter marker."""
-        rendered = self.format_block_parameter_template_from_workflow_run_context(value, workflow_run_context)
+        rendered = self.format_block_parameter_template_from_workflow_run_context(
+            value, workflow_run_context, env=jinja_json_finalize_strict_env
+        )
         if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
             json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
             try:
