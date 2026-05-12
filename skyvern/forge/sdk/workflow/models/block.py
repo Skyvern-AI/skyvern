@@ -5005,6 +5005,35 @@ class FileParserBlock(Block):
         )
         return llm_response
 
+    async def _record_failure(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        failure_reason: str,
+    ) -> BlockResult:
+        # SKY-7939: also surface the failure in `outputs.<block_label>` so callers
+        # can tell which block failed without cross-referencing the timeline.
+        error_codes = self.get_failure_error_codes()
+        failure_output: dict[str, Any] = {
+            "status": BlockStatus.failed.value,
+            "failure_reason": failure_reason,
+            "errors": [
+                {"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes
+            ],
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
+        return await self.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            output_parameter_value=failure_output,
+            status=BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            error_codes=error_codes or None,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -5032,14 +5061,12 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                error_codes=self.get_failure_error_codes() or None,
+            return await self._record_failure(
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+                f"Failed to format jinja template: {str(e)}",
             )
 
         try:
@@ -5054,14 +5081,12 @@ class FileParserBlock(Block):
             # Validate the file type
             self.validate_file_type(self.file_url, file_path)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to download or validate file: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                error_codes=self.get_failure_error_codes() or None,
+            return await self._record_failure(
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+                f"Failed to download or validate file: {str(e)}",
             )
 
         LOG.debug(
@@ -5092,14 +5117,12 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.DOCX:
             parsed_data = await self._parse_docx_file(file_path)
         else:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Unsupported file type: {self.file_type}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                error_codes=self.get_failure_error_codes() or None,
+            return await self._record_failure(
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+                f"Unsupported file type: {self.file_type}",
             )
 
         # If json_schema is provided, use AI to extract structured data
@@ -5121,14 +5144,12 @@ class FileParserBlock(Block):
                 )
                 final_data = ai_extracted_data
             except Exception as e:
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason=f"Failed to extract data with AI: {str(e)}",
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                    error_codes=self.get_failure_error_codes() or None,
+                return await self._record_failure(
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    f"Failed to extract data with AI: {str(e)}",
                 )
         else:
             # Return raw parsed data
