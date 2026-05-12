@@ -1,6 +1,7 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useRef } from "react";
+import { useParams } from "react-router-dom";
 
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
@@ -22,6 +23,7 @@ import { WorkflowAddMenu } from "../../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
+  const { workflowPermanentId } = useParams();
   const edges = useEdges();
   const nodes = useNodes();
   const debugStore = useDebugStore();
@@ -189,7 +191,10 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
-      recordingStore.setIsRecording(true);
+      recordingStore.setIsRecording(true, {
+        workflowPermanentId: workflowPermanentId ?? null,
+        browserSessionId: settingsStore.browserSessionId,
+      });
       updateWorkflowPanelState(false);
     }
   };
