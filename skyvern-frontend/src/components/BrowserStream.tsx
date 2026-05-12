@@ -39,6 +39,7 @@ import { useSettingsStore } from "@/store/SettingsStore";
 import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
+import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 
 import { RotateThrough } from "./RotateThrough";
 import "./browser-stream.css";
@@ -830,7 +831,7 @@ function BrowserStream({
               <div className="relative h-full w-full">
                 <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-red-500">
                   <div className="truncate">Browser is recording</div>
-                  <Tip content="To finish the recording, press stop on the animated recording button in the workflow.">
+                  <Tip content="To finish and turn your actions into blocks, click the stop icon.">
                     <div className="cursor-pointer">
                       <InfoCircledIcon />
                     </div>
@@ -850,6 +851,12 @@ function BrowserStream({
                             recordingStore.compressedChunks.length > 0;
                           if (!hasEvents) {
                             e.preventDefault();
+                            captureRecordBrowser("record_browser.cancelled", {
+                              event_count_at_cancel:
+                                recordingStore.getEventCount(),
+                              seconds_recording:
+                                recordingStore.getSecondsRecording(),
+                            });
                             recordingStore.setIsRecording(false);
                             recordingStore.reset();
                           }
@@ -874,6 +881,12 @@ function BrowserStream({
                           <Button
                             variant="destructive"
                             onClick={() => {
+                              captureRecordBrowser("record_browser.cancelled", {
+                                event_count_at_cancel:
+                                  recordingStore.getEventCount(),
+                                seconds_recording:
+                                  recordingStore.getSecondsRecording(),
+                              });
                               recordingStore.setIsRecording(false);
                               recordingStore.reset();
                             }}

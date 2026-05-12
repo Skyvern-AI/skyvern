@@ -1,5 +1,9 @@
 import { create } from "zustand";
 
+import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+
+const EVENT_CAPTURED_SAMPLE_RATE = 0.1;
+
 /**
  * example: {
  *  'targetInfo': {
@@ -124,6 +128,7 @@ interface RecordingStore {
    * Whether the user is currently in browser recording mode.
    */
   isRecording: boolean;
+  recordingStartedAtMs: number | null;
   /**
    * Add a new recorded event. Triggers async compression when buffer is full.
    */
@@ -139,7 +144,13 @@ interface RecordingStore {
   /**
    * Set whether the user is in browser recording mode.
    */
-  setIsRecording: (isRecording: boolean) => void;
+  setIsRecording: (
+    isRecording: boolean,
+    meta?: {
+      workflowPermanentId?: string | null;
+      browserSessionId?: string | null;
+    },
+  ) => void;
   /**
    * Flush any pending events into a compressed chunk.
    * Call this before consuming the data.
@@ -153,6 +164,7 @@ interface RecordingStore {
    * Get the total number of events (compressed + pending).
    */
   getEventCount: () => number;
+  getSecondsRecording: () => number;
 }
 
 /**
@@ -223,6 +235,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   pendingEvents: [],
   isCompressing: false,
   isRecording: false,
+  recordingStartedAtMs: null,
 
   add: (event) => {
     const state = get();
@@ -233,6 +246,13 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
 
     if (newPendingEvents.length >= CHUNK_SIZE && !state.isCompressing) {
+      if (Math.random() < EVENT_CAPTURED_SAMPLE_RATE) {
+        captureRecordBrowser("record_browser.event_captured", {
+          event_count: state.compressedChunks.length * CHUNK_SIZE + CHUNK_SIZE,
+          source: event.source,
+        });
+      }
+
       const eventsToCompress = newPendingEvents.slice(0, CHUNK_SIZE);
       const remainingEvents = newPendingEvents.slice(CHUNK_SIZE);
 
@@ -264,7 +284,12 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
-  clear: () => set({ compressedChunks: [], pendingEvents: [] }),
+  clear: () =>
+    set({
+      compressedChunks: [],
+      pendingEvents: [],
+      recordingStartedAtMs: null,
+    }),
 
   reset: () =>
     set({
@@ -273,15 +298,28 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       pendingEvents: [],
       isCompressing: false,
       isRecording: false,
+      recordingStartedAtMs: null,
     }),
 
-  setIsRecording: (isRecording) => {
+  setIsRecording: (isRecording, meta) => {
     const state = get();
-    // clear events on rising edge
     if (!state.isRecording && isRecording) {
       get().clear();
+      set({
+        isRecording: true,
+        recordingStartedAtMs: Date.now(),
+      });
+      captureRecordBrowser("record_browser.started", {
+        workflow_permanent_id: meta?.workflowPermanentId ?? undefined,
+        browser_session_id: meta?.browserSessionId ?? undefined,
+      });
+      return;
     }
-    set({ isRecording });
+
+    set({
+      isRecording,
+      recordingStartedAtMs: isRecording ? state.recordingStartedAtMs : null,
+    });
   },
 
   flush: async () => {
@@ -323,5 +361,13 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     return (
       state.compressedChunks.length * CHUNK_SIZE + state.pendingEvents.length
     );
+  },
+
+  getSecondsRecording: () => {
+    const started = get().recordingStartedAtMs;
+    if (started === null) {
+      return 0;
+    }
+    return (Date.now() - started) / 1000;
   },
 }));
