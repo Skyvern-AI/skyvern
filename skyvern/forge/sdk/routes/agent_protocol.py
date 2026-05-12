@@ -2235,8 +2235,8 @@ async def retry_webhook(
     if not latest_step:
         return await app.agent.build_task_response(task=task_obj)
 
-    # retry the webhook
-    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key)
+    # retry the webhook (single-shot - manual replay is itself the retry)
+    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key, enable_retries=False)
 
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
