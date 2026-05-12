@@ -11,7 +11,7 @@ interface InteractiveStreamViewProps {
   userIsControlling: boolean;
   setUserIsControlling: (v: boolean) => void;
   inputReady: boolean;
-  containerRef: RefObject<HTMLDivElement | null>;
+  containerRef: RefObject<HTMLDivElement>;
   showControlButtons: boolean;
   handlers: {
     handleMouseDown: (e: React.MouseEvent<HTMLImageElement>) => void;

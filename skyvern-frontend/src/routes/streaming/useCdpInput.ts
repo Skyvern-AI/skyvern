@@ -22,7 +22,7 @@ interface UseCdpInputReturn {
   userIsControlling: boolean;
   setUserIsControlling: (v: boolean) => void;
   inputReady: boolean;
-  containerRef: React.RefObject<HTMLDivElement | null>;
+  containerRef: React.RefObject<HTMLDivElement>;
   handlers: {
     handleMouseDown: (e: React.MouseEvent<HTMLImageElement>) => void;
     handleMouseUp: (e: React.MouseEvent<HTMLImageElement>) => void;
