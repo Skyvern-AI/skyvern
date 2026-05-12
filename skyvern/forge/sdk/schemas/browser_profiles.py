@@ -17,7 +17,9 @@ class BrowserProfile(BaseModel):
 
 
 class CreateBrowserProfileRequest(BaseModel):
-    name: str = Field(..., description="Name for the browser profile")
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(..., min_length=1, description="Name for the browser profile")
     description: str | None = Field(None, description="Optional profile description")
     browser_session_id: str | None = Field(
         default=None, description="Persistent browser session to convert into a profile"
@@ -30,4 +32,19 @@ class CreateBrowserProfileRequest(BaseModel):
     def _validate_source(self) -> "CreateBrowserProfileRequest":
         if bool(self.browser_session_id) == bool(self.workflow_run_id):
             raise ValueError("Provide either browser_session_id or workflow_run_id")
+        return self
+
+
+class UpdateBrowserProfileRequest(BaseModel):
+    # `None` for either field means "no change" — there is currently no way to
+    # clear a description back to null through this endpoint.
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, description="New name for the browser profile")
+    description: str | None = Field(default=None, description="New description for the browser profile")
+
+    @model_validator(mode="after")
+    def _require_at_least_one_field(self) -> "UpdateBrowserProfileRequest":
+        if self.name is None and self.description is None:
+            raise ValueError("At least one of `name` or `description` must be provided")
         return self

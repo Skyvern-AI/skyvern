@@ -16,6 +16,7 @@ from skyvern.cli.core.browser_ops import (
     do_execute,
     do_observe,
     ref_to_selector,
+    serialize_elements,
 )
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
@@ -138,6 +139,22 @@ class TestRefToSelector:
         result = ref_to_selector({"role": "button", "name": 'Click "here"'})
         assert result == 'role=button[name="Click \\"here\\""]'
 
+    def test_match_index_zero_emits_nth(self) -> None:
+        """Presence of match_index in the dict signals a duplicate group; emit nth even for 0."""
+        elem = {"role": "combobox", "name": "", "match_index": 0}
+        assert ref_to_selector(elem) == "role=combobox >> nth=0"
+
+    def test_unnamed_duplicate_appends_nth(self) -> None:
+        elem = {"role": "combobox", "name": "", "match_index": 2}
+        assert ref_to_selector(elem) == "role=combobox >> nth=2"
+
+    def test_named_duplicate_appends_nth(self) -> None:
+        elem = {"role": "button", "name": "Edit", "match_index": 1}
+        assert ref_to_selector(elem) == 'role=button[name="Edit"] >> nth=1'
+
+    def test_missing_match_index_is_backward_compatible(self) -> None:
+        assert ref_to_selector({"role": "textbox", "name": "Email"}) == 'role=textbox[name="Email"]'
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: do_observe
@@ -241,6 +258,108 @@ class TestDoObserve:
         assert tags["Email"] == "input"
         assert tags["Sign In"] == "button"
         assert tags["Forgot password?"] == "a"
+
+    @pytest.mark.asyncio
+    async def test_unique_elements_have_match_index_zero(self) -> None:
+        page = _make_page()
+        result = await do_observe(page)
+        assert all(e.match_index == 0 for e in result.elements)
+
+    @pytest.mark.asyncio
+    async def test_unnamed_duplicates_get_distinct_match_indices(self) -> None:
+        """SKY-9701: multiple unnamed widgets of the same role must each get a unique index."""
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+            ]
+        )
+        page = _make_page(tree)
+        result = await do_observe(page)
+        assert [e.match_index for e in result.elements] == [0, 1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_named_duplicates_get_distinct_match_indices(self) -> None:
+        """Elements sharing both role and name also collide; disambiguate by index."""
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "button", "name": "Edit"},
+                {"role": "button", "name": "Delete"},
+                {"role": "button", "name": "Edit"},
+            ]
+        )
+        page = _make_page(tree)
+        result = await do_observe(page)
+        grouped = [(e.role, e.name, e.match_index) for e in result.elements]
+        assert grouped == [
+            ("button", "Edit", 0),
+            ("button", "Delete", 0),
+            ("button", "Edit", 1),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_serialized_output_includes_match_index_for_every_member_of_duplicate_group(self) -> None:
+        """Every member of a multi-element (role, name) group carries match_index, including the first."""
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+            ]
+        )
+        page = _make_page(tree)
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+        assert serialized[0]["match_index"] == 0
+        assert serialized[1]["match_index"] == 1
+
+    @pytest.mark.asyncio
+    async def test_serialized_output_omits_match_index_for_unique_elements(self) -> None:
+        page = _make_page()
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+        assert all("match_index" not in d for d in serialized)
+
+    @pytest.mark.asyncio
+    async def test_disambiguation_counts_collisions_beyond_max_elements_cap(self) -> None:
+        """SKY-9701 follow-up: duplicates beyond the cap must still trigger disambiguation
+        for kept refs, otherwise selector-only clicks on capped duplicates fall back to the
+        ambiguous base selector."""
+        children = [{"role": "combobox", "name": ""} for _ in range(6)]
+        page = _make_page(_make_a11y_tree(children=children))
+        result = await do_observe(page, max_elements=2)
+        assert result.element_count == 2
+        assert result.total_on_page == 6
+        serialized = serialize_elements(result.elements)
+        # Both kept refs must carry match_index so the selector emits nth=N,
+        # even though only 2 of 6 are returned.
+        assert serialized[0]["match_index"] == 0
+        assert serialized[1]["match_index"] == 1
+        selectors = [ref_to_selector(elem) for elem in serialized]
+        assert selectors == ["role=combobox >> nth=0", "role=combobox >> nth=1"]
+
+    @pytest.mark.asyncio
+    async def test_unnamed_duplicate_resolves_to_distinct_selectors(self) -> None:
+        """End-to-end: observe -> serialize -> ref_to_selector produces unique selectors for every ref, including e0."""
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+            ]
+        )
+        page = _make_page(tree)
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+        selectors = [ref_to_selector(elem) for elem in serialized]
+        assert selectors == [
+            "role=combobox >> nth=0",
+            "role=combobox >> nth=1",
+            "role=combobox >> nth=2",
+            "role=combobox >> nth=3",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +624,59 @@ class TestSkyvernExecuteMCP:
         result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"ref": "e99"}}])
         assert result["ok"] is False
         assert "unknown ref" in result["data"]["results"][0]["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_ref_to_unnamed_duplicate_uses_nth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SKY-9701: clicking ref=e2 on a page with 4 unnamed comboboxes resolves to the 3rd, not the 1st."""
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+            ]
+        )
+        page = _make_page(tree)
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        click_result = {"ok": True, "data": None}
+        monkeypatch.setattr(mcp_browser, "skyvern_click", AsyncMock(return_value=click_result))
+
+        result = await mcp_browser.skyvern_execute(
+            steps=[
+                {"tool": "observe", "params": {}},
+                {"tool": "click", "params": {"ref": "e2"}},
+            ]
+        )
+        assert result["ok"] is True
+        click_kwargs = mcp_browser.skyvern_click.call_args.kwargs
+        assert click_kwargs["selector"] == "role=combobox >> nth=2"
+
+    @pytest.mark.asyncio
+    async def test_execute_ref_e0_on_unnamed_duplicate_emits_nth_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SKY-9701 follow-up: the first duplicate (e0) must also emit `nth=0` so Playwright
+        strict mode does not raise and the click does not silently resolve to whichever
+        element happens to be first."""
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "combobox", "name": ""},
+                {"role": "combobox", "name": ""},
+            ]
+        )
+        page = _make_page(tree)
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        click_result = {"ok": True, "data": None}
+        monkeypatch.setattr(mcp_browser, "skyvern_click", AsyncMock(return_value=click_result))
+
+        result = await mcp_browser.skyvern_execute(
+            steps=[
+                {"tool": "observe", "params": {}},
+                {"tool": "click", "params": {"ref": "e0"}},
+            ]
+        )
+        assert result["ok"] is True
+        click_kwargs = mcp_browser.skyvern_click.call_args.kwargs
+        assert click_kwargs["selector"] == "role=combobox >> nth=0"

@@ -57,7 +57,6 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
-    WrongElementToUploadFile,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -73,6 +72,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -2659,28 +2659,47 @@ async def chain_click(
         file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
 
     is_filechooser_trigger = False
+    is_upload_action = bool(action.file_url)
+    context = skyvern_context.current()
+    has_pending = (
+        context is not None and context.pending_file_chooser is not None and context.pending_file_chooser.page is page
+    )
+
+    if is_upload_action and has_pending and context is not None:
+        LOG.info("New UPLOAD_FILE action arrived, cleaning up stale pending file chooser listener")
+        context.cleanup_pending_file_chooser()
+        has_pending = False
 
     async def fc_func(fc: FileChooser) -> None:
         nonlocal is_filechooser_trigger
         is_filechooser_trigger = True
         await fc.set_files(files=file)
 
-    page.on("filechooser", fc_func)
-    LOG.info("Registered file chooser listener", action=action, path=file)
+    if not has_pending:
+        page.on("filechooser", fc_func)
+        LOG.info("Registered file chooser listener", action=action, path=file)
+    else:
+        LOG.info(
+            "Skipping defensive file chooser listener — pending deferred listener exists",
+            action=action,
+        )
 
     """
     Clicks on an element identified by the css and its parent if failed.
     :param css: css of the element to click
     """
+    # Tracks the return value so the finally block can inspect click success.
+    action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
-        return [ActionSuccess()]
+        action_results = [ActionSuccess()]
+        return action_results
 
     except Exception as e:
-        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+        action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
             try:
@@ -2831,21 +2850,61 @@ async def chain_click(
 
         return action_results
     finally:
-        LOG.info("Remove file chooser listener", action=action)
-
         # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
-        # Sleep for 15 seconds after uploading a file to let the page process it
-        # Removing this breaks file uploads using the filechooser
-        if file:
-            await asyncio.sleep(15)
-        page.remove_listener("filechooser", fc_func)
+        click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
 
-        if action.file_url and not is_filechooser_trigger:
+        if is_filechooser_trigger:
+            # File chooser opened during this click — upload completed normally
+            LOG.info("File chooser triggered during this click", action=action)
+            if file:
+                await asyncio.sleep(15)
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
+            if context is not None and context.pending_file_chooser is not None:
+                context.cleanup_pending_file_chooser()
+
+        elif is_upload_action and file and click_succeeded and context is not None:
+            # UPLOAD_FILE click succeeded but file chooser didn't open (e.g. popup intercepted).
+            # Defer the listener so a subsequent click can trigger it.
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
             LOG.warning(
-                "Action has file_url, but filechoose even hasn't been triggered. Upload file attempt seems to fail",
+                "UPLOAD_FILE click succeeded but file chooser was not triggered — deferring listener",
                 action=action,
             )
-            return [ActionFailure(WrongElementToUploadFile(action.element_id))]
+            # Clean up any existing pending listener (may be on a different page)
+            if context.pending_file_chooser is not None:
+                context.cleanup_pending_file_chooser()
+
+            pending = PendingFileChooserListener(page=page, file_paths=file)
+
+            async def deferred_fc_handler(fc: FileChooser) -> None:
+                pending.triggered = True
+                await fc.set_files(files=pending.file_paths)
+                # Auto-remove after firing to prevent double-consumption
+                pending.cleanup()
+
+            pending.handler = deferred_fc_handler
+            page.on("filechooser", deferred_fc_handler)
+            context.pending_file_chooser = pending
+
+        elif (
+            context is not None and context.pending_file_chooser is not None and context.pending_file_chooser.triggered
+        ):
+            # A previous UPLOAD_FILE's deferred listener was consumed by this click
+            LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
+            await asyncio.sleep(15)
+            context.cleanup_pending_file_chooser()
+
+        else:
+            # No file chooser involved — just clean up the defensive listener
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
+
+        if is_upload_action:
+            for r in action_results:
+                if isinstance(r, ActionSuccess):
+                    r.upload_file_triggered = is_filechooser_trigger
 
 
 @traced(name="skyvern.agent.dropdown.auto_completion")
@@ -4363,12 +4422,6 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
-# Sentinel for cached_age_seconds when the cache backend doesn't track per-key
-# write time (Redis tier) or returns a None age. Distinct from 0.0 so Datadog
-# can split "just-cached" from "age unknown" in shadow comparison events.
-_UNKNOWN_CACHE_AGE_SENTINEL = -1.0
-
-
 def _schedule_extraction_shadow_check_for_hit(
     *,
     task: Task,
@@ -4421,6 +4474,12 @@ def _schedule_extraction_shadow_check_for_hit(
             )
         return fresh
 
+    # Bind prompt_name + cache_path so Datadog can split the shared
+    # extract_information.shadow_comparison stream by call site.
+    shadow_logger = structlog.get_logger().bind(
+        prompt_name="extract-information",
+        cache_path="handler",
+    )
     extraction_shadow.schedule_shadow_check(
         gate=_shadow_gate,
         cache_key=cache_key,
@@ -4429,6 +4488,7 @@ def _schedule_extraction_shadow_check_for_hit(
         cached_age_seconds=cached_age_seconds,
         llm_call=_shadow_llm_call,
         schema=shadow_schema,
+        logger=shadow_logger,
     )
 
 
@@ -4606,7 +4666,7 @@ async def extract_information_for_navigation_goal(
                 cached_value=lookup_result.value,
                 cached_age_seconds=lookup_result.age_seconds
                 if lookup_result.age_seconds is not None
-                else _UNKNOWN_CACHE_AGE_SENTINEL,
+                else extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
                 scraped_page=scraped_page,
                 llm_key_override=llm_key_override,
                 extract_information_prompt=extract_information_prompt,
@@ -4706,7 +4766,7 @@ async def extract_information_for_navigation_goal(
                 workflow_run_id=task.workflow_run_id,
                 cache_key=cache_key,
                 cached_value=cross_run_value,
-                cached_age_seconds=_UNKNOWN_CACHE_AGE_SENTINEL,
+                cached_age_seconds=extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
                 scraped_page=scraped_page,
                 llm_key_override=llm_key_override,
                 extract_information_prompt=extract_information_prompt,

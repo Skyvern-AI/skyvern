@@ -4,10 +4,11 @@ import structlog
 from fastapi import BackgroundTasks, Depends, Header, HTTPException, Request
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_LOGIN_PROMPT
+from skyvern.constants import DEFAULT_LOGIN_PROMPT, SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes.code_samples import (
     DOWNLOAD_FILES_CODE_SAMPLE_PYTHON,
     DOWNLOAD_FILES_CODE_SAMPLE_TS,
@@ -62,6 +63,7 @@ async def _run_workflow_and_build_response(
     totp_verification_url: str | None,
     totp_identifier: str | None,
     x_api_key: str | None,
+    x_user_agent: str | None = None,
 ) -> WorkflowRunResponse:
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -77,6 +79,9 @@ async def _run_workflow_and_build_response(
         extra_http_headers=run_block_request.extra_http_headers,
     )
 
+    trigger_type = (
+        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+    )
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -88,6 +93,7 @@ async def _run_workflow_and_build_response(
             request_id=request_id,
             request=request,
             background_tasks=background_tasks,
+            trigger_type=trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -144,6 +150,7 @@ async def login(
     login_request: LoginRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
     url = _validate_url(login_request.url)
     totp_verification_url = _validate_url(login_request.totp_url)
@@ -277,6 +284,7 @@ async def login(
         totp_verification_url=totp_verification_url,
         totp_identifier=resolved_totp_identifier,
         x_api_key=x_api_key,
+        x_user_agent=x_user_agent,
     )
 
 
@@ -304,6 +312,7 @@ async def download_files(
     download_files_request: DownloadFilesRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
     url = _validate_url(download_files_request.url)
     totp_verification_url = _validate_url(download_files_request.totp_url)
@@ -366,4 +375,5 @@ async def download_files(
         totp_verification_url=totp_verification_url,
         totp_identifier=download_files_request.totp_identifier,
         x_api_key=x_api_key,
+        x_user_agent=x_user_agent,
     )

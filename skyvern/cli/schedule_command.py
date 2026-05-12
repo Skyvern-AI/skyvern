@@ -7,25 +7,64 @@ from typing import Any
 
 import typer
 from click.core import ParameterSource
-from dotenv import load_dotenv
 
-from skyvern.config import settings
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import run_tool
-from .mcp_tools.schedule import skyvern_schedule_create as tool_schedule_create
-from .mcp_tools.schedule import skyvern_schedule_delete as tool_schedule_delete
-from .mcp_tools.schedule import skyvern_schedule_disable as tool_schedule_disable
-from .mcp_tools.schedule import skyvern_schedule_enable as tool_schedule_enable
-from .mcp_tools.schedule import skyvern_schedule_get as tool_schedule_get
-from .mcp_tools.schedule import skyvern_schedule_list as tool_schedule_list
-from .mcp_tools.schedule import skyvern_schedule_list_for_workflow as tool_schedule_list_for_workflow
-from .mcp_tools.schedule import skyvern_schedule_update as tool_schedule_update
 
 schedule_app = typer.Typer(
     help="Manage workflow schedules (list, create, update, enable/disable, delete).",
     no_args_is_help=True,
 )
+
+
+async def tool_schedule_list(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_list  # noqa: PLC0415
+
+    return await skyvern_schedule_list(**kwargs)
+
+
+async def tool_schedule_list_for_workflow(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_list_for_workflow  # noqa: PLC0415
+
+    return await skyvern_schedule_list_for_workflow(**kwargs)
+
+
+async def tool_schedule_get(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_get  # noqa: PLC0415
+
+    return await skyvern_schedule_get(**kwargs)
+
+
+async def tool_schedule_create(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_create  # noqa: PLC0415
+
+    return await skyvern_schedule_create(**kwargs)
+
+
+async def tool_schedule_update(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_update  # noqa: PLC0415
+
+    return await skyvern_schedule_update(**kwargs)
+
+
+async def tool_schedule_enable(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_enable  # noqa: PLC0415
+
+    return await skyvern_schedule_enable(**kwargs)
+
+
+async def tool_schedule_disable(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_disable  # noqa: PLC0415
+
+    return await skyvern_schedule_disable(**kwargs)
+
+
+async def tool_schedule_delete(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.schedule import skyvern_schedule_delete  # noqa: PLC0415
+
+    return await skyvern_schedule_delete(**kwargs)
 
 
 @schedule_app.callback()
@@ -37,8 +76,10 @@ def schedule_callback(
         help="Skyvern API key.",
     ),
 ) -> None:
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
     if api_key:
+        from skyvern.config import settings  # noqa: PLC0415
+
         settings.SKYVERN_API_KEY = api_key
 
 
@@ -104,6 +145,7 @@ def schedule_list(
     async def _run() -> dict[str, Any]:
         if workflow_id is not None:
             return await tool_schedule_list_for_workflow(workflow_permanent_id=workflow_id)
+
         return await tool_schedule_list(page=page, page_size=page_size, status=status, search=search)
 
     run_tool(

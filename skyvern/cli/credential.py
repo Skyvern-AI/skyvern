@@ -5,20 +5,34 @@ from __future__ import annotations
 from typing import Any
 
 import typer
-from dotenv import load_dotenv
 
-from skyvern.config import settings
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import run_tool
-from .mcp_tools.credential import skyvern_credential_delete as tool_credential_delete
-from .mcp_tools.credential import skyvern_credential_get as tool_credential_get
-from .mcp_tools.credential import skyvern_credential_list as tool_credential_list
 
 credential_app = typer.Typer(
     help="MCP-parity credential commands (list/get/delete). Use `skyvern credentials add` for secure creation.",
     no_args_is_help=True,
 )
+
+
+async def tool_credential_list(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.credential import skyvern_credential_list  # noqa: PLC0415
+
+    return await skyvern_credential_list(**kwargs)
+
+
+async def tool_credential_get(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.credential import skyvern_credential_get  # noqa: PLC0415
+
+    return await skyvern_credential_get(**kwargs)
+
+
+async def tool_credential_delete(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.credential import skyvern_credential_delete  # noqa: PLC0415
+
+    return await skyvern_credential_delete(**kwargs)
 
 
 @credential_app.callback()
@@ -31,8 +45,10 @@ def credential_callback(
     ),
 ) -> None:
     """Load environment and optional API key override."""
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
     if api_key:
+        from skyvern.config import settings  # noqa: PLC0415
+
         settings.SKYVERN_API_KEY = api_key
 
 

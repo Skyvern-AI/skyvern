@@ -22,8 +22,9 @@ from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedError
 
-from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
+from skyvern.forge.sdk.routes.streaming.channels.execution import execution_for_message_channel
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent, ExfiltrationChannel
+from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
 from skyvern.forge.sdk.routes.streaming.registries import (
     add_message_channel,
     del_message_channel,
@@ -48,10 +49,24 @@ class MessageKind(enum.StrEnum):
     ASK_FOR_CLIPBOARD_RESPONSE = "ask-for-clipboard-response"
     BEGIN_EXFILTRATION = "begin-exfiltration"
     BROWSER_TABS = "browser-tabs"
+    BROWSER_URL = "browser-url"
     CEDE_CONTROL = "cede-control"
+    CLEAR_ALL_DATA = "clear-all-data"
+    CLEAR_COOKIES = "clear-cookies"
+    CLEAR_HISTORY = "clear-history"
+    CLIPBOARD_COPY = "clipboard-copy"
+    CLIPBOARD_PASTE = "clipboard-paste"
     END_EXFILTRATION = "end-exfiltration"
+    ERROR = "error"
     EXFILTRATED_EVENT = "exfiltrated-event"
+    GET_BROWSER_URL = "get-browser-url"
+    GO_BACK = "go-back"
+    GO_FORWARD = "go-forward"
+    NAVIGATE = "navigate"
+    RELOAD = "reload"
+    SCREENSHOT = "screenshot"
     TAKE_CONTROL = "take-control"
+    TAKE_SCREENSHOT = "take-screenshot"
 
 
 class ExfiltratedEventSource(enum.StrEnum):
@@ -76,10 +91,24 @@ MessageKinds = t.Literal[
     MessageKind.ASK_FOR_CLIPBOARD_RESPONSE,
     MessageKind.BEGIN_EXFILTRATION,
     MessageKind.BROWSER_TABS,
+    MessageKind.BROWSER_URL,
     MessageKind.CEDE_CONTROL,
+    MessageKind.CLEAR_ALL_DATA,
+    MessageKind.CLEAR_COOKIES,
+    MessageKind.CLEAR_HISTORY,
+    MessageKind.CLIPBOARD_COPY,
+    MessageKind.CLIPBOARD_PASTE,
     MessageKind.END_EXFILTRATION,
+    MessageKind.ERROR,
     MessageKind.EXFILTRATED_EVENT,
+    MessageKind.GET_BROWSER_URL,
+    MessageKind.GO_BACK,
+    MessageKind.GO_FORWARD,
+    MessageKind.NAVIGATE,
+    MessageKind.RELOAD,
+    MessageKind.SCREENSHOT,
     MessageKind.TAKE_CONTROL,
+    MessageKind.TAKE_SCREENSHOT,
 ]
 
 
@@ -115,6 +144,86 @@ class MessageInAskForClipboardResponse(Message):
 
 
 @dataclasses.dataclass
+class MessageInClipboardCopy(Message):
+    kind: t.Literal[MessageKind.CLIPBOARD_COPY] = MessageKind.CLIPBOARD_COPY
+
+
+@dataclasses.dataclass
+class MessageInClipboardPaste(Message):
+    kind: t.Literal[MessageKind.CLIPBOARD_PASTE] = MessageKind.CLIPBOARD_PASTE
+    text: str = ""
+
+
+@dataclasses.dataclass
+class MessageInGetBrowserUrl(Message):
+    kind: t.Literal[MessageKind.GET_BROWSER_URL] = MessageKind.GET_BROWSER_URL
+
+
+@dataclasses.dataclass
+class MessageInNavigate(Message):
+    kind: t.Literal[MessageKind.NAVIGATE] = MessageKind.NAVIGATE
+    url: str = ""
+
+
+@dataclasses.dataclass
+class MessageInReload(Message):
+    kind: t.Literal[MessageKind.RELOAD] = MessageKind.RELOAD
+    hard: bool = False
+
+
+@dataclasses.dataclass
+class MessageInGoBack(Message):
+    kind: t.Literal[MessageKind.GO_BACK] = MessageKind.GO_BACK
+
+
+@dataclasses.dataclass
+class MessageInGoForward(Message):
+    kind: t.Literal[MessageKind.GO_FORWARD] = MessageKind.GO_FORWARD
+
+
+@dataclasses.dataclass
+class MessageInTakeScreenshot(Message):
+    kind: t.Literal[MessageKind.TAKE_SCREENSHOT] = MessageKind.TAKE_SCREENSHOT
+
+
+@dataclasses.dataclass
+class MessageInClearCookies(Message):
+    kind: t.Literal[MessageKind.CLEAR_COOKIES] = MessageKind.CLEAR_COOKIES
+
+
+@dataclasses.dataclass
+class MessageInClearHistory(Message):
+    kind: t.Literal[MessageKind.CLEAR_HISTORY] = MessageKind.CLEAR_HISTORY
+
+
+@dataclasses.dataclass
+class MessageInClearAllData(Message):
+    kind: t.Literal[MessageKind.CLEAR_ALL_DATA] = MessageKind.CLEAR_ALL_DATA
+
+
+@dataclasses.dataclass
+class MessageOutBrowserUrl(Message):
+    kind: t.Literal[MessageKind.BROWSER_URL] = MessageKind.BROWSER_URL
+    url: str = ""
+
+
+@dataclasses.dataclass
+class MessageOutScreenshot(Message):
+    kind: t.Literal[MessageKind.SCREENSHOT] = MessageKind.SCREENSHOT
+    data: str = ""  # base64-encoded PNG payload
+    mime_type: str = "image/png"
+
+
+@dataclasses.dataclass
+class MessageOutError(Message):
+    """Surfaces a backend handler failure to the frontend so it can toast."""
+
+    kind: t.Literal[MessageKind.ERROR] = MessageKind.ERROR
+    failed_kind: str = ""
+    message: str = ""
+
+
+@dataclasses.dataclass
 class MessageOutExfiltratedEvent(Message):
     kind: t.Literal[MessageKind.EXFILTRATED_EVENT] = MessageKind.EXFILTRATED_EVENT
     event_name: str = "[not-specified]"
@@ -135,12 +244,25 @@ MessageIn = (
     MessageInAskForClipboardResponse
     | MessageInBeginExfiltration
     | MessageInCedeControl
+    | MessageInClearAllData
+    | MessageInClearCookies
+    | MessageInClearHistory
+    | MessageInClipboardCopy
+    | MessageInClipboardPaste
     | MessageInEndExfiltration
+    | MessageInGetBrowserUrl
+    | MessageInGoBack
+    | MessageInGoForward
+    | MessageInNavigate
+    | MessageInReload
     | MessageInTakeControl
+    | MessageInTakeScreenshot
 )
 
 
-MessageOut = MessageOutExfiltratedEvent | MessageOutTabInfo
+MessageOut = (
+    MessageOutBrowserUrl | MessageOutError | MessageOutExfiltratedEvent | MessageOutScreenshot | MessageOutTabInfo
+)
 
 
 ChannelMessage = MessageIn | MessageOut
@@ -157,10 +279,35 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInBeginExfiltration()
         case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
+        case MessageKind.CLEAR_ALL_DATA:
+            return MessageInClearAllData()
+        case MessageKind.CLEAR_COOKIES:
+            return MessageInClearCookies()
+        case MessageKind.CLEAR_HISTORY:
+            return MessageInClearHistory()
+        case MessageKind.CLIPBOARD_COPY:
+            return MessageInClipboardCopy()
+        case MessageKind.CLIPBOARD_PASTE:
+            text = data.get("text") or ""
+            return MessageInClipboardPaste(text=text)
         case MessageKind.END_EXFILTRATION:
             return MessageInEndExfiltration()
+        case MessageKind.GET_BROWSER_URL:
+            return MessageInGetBrowserUrl()
+        case MessageKind.GO_BACK:
+            return MessageInGoBack()
+        case MessageKind.GO_FORWARD:
+            return MessageInGoForward()
+        case MessageKind.NAVIGATE:
+            url = data.get("url") or ""
+            return MessageInNavigate(url=url)
+        case MessageKind.RELOAD:
+            hard = bool(data.get("hard") or False)
+            return MessageInReload(hard=hard)
         case MessageKind.TAKE_CONTROL:
             return MessageInTakeControl()
+        case MessageKind.TAKE_SCREENSHOT:
+            return MessageInTakeScreenshot()
         case _:
             raise ValueError(f"Unknown message kind: '{kind}'")
 
@@ -393,22 +540,37 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
             )
             return
 
+        async def send_error(failed_kind: MessageKind, reason: str) -> None:
+            await send(MessageOutError(failed_kind=str(failed_kind), message=reason))
+
+        async def send_current_browser_url(execute: t.Any) -> None:
+            url = await execute.get_current_url()
+            await send(MessageOutBrowserUrl(url=url))
+
         match message.kind:
             case MessageKind.ASK_FOR_CLIPBOARD_RESPONSE:
-                vnc_channel = get_vnc_channel(message_channel.client_id)
-
-                if not vnc_channel:
-                    LOG.error(
-                        f"{class_name} no vnc channel found for message channel.",
-                        message=message,
-                        **message_channel.identity,
-                    )
-                    return
-
                 text = message.text
 
-                async with execution_channel(vnc_channel) as execute:
-                    await execute.paste_text(text)
+                paste_byte_len = len(text.encode("utf-8"))
+                if paste_byte_len > MAX_CLIPBOARD_PASTE_BYTES:
+                    LOG.warning(
+                        f"{class_name} ask-for-clipboard-response paste exceeds size cap; rejecting.",
+                        size=paste_byte_len,
+                        max_size=MAX_CLIPBOARD_PASTE_BYTES,
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Clipboard payload too large.")
+                    return
+
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.paste_text(text)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to paste clipboard response into browser.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to paste into browser.")
 
             case MessageKind.BEGIN_EXFILTRATION:
                 if exfiltration_channel is not None:
@@ -447,6 +609,9 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
             case MessageKind.BROWSER_TABS:
                 await send(message)
 
+            case MessageKind.BROWSER_URL:
+                await send(message)
+
             case MessageKind.CEDE_CONTROL:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
@@ -459,6 +624,76 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     return
                 vnc_channel.interactor = "agent"
 
+            case MessageKind.CLEAR_ALL_DATA:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.clear_storage()
+                        await execute.clear_cookies()
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to clear all data.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to clear all browsing data.")
+
+            case MessageKind.CLEAR_COOKIES:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.clear_cookies()
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to clear cookies.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to clear cookies.")
+
+            case MessageKind.CLEAR_HISTORY:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.clear_history()
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to clear history.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to clear browsing history.")
+
+            case MessageKind.CLIPBOARD_COPY:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        copied_text = await execute.get_selected_text()
+                        await message_channel.send_copied_text(copied_text)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to copy text from browser.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to copy selected text.")
+
+            case MessageKind.CLIPBOARD_PASTE:
+                text = message.text
+
+                paste_byte_len = len(text.encode("utf-8"))
+                if paste_byte_len > MAX_CLIPBOARD_PASTE_BYTES:
+                    LOG.warning(
+                        f"{class_name} clipboard-paste payload exceeds size cap; rejecting.",
+                        size=paste_byte_len,
+                        max_size=MAX_CLIPBOARD_PASTE_BYTES,
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Clipboard payload too large.")
+                    return
+
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.paste_text(text)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to paste text into browser.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to paste into browser.")
+
             case MessageKind.END_EXFILTRATION:
                 if exfiltration_channel is None:
                     return
@@ -467,14 +702,89 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
                 exfiltration_channel = None
 
+            case MessageKind.ERROR:
+                await send(message)
+
             case MessageKind.EXFILTRATED_EVENT:
                 await send(message)
 
-            # case MessageKind.GET_TAB_INFO:
-            #     """
-            #     TODO(jdo): implement - this is an on-demand request for tab info, which is
-            #     required when connecting to an existing browser session.
-            #     """
+            case MessageKind.GET_BROWSER_URL:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        url = await execute.get_current_url()
+                        url_message = MessageOutBrowserUrl(url=url)
+                        await send(url_message)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to get browser URL.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to read browser URL.")
+
+            case MessageKind.GO_BACK:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.go_back()
+                        await send_current_browser_url(execute)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to go back.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Couldn't go back.")
+
+            case MessageKind.GO_FORWARD:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.go_forward()
+                        await send_current_browser_url(execute)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to go forward.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Couldn't go forward.")
+
+            case MessageKind.NAVIGATE:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.navigate(message.url)
+                        # Push the new URL back so the URL input reflects it immediately,
+                        # rather than waiting for the next poll.
+                        await send_current_browser_url(execute)
+                except ValueError as exc:
+                    LOG.warning(
+                        f"{class_name} rejected navigate.",
+                        url=message.url,
+                        error=str(exc),
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, str(exc))
+                except Exception:
+                    # The target URL is user-controlled; log it server-side
+                    # but don't reflect it back in the toast.
+                    LOG.exception(
+                        f"{class_name} failed to navigate.",
+                        url=message.url,
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Navigation failed.")
+
+            case MessageKind.RELOAD:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        await execute.reload(hard=message.hard)
+                        await send_current_browser_url(execute)
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to reload.",
+                        hard=message.hard,
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to reload.")
+
+            case MessageKind.SCREENSHOT:
+                await send(message)
 
             case MessageKind.TAKE_CONTROL:
                 LOG.info(f"{class_name} processing take-control message.", **message_channel.identity)
@@ -488,6 +798,18 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     )
                     return
                 vnc_channel.interactor = "user"
+
+            case MessageKind.TAKE_SCREENSHOT:
+                try:
+                    async with execution_for_message_channel(message_channel) as execute:
+                        screenshot_b64 = await execute.take_screenshot()
+                        await send(MessageOutScreenshot(data=screenshot_b64))
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to take screenshot.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to capture screenshot.")
 
             case _:
                 t.assert_never(message.kind)

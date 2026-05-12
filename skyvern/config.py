@@ -1,4 +1,5 @@
 import logging
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import (
+    BACKEND_ENV_BASENAMES,
+    BACKEND_ENV_INTENT_ENV_VAR,
+    EnvIntent,
+    backend_env_path_candidates,
+)
 
 
 def _default_database_string() -> str:
@@ -43,10 +49,23 @@ def _ensure_sqlite_dir(database_string: str) -> None:
 # Even if we were to resolve paths at instantiation time, the global `settings`
 # singleton instantiation at the bottom of this file also runs at import time
 # and relies on the same assumption.
-_DEFAULT_ENV_FILES = (
-    resolve_backend_env_path(".env"),
-    resolve_backend_env_path(".env.staging"),
-    resolve_backend_env_path(".env.prod"),
+#
+# pydantic-settings applies later dotenv files with higher precedence, so the
+# resolver's read-priority order is reversed here. With no explicit CLI intent,
+# AUTO preserves legacy self-hosted imports by only considering ./.env.
+def _settings_env_intent() -> EnvIntent:
+    try:
+        return EnvIntent(os.getenv(BACKEND_ENV_INTENT_ENV_VAR, EnvIntent.AUTO.value))
+    except ValueError:
+        return EnvIntent.AUTO
+
+
+def _settings_env_file_candidates(basename: str) -> tuple[Path, ...]:
+    return tuple(reversed(backend_env_path_candidates(basename, intent=_settings_env_intent())))
+
+
+_DEFAULT_ENV_FILES = tuple(
+    candidate for basename in BACKEND_ENV_BASENAMES for candidate in _settings_env_file_candidates(basename)
 )
 
 

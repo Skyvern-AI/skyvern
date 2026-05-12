@@ -143,8 +143,22 @@ CDP (Chrome DevTools Protocol) lets Skyvern control an external Chrome browser i
 
 ### Step 1: Enable Chrome remote debugging
 
-When Skyvern runs in Docker, Chrome must listen on an address the container can
-reach. Start Chrome manually with `--remote-debugging-address=0.0.0.0`:
+For an already-running Chrome profile, prefer Chrome's built-in remote debugging
+toggle:
+
+1. Open `chrome://inspect/#remote-debugging` in Chrome.
+2. Enable remote debugging for this browser instance.
+3. Keep Chrome open while Skyvern connects.
+
+This path keeps you on your existing Chrome profile. Skyvern will first try to
+auto-discover a local debugging server, then let you paste a direct
+`ws://.../devtools/browser/...` URL if Chrome exposes only a WebSocket endpoint.
+
+#### Docker-reachable isolated profile fallback
+
+When Skyvern runs in Docker, Chrome's built-in listener may bind to host
+loopback only. If the container cannot reach it, start a separate Chrome profile
+with a Docker-reachable CDP endpoint:
 
 <CodeGroup>
 ```bash macOS
@@ -175,7 +189,10 @@ google-chrome \
 ```
 </CodeGroup>
 
-The `--user-data-dir` flag creates a separate profile for Skyvern, preserving your main Chrome profile.
+The `--user-data-dir` flag creates a separate profile for Skyvern, preserving
+your main Chrome profile. Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port),
+`--remote-debugging-port` is ignored for the default Chrome data directory, so
+only use these flags with a non-standard user data directory.
 
 #### Windows Docker Desktop with `chrome://inspect`
 
@@ -216,6 +233,11 @@ BROWSER_TYPE=cdp-connect
 BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
 BROWSER_CDP_CONNECT_TIMEOUT_MS=120000
 ```
+
+Use the URL that matches the remote debugging path you chose. For a classic
+HTTP CDP endpoint, use the host and port. For a `chrome://inspect` flow that
+only exposes a browser WebSocket, use the full direct
+`ws://.../devtools/browser/<id>` URL.
 
 When running Skyvern in Docker:
 

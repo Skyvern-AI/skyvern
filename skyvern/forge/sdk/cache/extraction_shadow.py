@@ -31,6 +31,11 @@ _LIST_INDEX_RE = re.compile(r"\[\d+\]")
 
 _LlmCall = Callable[[], Awaitable[Any]]
 
+# Sentinel for shadow event `cached_age_seconds` when the cache backend doesn't
+# track per-key write time (Redis tier). Distinct from 0.0 so Datadog can split
+# "just-cached" from "age unknown."
+UNKNOWN_CACHE_AGE_SENTINEL = -1.0
+
 
 def _elapsed_ms(start_seconds: float) -> int:
     """Elapsed ms since ``start_seconds`` (a ``time.monotonic()`` reading)."""
@@ -322,9 +327,8 @@ async def run_shadow_comparison(
 
 # Strong refs so asyncio doesn't GC in-flight shadow tasks (create_task only holds a weak ref).
 _PENDING_SHADOW_TASKS: set[asyncio.Task[None]] = set()
-# Cap chosen so shadow calls never sustain more than ~10% of a typical provider's
-# burst quota at the expected 1% sample rate. Raise if sample rate climbs.
-_MAX_PENDING_SHADOWS = 50
+# Sized for a 5% sample rate with three producer call sites; raise if either climbs.
+_MAX_PENDING_SHADOWS = 250
 
 
 def _prune_pending() -> None:

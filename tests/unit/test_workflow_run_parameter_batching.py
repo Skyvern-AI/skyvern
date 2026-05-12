@@ -55,6 +55,7 @@ def _make_service_with_mocks(
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
+        browser_profile_id=None,
         run_with="agent",
         code_version=None,
         adaptive_caching=False,
@@ -96,6 +97,8 @@ async def test_setup_workflow_run_raises_on_missing_required_parameters() -> Non
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
         with pytest.raises(MissingValueForParameter):
             await service.setup_workflow_run(
@@ -140,6 +143,8 @@ async def test_setup_workflow_run_persistence_error_identifies_specific_failing_
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
         with pytest.raises(WorkflowRunParameterPersistenceError) as exc_info:
             await service.setup_workflow_run(
                 request_id="req_test",
@@ -170,6 +175,8 @@ async def test_setup_workflow_run_raises_on_non_string_credential_id() -> None:
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
         with pytest.raises(InvalidCredentialId):
             await service.setup_workflow_run(
                 request_id="req_test",
@@ -198,6 +205,8 @@ async def test_setup_workflow_run_batches_credential_validation() -> None:
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id=f"cred_id_{i}") for i in range(3)]
         )
@@ -227,6 +236,8 @@ async def test_setup_workflow_run_skips_credential_lookup_when_no_credentials() 
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
         await service.setup_workflow_run(
@@ -253,6 +264,8 @@ async def test_setup_workflow_run_raises_invalid_credential_when_missing() -> No
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
         with pytest.raises(InvalidCredentialId) as exc_info:
@@ -283,6 +296,8 @@ async def test_setup_workflow_run_surfaces_all_missing_credentials() -> None:
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         # Only cred_id_0 exists; cred_id_1 and cred_id_2 are missing.
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_id_0")]
@@ -319,6 +334,8 @@ async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_shared")]
         )
@@ -352,6 +369,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
         await service.setup_workflow_run(
             request_id="req_test",
@@ -393,6 +412,8 @@ async def test_setup_workflow_run_opens_one_outer_session() -> None:
     request = WorkflowRequestBody(data={"k": "v"})
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.workflow_runs.Session = lambda: _Counter()
         await service.setup_workflow_run(
             request_id="req_test",
@@ -446,6 +467,8 @@ async def test_setup_workflow_run_rolls_back_outer_session_on_batch_failure() ->
     request = WorkflowRequestBody(data={"a": "1", "b": "2"})
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.workflow_runs.Session = lambda: _Session()
         await service.setup_workflow_run(
             request_id="req_test",

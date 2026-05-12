@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -79,25 +80,28 @@ async def verify_browser_session(
     browser_address = browser_session.browser_address
 
     if not browser_address:
-        LOG.info(
-            "Waiting for browser session address.",
-            browser_session_id=browser_session_id,
-            organization_id=organization_id,
-        )
-
-        try:
-            browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
-                session_id=browser_session_id,
-                organization_id=organization_id,
-            )
-        except Exception as ex:
+        if settings.BROWSER_STREAMING_MODE == "cdp":
+            browser_address = ""
+        else:
             LOG.info(
-                "Browser session address not found for browser session.",
+                "Waiting for browser session address.",
                 browser_session_id=browser_session_id,
                 organization_id=organization_id,
-                ex=ex,
             )
-            return None
+
+            try:
+                browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+                    session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+            except Exception as ex:
+                LOG.info(
+                    "Browser session address not found for browser session.",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    ex=ex,
+                )
+                return None
 
     try:
         addressable_browser_session = AddressablePersistentBrowserSession(

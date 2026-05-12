@@ -1,6 +1,29 @@
 """Tests for ScriptReviewer quality validators: proactive misuse, fragile selectors, hardcoded run data."""
 
+from pathlib import Path
+
 from skyvern.services.script_reviewer import ScriptReviewer
+
+_PROMPT_PATH = Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "prompts" / "skyvern" / "script-reviewer.j2"
+
+
+class TestSelectorReplacementGuidance:
+    """Pin Rule 8b's multi-row form guidance against accidental deletion."""
+
+    def test_rule_8b_covers_multi_row_full_block_case(self) -> None:
+        # Assert on key concepts rather than exact wording so the rule can be
+        # rephrased without breaking the test. The invariants are: (1) multi-row
+        # forms are called out somewhere in the prompt, (2) the `full_block`
+        # episode case is covered, (3) the prescribed action is removal, not
+        # accumulation.
+        text = _PROMPT_PATH.read_text(encoding="utf-8")
+        assert "multi-row" in text.lower()
+        assert "full_block" in text
+        # The fix's whole point: REMOVE (not just dedupe) the ambiguous label
+        # selector. Case-sensitive — the prompt uses upper-case REMOVE as a
+        # directive marker.
+        assert "REMOVE" in text
+        assert "label:has-text" in text
 
 
 class TestValidateProactiveMisuse:
@@ -488,8 +511,8 @@ async def block_1(page, context):
 """
         result = extract_cached_blocks_from_source(source)
         assert set(result.keys()) == {"login", "block_1"}
-        assert "page.goto" in result["login"]
-        assert "page.click" in result["block_1"]
+        assert "page.goto" in result["login"]  # nosemgrep: incomplete-url-substring-sanitization
+        assert "page.click" in result["block_1"]  # nosemgrep: incomplete-url-substring-sanitization
         # login block should NOT contain block_1 code
         assert "page.click" not in result["login"]
 
@@ -509,7 +532,7 @@ async def block_1(page, context):
 """
         result = extract_single_cached_block(source, "block_1")
         assert result is not None
-        assert "page.click" in result
+        assert "page.click" in result  # nosemgrep: incomplete-url-substring-sanitization
         assert "page.goto" not in result
 
     def test_extract_first_block(self):
@@ -528,7 +551,7 @@ async def block_1(page, context):
 """
         result = extract_single_cached_block(source, "login")
         assert result is not None
-        assert "page.goto" in result
+        assert "page.goto" in result  # nosemgrep: incomplete-url-substring-sanitization
         assert "page.click" not in result
 
     def test_extract_single_block_not_found(self):

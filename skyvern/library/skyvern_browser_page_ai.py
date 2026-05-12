@@ -337,6 +337,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         self,
         navigation_goal: str,
         max_steps: int = 10,
+        validate_first: bool = False,
     ) -> None:
         """Activate the AI agent from the current page position.
 

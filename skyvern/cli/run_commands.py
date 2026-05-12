@@ -14,21 +14,24 @@ if TYPE_CHECKING:
 import psutil
 import typer
 import uvicorn
-from dotenv import load_dotenv, set_key
+from dotenv import set_key
 from rich.panel import Panel
 from rich.prompt import Confirm
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 from starlette.responses import Response as StarletteResponse
 
+from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.cli.commands._output import output_error
 from skyvern.cli.commands._tty import is_interactive
 from skyvern.cli.console import console
 from skyvern.cli.core.result import set_concise_responses
-from skyvern.cli.utils import start_services
-from skyvern.config import settings
 from skyvern.utils import detect_os
-from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
+from skyvern.utils.env_paths import (
+    EnvIntent,
+    resolve_backend_env_path,
+    resolve_frontend_env_path,
+)
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 _mcp_cleanup_done = False
@@ -116,7 +119,7 @@ def run_server() -> None:
 
         _handle_missing_dep(exc)
 
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.SERVER)
     from skyvern.config import settings  # noqa: PLC0415
 
     port = settings.PORT
@@ -189,9 +192,9 @@ def run_ui(
         shutil.copy(frontend_dir / ".env.example", frontend_env_path)
         console.print("✅ [green]Successfully set up frontend .env file[/green]")
 
-    backend_env_path = resolve_backend_env_path()
+    backend_env_path = resolve_backend_env_path(intent=EnvIntent.SERVER)
     if backend_env_path.exists():
-        load_dotenv(backend_env_path)
+        prepare_cli_runtime(intent=EnvIntent.SERVER)
         skyvern_api_key = os.getenv("SKYVERN_API_KEY")
         if skyvern_api_key:
             set_key(frontend_env_path, "VITE_SKYVERN_API_KEY", skyvern_api_key)
@@ -326,6 +329,8 @@ def run_docker() -> None:
 @run_app.command(name="all")
 def run_all() -> None:
     """Run the Skyvern API server and UI server in parallel."""
+    from skyvern.cli.utils import start_services  # noqa: PLC0415
+
     asyncio.run(start_services())
 
 
@@ -336,7 +341,7 @@ def run_dev() -> None:
     This command starts both services and immediately returns control to your terminal.
     Use 'skyvern stop all' to stop the services.
     """
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.SERVER)
     from skyvern.config import settings as skyvern_settings  # noqa: PLC0415
 
     console.print(Panel("[bold green]Starting Skyvern in development mode...[/bold green]", border_style="green"))
@@ -442,6 +447,7 @@ def run_mcp(
     ] = False,
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
     from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
@@ -531,6 +537,9 @@ def run_code(
     logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
+
+    from skyvern.config import settings  # noqa: PLC0415
+
     settings.LOG_LEVEL = "CRITICAL"
 
     from skyvern.forge.sdk.forge_log import setup_logger  # noqa: PLC0415

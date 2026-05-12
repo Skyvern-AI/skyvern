@@ -2,49 +2,238 @@
 
 import asyncio
 import subprocess
+import sys
+from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 from rich.text import Text
 
-from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.cli.console import console
+from skyvern.utils.env_paths import EnvScope, parse_env_scope, resolve_frontend_env_path
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
+
+
+def capture_setup_error(
+    event_name: str,
+    error: Exception,
+    error_type: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_error as _capture_setup_error  # noqa: PLC0415
+
+    _capture_setup_error(event_name, error, error_type, extra_data)
+
+
+class QuickstartPath(str, Enum):
+    CLOUD = "cloud"
+    LOCAL = "local"
+    SERVER = "server"
 
 
 def _has_server_quickstart_extra() -> bool:
     from skyvern.exceptions import SkyvernExtraNotInstalled, require_server_extra_modules  # noqa: PLC0415
 
     try:
-        require_server_extra_modules("skyvern quickstart", ("uvicorn",))
+        require_server_extra_modules("skyvern quickstart", ("uvicorn", "fastmcp"))
     except SkyvernExtraNotInstalled:
         return False
     return True
 
 
-def _print_install_path_guidance() -> None:
-    message = """Choose the Skyvern path for what you want to do:
+def _has_local_quickstart_extra() -> bool:
+    from skyvern.exceptions import SkyvernExtraNotInstalled, require_local_extra_modules  # noqa: PLC0415
 
-Cloud/API SDK
-  You already have this with `pip install skyvern`.
-  No quickstart is required. Use `Skyvern(api_key=...)` or run `skyvern setup` for cloud MCP.
+    try:
+        require_local_extra_modules("skyvern quickstart")
+    except SkyvernExtraNotInstalled:
+        return False
+    return True
 
-Embedded local Python SDK
-  Install: pip install "skyvern[local]"
-  Then: python -m playwright install chromium
-  Use: Skyvern.local(use_in_memory_db=True)
-  This path does not require Postgres, Docker, migrations, or `skyvern run server`.
 
-Self-hosted local server
-  Install: pip install "skyvern[server]"
-  Then rerun: skyvern quickstart
-  This path sets up the local server, database, local API key, MCP, and optional UI.
+def _is_interactive_input() -> bool:
+    return sys.stdin.isatty()
+
+
+def _default_quickstart_path(*, has_local_extra: bool, has_server_extra: bool) -> QuickstartPath:
+    if has_server_extra:
+        return QuickstartPath.SERVER
+    if has_local_extra:
+        return QuickstartPath.LOCAL
+    return QuickstartPath.CLOUD
+
+
+_QUICKSTART_PATH_CHOICES = {
+    "1": QuickstartPath.CLOUD,
+    "cloud": QuickstartPath.CLOUD,
+    "api": QuickstartPath.CLOUD,
+    "2": QuickstartPath.LOCAL,
+    "local": QuickstartPath.LOCAL,
+    "embedded": QuickstartPath.LOCAL,
+    "3": QuickstartPath.SERVER,
+    "server": QuickstartPath.SERVER,
+    "self-hosted": QuickstartPath.SERVER,
+    "selfhosted": QuickstartPath.SERVER,
+}
+
+
+def _parse_quickstart_path(value: str) -> QuickstartPath:
+    choice = _QUICKSTART_PATH_CHOICES.get(value.strip().lower())
+    if choice is None:
+        raise typer.BadParameter("Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3.")
+    return choice
+
+
+def _validate_install_type(value: str | None) -> str | None:
+    if value is not None:
+        _parse_quickstart_path(value)
+    return value
+
+
+def _print_quickstart_selector(
+    *,
+    default_path: QuickstartPath,
+    has_local_extra: bool,
+    has_server_extra: bool,
+) -> None:
+    local_status = "installed" if has_local_extra else 'requires `pip install "skyvern[local]"`'
+    server_status = "installed" if has_server_extra else 'requires `pip install "skyvern[server]"`'
+    message = f"""Choose how you want to use Skyvern:
+
+1. Cloud/API SDK usage
+   Status: installed with `pip install skyvern`
+
+2. Embedded local Python SDK via skyvern[local]
+   Status: {local_status}
+
+3. Self-hosted local server via skyvern[server]
+   Status: {server_status}
+
+Default: {default_path.value}
 """
     console.print(Panel(Text(message), title="Skyvern Quickstart", border_style="cyan"))
+
+
+def _select_quickstart_path(
+    install_type: str | None,
+    *,
+    has_local_extra: bool,
+    has_server_extra: bool,
+) -> QuickstartPath:
+    default_path = _default_quickstart_path(has_local_extra=has_local_extra, has_server_extra=has_server_extra)
+    if install_type is not None:
+        return _parse_quickstart_path(install_type)
+    _print_quickstart_selector(
+        default_path=default_path,
+        has_local_extra=has_local_extra,
+        has_server_extra=has_server_extra,
+    )
+    if not _is_interactive_input():
+        return default_path
+
+    default_choice = {
+        QuickstartPath.CLOUD: "1",
+        QuickstartPath.LOCAL: "2",
+        QuickstartPath.SERVER: "3",
+    }[default_path]
+    while True:
+        try:
+            selected = Prompt.ask(
+                "Choose a quickstart path (1/cloud, 2/local, 3/server)",
+                default=default_choice,
+            )
+        except EOFError:
+            return default_path
+        try:
+            return _parse_quickstart_path(selected)
+        except typer.BadParameter as exc:
+            console.print(f"[red]{exc.message}[/red]")
+
+
+def _server_quickstart_flags_requested(
+    *,
+    no_postgres: bool,
+    database_string: str,
+    skip_browser_install: bool,
+    server_only: bool,
+) -> bool:
+    """Return whether the user supplied options for the Python server setup path."""
+    return no_postgres or bool(database_string) or skip_browser_install or server_only
+
+
+def _parse_quickstart_env_scope(value: str) -> EnvScope:
+    try:
+        return parse_env_scope(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _print_cloud_guidance() -> None:
+    message = """Cloud/API SDK usage
+
+Installed with: pip install skyvern
+Next command: skyvern setup
+
+Python SDK:
+  from skyvern import Skyvern
+  skyvern = Skyvern(api_key="YOUR_API_KEY")
+
+No local browser, Postgres, Docker, migrations, or server startup is required.
+"""
+    console.print(Panel(Text(message), title="Cloud/API SDK", border_style="cyan"))
+
+
+def _print_local_guidance(*, has_local_extra: bool) -> None:
+    install_line = "Installed: skyvern[local]" if has_local_extra else 'Install: pip install "skyvern[local]"'
+    message = f"""Embedded local Python SDK
+
+{install_line}
+Next command: python -m playwright install chromium
+
+Use:
+  Skyvern.local(use_in_memory_db=True)
+
+This path does not require Postgres, Docker, migrations, or `skyvern run server`.
+"""
+    console.print(Panel(Text(message), title="Embedded Local SDK", border_style="cyan"))
+
+
+def _print_server_guidance() -> None:
+    message = """Self-hosted local server
+
+Install: pip install "skyvern[server]"
+Next: python -m skyvern quickstart
+
+This path sets up the local server, database, local API key, and MCP.
+Wheel installs run the backend only; use a source checkout or Docker Compose for the local UI.
+"""
+    console.print(Panel(Text(message), title="Self-Hosted Server", border_style="cyan"))
+
+
+def _browser_install_blocks_startup(init_result: object) -> bool:
+    browser_install = getattr(init_result, "browser_install", None)
+    return bool(
+        getattr(init_result, "run_local", False)
+        and getattr(browser_install, "required", False)
+        and not getattr(browser_install, "ready", True)
+    )
 
 
 def _run_server_quickstart(
@@ -60,23 +249,45 @@ def _run_server_quickstart(
 
         # Initialize Skyvern (pip install path)
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        run_local = init_env(
+        init_result = init_env(
             no_postgres=no_postgres,
             database_string=database_string,
             skip_browser_install=skip_browser_install,
+            return_result=True,
         )
+        run_local = bool(init_result)
         if run_local:
             _configure_cdp_livestreaming_defaults()
 
         # Start services
         if run_local:
+            if _browser_install_blocks_startup(init_result):
+                console.print(
+                    Panel(
+                        "[bold yellow]Skyvern setup is saved, but the browser install is incomplete.[/bold yellow]\n\n"
+                        "Quickstart will not start services yet because the selected browser mode launches "
+                        "Playwright-managed Chromium.\n\n"
+                        "Finish the browser install, then start Skyvern:\n"
+                        "[cyan]playwright install chromium[/cyan]\n"
+                        "[cyan]skyvern run server[/cyan]\n\n"
+                        "If you want to use an existing Chrome over CDP instead, rerun quickstart and choose "
+                        "Local browser -> Use actual browser, or pass [cyan]--skip-browser-install[/cyan] "
+                        "after configuring CDP.",
+                        border_style="yellow",
+                    )
+                )
+                return
+
             start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
             if start_now:
                 console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
                 asyncio.run(start_services(server_only=server_only))
             else:
+                start_command = (
+                    "skyvern run server" if server_only or resolve_frontend_env_path() is None else "skyvern run all"
+                )
                 console.print(
-                    "\n[yellow]Skipping service startup. You can start services later with 'skyvern run all'[/yellow]"
+                    f"\n[yellow]Skipping service startup. You can start services later with '{start_command}'[/yellow]"
                 )
 
     except KeyboardInterrupt:
@@ -292,10 +503,81 @@ def quickstart(
     ),
     server_only: bool = typer.Option(False, "--server-only", help="Only start the server, not the UI"),
     docker_compose: bool = typer.Option(False, "--docker-compose", help="Use Docker Compose for full setup"),
+    install_type: str | None = typer.Option(
+        None,
+        "--install-type",
+        callback=_validate_install_type,
+        help="Choose quickstart path: cloud, local, or server.",
+    ),
+    env_scope: str | None = typer.Option(
+        None,
+        "--env-scope",
+        help="Backend env location for setup writes: legacy/current, project, or global.",
+    ),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
+    install_type_value = install_type if isinstance(install_type, str) else None
+    env_scope_value = env_scope if isinstance(env_scope, str) else None
+
+    has_server_extra = _has_server_quickstart_extra()
+    # The server extra is a superset of the local embedded runtime dependencies.
+    has_local_extra = has_server_extra or _has_local_quickstart_extra()
+    server_flags_requested = _server_quickstart_flags_requested(
+        no_postgres=no_postgres,
+        database_string=database_string,
+        skip_browser_install=skip_browser_install,
+        server_only=server_only,
+    )
+    if docker_compose:
+        selected_path = (
+            QuickstartPath.SERVER if install_type_value is None else _parse_quickstart_path(install_type_value)
+        )
+        if selected_path is not QuickstartPath.SERVER:
+            console.print(
+                Panel(
+                    "[bold red]Conflicting quickstart options.[/bold red]\n"
+                    "`--docker-compose` starts the self-hosted server stack. "
+                    "Use `--install-type server` or omit `--install-type`.",
+                    border_style="red",
+                )
+            )
+            raise typer.Exit(1)
+        if env_scope_value is not None and _parse_quickstart_env_scope(env_scope_value) is not EnvScope.LEGACY:
+            console.print(
+                Panel(
+                    "[bold red]Conflicting quickstart options.[/bold red]\n"
+                    "Docker Compose uses the source checkout `.env` file. "
+                    "Use `--env-scope legacy` or omit `--env-scope`.",
+                    border_style="red",
+                )
+            )
+            raise typer.Exit(1)
+    elif install_type_value is None and server_flags_requested:
+        selected_path = QuickstartPath.SERVER
+    else:
+        selected_path = _select_quickstart_path(
+            install_type_value,
+            has_local_extra=has_local_extra,
+            has_server_extra=has_server_extra,
+        )
+    if selected_path is QuickstartPath.CLOUD:
+        _print_cloud_guidance()
+        raise typer.Exit(0)
+    if selected_path is QuickstartPath.LOCAL:
+        _print_local_guidance(has_local_extra=has_local_extra)
+        raise typer.Exit(0)
+    if env_scope_value is not None and _parse_quickstart_env_scope(env_scope_value) is not EnvScope.LEGACY:
+        console.print(
+            Panel(
+                "[bold red]Conflicting quickstart options.[/bold red]\n"
+                "Self-hosted local server setup writes ./.env. "
+                "Project/global scopes are for cloud/API config.",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(1)
 
     # Check if Docker Compose option was explicitly requested or offer choice
     docker_compose_available = check_docker_compose_file()
@@ -325,7 +607,7 @@ def quickstart(
         return
 
     # If Docker Compose file exists, offer the choice
-    if docker_compose_available and check_docker() and not database_string:
+    if docker_compose_available and check_docker() and not server_flags_requested:
         console.print("\n[bold blue]Setup Method[/bold blue]")
         console.print("Docker Compose file detected. Choose your setup method:\n")
         console.print("  [cyan]1.[/cyan] [green]Docker Compose (Recommended)[/green] - Full containerized setup")
@@ -340,8 +622,8 @@ def quickstart(
             run_docker_compose_setup()
             return
 
-    if not _has_server_quickstart_extra():
-        _print_install_path_guidance()
+    if not has_server_extra:
+        _print_server_guidance()
         raise typer.Exit(0)
 
     _run_server_quickstart(

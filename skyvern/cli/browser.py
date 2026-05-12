@@ -1,14 +1,12 @@
 import json
 import platform
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests  # type: ignore
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
-
-from skyvern.analytics import capture_setup_event
 
 from .console import console
 from .core.browser_launcher import (
@@ -19,6 +17,18 @@ from .core.browser_launcher import (
 
 # Ports to scan when auto-discovering a CDP debugging server
 _CDP_SCAN_PORTS = [9222, 9223, 9224, 9225, 9226, 9229]
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
 
 
 def _check_cdp_ws(port: int) -> Optional[dict]:
@@ -148,7 +158,11 @@ def _print_classic_cdp_instructions() -> None:
     console.print(
         Panel(
             "[bold]Enable Chrome remote debugging[/bold]\n\n"
-            "Start Chrome manually with a CDP endpoint that Docker can reach:\n\n"
+            "Recommended for your existing Chrome profile:\n"
+            "1. Open [cyan]chrome://inspect/#remote-debugging[/cyan] in Chrome.\n"
+            "2. Enable remote debugging for this browser instance.\n\n"
+            "If Skyvern runs in Docker and cannot reach that listener, start an isolated "
+            "Chrome profile with a Docker-reachable CDP endpoint instead:\n\n"
             f"[cyan]{_classic_cdp_launch_command()}[/cyan]",
             border_style="cyan",
         )
@@ -248,7 +262,9 @@ def _setup_local_browser_actual() -> tuple[str, Optional[str], Optional[str]]:
     # Step 2: Guide the user to enable Chrome remote debugging.
     _print_classic_cdp_instructions()
 
-    console.print("\n[bold yellow]Enable remote debugging in Chrome, then press Enter to continue...[/bold yellow]")
+    console.print(
+        "\n[bold yellow]Enable or start remote debugging in Chrome, then press Enter to continue...[/bold yellow]"
+    )
     Prompt.ask("Press Enter when ready", default="")
 
     # Step 3: Auto-discover the debugging server with retries

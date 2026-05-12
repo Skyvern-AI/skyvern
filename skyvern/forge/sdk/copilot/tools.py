@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlparse
 
 import structlog
 import yaml
-from agents import function_tool
+from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData, function_tool
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
@@ -25,7 +25,12 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import PROBABLE_SITE_BLOCK_STREAK_STOP_AT, TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import (
+    POST_INTERMEDIATE_SUCCESS_NUDGE,
+    PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
+    TOTAL_TIMEOUT_SECONDS,
+    _goal_likely_needs_more_blocks,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
@@ -42,6 +47,11 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
+from skyvern.forge.sdk.copilot.output_policy import (
+    evaluate_output_policy,
+    format_output_policy_tool_error,
+    output_policy_verdict_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     build_run_blocks_response,
@@ -49,6 +59,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -265,6 +276,47 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
         "credential ID, create the credential in the Credentials UI and return with its ID, or explicitly "
         "choose an unvalidated draft workflow that will not be run until credentials are available."
     )
+
+
+def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    tool_context = data.context
+    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    if not raw_arguments:
+        LOG.warning(
+            "workflow YAML output policy guardrail received no tool arguments",
+            tool_name=getattr(tool_context, "tool_name", None),
+            tool_call_id=getattr(tool_context, "tool_call_id", None),
+        )
+    try:
+        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
+    except json.JSONDecodeError:
+        parsed_arguments = {}
+    tool_arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
+    workflow_yaml_value = tool_arguments.get("workflow_yaml")
+    workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
+    verdict = evaluate_output_policy(
+        request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=tool_arguments or raw_arguments,
+    )
+    trace_data = output_policy_verdict_to_trace_data(
+        verdict,
+        surface="tool_input",
+        tool_name=getattr(tool_context, "tool_name", None),
+    )
+    LOG.info("copilot output policy tool guardrail verdict", **trace_data)
+    if not verdict.allowed:
+        return ToolGuardrailFunctionOutput.reject_content(
+            format_output_policy_tool_error(verdict),
+            output_info=trace_data,
+        )
+    return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
+
+
+_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
+    guardrail_function=_workflow_yaml_output_policy_guardrail,
+    name="workflow_yaml_output_policy_guardrail",
+)
 
 
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
@@ -742,6 +794,25 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     return None
 
 
+def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+    policy = getattr(ctx, "request_policy", None)
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if tool_name == "update_workflow" and not policy.allow_update_workflow:
+        return (
+            "Request policy blocks workflow updates for the latest user message. "
+            "Ask the user for safe stored credential metadata instead."
+        )
+    if tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
+        if policy.testing_intent == "skip_test":
+            return "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+        return (
+            "Request policy blocks block-running tools for the latest user message. "
+            "Ask the user for the required safe credential or clarification before testing."
+        )
+    return None
+
+
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
     WorkflowParameterType.STRING: "",
     WorkflowParameterType.INTEGER: 0,
@@ -823,6 +894,10 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
 ) -> dict[str, Any]:
+    policy_error = _request_policy_tool_error(ctx, "update_workflow")
+    if policy_error is not None:
+        return {"ok": False, "error": policy_error}
+
     workflow_yaml = params["workflow_yaml"]
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
@@ -830,6 +905,22 @@ async def _update_workflow(
         credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
         if credential_error is not None:
             return {"ok": False, "error": credential_error}
+
+    output_policy_verdict = evaluate_output_policy(
+        request_policy=getattr(ctx, "request_policy", None),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=params,
+    )
+    if not output_policy_verdict.allowed:
+        LOG.info(
+            "copilot output policy tool body verdict",
+            **output_policy_verdict_to_trace_data(
+                output_policy_verdict,
+                surface="tool_body",
+                tool_name="update_workflow",
+            ),
+        )
+        return {"ok": False, "error": format_output_policy_tool_error(output_policy_verdict)}
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
@@ -887,6 +978,7 @@ async def _update_workflow(
             proxy_location=workflow.proxy_location,
             webhook_callback_url=workflow.webhook_callback_url,
             persist_browser_session=workflow.persist_browser_session,
+            browser_profile_id=workflow.browser_profile_id,
             model=workflow.model,
             max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
             extra_http_headers=workflow.extra_http_headers,
@@ -3346,6 +3438,33 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
 
 
+def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
+    block_count = getattr(copilot_ctx, "last_update_block_count", None)
+    if not isinstance(block_count, int):
+        return None
+
+    user_message = getattr(copilot_ctx, "user_message", "")
+    request_policy = getattr(copilot_ctx, "request_policy", None)
+    completion_contract = getattr(request_policy, "completion_contract", None)
+    if isinstance(completion_contract, str):
+        completion_contract = completion_contract.strip() or None
+    else:
+        completion_contract = None
+
+    if not _goal_likely_needs_more_blocks(user_message, block_count, completion_contract):
+        return None
+
+    nudge_count = getattr(copilot_ctx, "coverage_nudge_count", 0)
+    if nudge_count >= 1:
+        return None
+    copilot_ctx.coverage_nudge_count = nudge_count + 1
+    return (
+        f"{POST_INTERMEDIATE_SUCCESS_NUDGE} The workflow was saved with {block_count} block"
+        f"{'' if block_count == 1 else 's'}, but it has not been run because the request-policy "
+        "completion contract still leaves distinct requested actions uncovered."
+    )
+
+
 def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
     """Single-pass analysis of run result blocks.
 
@@ -3539,7 +3658,10 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     update_repeated_failure_state(copilot_ctx, result)
 
 
-@function_tool(name_override="update_workflow")
+@function_tool(
+    name_override="update_workflow",
+    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
+)
 async def update_workflow_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
@@ -3669,6 +3791,10 @@ async def run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
+    policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if policy_error:
+        return json.dumps({"ok": False, "error": policy_error})
+
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -3735,6 +3861,7 @@ async def get_run_results_tool(
     name_override="update_and_run_blocks",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
+    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
@@ -3779,6 +3906,10 @@ async def update_and_run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
+    if policy_error:
+        return json.dumps({"ok": False, "error": policy_error})
+
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -3809,6 +3940,20 @@ async def update_and_run_blocks_tool(
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
+
+    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
+    if coverage_error:
+        result = {
+            "ok": False,
+            "error": coverage_error,
+            "data": {
+                "block_count": copilot_ctx.last_update_block_count,
+                "workflow_updated": True,
+                "workflow_run_skipped": True,
+            },
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        return json.dumps(result)
 
     # Step 2: Compute frontier and run the blocks
     new_definition = None

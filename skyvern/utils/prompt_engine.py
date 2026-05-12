@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.scraper.scraped_page import ElementTreeBuilder
@@ -107,13 +108,30 @@ def load_prompt_with_elements_tracked(
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
 
-    return enforce_prompt_ceiling_tracked(
+    final_prompt, final_kwargs = enforce_prompt_ceiling_tracked(
         prompt,
         prompt_engine=prompt_engine,
         template_name=template_name,
         kwargs=kwargs,
         elements=elements,
     )
+
+    # SKY-9718: stash per-prompt token breakdown on SkyvernContext so the
+    # downstream LLM API handler log can attach html_token_count / html_pct
+    # alongside input_tokens / llm_cost.
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        html_tokens = count_tokens(elements) if elements else 0
+        total_tokens_local = count_tokens(final_prompt)
+        html_pct = (html_tokens / total_tokens_local) if total_tokens_local else None
+        ctx.last_prompt_breakdown = {
+            "html_token_count": html_tokens,
+            "total_tokens_local": total_tokens_local,
+            "html_pct": round(html_pct, 4) if html_pct is not None else None,
+            "template_name": template_name,
+        }
+
+    return final_prompt, final_kwargs
 
 
 def load_prompt_with_elements(
