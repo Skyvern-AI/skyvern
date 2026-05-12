@@ -129,6 +129,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
@@ -5281,7 +5282,7 @@ class WorkflowService:
             headers=signed_data.headers,
         )
         try:
-            resp = await app.AGENT_FUNCTION.deliver_webhook(
+            resp = await deliver_webhook_with_retries(
                 url=workflow_run.webhook_callback_url,
                 payload=signed_data.signed_payload,
                 headers=signed_data.headers,

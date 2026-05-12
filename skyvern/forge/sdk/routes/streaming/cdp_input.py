@@ -30,12 +30,13 @@ LOG = structlog.get_logger()
 
 _VALID_MOUSE_TYPES = {"mousePressed", "mouseReleased", "mouseMoved"}
 _VALID_MOUSE_BUTTONS = {"left", "middle", "right", "none"}
-_VALID_KEY_TYPES = {"keyDown", "keyUp"}
+_VALID_KEY_TYPES = {"keyDown", "keyUp", "rawKeyDown"}
 _MAX_COORD = 10000
 _MAX_DELTA = 10000
 _MAX_KEY_LEN = 32
 _MAX_CODE_LEN = 32
 _MODIFIER_MASK = 0xF
+_MAX_VK_CODE = 0xFE
 
 
 @dataclasses.dataclass
@@ -123,6 +124,12 @@ def _validate_key_event(msg: dict) -> dict | None:
     text = msg.get("text", "")
     if isinstance(text, str) and len(text) == 1 and text.isprintable() and event_type == "keyDown":
         result["text"] = text
+
+    # Forward `windowsVirtualKeyCode` so CDP can resolve non-printable keys
+    # (Backspace, Enter, Arrow*, etc.) to actual editing actions.
+    vk = msg.get("windowsVirtualKeyCode")
+    if isinstance(vk, int) and 0 <= vk <= _MAX_VK_CODE:
+        result["windowsVirtualKeyCode"] = vk
 
     return result
 
@@ -379,9 +386,6 @@ async def cdp_input_browser_session_stream(
             return
 
         cdp_session = await page.context.new_cdp_session(page)
-        # stream_ref_inc/dec is intentionally omitted for browser sessions.
-        # Browser state lives in PersistentSessionsManager._browser_sessions,
-        # not BrowserManager.pages, so there is no entry to protect from eviction.
 
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})

@@ -36,6 +36,24 @@ def load_js_script() -> str:
 
 JS_FUNCTION_DEFS = load_js_script()
 
+_NAVIGATION_RECOVERY_MAX_ATTEMPTS = 4
+_NAVIGATION_SETTLE_TIMEOUT_MS = 3000
+
+
+def _is_navigation_context_lost(error_msg: str) -> bool:
+    if "Execution context was destroyed" in error_msg:
+        return True
+    return "ReferenceError" in error_msg and "is not defined" in error_msg
+
+
+async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) -> None:
+    if timeout_ms <= 0:
+        return
+    try:
+        await frame.wait_for_load_state("load", timeout=timeout_ms)
+    except PlaywrightError:
+        return
+
 
 def _load_cursor_overlay_js() -> str:
     path = f"{SKYVERN_DIR}/webeye/scraper/cursorOverlay.js"
@@ -272,31 +290,103 @@ class SkyvernFrame:
                 return await frame.evaluate(expression=expression, arg=arg)
         except PlaywrightError as e:
             error_msg = str(e)
-            is_context_destroyed = "Execution context was destroyed" in error_msg
-            is_domutils_missing = "ReferenceError" in error_msg and "is not defined" in error_msg
-            if is_context_destroyed or is_domutils_missing:
-                LOG.warning(
-                    "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
-                    expression=expression[:200],
-                    error=error_msg[:200],
-                )
-                try:
-                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
-                except PlaywrightError:
-                    LOG.warning("Re-injection of domUtils.js also failed, page may still be navigating")
-                    raise
-                # First call failed fast (context destroyed, not timeout), so a fresh
-                # timeout for the retry is acceptable.
-                try:
-                    async with asyncio.timeout(timeout_ms / 1000):
-                        return await frame.evaluate(expression=expression, arg=arg)
-                except asyncio.TimeoutError:
-                    LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
-                    raise TimeoutError("Skyvern timed out trying to analyze the page")
-            raise
+            if not _is_navigation_context_lost(error_msg):
+                raise
+            return await SkyvernFrame._evaluate_with_navigation_recovery(
+                frame=frame,
+                expression=expression,
+                arg=arg,
+                timeout_ms=timeout_ms,
+                initial_error=error_msg,
+            )
         except asyncio.TimeoutError:
             LOG.exception("Skyvern timed out trying to analyze the page", expression=expression)
             raise TimeoutError("Skyvern timed out trying to analyze the page")
+
+    @staticmethod
+    async def _evaluate_with_navigation_recovery(
+        frame: Page | Frame,
+        expression: str,
+        arg: Any | None,
+        timeout_ms: float,
+        initial_error: str,
+    ) -> Any:
+        # Multi-hop SSO/OIDC flows (especially response_mode=form_post) can destroy
+        # the JS execution context several times in a row as the page auto-submits
+        # through redirects. Wait for the page to settle between attempts instead
+        # of racing the next navigation. The whole recovery shares one monotonic
+        # deadline so retries can't compound into many multiples of timeout_ms.
+        per_attempt_seconds = timeout_ms / 1000
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + per_attempt_seconds * _NAVIGATION_RECOVERY_MAX_ATTEMPTS
+
+        def _remaining_seconds() -> float:
+            return max(0.0, deadline - loop.time())
+
+        last_error_msg = initial_error
+        for attempt in range(1, _NAVIGATION_RECOVERY_MAX_ATTEMPTS + 1):
+            if _remaining_seconds() <= 0:
+                LOG.error(
+                    "Skyvern timed out trying to analyze the page after navigation recovery",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+
+            LOG.warning(
+                "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
+                attempt=attempt,
+                expression=expression[:200],
+                error=last_error_msg[:200],
+            )
+            settle_ms = min(_NAVIGATION_SETTLE_TIMEOUT_MS, _remaining_seconds() * 1000)
+            await _wait_for_navigation_settle(frame, timeout_ms=settle_ms)
+
+            inject_budget = min(per_attempt_seconds, _remaining_seconds())
+            if inject_budget <= 0:
+                LOG.error(
+                    "Skyvern timed out trying to analyze the page after navigation recovery",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            try:
+                async with asyncio.timeout(inject_budget):
+                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
+            except asyncio.TimeoutError:
+                LOG.exception(
+                    "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            except PlaywrightError as inject_err:
+                last_error_msg = str(inject_err)
+                if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
+                    LOG.warning(
+                        "Re-injection of domUtils.js also failed, page may still be navigating",
+                        attempts=attempt,
+                    )
+                    raise
+                continue
+
+            retry_budget = min(per_attempt_seconds, _remaining_seconds())
+            if retry_budget <= 0:
+                LOG.error(
+                    "Skyvern timed out trying to analyze the page after navigation recovery",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            try:
+                async with asyncio.timeout(retry_budget):
+                    return await frame.evaluate(expression=expression, arg=arg)
+            except asyncio.TimeoutError:
+                LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            except PlaywrightError as retry_err:
+                last_error_msg = str(retry_err)
+                if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
+                    raise
+
+        # The loop either returns or raises; this is unreachable but keeps mypy happy.
+        raise PlaywrightError(last_error_msg)
 
     @staticmethod
     async def get_url(frame: Page | Frame) -> str:
