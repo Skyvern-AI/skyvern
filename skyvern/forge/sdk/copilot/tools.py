@@ -978,6 +978,7 @@ async def _update_workflow(
             proxy_location=workflow.proxy_location,
             webhook_callback_url=workflow.webhook_callback_url,
             persist_browser_session=workflow.persist_browser_session,
+            browser_profile_id=workflow.browser_profile_id,
             model=workflow.model,
             max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
             extra_http_headers=workflow.extra_http_headers,
