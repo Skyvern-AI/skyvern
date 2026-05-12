@@ -397,6 +397,11 @@ function WorkflowRun() {
                 Browser Session: {workflowRun.browser_session_id}
               </Link>
             )}
+            {workflowRun?.browser_profile_id && (
+              <span className="font-mono text-sm text-slate-400">
+                Browser Profile: {workflowRun.browser_profile_id}
+              </span>
+            )}
           </div>
 
           <div className="flex gap-2">
