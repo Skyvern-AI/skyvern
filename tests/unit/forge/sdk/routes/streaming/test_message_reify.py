@@ -133,6 +133,11 @@ class TestExecutionChannelHelpers:
         with pytest.raises(ValueError, match="explicit http\\(s\\) scheme or host"):
             ExecutionChannel._normalize_url("//evil.com")
 
+    @pytest.mark.parametrize("url", ["/foo", "/foo/bar", "/"])
+    def test_normalize_url_rejects_path_only_input(self, url: str) -> None:
+        with pytest.raises(ValueError, match="explicit http\\(s\\) scheme or host"):
+            ExecutionChannel._normalize_url(url)
+
     def test_origin_of_extracts_origin(self) -> None:
         assert ExecutionChannel._origin_of("https://example.com/foo/bar?q=1") == "https://example.com"
 
