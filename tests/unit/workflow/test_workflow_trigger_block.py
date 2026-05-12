@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -241,6 +242,77 @@ class TestPayloadTemplateRenderError:
         # And our live render path is actually using Jinja2, not the mocked stub
         # from TestRenderTemplatesInPayload above.
         assert jinja_sandbox_env is not None
+
+
+class TestPayloadJsonSerialization:
+    """Payload templates rendered with plain ``{{var}}`` must emit JSON for dict/list values."""
+
+    def _render_payload_live(
+        self,
+        block: WorkflowTriggerBlock,
+        payload: dict[str, Any],
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        ctx = MagicMock()
+        ctx.values = values
+        ctx.secrets = {}
+        ctx.include_secrets_in_templates = False
+        ctx.get_block_metadata = MagicMock(return_value={})
+        return block._render_templates_in_payload(payload, ctx)
+
+    def test_list_value_renders_as_json(self) -> None:
+        block = _make_block()
+        parties = [
+            {"entity_name": "1061 Realty"},
+            {"first_name": "Antonio", "last_name": "Rodriguez"},
+        ]
+        result = self._render_payload_live(
+            block,
+            {"parties_to_search": "{{ parties_to_search }}"},
+            {"parties_to_search": parties},
+        )
+        rendered = result["parties_to_search"]
+        assert isinstance(rendered, str)
+        assert json.loads(rendered) == parties
+
+    def test_dict_value_renders_as_json(self) -> None:
+        block = _make_block()
+        data = {"key": "value", "nested": {"x": 1}}
+        result = self._render_payload_live(
+            block,
+            {"data": "{{ data }}"},
+            {"data": data},
+        )
+        rendered = result["data"]
+        assert isinstance(rendered, str)
+        assert json.loads(rendered) == data
+
+    def test_string_value_unchanged(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"file_number": "{{ file_number }}"},
+            {"file_number": "ABC-123"},
+        )
+        assert result == {"file_number": "ABC-123"}
+
+    def test_int_value_renders_as_decimal_string(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"count": "{{ count }}"},
+            {"count": 42},
+        )
+        assert result == {"count": "42"}
+
+    def test_json_filter_still_returns_native_typed_value(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"data": "{{ data | json }}"},
+            {"data": {"key": "value"}},
+        )
+        assert result == {"data": {"key": "value"}}
 
 
 class TestCheckTriggerDepth:
