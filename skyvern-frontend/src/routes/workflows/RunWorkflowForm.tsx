@@ -57,6 +57,7 @@ import {
   isNestedLoopWorkflowBlock,
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
+import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
 
@@ -186,6 +187,7 @@ type RunWorkflowRequestBody = {
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
   browser_session_id: string | null;
+  browser_profile_id?: string | null;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   browser_address?: string | null;
@@ -201,6 +203,7 @@ function getRunWorkflowRequestBody(
     webhookCallbackUrl,
     proxyLocation,
     browserSessionId,
+    browserProfileId,
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
@@ -215,11 +218,13 @@ function getRunWorkflowRequestBody(
   );
 
   const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
+  const bpi = browserProfileId?.trim() === "" ? null : browserProfileId;
 
   const body: RunWorkflowRequestBody = {
     data: parsedParameters,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
+    browser_profile_id: bpi,
     browser_address: cdpAddress,
     run_with: runWith,
     ai_fallback: aiFallback ?? true,
@@ -281,6 +286,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
+  browserProfileId: string | null;
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
@@ -323,6 +329,7 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      browserProfileId: null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -465,6 +472,7 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
@@ -482,6 +490,7 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
@@ -495,6 +504,7 @@ function RunWorkflowForm({
       "webhookCallbackUrl",
       "proxyLocation",
       "browserSessionId",
+      "browserProfileId",
       "maxScreenshotScrolls",
       "extraHttpHeaders",
       "cdpAddress",
@@ -1004,6 +1014,38 @@ function RunWorkflowForm({
                                       ? ""
                                       : (field.value as string)
                                   }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="browserProfileId"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Browser Profile
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Load a saved browser profile to reuse cookies,
+                                  storage, and signed-in state for this run.
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <BrowserProfileSelector
+                                  value={field.value}
+                                  onChange={field.onChange}
                                 />
                               </FormControl>
                               <FormMessage />
