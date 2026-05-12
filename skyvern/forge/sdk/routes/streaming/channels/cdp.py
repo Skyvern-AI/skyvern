@@ -58,7 +58,7 @@ class CdpChannel:
     def identity(self) -> t.Dict[str, t.Any]:
         base = self.vnc_channel.identity
 
-        return base | {"url": self.url}
+        return base | {"cdp_url": self.url}
 
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         """
