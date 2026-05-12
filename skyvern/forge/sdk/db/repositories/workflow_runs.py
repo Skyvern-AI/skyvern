@@ -558,7 +558,8 @@ class WorkflowRunsRepository(BaseRepository):
                     ),
                 )
                 .filter(TaskRunModel.organization_id == organization_id)
-                .filter(TaskRunModel.status.isnot(None))
+                # Coalesced filter so rows with NULL task_runs.status but a set workflow_runs.status are visible.
+                .filter(effective_status.isnot(None))
                 .filter(TaskRunModel.parent_workflow_run_id.is_(None))
                 .filter(TaskRunModel.debug_session_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
