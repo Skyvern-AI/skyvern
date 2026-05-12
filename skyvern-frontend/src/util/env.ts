@@ -78,9 +78,14 @@ function getRuntimeApiKey(): string | null {
   const persisted = readPersistedApiKey();
   const candidate = persisted ?? buildTimeApiKey;
 
-  // Treat YOUR_API_KEY as missing. We may inherit this from .env.example
-  // in some cases of misconfiguration.
-  runtimeApiKey = candidate === "YOUR_API_KEY" ? null : candidate;
+  // Treat placeholder / example values as missing so they are never sent
+  // as real credentials (e.g. from .env.example or an un-replaced Docker placeholder).
+  const PLACEHOLDER_VALUES = [
+    "YOUR_API_KEY",
+    "__SKYVERN_API_KEY_PLACEHOLDER__",
+  ];
+  runtimeApiKey =
+    candidate && PLACEHOLDER_VALUES.includes(candidate) ? null : candidate;
   return runtimeApiKey;
 }
 
