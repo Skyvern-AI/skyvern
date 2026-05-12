@@ -7,6 +7,7 @@ import {
   useNodes,
 } from "@xyflow/react";
 import { useRef } from "react";
+import { useParams } from "react-router-dom";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -39,6 +40,7 @@ function EdgeWithAddButton({
   style = {},
   markerEnd,
 }: EdgeProps) {
+  const { workflowPermanentId } = useParams();
   const nodes = useNodes();
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
@@ -178,7 +180,10 @@ function EdgeWithAddButton({
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
-      recordingStore.setIsRecording(true);
+      recordingStore.setIsRecording(true, {
+        workflowPermanentId: workflowPermanentId ?? null,
+        browserSessionId: settingsStore.browserSessionId,
+      });
       updateWorkflowPanelState(false);
     }
   };
