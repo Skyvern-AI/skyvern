@@ -462,6 +462,137 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     assert verdict.reason_codes == [OutputPolicyReason.RAW_SECRET_LEAK]
 
 
+def test_sdk_output_guardrail_ignores_internal_context_credential_ids() -> None:
+    ctx = _ctx(
+        request_policy=_policy(
+            credential_input_kind="credential_name",
+            credential_refs=["azure_credentials"],
+            allow_run_blocks=False,
+            allow_missing_credentials_in_draft=True,
+        ),
+    )
+    ctx.last_workflow = object()
+    ctx.last_workflow_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: azure_credentials
+  blocks:
+    - block_type: login
+      label: login
+      url: https://example.com/login
+      parameter_keys:
+        - azure_credentials
+"""
+
+    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {
+            "type": "REPLY",
+            "user_response": "I have a draft workflow proposal. It has not been tested.",
+            "global_llm_context": "Tool observation listed cred_unrelated for a different saved credential.",
+        },
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+
+
+def test_sdk_output_guardrail_defers_raw_question_after_untested_draft() -> None:
+    ctx = _ctx(
+        request_policy=_policy(
+            testing_intent="skip_test",
+            credential_input_kind="credential_name",
+            credential_refs=["azure_credentials"],
+            allow_run_blocks=False,
+            allow_missing_credentials_in_draft=True,
+            resolved_credentials=[],
+        ),
+    )
+    ctx.allow_untested_workflow_draft = True
+    ctx.last_workflow = object()
+    ctx.last_update_block_count = 9
+    ctx.last_workflow_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: azure_credentials
+  blocks:
+    - block_type: login
+      label: login
+      url: https://example.com/login
+      parameter_keys:
+        - azure_credentials
+"""
+
+    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {
+            "type": "ASK_QUESTION",
+            "user_response": "I found cred_unrelated in an internal tool observation. Should I use it?",
+        },
+    )
+
+    assert response_type == "ASK_QUESTION"
+    assert verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+
+
+def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() -> None:
+    ctx = _ctx(
+        request_policy=_policy(
+            testing_intent="skip_test",
+            credential_input_kind="credential_name",
+            credential_refs=["azure_credentials"],
+            allow_run_blocks=False,
+            allow_missing_credentials_in_draft=True,
+            resolved_credentials=[],
+        ),
+    )
+    ctx.allow_untested_workflow_draft = True
+    ctx.last_workflow = object()
+    ctx.last_update_block_count = 9
+    ctx.workflow_persisted = True
+    ctx.last_workflow_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: azure_credentials
+  blocks:
+    - block_type: login
+      label: login
+      url: https://example.com/login
+      parameter_keys:
+        - azure_credentials
+"""
+
+    result = agent_module._translate_to_agent_result(
+        _fake_run_result(
+            {
+                "type": "ASK_QUESTION",
+                "user_response": "I found cred_unrelated in an internal tool observation. Should I use it?",
+                "global_llm_context": "{}",
+            }
+        ),
+        ctx,
+        "{}",
+        _chat_request(),
+        "org-1",
+    )
+
+    assert result.response_type == "REPLY"
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.unvalidated is True
+    assert result.clear_proposed_workflow is False
+    assert "without testing it" in result.user_response
+    assert "not been verified" in result.user_response
+    assert "cred_unrelated" not in result.user_response
+
+
 @pytest.mark.asyncio
 async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_secret() -> None:
     from agents import ToolInputGuardrailData
