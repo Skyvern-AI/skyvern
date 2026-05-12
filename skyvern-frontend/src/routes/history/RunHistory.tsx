@@ -16,12 +16,10 @@ import {
   Status,
   TaskRunListItem,
   TaskRunType,
-  TriggerType,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
-import { TriggerTypeBadge } from "@/components/TriggerTypeBadge";
 import {
   Pagination,
   PaginationContent,
@@ -69,17 +67,6 @@ import { HighlightText } from "@/routes/workflows/components/HighlightText";
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
   return statusValues.has(value);
-}
-
-// Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
-function inferTriggerType(run: TaskRunListItem): TriggerType | null {
-  if (
-    run.task_run_type === TaskRunType.WorkflowRun &&
-    run.run_id.startsWith("wr_sched_")
-  ) {
-    return TriggerType.Scheduled;
-  }
-  return null;
 }
 
 function getRunNavigationPath(run: TaskRunListItem): string {
@@ -208,12 +195,10 @@ function RunHistory() {
       const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
       const navPath = getRunNavigationPath(run);
-      const triggerType = inferTriggerType(run);
 
       const titleContent =
-        triggerType || run.script_run || run.workflow_deleted ? (
+        run.script_run || run.workflow_deleted ? (
           <div className="flex items-center gap-2">
-            {triggerType && <TriggerTypeBadge triggerType={triggerType} />}
             {run.script_run && (
               <Tip content="Ran with code">
                 <LightningBoltIcon className="text-[gold]" />
