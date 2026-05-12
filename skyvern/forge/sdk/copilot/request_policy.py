@@ -90,7 +90,7 @@ class RequestPolicy:
             "allow_run_blocks": self.allow_run_blocks,
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "resolved_credential_count": len(self.resolved_credentials),
-            "completion_contract": self.completion_contract,
+            "has_completion_contract": bool(self.completion_contract),
             "raw_secret_detected": self.raw_secret_detected,
         }
 

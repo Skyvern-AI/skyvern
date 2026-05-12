@@ -129,6 +129,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
@@ -803,6 +804,12 @@ class WorkflowService:
                 workflow_request.webhook_callback_url = workflow.webhook_callback_url
             if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
                 workflow_request.extra_http_headers = workflow.extra_http_headers
+            if (
+                workflow_request.browser_profile_id is None
+                and workflow_request.browser_session_id is None
+                and workflow.browser_profile_id is not None
+            ):
+                workflow_request.browser_profile_id = workflow.browser_profile_id
             if workflow_request.run_with is None:
                 workflow_request.run_with = workflow.run_with
 
@@ -3363,6 +3370,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        browser_profile_id: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -3393,6 +3401,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
                 model=model,
                 workflow_permanent_id=workflow_permanent_id,
                 version=version,
@@ -3774,6 +3783,7 @@ class WorkflowService:
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
@@ -3795,6 +3805,7 @@ class WorkflowService:
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
                 persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
@@ -3817,6 +3828,7 @@ class WorkflowService:
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
             persist_browser_session=persist_browser_session,
+            browser_profile_id=browser_profile_id,
             model=model,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
@@ -5281,7 +5293,7 @@ class WorkflowService:
             headers=signed_data.headers,
         )
         try:
-            resp = await app.AGENT_FUNCTION.deliver_webhook(
+            resp = await deliver_webhook_with_retries(
                 url=workflow_run.webhook_callback_url,
                 payload=signed_data.signed_payload,
                 headers=signed_data.headers,
@@ -5531,6 +5543,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    browser_profile_id=request.browser_profile_id,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
@@ -5564,6 +5577,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    browser_profile_id=request.browser_profile_id,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,

@@ -1065,6 +1065,7 @@ def _process_workflow_yaml(
         proxy_location=workflow_yaml_request.proxy_location,
         webhook_callback_url=workflow_yaml_request.webhook_callback_url,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        browser_profile_id=workflow_yaml_request.browser_profile_id,
         model=workflow_yaml_request.model,
         max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
         extra_http_headers=workflow_yaml_request.extra_http_headers,
@@ -1351,6 +1352,9 @@ async def _new_copilot_chat_post(
                         )
                     )
 
+            # Count from the full message log; chat_history below is truncated.
+            turn_index = sum(1 for m in chat_messages if m.sender == WorkflowCopilotChatSender.USER) + 1
+
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -1362,6 +1366,7 @@ async def _new_copilot_chat_post(
                     llm_api_handler=llm_api_handler,
                     api_key=api_key,
                     config=copilot_config,
+                    turn_index=turn_index,
                 )
 
             if getattr(agent_result, "cancelled", False):
