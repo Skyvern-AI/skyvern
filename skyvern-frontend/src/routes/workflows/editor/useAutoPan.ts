@@ -29,7 +29,7 @@ import { AppNode } from "./nodes";
  * change in the editor
  */
 const useAutoPan = (
-  editorElementRef: React.RefObject<HTMLDivElement>,
+  editorElementRef: React.RefObject<HTMLDivElement | null>,
   nodes: AppNode[],
 ) => {
   const { setViewport, getViewport } = useReactFlow();
