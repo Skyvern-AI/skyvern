@@ -103,6 +103,34 @@ class BrowserSessionsRepository(BaseRepository):
             browser_profile.deleted_at = datetime.now(timezone.utc)
             await session.commit()
 
+    @db_operation("update_browser_profile")
+    async def update_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> BrowserProfile:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+                .filter(BrowserProfileModel.deleted_at.is_(None))
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+
+            if name is not None:
+                browser_profile.name = name
+            if description is not None:
+                browser_profile.description = description
+
+            await session.commit()
+            await session.refresh(browser_profile)
+            return BrowserProfile.model_validate(browser_profile)
+
     @db_operation("get_active_persistent_browser_sessions")
     async def get_active_persistent_browser_sessions(
         self,

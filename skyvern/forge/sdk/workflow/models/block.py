@@ -111,6 +111,7 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
 from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
+    jinja_json_finalize_strict_env,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -7816,7 +7817,9 @@ class WorkflowTriggerBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> Any:
         """Render a single Jinja2 template string, handling the | json filter marker."""
-        rendered = self.format_block_parameter_template_from_workflow_run_context(value, workflow_run_context)
+        rendered = self.format_block_parameter_template_from_workflow_run_context(
+            value, workflow_run_context, env=jinja_json_finalize_strict_env
+        )
         if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
             json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
             try:
