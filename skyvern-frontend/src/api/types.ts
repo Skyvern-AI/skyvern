@@ -594,6 +594,7 @@ export type WorkflowRunStatusApiResponse = {
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;
+  browser_profile_id: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   waiting_for_verification_code?: boolean;
@@ -626,6 +627,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;
+  browser_profile_id: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   workflow: WorkflowApiResponse;
@@ -686,6 +688,17 @@ export type Createv2TaskRequest = {
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
   browser_session_id?: string | null;
+};
+
+export type BrowserProfileApiResponse = {
+  browser_profile_id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  source_browser_type: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
 };
 
 export type PasswordCredentialApiResponse = {

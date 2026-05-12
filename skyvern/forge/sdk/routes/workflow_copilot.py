@@ -1065,6 +1065,7 @@ def _process_workflow_yaml(
         proxy_location=workflow_yaml_request.proxy_location,
         webhook_callback_url=workflow_yaml_request.webhook_callback_url,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        browser_profile_id=workflow_yaml_request.browser_profile_id,
         model=workflow_yaml_request.model,
         max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
         extra_http_headers=workflow_yaml_request.extra_http_headers,
