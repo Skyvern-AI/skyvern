@@ -1,5 +1,6 @@
 import { useParams } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
+import { useRef } from "react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
@@ -9,6 +10,10 @@ import {
   type WorkflowBlock,
   type WorkflowParameter,
 } from "@/routes/workflows/types/workflowTypes";
+import {
+  captureRecordBrowser,
+  markRecordBrowserProcessed,
+} from "@/util/recordBrowserTelemetry";
 
 const FAIL_QUIET_NO_EVENTS = "FAIL-QUIET:NO-EVENTS" as const;
 
@@ -25,6 +30,7 @@ const useProcessRecordingMutation = ({
   const credentialGetter = useCredentialGetter();
   const recordingStore = useRecordingStore();
   const { workflowPermanentId } = useParams();
+  const mutationStartedAtRef = useRef<number | null>(null);
 
   const processRecordingMutation = useMutation({
     mutationFn: async () => {
@@ -40,16 +46,24 @@ const useProcessRecordingMutation = ({
         );
       }
 
+      mutationStartedAtRef.current = Date.now();
+
       const eventCount = recordingStore.getEventCount();
 
       if (eventCount === 0) {
+        captureRecordBrowser("record_browser.empty_blocked", {
+          seconds_recording: recordingStore.getSecondsRecording(),
+        });
         throw new Error(FAIL_QUIET_NO_EVENTS);
       }
 
-      // (this flushes any pending events)
       const compressedChunks = await recordingStore.getCompressedChunks();
 
-      // TODO: Replace this mock with actual API call when endpoint is ready
+      captureRecordBrowser("record_browser.process_attempted", {
+        event_count: recordingStore.getEventCount(),
+        compressed_chunk_count: compressedChunks.length,
+      });
+
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client
         .post<
@@ -70,6 +84,20 @@ const useProcessRecordingMutation = ({
         }));
     },
     onSuccess: ({ blocks, parameters }) => {
+      const latencyMs =
+        mutationStartedAtRef.current !== null
+          ? Date.now() - mutationStartedAtRef.current
+          : 0;
+      mutationStartedAtRef.current = null;
+
+      markRecordBrowserProcessed(blocks?.length ?? 0);
+
+      captureRecordBrowser("record_browser.processed", {
+        block_count: blocks?.length ?? 0,
+        parameter_count: parameters?.length ?? 0,
+        latency_ms: latencyMs,
+      });
+
       recordingStore.clear();
 
       if (blocks && blocks.length > 0) {
@@ -91,14 +119,32 @@ const useProcessRecordingMutation = ({
       });
     },
     onError: (error) => {
+      const latencyMs =
+        mutationStartedAtRef.current !== null
+          ? Date.now() - mutationStartedAtRef.current
+          : 0;
+      mutationStartedAtRef.current = null;
+
       if (error instanceof Error && error.message === FAIL_QUIET_NO_EVENTS) {
+        recordingStore.reset();
+        toast({
+          variant: "warning",
+          title: "Nothing was recorded",
+          description:
+            "Interact with the live browser (clicks, typing, navigation), then stop recording again to generate blocks.",
+        });
         return;
       }
+
+      captureRecordBrowser("record_browser.processing_failed", {
+        error_message: error instanceof Error ? error.message : String(error),
+        latency_ms: latencyMs,
+      });
 
       toast({
         variant: "destructive",
         title: "Error Processing Recording",
-        description: error.message,
+        description: error instanceof Error ? error.message : String(error),
       });
     },
   });
