@@ -76,12 +76,18 @@ class BrowserSessionsRepository(BaseRepository):
         self,
         organization_id: str,
         include_deleted: bool = False,
+        page: int = 1,
+        page_size: int = 10,
     ) -> list[BrowserProfile]:
+        if page < 1:
+            raise ValueError(f"Page must be greater than 0, got {page}")
+        db_page = page - 1
         async with self.Session() as session:
             query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
             if not include_deleted:
                 query = query.filter(BrowserProfileModel.deleted_at.is_(None))
-            browser_profiles = await session.scalars(query.order_by(asc(BrowserProfileModel.created_at)))
+            query = query.order_by(asc(BrowserProfileModel.created_at)).limit(page_size).offset(db_page * page_size)
+            browser_profiles = await session.scalars(query)
             return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
 
     @db_operation("delete_browser_profile")

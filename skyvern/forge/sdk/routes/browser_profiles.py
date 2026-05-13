@@ -135,6 +135,8 @@ async def create_browser_profile(
     include_in_schema=False,
 )
 async def list_browser_profiles(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
     include_deleted: bool = Query(default=False, description="Include deleted browser profiles"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[BrowserProfile]:
@@ -144,11 +146,15 @@ async def list_browser_profiles(
         "Listing browser profiles",
         organization_id=organization_id,
         include_deleted=include_deleted,
+        page=page,
+        page_size=page_size,
     )
 
     profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
         organization_id=organization_id,
         include_deleted=include_deleted,
+        page=page,
+        page_size=page_size,
     )
 
     LOG.info(
