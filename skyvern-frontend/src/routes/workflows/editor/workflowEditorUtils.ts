@@ -1672,6 +1672,7 @@ function getElements(
     startNode(startNodeId, {
       withWorkflowSettings: true,
       persistBrowserSession: settings.persistBrowserSession,
+      browserProfileId: settings.browserProfileId,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
@@ -3018,6 +3019,7 @@ function getWorkflowBlocks(
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
     persistBrowserSession: false,
+    browserProfileId: null,
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
     model: null,
@@ -3043,6 +3045,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   if (isWorkflowStartNodeData(data)) {
     return {
       persistBrowserSession: data.persistBrowserSession,
+      browserProfileId: data.browserProfileId,
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
@@ -4315,6 +4318,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
+    browser_profile_id: workflow.browser_profile_id ?? null,
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,

@@ -103,6 +103,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
+    browserProfileId: version.browser_profile_id ?? null,
     model: version.model,
     maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
     extraHttpHeaders: version.extra_http_headers
