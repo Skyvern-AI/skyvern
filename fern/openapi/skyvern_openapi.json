@@ -2488,6 +2488,101 @@
           }
         ]
       },
+      "patch": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Update browser profile",
+        "description": "Update a browser profile's name and/or description",
+        "operationId": "update_browser_profile_v1_browser_profiles__profile_id__patch",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile to update. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile to update. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBrowserProfileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated browser profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfile"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "409": {
+            "description": "Browser profile name already exists"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profile = await skyvern.browser_profiles.update_browser_profile(\n    \"bp_123\",\n    name=\"Renamed Profile\",\n    description=\"Updated description\",\n)\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfile = await skyvern.browserProfiles.updateBrowserProfile(\"bp_123\", {\n    name: \"Renamed Profile\",\n    description: \"Updated description\",\n});\nconsole.log(browserProfile);\n"
+              }
+            ]
+          }
+        ]
+      },
       "delete": {
         "tags": [
           "Browser Profiles"
@@ -7790,6 +7885,7 @@
         "properties": {
           "name": {
             "type": "string",
+            "minLength": 1,
             "title": "Name",
             "description": "Name for the browser profile"
           },
@@ -18124,6 +18220,37 @@
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
       },
+      "UpdateBrowserProfileRequest": {
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "New name for the browser profile"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "New description for the browser profile"
+          }
+        },
+        "type": "object",
+        "title": "UpdateBrowserProfileRequest"
+      },
       "UpdateWorkflowFolderRequest": {
         "properties": {
           "folder_id": {
@@ -19925,6 +20052,17 @@
             "title": "Persist Browser Session",
             "default": false
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id"
+          },
           "model": {
             "anyOf": [
               {
@@ -20183,6 +20321,17 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id"
           },
           "model": {
             "anyOf": [
