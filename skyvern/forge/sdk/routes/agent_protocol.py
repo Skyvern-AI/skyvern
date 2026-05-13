@@ -1595,6 +1595,46 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     return media_type, "inline"
 
 
+_RANGE_UNSATISFIABLE: tuple[int, int] = (-1, -1)
+
+
+def _parse_range_header(range_header: str | None, content_length: int) -> tuple[int, int] | None:
+    """Return one satisfiable byte range, ``_RANGE_UNSATISFIABLE`` when unsatisfiable, or ``None`` when ignored."""
+    if not range_header:
+        return None
+    stripped = range_header.lstrip()
+    prefix = "bytes="
+    if stripped[: len(prefix)].lower() != prefix:
+        return None
+    spec = stripped[len(prefix) :].strip()
+    # RFC 7233 allows multipart ranges (e.g. "0-100,200-300"); we don't.
+    if "," in spec or "-" not in spec:
+        return None
+    start_str, end_str = spec.split("-", 1)
+    # byte-pos = 1*DIGIT (ASCII per RFC 5234) — reject negatives, signs, and non-ASCII digits.
+    if start_str and not (start_str.isascii() and start_str.isdigit()):
+        return None
+    if end_str and not (end_str.isascii() and end_str.isdigit()):
+        return None
+    if start_str == "":
+        # Suffix range: "-N" => last N bytes.
+        if end_str == "":
+            return None
+        suffix_len = int(end_str)
+        if suffix_len <= 0:
+            return None
+        start = max(0, content_length - suffix_len)
+        end = content_length - 1
+    else:
+        start = int(start_str)
+        end = int(end_str) if end_str else content_length - 1
+        if end >= content_length:
+            end = content_length - 1
+    if start >= content_length or end < start:
+        return _RANGE_UNSATISFIABLE
+    return (start, end)
+
+
 def _artifact_content_response_headers(
     *,
     disposition: str,
@@ -1634,13 +1674,16 @@ def _artifact_content_response_headers(
     summary="Get artifact content",
     responses={
         200: {"description": "Raw artifact content"},
+        206: {"description": "Partial artifact content (Range request)"},
         403: {"description": "Invalid or expired artifact URL"},
         404: {"description": "Artifact not found or content unavailable"},
+        416: {"description": "Range not satisfiable"},
     },
     include_in_schema=True,
 )
 async def get_artifact_content(
     artifact_id: str,
+    request: Request,
     sig: Annotated[str | None, Query(include_in_schema=False)] = None,
     expiry: Annotated[str | None, Query(include_in_schema=False)] = None,
     kid: Annotated[str | None, Query(include_in_schema=False)] = None,
@@ -1701,14 +1744,33 @@ async def get_artifact_content(
             signed_expiry_unix = int(expiry)
         except ValueError:
             signed_expiry_unix = None
+    headers = _artifact_content_response_headers(
+        disposition=content_disposition,
+        is_signed=is_signed,
+        signed_expiry_unix=signed_expiry_unix,
+    )
+    headers["Accept-Ranges"] = "bytes"
+    content_length = len(content)
+    parsed_range = _parse_range_header(request.headers.get("range"), content_length)
+    if parsed_range == _RANGE_UNSATISFIABLE:
+        headers["Content-Range"] = f"bytes */{content_length}"
+        return Response(
+            status_code=http_status.HTTP_416_RANGE_NOT_SATISFIABLE,
+            headers=headers,
+        )
+    if parsed_range is not None:
+        start, end = parsed_range
+        headers["Content-Range"] = f"bytes {start}-{end}/{content_length}"
+        return Response(
+            content=content[start : end + 1],
+            media_type=media_type,
+            status_code=http_status.HTTP_206_PARTIAL_CONTENT,
+            headers=headers,
+        )
     return Response(
         content=content,
         media_type=media_type,
-        headers=_artifact_content_response_headers(
-            disposition=content_disposition,
-            is_signed=is_signed,
-            signed_expiry_unix=signed_expiry_unix,
-        ),
+        headers=headers,
     )
 
 
