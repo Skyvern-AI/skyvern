@@ -1032,7 +1032,7 @@ def _action_to_stmt(
                         ),
                     )
                 )
-            if task.get("totp_url"):
+            if task.get("totp_verification_url"):
                 args.append(
                     cst.Arg(
                         keyword=cst.Name("totp_url"),

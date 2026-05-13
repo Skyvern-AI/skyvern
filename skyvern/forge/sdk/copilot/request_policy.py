@@ -15,6 +15,10 @@ from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+)
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -135,6 +139,128 @@ class RequestPolicy:
         return "\n".join(lines)
 
 
+_TRANSCRIPT_TOTAL_CHAR_BUDGET = 2048
+TRANSCRIPT_ANCHOR_CHAR_CAP = 512
+_TRANSCRIPT_RETAINED_MIN_CHARS = 512
+_TRANSCRIPT_MARKER_RESERVE = 32
+_EMPTY_SLOT_SENTINEL = "(none)"
+
+
+@dataclass(frozen=True)
+class RequestPolicyTranscriptContext:
+    earliest_user_turn: str
+    latest_prior_user_turn: str
+    latest_assistant_turn: str
+    retained_history: str
+    omitted_any: bool
+
+
+def _middle_truncate(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    keep = max(cap - 32, 16)
+    head_len = keep // 2
+    tail_len = keep - head_len
+    omitted = len(text) - keep
+    return f"{text[:head_len]}<…{omitted} chars truncated…>{text[-tail_len:]}"
+
+
+def _safe_slot(text: str | None, cap: int) -> str:
+    if not text:
+        return _EMPTY_SLOT_SENTINEL
+    # Truncate the raw text first to bound regex work on pasted large messages.
+    # A secret that straddles the head/tail splice would not be caught here, but
+    # `_middle_truncate` later collapses the rendered output anyway, so any such
+    # value already cannot leak intact to the prompt.
+    bounded = text if len(text) <= cap * 4 else text[: cap * 2] + text[-cap * 2 :]
+    return _middle_truncate(escape_code_fences(redact_raw_secrets_for_prompt(bounded)), cap)
+
+
+def _build_transcript_context(
+    messages: list[WorkflowCopilotChatHistoryMessage],
+    current_user_message: str,
+    *,
+    total_char_budget: int = _TRANSCRIPT_TOTAL_CHAR_BUDGET,
+    anchor_char_cap: int = TRANSCRIPT_ANCHOR_CHAR_CAP,
+    retained_min_chars: int = _TRANSCRIPT_RETAINED_MIN_CHARS,
+) -> RequestPolicyTranscriptContext:
+    """Shape chat history into structural anchors for the request-policy classifier.
+
+    The chat window is already truncated upstream (see
+    `CHAT_HISTORY_CONTEXT_MESSAGES` in `skyvern/forge/sdk/routes/workflow_copilot.py`),
+    so `earliest_user_turn` is the head of the retained tail rather than the
+    original conversation goal — the prompt header surfaces that caveat.
+    """
+    filtered: list[WorkflowCopilotChatHistoryMessage] = [m for m in messages if (m.content or "").strip()]
+    current_stripped = (current_user_message or "").strip()
+    if (
+        filtered
+        and filtered[-1].sender == WorkflowCopilotChatSender.USER
+        and (filtered[-1].content or "").strip() == current_stripped
+        and current_stripped
+    ):
+        filtered = filtered[:-1]
+
+    user_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.USER]
+    ai_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.AI]
+
+    earliest_idx = user_indices[0] if user_indices else None
+    latest_user_idx = user_indices[-1] if user_indices else None
+    latest_ai_idx = ai_indices[-1] if ai_indices else None
+    anchor_indices = {idx for idx in (earliest_idx, latest_user_idx, latest_ai_idx) if idx is not None}
+
+    earliest_text = filtered[earliest_idx].content if earliest_idx is not None else None
+    latest_user_text = filtered[latest_user_idx].content if latest_user_idx is not None else None
+    latest_ai_text = filtered[latest_ai_idx].content if latest_ai_idx is not None else None
+
+    earliest_slot = _safe_slot(earliest_text, anchor_char_cap)
+    latest_user_slot = _safe_slot(latest_user_text, anchor_char_cap)
+    latest_ai_slot = _safe_slot(latest_ai_text, anchor_char_cap)
+
+    consumed = sum(len(slot) for slot in (earliest_slot, latest_user_slot, latest_ai_slot))
+    retained_budget = max(total_char_budget - consumed, retained_min_chars)
+    # Inner max() floors the retained block at `retained_min_chars // 2` when
+    # the marker reserve would otherwise drive it negative; outer min() caps it
+    # by total_char_budget so retained_history cannot exceed the declared ceiling
+    # even when retained_min_chars is configured above total_char_budget.
+    content_budget = min(
+        max(retained_budget - _TRANSCRIPT_MARKER_RESERVE, retained_min_chars // 2),
+        total_char_budget,
+    )
+
+    candidate_lines: list[tuple[int, str]] = []
+    for i, message in enumerate(filtered):
+        if i in anchor_indices:
+            continue
+        role = "user" if message.sender == WorkflowCopilotChatSender.USER else "assistant"
+        candidate_lines.append((i, f"[{i + 1}] {role}: {_safe_slot(message.content, anchor_char_cap)}"))
+
+    keep: list[str] = []
+    used = 0
+    # break (not continue) on overflow: drops the oldest tail entirely instead
+    # of skipping a large recent turn to fit smaller older ones.
+    for _i, line in reversed(candidate_lines):
+        cost = len(line) + 1
+        if used + cost > content_budget:
+            break
+        keep.append(line)
+        used += cost
+    omitted_count = len(candidate_lines) - len(keep)
+    keep.reverse()
+
+    if omitted_count:
+        keep.insert(0, f"<omitted {omitted_count} entries>")
+
+    retained = "\n".join(keep) if keep else _EMPTY_SLOT_SENTINEL
+    return RequestPolicyTranscriptContext(
+        earliest_user_turn=earliest_slot,
+        latest_prior_user_turn=latest_user_slot,
+        latest_assistant_turn=latest_ai_slot,
+        retained_history=retained,
+        omitted_any=bool(omitted_count),
+    )
+
+
 def _clean_list(values: list[Any]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
@@ -158,28 +284,6 @@ def redact_raw_secrets_for_prompt(text: str) -> str:
     for pattern in _RAW_SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED_SECRET]", redacted)
     return redacted
-
-
-_CHAT_HISTORY_TRUNCATION_MARKER = "\n...[earlier chat history truncated]...\n"
-
-
-def _clip_chat_history_for_prompt(text: str, limit: int = 2048, head: int = 384) -> str:
-    """Middle-truncate chat history so the most recent assistant turn survives.
-
-    Plain `[:limit]` clips the tail in long conversations, hiding the latest
-    assistant turn that the classifier's slot-fill rule depends on. The head
-    boundary snaps back to the last newline so we do not cut a turn mid-line.
-    """
-    if len(text) <= limit:
-        return text
-    head_text = text[:head]
-    snap = head_text.rfind("\n")
-    if snap > head // 2:
-        head_text = head_text[: snap + 1]
-    tail = limit - len(head_text) - len(_CHAT_HISTORY_TRUNCATION_MARKER)
-    if tail <= 0:
-        return text[-limit:]
-    return head_text + _CHAT_HISTORY_TRUNCATION_MARKER + text[-tail:]
 
 
 def _classification_from_raw(raw: Any) -> RequestPolicy:
@@ -218,7 +322,11 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
 
 
 async def _classify_request(
-    user_message: str, workflow_yaml: str, chat_history: str, global_llm_context: str, handler: Any
+    user_message: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str,
+    handler: Any,
 ) -> RequestPolicy:
     ids = _credential_ids(user_message)
     if _raw_secret_detected(user_message):
@@ -231,15 +339,15 @@ async def _classify_request(
     if handler is None:
         return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
 
-    # workflow_yaml and global_llm_context are head-truncated: the front matter
-    # (title, parameters, first blocks) is what the classifier needs. chat_history
-    # is middle-truncated because the slot-fill rule reads the latest assistant
-    # turn at the tail.
+    transcript = _build_transcript_context(chat_history, user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=escape_code_fences(user_message),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
-        chat_history=escape_code_fences(_clip_chat_history_for_prompt(redact_raw_secrets_for_prompt(chat_history))),
+        earliest_user_turn=transcript.earliest_user_turn,
+        latest_prior_user_turn=transcript.latest_prior_user_turn,
+        latest_assistant_turn=transcript.latest_assistant_turn,
+        retained_history=transcript.retained_history,
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)[:2048]),
     )
     try:
@@ -583,7 +691,7 @@ async def build_request_policy(
     *,
     user_message: str,
     workflow_yaml: str,
-    chat_history: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
     organization_id: str,
     handler: Any,
