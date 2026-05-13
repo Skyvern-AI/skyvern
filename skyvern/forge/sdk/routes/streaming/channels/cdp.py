@@ -60,32 +60,6 @@ class CdpChannel:
 
         return base | {"cdp_url": self.url}
 
-    @staticmethod
-    def _select_browser_context(contexts: list[BrowserContext]) -> BrowserContext | None:
-        if not contexts:
-            return None
-
-        populated_contexts = [context for context in contexts if context.pages]
-        if not populated_contexts:
-            return contexts[0]
-
-        for context in populated_contexts:
-            if any(not page.url.startswith("devtools:") for page in context.pages):
-                return context
-
-        return populated_contexts[0]
-
-    @staticmethod
-    def _select_page(browser_context: BrowserContext | None) -> Page | None:
-        if browser_context is None or not browser_context.pages:
-            return None
-
-        for page in browser_context.pages:
-            if not page.url.startswith("devtools:"):
-                return page
-
-        return browser_context.pages[0]
-
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         """
         Idempotent.
@@ -132,17 +106,16 @@ class CdpChannel:
         await self.apply_download_behavior(self.browser)
 
         contexts = self.browser.contexts
-        selected_context = self._select_browser_context(contexts)
-        if selected_context:
+        if contexts:
             LOG.info(f"{self.class_name} using existing browser context", **self.identity)
-            self.browser_context = selected_context
+            self.browser_context = contexts[0]
         else:
             LOG.warning(f"{self.class_name} No existing browser context found, creating new one", **self.identity)
             self.browser_context = await self.browser.new_context()
 
-        selected_page = self._select_page(self.browser_context)
-        if selected_page:
-            self.page = selected_page
+        pages = self.browser_context.pages
+        if pages:
+            self.page = pages[0]
             LOG.info(f"{self.class_name} connected to page", **self.identity)
         else:
             LOG.warning(f"{self.class_name} No pages found in browser context", **self.identity)
