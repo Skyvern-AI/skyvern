@@ -336,7 +336,6 @@ class TestCapabilities:
         assert "subcommands" in tree
         sub_names = [s["name"] for s in tree["subcommands"]]
         assert "workflow" in sub_names
-        assert "browser-profile" in sub_names
         assert "credential" in sub_names
         assert "capabilities" in sub_names
 

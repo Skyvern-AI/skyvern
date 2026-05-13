@@ -30,31 +30,6 @@ def _fake_workflow_response() -> SimpleNamespace:
     )
 
 
-def _fake_workflow_run_response(**overrides: object) -> SimpleNamespace:
-    defaults: dict[str, object] = {
-        "run_id": "wr_run",
-        "status": "running",
-        "run_type": "workflow_run",
-        "step_count": None,
-        "failure_reason": None,
-        "recording_url": None,
-        "app_url": None,
-        "browser_session_id": None,
-        "browser_profile_id": None,
-        "run_with": None,
-        "ai_fallback": None,
-        "output": None,
-        "created_at": None,
-        "modified_at": None,
-        "started_at": None,
-        "finished_at": None,
-        "queued_at": None,
-        "script_run": None,
-    }
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
-
-
 def _fake_http_response(payload: dict[str, object], status_code: int = 200) -> SimpleNamespace:
     return SimpleNamespace(
         status_code=status_code,
@@ -176,7 +151,6 @@ def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dic
             }
         ],
         "outputs": outputs,
-        "browser_profile_id": "bp_status",
         "run_with": "code",
     }
 
@@ -636,106 +610,6 @@ async def test_mcp_text_prompt_without_llm_key_stays_null(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_workflow_run_passes_browser_profile_id_and_surfaces_debug(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = SimpleNamespace(
-        run_workflow=AsyncMock(
-            return_value=_fake_workflow_run_response(
-                run_id="wr_profile",
-                browser_session_id="pbs_existing",
-                browser_profile_id="bp_saved",
-            )
-        )
-    )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
-
-    result = await workflow_tools.skyvern_workflow_run(
-        workflow_id="wpid_test",
-        parameters='{"account": "123"}',
-        browser_session_id="pbs_existing",
-        browser_profile_id="bp_saved",
-    )
-
-    assert result["ok"] is True
-    fake_client.run_workflow.assert_awaited_once()
-    sent = fake_client.run_workflow.await_args.kwargs
-    assert sent["browser_session_id"] == "pbs_existing"
-    assert sent["browser_profile_id"] == "bp_saved"
-    assert result["data"]["browser_profile_id"] == "bp_saved"
-    assert "browser_session_id='pbs_existing'" in result["data"]["sdk_equivalent"]
-    assert "browser_profile_id='bp_saved'" in result["data"]["sdk_equivalent"]
-
-
-@pytest.mark.asyncio
-async def test_workflow_run_maps_browser_profile_not_found_to_invalid_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from skyvern.cli.core.result import ErrorCode
-    from skyvern.client.core.api_error import ApiError
-
-    # Reproduce Fern's actual production behavior: run_workflow's Fern client
-    # only explicitly maps 400/422, so a 404 arrives as a generic ApiError
-    # (NOT NotFoundError). The handler must key off status_code to catch it.
-    fake_client = SimpleNamespace(
-        run_workflow=AsyncMock(
-            side_effect=ApiError(
-                status_code=404,
-                body={"detail": "Browser profile bp_missing not found"},
-            )
-        )
-    )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
-
-    result = await workflow_tools.skyvern_workflow_run(
-        workflow_id="wpid_exists",
-        browser_profile_id="bp_missing",
-    )
-
-    assert result["ok"] is False
-    assert result["error"]["code"] == ErrorCode.INVALID_INPUT
-    assert "browser profile" in result["error"]["message"].lower()
-    assert "skyvern_browser_profile_list" in result["error"]["hint"]
-
-
-@pytest.mark.asyncio
-async def test_workflow_run_maps_workflow_not_found_to_workflow_not_found(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from skyvern.cli.core.result import ErrorCode
-    from skyvern.client.core.api_error import ApiError
-
-    # A 404 whose body does NOT mention "browser profile" must still route
-    # to WORKFLOW_NOT_FOUND even when it arrives as generic ApiError.
-    fake_client = SimpleNamespace(
-        run_workflow=AsyncMock(side_effect=ApiError(status_code=404, body={"detail": "Workflow wpid_ghost not found"}))
-    )
-    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
-
-    result = await workflow_tools.skyvern_workflow_run(workflow_id="wpid_ghost")
-
-    assert result["ok"] is False
-    assert result["error"]["code"] == ErrorCode.WORKFLOW_NOT_FOUND
-    assert "wpid_ghost" in result["error"]["message"]
-
-
-@pytest.mark.asyncio
-async def test_workflow_run_rejects_empty_browser_profile_id() -> None:
-    from skyvern.cli.core.result import ErrorCode
-
-    result = await workflow_tools.skyvern_workflow_run(
-        workflow_id="wpid_exists",
-        browser_profile_id="",
-    )
-
-    # Empty string must not silently reach the SDK; validate_browser_profile_id
-    # rejects it because "" does not start with bp_.
-    assert result["ok"] is False
-    assert result["error"]["code"] == ErrorCode.INVALID_INPUT
-    assert "bp_" in result["error"]["hint"]
-
-
-@pytest.mark.asyncio
 async def test_workflow_status_uses_workflow_run_route_for_wr_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = _heavy_workflow_run_payload(include_expanded_outputs=False)
     request = AsyncMock(return_value=_fake_http_response(payload))
@@ -788,7 +662,6 @@ async def test_workflow_status_full_preserves_expanded_workflow_details(monkeypa
     assert data["recording_url"] == payload["recording_url"]
     assert data["output"] == payload["outputs"]
     assert data["workflow_title"] == "Heavy workflow"
-    assert data["browser_profile_id"] == "bp_status"
 
 
 @pytest.mark.asyncio
@@ -865,7 +738,6 @@ async def test_workflow_status_full_via_mcp_client(monkeypatch: pytest.MonkeyPat
     assert data["run_id"] == "wr_heavy"
     assert data["recording_url"] == payload["recording_url"]
     assert data["output"] == payload["outputs"]
-    assert data["browser_profile_id"] == "bp_status"
 
 
 # ---------------------------------------------------------------------------

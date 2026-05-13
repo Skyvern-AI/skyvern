@@ -444,7 +444,6 @@ class TestWorkflowCommands:
             workflow_id="wpid_123",
             params=f"@{params_file}",
             session="pbs_456",
-            browser_profile_id="bp_saved",
             webhook="https://example.com/webhook",
             proxy="RESIDENTIAL",
             wait=True,
@@ -457,7 +456,6 @@ class TestWorkflowCommands:
             "workflow_id": "wpid_123",
             "parameters": '{"company": "Acme"}',
             "browser_session_id": "pbs_456",
-            "browser_profile_id": "bp_saved",
             "webhook_url": "https://example.com/webhook",
             "proxy_location": "RESIDENTIAL",
             "wait": True,
@@ -467,41 +465,6 @@ class TestWorkflowCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is True
         assert parsed["data"]["run_id"] == "wr_123"
-
-    def test_session_create_passes_browser_profile_id_and_outputs_it(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
-    ) -> None:
-        from skyvern.cli.commands import browser as browser_cmd
-
-        skyvern = object()
-        result = SimpleNamespace(session_id="pbs_123", timeout_minutes=30, browser_profile_id="bp_saved")
-        do_create = AsyncMock(return_value=(object(), result))
-        monkeypatch.setattr(browser_cmd, "get_skyvern", lambda: skyvern)
-        monkeypatch.setattr(browser_cmd, "do_session_create", do_create)
-        monkeypatch.setattr(browser_cmd, "save_state", MagicMock())
-        capture_mock = MagicMock()
-        monkeypatch.setattr(browser_cmd, "capture_cli_tool_call", capture_mock)
-
-        browser_cmd.session_create(
-            timeout=30,
-            proxy="RESIDENTIAL",
-            browser_profile_id="bp_saved",
-            local=False,
-            headless=False,
-            json_output=True,
-        )
-
-        do_create.assert_awaited_once_with(
-            skyvern,
-            timeout=30,
-            proxy_location="RESIDENTIAL",
-            browser_profile_id="bp_saved",
-        )
-        parsed = json.loads(capsys.readouterr().out)
-        assert parsed["ok"] is True
-        assert parsed["data"]["session_id"] == "pbs_123"
-        assert parsed["data"]["browser_profile_id"] == "bp_saved"
-        capture_mock.assert_called_once_with("skyvern_browser_session_create", ok=True)
 
     def test_workflow_status_json_error_exits_nonzero(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

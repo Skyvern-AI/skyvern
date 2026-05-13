@@ -658,27 +658,6 @@ async def test_session_create_stateless_mode_rejects_local() -> None:
     assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
 
 
-@pytest.mark.parametrize(
-    ("local", "browser_type"),
-    [(True, None), (False, "cdp-connect")],
-    ids=["local", "cdp"],
-)
-@pytest.mark.asyncio
-async def test_session_create_rejects_local_or_cdp_browser_profile_id(
-    monkeypatch: pytest.MonkeyPatch,
-    local: bool,
-    browser_type: str | None,
-) -> None:
-    if browser_type:
-        monkeypatch.setenv("BROWSER_TYPE", browser_type)
-
-    result = await mcp_session.skyvern_browser_session_create(local=local, browser_profile_id="bp_saved")
-
-    assert result["ok"] is False
-    assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
-    assert "cloud" in result["error"]["hint"]
-
-
 @pytest.mark.asyncio
 async def test_session_create_forwards_extensions_to_stateful_session_create(
     monkeypatch: pytest.MonkeyPatch,
@@ -739,40 +718,3 @@ async def test_session_create_persists_active_api_key_hash_in_session_state(
     assert current.context == BrowserContext(mode="cloud_session", session_id="pbs_123")
     assert current.api_key_hash == session_manager._api_key_hash("sk_key_create")
     assert current.api_key_hash != "sk_key_create"
-
-
-@pytest.mark.asyncio
-async def test_session_create_rejects_empty_browser_profile_id() -> None:
-    # Empty string must not silently slip through to the SDK. The server's
-    # profile lookup is also truthy-gated, so "" would be treated as
-    # "no profile" and silently skip login-reuse. validate_browser_profile_id
-    # rejects "" because it does not start with bp_.
-    result = await mcp_session.skyvern_browser_session_create(browser_profile_id="")
-
-    assert result["ok"] is False
-    assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
-    assert "bp_" in result["error"]["hint"]
-
-
-@pytest.mark.asyncio
-async def test_session_create_maps_browser_profile_not_found_to_invalid_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from skyvern.client.errors import NotFoundError
-
-    session_manager.set_stateless_http_mode(True)
-    fake_skyvern = MagicMock()
-    fake_skyvern.create_browser_session = AsyncMock(
-        side_effect=NotFoundError(body={"detail": "Browser profile bp_missing not found"})
-    )
-    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
-
-    try:
-        result = await mcp_session.skyvern_browser_session_create(browser_profile_id="bp_missing")
-    finally:
-        session_manager.set_stateless_http_mode(False)
-
-    assert result["ok"] is False
-    assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
-    assert "browser profile" in result["error"]["message"].lower()
-    assert "skyvern_browser_profile_list" in result["error"]["hint"]
