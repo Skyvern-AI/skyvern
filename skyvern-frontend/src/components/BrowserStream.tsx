@@ -271,7 +271,8 @@ function BrowserStream({
     };
   }, [onReadyChange]);
 
-  // update global settings store about browser usage
+  // `isUsingABrowser` is tied to local `isReady`, so this component owns it.
+  // `isLoadingABrowser` is owned by the route instead (SKY-9777).
   useEffect(() => {
     settingsStore.setIsUsingABrowser(isReady);
     settingsStore.setBrowserSessionId(
