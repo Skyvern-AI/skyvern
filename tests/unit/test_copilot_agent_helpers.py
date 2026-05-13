@@ -320,6 +320,80 @@ class TestRequestPolicyInputGuardrail:
         assert result.output.output_info["blocked"] is True
         assert "hunter2" not in str(result.output.output_info)
 
+    @pytest.mark.asyncio
+    async def test_request_policy_proceeds_on_workflow_behavior_question(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            credential_input_kind="none",
+            testing_intent="unspecified",
+            user_response_policy="proceed",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message=(
+                    "trigger_login appears to have worked as anticipated but "
+                    "next_step is not receiving an active browser session to work with."
+                ),
+                workflow_yaml="title: w\nworkflow_definition:\n  blocks: [{block_type: navigation}]\n",
+                chat_history_text="user: consolidate the blocks of this workflow.\nassistant: Which blocks should I merge?",
+                global_llm_context="",
+                organization_id="org-1",
+                handler=object(),
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert ctx.request_policy.credential_input_kind == "none"
+        assert ctx.request_policy.allow_run_blocks is True
+        assert ctx.request_policy.allow_update_workflow is True
+        assert result.output.output_info["blocked"] is False
+
+    @pytest.mark.asyncio
+    async def test_request_policy_proceeds_on_bare_keyvault_slotfill(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            credential_input_kind="none",
+            testing_intent="unspecified",
+            user_response_policy="proceed",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message="customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass",
+                workflow_yaml="title: w\nworkflow_definition:\n  blocks: [{block_type: login}]\n",
+                chat_history_text=("assistant: What value should I use for password_key_vault_id?"),
+                global_llm_context="",
+                organization_id="org-1",
+                handler=object(),
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert ctx.request_policy.credential_input_kind == "none"
+        assert ctx.request_policy.raw_secret_detected is False
+        assert ctx.request_policy.allow_run_blocks is True
+
 
 class TestShouldRestorePersistedWorkflow:
     """SKY-9143: auto_accept=True must still restore when no proposal shipped."""
