@@ -2,10 +2,6 @@ import { describe, expect, it } from "vitest";
 import { cardVariants } from "./card-variants";
 
 describe("cardVariants", () => {
-  // Pre-cva Card class string was:
-  //   "rounded-xl border bg-card text-card-foreground shadow"
-  // Default tone MUST emit those same classes (order-insensitive — twMerge
-  // resolves ordering when cn() composes them with caller className).
   it("returns the legacy class set for tone=default (existing-caller preservation)", () => {
     const result = cardVariants({ tone: "default" });
     expect(result).toContain("rounded-xl");
@@ -35,8 +31,6 @@ describe("cardVariants", () => {
   });
 
   it("keeps the rounded-xl + shadow + bg-card base across all tones (border-tint only)", () => {
-    // Tones are border-tints only — full background washes were out-of-scope
-    // per mandate. A destructive Card still reads as a Card, not a Banner.
     for (const tone of [
       "default",
       "success",

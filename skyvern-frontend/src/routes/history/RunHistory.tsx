@@ -47,7 +47,7 @@ import {
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -69,6 +69,23 @@ import { HighlightText } from "@/routes/workflows/components/HighlightText";
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
   return statusValues.has(value);
+}
+
+function parseStatusParam(raw: string | null): Array<Status> {
+  if (!raw) {
+    return [];
+  }
+  const seen = new Set<Status>();
+  const out: Array<Status> = [];
+  for (const token of raw.split(",")) {
+    const trimmed = token.trim();
+    if (trimmed === "" || !isKnownStatus(trimmed) || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
 }
 
 // Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
@@ -103,25 +120,55 @@ function RunHistory() {
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
     : 10;
-  const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
+  const workflowPermanentIdFilter = searchParams.get("workflow_permanent_id");
+  const statusFilters = useMemo(
+    () => parseStatusParam(searchParams.get("status")),
+    [searchParams],
+  );
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
-  const { data: runs, isFetching } = useRunsQuery({
+  const effectiveSearch = workflowPermanentIdFilter || debouncedSearch;
+
+  const { data: rawRuns, isFetching } = useRunsQuery({
     page,
     pageSize: itemsPerPage,
     statusFilters,
-    search: debouncedSearch,
+    search: effectiveSearch,
   });
   const navigate = useNavigate();
 
-  const { data: nextPageRuns } = useRunsQuery({
+  const { data: rawNextPageRuns } = useRunsQuery({
     page: page + 1,
     pageSize: itemsPerPage,
     statusFilters,
-    search: debouncedSearch,
-    enabled: runs?.length === itemsPerPage,
+    search: effectiveSearch,
+    enabled: rawRuns?.length === itemsPerPage,
   });
+
+  // /runs treats `search` as a substring match across searchable_text,
+  // run_id, and workflow_permanent_id. When the user is filtering by a
+  // specific workflow_permanent_id we tighten the result client-side so
+  // unrelated runs whose text shares a substring with this id don't bleed in.
+  // Pagination becomes best-effort under this filter — pages may be shorter
+  // than itemsPerPage when matches are sparse.
+  const runs = useMemo(() => {
+    if (!rawRuns || !workflowPermanentIdFilter) {
+      return rawRuns;
+    }
+    return rawRuns.filter(
+      (run) => run.workflow_permanent_id === workflowPermanentIdFilter,
+    );
+  }, [rawRuns, workflowPermanentIdFilter]);
+
+  const nextPageRuns = useMemo(() => {
+    if (!rawNextPageRuns || !workflowPermanentIdFilter) {
+      return rawNextPageRuns;
+    }
+    return rawNextPageRuns.filter(
+      (run) => run.workflow_permanent_id === workflowPermanentIdFilter,
+    );
+  }, [rawNextPageRuns, workflowPermanentIdFilter]);
 
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
@@ -318,11 +365,37 @@ function RunHistory() {
     });
   };
 
+  function clearWorkflowFilter() {
+    const params = new URLSearchParams(searchParams);
+    params.delete("workflow_permanent_id");
+    params.set("page", "1");
+    setSearchParams(params, { replace: true });
+  }
+
   return (
     <div className="space-y-4">
       <header>
         <h1 className="text-2xl">Run History</h1>
       </header>
+      {workflowPermanentIdFilter ? (
+        <div
+          className="flex items-center justify-between gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs"
+          data-testid="workflow-filter-banner"
+        >
+          <span className="truncate">
+            Filtering runs for workflow{" "}
+            <span className="font-mono">{workflowPermanentIdFilter}</span>
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={clearWorkflowFilter}
+            className="h-auto py-1 text-xs"
+          >
+            Clear
+          </Button>
+        </div>
+      ) : null}
       <div className="flex items-center justify-between gap-4">
         <TableSearchInput
           value={search}
@@ -332,14 +405,23 @@ function RunHistory() {
             params.set("page", "1");
             setSearchParams(params, { replace: true });
           }}
-          placeholder="Search by run ID or parameter..."
+          placeholder={
+            workflowPermanentIdFilter
+              ? "Clear the workflow filter above to search"
+              : "Search by run ID or parameter..."
+          }
+          disabled={!!workflowPermanentIdFilter}
           className="w-48 lg:w-72"
         />
         <StatusFilterDropdown
           values={statusFilters}
           onChange={(filters) => {
-            setStatusFilters(filters);
             const params = new URLSearchParams(searchParams);
+            if (filters.length === 0) {
+              params.delete("status");
+            } else {
+              params.set("status", filters.join(","));
+            }
             params.set("page", "1");
             setSearchParams(params, { replace: true });
           }}
