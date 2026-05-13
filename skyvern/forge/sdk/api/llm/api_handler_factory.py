@@ -305,11 +305,21 @@ def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> Allow
     )
 
 
+# Public so callers (e.g. scripts/skyvern_run_script_helper.get_gemini_3_reasoning_effort_override)
+# can validate against the same set instead of duplicating the values.
+VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
     _thinking_budget_settings: dict[str, int] | None = None
     _prompt_caching_settings: dict[str, bool] | None = None
+    # When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to
+    # `thinkingLevel` in Vertex) instead of the legacy `thinking={budget_tokens:N}`
+    # payload — which litellm silently drops for Gemini 3, leaving the model at
+    # its default HIGH thinking level (SKY-9785).
+    _gemini_3_reasoning_effort_override: str | None = None
 
     @staticmethod
     def _strip_static_prompt_from_messages(messages: list[dict[str, Any]], static_prompt: str) -> bool:
@@ -533,11 +543,51 @@ class LLMAPIHandlerFactory:
             )
 
     @staticmethod
+    def _is_gemini_3_model(llm_config: LLMConfig | LLMRouterConfig) -> bool:
+        """Detect whether the underlying provider is Gemini 3.x.
+
+        Routers carry their primary as `main_model_group` (e.g.
+        `vertex-gemini-3-flash-preview`) while the top-level `model_name`
+        is the router alias (e.g. `gemini-3.0-flash-gpt-5-fallback-router`).
+        Both contain the `gemini-3` substring, so a single check on either
+        identifies the case where Vertex rejects `thinkingBudget` semantics.
+        """
+        if isinstance(llm_config, LLMRouterConfig):
+            main_group = getattr(llm_config, "main_model_group", "") or ""
+            if "gemini-3" in main_group.lower():
+                return True
+        model_name = getattr(llm_config, "model_name", "") or ""
+        return "gemini-3" in model_name.lower()
+
+    @staticmethod
     def _apply_gemini_thinking_optimization(
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
         """Apply thinking optimization for Gemini models using exact integer budget value."""
         model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+
+        # Gemini 3 experiment (SKY-9785): override runs BEFORE the thinking_level
+        # early-return guard below — the single-handler path (api_handler_factory.py
+        # ~1402) merges `llm_config.litellm_params` into `parameters` before this
+        # function runs, which lifts `thinking_level="minimal"` from Gemini 3 configs
+        # into `parameters`. Without this ordering, the guard would fire and the
+        # override would silently skip direct Gemini 3 configs (task/workflow-level
+        # model overrides that bypass the router).
+        override = LLMAPIHandlerFactory._gemini_3_reasoning_effort_override
+        if override and LLMAPIHandlerFactory._is_gemini_3_model(llm_config):
+            parameters["reasoning_effort"] = override
+            # litellm raises 400 if both reasoning_effort and thinking_budget land
+            # on the same Gemini 3 request; clear any conflicting payload that may
+            # have been merged from the model config or set earlier.
+            parameters.pop("thinking", None)
+            parameters.pop("thinking_level", None)
+            LOG.debug(
+                "Applied Gemini 3 thinking_level via reasoning_effort experiment override",
+                prompt_name=prompt_name,
+                reasoning_effort=override,
+                model=model_label,
+            )
+            return
 
         # Models that use thinking_level (e.g. Gemini 3 Pro/Flash) don't support budget_tokens.
         # Their reasoning is already bounded by the thinking_level set in their config, so skip.
@@ -1875,6 +1925,29 @@ class LLMAPIHandlerFactory:
         cls._prompt_caching_settings = settings
         if settings:
             LOG.info("Prompt caching optimization settings applied", settings=settings)
+
+    @classmethod
+    def set_gemini_3_reasoning_effort_override(cls, value: str | None) -> None:
+        """Set the Gemini 3 reasoning_effort override for the current task/workflow.
+
+        Valid values: "minimal", "low", "medium", "high" — or None to clear.
+        Whitespace and case are normalized. Invalid values are coerced to None
+        and logged.
+        """
+        if not value:
+            cls._gemini_3_reasoning_effort_override = None
+            return
+        normalized = value.strip().lower() if isinstance(value, str) else None
+        if normalized not in VALID_GEMINI_3_REASONING_EFFORTS:
+            LOG.warning(
+                "Invalid Gemini 3 reasoning_effort override; clearing",
+                value=value,
+                valid_values=list(VALID_GEMINI_3_REASONING_EFFORTS),
+            )
+            cls._gemini_3_reasoning_effort_override = None
+            return
+        cls._gemini_3_reasoning_effort_override = normalized
+        LOG.info("Gemini 3 reasoning_effort override applied", value=normalized)
 
 
 class LLMCaller:

@@ -49,45 +49,6 @@ skyvern browser session connect --cdp "ws://localhost:9222"
 Session state persists between commands. After `session create`, subsequent commands auto-attach.
 Override with `--session pbs_...`. Close when done: `skyvern browser session close`.
 
-## Cloud Saved Login Reuse
-
-When a user asks to "save this login", "remember this session", or reuse an authenticated cloud state later,
-use a browser profile. A cloud browser profile is a durable saved-login archive identified by `bp_...`; it is
-not the same as `skyvern browser state save/load` or MCP `state_save/state_load`, which are local browser-state
-file tools.
-
-Save explicitly after login:
-
-```bash
-# From a completed workflow run whose workflow definition has persist_browser_session=true
-# (server polls internally for up to 30s, no close-first dance required).
-skyvern browser-profile create --name "site-signed-in" --workflow-run-id wr_123
-
-# Or from an eligible persisted browser session. The session archive only
-# uploads AFTER the session is closed, so the correct sequence is:
-#   log in -> close the session -> wait a few seconds -> create the profile.
-# Calling create against an OPEN session returns ARCHIVE_NOT_READY and will
-# never succeed until the session is closed.
-skyvern browser session close --id pbs_123
-skyvern browser-profile create --name "site-signed-in" --browser-session-id pbs_123
-```
-
-persist_browser_session=true is a workflow-definition property, not a `workflow run` flag. A plain
-`create_browser_session()` session alone does not create a browser-profile archive; the source must have
-persisted browser state that Skyvern can archive. Archive creation is asynchronous, so if profile creation says
-the archive is not ready, wait briefly and retry with a small bounded retry loop.
-
-Reuse through normal entrypoints, then validate before logging in again:
-
-```bash
-skyvern workflow run --id wpid_123 --browser-profile-id bp_123 --wait
-skyvern browser session create --browser-profile-id bp_123
-skyvern browser validate --prompt "Is the user already logged in? Look for the account dashboard or avatar."
-```
-
-If the profile state is valid, skip or conditionalize login blocks instead of blindly repeating login. Product UI
-is not required for this MCP/CLI/skill path.
-
 ## Step 4: Execute by Classification
 
 ### Quick check (yes/no)
