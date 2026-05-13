@@ -57,7 +57,6 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
-    WrongElementToUploadFile,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -73,6 +72,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -2659,28 +2659,47 @@ async def chain_click(
         file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
 
     is_filechooser_trigger = False
+    is_upload_action = bool(action.file_url)
+    context = skyvern_context.current()
+    has_pending = (
+        context is not None and context.pending_file_chooser is not None and context.pending_file_chooser.page is page
+    )
+
+    if is_upload_action and has_pending and context is not None:
+        LOG.info("New UPLOAD_FILE action arrived, cleaning up stale pending file chooser listener")
+        context.cleanup_pending_file_chooser()
+        has_pending = False
 
     async def fc_func(fc: FileChooser) -> None:
         nonlocal is_filechooser_trigger
         is_filechooser_trigger = True
         await fc.set_files(files=file)
 
-    page.on("filechooser", fc_func)
-    LOG.info("Registered file chooser listener", action=action, path=file)
+    if not has_pending:
+        page.on("filechooser", fc_func)
+        LOG.info("Registered file chooser listener", action=action, path=file)
+    else:
+        LOG.info(
+            "Skipping defensive file chooser listener — pending deferred listener exists",
+            action=action,
+        )
 
     """
     Clicks on an element identified by the css and its parent if failed.
     :param css: css of the element to click
     """
+    # Tracks the return value so the finally block can inspect click success.
+    action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
-        return [ActionSuccess()]
+        action_results = [ActionSuccess()]
+        return action_results
 
     except Exception as e:
-        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+        action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
             try:
@@ -2831,21 +2850,61 @@ async def chain_click(
 
         return action_results
     finally:
-        LOG.info("Remove file chooser listener", action=action)
-
         # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
-        # Sleep for 15 seconds after uploading a file to let the page process it
-        # Removing this breaks file uploads using the filechooser
-        if file:
-            await asyncio.sleep(15)
-        page.remove_listener("filechooser", fc_func)
+        click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
 
-        if action.file_url and not is_filechooser_trigger:
+        if is_filechooser_trigger:
+            # File chooser opened during this click — upload completed normally
+            LOG.info("File chooser triggered during this click", action=action)
+            if file:
+                await asyncio.sleep(15)
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
+            if context is not None and context.pending_file_chooser is not None:
+                context.cleanup_pending_file_chooser()
+
+        elif is_upload_action and file and click_succeeded and context is not None:
+            # UPLOAD_FILE click succeeded but file chooser didn't open (e.g. popup intercepted).
+            # Defer the listener so a subsequent click can trigger it.
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
             LOG.warning(
-                "Action has file_url, but filechoose even hasn't been triggered. Upload file attempt seems to fail",
+                "UPLOAD_FILE click succeeded but file chooser was not triggered — deferring listener",
                 action=action,
             )
-            return [ActionFailure(WrongElementToUploadFile(action.element_id))]
+            # Clean up any existing pending listener (may be on a different page)
+            if context.pending_file_chooser is not None:
+                context.cleanup_pending_file_chooser()
+
+            pending = PendingFileChooserListener(page=page, file_paths=file)
+
+            async def deferred_fc_handler(fc: FileChooser) -> None:
+                pending.triggered = True
+                await fc.set_files(files=pending.file_paths)
+                # Auto-remove after firing to prevent double-consumption
+                pending.cleanup()
+
+            pending.handler = deferred_fc_handler
+            page.on("filechooser", deferred_fc_handler)
+            context.pending_file_chooser = pending
+
+        elif (
+            context is not None and context.pending_file_chooser is not None and context.pending_file_chooser.triggered
+        ):
+            # A previous UPLOAD_FILE's deferred listener was consumed by this click
+            LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
+            await asyncio.sleep(15)
+            context.cleanup_pending_file_chooser()
+
+        else:
+            # No file chooser involved — just clean up the defensive listener
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
+
+        if is_upload_action:
+            for r in action_results:
+                if isinstance(r, ActionSuccess):
+                    r.upload_file_triggered = is_filechooser_trigger
 
 
 @traced(name="skyvern.agent.dropdown.auto_completion")
@@ -4363,6 +4422,76 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
+def _schedule_extraction_shadow_check_for_hit(
+    *,
+    task: Task,
+    workflow_run_id: str,
+    cache_key: str,
+    cached_value: Any,
+    cached_age_seconds: float,
+    scraped_page: ScrapedPage,
+    llm_key_override: str | None,
+    extract_information_prompt: str,
+) -> None:
+    shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+    )
+    shadow_schema = task.extracted_information_schema
+    # Snapshot screenshots at schedule time — scraped_page is mutable
+    # and may be refreshed before the background task runs.
+    shadow_screenshots = list(scraped_page.screenshots)
+
+    async def _shadow_gate() -> bool:
+        # Captures `task` by reference — safe because the cloud override
+        # only reads immutable identifiers (workflow_run_id, organization_id,
+        # workflow_permanent_id, task_id) set at construction.
+        return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+    async def _shadow_llm_call() -> Any:
+        fresh = await shadow_llm_api_handler(
+            prompt=extract_information_prompt,
+            # step=None suppresses both update_step (token/cost accounting)
+            # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
+            # are an observability side-channel — the user-visible request
+            # was served from cache, so they must not inflate step usage,
+            # billing, or artifact counts.
+            step=None,
+            screenshots=shadow_screenshots,
+            # Use the same prompt_name as the miss path so prompt-level
+            # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
+            # cached (tuned) vs fresh (untuned) would diverge for config
+            # reasons unrelated to cache correctness.
+            prompt_name="extract-information",
+            force_dict=False,
+            system_prompt=task.workflow_system_prompt,
+        )
+        # Apply the same post-processing the miss path applies so the
+        # comparison is apples-to-apples against the cached value.
+        if shadow_schema:
+            fresh = validate_and_fill_extraction_result(
+                extraction_result=fresh,
+                schema=shadow_schema,
+            )
+        return fresh
+
+    # Bind prompt_name + cache_path so Datadog can split the shared
+    # extract_information.shadow_comparison stream by call site.
+    shadow_logger = structlog.get_logger().bind(
+        prompt_name="extract-information",
+        cache_path="handler",
+    )
+    extraction_shadow.schedule_shadow_check(
+        gate=_shadow_gate,
+        cache_key=cache_key,
+        workflow_run_id=workflow_run_id,
+        cached_value=cached_value,
+        cached_age_seconds=cached_age_seconds,
+        llm_call=_shadow_llm_call,
+        schema=shadow_schema,
+        logger=shadow_logger,
+    )
+
+
 async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
@@ -4530,57 +4659,17 @@ async def extract_information_for_navigation_goal(
         # inside the background task so the cache-hit return is not blocked
         # by the flag provider (e.g. PostHog latency on the first hit per run).
         if cache_key is not None and task.workflow_run_id is not None:
-            shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
-            )
-            shadow_schema = task.extracted_information_schema
-            # Snapshot screenshots at schedule time — scraped_page is mutable
-            # and may be refreshed before the background task runs.
-            shadow_screenshots = list(scraped_page.screenshots)
-
-            async def _shadow_gate() -> bool:
-                # Captures `task` by reference — safe because the cloud override
-                # only reads immutable identifiers (workflow_run_id, organization_id,
-                # workflow_permanent_id, task_id) set at construction.
-                return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
-
-            async def _shadow_llm_call() -> Any:
-                fresh = await shadow_llm_api_handler(
-                    prompt=extract_information_prompt,
-                    # step=None suppresses both update_step (token/cost accounting)
-                    # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
-                    # are an observability side-channel — the user-visible request
-                    # was served from cache, so they must not inflate step usage,
-                    # billing, or artifact counts.
-                    step=None,
-                    screenshots=shadow_screenshots,
-                    # Use the same prompt_name as the miss path so prompt-level
-                    # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
-                    # cached (tuned) vs fresh (untuned) would diverge for config
-                    # reasons unrelated to cache correctness.
-                    prompt_name="extract-information",
-                    force_dict=False,
-                    system_prompt=task.workflow_system_prompt,
-                )
-                # Apply the same post-processing the miss path applies so the
-                # comparison is apples-to-apples against the cached value.
-                if shadow_schema:
-                    fresh = validate_and_fill_extraction_result(
-                        extraction_result=fresh,
-                        schema=shadow_schema,
-                    )
-                return fresh
-
-            extraction_shadow.schedule_shadow_check(
-                gate=_shadow_gate,
-                cache_key=cache_key,
+            _schedule_extraction_shadow_check_for_hit(
+                task=task,
                 workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
                 cached_value=lookup_result.value,
-                # -1.0 sentinel marks "age unknown" so it's distinguishable in
-                # Datadog from "just-cached (0.0)".
-                cached_age_seconds=lookup_result.age_seconds if lookup_result.age_seconds is not None else -1.0,
-                llm_call=_shadow_llm_call,
-                schema=shadow_schema,
+                cached_age_seconds=lookup_result.age_seconds
+                if lookup_result.age_seconds is not None
+                else extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
+                scraped_page=scraped_page,
+                llm_key_override=llm_key_override,
+                extract_information_prompt=extract_information_prompt,
             )
         return ScrapeResult(scraped_data=lookup_result.value)
     if lookup_result is not None and lookup_result.hit:
@@ -4655,8 +4744,6 @@ async def extract_information_for_navigation_goal(
             cache_key=cache_key,
             cache_hit=True,
             cache_scope=extraction_cache.SCOPE_WPID,
-            # Age tracking in the cross-run tier is a follow-up; emit None so
-            # the field is always present but distinguishable from in-run hits.
             cache_age_seconds=None,
             fallback_reason=None,
             cache_path="handler",
@@ -4670,9 +4757,20 @@ async def extract_information_for_navigation_goal(
                 "extract_information cross-run cache backfill to in-run failed",
                 exc_info=True,
             )
-        # Shadow sampling on cross-run hits is a follow-up — plumbing needs
-        # a cached_age for the comparison event and the current Redis backend
-        # does not track it yet.
+        # Fire-and-forget shadow sampling on cross-run hits. Mirrors the
+        # in-run path above; uses the -1.0 cached_age_seconds sentinel
+        # because the Redis tier does not track per-key write time.
+        if task.workflow_run_id is not None:
+            _schedule_extraction_shadow_check_for_hit(
+                task=task,
+                workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
+                cached_value=cross_run_value,
+                cached_age_seconds=extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
+                scraped_page=scraped_page,
+                llm_key_override=llm_key_override,
+                extract_information_prompt=extract_information_prompt,
+            )
         return ScrapeResult(scraped_data=cross_run_value)
 
     # Cross-run miss log — INFO so the wpid-tier hit rate is computable

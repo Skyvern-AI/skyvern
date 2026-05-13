@@ -5,22 +5,61 @@ from __future__ import annotations
 from typing import Any
 
 import typer
-from dotenv import load_dotenv
 
-from skyvern.config import settings
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import resolve_inline_or_file, run_tool
-from .mcp_tools.workflow import skyvern_workflow_cancel as tool_workflow_cancel
-from .mcp_tools.workflow import skyvern_workflow_create as tool_workflow_create
-from .mcp_tools.workflow import skyvern_workflow_delete as tool_workflow_delete
-from .mcp_tools.workflow import skyvern_workflow_get as tool_workflow_get
-from .mcp_tools.workflow import skyvern_workflow_list as tool_workflow_list
-from .mcp_tools.workflow import skyvern_workflow_run as tool_workflow_run
-from .mcp_tools.workflow import skyvern_workflow_status as tool_workflow_status
-from .mcp_tools.workflow import skyvern_workflow_update as tool_workflow_update
 
 workflow_app = typer.Typer(help="Manage Skyvern workflows.", no_args_is_help=True)
+
+
+async def tool_workflow_list(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_list  # noqa: PLC0415
+
+    return await skyvern_workflow_list(**kwargs)
+
+
+async def tool_workflow_get(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_get  # noqa: PLC0415
+
+    return await skyvern_workflow_get(**kwargs)
+
+
+async def tool_workflow_create(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_create  # noqa: PLC0415
+
+    return await skyvern_workflow_create(**kwargs)
+
+
+async def tool_workflow_update(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_update  # noqa: PLC0415
+
+    return await skyvern_workflow_update(**kwargs)
+
+
+async def tool_workflow_delete(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_delete  # noqa: PLC0415
+
+    return await skyvern_workflow_delete(**kwargs)
+
+
+async def tool_workflow_run(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_run  # noqa: PLC0415
+
+    return await skyvern_workflow_run(**kwargs)
+
+
+async def tool_workflow_status(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_status  # noqa: PLC0415
+
+    return await skyvern_workflow_status(**kwargs)
+
+
+async def tool_workflow_cancel(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_cancel  # noqa: PLC0415
+
+    return await skyvern_workflow_cancel(**kwargs)
 
 
 @workflow_app.callback()
@@ -33,8 +72,10 @@ def workflow_callback(
     ),
 ) -> None:
     """Load workflow CLI environment and optional API key override."""
-    load_dotenv(resolve_backend_env_path())
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
     if api_key:
+        from skyvern.config import settings  # noqa: PLC0415
+
         settings.SKYVERN_API_KEY = api_key
 
 

@@ -1,3 +1,4 @@
+import { StopIcon } from "@radix-ui/react-icons";
 import { ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -127,7 +128,12 @@ function WorkflowAdderBusy({
                 style={{ backgroundColor: color }}
                 onClick={handleClick}
               />
-              <div className="pointer-events-none flex items-center justify-center">
+              <div
+                className={cn(
+                  "pointer-events-none flex items-center justify-center",
+                  operation === "recording" && "opacity-0",
+                )}
+              >
                 {children}
               </div>
               <div className="pointer-events-none absolute inset-0">
@@ -154,7 +160,17 @@ function WorkflowAdderBusy({
                   />
                 </svg>
               </div>
-              {isHovered && (
+              {operation === "recording" && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <StopIcon
+                    className={cn(
+                      "text-white drop-shadow-md",
+                      size === "small" ? "h-5 w-5" : "h-10 w-10",
+                    )}
+                  />
+                </div>
+              )}
+              {isHovered && operation !== "recording" && (
                 <div className="pointer-events-none absolute inset-0">
                   <svg
                     className="h-full w-full"
@@ -185,14 +201,14 @@ function WorkflowAdderBusy({
           <TooltipContent>
             <p>
               {operation === "recording"
-                ? "Finish Recording"
+                ? "Stop recording & generate blocks"
                 : operation === "uploading"
                   ? "Converting SOP... (click to cancel)"
                   : "Processing..."}
             </p>
           </TooltipContent>
         </Tooltip>
-        {recordingStore.isRecording && eventCount > 0 && (
+        {operation === "recording" && (
           <Tooltip delayDuration={0}>
             <TooltipTrigger asChild>
               <div
@@ -201,6 +217,7 @@ function WorkflowAdderBusy({
                   {
                     "scale-125": shouldBump,
                     "scale-100": !shouldBump,
+                    "opacity-90": eventCount === 0,
                   },
                 )}
                 style={{
@@ -212,7 +229,11 @@ function WorkflowAdderBusy({
               </div>
             </TooltipTrigger>
             <TooltipContent>
-              <p>Event Count</p>
+              <p>
+                {eventCount === 0
+                  ? "No events yet — click and type in the live browser"
+                  : "Events captured in this recording"}
+              </p>
             </TooltipContent>
           </Tooltip>
         )}

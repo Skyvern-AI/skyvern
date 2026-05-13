@@ -359,13 +359,18 @@ class LocalStorage(BaseStorage):
             if not path_obj.exists():
                 continue
 
-            file_size = path_obj.stat().st_size
+            try:
+                stat_result = path_obj.stat()
+            except OSError:
+                LOG.warning("Failed to stat local recording file", path=file_path, exc_info=True)
+                continue
+            file_size = stat_result.st_size
             if file_size == 0:
                 continue
 
             # Return UTC-aware so consumers can safely compare against S3 LastModified
             # (also UTC-aware) without hitting naive-vs-aware TypeErrors.
-            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime, tz=UTC)
+            modified_at = datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
             checksum = calculate_sha256_for_file(file_path)
             filename = path_obj.name
 
@@ -373,6 +378,7 @@ class LocalStorage(BaseStorage):
                 url=uri,
                 checksum=checksum,
                 filename=filename,
+                file_size=file_size,
                 modified_at=modified_at,
             )
             file_infos.append(file_info)
@@ -387,9 +393,18 @@ class LocalStorage(BaseStorage):
         for file_or_folder in files_and_folders:
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
-                # Calculate checksum for the file
                 checksum = calculate_sha256_for_file(path)
-                file_info = FileInfo(url=f"file://{path}", checksum=checksum, filename=file_or_folder)
+                try:
+                    file_size = os.path.getsize(path)
+                except OSError:
+                    LOG.warning("Failed to get local downloaded file size", path=path, exc_info=True)
+                    file_size = None
+                file_info = FileInfo(
+                    url=f"file://{path}",
+                    checksum=checksum,
+                    filename=file_or_folder,
+                    file_size=file_size,
+                )
                 file_infos.append(file_info)
         return file_infos
 

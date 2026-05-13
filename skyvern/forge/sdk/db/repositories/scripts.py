@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_script_block_id, generate_script_file_id
 from skyvern.forge.sdk.db.models import (
     ScriptBlockModel,
     ScriptBranchHitModel,
@@ -230,25 +231,56 @@ class ScriptsRepository(BaseRepository):
         encoding: str = "utf-8",
         artifact_id: str | None = None,
     ) -> ScriptFile:
-        """Create a script file."""
+        """Create a script file. Idempotent on (script_revision_id, file_path)."""
         async with self.Session() as session:
-            script_file = ScriptFileModel(
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                file_path=file_path,
-                file_name=file_name,
-                file_type=file_type,
-                content_hash=content_hash,
-                file_size=file_size,
-                mime_type=mime_type,
-                encoding=encoding,
-                artifact_id=artifact_id,
+            now = datetime.now(timezone.utc)
+            stmt = (
+                insert(ScriptFileModel)
+                .values(
+                    file_id=generate_script_file_id(),
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    content_hash=content_hash,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    encoding=encoding,
+                    artifact_id=artifact_id,
+                    created_at=now,
+                    modified_at=now,
+                )
+                .on_conflict_do_nothing(constraint="unique_script_file_path")
+                .returning(ScriptFileModel)
             )
-            session.add(script_file)
+            inserted = (await session.scalars(stmt)).first()
+            if inserted is None:
+                LOG.info(
+                    "create_script_file_idempotent_hit",
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                )
+                inserted = (
+                    await session.scalars(
+                        select(ScriptFileModel)
+                        .filter_by(script_revision_id=script_revision_id)
+                        .filter_by(file_path=file_path)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
+                if inserted is None:
+                    raise RuntimeError(
+                        f"create_script_file: conflict row not owned by caller "
+                        f"organization_id={organization_id} "
+                        f"script_revision_id={script_revision_id} file_path={file_path}"
+                    )
+            converted = convert_to_script_file(inserted)
             await session.commit()
-            await session.refresh(script_file)
-            return convert_to_script_file(script_file)
+            return converted
 
     @db_operation("create_script_block")
     async def create_script_block(
@@ -264,24 +296,56 @@ class ScriptsRepository(BaseRepository):
         input_fields: list[str] | None = None,
         requires_agent: bool = False,
     ) -> ScriptBlock:
-        """Create a script block."""
+        """Create a script block. Idempotent on (script_revision_id, script_block_label)."""
         async with self.Session() as session:
-            script_block = ScriptBlockModel(
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                script_block_label=script_block_label,
-                script_file_id=script_file_id,
-                run_signature=run_signature,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                input_fields=input_fields,
-                requires_agent=requires_agent,
+            now = datetime.now(timezone.utc)
+            stmt = (
+                insert(ScriptBlockModel)
+                .values(
+                    script_block_id=generate_script_block_id(),
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    script_block_label=script_block_label,
+                    script_file_id=script_file_id,
+                    run_signature=run_signature,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    input_fields=input_fields,
+                    requires_agent=requires_agent,
+                    created_at=now,
+                    modified_at=now,
+                )
+                .on_conflict_do_nothing(constraint="uc_script_revision_id_script_block_label")
+                .returning(ScriptBlockModel)
             )
-            session.add(script_block)
+            inserted = (await session.scalars(stmt)).first()
+            if inserted is None:
+                LOG.info(
+                    "create_script_block_idempotent_hit",
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    script_block_label=script_block_label,
+                )
+                inserted = (
+                    await session.scalars(
+                        select(ScriptBlockModel)
+                        .filter_by(script_revision_id=script_revision_id)
+                        .filter_by(script_block_label=script_block_label)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
+                if inserted is None:
+                    raise RuntimeError(
+                        f"create_script_block: conflict row not owned by caller "
+                        f"organization_id={organization_id} "
+                        f"script_revision_id={script_revision_id} "
+                        f"script_block_label={script_block_label}"
+                    )
+            converted = convert_to_script_block(inserted)
             await session.commit()
-            await session.refresh(script_block)
-            return convert_to_script_block(script_block)
+            return converted
 
     @db_operation("update_script_block")
     async def update_script_block(

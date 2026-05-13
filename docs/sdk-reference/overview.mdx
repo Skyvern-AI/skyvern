@@ -32,7 +32,7 @@ npm install @skyvern/client
 </CodeGroup>
 
 <Note>
-If you hit Python version errors, use `pipx install skyvern` to install in an isolated environment.
+`pip install skyvern` is the lightweight SDK for Skyvern Cloud and remote API calls. Embedded local SDK features such as `Skyvern.local()` and local browser control require `pip install "skyvern[local]"`. Local server and local stdio MCP commands require `pip install "skyvern[server]"`. Guided quickstart and migrations currently require Docker Compose or a source checkout.
 </Note>
 
 ---
@@ -144,7 +144,7 @@ const skyvern = new Skyvern({
 
 Run Skyvern entirely on your machine - no cloud, no network calls. `Skyvern.local()` reads your `.env` file, boots the engine in-process, and connects the client to it.
 
-**Prerequisite:** Run `skyvern quickstart` once to create the `.env` file with your database connection and LLM API keys.
+**Prerequisite:** Install the local extra with `pip install "skyvern[local]"`. For local browser control, also run `python -m playwright install chromium`.
 
 ```python
 from skyvern import Skyvern

@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.client.core import RequestOptions
+from skyvern.client.types.extensions import Extensions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
@@ -224,9 +225,9 @@ class Skyvern(AsyncSkyvern):
         try:
             from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
         except ImportError as exc:
-            from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+            from skyvern.exceptions import raise_local_extra_required  # noqa: PLC0415
 
-            raise_server_extra_required("Skyvern.local()", exc)
+            raise_local_extra_required("Skyvern.local()", exc)
 
         from skyvern.utils.env_paths import resolve_backend_env_path  # noqa: PLC0415
 
@@ -360,6 +361,7 @@ class Skyvern(AsyncSkyvern):
         browser_address: str | None = None,
         ai_fallback: bool | None = None,
         run_with: str | None = None,
+        run_metadata: dict[str, str] | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         request_options: RequestOptions | None = None,
@@ -382,6 +384,7 @@ class Skyvern(AsyncSkyvern):
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            run_metadata=run_metadata,
             request_options=request_options,
         )
         if wait_for_completion:
@@ -545,6 +548,7 @@ class Skyvern(AsyncSkyvern):
         timeout: int | None = None,
         proxy_location: ProxyLocationInput = None,
         browser_profile_id: str | None = None,
+        extensions: list[Extensions] | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -556,16 +560,21 @@ class Skyvern(AsyncSkyvern):
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
             browser_profile_id: Browser profile ID to load into the new session.
+            extensions: Browser extensions to install in the session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
         """
         self._ensure_cloud_environment()
-        browser_session = await self.create_browser_session(
-            timeout=timeout,
-            proxy_location=proxy_location_to_request(proxy_location),
-            browser_profile_id=browser_profile_id,
-        )
+        create_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "proxy_location": proxy_location_to_request(proxy_location),
+        }
+        if browser_profile_id is not None:
+            create_kwargs["browser_profile_id"] = browser_profile_id
+        if extensions is not None:
+            create_kwargs["extensions"] = extensions
+        browser_session = await self.create_browser_session(**create_kwargs)
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(
                 "Launched new cloud browser session",
@@ -649,14 +658,14 @@ class Skyvern(AsyncSkyvern):
 
     async def _get_playwright(self) -> Playwright:
         if self._playwright is None:
-            from skyvern.exceptions import raise_server_extra_required  # noqa: PLC0415
+            from skyvern.exceptions import raise_local_extra_required  # noqa: PLC0415
 
             # Cloud-API-only SDK users can instantiate Skyvern without server extras,
             # so browser startup keeps its own extra hint at the Playwright boundary.
             try:
                 from playwright.async_api import async_playwright  # noqa: PLC0415
             except ImportError as exc:
-                raise_server_extra_required("Browser APIs", exc)
+                raise_local_extra_required("Browser APIs", exc)
 
             self._playwright = await async_playwright().start()
         return self._playwright

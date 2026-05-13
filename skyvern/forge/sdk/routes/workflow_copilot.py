@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.core import skyvern_context
@@ -50,6 +52,7 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import (
     BlockYAML,
     BranchConditionYAML,
@@ -67,6 +70,51 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_know
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
 
 LOG = structlog.get_logger()
+
+
+def _proxy_location_alias_key(value: str) -> str:
+    return "_".join(value.strip().upper().replace("-", "_").split())
+
+
+def _build_copilot_proxy_location_aliases() -> dict[str, str]:
+    aliases: dict[str, str] = {}
+
+    def add(alias: str, proxy_location: ProxyLocation) -> None:
+        aliases[_proxy_location_alias_key(alias)] = proxy_location.value
+
+    for proxy_location in ProxyLocation:
+        add(proxy_location.name, proxy_location)
+        add(proxy_location.value, proxy_location)
+
+    for proxy_location in ProxyLocation.residential_country_locations():
+        add(ProxyLocation.get_country_code(proxy_location), proxy_location)
+
+    add("USA", ProxyLocation.RESIDENTIAL)
+    add("United States", ProxyLocation.RESIDENTIAL)
+    add("United States of America", ProxyLocation.RESIDENTIAL)
+    add("RESIDENTIAL_US", ProxyLocation.RESIDENTIAL)
+    add("UK", ProxyLocation.RESIDENTIAL_GB)
+    add("United Kingdom", ProxyLocation.RESIDENTIAL_GB)
+
+    return aliases
+
+
+_COPILOT_PROXY_LOCATION_ALIASES = _build_copilot_proxy_location_aliases()
+
+
+def _canonicalize_copilot_proxy_location(parsed_yaml: dict[str, Any]) -> None:
+    if "proxy_location" not in parsed_yaml:
+        return
+
+    proxy_location = parsed_yaml.get("proxy_location")
+    if not isinstance(proxy_location, str):
+        return
+
+    canonical = _COPILOT_PROXY_LOCATION_ALIASES.get(_proxy_location_alias_key(proxy_location))
+    if canonical is None:
+        return
+
+    parsed_yaml["proxy_location"] = canonical
 
 
 async def _resolve_copilot_agent_handler(
@@ -968,6 +1016,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
     if isinstance(parsed_yaml, dict):
         # title is schema-required; coerce rather than force a self-healing round-trip.
         parsed_yaml.setdefault("title", "")
+        _canonicalize_copilot_proxy_location(parsed_yaml)
         workflow_definition = parsed_yaml.get("workflow_definition", None)
         if workflow_definition:
             blocks = workflow_definition.get("blocks", []) or []
@@ -1016,6 +1065,7 @@ def _process_workflow_yaml(
         proxy_location=workflow_yaml_request.proxy_location,
         webhook_callback_url=workflow_yaml_request.webhook_callback_url,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        browser_profile_id=workflow_yaml_request.browser_profile_id,
         model=workflow_yaml_request.model,
         max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
         extra_http_headers=workflow_yaml_request.extra_http_headers,
@@ -1027,6 +1077,118 @@ def _process_workflow_yaml(
         created_at=now,
         modified_at=now,
     )
+
+
+def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
+    if not workflow_yaml:
+        return 0
+    try:
+        parsed_yaml = safe_load_no_dates(workflow_yaml)
+    except Exception:
+        return 0
+    if not isinstance(parsed_yaml, dict):
+        return 0
+
+    workflow_definition = parsed_yaml.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return 0
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return 0
+    return len(blocks)
+
+
+def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
+    cleaned = deepcopy(block)
+    cleaned.pop("output_parameter", None)
+    cleaned.pop("workflow_system_prompt", None)
+
+    parameters = cleaned.pop("parameters", None)
+    if isinstance(parameters, list) and "parameter_keys" not in cleaned:
+        parameter_keys = [
+            parameter.get("key")
+            for parameter in parameters
+            if isinstance(parameter, dict)
+            and parameter.get("key")
+            and parameter.get("parameter_type") != ParameterType.OUTPUT.value
+        ]
+        if parameter_keys:
+            cleaned["parameter_keys"] = parameter_keys
+
+    loop_over = cleaned.pop("loop_over", None)
+    if isinstance(loop_over, dict) and "loop_over_parameter_key" not in cleaned:
+        loop_over_parameter_key = loop_over.get("key")
+        if loop_over_parameter_key:
+            cleaned["loop_over_parameter_key"] = loop_over_parameter_key
+
+    loop_blocks = cleaned.get("loop_blocks")
+    if isinstance(loop_blocks, list):
+        cleaned["loop_blocks"] = [
+            _strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
+            for loop_block in loop_blocks
+        ]
+    return cleaned
+
+
+def _workflow_to_copilot_yaml(workflow: Workflow) -> str:
+    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
+    workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
+
+    parameters = workflow_definition.get("parameters")
+    if isinstance(parameters, list):
+        workflow_definition["parameters"] = [
+            parameter
+            for parameter in parameters
+            if not (isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.OUTPUT.value)
+        ]
+
+    blocks = workflow_definition.get("blocks")
+    if isinstance(blocks, list):
+        workflow_definition["blocks"] = [
+            _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
+        ]
+
+    request_data = {
+        key: workflow_data[key]
+        for key in WorkflowCreateYAMLRequest.model_fields
+        if key != "workflow_definition" and key in workflow_data
+    }
+    request_data["workflow_definition"] = workflow_definition
+
+    try:
+        workflow_request = WorkflowCreateYAMLRequest.model_validate(request_data)
+        yaml_data = workflow_request.model_dump(mode="json", exclude_none=True)
+    except ValidationError:
+        LOG.warning(
+            "Persisted workflow did not round-trip through copilot YAML schema; using best-effort workflow dump",
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            exc_info=True,
+        )
+        yaml_data = request_data
+    return yaml.safe_dump(yaml_data, sort_keys=False)
+
+
+def _ensure_copilot_workflow_yaml(chat_request: WorkflowCopilotChatRequest, original_workflow: Workflow) -> None:
+    if _workflow_yaml_block_count(chat_request.workflow_yaml) > 0:
+        return
+    workflow_definition = original_workflow.workflow_definition
+    if workflow_definition is None or not workflow_definition.blocks:
+        return
+
+    persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+    if not persisted_workflow_yaml:
+        return
+
+    LOG.warning(
+        "Copilot V2 chat request had no workflow blocks; using persisted workflow YAML",
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        workflow_id=original_workflow.workflow_id,
+        submitted_workflow_yaml_length=len(chat_request.workflow_yaml or ""),
+        persisted_workflow_yaml_length=len(persisted_workflow_yaml),
+        persisted_block_count=len(workflow_definition.blocks),
+    )
+    chat_request.workflow_yaml = persisted_workflow_yaml
 
 
 async def _new_copilot_chat_post(
@@ -1143,6 +1305,7 @@ async def _new_copilot_chat_post(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
 
             chat_request.workflow_id = original_workflow.workflow_id
+            _ensure_copilot_workflow_yaml(chat_request, original_workflow)
 
             llm_api_handler = await _resolve_copilot_agent_handler(
                 chat_request.workflow_permanent_id, organization.organization_id
@@ -1169,7 +1332,7 @@ async def _new_copilot_chat_post(
                 )
                 return
 
-            security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
+            copilot_config = app.AGENT_FUNCTION.get_copilot_config() or CopilotConfig()
 
             # Spawn the cancel watcher only after the chat row exists; cancels
             # that land during pre-agent setup are not user-cancellable
@@ -1189,6 +1352,9 @@ async def _new_copilot_chat_post(
                         )
                     )
 
+            # Count from the full message log; chat_history below is truncated.
+            turn_index = sum(1 for m in chat_messages if m.sender == WorkflowCopilotChatSender.USER) + 1
+
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -1199,7 +1365,8 @@ async def _new_copilot_chat_post(
                     debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
                     api_key=api_key,
-                    security_rules=security_rules,
+                    config=copilot_config,
+                    turn_index=turn_index,
                 )
 
             if getattr(agent_result, "cancelled", False):

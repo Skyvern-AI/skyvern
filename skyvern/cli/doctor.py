@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 import platform
+import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -25,6 +27,10 @@ from skyvern.cli.console import console
 
 doctor_app = typer.Typer(help="Check Skyvern installation health.")
 
+GENERATED_CREDENTIALS_FILE = Path(".skyvern/credentials.toml")
+LEGACY_STREAMLIT_CREDENTIALS_FILE = Path(".streamlit/secrets.toml")
+_FINGERPRINT_TAGS: dict[str, str] = {}
+
 
 @dataclass
 class CheckResult:
@@ -32,6 +38,25 @@ class CheckResult:
     status: Literal["ok", "warn", "error"]
     detail: str
     hint: str = field(default="")
+
+
+FRONTEND_RUNTIME_URL_VARS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "VITE_API_BASE_URL": ("http://localhost:8000/api/v1", ("http://", "https://")),
+    "VITE_WSS_BASE_URL": ("ws://localhost:8000/api/v1", ("ws://", "wss://")),
+    "VITE_ARTIFACT_API_BASE_URL": ("http://localhost:9090", ("http://", "https://")),
+}
+LOCAL_STREAMING_MODE = "cdp"
+FRONTEND_STREAMING_MODE_VAR = "VITE_BROWSER_STREAMING_MODE"
+BACKEND_STREAMING_MODE_VAR = "BROWSER_STREAMING_MODE"
+ALLOWED_STREAMING_MODES = {"cdp", "vnc"}
+
+FRONTEND_BUNDLE_PLACEHOLDERS = {
+    "__VITE_API_BASE_URL_PLACEHOLDER__",
+    "__VITE_WSS_BASE_URL_PLACEHOLDER__",
+    "__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__",
+    "__SKYVERN_API_KEY_PLACEHOLDER__",
+    "__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +350,11 @@ def _check_database() -> CheckResult:
         )
         if result.returncode == 0:
             return CheckResult(name="Database", status="ok", detail=f"Connected: {_redact_password(db_string)}")
+
+        compose_check = _check_compose_database_connection()
+        if compose_check is not None:
+            return compose_check
+
         stderr = result.stderr.strip()
         if "does not exist" in stderr:
             return CheckResult(
@@ -359,6 +389,42 @@ def _check_database() -> CheckResult:
             status="warn",
             detail="Cannot verify (python not on PATH)",
         )
+
+
+def _check_compose_database_connection() -> CheckResult | None:
+    """Return an ok result if the running Compose backend can reach its database."""
+    if not _docker_compose_available():
+        return None
+
+    script = r"""
+import json
+import sqlalchemy
+
+from skyvern.config import settings
+
+engine = sqlalchemy.create_engine(settings.DATABASE_STRING)
+with engine.connect():
+    pass
+
+print(json.dumps({"status": "ok"}))
+"""
+    try:
+        result = _run_docker_compose_exec("skyvern", script, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return None
+
+    if payload.get("status") == "ok":
+        return CheckResult(name="Database", status="ok", detail="Docker Compose backend can connect to database")
+
+    return None
 
 
 def _check_docker() -> CheckResult:
@@ -460,45 +526,61 @@ def _check_llm_config() -> CheckResult:
     )
 
 
-def _check_api_key_consistency() -> CheckResult:
-    """Check that API keys are consistent across backend .env, frontend .env, and secrets.toml."""
-    import re
+def _read_credential_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    m = re.search(r'(?<![A-Za-z0-9_])cred\s*=\s*"([^"]*)"', path.read_text())
+    return m.group(1) if m else ""
 
+
+def _read_generated_credential() -> str:
+    return _read_credential_file(GENERATED_CREDENTIALS_FILE)
+
+
+def _read_legacy_streamlit_credential() -> str:
+    return _read_credential_file(LEGACY_STREAMLIT_CREDENTIALS_FILE)
+
+
+def _check_api_key_consistency() -> CheckResult:
+    """Check that local API keys are consistent.
+
+    Generated Docker credentials are only a fallback for compose startup; backend .env
+    remains the preferred source when present.
+    """
     from dotenv import dotenv_values
 
     from skyvern.utils.env_paths import resolve_backend_env_path
 
     backend_env = resolve_backend_env_path()
     frontend_env = Path("skyvern-frontend/.env")
-    secrets_toml = Path(".streamlit/secrets.toml")
 
     backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
     frontend_raw = dotenv_values(frontend_env).get("VITE_SKYVERN_API_KEY", "") if frontend_env.exists() else ""
     frontend_key = "" if frontend_raw in ("", "YOUR_API_KEY") else frontend_raw
+    generated_key = _read_generated_credential()
+    legacy_key = _read_legacy_streamlit_credential()
 
-    secrets_key = ""
-    if secrets_toml.exists():
-        m = re.search(r'cred\s*=\s*"([^"]*)"', secrets_toml.read_text())
-        if m:
-            secrets_key = m.group(1)
-
-    canonical = secrets_key or backend_key
+    # Docker Compose can inject the generated credentials file into the UI
+    # without requiring VITE_SKYVERN_API_KEY in skyvern-frontend/.env.
+    # Legacy installs may only have the API key in the old compatibility file;
+    # treat it as a migration source.
+    canonical = backend_key or generated_key or legacy_key
     if not canonical:
         return CheckResult(
             name="API Key Consistency",
             status="warn",
-            detail="No API key found in backend .env or .streamlit/secrets.toml",
+            detail="No API key found in backend .env or generated credentials",
             hint="Run `skyvern init` or `skyvern quickstart` to generate an API key",
         )
 
     mismatches: list[str] = []
-    if backend_key and backend_key != canonical:
-        mismatches.append("backend .env differs from secrets.toml")
+    if not backend_key and not generated_key:
+        mismatches.append("SKYVERN_API_KEY not set in backend .env")
     if not frontend_env.exists():
         mismatches.append("skyvern-frontend/.env missing")
-    elif not frontend_key:
+    elif not frontend_key and not generated_key:
         mismatches.append("VITE_SKYVERN_API_KEY not set in frontend .env")
-    elif frontend_key != canonical:
+    elif frontend_key and frontend_key != canonical:
         mismatches.append("frontend .env differs from backend")
 
     if mismatches:
@@ -509,7 +591,591 @@ def _check_api_key_consistency() -> CheckResult:
             hint="Run `skyvern doctor --fix` to sync API keys",
         )
 
-    return CheckResult(name="API Key Consistency", status="ok", detail="Keys consistent across all config files")
+    return CheckResult(name="API Key Consistency", status="ok", detail="Backend and frontend API keys are consistent")
+
+
+def _check_legacy_streamlit_secrets() -> CheckResult:
+    if not LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
+        return CheckResult(name="Legacy Streamlit Secrets", status="ok", detail="not present")
+
+    from dotenv import dotenv_values
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    legacy_key = _read_legacy_streamlit_credential()
+
+    if not legacy_key:
+        return CheckResult(
+            name="Legacy Streamlit Secrets",
+            status="warn",
+            detail=".streamlit/secrets.toml exists but no cred value was found",
+            hint="Remove the file, or run `skyvern doctor --fix` to remove the deprecated file",
+        )
+
+    if not backend_key:
+        return CheckResult(
+            name="Legacy Streamlit Secrets",
+            status="warn",
+            detail=".streamlit/secrets.toml has a legacy API key but backend .env is missing SKYVERN_API_KEY",
+            hint="Run `skyvern doctor --fix` to migrate the key into .env and skyvern-frontend/.env",
+        )
+
+    if legacy_key != backend_key:
+        return CheckResult(
+            name="Legacy Streamlit Secrets",
+            status="warn",
+            detail=".streamlit/secrets.toml is deprecated and differs from backend .env",
+            hint="Run `skyvern doctor --fix` to remove the deprecated file",
+        )
+
+    return CheckResult(
+        name="Legacy Streamlit Secrets",
+        status="warn",
+        detail=".streamlit/secrets.toml matches backend .env; deprecated compatibility file only",
+        hint="Run `skyvern doctor --fix` to remove the deprecated file",
+    )
+
+
+def _fingerprint(value: str) -> str:
+    """Return an opaque process-local tag for comparing sensitive values in logs."""
+    if not value:
+        return "missing"
+    if value not in _FINGERPRINT_TAGS:
+        _FINGERPRINT_TAGS[value] = secrets.token_hex(6)
+    return _FINGERPRINT_TAGS[value]
+
+
+def _write_generated_credentials_file(api_key: str) -> None:
+    """Write generated local credentials with private file permissions from creation."""
+    GENERATED_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(GENERATED_CREDENTIALS_FILE, flags, 0o600)
+    try:
+        os.write(fd, f'[general]\ncred = "{api_key}"\n'.encode())
+    finally:
+        os.close(fd)
+
+
+def _run_docker_compose_exec(service: str, script: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", "compose", "exec", "-T", service, "python", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _docker_compose_available() -> bool:
+    return shutil.which("docker") is not None and Path("docker-compose.yml").exists()
+
+
+def _is_placeholder_env_value(value: str) -> bool:
+    normalized = value.strip()
+    return (
+        normalized in ("", "PLACEHOLDER", "YOUR_API_KEY")
+        or normalized in FRONTEND_BUNDLE_PLACEHOLDERS
+        or (normalized.startswith("__") and normalized.endswith("__") and "PLACEHOLDER" in normalized)
+    )
+
+
+def _validate_frontend_runtime_url_values(values: dict[str, str], source: str) -> list[str]:
+    problems: list[str] = []
+    for name, (_default, allowed_prefixes) in FRONTEND_RUNTIME_URL_VARS.items():
+        value = values.get(name, "").strip()
+        if not value:
+            problems.append(f"{source} {name} is missing")
+        elif _is_placeholder_env_value(value):
+            problems.append(f"{source} {name} is still {value}")
+        elif not value.startswith(allowed_prefixes):
+            allowed = " or ".join(allowed_prefixes)
+            problems.append(f"{source} {name} must start with {allowed}; got {value}")
+    return problems
+
+
+def _normalize_streaming_mode(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _validate_streaming_mode_value(value: str | None, source: str) -> list[str]:
+    mode = _normalize_streaming_mode(value)
+    if not mode:
+        return [f"{source} streaming mode is missing"]
+    if _is_placeholder_env_value(value or ""):
+        return [f"{source} streaming mode is still {value}"]
+    if mode not in ALLOWED_STREAMING_MODES:
+        allowed = ", ".join(sorted(ALLOWED_STREAMING_MODES))
+        return [f"{source} streaming mode must be one of {allowed}; got {value}"]
+    return []
+
+
+def _check_local_streaming_mode() -> CheckResult:
+    """Check that local self-hosted installs default to CDP livestreaming."""
+    from dotenv import dotenv_values
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    frontend_env = Path("skyvern-frontend/.env")
+
+    backend_raw = dotenv_values(backend_env).get(BACKEND_STREAMING_MODE_VAR, "") if backend_env.exists() else ""
+    frontend_raw = dotenv_values(frontend_env).get(FRONTEND_STREAMING_MODE_VAR, "") if frontend_env.exists() else ""
+
+    problems: list[str] = []
+    if backend_env.exists():
+        problems.extend(_validate_streaming_mode_value(str(backend_raw or ""), "backend .env"))
+        if _normalize_streaming_mode(str(backend_raw or "")) != LOCAL_STREAMING_MODE:
+            problems.append(f"backend .env {BACKEND_STREAMING_MODE_VAR} should be {LOCAL_STREAMING_MODE}")
+    else:
+        problems.append("backend .env is missing")
+
+    if frontend_env.exists():
+        problems.extend(_validate_streaming_mode_value(str(frontend_raw or ""), "skyvern-frontend/.env"))
+        if _normalize_streaming_mode(str(frontend_raw or "")) != LOCAL_STREAMING_MODE:
+            problems.append(f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR} should be {LOCAL_STREAMING_MODE}")
+    else:
+        problems.append("skyvern-frontend/.env is missing")
+
+    if problems:
+        return CheckResult(
+            name="Local Streaming Mode",
+            status="warn",
+            detail="; ".join(problems),
+            hint="Run `skyvern doctor --fix` to enable CDP livestreaming for backend and UI",
+        )
+
+    if not _docker_compose_available():
+        return CheckResult(
+            name="Local Streaming Mode",
+            status="ok",
+            detail="backend and frontend env files enable CDP livestreaming",
+        )
+
+    container_problems: list[str] = []
+    checked_containers = 0
+    backend_result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "skyvern", "printenv", BACKEND_STREAMING_MODE_VAR],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if backend_result.returncode == 0:
+        checked_containers += 1
+        backend_container_mode = _normalize_streaming_mode(backend_result.stdout)
+        if backend_container_mode != LOCAL_STREAMING_MODE:
+            container_problems.append(
+                f"running skyvern {BACKEND_STREAMING_MODE_VAR} is {backend_container_mode or 'missing'}"
+            )
+
+    ui_result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "skyvern-ui", "printenv", FRONTEND_STREAMING_MODE_VAR],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if ui_result.returncode == 0:
+        checked_containers += 1
+        ui_container_mode = _normalize_streaming_mode(ui_result.stdout)
+        if ui_container_mode != LOCAL_STREAMING_MODE:
+            container_problems.append(
+                f"running skyvern-ui {FRONTEND_STREAMING_MODE_VAR} is {ui_container_mode or 'missing'}"
+            )
+
+    if container_problems:
+        return CheckResult(
+            name="Local Streaming Mode",
+            status="warn",
+            detail="; ".join(container_problems),
+            hint="Run `docker compose up -d --force-recreate skyvern skyvern-ui`",
+        )
+
+    if checked_containers == 0:
+        return CheckResult(
+            name="Local Streaming Mode",
+            status="ok",
+            detail="backend and frontend env files enable CDP livestreaming; running containers not checked",
+        )
+
+    return CheckResult(
+        name="Local Streaming Mode",
+        status="ok",
+        detail="CDP livestreaming is enabled for backend, UI, and running containers",
+    )
+
+
+def _check_frontend_runtime_env() -> CheckResult:
+    """Check Vite runtime config before the UI can white-screen on placeholders."""
+    frontend_dir = Path("skyvern-frontend")
+    compose_file = Path("docker-compose.yml")
+    if not frontend_dir.exists() and not compose_file.exists():
+        return CheckResult(name="Frontend Runtime Env", status="ok", detail="not checked (no frontend or compose)")
+
+    from dotenv import dotenv_values
+
+    frontend_env = frontend_dir / ".env"
+    frontend_example = frontend_dir / ".env.example"
+    if not frontend_env.exists():
+        hint = "Run `skyvern doctor --fix` to create skyvern-frontend/.env"
+        if frontend_example.exists():
+            hint += ", or copy skyvern-frontend/.env.example to skyvern-frontend/.env"
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="error",
+            detail="skyvern-frontend/.env is missing; skyvern-ui will fall back to Dockerfile placeholders",
+            hint=hint,
+        )
+
+    host_values_raw = dotenv_values(frontend_env)
+    host_values = {name: str(host_values_raw.get(name) or "") for name in FRONTEND_RUNTIME_URL_VARS}
+    host_problems = _validate_frontend_runtime_url_values(host_values, "skyvern-frontend/.env")
+    host_problems.extend(
+        _validate_streaming_mode_value(
+            str(host_values_raw.get(FRONTEND_STREAMING_MODE_VAR) or ""),
+            "skyvern-frontend/.env",
+        )
+    )
+    if host_problems:
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="error",
+            detail="; ".join(host_problems),
+            hint="Run `skyvern doctor --fix`, then `docker compose up -d --force-recreate skyvern-ui`",
+        )
+
+    if not _docker_compose_available():
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="ok",
+            detail="skyvern-frontend/.env has valid Vite runtime URLs",
+        )
+
+    script = r"""
+const fs = require("fs");
+const path = require("path");
+
+const names = [
+  "VITE_API_BASE_URL",
+  "VITE_WSS_BASE_URL",
+  "VITE_ARTIFACT_API_BASE_URL",
+  "VITE_BROWSER_STREAMING_MODE",
+];
+const placeholders = [
+  "__VITE_API_BASE_URL_PLACEHOLDER__",
+  "__VITE_WSS_BASE_URL_PLACEHOLDER__",
+  "__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__",
+  "__SKYVERN_API_KEY_PLACEHOLDER__",
+  "__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__",
+];
+
+const values = {};
+for (const name of names) {
+  values[name] = process.env[name] || "";
+}
+
+const bundlePlaceholders = new Set();
+let bundleError = "";
+try {
+  const assetsDir = "/app/dist/assets";
+  for (const file of fs.readdirSync(assetsDir)) {
+    if (!file.endsWith(".js")) {
+      continue;
+    }
+    const contents = fs.readFileSync(path.join(assetsDir, file), "utf8");
+    for (const placeholder of placeholders) {
+      if (contents.includes(placeholder)) {
+        bundlePlaceholders.add(placeholder);
+      }
+    }
+  }
+} catch (error) {
+  bundleError = String(error);
+}
+
+console.log(JSON.stringify({
+  values,
+  bundle_placeholders: Array.from(bundlePlaceholders),
+  bundle_error: bundleError,
+}));
+"""
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-T", "skyvern-ui", "node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="warn",
+            detail=f"host frontend env is valid; running skyvern-ui not checked: {exc}",
+            hint="Start skyvern-ui and rerun `skyvern doctor`",
+        )
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "skyvern-ui compose service is not running"
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="warn",
+            detail=f"host frontend env is valid; running skyvern-ui not checked: {detail[:240]}",
+            hint="Run `docker compose up -d skyvern-ui` and rerun `skyvern doctor`",
+        )
+
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="warn",
+            detail=f"could not parse skyvern-ui env diagnostic output: {result.stdout.strip()[:200]}",
+        )
+
+    container_values = {name: str((payload.get("values") or {}).get(name) or "") for name in FRONTEND_RUNTIME_URL_VARS}
+    container_problems = _validate_frontend_runtime_url_values(container_values, "running skyvern-ui")
+    container_problems.extend(
+        _validate_streaming_mode_value(
+            str((payload.get("values") or {}).get(FRONTEND_STREAMING_MODE_VAR) or ""),
+            "running skyvern-ui",
+        )
+    )
+    if container_problems:
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="error",
+            detail="; ".join(container_problems),
+            hint=(
+                "Recreate the UI after fixing skyvern-frontend/.env: `docker compose up -d --force-recreate skyvern-ui`"
+            ),
+        )
+
+    bundle_placeholders = [str(value) for value in payload.get("bundle_placeholders") or []]
+    if bundle_placeholders:
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="error",
+            detail="running UI bundle still contains placeholders: " + ", ".join(bundle_placeholders),
+            hint="Run `docker compose up -d --force-recreate skyvern-ui` after fixing skyvern-frontend/.env",
+        )
+
+    bundle_error = str(payload.get("bundle_error") or "")
+    if bundle_error:
+        return CheckResult(
+            name="Frontend Runtime Env",
+            status="warn",
+            detail=f"could not inspect running UI bundle: {bundle_error[:240]}",
+        )
+
+    return CheckResult(
+        name="Frontend Runtime Env",
+        status="ok",
+        detail="skyvern-frontend/.env, running skyvern-ui env, and UI bundle placeholders look valid",
+    )
+
+
+def _check_docker_local_auth() -> CheckResult:
+    """Validate that the running Docker backend accepts its configured local API key."""
+    if not _docker_compose_available():
+        return CheckResult(name="Docker Local Auth", status="ok", detail="not checked (no docker-compose.yml)")
+
+    script = r"""
+import json
+import os
+import urllib.error
+import urllib.request
+
+token = os.environ.get("SKYVERN_API_KEY", "").strip()
+if not token or token == "PLACEHOLDER":
+    print(json.dumps({"status": "missing_container_api_key"}))
+    raise SystemExit(0)
+
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/api/v1/internal/auth/status",
+    headers={"x-api-key": token},
+)
+
+try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+        print(response.read().decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = {}
+
+    if isinstance(payload, dict) and payload.get("status"):
+        print(json.dumps(payload))
+    else:
+        print(json.dumps({
+            "status": "http_error",
+            "status_code": exc.code,
+            "detail": payload.get("detail") if isinstance(payload, dict) else body or str(exc),
+        }))
+"""
+
+    try:
+        result = _run_docker_compose_exec("skyvern", script, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        return CheckResult(
+            name="Docker Local Auth",
+            status="warn",
+            detail=f"not checked: Docker auth diagnostic timed out after {exc.timeout}s",
+            hint="Start Docker Compose and rerun `skyvern doctor`",
+        )
+    except FileNotFoundError as exc:
+        return CheckResult(
+            name="Docker Local Auth",
+            status="warn",
+            detail=f"not checked: {exc}",
+            hint="Start Docker Compose and rerun `skyvern doctor`",
+        )
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        detail = stderr or result.stdout.strip() or "skyvern compose service is not running"
+        return CheckResult(
+            name="Docker Local Auth",
+            status="warn",
+            detail=detail[:300],
+            hint="Run `docker compose up -d` to enable Docker auth diagnostics",
+        )
+
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return CheckResult(
+            name="Docker Local Auth",
+            status="warn",
+            detail=f"could not parse diagnostic output: {result.stdout.strip()[:200]}",
+        )
+
+    status_value = payload.get("status") or ("http_error" if payload.get("detail") else None)
+    org_id = payload.get("organization_id", "")
+    if status_value == "ok":
+        return CheckResult(
+            name="Docker Local Auth", status="ok", detail=f"running backend accepts API key for {org_id}"
+        )
+
+    detail_text = str(payload.get("detail") or "")
+    details = {
+        "missing_container_api_key": "running backend has no SKYVERN_API_KEY",
+        "missing_api_key": "running backend has no SKYVERN_API_KEY",
+        "invalid_format": "running backend cannot decode SKYVERN_API_KEY",
+        "invalid": "running backend cannot validate SKYVERN_API_KEY",
+        "expired": f"running backend API key is expired for {org_id}",
+        "not_found": "API key decodes, but its organization is missing from Docker DB",
+        "organization_not_found": f"API key decodes, but organization {org_id} is missing from Docker DB",
+        "token_not_in_database": f"organization {org_id} exists, but this API key is not in Docker DB",
+        "db_token_invalid": f"organization {org_id} exists, but this API key is marked invalid",
+        "http_error": "running backend auth diagnostics endpoint returned an HTTP error",
+    }
+    detail = details.get(str(status_value), f"unknown Docker auth status: {status_value}")
+    if detail_text:
+        detail = f"{detail}: {detail_text}"
+    return CheckResult(
+        name="Docker Local Auth",
+        status="error",
+        detail=detail,
+        hint="Run `skyvern doctor --fix` to create a Docker-local org/key and sync env files",
+    )
+
+
+def _check_frontend_build_api_key() -> CheckResult:
+    """Check whether the running production UI bundle was built with the current Vite API key."""
+    if not _docker_compose_available():
+        return CheckResult(name="Frontend Build API Key", status="ok", detail="not checked (no docker-compose.yml)")
+
+    script = r"""
+const fs = require("fs");
+const path = require("path");
+
+function readGeneratedKey() {
+  const credentialsFile = process.env.SKYVERN_CREDENTIALS_FILE || "/app/.skyvern/credentials.toml";
+  try {
+    const contents = fs.readFileSync(credentialsFile, "utf8");
+    const match = contents.match(/(?:^|[^A-Za-z0-9_])cred\s*=\s*"([^"]*)"/);
+    return match ? match[1].trim() : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+const envKey = (process.env.VITE_SKYVERN_API_KEY || "").trim();
+const generatedKey = readGeneratedKey();
+const key = envKey && envKey !== "YOUR_API_KEY" ? envKey : generatedKey;
+if (!key) {
+  console.log(JSON.stringify({ status: "missing_env" }));
+  process.exit(0);
+}
+
+const assetsDir = "/app/dist/assets";
+let matches = 0;
+try {
+  for (const file of fs.readdirSync(assetsDir)) {
+    if (!file.endsWith(".js")) {
+      continue;
+    }
+    const contents = fs.readFileSync(path.join(assetsDir, file), "utf8");
+    if (contents.includes(key)) {
+      matches += 1;
+    }
+  }
+} catch (error) {
+  console.log(JSON.stringify({ status: "missing_bundle", detail: String(error) }));
+  process.exit(0);
+}
+
+console.log(JSON.stringify({ status: matches > 0 ? "ok" : "stale_or_missing_bundle", matches }));
+"""
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-T", "skyvern-ui", "node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return CheckResult(
+            name="Frontend Build API Key",
+            status="warn",
+            detail=f"not checked: {exc}",
+            hint="Start skyvern-ui and rerun `skyvern doctor`",
+        )
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "skyvern-ui compose service is not running"
+        return CheckResult(
+            name="Frontend Build API Key",
+            status="warn",
+            detail=detail[:300],
+            hint="Run `docker compose up -d skyvern-ui` to enable UI bundle diagnostics",
+        )
+
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return CheckResult(
+            name="Frontend Build API Key",
+            status="warn",
+            detail=f"could not parse diagnostic output: {result.stdout.strip()[:200]}",
+        )
+
+    if payload.get("status") == "ok":
+        return CheckResult(name="Frontend Build API Key", status="ok", detail="running UI bundle contains Vite API key")
+    if payload.get("status") == "missing_env":
+        return CheckResult(
+            name="Frontend Build API Key",
+            status="error",
+            detail="running skyvern-ui has no VITE_SKYVERN_API_KEY or generated credentials file",
+            hint="Run `skyvern doctor --fix` to sync env files and recreate skyvern-ui",
+        )
+    return CheckResult(
+        name="Frontend Build API Key",
+        status="error",
+        detail="running UI bundle does not contain the current VITE_SKYVERN_API_KEY",
+        hint="Run `skyvern doctor --fix` or recreate skyvern-ui after editing skyvern-frontend/.env",
+    )
 
 
 def _redact_password(db_string: str) -> str:
@@ -576,6 +1242,11 @@ _CHECKS = [
     _check_docker,
     _check_llm_config,
     _check_api_key_consistency,
+    _check_legacy_streamlit_secrets,
+    _check_local_streaming_mode,
+    _check_frontend_runtime_env,
+    _check_docker_local_auth,
+    _check_frontend_build_api_key,
     _check_playwright_browser,
     _check_port_8000,
     _check_api_connectivity,
@@ -603,6 +1274,16 @@ def _try_fix(result: CheckResult) -> bool:
         return _fix_install_playwright()
     if result.name == "API Key Consistency" and result.status == "error":
         return _fix_api_key_consistency()
+    if result.name == "Legacy Streamlit Secrets" and result.status == "warn":
+        return _fix_legacy_streamlit_secrets()
+    if result.name == "Local Streaming Mode" and result.status in {"warn", "error"}:
+        return _fix_local_streaming_mode()
+    if result.name == "Frontend Runtime Env" and result.status == "error":
+        return _fix_frontend_runtime_env()
+    if result.name == "Docker Local Auth" and result.status == "error":
+        return _fix_docker_local_auth()
+    if result.name == "Frontend Build API Key" and result.status == "error":
+        return _recreate_docker_services(["skyvern-ui"])
     if result.name == "Docker" and "not running" in result.detail:
         console.print("  [yellow]→ Please start Docker Desktop manually[/yellow]")
         return False
@@ -671,8 +1352,6 @@ def _fix_start_postgres() -> bool:
 
 
 def _fix_api_key_consistency() -> bool:
-    import re
-
     from dotenv import dotenv_values, set_key
 
     from skyvern.utils.env_paths import resolve_backend_env_path
@@ -680,23 +1359,22 @@ def _fix_api_key_consistency() -> bool:
     backend_env = resolve_backend_env_path()
     frontend_env = Path("skyvern-frontend/.env")
     frontend_example = Path("skyvern-frontend/.env.example")
-    secrets_toml = Path(".streamlit/secrets.toml")
 
     backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
-    secrets_key = ""
-    if secrets_toml.exists():
-        m = re.search(r'cred\s*=\s*"([^"]*)"', secrets_toml.read_text())
-        if m:
-            secrets_key = m.group(1)
+    generated_key = _read_generated_credential()
+    legacy_key = _read_legacy_streamlit_credential()
 
-    canonical = secrets_key or backend_key
+    canonical = backend_key or generated_key or legacy_key
     if not canonical:
         console.print("  [yellow]→ No source API key found to sync from[/yellow]")
         return False
 
-    if not frontend_env.exists() and frontend_example.exists():
-        import shutil
+    if not backend_env.exists():
+        backend_env.touch()
 
+    set_key(str(backend_env), "SKYVERN_API_KEY", canonical, quote_mode="never")
+
+    if not frontend_env.exists() and frontend_example.exists():
         shutil.copy(frontend_example, frontend_env)
         console.print("  [cyan]Created skyvern-frontend/.env from .env.example[/cyan]")
 
@@ -704,10 +1382,222 @@ def _fix_api_key_consistency() -> bool:
         console.print("  [yellow]→ skyvern-frontend/.env not found and no .env.example to copy[/yellow]")
         return False
 
-    set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", canonical)
-    source = "secrets.toml" if secrets_key else "backend .env"
-    console.print(f"  [green]✅ Synced VITE_SKYVERN_API_KEY in skyvern-frontend/.env (from {source})[/green]")
+    set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", canonical, quote_mode="never")
+    source = (
+        "backend .env"
+        if backend_key
+        else ".skyvern/credentials.toml"
+        if generated_key
+        else "legacy .streamlit/secrets.toml"
+    )
+    console.print(f"  [green]✅ Synced local API key across backend and frontend (from {source})[/green]")
     return True
+
+
+def _fix_legacy_streamlit_secrets() -> bool:
+    """Best-effort migration for old .streamlit/secrets.toml installs."""
+    from dotenv import dotenv_values, set_key
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    legacy_key = _read_legacy_streamlit_credential()
+
+    if not LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
+        return False
+
+    if not legacy_key:
+        console.print(
+            "  [yellow]→ Legacy .streamlit/secrets.toml has no cred value; leaving it for inspection[/yellow]"
+        )
+        return False
+
+    if not backend_key and legacy_key:
+        if not backend_env.exists():
+            backend_env.touch()
+        set_key(str(backend_env), "SKYVERN_API_KEY", legacy_key, quote_mode="never")
+        if not frontend_env.exists() and frontend_example.exists():
+            shutil.copy(frontend_example, frontend_env)
+        if frontend_env.exists():
+            set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", legacy_key, quote_mode="never")
+        console.print("  [green]✅ Migrated legacy .streamlit API key into .env files[/green]")
+
+    LEGACY_STREAMLIT_CREDENTIALS_FILE.unlink()
+    console.print("  [green]✅ Removed deprecated .streamlit/secrets.toml[/green]")
+    return True
+
+
+def _ensure_frontend_env_exists() -> Path:
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists():
+        frontend_env.parent.mkdir(parents=True, exist_ok=True)
+        if frontend_example.exists():
+            shutil.copy(frontend_example, frontend_env)
+            console.print("  [cyan]Created skyvern-frontend/.env from .env.example[/cyan]")
+        else:
+            frontend_env.touch()
+            console.print("  [cyan]Created empty skyvern-frontend/.env[/cyan]")
+    return frontend_env
+
+
+def _fix_local_streaming_mode() -> bool:
+    """Enable local CDP livestreaming in backend and frontend env files."""
+    from dotenv import set_key
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    backend_env = resolve_backend_env_path()
+    if not backend_env.exists():
+        backend_env.touch()
+    set_key(str(backend_env), BACKEND_STREAMING_MODE_VAR, LOCAL_STREAMING_MODE, quote_mode="never")
+    console.print(f"  [cyan]Set {BACKEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in backend .env[/cyan]")
+
+    frontend_env = _ensure_frontend_env_exists()
+    set_key(str(frontend_env), FRONTEND_STREAMING_MODE_VAR, LOCAL_STREAMING_MODE, quote_mode="never")
+    console.print(f"  [cyan]Set {FRONTEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in skyvern-frontend/.env[/cyan]")
+
+    if _docker_compose_available():
+        return _recreate_docker_services(["skyvern", "skyvern-ui"])
+
+    return True
+
+
+def _fix_frontend_runtime_env() -> bool:
+    """Create/fill frontend Vite env values and recreate the UI container."""
+    from dotenv import dotenv_values, set_key
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    frontend_env = _ensure_frontend_env_exists()
+
+    values = dotenv_values(frontend_env)
+    changed = False
+    for name, (default, allowed_prefixes) in FRONTEND_RUNTIME_URL_VARS.items():
+        value = str(values.get(name) or "").strip()
+        if not value or _is_placeholder_env_value(value) or not value.startswith(allowed_prefixes):
+            set_key(str(frontend_env), name, default, quote_mode="never")
+            console.print(f"  [cyan]Set {name}={default} in skyvern-frontend/.env[/cyan]")
+            changed = True
+
+    streaming_mode = str(values.get(FRONTEND_STREAMING_MODE_VAR) or "").strip()
+    if _normalize_streaming_mode(streaming_mode) != LOCAL_STREAMING_MODE:
+        set_key(str(frontend_env), FRONTEND_STREAMING_MODE_VAR, LOCAL_STREAMING_MODE, quote_mode="never")
+        console.print(
+            f"  [cyan]Set {FRONTEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in skyvern-frontend/.env[/cyan]"
+        )
+        changed = True
+
+    backend_env = resolve_backend_env_path()
+    backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
+    generated_key = _read_generated_credential()
+    legacy_key = _read_legacy_streamlit_credential()
+    canonical_key = str(backend_key or generated_key or legacy_key or "").strip()
+    frontend_api_key = str(values.get("VITE_SKYVERN_API_KEY") or "").strip()
+    if canonical_key and _is_placeholder_env_value(frontend_api_key):
+        set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", canonical_key, quote_mode="never")
+        console.print("  [cyan]Synced VITE_SKYVERN_API_KEY in skyvern-frontend/.env[/cyan]")
+        changed = True
+    elif not canonical_key:
+        console.print("  [yellow]→ No backend API key found to sync into skyvern-frontend/.env[/yellow]")
+
+    if _docker_compose_available():
+        return _recreate_docker_services(["skyvern-ui"]) or changed
+
+    return changed
+
+
+def _fix_docker_local_auth() -> bool:
+    """Create a fresh local org/token inside Docker Postgres and sync host env files."""
+    from dotenv import set_key
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    script = r"""
+import asyncio
+import json
+
+from skyvern.forge import app
+from skyvern.forge.sdk.services.org_auth_token_service import create_org_api_token
+
+
+async def main():
+    org = await app.DATABASE.organizations.create_organization("Skyvern Local Demo")
+    token = await create_org_api_token(org.organization_id)
+    print(json.dumps({"api_key": token.token, "organization_id": org.organization_id}))
+
+
+asyncio.run(main())
+"""
+    console.print("  [cyan]Creating a fresh local org/API key in Docker Postgres...[/cyan]")
+    try:
+        result = _run_docker_compose_exec("skyvern", script, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        console.print(f"  [red]Failed to run Docker auth repair: {exc}[/red]")
+        return False
+
+    if result.returncode != 0:
+        console.print(f"  [red]Failed to create Docker-local API key: {(result.stderr or result.stdout)[:500]}[/red]")
+        return False
+
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        console.print(f"  [red]Could not parse Docker auth repair output: {result.stdout[:500]}[/red]")
+        return False
+
+    api_key = str(payload.get("api_key") or "")
+    organization_id = str(payload.get("organization_id") or "")
+    if not api_key:
+        console.print("  [red]Docker auth repair did not return an API key[/red]")
+        return False
+
+    backend_env = resolve_backend_env_path()
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+
+    if not backend_env.exists():
+        backend_env.touch()
+    if not frontend_env.exists() and frontend_example.exists():
+        shutil.copy(frontend_example, frontend_env)
+        console.print("  [cyan]Created skyvern-frontend/.env from .env.example[/cyan]")
+    if not frontend_env.exists():
+        console.print("  [red]skyvern-frontend/.env not found and no .env.example to copy[/red]")
+        return False
+
+    set_key(str(backend_env), "SKYVERN_API_KEY", api_key, quote_mode="never")
+    set_key(str(frontend_env), "VITE_SKYVERN_API_KEY", api_key, quote_mode="never")
+    _write_generated_credentials_file(api_key)
+    if LEGACY_STREAMLIT_CREDENTIALS_FILE.exists():
+        LEGACY_STREAMLIT_CREDENTIALS_FILE.unlink()
+
+    console.print(
+        "  [green]✅ Synced fresh Docker-local API key "
+        f"for {organization_id} (fingerprint {_fingerprint(api_key)})[/green]"
+    )
+    return _recreate_docker_services(["skyvern", "skyvern-ui"])
+
+
+def _recreate_docker_services(services: list[str]) -> bool:
+    if not _docker_compose_available():
+        return False
+
+    console.print(f"  [cyan]Recreating Docker service(s): {', '.join(services)}...[/cyan]")
+    result = subprocess.run(
+        ["docker", "compose", "up", "-d", "--force-recreate", *services],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode == 0:
+        console.print("  [green]✅ Docker services recreated[/green]")
+        return True
+
+    console.print(f"  [red]Failed to recreate Docker services: {(result.stderr or result.stdout)[:500]}[/red]")
+    return False
 
 
 def _fix_install_playwright() -> bool:

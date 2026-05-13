@@ -3,9 +3,9 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from skyvern.exceptions import require_server_extra_modules
+from skyvern.exceptions import require_local_extra_modules
 
-require_server_extra_modules("skyvern.library.skyvern_browser_page_ai")
+require_local_extra_modules("skyvern.library.skyvern_browser_page_ai")
 
 from playwright.async_api import Page
 
@@ -337,6 +337,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         self,
         navigation_goal: str,
         max_steps: int = 10,
+        validate_first: bool = False,
     ) -> None:
         """Activate the AI agent from the current page position.
 

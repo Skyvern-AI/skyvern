@@ -24,7 +24,7 @@ You have three ways to connect a client to Skyvern:
 | | OAuth (sign in with browser) | API key | Local mode |
 |---|---|---|---|
 | **Best for** | Claude Code, Codex CLI, Cursor, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern |
-| **Install required** | None | None | Python 3.11+ and `pip install skyvern` |
+| **Install required** | None | None | Python 3.11+ and `pip install "skyvern[server]"` |
 | **Credential** | Browser sign-in with your Skyvern account | API key from [app.skyvern.com](https://app.skyvern.com) | API key from your self-hosted instance |
 | **Where it runs** | Directly against Skyvern Cloud over HTTPS | Directly against Skyvern Cloud over HTTPS | Local Python process talking to your Skyvern server |
 
@@ -289,7 +289,7 @@ skyvern setup mcporter
 After setup, restart your MCP client. Skyvern should appear as an MCP server and is ready for browser tasks.
 
 <Tip>
-Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
+Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, use Docker Compose or a source checkout, then run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
 </Tip>
 
 ## Switch an existing MCP config
@@ -321,19 +321,19 @@ If a config file exists but does not already contain a Skyvern entry, run `skyve
 
 ## Alternative: Local mode (self-hosted)
 
-Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a lightweight Python process on your machine that connects to your local Skyvern server.
+Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a local Python process on your machine that connects to your local Skyvern server.
 
 <Tip title="Supported Python Versions" icon="fa-brands fa-python">
 Local mode requires Python 3.11, 3.12, or 3.13.
 </Tip>
 
 ```bash
-pip install skyvern
+pip install ".[server]"
 ```
 
 ### Recommended local Claude Code flow
 
-Run the setup wizard from your project or repo root:
+Run the setup wizard from a Skyvern source checkout or Docker Compose setup:
 
 ```bash
 skyvern quickstart
@@ -425,7 +425,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 </Tabs>
 
 <Tip>
-`skyvern init` and `skyvern quickstart` can write the local MCP config for you. In a project directory, choosing Claude Code defaults to project-local `.mcp.json` and installs `.claude/skills/qa`.
+From Docker Compose or a source checkout, `skyvern init` and `skyvern quickstart` can write the local MCP config for you. In a project directory, choosing Claude Code defaults to project-local `.mcp.json` and installs `.claude/skills/qa`.
 </Tip>
 
 <Accordion title="Config file locations by client">
@@ -496,10 +496,10 @@ Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern
 
 ## QA your frontend changes
 
-For the local self-hosted path, run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+For the local self-hosted path, use Docker Compose or a Skyvern source checkout, then run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
 
 ```bash
-pip install skyvern
+pip install ".[server]"
 skyvern quickstart
 # or: skyvern init
 ```

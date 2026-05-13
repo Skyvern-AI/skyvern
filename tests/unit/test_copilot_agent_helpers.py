@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 
 
 def _ctx(**overrides):
@@ -42,6 +45,35 @@ class TestFailedTestResponseNormalization:
         assert "draft workflow with 2 blocks" in rewritten
         assert "test failed" in rewritten.lower()
         assert "Call log:" not in rewritten
+
+    def test_pre_run_coverage_guard_uses_completion_contract(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Go to https://the-internet.herokuapp.com/download and then download the first file.",
+            request_policy=SimpleNamespace(completion_contract="complete when the download starts"),
+            last_update_block_count=1,
+            coverage_nudge_count=0,
+        )
+
+        error = _pre_run_workflow_coverage_error(ctx)
+
+        assert error is not None
+        assert "has not been run" in error
+        assert ctx.coverage_nudge_count == 1
+
+    def test_pre_run_coverage_guard_allows_single_final_action_contract(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Click Delete. Your goal is complete when the Delete button disappears.",
+            request_policy=SimpleNamespace(completion_contract="complete when the Delete button disappears"),
+            last_update_block_count=1,
+            coverage_nudge_count=0,
+        )
+
+        assert _pre_run_workflow_coverage_error(ctx) is None
+        assert ctx.coverage_nudge_count == 0
 
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
@@ -110,6 +142,22 @@ class TestFailedTestResponseNormalization:
         original = "Let me know what you want to build."
         assert _rewrite_failed_test_response(original, ctx) == original
 
+    def test_rewrite_untested_draft_request_surfaces_explicit_unverified_copy(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            allow_untested_workflow_draft=True,
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+        )
+        rewritten = _rewrite_failed_test_response("Done.", ctx)
+
+        assert "without testing it, as requested" in rewritten
+        assert "not been verified end-to-end" in rewritten
+        assert "successful" not in rewritten.lower()
+
     def test_rewrite_appends_keep_draft_affordance_when_draft_on_hand(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
 
@@ -173,6 +221,178 @@ class TestVerifiedWorkflowOrNone:
             last_test_suspicious_success=True,
         )
         assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+class TestSupersededAgentIntentGates:
+    def test_agent_no_longer_owns_request_policy_classification(self) -> None:
+        assert not hasattr(agent_module, "_user_requests_untested_workflow_draft")
+        assert not hasattr(agent_module, "_extract_user_supplied_credential_ids")
+        assert not hasattr(agent_module, "_credential_validation_result_for_user_message")
+
+
+class TestRequestPolicyInputGuardrail:
+    @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            testing_intent="skip_test",
+            credential_input_kind="credential_name",
+            credential_refs=["Saved Login"],
+            allow_run_blocks=False,
+        )
+        build_request_policy = AsyncMock(return_value=policy)
+        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="just draft without testing",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="user: build the login workflow",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=object(),
+            previous_user_message="build the login workflow",
+        )
+
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert ctx.allow_untested_workflow_draft is True
+        assert "Draft the workflow requested earlier" in ctx.user_message
+        assert "build the login workflow" in ctx.user_message
+        assert result.output.output_info["policy_present"] is True
+        assert result.output.output_info["testing_intent"] == "skip_test"
+        assert "completion_contract" not in result.output.output_info
+        build_request_policy.assert_awaited_once_with(
+            user_message="just draft without testing",
+            workflow_yaml="workflow: yaml",
+            chat_history="user: build the login workflow",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=policy_inputs.handler,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            credential_input_kind="raw_secret",
+            user_response_policy="ask_clarification",
+            allow_update_workflow=False,
+            allow_run_blocks=False,
+            raw_secret_detected=True,
+            clarification_reason="raw_secret",
+            clarification_question="Do not paste raw credentials.",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message="use password=hunter2",
+                workflow_yaml="",
+                chat_history_text="",
+                global_llm_context="",
+                organization_id="org-1",
+                handler=None,
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is True
+        assert ctx.request_policy is policy
+        assert result.output.output_info["credential_input_kind"] == "raw_secret"
+        assert result.output.output_info["blocked"] is True
+        assert "hunter2" not in str(result.output.output_info)
+
+    @pytest.mark.asyncio
+    async def test_request_policy_proceeds_on_workflow_behavior_question(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            credential_input_kind="none",
+            testing_intent="unspecified",
+            user_response_policy="proceed",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message=(
+                    "trigger_login appears to have worked as anticipated but "
+                    "next_step is not receiving an active browser session to work with."
+                ),
+                workflow_yaml="title: w\nworkflow_definition:\n  blocks: [{block_type: navigation}]\n",
+                chat_history_text="user: consolidate the blocks of this workflow.\nassistant: Which blocks should I merge?",
+                global_llm_context="",
+                organization_id="org-1",
+                handler=object(),
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert ctx.request_policy.credential_input_kind == "none"
+        assert ctx.request_policy.allow_run_blocks is True
+        assert ctx.request_policy.allow_update_workflow is True
+        assert result.output.output_info["blocked"] is False
+
+    @pytest.mark.asyncio
+    async def test_request_policy_proceeds_on_bare_keyvault_slotfill(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            credential_input_kind="none",
+            testing_intent="unspecified",
+            user_response_policy="proceed",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message="customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass",
+                workflow_yaml="title: w\nworkflow_definition:\n  blocks: [{block_type: login}]\n",
+                chat_history_text=("assistant: What value should I use for password_key_vault_id?"),
+                global_llm_context="",
+                organization_id="org-1",
+                handler=object(),
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert ctx.request_policy.credential_input_kind == "none"
+        assert ctx.request_policy.raw_secret_detected is False
+        assert ctx.request_policy.allow_run_blocks is True
 
 
 class TestShouldRestorePersistedWorkflow:
@@ -432,6 +652,40 @@ workflow_definition:
         assert agent_result.unvalidated is False
         assert agent_result.response_type == "ASK_QUESTION"
 
+    def test_probable_site_block_ask_question_is_concise_and_proxy_aware(self) -> None:
+        ctx = _ctx(
+            last_test_ok=False,
+            last_test_failure_reason="Skyvern failed to load the website. The page may have navigated unexpectedly.",
+            probable_site_block_stop_nudge_count=1,
+            effective_workflow_proxy_location="RESIDENTIAL",
+        )
+        verbose_response = (
+            "Diagnostic recap:\n"
+            "- I tried several workflow shapes with the same browser state.\n"
+            '- global_llm_context: {"workflow_state": "many internal details"}\n'
+            "- The final failure_reason was: Skyvern failed to load the website. "
+            "The page may have navigated unexpectedly.\n"
+            "- More implementation details that should not be user-facing.\n"
+            "Would you like me to configure a proxy?"
+        )
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": verbose_response})
+
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert len(agent_result.user_response.splitlines()) <= 8
+        assert "global_llm_context" not in agent_result.user_response
+        assert "configure a proxy" not in agent_result.user_response.lower()
+        assert "Would you like me to whether" not in agent_result.user_response
+        assert "different proxy location" in agent_result.user_response.lower()
+        assert "US-CA" in agent_result.user_response
+        assert "Skyvern failed to load the website. The page may have navigated unexpectedly." in (
+            agent_result.user_response
+        )
+        assert "same IP/workflow shape" in agent_result.user_response
+
     def test_reply_still_rewrites_after_failed_test(self) -> None:
         ctx = _ctx(
             last_update_block_count=2,
@@ -485,6 +739,50 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.unvalidated is True
+        assert "review" in agent_result.user_response.lower()
+        assert "accept" in agent_result.user_response.lower()
+        assert "reject" in agent_result.user_response.lower()
+        assert "discard" in agent_result.user_response.lower()
+
+    def test_unvalidated_wip_reply_adds_proposal_affordance(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=None,
+            last_test_ok=None,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Please provide credentials before I continue."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+        assert "Please provide credentials before I continue." in agent_result.user_response
+        assert "review" in agent_result.user_response.lower()
+        assert "accept" in agent_result.user_response.lower()
+        assert "reject" in agent_result.user_response.lower()
+        assert "discard" in agent_result.user_response.lower()
+
+    def test_unvalidated_wip_reply_keeps_existing_ui_affordance(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=None,
+            last_test_ok=None,
+        )
+        response = "I have a draft proposal. Use Review to inspect it, Accept to save it, or Reject it."
+        result = _fake_run_result({"type": "REPLY", "user_response": response})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert response in agent_result.user_response
+        assert "not been tested or verified" in agent_result.user_response
+        assert agent_result.updated_workflow is wf
 
     def test_goal_reached_false_flips_validated_proposal_to_unvalidated(self) -> None:
         # Agent-emitted goal_reached=False must override last_test_ok=True so
@@ -580,6 +878,46 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
         assert agent_result.unvalidated is False
+
+    def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
+        ctx = _ctx(last_test_ok=None)
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "here's the workflow" not in agent_result.user_response.lower()
+        assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_initial_part_workflow_claim_is_rewritten_without_proposal(self) -> None:
+        ctx = _ctx(last_test_ok=None)
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
+            }
+        )
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "initial part of your workflow" not in agent_result.user_response.lower()
+        assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_unbacked_workflow_claim_not_rewritten_when_proposal_exists(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="title: drafted", last_test_ok=True)
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.user_response == "Here's the workflow."
+        assert agent_result.updated_workflow is wf
 
     def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
         # Failed-test path already routes to unvalidated WIP. A redundant
@@ -705,7 +1043,7 @@ class TestCredentialRefusalReachesAgent:
     """Prove the SKY-9189 refusal rule is actually delivered to the agent.
 
     `run_copilot_agent` constructs the openai-agents SDK `Agent(...)` with
-    `instructions=_build_system_prompt(...)` and `tools=list(NATIVE_TOOLS)`.
+    dynamic instructions derived from `_build_system_prompt(...)` and `tools=list(NATIVE_TOOLS)`.
     A behavior test would require patching the agent loop and is fragile; a
     construction test (rule text flows through the exact helpers the route
     uses) is deterministic and catches both prompt and tool-surface drift.
@@ -740,6 +1078,695 @@ class TestCredentialRefusalReachesAgent:
             assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
 
 
+class TestRequestPolicyCredentialResolution:
+    @pytest.mark.asyncio
+    async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        policy = await build_request_policy(
+            user_message="Please build it with cred_valid and cred_missing.",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=None,
+        )
+
+        assert policy.credential_input_kind == "credential_id"
+        assert policy.credential_refs == ["cred_valid", "cred_missing"]
+        assert policy.invalid_credential_ids == ["cred_missing"]
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert policy.allow_missing_credentials_in_draft is False
+        assert policy.clarification_question
+        assert "cred_missing" in policy.clarification_question
+        assert "not found in this organization" in policy.clarification_question
+        assert "unvalidated draft" in policy.clarification_question
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_skip_test_allows_missing_user_supplied_credential_ids_in_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        get_credentials_by_ids = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "skip_test",
+                "credential_input_kind": "credential_id",
+                "credential_refs": ["cred_missing"],
+            }
+
+        policy = await build_request_policy(
+            user_message="Build an untested draft with cred_missing.",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.testing_intent == "skip_test"
+        assert policy.invalid_credential_ids == ["cred_missing"]
+        assert policy.user_response_policy == "proceed"
+        assert policy.allow_update_workflow is True
+        assert policy.allow_run_blocks is False
+        assert policy.allow_missing_credentials_in_draft is True
+        get_credentials_by_ids.assert_awaited_once_with(["cred_missing"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_valid_user_supplied_credential_ids_continue_normally(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_valid")
+        get_credentials_by_ids = AsyncMock(return_value=[credential])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        policy = await build_request_policy(
+            user_message="Please build it with cred_valid.",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=None,
+        )
+
+        assert policy.credential_refs == ["cred_valid"]
+        assert policy.resolved_credentials == [credential]
+        assert policy.invalid_credential_ids == []
+        assert policy.user_response_policy == "proceed"
+        assert policy.allow_run_blocks is True
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_raw_inline_secret_refuses_before_model_classification(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        get_credentials_by_ids = AsyncMock()
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+        handler = AsyncMock()
+
+        policy = await build_request_policy(
+            user_message="Use username test@example.com and password=hunter2 to log in.",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.raw_secret_detected is True
+        assert policy.credential_input_kind == "raw_secret"
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in (policy.clarification_question or "")
+        assert "hunter2" not in (policy.clarification_question or "")
+        handler.assert_not_awaited()
+        get_credentials_by_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(**kwargs):
+            return handler.response
+
+        args = dict(workflow_yaml="", global_llm_context="", organization_id="org-1", handler=handler)
+        handler.response = {
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["Bank"],
+        }
+        name_policy = await build_request_policy(user_message="use my saved Bank credential", chat_history="", **args)
+        assert name_policy.user_response_policy == "proceed"
+        assert name_policy.resolved_credentials == [credential]
+
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://bank.example/login"],
+        }
+        site_policy = await build_request_policy(user_message="use the saved login", chat_history="", **args)
+        assert site_policy.user_response_policy == "proceed"
+        assert site_policy.resolved_credentials == [credential]
+
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://evil.example/login"],
+        }
+        url_policy = await build_request_policy(user_message="use the saved login", chat_history="", **args)
+        assert url_policy.user_response_policy == "ask_clarification" and not url_policy.resolved_credentials
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://bank.example/login"],
+            "requires_user_clarification": False,
+            "clarification_reason": "none",
+        }
+        exact_url_policy = await build_request_policy(
+            user_message=(
+                "Build and test a workflow that logs into https://bank.example/login "
+                "using the saved credential for that site."
+            ),
+            chat_history="",
+            **args,
+        )
+        assert exact_url_policy.user_response_policy == "proceed"
+        assert exact_url_policy.testing_intent == "require_test"
+        assert exact_url_policy.credential_input_kind == "website_stored_credential"
+        assert exact_url_policy.resolved_credentials == [credential]
+        assert exact_url_policy.allow_update_workflow and exact_url_policy.allow_run_blocks
+
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://evil.example/login"],
+        }
+        no_suffix_policy = await build_request_policy(
+            user_message="Use the stored credential for https://evil.example/login.",
+            chat_history="",
+            **args,
+        )
+        assert no_suffix_policy.user_response_policy == "ask_clarification"
+        assert not no_suffix_policy.resolved_credentials
+        assert "could not find a stored credential" in (no_suffix_policy.clarification_question or "")
+
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "requires_user_clarification": True,
+            "clarification_reason": "missing_target_context",
+        }
+        missing_url_policy = await build_request_policy(
+            user_message="use my saved login for this site",
+            chat_history="",
+            **args,
+        )
+        assert missing_url_policy.user_response_policy == "ask_clarification"
+        assert "stored credential" in (missing_url_policy.clarification_question or "")
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        vague_skip_policy = await build_request_policy(
+            user_message="use my saved login for this site and finish the workflow",
+            chat_history="user: create a login workflow",
+            **args,
+        )
+        assert vague_skip_policy.user_response_policy == "ask_clarification"
+        assert not vague_skip_policy.allow_update_workflow
+        assert not vague_skip_policy.allow_run_blocks
+        assert "saved credential" in (vague_skip_policy.clarification_question or "")
+
+        prior_clarification_context = (
+            '{"decisions_made":["request-policy clarification required: credential_name/credential_name_unresolved"]}'
+        )
+        history_refs_from_context = await build_request_policy(
+            user_message="Just draft a workflow without testing it.",
+            workflow_yaml="",
+            chat_history="user: login using the 'azure_credentials' and get the code from the 'mfa_email'",
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert history_refs_from_context.user_response_policy == "proceed"
+        assert history_refs_from_context.allow_update_workflow and not history_refs_from_context.allow_run_blocks
+        assert history_refs_from_context.allow_missing_credentials_in_draft
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        first_turn_missing_name_policy = await build_request_policy(
+            user_message="Draft but do not test using my saved credential.",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert first_turn_missing_name_policy.user_response_policy == "ask_clarification"
+        assert not first_turn_missing_name_policy.allow_update_workflow
+
+        follow_up_missing_name_policy = await build_request_policy(
+            user_message="Just draft a workflow without testing it.",
+            workflow_yaml="",
+            chat_history="user: login using azure_credentials",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert follow_up_missing_name_policy.user_response_policy == "ask_clarification"
+        assert not follow_up_missing_name_policy.allow_update_workflow
+        assert not follow_up_missing_name_policy.allow_run_blocks
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["azure_credentials", "mfa_email"],
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        history_refs = await build_request_policy(
+            user_message="Just draft a workflow without testing it.",
+            chat_history="user: login using the 'azure_credentials' and get the code from the 'mfa_email'",
+            **args,
+        )
+        assert history_refs.user_response_policy == "proceed"
+        assert history_refs.credential_input_kind == "credential_name"
+        assert history_refs.credential_refs == ["azure_credentials", "mfa_email"]
+        assert history_refs.allow_update_workflow and not history_refs.allow_run_blocks
+        assert history_refs.allow_missing_credentials_in_draft
+
+        handler.response = {
+            "testing_intent": "unspecified",
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["azure_credentials", "mfa_email"],
+            "requires_user_clarification": True,
+            "clarification_reason": "missing_conditional_condition",
+        }
+        credential_priority_policy = await build_request_policy(
+            user_message="Log in using the 'azure_credentials' and use 'mfa_email' for MFA. If no account is provided, search by account number.",
+            chat_history="",
+            **args,
+        )
+        assert credential_priority_policy.user_response_policy == "ask_clarification"
+        assert credential_priority_policy.clarification_reason == "credential_name_unresolved"
+        assert "azure_credentials" in (credential_priority_policy.clarification_question or "")
+        assert "condition" not in (credential_priority_policy.clarification_question or "").lower()
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["azure_credentials", "mfa_email"],
+            "requires_user_clarification": True,
+            "clarification_reason": "missing_conditional_condition",
+        }
+        history_refs_with_noncredential_reason = await build_request_policy(
+            user_message="Just draft a workflow without testing it.",
+            chat_history="user: login using the 'azure_credentials' and get the code from the 'mfa_email'",
+            **args,
+        )
+        assert history_refs_with_noncredential_reason.user_response_policy == "proceed"
+        assert history_refs_with_noncredential_reason.clarification_reason == "credential_name_unresolved"
+        assert history_refs_with_noncredential_reason.credential_refs == ["azure_credentials", "mfa_email"]
+        assert history_refs_with_noncredential_reason.allow_update_workflow
+        assert not history_refs_with_noncredential_reason.allow_run_blocks
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["azure_credentials"],
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        bare_name_skip_policy = await build_request_policy(
+            user_message=(
+                "Draft but do not test a workflow that logs into https://example.com/login "
+                "using azure_credentials and goes to Billing & Payment Activity."
+            ),
+            chat_history="",
+            **args,
+        )
+        assert bare_name_skip_policy.user_response_policy == "proceed"
+        assert bare_name_skip_policy.credential_refs == ["azure_credentials"]
+        assert bare_name_skip_policy.allow_update_workflow and not bare_name_skip_policy.allow_run_blocks
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "credential_refs": ["azure_credentials"],
+            "requires_user_clarification": True,
+        }
+        skip_policy = await build_request_policy(
+            user_message="just draft without testing", chat_history="user: use azure_credentials", **args
+        )
+        assert skip_policy.user_response_policy == "proceed"
+        assert skip_policy.allow_update_workflow and not skip_policy.allow_run_blocks
+        assert skip_policy.allow_missing_credentials_in_draft
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "completion_contract": "complete when the page says your message has been sent",
+        }
+        completion_not_skip_policy = await build_request_policy(
+            user_message=(
+                "Fill out the contact form and submit it. "
+                "Your goal is complete when the page says your message has been sent."
+            ),
+            chat_history="",
+            **args,
+        )
+        assert completion_not_skip_policy.testing_intent == "unspecified"
+        assert completion_not_skip_policy.allow_run_blocks
+        assert (
+            completion_not_skip_policy.completion_contract == "complete when the page says your message has been sent"
+        )
+
+        handler.response = {
+            "credential_input_kind": "website_stored_credential",
+            "login_page_urls": ["https://bank.example/login"],
+        }
+        stored_credential_with_id_policy = await build_request_policy(
+            user_message="use the saved login for https://bank.example/login, credential id cred_bank",
+            chat_history="",
+            **args,
+        )
+        assert stored_credential_with_id_policy.credential_input_kind == "website_stored_credential"
+        assert stored_credential_with_id_policy.credential_refs == ["cred_bank"]
+        assert stored_credential_with_id_policy.resolved_credentials == [credential]
+
+        handler.response = {
+            "completion_contract": "confirmation banner appears",
+        }
+        no_completion_condition_policy = await build_request_policy(
+            user_message="submit the contact form and report whether it worked",
+            chat_history="",
+            **args,
+        )
+        assert no_completion_condition_policy.completion_contract is None
+
+        handler.response = {
+            "completion_contract": "confirmation banner appears",
+        }
+        paraphrased_completion_policy = await build_request_policy(
+            user_message="submit the contact form until the requested success state is reached",
+            chat_history="",
+            **args,
+        )
+        assert paraphrased_completion_policy.completion_contract is None
+        assert "completion_contract:" not in paraphrased_completion_policy.prompt_summary()
+        assert paraphrased_completion_policy.to_trace_data()["has_completion_contract"] is False
+
+    @pytest.mark.asyncio
+    async def test_request_policy_noncredential_clarification_uses_specific_copy(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(**kwargs):
+            return handler.response
+
+        handler.response = {
+            "testing_intent": "unspecified",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "missing_conditional_condition",
+        }
+        policy = await build_request_policy(
+            user_message="Add a conditional that goes to https://example.com/dropdown.",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.clarification_reason == "missing_conditional_condition"
+        assert policy.clarification_question == "What condition should trigger this conditional route?"
+
+        handler.response = {
+            "testing_intent": "unspecified",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "ambiguous_loop_edit",
+        }
+        loop_policy = await build_request_policy(
+            user_message="can you put it inside of a loop block",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert loop_policy.user_response_policy == "ask_clarification"
+        assert loop_policy.clarification_reason == "ambiguous_loop_edit"
+        assert "inside the loop" in (loop_policy.clarification_question or "")
+
+    @pytest.mark.asyncio
+    async def test_request_policy_refuses_invented_credential_id(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "requires_user_clarification": True,
+                "clarification_reason": "credential_invention_requested",
+            }
+
+        policy = await build_request_policy(
+            user_message="ya that sounds good and make up a credential id",
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.clarification_reason == "credential_invention_requested"
+        assert not policy.allow_update_workflow
+        assert not policy.allow_run_blocks
+        assert "cannot invent a credential ID" in (policy.clarification_question or "")
+
+    @pytest.mark.asyncio
+    async def test_request_policy_resolves_classifier_credential_refs(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "credential_name",
+                "credential_refs": ["azure_credentials", "mfa_email"],
+                "requires_user_clarification": True,
+            }
+
+        policy = await build_request_policy(
+            user_message=(
+                "Log in using the 'azure_credentials'. "
+                "If prompted for 2FA, get the code from the 'mfa_email'. "
+                "Then search for 'account_number'."
+            ),
+            workflow_yaml="",
+            chat_history="",
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.credential_refs == ["azure_credentials", "mfa_email"]
+        assert "azure_credentials" in (policy.clarification_question or "")
+        assert "account_number" not in policy.credential_refs
+
+    def test_translate_untested_draft_request_surfaces_unvalidated_workflow(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            allow_untested_workflow_draft=True,
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=4,
+            last_test_ok=None,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
+
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: drafted"
+        assert agent_result.unvalidated is True
+        assert "without testing it, as requested" in agent_result.user_response
+
+
+class TestNativeToolCredentialIdValidation:
+    def test_extracts_credential_ids_from_nested_tool_values(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _extract_credential_ids_from_tool_value
+
+        ids = _extract_credential_ids_from_tool_value(
+            {
+                "workflow_yaml": "credential_id: cred_valid",
+                "parameters": {"login": "cred_missing", "note": "repeat cred_valid"},
+            }
+        )
+
+        assert ids == ["cred_valid", "cred_missing"]
+
+    def test_workflow_yaml_extraction_ignores_credential_like_parameter_keys(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _extract_credential_ids_from_workflow_yaml
+
+        ids = _extract_credential_ids_from_workflow_yaml(
+            """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: cred_param
+      default_value: cred_valid
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: cred_not_an_id
+      default_value: cred_also_not_an_id
+"""
+        )
+
+        assert ids == ["cred_valid"]
+
+    @pytest.mark.asyncio
+    async def test_missing_tool_credential_reference_returns_blocking_error(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _credential_reference_validation_error
+
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        error = await _credential_reference_validation_error(
+            """
+workflow_definition:
+  parameters:
+    - parameter_type: credential
+      key: credentials
+      credential_id: cred_valid
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: backup_credentials
+      default_value: cred_missing
+""",
+            _ctx(),
+        )
+
+        assert error is not None
+        assert "cred_missing" in error
+        assert "not found in this organization" in error
+        assert "Stop before creating, updating, or running the workflow" in error
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_valid_tool_credential_reference_allows_tool_path(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _credential_reference_validation_error
+
+        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        error = await _credential_reference_validation_error({"credential_id": "cred_valid"}, _ctx())
+
+        assert error is None
+        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_allows_missing_credentials_for_explicit_untested_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _update_workflow
+
+        ctx = _ctx(allow_untested_workflow_draft=True)
+
+        workflow = MagicMock()
+        workflow.title = "Untested Draft"
+        workflow.description = ""
+        workflow.workflow_definition = MagicMock()
+        workflow.workflow_definition.blocks = []
+        workflow.proxy_location = None
+        workflow.webhook_callback_url = None
+        workflow.persist_browser_session = False
+        workflow.model = None
+        workflow.max_screenshot_scrolls = None
+        workflow.extra_http_headers = None
+        workflow.run_with = None
+        workflow.ai_fallback = None
+        workflow.cache_key = None
+        workflow.run_sequentially = False
+        workflow.sequential_key = None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            lambda **kwargs: workflow,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.resolve_copilot_created_by_stamp",
+            AsyncMock(return_value="copilot"),
+        )
+        workflow_service = MagicMock()
+        workflow_service.update_workflow_definition = AsyncMock()
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE", workflow_service)
+        get_credentials_by_ids = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            agent_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_missing
+  blocks: []
+"""
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        get_credentials_by_ids.assert_not_called()
+
+
 class TestResponseTypeClassificationRuleReachesAgent:
     """Pin the classifier rule that selects ASK_QUESTION when `user_response` asks the user for required input — the agent.py null-out gate keys on `resp_type == "ASK_QUESTION"` and depends on this prompt text."""
 
@@ -754,4 +1781,109 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert "goal_reached: false" in prompt
         assert "Classify by intent, not punctuation" in prompt
         assert "does NOT imply REPLY" in prompt
+        assert "explicitly asks for an untested draft" in prompt
+        assert "workflow was drafted without testing as requested" in prompt
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
+
+
+class TestCopilotConfig:
+    def test_system_prompt_uses_custom_security_rules(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            config=CopilotConfig(security_rules="CUSTOM SECURITY RULE"),
+        )
+
+        assert "CUSTOM SECURITY RULE" in prompt
+
+    def test_retriable_llm_error_detects_openai_rate_limit(self) -> None:
+        class FakeRateLimitError(Exception):
+            pass
+
+        FakeRateLimitError.__module__ = "openai"
+
+        assert agent_module._is_retriable_llm_error(FakeRateLimitError("rate limit"))
+
+    def test_fallback_key_skips_missing_or_same_key(self) -> None:
+        assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key=None), "PRIMARY") is None
+        assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="PRIMARY"), "PRIMARY") is None
+        assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="SECONDARY"), "PRIMARY") == "SECONDARY"
+
+    @pytest.mark.asyncio
+    async def test_run_copilot_agent_retries_retriable_failure_with_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeRateLimitError(Exception):
+            pass
+
+        FakeRateLimitError.__module__ = "openai"
+
+        async def fake_feasibility_gate(**_kwargs):
+            return SimpleNamespace(verdict="proceed", question=None, rationale=None)
+
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        resolved_keys: list[str] = []
+
+        def fake_resolve_model_config(_handler, *, copilot_config=None, llm_key_override=None):
+            del copilot_config
+            key = llm_key_override or "PRIMARY"
+            resolved_keys.append(key)
+            return f"model-{key}", object(), key, True
+
+        run_with_enforcement = AsyncMock(
+            side_effect=[
+                FakeRateLimitError("rate limit"),
+                _fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True}),
+            ]
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.feasibility_gate.run_feasibility_gate",
+            fake_feasibility_gate,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=SimpleNamespace(
+                message="build it",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_yaml="",
+                browser_session_id=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            debug_run_info_text="",
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        )
+
+        assert result.user_response == "ok"
+        assert resolved_keys == ["PRIMARY", "SECONDARY"]
+        assert run_with_enforcement.await_count == 2
+        for call in run_with_enforcement.await_args_list:
+            assert not getattr(call.kwargs["agent"], "input_guardrails", None)

@@ -1,16 +1,12 @@
 import json
-import os
 import platform
-import subprocess
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests  # type: ignore
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
-
-from skyvern.analytics import capture_setup_event
 
 from .console import console
 from .core.browser_launcher import (
@@ -23,12 +19,24 @@ from .core.browser_launcher import (
 _CDP_SCAN_PORTS = [9222, 9223, 9224, 9225, 9226, 9229]
 
 
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> None:
+    from skyvern.analytics import capture_setup_event as _capture_setup_event  # noqa: PLC0415
+
+    _capture_setup_event(event_name, success, error_type, error_message, extra_data)
+
+
 def _check_cdp_ws(port: int) -> Optional[dict]:
     """Try a WebSocket CDP handshake on the given port.
 
-    Chrome's chrome://inspect#remote-debugging exposes a WS-only CDP server
-    (no /json/version HTTP endpoint). This sends Browser.getVersion over WS
-    to detect it.
+    Some CDP-compatible servers expose a WebSocket endpoint without the
+    /json/version HTTP discovery endpoint. This sends Browser.getVersion over
+    WS to detect those endpoints.
 
     Returns the version info dict if successful, else None.
     """
@@ -115,37 +123,50 @@ def _print_cdp_info(url: str, cached_info: dict | None = None) -> None:
             console.print(f"  WebSocket URL: [dim]{info['webSocketDebuggerUrl']}[/dim]")
 
 
-def _open_chrome_inspect() -> None:
-    """Open chrome://inspect/#remote-debugging in the user's default browser."""
+def _classic_cdp_launch_command() -> str:
     system = platform.system()
-    url = "chrome://inspect/#remote-debugging"
-    try:
-        if system == "Darwin":
-            subprocess.Popen(
-                ["open", "-a", "Google Chrome", url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif system == "Windows":
-            subprocess.Popen(
-                ["start", "chrome", url],
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        else:
-            # Linux — try common Chrome names
-            for cmd in ["google-chrome", "chromium", "chromium-browser"]:
-                if os.path.exists(f"/usr/bin/{cmd}"):
-                    subprocess.Popen(
-                        [cmd, url],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    return
-            console.print(f"[yellow]Could not open Chrome automatically. Please navigate to: {url}[/yellow]")
-    except Exception:
-        console.print(f"[yellow]Could not open Chrome automatically. Please navigate to: {url}[/yellow]")
+    if system == "Darwin":
+        return (
+            "/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\\n"
+            "  --remote-debugging-port=9222 \\\n"
+            "  --remote-debugging-address=0.0.0.0 \\\n"
+            '  --user-data-dir="$HOME/skyvern-chrome-cdp" \\\n'
+            "  --no-first-run \\\n"
+            "  --no-default-browser-check"
+        )
+    if system == "Windows":
+        return (
+            "taskkill /F /IM chrome.exe\n\n"
+            '& "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" `\n'
+            "  --remote-debugging-port=9222 `\n"
+            "  --remote-debugging-address=0.0.0.0 `\n"
+            '  --user-data-dir="$env:TEMP\\skyvern-chrome-cdp" `\n'
+            "  --no-first-run `\n"
+            "  --no-default-browser-check"
+        )
+    return (
+        "google-chrome \\\n"
+        "  --remote-debugging-port=9222 \\\n"
+        "  --remote-debugging-address=0.0.0.0 \\\n"
+        '  --user-data-dir="$HOME/skyvern-chrome-cdp" \\\n'
+        "  --no-first-run \\\n"
+        "  --no-default-browser-check"
+    )
+
+
+def _print_classic_cdp_instructions() -> None:
+    console.print(
+        Panel(
+            "[bold]Enable Chrome remote debugging[/bold]\n\n"
+            "Recommended for your existing Chrome profile:\n"
+            "1. Open [cyan]chrome://inspect/#remote-debugging[/cyan] in Chrome.\n"
+            "2. Enable remote debugging for this browser instance.\n\n"
+            "If Skyvern runs in Docker and cannot reach that listener, start an isolated "
+            "Chrome profile with a Docker-reachable CDP endpoint instead:\n\n"
+            f"[cyan]{_classic_cdp_launch_command()}[/cyan]",
+            border_style="cyan",
+        )
+    )
 
 
 def _setup_local_browser_clone() -> tuple[str, Optional[str], Optional[str]]:
@@ -238,22 +259,12 @@ def _setup_local_browser_actual() -> tuple[str, Optional[str], Optional[str]]:
         )
         return "cdp-connect", None, existing
 
-    # Step 2: Guide the user to enable remote debugging
+    # Step 2: Guide the user to enable Chrome remote debugging.
+    _print_classic_cdp_instructions()
+
     console.print(
-        Panel(
-            "[bold]Enable Remote Debugging in Chrome[/bold]\n\n"
-            "1. We'll open [cyan]chrome://inspect/#remote-debugging[/cyan] in your browser\n"
-            "2. Click [bold]Enable[/bold] to start the debugging server\n"
-            "3. You should see: [green]Server running at: 127.0.0.1:9222[/green]",
-            border_style="cyan",
-        )
+        "\n[bold yellow]Enable or start remote debugging in Chrome, then press Enter to continue...[/bold yellow]"
     )
-
-    open_page = Confirm.ask("Open chrome://inspect/#remote-debugging now?", default=True)
-    if open_page:
-        _open_chrome_inspect()
-
-    console.print("\n[bold yellow]Enable remote debugging in Chrome, then press Enter to continue...[/bold yellow]")
     Prompt.ask("Press Enter when ready", default="")
 
     # Step 3: Auto-discover the debugging server with retries
@@ -277,7 +288,7 @@ def _setup_local_browser_actual() -> tuple[str, Optional[str], Optional[str]]:
 
     # Step 4: Fallback — ask for manual URL
     console.print("[yellow]Could not auto-detect the debugging server.[/yellow]")
-    console.print("[dim]Make sure you clicked 'Enable' on the chrome://inspect page.[/dim]")
+    console.print("[dim]Make sure /json/version returns JSON from the URL you enter.[/dim]")
     manual_url = Prompt.ask(
         "Enter the debugging URL manually (e.g. http://127.0.0.1:9222)",
         default="http://127.0.0.1:9222",

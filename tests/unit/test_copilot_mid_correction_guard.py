@@ -14,7 +14,7 @@ from skyvern.forge.sdk.copilot.agent import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.tools import (
-    PER_TOOL_CALL_BUDGET_SECONDS,
+    COPILOT_FINAL_REPLY_RESERVE_SECONDS,
     _record_run_blocks_result,
     _tool_loop_error,
 )
@@ -44,7 +44,7 @@ def _ctx_after_failure_with_verified_prefix(*, elapsed_seconds: float) -> Copilo
 
 
 def test_tool_loop_error_blocks_run_when_budget_low_after_failure() -> None:
-    elapsed = TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS - 30)
+    elapsed = TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS - 10)
     ctx = _ctx_after_failure_with_verified_prefix(elapsed_seconds=elapsed)
     for tool in ("update_and_run_blocks", "run_blocks_and_collect_debug"):
         msg = _tool_loop_error(ctx, tool)
@@ -53,27 +53,31 @@ def test_tool_loop_error_blocks_run_when_budget_low_after_failure() -> None:
 
 def test_tool_loop_error_no_guard_when_budget_sufficient() -> None:
     ctx = _ctx_after_failure_with_verified_prefix(
-        elapsed_seconds=TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS + 60)
+        elapsed_seconds=TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS + 30)
     )
     assert _tool_loop_error(ctx, "update_and_run_blocks") is None
 
 
-def test_tool_loop_error_no_guard_on_first_call() -> None:
+def test_tool_loop_error_blocks_first_call_when_turn_budget_is_too_low() -> None:
     ctx = _fresh_context()
     ctx.copilot_run_start_monotonic = time.monotonic() - (TOTAL_TIMEOUT_SECONDS - 10)
-    assert _tool_loop_error(ctx, "update_and_run_blocks") is None
+    msg = _tool_loop_error(ctx, "update_and_run_blocks")
+    assert msg is not None
+    assert "Do NOT start another block-running tool call" in msg
 
 
-def test_tool_loop_error_no_guard_when_no_good_workflow_exists() -> None:
+def test_tool_loop_error_blocks_failed_retry_when_no_good_workflow_exists() -> None:
     ctx = _fresh_context()
     ctx.copilot_run_start_monotonic = time.monotonic() - (TOTAL_TIMEOUT_SECONDS - 10)
     ctx.last_test_ok = False
     ctx.last_failed_workflow_yaml = "yaml-failed"
-    assert _tool_loop_error(ctx, "update_and_run_blocks") is None
+    msg = _tool_loop_error(ctx, "update_and_run_blocks")
+    assert msg is not None
+    assert "Do NOT retry" in msg
 
 
 def test_tool_loop_error_no_guard_for_non_block_running_tools() -> None:
-    elapsed = TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS - 30)
+    elapsed = TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS - 10)
     ctx = _ctx_after_failure_with_verified_prefix(elapsed_seconds=elapsed)
     for tool in ("update_workflow", "list_credentials", "get_run_results"):
         assert _tool_loop_error(ctx, tool) is None, tool
@@ -82,7 +86,7 @@ def test_tool_loop_error_no_guard_for_non_block_running_tools() -> None:
 def test_tool_loop_error_guard_persists_through_update_workflow() -> None:
     # ``last_test_ok`` flips to None on every ``update_workflow``, but
     # ``last_failed_workflow_yaml`` stays — so the guard must still fire.
-    elapsed = TOTAL_TIMEOUT_SECONDS - (PER_TOOL_CALL_BUDGET_SECONDS - 30)
+    elapsed = TOTAL_TIMEOUT_SECONDS - (COPILOT_FINAL_REPLY_RESERVE_SECONDS - 10)
     ctx = _ctx_after_failure_with_verified_prefix(elapsed_seconds=elapsed)
     ctx.last_test_ok = None
     ctx.last_workflow = SimpleNamespace(workflow_id="wf-edited")
@@ -194,7 +198,10 @@ def test_translate_to_agent_result_salvages_last_good_on_failed_reply() -> None:
     assert agent_result.unvalidated is True
     # Failure rewrite would have replaced the agent's text with one based on
     # ``last_update_block_count=5``; salvage must skip the rewrite.
-    assert agent_result.user_response == agent_text
+    assert agent_result.user_response.startswith(agent_text)
+    assert "Use Review to inspect it" in agent_result.user_response
+    assert "Accept to save it" in agent_result.user_response
+    assert "Reject to discard it" in agent_result.user_response
 
 
 def test_translate_to_agent_result_salvages_after_failure_then_update_workflow() -> None:
@@ -216,7 +223,10 @@ def test_translate_to_agent_result_salvages_after_failure_then_update_workflow()
     )
     assert agent_result.updated_workflow is ctx.last_good_workflow
     assert agent_result.unvalidated is True
-    assert agent_result.user_response == agent_text
+    assert agent_result.user_response.startswith(agent_text)
+    assert "Use Review to inspect it" in agent_result.user_response
+    assert "Accept to save it" in agent_result.user_response
+    assert "Reject to discard it" in agent_result.user_response
 
 
 def test_translate_to_agent_result_does_not_salvage_on_standalone_edit() -> None:

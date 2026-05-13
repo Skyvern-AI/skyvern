@@ -30,6 +30,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -94,6 +95,9 @@ class AgentContext:
     workflow_persisted: bool = False
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None
+    allow_untested_workflow_draft: bool = False
+    request_policy: RequestPolicy | None = None
+    effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None
 

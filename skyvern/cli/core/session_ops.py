@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
 
@@ -62,6 +63,7 @@ async def do_session_create(
     skyvern: Any,
     timeout: int = 60,
     proxy_location: ProxyLocationInput | str | None = None,
+    extensions: list[Extensions] | None = None,
     local: bool = False,
     headless: bool = False,
     browser_profile_id: str | None = None,
@@ -74,11 +76,12 @@ async def do_session_create(
         return browser, SessionCreateResult(session_id=None, local=True, headless=headless)
 
     proxy = coerce_proxy_location(proxy_location)
-    browser = await skyvern.launch_cloud_browser(
-        timeout=timeout,
-        proxy_location=proxy,
-        browser_profile_id=browser_profile_id,
-    )
+    launch_kwargs: dict[str, Any] = {"timeout": timeout, "proxy_location": proxy}
+    if browser_profile_id is not None:
+        launch_kwargs["browser_profile_id"] = browser_profile_id
+    if extensions is not None:
+        launch_kwargs["extensions"] = extensions
+    browser = await skyvern.launch_cloud_browser(**launch_kwargs)
     # SkyvernBrowser does not expose browser_profile_id today; surface the
     # requested id so callers (CLI result, MCP data) can display what was sent.
     return browser, SessionCreateResult(

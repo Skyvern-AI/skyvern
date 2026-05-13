@@ -77,7 +77,16 @@ class Base(AsyncAttrs, DeclarativeBase):
 
 class TaskModel(Base):
     __tablename__ = "tasks"
-    __table_args__ = (Index("idx_tasks_org_created", "organization_id", "created_at"),)
+    __table_args__ = (
+        Index("idx_tasks_org_created", "organization_id", "created_at"),
+        Index(
+            "ix_tasks_nonterminal_status",
+            "status",
+            "modified_at",
+            "created_at",
+            postgresql_where=text("status IN ('created', 'queued', 'running')"),
+        ),
+    )
 
     task_id = Column(String, primary_key=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
@@ -259,6 +268,7 @@ class ArtifactModel(Base):
     run_id = Column(String, nullable=True)
     browser_session_id = Column(String, nullable=True)
     checksum = Column(String, nullable=True)
+    file_size = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -319,6 +329,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    browser_profile_id = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
@@ -405,7 +416,16 @@ class WorkflowTemplateModel(Base):
 
 class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
-    __table_args__ = (Index("idx_workflow_runs_org_created", "organization_id", "created_at"),)
+    __table_args__ = (
+        Index("idx_workflow_runs_org_created", "organization_id", "created_at"),
+        Index(
+            "ix_workflow_runs_nonterminal_status",
+            "status",
+            "modified_at",
+            "created_at",
+            postgresql_where=text("status IN ('created', 'queued', 'running', 'paused')"),
+        ),
+    )
 
     workflow_run_id = Column(String, primary_key=True, default=generate_workflow_run_id)
     workflow_id = Column(String, nullable=False)
@@ -1013,7 +1033,7 @@ class TaskRunModel(Base):
             "organization_id",
             desc("created_at"),
             postgresql_using="btree",
-            postgresql_where=text("parent_workflow_run_id IS NULL AND debug_session_id IS NULL AND status IS NOT NULL"),
+            postgresql_where=text("parent_workflow_run_id IS NULL AND debug_session_id IS NULL"),
         ),
         Index(
             "ix_task_runs_org_status_created",

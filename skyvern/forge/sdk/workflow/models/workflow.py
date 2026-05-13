@@ -15,7 +15,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
-from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
@@ -35,6 +35,7 @@ class WorkflowRequestBody(BaseModel):
     browser_address: str | None = None
     run_with: str | None = None
     ai_fallback: bool | None = None
+    run_metadata: dict[str, str] | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -42,6 +43,11 @@ class WorkflowRequestBody(BaseModel):
         if not url:
             return url
         return validate_url(url)
+
+    @field_validator("run_metadata")
+    @classmethod
+    def validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return normalize_run_metadata(v)
 
 
 @deprecated("Use WorkflowRunResponse instead")
@@ -101,6 +107,7 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    browser_profile_id: str | None = None
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None

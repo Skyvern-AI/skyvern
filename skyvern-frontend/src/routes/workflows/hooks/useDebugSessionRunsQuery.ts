@@ -6,9 +6,7 @@ type Props = {
   debugSessionId?: string;
 };
 
-const debugSessionStatuses = ["created", "completed"] as const;
-
-type DebugSessionStatus = (typeof debugSessionStatuses)[number];
+type DebugSessionStatus = "created" | "completed";
 
 interface DebugSession {
   debug_session_id: string;

@@ -229,6 +229,26 @@ async def test_get_all_runs_v2_selects_workflow_deleted_flag() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_all_runs_v2_status_filter_uses_coalesced_effective_status() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test")
+
+    where_clause = _where_clause_sql(captured["query"]).lower()
+    assert "coalesce(workflow_runs.status, task_runs.status) is not null" in where_clause
+    assert "task_runs.status is not null" not in where_clause
+
+
+@pytest.mark.asyncio
 async def test_get_all_runs_v2_excludes_copilot_session_workflow_runs() -> None:
     captured: dict[str, Any] = {}
 

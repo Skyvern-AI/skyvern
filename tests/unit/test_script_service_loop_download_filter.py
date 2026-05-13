@@ -1,6 +1,8 @@
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.services.script_service import (
     _append_to_loop_output,
     _filter_downloaded_files_for_current_iteration,
@@ -100,85 +102,134 @@ def test_filter_downloaded_files_handles_urls_without_query_strings() -> None:
 
 
 # --- _append_to_loop_output tests ---
+#
+# Pin the legacy webhook contract: cached for-loop output is
+# List[List[{loop_value, output_parameter, output_value}]] — list-of-lists,
+# per-item keyed by output_parameter (key ends in _output), matching
+# ForLoopBlock.execute's outputs_with_loop_values shape.
 
 
-def test_append_to_loop_output_merges_downloaded_files() -> None:
-    """When loop_value is a dict and output has downloaded_files, current_value should include them."""
-    mock_context = MagicMock()
-    mock_context.loop_output_values = []
-    mock_context.loop_metadata = {
+def _mock_context(loop_output_values: list[list[dict]] | None, loop_value: object = "item") -> MagicMock:
+    ctx = MagicMock()
+    ctx.loop_output_values = loop_output_values
+    ctx.loop_metadata = {
         "current_index": 0,
-        "current_value": {"name": "test"},
-        "current_item": {"name": "test"},
+        "current_value": loop_value,
+        "current_item": loop_value,
     }
+    ctx.workflow_id = "wf_test"
+    return ctx
 
-    with patch("skyvern.services.script_service.skyvern_context.current", return_value=mock_context):
-        _append_to_loop_output(
-            {"downloaded_files": ["/path/to/file.pdf"], "extracted_information": {"key": "val"}},
-            label="my_block",
-        )
 
-    assert len(mock_context.loop_output_values) == 1
-    entry = mock_context.loop_output_values[0]
-    assert entry["current_value"]["name"] == "test"
-    assert entry["current_value"]["downloaded_files"] == ["/path/to/file.pdf"]
-    # extracted_information should NOT be copied into current_value — it already
-    # lives in output_value and duplicating it causes _collect_extracted_information
-    # to count it twice.
-    assert "extracted_information" not in entry["current_value"]
-    assert entry["output_value"]["extracted_information"] == {"key": "val"}
+def test_append_to_loop_output_emits_legacy_per_item_shape() -> None:
+    ctx = _mock_context([[]], loop_value={"name": "test"})
+    with patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx):
+        _append_to_loop_output({"extracted_information": {"key": "val"}}, label="my_block")
+
+    assert len(ctx.loop_output_values) == 1
+    iteration = ctx.loop_output_values[0]
+    assert len(iteration) == 1
+    entry = iteration[0]
+    # Per-item legacy shape: loop_value + output_parameter + output_value, nothing else.
+    assert set(entry.keys()) == {"loop_value", "output_parameter", "output_value"}
     assert entry["loop_value"] == {"name": "test"}
-    assert entry["label"] == "my_block"
+    assert entry["output_value"] == {"extracted_information": {"key": "val"}}
+    # output_parameter.key must carry the legacy _output suffix.
+    assert entry["output_parameter"].key == "my_block_output"
+    assert entry["output_parameter"].workflow_id == "wf_test"
+
+
+def test_append_to_loop_output_groups_items_per_iteration() -> None:
+    """Items from the same iteration land in the same sub-list; new sub-list = new iteration."""
+    ctx = _mock_context([[]])
+    with patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx):
+        _append_to_loop_output({"k": 1}, label="navigate")
+        _append_to_loop_output({"k": 2}, label="extract")
+
+        # Simulate the loop generator opening a new iteration.
+        ctx.loop_output_values.append([])
+        _append_to_loop_output({"k": 3}, label="navigate")
+
+    assert len(ctx.loop_output_values) == 2
+    assert len(ctx.loop_output_values[0]) == 2
+    assert len(ctx.loop_output_values[1]) == 1
+    assert [e["output_parameter"].key for e in ctx.loop_output_values[0]] == [
+        "navigate_output",
+        "extract_output",
+    ]
+    assert ctx.loop_output_values[1][0]["output_parameter"].key == "navigate_output"
+
+
+def test_append_to_loop_output_initializes_sublist_when_empty() -> None:
+    """Defensive fallback: if the generator never appended a sub-list, one gets created."""
+    ctx = _mock_context([])
+    with patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx):
+        _append_to_loop_output({"k": "v"}, label="block_1")
+
+    assert len(ctx.loop_output_values) == 1
+    assert len(ctx.loop_output_values[0]) == 1
 
 
 def test_append_to_loop_output_non_dict_loop_value() -> None:
-    """When loop_value is not a dict, current_value should equal loop_value."""
-    mock_context = MagicMock()
-    mock_context.loop_output_values = []
-    mock_context.loop_metadata = {
-        "current_index": 0,
-        "current_value": "just_a_string",
-        "current_item": "just_a_string",
-    }
-
-    with patch("skyvern.services.script_service.skyvern_context.current", return_value=mock_context):
+    ctx = _mock_context([[]], loop_value="just_a_string")
+    with patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx):
         _append_to_loop_output({"some": "output"}, label="block_1")
 
-    assert len(mock_context.loop_output_values) == 1
-    entry = mock_context.loop_output_values[0]
-    assert entry["current_value"] == "just_a_string"
+    entry = ctx.loop_output_values[0][0]
     assert entry["loop_value"] == "just_a_string"
 
 
-def test_append_to_loop_output_does_not_mutate_loop_value() -> None:
-    """Modifying current_value after append must not affect the original loop_value."""
-    original_value = {"name": "test", "nested": {"key": "original"}}
-    mock_context = MagicMock()
-    mock_context.loop_output_values = []
-    mock_context.loop_metadata = {
-        "current_index": 0,
-        "current_value": original_value,
-        "current_item": original_value,
-    }
-
-    with patch("skyvern.services.script_service.skyvern_context.current", return_value=mock_context):
-        _append_to_loop_output({"downloaded_files": ["file.pdf"]}, label="block_1")
-
-    entry = mock_context.loop_output_values[0]
-    # Mutate the copied current_value
-    entry["current_value"]["nested"]["key"] = "mutated"
-    entry["current_value"]["new_key"] = "added"
-
-    # Original should be unaffected
-    assert original_value["nested"]["key"] == "original"
-    assert "new_key" not in original_value
-    assert "downloaded_files" not in original_value
-
-
 def test_append_to_loop_output_noop_when_no_context() -> None:
-    """Should return without error when context is None."""
     with patch("skyvern.services.script_service.skyvern_context.current", return_value=None):
         _append_to_loop_output({"output": "data"})  # Should not raise
+
+
+def test_append_to_loop_output_noop_when_label_missing() -> None:
+    """No label means no output_parameter.key to route on; entry is dropped and the drop is logged (not silent)."""
+    ctx = _mock_context([[]])
+    with (
+        patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx),
+        patch("skyvern.services.script_service.LOG") as mock_log,
+    ):
+        _append_to_loop_output({"output": "data"}, label=None)
+        _append_to_loop_output({"output": "data2"})  # default label=None
+        _append_to_loop_output({"output": "data3"}, label="")
+
+    assert ctx.loop_output_values == [[]]
+    # All three drops should have logged — empty-string callers don't get silently dropped.
+    assert mock_log.warning.call_count == 3
+
+
+def test_append_to_loop_output_preserves_passed_output_parameter() -> None:
+    """When the caller hands us the real OutputParameter, we preserve its ID (don't synthesize a fresh UUID)."""
+    real_op = OutputParameter(
+        output_parameter_id="op_real_123",
+        key="my_block_output",
+        workflow_id="wf_test",
+        created_at=datetime(2026, 1, 1),
+        modified_at=datetime(2026, 1, 1),
+        parameter_type=ParameterType.OUTPUT,
+    )
+    ctx = _mock_context([[]])
+    with patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx):
+        _append_to_loop_output({"k": "v"}, label="my_block", output_parameter=real_op)
+
+    entry = ctx.loop_output_values[0][0]
+    assert entry["output_parameter"] is real_op
+    assert entry["output_parameter"].output_parameter_id == "op_real_123"
+
+
+def test_append_to_loop_output_synthesizes_when_output_parameter_missing() -> None:
+    """Fallback path: no OutputParameter passed -> synthesize one from the label."""
+    ctx = _mock_context([[]])
+    with patch("skyvern.services.script_service.skyvern_context.current", return_value=ctx):
+        _append_to_loop_output({"k": "v"}, label="my_block")
+
+    entry = ctx.loop_output_values[0][0]
+    assert entry["output_parameter"].key == "my_block_output"
+    # Synthesized fallback gets a fresh UUID, never the empty string.
+    assert entry["output_parameter"].output_parameter_id
+    assert entry["output_parameter"].output_parameter_id != "op_real_123"
 
 
 # --- _to_downloaded_file_signature tests ---

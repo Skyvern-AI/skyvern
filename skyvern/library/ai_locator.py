@@ -3,9 +3,9 @@ from __future__ import annotations
 # ruff: noqa: E402
 from typing import Any, Callable
 
-from skyvern.exceptions import require_server_extra_modules
+from skyvern.exceptions import require_local_extra_modules
 
-require_server_extra_modules("skyvern.library.ai_locator")
+require_local_extra_modules("skyvern.library.ai_locator")
 
 from playwright.async_api import Locator, Page
 

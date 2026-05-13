@@ -102,6 +102,7 @@ async def test_create_download_artifact_inserts_row_without_uploading():
             workflow_run_id="wr_1",
             uri="s3://skyvern-uploads/download/prod/o_1/wr_1/file.pdf",
             filename="file.pdf",
+            file_size=123,
         )
 
     assert artifact_id.startswith("a_")
@@ -112,6 +113,7 @@ async def test_create_download_artifact_inserts_row_without_uploading():
     assert kwargs["organization_id"] == "o_1"
     assert kwargs["run_id"] == "wr_1"
     assert kwargs["workflow_run_id"] == "wr_1"
+    assert kwargs["file_size"] == 123
     mock_store.assert_not_awaited()
 
 
@@ -144,7 +146,12 @@ async def test_save_downloaded_files_registers_artifact_per_file(tmp_path):
     assert mock_create_download.await_count == 2
     uris = {call.kwargs["uri"] for call in mock_create_download.await_args_list}
     filenames = {call.kwargs["filename"] for call in mock_create_download.await_args_list}
+    file_sizes = {call.kwargs["filename"]: call.kwargs["file_size"] for call in mock_create_download.await_args_list}
     assert filenames == {"invoice.pdf", "report.csv"}
+    assert file_sizes == {
+        "invoice.pdf": (download_dir / "invoice.pdf").stat().st_size,
+        "report.csv": (download_dir / "report.csv").stat().st_size,
+    }
     assert all(u.startswith("s3://") and "/downloads/" in u and "/o_1/wr_1/" in u for u in uris)
     for call in mock_create_download.await_args_list:
         assert call.kwargs["organization_id"] == "o_1"
@@ -157,6 +164,7 @@ def _make_artifact(
     run_id: str = "wr_1",
     *,
     checksum: str | None = None,
+    file_size: int | None = None,
     created_at: str = "2026-04-23T00:00:00Z",
 ) -> Artifact:
     return Artifact(
@@ -167,6 +175,7 @@ def _make_artifact(
         run_id=run_id,
         workflow_run_id=run_id if run_id.startswith("wr_") else None,
         checksum=checksum,
+        file_size=file_size,
         created_at=created_at,
         modified_at=created_at,
     )
@@ -200,6 +209,7 @@ async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_c
         "a_42",
         "s3://skyvern-uploads/downloads/local/o_1/wr_1/invoice.pdf",
         checksum="sha-from-db",
+        file_size=4096,
     )
     mock_list = AsyncMock(return_value=[artifact])
     build_url = MagicMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
@@ -215,6 +225,7 @@ async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_c
     assert result[0].url.startswith("https://api.skyvern.com/v1/artifacts/a_42/content")
     assert result[0].filename == "invoice.pdf"
     assert result[0].checksum == "sha-from-db"
+    assert result[0].file_size == 4096
     assert result[0].modified_at is not None
     storage.async_client.list_files.assert_not_awaited()
     storage.async_client.get_file_metadata.assert_not_awaited()
@@ -263,8 +274,11 @@ async def test_get_downloaded_files_falls_back_to_presigned_for_legacy_runs(keyr
     storage.async_client = MagicMock()
     s3_key = "downloads/local/o_1/wr_old/legacy.pdf"
     storage.async_client.list_files = AsyncMock(return_value=[s3_key])
-    storage.async_client.get_file_metadata = AsyncMock(
-        return_value={"sha256_checksum": "sha-old", "original_filename": "legacy.pdf"}
+    storage.async_client.get_object_info = AsyncMock(
+        return_value={
+            "Metadata": {"sha256_checksum": "sha-old", "original_filename": "legacy.pdf"},
+            "ContentLength": 2048,
+        }
     )
     storage.async_client.create_presigned_urls = AsyncMock(
         return_value=["https://skyvern-uploads.s3.amazonaws.com/...?sig=old"]
@@ -282,6 +296,7 @@ async def test_get_downloaded_files_falls_back_to_presigned_for_legacy_runs(keyr
     assert len(result) == 1
     assert result[0].filename == "legacy.pdf"
     assert result[0].checksum == "sha-old"
+    assert result[0].file_size == 2048
     assert _is_amazonaws_s3_url(result[0].url)
     build_url.assert_not_called()
     storage.async_client.list_files.assert_awaited_once()
@@ -299,8 +314,11 @@ async def test_get_downloaded_files_falls_back_to_presigned_when_keyring_unset(t
     storage.async_client = MagicMock()
     s3_key = "downloads/local/o_1/wr_1/invoice.pdf"
     storage.async_client.list_files = AsyncMock(return_value=[s3_key])
-    storage.async_client.get_file_metadata = AsyncMock(
-        return_value={"sha256_checksum": "sha-abc", "original_filename": "invoice.pdf"}
+    storage.async_client.get_object_info = AsyncMock(
+        return_value={
+            "Metadata": {"sha256_checksum": "sha-abc", "original_filename": "invoice.pdf"},
+            "ContentLength": 1024,
+        }
     )
     storage.async_client.create_presigned_urls = AsyncMock(
         return_value=["https://skyvern-uploads.s3.amazonaws.com/...?sig=fallback"]
@@ -320,6 +338,7 @@ async def test_get_downloaded_files_falls_back_to_presigned_when_keyring_unset(t
 
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
+    assert result[0].file_size == 1024
     build_url.assert_not_called()
 
 
@@ -332,8 +351,11 @@ async def test_get_downloaded_files_artifact_lookup_failure_falls_back_to_listin
     storage.async_client = MagicMock()
     s3_key = "downloads/local/o_1/wr_1/recoverable.pdf"
     storage.async_client.list_files = AsyncMock(return_value=[s3_key])
-    storage.async_client.get_file_metadata = AsyncMock(
-        return_value={"sha256_checksum": "sha-recover", "original_filename": "recoverable.pdf"}
+    storage.async_client.get_object_info = AsyncMock(
+        return_value={
+            "Metadata": {"sha256_checksum": "sha-recover", "original_filename": "recoverable.pdf"},
+            "ContentLength": 512,
+        }
     )
     storage.async_client.create_presigned_urls = AsyncMock(
         return_value=["https://skyvern-uploads.s3.amazonaws.com/...?sig=fallback"]
@@ -347,6 +369,7 @@ async def test_get_downloaded_files_artifact_lookup_failure_falls_back_to_listin
 
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
+    assert result[0].file_size == 512
     storage.async_client.list_files.assert_awaited_once()
 
 

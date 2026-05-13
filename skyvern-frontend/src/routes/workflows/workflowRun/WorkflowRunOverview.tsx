@@ -23,6 +23,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
+import { browserStreamingMode } from "@/util/env";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -112,8 +113,11 @@ function WorkflowRunOverview() {
         selection.block_type === "human_interaction"))
   );
 
-  const shouldShowBrowserStream = wantsVncStream && !vncFailed;
-  const shouldShowScreencastFallback = wantsVncStream && vncFailed;
+  const shouldUseCdpStream = browserStreamingMode === "cdp";
+  const shouldShowBrowserStream =
+    wantsVncStream && !shouldUseCdpStream && !vncFailed;
+  const shouldShowScreencastFallback =
+    wantsVncStream && (shouldUseCdpStream || vncFailed);
 
   const isStreamActive =
     shouldShowBrowserStream ||

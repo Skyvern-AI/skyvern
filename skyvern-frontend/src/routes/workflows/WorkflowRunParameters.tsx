@@ -21,6 +21,7 @@ function WorkflowRunParameters() {
         .get(`/workflows/${workflowPermanentId}`)
         .then((response) => response.data);
     },
+    enabled: !!workflowPermanentId,
     refetchOnWindowFocus: false,
   });
 

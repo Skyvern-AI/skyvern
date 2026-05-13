@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -11,7 +11,9 @@ import structlog
 from skyvern.config import settings
 
 if TYPE_CHECKING:
-    from playwright.async_api import Frame, Page
+    from playwright.async_api import FileChooser, Frame, Page
+
+    from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
 LOG = structlog.get_logger()
 
@@ -27,6 +29,22 @@ class DialogEntry(TypedDict):
     type: str
     message: str
     count: int
+
+
+@dataclass
+class PendingFileChooserListener:
+    page: Page
+    file_paths: list[str] | str
+    handler: Callable[[FileChooser], Any] | None = None
+    triggered: bool = False
+
+    def cleanup(self) -> None:
+        if self.handler is not None:
+            try:
+                self.page.remove_listener("filechooser", self.handler)
+            except Exception:
+                LOG.debug("Failed to remove filechooser listener during cleanup", exc_info=True)
+            self.handler = None
 
 
 @dataclass
@@ -72,6 +90,15 @@ class SkyvernContext:
     enable_speed_optimizations: bool = False
     use_artifact_bundling: bool = False
 
+    # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
+    # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
+    # without taking a dependency on the public-API request shape.
+    trigger_type: WorkflowRunTriggerType | None = None
+    # When true, downstream LLM handler selection may swap the resolved handler to a
+    # flex-tier router. Cloud sets this at run boot via a PostHog flag for non-UI runs;
+    # OSS keeps it False because OSS has no flex routers registered.
+    use_flex_llm_routing: bool = False
+
     # script run context
     code_version: int | None = None
     script_id: str | None = None
@@ -82,7 +109,7 @@ class SkyvernContext:
     workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
-    loop_output_values: list[dict[str, Any]] | None = None
+    loop_output_values: list[list[dict[str, Any]]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
     is_static_script: bool = False
@@ -90,6 +117,8 @@ class SkyvernContext:
     ai_mode_override: str | None = None
     script_llm_call_count: int = 0
     last_classify_result: str | None = None
+    last_classify_meta: dict[str, Any] | None = None
+    current_step_actions: list[dict[str, Any]] | None = None
     skip_complete_verification: bool = False
 
     # magic link handling
@@ -124,6 +153,24 @@ class SkyvernContext:
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
     recent_dialog_messages: list[DialogEntry] = field(default_factory=list)
+
+    # Per-step prompt token breakdown (SKY-9718). Written by prompt-build sites
+    # (prompt_engine.load_prompt_with_elements_tracked + the cached extract-action
+    # path in agent.py); read + cleared by the LLM API handler when emitting the
+    # "LLM API handler duration metrics" log so html_token_count / html_pct land
+    # alongside the existing input_tokens / llm_cost on the same row.
+    last_prompt_breakdown: dict[str, Any] | None = None
+
+    # Deferred file chooser listener — survives across steps so a popup-intercepted upload
+    # can be completed when a subsequent click triggers the actual file chooser.
+    pending_file_chooser: PendingFileChooserListener | None = None
+
+    def cleanup_pending_file_chooser(self) -> None:
+        if self.pending_file_chooser is not None:
+            if not self.pending_file_chooser.triggered:
+                LOG.warning("Cleaning up unconsumed pending file chooser listener")
+            self.pending_file_chooser.cleanup()
+            self.pending_file_chooser = None
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id}, copilot_session_id={self.copilot_session_id})"
@@ -272,13 +319,16 @@ def replace(context: SkyvernContext) -> None:
     Returns:
         None
     """
-    _flush_feature_flags_if_needed(current())
+    _cleanup_outgoing_context(current())
     _context.set(context)
 
 
-def _flush_feature_flags_if_needed(context: SkyvernContext | None) -> None:
-    if context is not None and context.feature_flag_entries:
+def _cleanup_outgoing_context(context: SkyvernContext | None) -> None:
+    if context is None:
+        return
+    if context.feature_flag_entries:
         context.flush_feature_flags()
+    context.cleanup_pending_file_chooser()
 
 
 def _restore(token: Token[SkyvernContext | None]) -> None:
@@ -291,7 +341,7 @@ def _restore(token: Token[SkyvernContext | None]) -> None:
     Returns:
         None
     """
-    _flush_feature_flags_if_needed(current())
+    _cleanup_outgoing_context(current())
     _context.reset(token)
 
 
@@ -320,5 +370,5 @@ def reset() -> None:
     Returns:
         None
     """
-    _flush_feature_flags_if_needed(current())
+    _cleanup_outgoing_context(current())
     _context.set(None)

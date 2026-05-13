@@ -16,7 +16,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScriptTerminationException
+from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException
 
 
 def create_mock_page():
@@ -200,7 +200,8 @@ async def test_wait_for_page_ready_attribute_access_regression():
     source = inspect.getsource(ScriptSkyvernPage._wait_for_page_ready_before_action)
 
     # The fixed code should use self.page
-    assert "self.page" in source, "Method should access self.page"
+    # nosemgrep false positive: "self.page" is an attribute name, not a URL.
+    assert "self.page" in source, "Method should access self.page"  # nosemgrep: incomplete-url-substring-sanitization
 
     # The fixed code should NOT use self._page (except in comments)
     # Remove comments and docstrings first
@@ -558,6 +559,87 @@ async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_
                 await script_page.terminate(errors=["handler error"])
 
             mock_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_illegit_complete_subclass_when_handler_rejects(mock_scraped_page, mock_ai):
+    """
+    When handle_complete_action returns an ActionFailure (verifier rejected the
+    completion), complete() must raise IllegitCompleteScriptTermination — the
+    subclass — not the parent ScriptTerminationException. The script_service
+    catch sites distinguish the two: subclass → BlockStatus.failed (fallback
+    fires), parent → BlockStatus.terminated (no fallback).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+        mock_context.skip_complete_verification = False
+        mock_context.code_version = 1
+        mock_context.is_static_script = False
+        mock_context.script_mode = False
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        rejected_result = MagicMock(success=False)
+        rejected_result.exception_message = (
+            "Illegit complete, data={'error': 'Goal not achieved — page still on landing'}"
+        )
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch.object(
+                ScriptSkyvernPage,
+                "_update_step_output_before_complete",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                ScriptSkyvernPage,
+                "_create_final_screenshot",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_complete_action",
+                new_callable=AsyncMock,
+                return_value=[rejected_result],
+            ),
+        ):
+            # The subclass is what the catch sites in script_service.py key off of
+            # to record BlockStatus.failed (so AI fallback fires). If complete()
+            # regresses to raising plain ScriptTerminationException, the parent
+            # arm catches it and the block is recorded as terminated — no
+            # fallback fires for what is genuinely a failure.
+            with pytest.raises(IllegitCompleteScriptTermination, match="Illegit complete"):
+                await script_page.complete()
 
 
 # =============================================================================
@@ -1100,3 +1182,388 @@ class TestActionSubclassPersistence:
         assert isinstance(action, Action)
         assert not isinstance(action, VerificationCodeAction)
         assert action.action_type == ActionType.VERIFICATION_CODE
+
+
+@pytest.mark.asyncio
+async def test_fill_form_raises_when_zero_fields_mapped_with_data(mock_scraped_page, mock_ai):
+    """RuntimeError when N>0 fields extracted, non-empty data, but mapping is empty."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [
+            {"label": "username", "type": "text", "selector": "#user"},
+            {"label": "password", "type": "password", "selector": "#pass"},
+        ]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "validate_mapping", new=AsyncMock(return_value=True)) as validate_mock,
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+        ):
+            with pytest.raises(RuntimeError, match="mapped 0 of 2"):
+                await script_page.fill_form({"user_email": "x@y.com", "user_pw": "secret"})
+
+            validate_mock.assert_not_called()
+            fill_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_form_does_not_raise_when_data_is_empty(mock_scraped_page, mock_ai):
+    """Empty data legitimately produces an empty mapping; the 0-mapped guard must not fire."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [{"label": "search", "type": "text", "selector": "#q"}]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "validate_mapping", new=AsyncMock(return_value=True)),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+        ):
+            await script_page.fill_form({})
+            fill_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fill_form_raises_for_all_file_form_when_mapping_empty(mock_scraped_page, mock_ai):
+    """0-mapped guard is unconditional - all-file forms also fall back to AI when mapping is empty,
+    since fill_from_mapping's post-fill heuristic match is unreliable enough to risk silent no-ops."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [
+            {"label": "resume", "type": "file", "selector": "#resume"},
+            {"label": "cover_letter", "type": "file", "selector": "#cl"},
+        ]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "validate_mapping", new=AsyncMock(return_value=True)),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+        ):
+            with pytest.raises(RuntimeError, match="mapped 0 of 2"):
+                await script_page.fill_form({"resume_url": "https://example.com/resume.pdf"})
+            fill_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_raises_when_zero_fields_mapped_with_data(mock_scraped_page, mock_ai):
+    """RuntimeError when a multi-page form has fillable fields and data but maps 0 fields."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [
+            {"label": "email", "type": "text", "tag": "input", "selector": "#email", "required": True},
+            {"label": "password", "type": "password", "tag": "input", "selector": "#password", "required": True},
+        ]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock()) as click_mock,
+        ):
+            with pytest.raises(RuntimeError, match="fill_multipage_form mapped 0 of 2"):
+                await script_page.fill_multipage_form({"username": "x@y.com", "user_pw": "secret"})
+
+            fill_mock.assert_not_called()
+            click_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_does_not_raise_when_data_is_empty(mock_scraped_page, mock_ai):
+    """Empty data can legitimately produce an empty multi-page mapping."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [{"label": "search", "type": "text", "tag": "input", "selector": "#q"}]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock(side_effect=Exception)),
+        ):
+            pages_filled = await script_page.fill_multipage_form({})
+
+            assert pages_filled == 1
+            fill_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_skips_unmapped_optional_intermediate_page(mock_scraped_page, mock_ai):
+    """Optional intermediate pages with no matching data should still advance."""
+    mock_page = create_mock_page()
+    mock_page.evaluate = AsyncMock(return_value=[])
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        first_page_fields = [{"label": "email", "type": "text", "tag": "input", "selector": "#email"}]
+        optional_page_fields = [
+            {
+                "label": "demographics",
+                "type": "radio_group",
+                "tag": "input",
+                "selector": "#demographics",
+                "required": False,
+            }
+        ]
+        final_page_fields = [{"label": "phone", "type": "text", "tag": "input", "selector": "#phone", "required": True}]
+
+        with (
+            patch.object(
+                script_page,
+                "extract_form_fields",
+                new=AsyncMock(
+                    side_effect=[
+                        first_page_fields,
+                        first_page_fields,
+                        optional_page_fields,
+                        optional_page_fields,
+                        final_page_fields,
+                        final_page_fields,
+                    ]
+                ),
+            ),
+            patch.object(
+                script_page, "dynamic_field_map", new=AsyncMock(side_effect=[{0: "x@y.com"}, {}, {0: "555-0100"}])
+            ),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock(side_effect=[None, None, Exception])) as click_mock,
+            patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new=AsyncMock()),
+        ):
+            pages_filled = await script_page.fill_multipage_form({"email": "x@y.com", "phone": "555-0100"})
+
+            assert pages_filled == 3
+            assert fill_mock.call_count == 3
+            assert click_mock.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_skips_unmapped_optional_first_page(mock_scraped_page, mock_ai):
+    """Optional first pages with no matching data should still advance to later pages."""
+    mock_page = create_mock_page()
+    mock_page.evaluate = AsyncMock(return_value=[])
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        optional_page_fields = [
+            {
+                "label": "referral source",
+                "type": "radio_group",
+                "tag": "input",
+                "selector": "#referral",
+                "required": False,
+            }
+        ]
+        second_page_fields = [
+            {"label": "email", "type": "text", "tag": "input", "selector": "#email", "required": True}
+        ]
+
+        with (
+            patch.object(
+                script_page,
+                "extract_form_fields",
+                new=AsyncMock(
+                    side_effect=[
+                        optional_page_fields,
+                        optional_page_fields,
+                        second_page_fields,
+                        second_page_fields,
+                    ]
+                ),
+            ),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(side_effect=[{}, {0: "x@y.com"}])),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock(side_effect=[None, Exception])) as click_mock,
+            patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new=AsyncMock()),
+        ):
+            pages_filled = await script_page.fill_multipage_form({"email": "x@y.com"})
+
+            assert pages_filled == 2
+            assert fill_mock.call_count == 2
+            assert click_mock.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_raises_when_unmapped_optional_page_cannot_advance(mock_scraped_page, mock_ai):
+    """An unmapped optional page must either advance or raise to avoid silent no-op success."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [
+            {
+                "label": "referral source",
+                "type": "radio_group",
+                "tag": "input",
+                "selector": "#referral",
+                "required": False,
+            }
+        ]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock(side_effect=Exception)) as click_mock,
+        ):
+            with pytest.raises(RuntimeError, match="could not advance"):
+                await script_page.fill_multipage_form({"email": "x@y.com"})
+
+            fill_mock.assert_called_once()
+            click_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_raises_when_unmapped_optional_page_stays_put(mock_scraped_page, mock_ai):
+    """An unmapped optional page must not count as skippable if the next click does not advance."""
+    mock_page = create_mock_page()
+    mock_page.evaluate = AsyncMock(return_value=[])
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [
+            {
+                "label": "referral source",
+                "type": "radio_group",
+                "tag": "input",
+                "selector": "#referral",
+                "required": False,
+            }
+        ]
+
+        with (
+            patch.object(
+                script_page,
+                "extract_form_fields",
+                new=AsyncMock(side_effect=[form_fields, form_fields, form_fields]),
+            ),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock()) as click_mock,
+            patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new=AsyncMock()),
+        ):
+            with pytest.raises(RuntimeError, match="next click did not advance"):
+                await script_page.fill_multipage_form({"email": "x@y.com"})
+
+            fill_mock.assert_called_once()
+            click_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fill_multipage_form_allows_unmapped_optional_file_page_to_stop(mock_scraped_page, mock_ai):
+    """Unmapped optional file pages may succeed through fill_from_mapping's URL fallback."""
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        form_fields = [
+            {
+                "label": "resume",
+                "type": "file",
+                "tag": "input",
+                "selector": "#resume",
+                "required": False,
+            }
+        ]
+
+        with (
+            patch.object(script_page, "extract_form_fields", new=AsyncMock(return_value=form_fields)),
+            patch.object(script_page, "dynamic_field_map", new=AsyncMock(return_value={})),
+            patch.object(script_page, "fill_from_mapping", new=AsyncMock()) as fill_mock,
+            patch.object(script_page, "click", new=AsyncMock(side_effect=Exception)) as click_mock,
+        ):
+            pages_filled = await script_page.fill_multipage_form({"resume_url": "https://example.com/resume.pdf"})
+
+            assert pages_filled == 1
+            fill_mock.assert_called_once()
+            click_mock.assert_called_once()

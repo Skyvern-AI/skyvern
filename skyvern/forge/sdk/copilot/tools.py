@@ -10,10 +10,11 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlparse
 
 import structlog
 import yaml
-from agents import function_tool
+from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData, function_tool
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
@@ -24,7 +25,12 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import (
+    POST_INTERMEDIATE_SUCCESS_NUDGE,
+    PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
+    TOTAL_TIMEOUT_SECONDS,
+    _goal_likely_needs_more_blocks,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
@@ -41,6 +47,11 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
+from skyvern.forge.sdk.copilot.output_policy import (
+    evaluate_output_policy,
+    format_output_policy_tool_error,
+    output_policy_verdict_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     build_run_blocks_response,
@@ -48,6 +59,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -61,6 +73,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -113,6 +126,9 @@ PER_TOOL_CALL_BUDGET_SECONDS = 240
 # false-positives on healthy runs.
 RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 
+# Reserve final-reply room; active block runs shrink their own budget near the deadline.
+COPILOT_FINAL_REPLY_RESERVE_SECONDS = 90
+
 # 5 s balances responsiveness (18 samples inside the stagnation window) against
 # DB load (240 polls worst case at the safety ceiling).
 RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
@@ -122,6 +138,7 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 # retrieved" warning cannot fire — each task adds a done-callback that logs
 # exceptions and removes itself from this set.
 _DETACHED_CLEANUP_TASKS: set[asyncio.Task] = set()
+_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 
 
 async def _cancel_run_task_if_not_final(
@@ -172,6 +189,170 @@ def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
     exc = task.exception() if task.done() and not task.cancelled() else None
     if exc is not None:
         LOG.warning("Detached cancel fallback failed", exc_info=exc)
+
+
+def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
+    found: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            found.extend(_CREDENTIAL_ID_RE.findall(item))
+        elif isinstance(item, dict):
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, (list, tuple, set)):
+            for nested in item:
+                visit(nested)
+        elif hasattr(item, "model_dump"):
+            try:
+                visit(item.model_dump(mode="json"))
+            except Exception:
+                return
+
+    visit(value)
+    return list(dict.fromkeys(found))
+
+
+def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[str]:
+    if not isinstance(parameters, list):
+        return []
+
+    found: list[str] = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+
+        parameter_type = str(parameter.get("parameter_type") or "").lower()
+        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+        if parameter_type == "credential":
+            found.extend(_extract_credential_ids_from_tool_value(parameter.get("credential_id")))
+        elif parameter_type == "workflow" and workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID.value:
+            found.extend(_extract_credential_ids_from_tool_value(parameter.get("default_value")))
+
+    return list(dict.fromkeys(found))
+
+
+def _workflow_definition_as_dict(workflow_definition: Any) -> dict[str, Any]:
+    if workflow_definition is None:
+        return {}
+    if isinstance(workflow_definition, dict):
+        return workflow_definition
+    if hasattr(workflow_definition, "model_dump"):
+        try:
+            dumped = workflow_definition.model_dump(mode="json")
+        except Exception:
+            return {}
+        return dumped if isinstance(dumped, dict) else {}
+    return {}
+
+
+def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -> list[str]:
+    definition = _workflow_definition_as_dict(workflow_definition)
+    return _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
+
+
+def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> list[str]:
+    if not workflow_yaml:
+        return []
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return []
+    return _extract_credential_ids_from_workflow_parameters(workflow_definition.get("parameters"))
+
+
+def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) -> str:
+    formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
+    id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
+    was_word = "was" if len(missing_credential_ids) == 1 else "were"
+    return (
+        f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
+        "Stop before creating, updating, or running the workflow. Ask the user to provide/select a valid "
+        "credential ID, create the credential in the Credentials UI and return with its ID, or explicitly "
+        "choose an unvalidated draft workflow that will not be run until credentials are available."
+    )
+
+
+def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    tool_context = data.context
+    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    if not raw_arguments:
+        LOG.warning(
+            "workflow YAML output policy guardrail received no tool arguments",
+            tool_name=getattr(tool_context, "tool_name", None),
+            tool_call_id=getattr(tool_context, "tool_call_id", None),
+        )
+    try:
+        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
+    except json.JSONDecodeError:
+        parsed_arguments = {}
+    tool_arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
+    workflow_yaml_value = tool_arguments.get("workflow_yaml")
+    workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
+    verdict = evaluate_output_policy(
+        request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=tool_arguments or raw_arguments,
+    )
+    trace_data = output_policy_verdict_to_trace_data(
+        verdict,
+        surface="tool_input",
+        tool_name=getattr(tool_context, "tool_name", None),
+    )
+    LOG.info("copilot output policy tool guardrail verdict", **trace_data)
+    if not verdict.allowed:
+        return ToolGuardrailFunctionOutput.reject_content(
+            format_output_policy_tool_error(verdict),
+            output_info=trace_data,
+        )
+    return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
+
+
+_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
+    guardrail_function=_workflow_yaml_output_policy_guardrail,
+    name="workflow_yaml_output_policy_guardrail",
+)
+
+
+async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
+    if not credential_ids:
+        return None
+    try:
+        existing_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+            credential_ids,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Copilot tool failed to validate credential IDs",
+            organization_id=ctx.organization_id,
+            credential_ids=credential_ids,
+            exc_info=True,
+        )
+        return (
+            "Credential ID validation failed, so the workflow cannot be created, updated, or run safely. "
+            "Ask the user to provide/select a valid credential ID or explicitly choose an unvalidated draft "
+            "workflow that will not be run until credentials are available."
+        )
+
+    found_ids = {credential.credential_id for credential in existing_credentials}
+    missing_ids = [credential_id for credential_id in credential_ids if credential_id not in found_ids]
+    if not missing_ids:
+        return None
+    return _missing_credential_reference_tool_error(missing_ids)
+
+
+async def _credential_reference_validation_error(value: Any, ctx: AgentContext) -> str | None:
+    if isinstance(value, str):
+        credential_ids = _extract_credential_ids_from_workflow_yaml(value)
+    else:
+        credential_ids = _extract_credential_ids_from_tool_value(value)
+    return await _credential_ids_validation_error(credential_ids, ctx)
 
 
 async def _safe_read_workflow_run(
@@ -246,6 +427,102 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
     was_per_tool_budget = getattr(copilot_ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
     if is_trusted_final or was_per_tool_budget:
         copilot_ctx.pending_reconciliation_run_id = None
+
+
+def _enum_or_string_name(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    if not isinstance(raw, str):
+        raw = getattr(value, "name", raw)
+    return str(raw).strip().lower()
+
+
+def _per_tool_budget_problem_label_set(ctx: Any) -> set[str]:
+    labels = getattr(ctx, "per_tool_budget_problem_block_labels", None)
+    if not isinstance(labels, list):
+        return set()
+    return {label for label in labels if isinstance(label, str) and label}
+
+
+def _record_per_tool_budget_problem_blocks_from_results(copilot_ctx: Any, result: dict[str, Any]) -> None:
+    if getattr(copilot_ctx, "last_failure_category_top", None) != PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        return
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return
+    pending_run_id = getattr(copilot_ctx, "pending_reconciliation_run_id", None)
+    resolved_run_id = data.get("workflow_run_id")
+    if isinstance(pending_run_id, str) and pending_run_id and resolved_run_id != pending_run_id:
+        return
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return
+
+    labels = _per_tool_budget_problem_label_set(copilot_ctx)
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if _enum_or_string_name(block.get("block_type")) != BlockType.NAVIGATION.value:
+            continue
+        if _enum_or_string_name(block.get("status")) not in _FAILED_BLOCK_STATUSES:
+            continue
+        label = block.get("label")
+        if isinstance(label, str) and label:
+            labels.add(label)
+    setattr(copilot_ctx, "per_tool_budget_problem_block_labels", sorted(labels))
+
+
+def _navigation_labels_in_workflow(workflow: Any) -> set[str]:
+    definition = getattr(workflow, "workflow_definition", None)
+    blocks = getattr(definition, "blocks", None)
+    if not isinstance(blocks, list):
+        return set()
+
+    labels: set[str] = set()
+    for block in blocks:
+        if _enum_or_string_name(getattr(block, "block_type", None)) != BlockType.NAVIGATION.value:
+            continue
+        label = getattr(block, "label", None)
+        if isinstance(label, str) and label:
+            labels.add(label)
+    return labels
+
+
+def _clear_resolved_per_tool_budget_problem_labels(copilot_ctx: Any, workflow: Any) -> None:
+    problem_labels = _per_tool_budget_problem_label_set(copilot_ctx)
+    if not problem_labels:
+        return
+    remaining = sorted(problem_labels & _navigation_labels_in_workflow(workflow))
+    setattr(copilot_ctx, "per_tool_budget_problem_block_labels", remaining)
+
+
+def _requested_block_label_set(arguments: dict[str, Any] | None) -> set[str] | None:
+    if not isinstance(arguments, dict):
+        return None
+    block_labels = arguments.get("block_labels")
+    if not isinstance(block_labels, list):
+        return None
+    return {label for label in block_labels if isinstance(label, str) and label}
+
+
+def _per_tool_budget_problem_rerun_error(ctx: Any, arguments: dict[str, Any] | None) -> str | None:
+    problem_labels = _per_tool_budget_problem_label_set(ctx)
+    if not problem_labels:
+        return None
+
+    requested_labels = _requested_block_label_set(arguments)
+    blocked_labels = problem_labels if not requested_labels else problem_labels & requested_labels
+    if not blocked_labels:
+        return None
+
+    labels = ", ".join(sorted(blocked_labels))
+    return (
+        "The prior PER_TOOL_BUDGET run's get_run_results showed navigation "
+        f"block(s) [{labels}] were canceled or failed while applying page state. "
+        "Do NOT rerun those block label(s) unchanged with run_blocks_and_collect_debug. "
+        "Update the workflow to split or replace the oversized navigation block first, "
+        "prefer a code or validation block for DOM/page-state verification, or run only "
+        "newly-created smaller block labels that apply one missing constraint at a time."
+    )
 
 
 # Streak threshold at which the copilot hard-aborts a tool call because the
@@ -388,6 +665,55 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
+def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
+    started_at = getattr(ctx, "copilot_run_start_monotonic", None)
+    if not isinstance(started_at, int | float):
+        return None
+    return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
+
+
+def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
+    remaining = _copilot_seconds_remaining(ctx)
+    if remaining is None:
+        return PER_TOOL_CALL_BUDGET_SECONDS
+    remaining_after_reply_reserve = remaining - COPILOT_FINAL_REPLY_RESERVE_SECONDS
+    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining_after_reply_reserve)))
+
+
+def _late_block_running_call_error(ctx: AgentContext) -> str | None:
+    remaining = _copilot_seconds_remaining(ctx)
+    if remaining is None or remaining > COPILOT_FINAL_REPLY_RESERVE_SECONDS:
+        return None
+
+    last_failed_workflow_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
+    last_good_workflow_yaml = getattr(ctx, "last_good_workflow_yaml", None)
+    if (
+        isinstance(last_failed_workflow_yaml, str)
+        and last_failed_workflow_yaml
+        and isinstance(last_good_workflow_yaml, str)
+        and last_good_workflow_yaml
+    ):
+        return (
+            f"Wall-clock budget too low to retry: about {int(max(0.0, remaining))}s remain of the "
+            f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified workflow exists from before the failure. "
+            "Do NOT call update_and_run_blocks or run_blocks_and_collect_debug again. REPLY now: summarize "
+            "what worked, name the block that failed, and tell the user they can keep the verified prefix or discard."
+        )
+
+    if isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
+        return (
+            f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn "
+            "after the previous workflow run failed. Do NOT retry block-running tools; reply to the user "
+            "with the failure evidence gathered so far and make clear that any draft workflow is unverified."
+        )
+
+    return (
+        f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn. "
+        "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
+        "progress gathered so far, and make clear which parts have not been verified end-to-end."
+    )
+
+
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:
@@ -428,6 +754,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 f"side effects on live sites."
             )
 
+        if tool_name == "run_blocks_and_collect_debug":
+            budget_rerun_error = _per_tool_budget_problem_rerun_error(ctx, arguments)
+            if budget_rerun_error is not None:
+                return budget_rerun_error
+
         streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
         streak = streak_raw if isinstance(streak_raw, int) else 0
         if streak >= REPEATED_ACTION_STREAK_ABORT_AT:
@@ -457,26 +788,28 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 "explaining the failure and asking them to verify the URL."
             )
 
-        # Gate on ``last_failed_workflow_yaml`` (sticky across
-        # ``update_workflow``) rather than ``last_test_ok``: otherwise the
-        # agent can sandwich an ``update_workflow`` call between the failure
-        # and the retry to clear ``last_test_ok=None`` and slip past.
-        start_ts = getattr(ctx, "copilot_run_start_monotonic", None)
-        last_failed_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
-        last_good_yaml = getattr(ctx, "last_good_workflow_yaml", None)
-        if start_ts is not None and last_failed_yaml and last_good_yaml:
-            remaining = TOTAL_TIMEOUT_SECONDS - (time.monotonic() - start_ts)
-            if remaining < PER_TOOL_CALL_BUDGET_SECONDS:
-                return (
-                    f"Wall-clock budget too low to retry: about "
-                    f"{int(max(0.0, remaining))}s remain of the "
-                    f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified "
-                    "workflow exists from before the failure. Do NOT call "
-                    "update_and_run_blocks or run_blocks_and_collect_debug "
-                    "again. REPLY now: summarize what worked, name the "
-                    "block that failed, and tell the user they can keep "
-                    "the verified prefix or discard."
-                )
+        late_block_running_error = _late_block_running_call_error(ctx)
+        if late_block_running_error is not None:
+            return late_block_running_error
+    return None
+
+
+def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+    policy = getattr(ctx, "request_policy", None)
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if tool_name == "update_workflow" and not policy.allow_update_workflow:
+        return (
+            "Request policy blocks workflow updates for the latest user message. "
+            "Ask the user for safe stored credential metadata instead."
+        )
+    if tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
+        if policy.testing_intent == "skip_test":
+            return "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+        return (
+            "Request policy blocks block-running tools for the latest user message. "
+            "Ask the user for the required safe credential or clarification before testing."
+        )
     return None
 
 
@@ -555,8 +888,40 @@ def _parameter_binding_invariant_error(
     )
 
 
-async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+async def _update_workflow(
+    params: dict[str, Any],
+    ctx: AgentContext,
+    *,
+    allow_missing_credentials: bool | None = None,
+) -> dict[str, Any]:
+    policy_error = _request_policy_tool_error(ctx, "update_workflow")
+    if policy_error is not None:
+        return {"ok": False, "error": policy_error}
+
     workflow_yaml = params["workflow_yaml"]
+    if allow_missing_credentials is None:
+        allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
+    if not allow_missing_credentials:
+        credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
+        if credential_error is not None:
+            return {"ok": False, "error": credential_error}
+
+    output_policy_verdict = evaluate_output_policy(
+        request_policy=getattr(ctx, "request_policy", None),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=params,
+    )
+    if not output_policy_verdict.allowed:
+        LOG.info(
+            "copilot output policy tool body verdict",
+            **output_policy_verdict_to_trace_data(
+                output_policy_verdict,
+                surface="tool_body",
+                tool_name="update_workflow",
+            ),
+        )
+        return {"ok": False, "error": format_output_policy_tool_error(output_policy_verdict)}
+
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
     # LLM actually saw, not the turn-start persisted state.
@@ -566,6 +931,10 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
     if stale_metadata:
         return {"ok": False, "error": _stale_block_metadata_message(stale_metadata)}
 
+    wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
+    if wait_block_error:
+        return {"ok": False, "error": wait_block_error}
+
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
     # schema; this safety net fires regardless of emission path. Label-based
@@ -574,6 +943,21 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
         return {"ok": False, "error": _banned_block_reject_message(banned_items)}
+
+    goto_url_state_shortcuts = _detect_unverified_goto_url_state_shortcuts(workflow_yaml)
+    if goto_url_state_shortcuts:
+        _record_goto_url_state_shortcut_reject_span("_update_workflow", goto_url_state_shortcuts)
+        return {"ok": False, "error": _goto_url_state_shortcut_message(goto_url_state_shortcuts)}
+
+    navigation_url_search_setups = _detect_navigation_url_stable_search_setups(workflow_yaml)
+    if navigation_url_search_setups:
+        _record_navigation_url_stable_search_reject_span("_update_workflow", navigation_url_search_setups)
+        return {"ok": False, "error": _navigation_url_stable_search_message(navigation_url_search_setups)}
+
+    stable_search_drips = _detect_click_driven_stable_search_drips(workflow_yaml)
+    if stable_search_drips:
+        _record_goto_url_stable_search_drip_reject_span("_update_workflow", stable_search_drips)
+        return {"ok": False, "error": _goto_url_stable_search_drip_message(stable_search_drips)}
     try:
         workflow = _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
@@ -581,6 +965,7 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml,
         )
+        _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
         created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
 
@@ -593,6 +978,7 @@ async def _update_workflow(params: dict[str, Any], ctx: AgentContext) -> dict[st
             proxy_location=workflow.proxy_location,
             webhook_callback_url=workflow.webhook_callback_url,
             persist_browser_session=workflow.persist_browser_session,
+            browser_profile_id=workflow.browser_profile_id,
             model=workflow.model,
             max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
             extra_http_headers=workflow.extra_http_headers,
@@ -1429,6 +1815,16 @@ async def _run_blocks_and_collect_debug(
     if not workflow:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
 
+    credential_ids = list(
+        dict.fromkeys(
+            _extract_credential_ids_from_tool_value(params.get("parameters") or {})
+            + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
+        )
+    )
+    credential_error = await _credential_ids_validation_error(credential_ids, ctx)
+    if credential_error is not None:
+        return {"ok": False, "error": credential_error}
+
     for label in block_labels:
         if not workflow.get_output_parameter(label):
             return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
@@ -1563,7 +1959,7 @@ async def _run_blocks_and_collect_debug(
     # indefinitely.
     budget_exit_reason: WatchdogExitReason
     if stagnation_enabled:
-        budget_seconds = max(1, PER_TOOL_CALL_BUDGET_SECONDS)
+        budget_seconds = _active_block_run_budget_seconds(ctx)
         budget_exit_reason = "per_tool_budget"
     else:
         budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
@@ -1930,6 +2326,142 @@ _COPILOT_BANNED_BLOCK_ALTERNATIVES = (
     "`login` for authentication, or `goto_url` for pure URL navigation."
 )
 
+_GOTO_URL_DYNAMIC_STATE_KEY_TOKENS = frozenset(
+    {
+        "attr",
+        "attribute",
+        "category",
+        "constraint",
+        "criteria",
+        "criterion",
+        "facet",
+        "filter",
+        "option",
+        "refine",
+        "refinement",
+        "selected",
+        "selection",
+        "toggle",
+    }
+)
+_GOTO_URL_DYNAMIC_STATE_VALUE_TOKENS = frozenset(
+    {
+        "facet",
+        "filter",
+        "refine",
+        "refinement",
+        "selected",
+        "selection",
+    }
+)
+_GOTO_URL_VERIFICATION_BLOCK_TYPES = frozenset({"code", "navigation", "validation"})
+_GOTO_URL_DATA_PRODUCING_BLOCK_TYPES = frozenset({"extraction", "text_prompt"})
+_GOTO_URL_STATE_ACTION_TOKENS = frozenset(
+    {
+        "apply",
+        "check",
+        "choose",
+        "click",
+        "confirm",
+        "confirmed",
+        "ensure",
+        "inspect",
+        "observe",
+        "select",
+        "set",
+        "verify",
+        "verified",
+        "verifies",
+        "verifying",
+    }
+)
+_GOTO_URL_STATE_EVIDENCE_TOKENS = frozenset(
+    {
+        "active",
+        "aria",
+        "checked",
+        "checkbox",
+        "chip",
+        "constraint",
+        "control",
+        "criteria",
+        "criterion",
+        "dom",
+        "facet",
+        "filter",
+        "form",
+        "input",
+        "option",
+        "selected",
+        "state",
+        "url",
+        "value",
+    }
+)
+_GOTO_URL_CODE_EVIDENCE_TOKENS = frozenset(
+    {
+        "all_text_contents",
+        "attribute",
+        "contents",
+        "evaluate",
+        "inner_text",
+        "locator",
+        "query",
+        "query_selector",
+        "selector",
+        "text",
+        "text_content",
+    }
+)
+_GOTO_URL_DISMISSAL_TOKENS = frozenset({"banner", "cookie", "cookies", "dismiss", "modal", "popup", "popups"})
+_GOTO_URL_SEARCH_SETUP_ACTION_TOKENS = frozenset(
+    {
+        "choose",
+        "enter",
+        "fill",
+        "input",
+        "pick",
+        "select",
+        "set",
+        "type",
+    }
+)
+_GOTO_URL_SEARCH_SETUP_CONTEXT_TOKENS = frozenset(
+    {
+        "calendar",
+        "checkout",
+        "checkin",
+        "date",
+        "dates",
+        "find",
+        "lookup",
+        "query",
+        "search",
+    }
+)
+_GOTO_URL_SEARCH_SETUP_TERMINAL_TOKENS = frozenset(
+    {
+        "active",
+        "checked",
+        "checkbox",
+        "chip",
+        "constraint",
+        "control",
+        "dom",
+        "extract",
+        "extraction",
+        "facet",
+        "filter",
+        "result",
+        "results",
+        "verified",
+        "verify",
+    }
+)
+_GOTO_URL_STRUCTURAL_STATE_SPLIT_RE = re.compile(r"[;|]")
+_GOTO_URL_STRUCTURAL_ASSIGNMENT_LHS_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_GOTO_URL_VALUE_SCHEME_RE = re.compile(r"^\s*[a-z][a-z0-9+.-]*:", re.IGNORECASE)
+
 
 def _banned_block_reject_message(items: list[tuple[str, str]]) -> str:
     """Uniform error text for the post-emission reject, sharing the
@@ -1953,6 +2485,79 @@ def _record_banned_block_reject_span(source_tool: str, items: list[tuple[str, st
             "labels": [label for label, _ in items],
             "block_types": sorted({block_type for _, block_type in items}),
             "source_tool": source_tool,
+        },
+    ):
+        pass
+
+
+def _proxy_location_trace_value(proxy_location: Any) -> Any:
+    if proxy_location is None:
+        return None
+    if hasattr(proxy_location, "value"):
+        return proxy_location.value
+    if hasattr(proxy_location, "model_dump"):
+        return proxy_location.model_dump(mode="json")
+    return proxy_location
+
+
+def _raw_yaml_proxy_location(workflow_yaml: str) -> tuple[bool, Any]:
+    try:
+        parsed_yaml = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return False, None
+
+    if not isinstance(parsed_yaml, dict) or "proxy_location" not in parsed_yaml:
+        return False, None
+    return True, _proxy_location_trace_value(parsed_yaml.get("proxy_location"))
+
+
+def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:
+    input_present, input_proxy_location = _raw_yaml_proxy_location(workflow_yaml)
+    effective_proxy_location = _proxy_location_trace_value(workflow.proxy_location)
+    with copilot_span(
+        "workflow_proxy_location_normalized",
+        data={
+            "input_proxy_location_present": input_present,
+            "input_proxy_location": input_proxy_location,
+            "effective_proxy_location": effective_proxy_location,
+        },
+    ):
+        pass
+
+
+def _record_goto_url_state_shortcut_reject_span(source_tool: str, items: list[dict[str, Any]]) -> None:
+    with copilot_span(
+        "goto_url_state_shortcut_reject",
+        data={
+            "source_tool": source_tool,
+            "items": items,
+            "labels": [item.get("label") for item in items],
+            "dynamic_state_keys": sorted({key for item in items for key in item.get("dynamic_state_keys", [])}),
+        },
+    ):
+        pass
+
+
+def _record_goto_url_stable_search_drip_reject_span(source_tool: str, items: list[dict[str, Any]]) -> None:
+    with copilot_span(
+        "goto_url_stable_search_drip_reject",
+        data={
+            "source_tool": source_tool,
+            "items": items,
+            "entry_labels": [item.get("entry_label") for item in items],
+            "navigation_labels": [item.get("navigation_labels", []) for item in items],
+        },
+    ):
+        pass
+
+
+def _record_navigation_url_stable_search_reject_span(source_tool: str, items: list[dict[str, Any]]) -> None:
+    with copilot_span(
+        "navigation_url_stable_search_reject",
+        data={
+            "source_tool": source_tool,
+            "items": items,
+            "labels": [item.get("label") for item in items],
         },
     ):
         pass
@@ -2002,6 +2607,384 @@ def _parse_workflow_blocks(yaml_str: str | None) -> list[Any] | None:
     return blocks if isinstance(blocks, list) else None
 
 
+def _normalized_query_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _query_token_parts(value: str) -> set[str]:
+    parts: set[str] = set()
+    for part in value.split("_"):
+        if not part:
+            continue
+        parts.add(part)
+        if len(part) > 3 and part.endswith("s"):
+            parts.add(part[:-1])
+    return parts
+
+
+def _is_dynamic_state_query_key(key: str) -> bool:
+    return bool(_query_token_parts(key) & _GOTO_URL_DYNAMIC_STATE_KEY_TOKENS)
+
+
+def _is_dynamic_state_query_value(value: str) -> bool:
+    return bool(_query_token_parts(value) & _GOTO_URL_DYNAMIC_STATE_VALUE_TOKENS)
+
+
+def _is_url_like_query_value(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("/") or _GOTO_URL_VALUE_SCHEME_RE.match(stripped):
+        return True
+    first_equals = stripped.find("=")
+    first_query = stripped.find("?")
+    return first_query != -1 and (first_equals == -1 or first_query < first_equals)
+
+
+def _assignment_lhs(clause: str) -> str | None:
+    if "=" not in clause:
+        return None
+    lhs, rhs = clause.split("=", 1)
+    lhs = lhs.strip()
+    if not lhs or not rhs.strip():
+        return None
+    if not _GOTO_URL_STRUCTURAL_ASSIGNMENT_LHS_RE.fullmatch(lhs):
+        return None
+    return _normalized_query_token(lhs)
+
+
+def _is_structural_dynamic_state_query_value(value: str, outer_key: str) -> bool:
+    if not value or _is_url_like_query_value(value):
+        return False
+
+    clauses = [clause.strip() for clause in _GOTO_URL_STRUCTURAL_STATE_SPLIT_RE.split(value) if clause.strip()]
+    if not clauses:
+        return False
+
+    assignment_lhses = [lhs for lhs in (_assignment_lhs(clause) for clause in clauses) if lhs is not None]
+    if len(assignment_lhses) >= 2:
+        return True
+    if len(assignment_lhses) == 1 and assignment_lhses[0] != outer_key:
+        return True
+    return False
+
+
+def _dynamic_state_query_keys(url: Any) -> list[str]:
+    if not isinstance(url, str) or not url:
+        return []
+    try:
+        pairs = parse_qsl(urlparse(url).query, keep_blank_values=True)
+    except ValueError:
+        return []
+    if not pairs:
+        return []
+
+    normalized_pairs = [(_normalized_query_token(key), _normalized_query_token(value), value) for key, value in pairs]
+    key_counts = Counter(key for key, _, _ in normalized_pairs if key)
+    dynamic_keys: set[str] = set()
+    for key, value, raw_value in normalized_pairs:
+        if not key:
+            continue
+        if _is_structural_dynamic_state_query_value(raw_value, key):
+            dynamic_keys.add(key)
+        elif _is_dynamic_state_query_key(key):
+            dynamic_keys.add(key)
+        elif key_counts[key] > 1:
+            dynamic_keys.add(key)
+        elif _is_dynamic_state_query_value(value):
+            dynamic_keys.add(key)
+    return sorted(dynamic_keys)
+
+
+def _block_label_from_yaml(block: dict[str, Any]) -> str | None:
+    label = block.get("label")
+    return label if isinstance(label, str) and label else None
+
+
+def _next_top_level_block(
+    *,
+    blocks: list[dict[str, Any]],
+    by_label: dict[str, dict[str, Any]],
+    index_by_label: dict[str, int],
+    current: dict[str, Any],
+) -> dict[str, Any] | None:
+    next_label = current.get("next_block_label")
+    if isinstance(next_label, str) and next_label:
+        return by_label.get(next_label)
+
+    label = _block_label_from_yaml(current)
+    if label is None:
+        return None
+    index = index_by_label.get(label)
+    if index is None:
+        return None
+    if index + 1 >= len(blocks):
+        return None
+    return blocks[index + 1]
+
+
+def _next_data_block_without_verification(
+    *,
+    blocks: list[dict[str, Any]],
+    by_label: dict[str, dict[str, Any]],
+    index_by_label: dict[str, int],
+    start: dict[str, Any],
+) -> dict[str, Any] | None:
+    seen: set[str] = set()
+    current = start
+    while True:
+        next_block = _next_top_level_block(
+            blocks=blocks,
+            by_label=by_label,
+            index_by_label=index_by_label,
+            current=current,
+        )
+        if next_block is None:
+            return None
+        current = next_block
+
+        label = _block_label_from_yaml(current)
+        if label is not None:
+            if label in seen:
+                return None
+            seen.add(label)
+
+        block_type = str(current.get("block_type", "")).strip().lower()
+        if _block_verifies_dynamic_goto_url_state(current):
+            return None
+        if block_type in _GOTO_URL_DATA_PRODUCING_BLOCK_TYPES:
+            return current
+
+
+def _block_state_text(block: dict[str, Any]) -> str:
+    values = []
+    for key in (
+        "navigation_goal",
+        "complete_criterion",
+        "terminate_criterion",
+        "validation_goal",
+        "code",
+        "description",
+        "title",
+    ):
+        value = block.get(key)
+        if isinstance(value, str):
+            values.append(value)
+    return _normalized_query_token(" ".join(values))
+
+
+def _block_primary_goal_text(block: dict[str, Any]) -> str:
+    for key in ("navigation_goal", "validation_goal", "code", "description", "title"):
+        value = block.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        first_fence = value.find("```")
+        if first_fence == -1:
+            return _normalized_query_token(value)
+        second_fence = value.find("```", first_fence + 3)
+        if second_fence != -1:
+            fenced = value[first_fence + 3 : second_fence].strip()
+            if fenced:
+                return _normalized_query_token(fenced)
+        return _normalized_query_token(value)
+    return ""
+
+
+def _block_verifies_dynamic_goto_url_state(block: dict[str, Any]) -> bool:
+    block_type = str(block.get("block_type", "")).strip().lower()
+    if block_type not in _GOTO_URL_VERIFICATION_BLOCK_TYPES:
+        return False
+
+    parts = _query_token_parts(_block_state_text(block))
+    if not parts:
+        return False
+
+    has_state_evidence = bool(parts & _GOTO_URL_STATE_EVIDENCE_TOKENS)
+    if block_type == "code":
+        return has_state_evidence and bool(parts & _GOTO_URL_CODE_EVIDENCE_TOKENS)
+    if block_type == "validation":
+        return has_state_evidence
+    if parts & _GOTO_URL_DISMISSAL_TOKENS and not parts & {"active", "checked", "selected"}:
+        return False
+    return has_state_evidence and bool(parts & _GOTO_URL_STATE_ACTION_TOKENS)
+
+
+def _is_stable_search_setup_navigation(block: dict[str, Any]) -> bool:
+    if str(block.get("block_type", "")).strip().lower() != "navigation":
+        return False
+
+    parts = _query_token_parts(_block_primary_goal_text(block))
+    if not parts:
+        return False
+    if parts & _GOTO_URL_SEARCH_SETUP_TERMINAL_TOKENS:
+        return False
+    return bool(parts & _GOTO_URL_SEARCH_SETUP_ACTION_TOKENS) and bool(parts & _GOTO_URL_SEARCH_SETUP_CONTEXT_TOKENS)
+
+
+def _detect_navigation_url_stable_search_setups(workflow_yaml: str | None) -> list[dict[str, Any]]:
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if not blocks:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if not isinstance(block.get("url"), str) or not block["url"].strip():
+            continue
+        if not _is_stable_search_setup_navigation(block):
+            continue
+        findings.append(
+            {
+                "label": _block_label_from_yaml(block) or "<missing label>",
+                "url": block["url"],
+            }
+        )
+    return findings
+
+
+def _detect_click_driven_stable_search_drips(workflow_yaml: str | None) -> list[dict[str, Any]]:
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if not blocks:
+        return []
+
+    top_level_blocks = [block for block in blocks if isinstance(block, dict)]
+    findings: list[dict[str, Any]] = []
+    entry_label: str | None = None
+    stable_nav_labels: list[str] = []
+
+    for block in top_level_blocks:
+        block_type = str(block.get("block_type", "")).strip().lower()
+        label = _block_label_from_yaml(block) or "<missing label>"
+
+        if block_type == "goto_url":
+            entry_label = label
+            stable_nav_labels = []
+            continue
+
+        if entry_label is None:
+            continue
+
+        if block_type in {"code", "validation"}:
+            stable_nav_labels = []
+            continue
+
+        if block_type in _GOTO_URL_DATA_PRODUCING_BLOCK_TYPES:
+            entry_label = None
+            stable_nav_labels = []
+            continue
+
+        if _is_stable_search_setup_navigation(block):
+            stable_nav_labels.append(label)
+            if len(stable_nav_labels) >= 2:
+                findings.append(
+                    {
+                        "entry_label": entry_label,
+                        "navigation_labels": stable_nav_labels.copy(),
+                    }
+                )
+                entry_label = None
+                stable_nav_labels = []
+            continue
+
+    return findings
+
+
+def _detect_unverified_goto_url_state_shortcuts(workflow_yaml: str | None) -> list[dict[str, Any]]:
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if not blocks:
+        return []
+
+    top_level_blocks = [block for block in blocks if isinstance(block, dict)]
+    by_label: dict[str, dict[str, Any]] = {}
+    index_by_label: dict[str, int] = {}
+    for index, block in enumerate(top_level_blocks):
+        label = _block_label_from_yaml(block)
+        if label is None:
+            continue
+        by_label[label] = block
+        index_by_label[label] = index
+
+    findings: list[dict[str, Any]] = []
+    for block in top_level_blocks:
+        if str(block.get("block_type", "")).strip().lower() != "goto_url":
+            continue
+        dynamic_state_keys = _dynamic_state_query_keys(block.get("url"))
+        if not dynamic_state_keys:
+            continue
+        next_data_block = _next_data_block_without_verification(
+            blocks=top_level_blocks,
+            by_label=by_label,
+            index_by_label=index_by_label,
+            start=block,
+        )
+        if next_data_block is None:
+            continue
+        findings.append(
+            {
+                "label": _block_label_from_yaml(block) or "<missing label>",
+                "dynamic_state_keys": dynamic_state_keys,
+                "next_data_block_label": _block_label_from_yaml(next_data_block) or "<missing label>",
+            }
+        )
+    return findings
+
+
+_GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT = 5
+
+
+def _goto_url_state_shortcut_message(items: list[dict[str, Any]]) -> str:
+    details = []
+    for item in items[:_GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT]:
+        label = item.get("label", "?")
+        keys = ", ".join(str(key) for key in item.get("dynamic_state_keys", []))
+        next_label = item.get("next_data_block_label", "?")
+        details.append(f"{label}: query keys [{keys}] feed directly into {next_label}")
+    if len(items) > _GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT:
+        details.append(f"(and {len(items) - _GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT} more)")
+    return (
+        "Workflow validation failed: goto_url may bootstrap stable page state, but URL-encoded dynamic page "
+        "state must be verified from the live page before data extraction. Add a code, validation, or navigation block "
+        "between the URL shortcut and extraction that inspects active chips, checked controls, search fields, "
+        "or DOM/link/form evidence; applies any missing state through UI actions when needed; and verifies all "
+        "requested constraints are active together. Offending shortcuts: "
+        f"{'; '.join(details)}"
+    )
+
+
+def _goto_url_stable_search_drip_message(items: list[dict[str, Any]]) -> str:
+    details = []
+    for item in items[:_GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT]:
+        entry_label = item.get("entry_label", "?")
+        labels = ", ".join(str(label) for label in item.get("navigation_labels", []))
+        details.append(f"{entry_label}: click-driven stable search setup blocks [{labels}]")
+    if len(items) > _GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT:
+        details.append(f"(and {len(items) - _GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT} more)")
+    return (
+        "Workflow validation failed: after a goto_url entry page, do not build stateful search setup as one "
+        "click-driven navigation block per stable field. Use observed same-site evidence from the live page "
+        "(current URL, form action, field names/values, result links, or URL deltas) to bootstrap stable search "
+        "state with goto_url, or insert a short code/validation block that inspects the DOM and verifies/navigates "
+        "the stable results page. Reserve click-driven navigation for missing dynamic state or when URL/form "
+        f"evidence is insufficient. Offending sequence: {'; '.join(details)}"
+    )
+
+
+def _navigation_url_stable_search_message(items: list[dict[str, Any]]) -> str:
+    details = []
+    for item in items[:_GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT]:
+        details.append(f"{item.get('label', '?')}: navigation url={item.get('url', '?')}")
+    if len(items) > _GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT:
+        details.append(f"(and {len(items) - _GOTO_URL_STATE_SHORTCUT_MESSAGE_LIMIT} more)")
+    return (
+        "Workflow validation failed: a navigation block with a URL is combining entry-page navigation with "
+        "stable search setup. Split pure page loading into a goto_url block first. Then use observed same-site "
+        "evidence (current URL, form action, field names/values, result links, or URL deltas) to bootstrap "
+        "stable search state with goto_url, or add a short code/validation block to inspect the DOM before "
+        f"click-driven setup. Offending blocks: {'; '.join(details)}"
+    )
+
+
 def _detect_new_banned_blocks(
     submitted_yaml: str,
     prior_workflow_yaml: str | None,
@@ -2029,6 +3012,65 @@ def _detect_new_banned_blocks(
     prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
     prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [])}
     return [(label, block_type) for label, block_type in submitted_items if label not in prior_labels]
+
+
+_CHALLENGE_WAIT_PATTERN = re.compile(
+    r"\b(anti[-_\s]?bot|bot[-_\s]?block|captcha|challenge|cloudflare|ip[-_\s]?block|waf)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_confirmed_waf_or_site_block(ctx: Any) -> bool:
+    if getattr(ctx, "last_test_anti_bot", None):
+        return True
+    return _get_int_attr(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+
+
+def _get_int_attr(ctx: Any, name: str, default: int = 0) -> int:
+    value = getattr(ctx, name, default)
+    return value if isinstance(value, int) else default
+
+
+def _block_challenge_wait_text(block: dict[str, Any]) -> str:
+    values = []
+    for key in ("label", "title", "description", "navigation_goal", "complete_criterion"):
+        value = block.get(key)
+        if isinstance(value, str):
+            values.append(value)
+    return " ".join(values)
+
+
+def _detect_timing_only_challenge_wait_blocks(submitted_yaml: str | None) -> list[str]:
+    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
+    if submitted_blocks is None:
+        return []
+    labels: list[str] = []
+    for block in _iter_yaml_blocks(submitted_blocks):
+        raw_type = block.get("block_type")
+        if not isinstance(raw_type, str) or raw_type.strip().lower() != "wait":
+            continue
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        if _CHALLENGE_WAIT_PATTERN.search(_block_challenge_wait_text(block)):
+            labels.append(label)
+    return labels
+
+
+def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | None) -> str | None:
+    if not _has_confirmed_waf_or_site_block(ctx):
+        return None
+    labels = _detect_timing_only_challenge_wait_blocks(submitted_yaml)
+    if not labels:
+        return None
+    labels_text = ", ".join(sorted(set(labels)))
+    return (
+        "Workflow validation failed: timing-only challenge wait blocks are not allowed after confirmed "
+        "anti-bot/WAF or repeated site-block evidence. "
+        f"Offending labels: [{labels_text}]. "
+        "Do not add wait/delay-only blocks for this blocker; use a conditional challenge check that takes a "
+        "real action, try a materially different proxy/source if allowed, or stop and explain the blocker."
+    )
 
 
 async def _get_block_schema_pre_hook(
@@ -2372,7 +3414,9 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
 
     wf = result["_workflow"]
     copilot_ctx.last_workflow = wf
+    _clear_resolved_per_tool_budget_problem_labels(copilot_ctx, wf)
     copilot_ctx.last_workflow_yaml = copilot_ctx.workflow_yaml or None
+    copilot_ctx.effective_workflow_proxy_location = getattr(wf, "proxy_location", None) or ProxyLocation.RESIDENTIAL
     data = result.get("data")
     if isinstance(data, dict):
         block_count = data.get("block_count")
@@ -2392,6 +3436,33 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     # workflow itself changes — without this clear, a user who fixes the bug
     # via update_workflow gets a LOOP DETECTED on the next legitimate run.
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
+
+
+def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
+    block_count = getattr(copilot_ctx, "last_update_block_count", None)
+    if not isinstance(block_count, int):
+        return None
+
+    user_message = getattr(copilot_ctx, "user_message", "")
+    request_policy = getattr(copilot_ctx, "request_policy", None)
+    completion_contract = getattr(request_policy, "completion_contract", None)
+    if isinstance(completion_contract, str):
+        completion_contract = completion_contract.strip() or None
+    else:
+        completion_contract = None
+
+    if not _goal_likely_needs_more_blocks(user_message, block_count, completion_contract):
+        return None
+
+    nudge_count = getattr(copilot_ctx, "coverage_nudge_count", 0)
+    if nudge_count >= 1:
+        return None
+    copilot_ctx.coverage_nudge_count = nudge_count + 1
+    return (
+        f"{POST_INTERMEDIATE_SUCCESS_NUDGE} The workflow was saved with {block_count} block"
+        f"{'' if block_count == 1 else 's'}, but it has not been run because the request-policy "
+        "completion contract still leaves distinct requested actions uncovered."
+    )
 
 
 def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
@@ -2587,7 +3658,10 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     update_repeated_failure_state(copilot_ctx, result)
 
 
-@function_tool(name_override="update_workflow")
+@function_tool(
+    name_override="update_workflow",
+    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
+)
 async def update_workflow_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
@@ -2595,6 +3669,19 @@ async def update_workflow_tool(
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
     Returns the validated workflow or validation errors.
+
+    If a `goto_url` URL encodes dynamic page state, do not wire it
+    directly to extraction. Add a `code`, `validation`, or `navigation` block
+    first that verifies the live page state from active chips, checked controls,
+    fields, or DOM/link/form evidence.
+
+    After a `goto_url` entry page for a stateful search, do not add one
+    click-driven `navigation` block per stable field (query terms, dates,
+    search-form inputs). Use observed current URL / form action / field
+    names / result links / URL deltas to bootstrap stable search state with
+    `goto_url`, or add a short `code`/`validation` block to inspect the DOM.
+    Do not bypass this by combining a URL and stable search setup in a
+    `navigation` block; split pure loading into `goto_url` first.
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml}
@@ -2603,7 +3690,11 @@ async def update_workflow_tool(
         return json.dumps({"ok": False, "error": loop_error})
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow(arguments, copilot_ctx)
+        result = await _update_workflow(
+            arguments,
+            copilot_ctx,
+            allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
+        )
         _record_workflow_update_result(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
@@ -2676,6 +3767,11 @@ async def run_blocks_tool(
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
 
+    For a diagnostic / observational complaint about the current workflow,
+    this tool is not the first response. Follow the system prompt's
+    inspect-and-clarify path first: inspect current workflow context and
+    existing run evidence before deciding whether a fresh run is needed.
+
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
     supplied concrete non-secret values in their message (names, emails, IDs),
@@ -2686,9 +3782,19 @@ async def run_blocks_tool(
     the stored `credential_id`. If no stored credential matches, do NOT pass
     the inline value via `parameters`; stop and follow the CREDENTIAL
     HANDLING refusal rule in the system prompt.
+
+    When a prior `goto_url` used URL params for dynamic page state, the
+    blocks you run must include live-page verification before extraction. If
+    the visible state is uncertain or only partially applied, inspect it
+    through a `code` or `validation` block, or apply missing state through a
+    `navigation` block, instead of retrying guessed URL params.
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
+    policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if policy_error:
+        return json.dumps({"ok": False, "error": policy_error})
+
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -2743,6 +3849,7 @@ async def get_run_results_tool(
         return json.dumps({"ok": False, "error": loop_error})
 
     result = await _get_run_results(params, copilot_ctx)
+    _record_per_tool_budget_problem_blocks_from_results(copilot_ctx, result)
     _maybe_clear_reconciliation_flag(copilot_ctx, result)
     record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
 
@@ -2754,6 +3861,7 @@ async def get_run_results_tool(
     name_override="update_and_run_blocks",
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
+    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
@@ -2765,6 +3873,11 @@ async def update_and_run_blocks_tool(
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
 
+    For a diagnostic / observational complaint about the current workflow,
+    this tool is not the first response. Follow the system prompt's
+    inspect-and-clarify path first, and only update/run when the user asked
+    for an edit or the inspected evidence makes the correction clear.
+
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
     supplied concrete non-secret values in their message (names, emails, IDs),
@@ -2775,9 +3888,28 @@ async def update_and_run_blocks_tool(
     the stored `credential_id`. If no stored credential matches, do NOT pass
     the inline value via `parameters`; stop and follow the CREDENTIAL
     HANDLING refusal rule in the system prompt.
+
+    Treat `goto_url` as a bootstrap for stateful search/result pages. If URL query
+    params encode dynamic page state, include a `code`, `validation`, or
+    `navigation` block before extraction that verifies every requested
+    constraint is active simultaneously from live page state, and only refine
+    URL params when they are grounded in observed DOM/link/form state or
+    observed URL deltas.
+
+    After a `goto_url` entry page for a stateful search, do not add one
+    click-driven `navigation` block per stable field (query terms, dates,
+    search-form inputs). Use observed current URL / form action / field
+    names / result links / URL deltas to bootstrap stable search state with
+    `goto_url`, or add a short `code`/`validation` block to inspect the DOM.
+    Do not bypass this by combining a URL and stable search setup in a
+    `navigation` block; split pure loading into `goto_url` first.
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
+    if policy_error:
+        return json.dumps({"ok": False, "error": policy_error})
+
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -2797,13 +3929,31 @@ async def update_and_run_blocks_tool(
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        update_result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        update_result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml},
+            copilot_ctx,
+            allow_missing_credentials=False,
+        )
         _record_workflow_update_result(copilot_ctx, update_result)
 
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
+
+    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
+    if coverage_error:
+        result = {
+            "ok": False,
+            "error": coverage_error,
+            "data": {
+                "block_count": copilot_ctx.last_update_block_count,
+                "workflow_updated": True,
+                "workflow_run_skipped": True,
+            },
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        return json.dumps(result)
 
     # Step 2: Compute frontier and run the blocks
     new_definition = None

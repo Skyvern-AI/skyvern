@@ -3,10 +3,10 @@ from http import HTTPStatus
 from importlib.util import find_spec
 from typing import NoReturn
 
-# Representative modules that indicate the server extra is installed enough for
-# server/local/browser import graphs. Keep this list intentionally small, but
-# include the heavy modules users commonly have partially installed.
-_SERVER_EXTRA_SENTINELS = (
+# Representative modules that indicate the local extra is installed enough for
+# embedded/browser import graphs. Keep this list intentionally small, but include
+# the heavy modules users commonly have partially installed.
+_LOCAL_EXTRA_SENTINELS = (
     "fastapi",
     "jinja2",
     "libcst",
@@ -17,15 +17,27 @@ _SERVER_EXTRA_SENTINELS = (
     "starlette_context",
 )
 
+# Server installs are a superset of local installs, but embedded local mode still
+# imports some Forge/API modules such as skyvern.forge.api_app. Keep the default
+# server sentinels local-compatible so those imports continue to work in
+# skyvern[local]. Full server entrypoints pass server-only module_names such as
+# "uvicorn" when they need to fail for local-only installs.
+_SERVER_EXTRA_SENTINELS = tuple(_LOCAL_EXTRA_SENTINELS)
 
-def _missing_server_extra_dependency(module_name: str) -> bool:
+_EXTRA_SUPPORT_LABELS = {
+    "local": "local embedded/browser support",
+    "server": "server support",
+}
+
+
+def _missing_extra_dependency(module_name: str, sentinels: tuple[str, ...]) -> bool:
     root_module = module_name.split(".", maxsplit=1)[0]
-    if root_module in _SERVER_EXTRA_SENTINELS:
+    if root_module in sentinels:
         return find_spec(root_module) is None
     if root_module == "skyvern":
         return False
     # Unknown missing modules may be genuine dependency bugs, so only known
-    # server-extra sentinels are rewritten to the install hint.
+    # extra sentinels are rewritten to the install hint.
     return False
 
 
@@ -39,22 +51,49 @@ class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
         self.feature = feature
         self.extra = extra
-        super().__init__(f"{feature} requires server support. Install it with `pip install skyvern[{extra}]`.")
+        support_label = _EXTRA_SUPPORT_LABELS.get(extra, f"{extra} support")
+        super().__init__(f'{feature} requires {support_label}. Install it with `pip install "skyvern[{extra}]"`.')
 
 
-def raise_server_extra_required(feature: str, exc: ImportError) -> NoReturn:
-    if isinstance(exc, ModuleNotFoundError) and exc.name is not None and _missing_server_extra_dependency(exc.name):
-        raise SkyvernExtraNotInstalled(feature) from exc
+def _raise_extra_required(
+    feature: str,
+    exc: ImportError,
+    *,
+    extra: str,
+    sentinels: tuple[str, ...],
+) -> NoReturn:
+    if isinstance(exc, SkyvernExtraNotInstalled):
+        raise SkyvernExtraNotInstalled(feature, extra=extra) from exc
+    if isinstance(exc, ModuleNotFoundError) and exc.name is not None and _missing_extra_dependency(exc.name, sentinels):
+        raise SkyvernExtraNotInstalled(feature, extra=extra) from exc
     raise exc
 
 
-def require_server_extra_modules(feature: str, module_names: tuple[str, ...] = ()) -> None:
-    # Server/local/browser APIs require the full server extra, not a partial Playwright-only install.
-    required_modules = dict.fromkeys((*_SERVER_EXTRA_SENTINELS, *module_names))
+def raise_local_extra_required(feature: str, exc: ImportError) -> NoReturn:
+    _raise_extra_required(feature, exc, extra="local", sentinels=_LOCAL_EXTRA_SENTINELS)
+
+
+def raise_server_extra_required(feature: str, exc: ImportError) -> NoReturn:
+    _raise_extra_required(feature, exc, extra="server", sentinels=_SERVER_EXTRA_SENTINELS)
+
+
+def _require_extra_modules(feature: str, extra: str, sentinels: tuple[str, ...], module_names: tuple[str, ...]) -> None:
+    required_modules = dict.fromkeys((*sentinels, *module_names))
     for module_name in required_modules:
         if find_spec(module_name) is None:
             missing = ModuleNotFoundError(f"No module named '{module_name}'", name=module_name)
-            raise SkyvernExtraNotInstalled(feature) from missing
+            raise SkyvernExtraNotInstalled(feature, extra=extra) from missing
+
+
+def require_local_extra_modules(feature: str, module_names: tuple[str, ...] = ()) -> None:
+    # Embedded/local browser APIs require the local extra, not a partial Playwright-only install.
+    _require_extra_modules(feature, "local", _LOCAL_EXTRA_SENTINELS, module_names)
+
+
+def require_server_extra_modules(feature: str, module_names: tuple[str, ...] = ()) -> None:
+    # With no module_names, this only guards against base installs. Pass server-only
+    # modules when a path must discriminate between local and full server extras.
+    _require_extra_modules(feature, "server", _SERVER_EXTRA_SENTINELS, module_names)
 
 
 class SkyvernClientException(SkyvernException):
@@ -382,6 +421,10 @@ class UnknownBrowserType(SkyvernException):
         super().__init__(f"Unknown browser type {browser_type}")
 
 
+class CdpConnectionConfigurationError(SkyvernException):
+    """Raised when a configured CDP endpoint is reachable but not usable by Skyvern."""
+
+
 class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
     SUPPORT_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
@@ -392,6 +435,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, CdpConnectionConfigurationError):
+            return exception.message or str(exception)
+
         raw_message = str(exception).strip()
         raw_lower = raw_message.lower()
 
@@ -611,13 +657,16 @@ class OnePasswordBaseError(SkyvernException):
 
 
 class OnePasswordServiceUnavailableError(OnePasswordBaseError):
-    def __init__(self, status_code: int | None = None) -> None:
+    def __init__(self, status_code: int | None = None, lookup_context: str | None = None) -> None:
         suffix = f" (HTTP {status_code})" if status_code else ""
-        super().__init__(
+        message = (
             f"1Password is currently unavailable{suffix}. "
             "This is an upstream outage on 1Password's side, not a Skyvern issue. "
             "Please retry in a few minutes."
         )
+        if lookup_context:
+            message = f"{message} {lookup_context}"
+        super().__init__(message)
 
 
 class OnePasswordRateLimitError(OnePasswordBaseError):
@@ -1141,6 +1190,10 @@ class AzureConfigurationError(AzureBaseError):
 class ScriptTerminationException(SkyvernException):
     def __init__(self, reason: str | None = None) -> None:
         super().__init__(reason)
+
+
+class IllegitCompleteScriptTermination(ScriptTerminationException):
+    """Raised when a cached script's page.complete() is rejected by the verifier; distinct from plain ScriptTerminationException, which is an intentional terminate()."""
 
 
 class InvalidSchemaError(SkyvernException):

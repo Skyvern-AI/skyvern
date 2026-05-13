@@ -1,4 +1,5 @@
 import logging
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import (
+    BACKEND_ENV_BASENAMES,
+    BACKEND_ENV_INTENT_ENV_VAR,
+    EnvIntent,
+    backend_env_path_candidates,
+)
 
 
 def _default_database_string() -> str:
@@ -43,10 +49,23 @@ def _ensure_sqlite_dir(database_string: str) -> None:
 # Even if we were to resolve paths at instantiation time, the global `settings`
 # singleton instantiation at the bottom of this file also runs at import time
 # and relies on the same assumption.
-_DEFAULT_ENV_FILES = (
-    resolve_backend_env_path(".env"),
-    resolve_backend_env_path(".env.staging"),
-    resolve_backend_env_path(".env.prod"),
+#
+# pydantic-settings applies later dotenv files with higher precedence, so the
+# resolver's read-priority order is reversed here. With no explicit CLI intent,
+# AUTO preserves legacy self-hosted imports by only considering ./.env.
+def _settings_env_intent() -> EnvIntent:
+    try:
+        return EnvIntent(os.getenv(BACKEND_ENV_INTENT_ENV_VAR, EnvIntent.AUTO.value))
+    except ValueError:
+        return EnvIntent.AUTO
+
+
+def _settings_env_file_candidates(basename: str) -> tuple[Path, ...]:
+    return tuple(reversed(backend_env_path_candidates(basename, intent=_settings_env_intent())))
+
+
+_DEFAULT_ENV_FILES = tuple(
+    candidate for basename in BACKEND_ENV_BASENAMES for candidate in _settings_env_file_candidates(basename)
 )
 
 
@@ -66,6 +85,8 @@ class Settings(BaseSettings):
 
     BROWSER_TYPE: str = "chromium-headful"
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
+    BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
+    BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
@@ -98,9 +119,9 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
-    DATABASE_POOL_SIZE: int = 5
-    DATABASE_POOL_MAX_OVERFLOW: int = 10
-    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_SIZE: int = 20
+    DATABASE_POOL_MAX_OVERFLOW: int = 20
+    DATABASE_POOL_TIMEOUT: int = 10
     DATABASE_POOL_RECYCLE: int = 1800
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
@@ -425,7 +446,6 @@ class Settings(BaseSettings):
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
-    VERIFICATION_CODE_POLLING_MAX_CONSECUTIVE_FAILURES: int = 3
 
     # Bitwarden Settings
     BITWARDEN_CLIENT_ID: str | None = None
@@ -711,7 +731,7 @@ class Settings(BaseSettings):
 
     def execute_all_steps(self) -> bool:
         """
-        This provides the functionality to execute steps one by one through the Streamlit UI.
+        This provides the functionality to execute steps one by one through the local UI.
         ***Value is always True if ENV is not local.***
 
         :return: True if env is not local, else the value of EXECUTE_ALL_STEPS

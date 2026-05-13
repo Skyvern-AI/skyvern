@@ -64,6 +64,7 @@ function WorkflowRun() {
   const isEmbedded = embed === "true";
   const active = searchParams.get("active");
   const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowPermanentIdParam = useFirstParam("workflowPermanentId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
@@ -77,7 +78,8 @@ function WorkflowRun() {
 
   const status = (error as AxiosError | undefined)?.response?.status;
   const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflow?.workflow_permanent_id;
+  const workflowPermanentId =
+    workflowPermanentIdParam ?? workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const isWorkflowDeleted = Boolean(workflow?.deleted_at);
@@ -394,6 +396,11 @@ function WorkflowRun() {
               >
                 Browser Session: {workflowRun.browser_session_id}
               </Link>
+            )}
+            {workflowRun?.browser_profile_id && (
+              <span className="font-mono text-sm text-slate-400">
+                Browser Profile: {workflowRun.browser_profile_id}
+              </span>
             )}
           </div>
 

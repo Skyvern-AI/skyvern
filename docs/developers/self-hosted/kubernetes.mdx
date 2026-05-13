@@ -198,7 +198,7 @@ The backend pod takes 1-2 minutes to become ready as it runs database migrations
 Wait for the backend pod to show `1/1` in the `READY` column of `kubectl get pods -n skyvern` before running this command. The API key file is generated during startup and won't exist until the pod is ready.
 
 ```bash
-kubectl exec -n skyvern deployment/skyvern-backend -- cat /app/.streamlit/secrets.toml
+kubectl exec -n skyvern deployment/skyvern-backend -- cat /app/.skyvern/credentials.toml
 ```
 
 Copy the `cred` value and update `frontend/frontend-secrets.yaml`:
@@ -434,7 +434,7 @@ This removes all resources in the `skyvern` namespace.
 To clean up host storage (if using hostPath):
 
 ```bash
-rm -rf /data/artifacts /data/videos /data/har /data/log /app/.streamlit
+rm -rf /data/artifacts /data/videos /data/har /data/log /app/.skyvern
 ```
 
 ---

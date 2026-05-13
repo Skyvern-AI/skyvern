@@ -13,6 +13,7 @@ ENV VITE_API_BASE_URL=__VITE_API_BASE_URL_PLACEHOLDER__
 ENV VITE_WSS_BASE_URL=__VITE_WSS_BASE_URL_PLACEHOLDER__
 ENV VITE_ARTIFACT_API_BASE_URL=__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__
 ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
+ENV VITE_BROWSER_STREAMING_MODE=__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__
 
 # APP_VERSION is baked into the JS bundle at build time via Vite's define.
 # Pass --build-arg APP_VERSION=$(git rev-parse HEAD) when building the image.
@@ -25,4 +26,3 @@ RUN npm run build
 # Use tini as init for proper signal handling and zombie reaping
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "/app/entrypoint-skyvernui.sh"]
-

@@ -83,7 +83,7 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.cache import extraction_cache
+from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -113,6 +113,7 @@ from skyvern.services.otp_service import (
     poll_otp_value,
     try_generate_totp_from_credential,
 )
+from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
     PROMPT_HARD_CEILING_TOKENS,
@@ -256,6 +257,45 @@ class ActionLinkedNode:
     def __init__(self, action: Action) -> None:
         self.action = action
         self.next: ActionLinkedNode | None = None
+
+
+def _schedule_summary_shadow_check_for_hit(
+    *,
+    task: Task,
+    workflow_run_id: str,
+    cache_key: str,
+    cached_value: Any,
+    cached_age_seconds: float,
+    summary_prompt: str,
+) -> None:
+    """Mirrors the miss-path LLM invocation exactly so the comparison can't
+    diverge for non-cache reasons."""
+
+    async def _shadow_gate() -> bool:
+        return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+    async def _shadow_llm_call() -> Any:
+        return await app.EXTRACTION_LLM_API_HANDLER(
+            prompt=summary_prompt,
+            step=None,
+            prompt_name="data-extraction-summary",
+            system_prompt=task.workflow_system_prompt,
+        )
+
+    shadow_logger = structlog.get_logger().bind(
+        prompt_name="data-extraction-summary",
+        cache_path="agent",
+    )
+    extraction_shadow.schedule_shadow_check(
+        gate=_shadow_gate,
+        cache_key=cache_key,
+        workflow_run_id=workflow_run_id,
+        cached_value=cached_value,
+        cached_age_seconds=cached_age_seconds,
+        llm_call=_shadow_llm_call,
+        schema=None,
+        logger=shadow_logger,
+    )
 
 
 class ForgeAgent:
@@ -3432,7 +3472,21 @@ class ForgeAgent:
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
-                if count_tokens(combined_prompt) > PROMPT_HARD_CEILING_TOKENS:
+                combined_token_count = count_tokens(combined_prompt)
+
+                # SKY-9718: stash html-token breakdown on the cached split-template path
+                # too — load_prompt_with_elements_tracked never sees this prompt, so the
+                # downstream LLM API handler would otherwise log nothing for it.
+                html_tokens = count_tokens(elements_for_prompt) if elements_for_prompt else 0
+                html_pct = (html_tokens / combined_token_count) if combined_token_count else None
+                context.last_prompt_breakdown = {
+                    "html_token_count": html_tokens,
+                    "total_tokens_local": combined_token_count,
+                    "html_pct": round(html_pct, 4) if html_pct is not None else None,
+                    "template_name": f"{template}-cached",
+                }
+
+                if combined_token_count > PROMPT_HARD_CEILING_TOKENS:
                     # The cached split-template path renders static+dynamic separately,
                     # so the load_prompt_with_elements ceiling logic never sees this
                     # prompt. Raise the dedicated sentinel to trigger the except below,
@@ -3937,6 +3991,14 @@ class ForgeAgent:
             await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
             )
+        try:
+            await app.AGENT_FUNCTION.release_proxy_session_for_owner(task.task_id)
+        except Exception:
+            LOG.warning(
+                "Failed to release proxy session for task",
+                exc_info=True,
+                task_id=task.task_id,
+            )
 
         # Wait for all tasks to complete before generating the links for the artifacts
         with _tracer.start_as_current_span("skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
@@ -3952,6 +4014,7 @@ class ForgeAgent:
         self,
         task: Task,
         api_key: str | None,
+        enable_retries: bool = True,
     ) -> None:
         if not api_key:
             LOG.warning(
@@ -3999,13 +4062,14 @@ class ForgeAgent:
                 headers=signed_data.headers,
             )
 
-            resp = await app.AGENT_FUNCTION.deliver_webhook(
+            resp = await deliver_webhook_with_retries(
                 url=task.webhook_callback_url,
                 payload=signed_data.signed_payload,
                 headers=signed_data.headers,
                 timeout_seconds=30.0,
                 organization_id=task.organization_id,
                 run_id=task.task_id,
+                max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
             )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
@@ -5613,6 +5677,15 @@ class ForgeAgent:
                     LOG.warning(
                         "data-extraction-summary cross-run cache backfill to in-run failed",
                         exc_info=True,
+                    )
+                if workflow_run_id is not None:
+                    _schedule_summary_shadow_check_for_hit(
+                        task=task,
+                        workflow_run_id=workflow_run_id,
+                        cache_key=cache_key,
+                        cached_value=cross_run_value,
+                        cached_age_seconds=extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
+                        summary_prompt=prompt,
                     )
                 data_extraction_summary_resp = cross_run_value
             else:

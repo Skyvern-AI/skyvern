@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from typing import Any
 
-from skyvern.forge.sdk.copilot.tools import BLOCK_RUNNING_TOOLS, _tool_loop_error
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.tools import (
+    BLOCK_RUNNING_TOOLS,
+    COPILOT_FINAL_REPLY_RESERVE_SECONDS,
+    PER_TOOL_CALL_BUDGET_SECONDS,
+    _active_block_run_budget_seconds,
+    _tool_loop_error,
+)
 
 
 def _ctx(**overrides: Any) -> Any:
@@ -15,6 +23,10 @@ def _ctx(**overrides: Any) -> Any:
         "repeated_action_fingerprint_streak_count": 0,
         "last_test_non_retriable_nav_error": None,
         "non_retriable_nav_error_last_emitted_signature": None,
+        "last_failed_workflow_yaml": None,
+        "last_workflow_yaml": None,
+        "last_test_ok": None,
+        "copilot_run_start_monotonic": None,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -47,6 +59,79 @@ def test_block_running_tool_is_blocked_by_repeated_action_streak() -> None:
     msg = _tool_loop_error(ctx, "update_and_run_blocks")
     assert msg is not None
     assert "Repeated-action abort" in msg
+
+
+def test_block_running_tool_blocks_late_retry_after_failed_workflow() -> None:
+    ctx = _ctx(
+        last_failed_workflow_yaml="version: '1.0'",
+        copilot_run_start_monotonic=time.monotonic() - 540,
+    )
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks")
+
+    assert msg is not None
+    assert "less than 90 seconds" in msg.lower()
+    assert "Do NOT retry" in msg
+    assert "reply to the user" in msg
+    assert "any draft workflow is unverified" in msg
+
+
+def test_late_retry_guard_allows_latter_half_calls_when_reply_room_remains() -> None:
+    ctx = _ctx(
+        last_failed_workflow_yaml="version: '1.0'",
+        copilot_run_start_monotonic=time.monotonic() - 300,
+    )
+
+    assert _tool_loop_error(ctx, "run_blocks_and_collect_debug") is None
+
+
+def test_block_running_tool_blocks_late_continuation_after_successful_prefix() -> None:
+    ctx = _ctx(
+        last_workflow_yaml="version: '1.0'",
+        last_test_ok=True,
+        copilot_run_start_monotonic=time.monotonic() - 540,
+    )
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks")
+
+    assert msg is not None
+    assert "less than 90 seconds" in msg.lower()
+    assert "Do NOT start another block-running tool call" in msg
+    assert "workflow draft and progress gathered so far" in msg
+    assert "not been verified end-to-end" in msg
+
+
+def test_late_retry_guard_waits_until_budget_is_low() -> None:
+    ctx = _ctx(
+        last_failed_workflow_yaml="version: '1.0'",
+        copilot_run_start_monotonic=time.monotonic() - 250,
+    )
+
+    assert _tool_loop_error(ctx, "update_and_run_blocks") is None
+
+
+def test_active_block_run_budget_shrinks_near_deadline() -> None:
+    remaining = COPILOT_FINAL_REPLY_RESERVE_SECONDS + 30
+    ctx = _ctx(copilot_run_start_monotonic=time.monotonic() - (TOTAL_TIMEOUT_SECONDS - remaining))
+
+    budget = _active_block_run_budget_seconds(ctx)
+    assert 25 <= budget <= 30
+
+
+def test_active_block_run_budget_uses_full_budget_when_deadline_is_distant() -> None:
+    remaining = COPILOT_FINAL_REPLY_RESERVE_SECONDS + PER_TOOL_CALL_BUDGET_SECONDS + 30
+    ctx = _ctx(copilot_run_start_monotonic=time.monotonic() - (TOTAL_TIMEOUT_SECONDS - remaining))
+
+    assert _active_block_run_budget_seconds(ctx) == PER_TOOL_CALL_BUDGET_SECONDS
+
+
+def test_late_retry_guard_is_scoped_to_block_running_tools() -> None:
+    ctx = _ctx(
+        last_failed_workflow_yaml="version: '1.0'",
+        copilot_run_start_monotonic=time.monotonic() - 540,
+    )
+
+    assert _tool_loop_error(ctx, "update_workflow") is None
 
 
 def test_bypass_applies_to_both_block_running_tool_names() -> None:

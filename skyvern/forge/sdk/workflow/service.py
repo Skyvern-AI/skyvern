@@ -129,6 +129,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
@@ -173,6 +174,7 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.LOGIN,
     BlockType.FILE_DOWNLOAD,
     BlockType.FOR_LOOP,
+    BlockType.WHILE_LOOP,
 }
 
 
@@ -352,6 +354,52 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
 class WorkflowService:
     # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+
+    @staticmethod
+    async def _record_workflow_run_metadata_best_effort(
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Persist optional workflow-run metadata while swallowing write failures."""
+        if not run_metadata:
+            return
+
+        try:
+            await app.AGENT_FUNCTION.record_workflow_run_metadata(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                run_metadata=run_metadata,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record workflow run metadata",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+
+    def _record_workflow_run_metadata_in_background(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Schedule optional workflow-run metadata persistence off the run-creation path."""
+        if not run_metadata:
+            return
+
+        task = asyncio.create_task(
+            self._record_workflow_run_metadata_best_effort(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                run_metadata=run_metadata,
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     @staticmethod
     def _determine_cache_invalidation(
@@ -785,210 +833,251 @@ class WorkflowService:
         :param max_steps_override: The max steps override for the workflow run, if any.
         :return: The created workflow run.
         """
-        # Validate the workflow and the organization
-        workflow = await self.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=None if is_template_workflow else organization.organization_id,
-            version=version,
-        )
-        if workflow is None:
-            LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
-            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
-        workflow_id = workflow.workflow_id
-        if workflow_request.proxy_location is None and workflow.proxy_location is not None:
-            workflow_request.proxy_location = workflow.proxy_location
-        if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
-            workflow_request.webhook_callback_url = workflow.webhook_callback_url
-        if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
-            workflow_request.extra_http_headers = workflow.extra_http_headers
-        if workflow_request.run_with is None:
-            workflow_request.run_with = workflow.run_with
+        async with app.DATABASE.workflow_runs.Session() as outer_session:
+            # Validate the workflow and the organization
+            workflow = await self.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=None if is_template_workflow else organization.organization_id,
+                version=version,
+            )
+            if workflow is None:
+                LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
+                raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
+            workflow_id = workflow.workflow_id
+            if workflow_request.proxy_location is None and workflow.proxy_location is not None:
+                workflow_request.proxy_location = workflow.proxy_location
+            if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
+                workflow_request.webhook_callback_url = workflow.webhook_callback_url
+            if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
+                workflow_request.extra_http_headers = workflow.extra_http_headers
+            if (
+                workflow_request.browser_profile_id is None
+                and workflow_request.browser_session_id is None
+                and workflow.browser_profile_id is not None
+            ):
+                workflow_request.browser_profile_id = workflow.browser_profile_id
+            if workflow_request.run_with is None:
+                workflow_request.run_with = workflow.run_with
 
-        # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
-        # Adaptive caching requires AI fallback to self-heal when cached scripts break.
-        # Without this, a caller sending ai_fallback=false would silently disable recovery.
-        effective_code_version = (
-            workflow.code_version if workflow.code_version is not None else (2 if workflow.adaptive_caching else None)
-        )
-        if (effective_code_version or 0) >= 2 and (workflow_request.run_with == "code"):
-            if workflow_request.ai_fallback is False:
-                LOG.info(
-                    "Overriding ai_fallback to True for adaptive caching run",
-                    workflow_permanent_id=workflow_permanent_id,
-                    request_run_with=workflow_request.run_with,
-                    workflow_code_version=workflow.code_version,
-                )
-                workflow_request.ai_fallback = True
+            # Force ai_fallback=True for adaptive caching (code_version >= 2) runs.
+            # Adaptive caching requires AI fallback to self-heal when cached scripts break.
+            # Without this, a caller sending ai_fallback=false would silently disable recovery.
+            effective_code_version = (
+                workflow.code_version
+                if workflow.code_version is not None
+                else (2 if workflow.adaptive_caching else None)
+            )
+            if (effective_code_version or 0) >= 2 and (workflow_request.run_with == "code"):
+                if workflow_request.ai_fallback is False:
+                    LOG.info(
+                        "Overriding ai_fallback to True for adaptive caching run",
+                        workflow_permanent_id=workflow_permanent_id,
+                        request_run_with=workflow_request.run_with,
+                        workflow_code_version=workflow.code_version,
+                    )
+                    workflow_request.ai_fallback = True
 
-        # Inherit from ambient context so descendant runs (TriggerWorkflowBlock children)
-        # carry the parent's chat id forward without per-call plumbing. Resolved here so
-        # the same value reaches both the DB row and the new SkyvernContext below.
-        ambient_context: skyvern_context.SkyvernContext | None = skyvern_context.current()
-        resolved_copilot_session_id = (
-            copilot_session_id
-            if copilot_session_id is not None
-            else (ambient_context.copilot_session_id if ambient_context else None)
-        )
+            # Inherit from ambient context so descendant runs (TriggerWorkflowBlock children)
+            # carry the parent's chat id forward without per-call plumbing. Resolved here so
+            # the same value reaches both the DB row and the new SkyvernContext below.
+            ambient_context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+            resolved_copilot_session_id = (
+                copilot_session_id
+                if copilot_session_id is not None
+                else (ambient_context.copilot_session_id if ambient_context else None)
+            )
 
-        # Create the workflow run and set skyvern context
-        workflow_run = await self.create_workflow_run(
-            workflow_request=workflow_request,
-            workflow_permanent_id=workflow_permanent_id,
-            workflow_id=workflow_id,
-            organization_id=organization.organization_id,
-            parent_workflow_run_id=parent_workflow_run_id,
-            sequential_key=workflow.sequential_key,
-            debug_session_id=debug_session_id,
-            code_gen=code_gen,
-            workflow_run_id=workflow_run_id,
-            trigger_type=trigger_type,
-            workflow_schedule_id=workflow_schedule_id,
-            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
-            copilot_session_id=resolved_copilot_session_id,
-        )
-        LOG.info(
-            f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
-            request_id=request_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_id=workflow.workflow_id,
-            organization_id=workflow.organization_id,
-            proxy_location=workflow_request.proxy_location,
-            webhook_callback_url=workflow_request.webhook_callback_url,
-            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
-            ai_fallback=workflow_request.ai_fallback,
-            run_with=workflow_request.run_with,
-            code_gen=code_gen,
-        )
-        context: skyvern_context.SkyvernContext | None = skyvern_context.current()
-        current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
-        root_workflow_run_id = (
-            context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run.workflow_run_id
-        )
-        skyvern_context.replace(
-            SkyvernContext(
-                organization_id=organization.organization_id,
-                organization_name=organization.organization_name,
-                request_id=request_id,
+            # Create the workflow run and set skyvern context
+            workflow_run = await self.create_workflow_run(
+                workflow_request=workflow_request,
+                workflow_permanent_id=workflow_permanent_id,
                 workflow_id=workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                root_workflow_run_id=root_workflow_run_id,
-                run_id=current_run_id,
-                workflow_permanent_id=workflow_run.workflow_permanent_id,
-                max_steps_override=max_steps_override,
-                max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
-                loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
+                organization_id=organization.organization_id,
+                parent_workflow_run_id=parent_workflow_run_id,
+                sequential_key=workflow.sequential_key,
+                debug_session_id=debug_session_id,
+                code_gen=code_gen,
+                workflow_run_id=workflow_run_id,
+                trigger_type=trigger_type,
+                workflow_schedule_id=workflow_schedule_id,
+                ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
             )
-        )
-
-        # Check artifact bundling flag at workflow level so it applies to both agent and cached paths.
-        # See also: skyvern/forge/agent.py Agent.agent_step() checks per-task for standalone task runs.
-        new_context = skyvern_context.current()
-        if new_context:
-            try:
-                new_context.use_artifact_bundling = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "USE_ARTIFACT_BUNDLING",
-                    workflow_run.workflow_run_id,
-                    properties={"organization_id": organization.organization_id},
-                )
-                LOG.debug(
-                    "USE_ARTIFACT_BUNDLING flag resolved for workflow",
-                    use_artifact_bundling=new_context.use_artifact_bundling,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    organization_id=organization.organization_id,
-                )
-            except Exception:
-                LOG.warning("Failed to check USE_ARTIFACT_BUNDLING flag for workflow", exc_info=True)
-                new_context.use_artifact_bundling = False
-
-        # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
-        all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
-        try:
-            missing_parameters: list[str] = []
-            workflow_parameter_values: list[tuple[WorkflowParameter, Any]] = []
-            for workflow_parameter in all_workflow_parameters:
-                if workflow_request.data and workflow_parameter.key in workflow_request.data:
-                    request_body_value = workflow_request.data[workflow_parameter.key]
-                    # Fall back to default value if the request explicitly sends null
-                    # This supports API clients (e.g., n8n) that include the key with null value
-                    if request_body_value is None and workflow_parameter.default_value is not None:
-                        request_body_value = workflow_parameter.default_value
-                    if self._is_missing_required_value(workflow_parameter, request_body_value):
-                        missing_parameters.append(workflow_parameter.key)
-                        continue
-                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
-                        if not isinstance(request_body_value, str):
-                            raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
-                    workflow_parameter_values.append((workflow_parameter, request_body_value))
-                elif workflow_parameter.default_value is not None:
-                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
-                        if not isinstance(workflow_parameter.default_value, str):
-                            raise InvalidCredentialId(
-                                f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
-                            )
-                    workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
-                else:
-                    missing_parameters.append(workflow_parameter.key)
-
-            if missing_parameters:
-                missing_list = ", ".join(sorted(missing_parameters))
-                raise MissingValueForParameter(
-                    parameter_key=missing_list,
-                    workflow_id=workflow.workflow_permanent_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-
-            await self._validate_credential_ids(
-                [
-                    value
-                    for (workflow_parameter, value) in workflow_parameter_values
-                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
-                ],
-                organization,
-            )
-
-            if workflow_parameter_values:
-                try:
-                    await self.create_workflow_run_parameters(
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        workflow_parameter_values=workflow_parameter_values,
-                    )
-                except SQLAlchemyError as batch_error:
-                    # Batch failed — retry one-by-one to identify the exact failing parameter
-                    for workflow_parameter, value in workflow_parameter_values:
-                        try:
-                            await self.create_workflow_run_parameter(
-                                workflow_run_id=workflow_run.workflow_run_id,
-                                workflow_parameter=workflow_parameter,
-                                value=value,
-                            )
-                        except SQLAlchemyError as parameter_error:
-                            raise WorkflowRunParameterPersistenceError(
-                                parameter_key=workflow_parameter.key,
-                                workflow_id=workflow.workflow_permanent_id,
-                                workflow_run_id=workflow_run.workflow_run_id,
-                                reason=self._format_parameter_persistence_error(parameter_error),
-                            ) from parameter_error
-                    # All individual inserts succeeded — the batch failure was transient
-                    LOG.warning(
-                        "Batch parameter insert failed but individual inserts succeeded",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        batch_error=str(batch_error),
-                    )
-        except Exception as e:
-            LOG.exception(
-                f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+            self._record_workflow_run_metadata_in_background(
                 workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+                run_metadata=workflow_request.run_metadata,
             )
 
-            failure_reason = f"Setup workflow failed. failure reason: {get_user_facing_exception_message(e)}"
-
-            workflow_run = await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            LOG.info(
+                f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
+                request_id=request_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                organization_id=workflow.organization_id,
+                proxy_location=workflow_request.proxy_location,
+                webhook_callback_url=workflow_request.webhook_callback_url,
+                max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+                ai_fallback=workflow_request.ai_fallback,
+                run_with=workflow_request.run_with,
+                code_gen=code_gen,
             )
-            raise e
+            context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+            current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
+            root_workflow_run_id = (
+                context.root_workflow_run_id
+                if context and context.root_workflow_run_id
+                else workflow_run.workflow_run_id
+            )
+            skyvern_context.replace(
+                SkyvernContext(
+                    organization_id=organization.organization_id,
+                    organization_name=organization.organization_name,
+                    request_id=request_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    root_workflow_run_id=root_workflow_run_id,
+                    run_id=current_run_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    max_steps_override=max_steps_override,
+                    max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
+                    loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
+                    copilot_session_id=resolved_copilot_session_id,
+                    trigger_type=trigger_type,
+                )
+            )
 
-        return workflow_run
+            # Check artifact bundling flag at workflow level so it applies to both agent and cached paths.
+            # See also: skyvern/forge/agent.py Agent.agent_step() checks per-task for standalone task runs.
+            new_context = skyvern_context.current()
+            if new_context:
+                try:
+                    new_context.use_artifact_bundling = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "USE_ARTIFACT_BUNDLING",
+                        workflow_run.workflow_run_id,
+                        properties={"organization_id": organization.organization_id},
+                    )
+                    LOG.debug(
+                        "USE_ARTIFACT_BUNDLING flag resolved for workflow",
+                        use_artifact_bundling=new_context.use_artifact_bundling,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization.organization_id,
+                    )
+                except Exception:
+                    LOG.warning("Failed to check USE_ARTIFACT_BUNDLING flag for workflow", exc_info=True)
+                    new_context.use_artifact_bundling = False
+
+                # Resolve flex routing eligibility once per run boot. Site B
+                # (scripts/run_workflow.py) re-resolves in the Temporal worker — both go
+                # through the same AgentFunction hook so the cloud side is the single
+                # owner of the flag name and property shape.
+                new_context.use_flex_llm_routing = await app.AGENT_FUNCTION.should_use_flex_llm_routing(
+                    trigger_type=trigger_type,
+                    organization_id=organization.organization_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+
+            # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
+            all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+            try:
+                missing_parameters: list[str] = []
+                workflow_parameter_values: list[tuple[WorkflowParameter, Any]] = []
+                for workflow_parameter in all_workflow_parameters:
+                    if workflow_request.data and workflow_parameter.key in workflow_request.data:
+                        request_body_value = workflow_request.data[workflow_parameter.key]
+                        # Fall back to default value if the request explicitly sends null
+                        # This supports API clients (e.g., n8n) that include the key with null value
+                        if request_body_value is None and workflow_parameter.default_value is not None:
+                            request_body_value = workflow_parameter.default_value
+                        if self._is_missing_required_value(workflow_parameter, request_body_value):
+                            missing_parameters.append(workflow_parameter.key)
+                            continue
+                        if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                            if not isinstance(request_body_value, str):
+                                raise InvalidCredentialId(
+                                    f"<non-string value of type {type(request_body_value).__name__}>"
+                                )
+                        workflow_parameter_values.append((workflow_parameter, request_body_value))
+                    elif workflow_parameter.default_value is not None:
+                        if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                            if not isinstance(workflow_parameter.default_value, str):
+                                raise InvalidCredentialId(
+                                    f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
+                                )
+                        workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
+                    else:
+                        missing_parameters.append(workflow_parameter.key)
+
+                if missing_parameters:
+                    missing_list = ", ".join(sorted(missing_parameters))
+                    raise MissingValueForParameter(
+                        parameter_key=missing_list,
+                        workflow_id=workflow.workflow_permanent_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+
+                await self._validate_credential_ids(
+                    [
+                        value
+                        for (workflow_parameter, value) in workflow_parameter_values
+                        if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                    ],
+                    organization,
+                )
+
+                if workflow_parameter_values:
+                    try:
+                        await self.create_workflow_run_parameters(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_parameter_values=workflow_parameter_values,
+                        )
+                    except SQLAlchemyError as batch_error:
+                        # Roll back the failed transaction so the per-parameter fallback
+                        # (and any later mark_workflow_run_as_failed) can reuse the outer session.
+                        await outer_session.rollback()
+                        # Batch failed — retry one-by-one to identify the exact failing parameter
+                        for workflow_parameter, value in workflow_parameter_values:
+                            try:
+                                await self.create_workflow_run_parameter(
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    workflow_parameter=workflow_parameter,
+                                    value=value,
+                                )
+                            except SQLAlchemyError as parameter_error:
+                                raise WorkflowRunParameterPersistenceError(
+                                    parameter_key=workflow_parameter.key,
+                                    workflow_id=workflow.workflow_permanent_id,
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    reason=self._format_parameter_persistence_error(parameter_error),
+                                ) from parameter_error
+                        # All individual inserts succeeded — the batch failure was transient
+                        LOG.warning(
+                            "Batch parameter insert failed but individual inserts succeeded",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            batch_error=str(batch_error),
+                        )
+            except Exception as e:
+                LOG.exception(
+                    f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+
+                # Discard any failed transaction state on the shared outer session before
+                # mark_workflow_run_as_failed reuses it.
+                try:
+                    await outer_session.rollback()
+                except SQLAlchemyError:
+                    LOG.warning("Failed to rollback outer session during setup failure", exc_info=True)
+
+                failure_reason = f"Setup workflow failed. failure reason: {get_user_facing_exception_message(e)}"
+
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                )
+                raise
+
+            return workflow_run
 
     @staticmethod
     def _format_parameter_persistence_error(error: SQLAlchemyError) -> str:
@@ -2406,6 +2495,10 @@ class WorkflowService:
 
                     LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
 
+                    # Pre-init so the success log can reference output_value
+                    # when ScriptTerminationException was caught (terminated
+                    # is now in script_success_statuses).
+                    output_value: Any = None
                     try:
                         exec_code = compile(wrapper_code, "<run_signature>", "exec")
                         exec(exec_code, exec_globals)
@@ -2433,10 +2526,10 @@ class WorkflowService:
                             status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
                             workflow_run_block_id=latest_block.workflow_run_block_id,
                         )
-                        # Terminated is a valid script outcome when generate_script_on_terminal is set
-                        script_success_statuses = {BlockStatus.completed}
-                        if workflow.generate_script_on_terminal:
-                            script_success_statuses.add(BlockStatus.terminated)
+                        # Terminate() is an explicit signal to stop, not a
+                        # failure to retry. `generate_script_on_terminal` is
+                        # orthogonal — it gates script generation, not fallback.
+                        script_success_statuses = {BlockStatus.completed, BlockStatus.terminated}
 
                         block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                         if workflow_run_block_result.status in script_success_statuses:
@@ -2603,34 +2696,11 @@ class WorkflowService:
                 # if the failure is code-fixable.
                 if fallback_episode_id and workflow_run_block_result:
                     try:
-                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
-
-                        # Build agent actions summary for both success and failure
-                        agent_actions_summary: dict = {
-                            "block_status": str(workflow_run_block_result.status),
-                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
-                            if workflow_run_block_result.output_parameter_value
-                            else None,
-                        }
-                        if form_fields_for_episode:
-                            agent_actions_summary["form_fields"] = form_fields_for_episode
-
-                        # For failed fallbacks, capture the failure reason
-                        if not fallback_succeeded:
-                            agent_actions_summary["failure_reason"] = (
-                                str(workflow_run_block_result.failure_reason)[:2000]
-                                if workflow_run_block_result.failure_reason
-                                else None
-                            )
-                            LOG.info(
-                                "AI fallback failed, keeping episode for triage",
-                                episode_id=fallback_episode_id,
-                                block_status=workflow_run_block_result.status,
-                                block_label=block.label,
-                            )
-
-                        # Fetch rich action details from the fallback execution
+                        # None = unknown count (taskless wrb / fetch error);
+                        # only a confirmed zero downgrades fallback_succeeded.
                         fallback_wrb_id = workflow_run_block_result.workflow_run_block_id
+                        agent_action_count: int | None = None
+                        action_summaries: list[dict] | None = None
                         if fallback_wrb_id:
                             try:
                                 wrb = await app.DATABASE.observer.get_workflow_run_block(
@@ -2642,13 +2712,47 @@ class WorkflowService:
                                         task_id=wrb.task_id,
                                         organization_id=organization_id,
                                     )
-                                    agent_actions_summary["actions"] = build_action_summaries_with_timing(actions)
+                                    agent_action_count = len(actions)
+                                    action_summaries = build_action_summaries_with_timing(actions)
                             except Exception:
                                 LOG.debug(
                                     "Could not fetch rich actions for fallback episode",
                                     fallback_wrb_id=fallback_wrb_id,
                                     exc_info=True,
                                 )
+
+                        # `completed` with confirmed 0 actions = the agent's
+                        # complete-verify accepting what the script's rejected.
+                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
+                        if fallback_succeeded and agent_action_count == 0:
+                            fallback_succeeded = False
+
+                        # Build agent actions summary for both success and failure
+                        agent_actions_summary: dict = {
+                            "block_status": str(workflow_run_block_result.status),
+                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
+                            if workflow_run_block_result.output_parameter_value
+                            else None,
+                        }
+                        if form_fields_for_episode:
+                            agent_actions_summary["form_fields"] = form_fields_for_episode
+                        if action_summaries is not None:
+                            agent_actions_summary["actions"] = action_summaries
+
+                        if not fallback_succeeded:
+                            if workflow_run_block_result.failure_reason:
+                                agent_actions_summary["failure_reason"] = str(workflow_run_block_result.failure_reason)[
+                                    :2000
+                                ]
+                            elif workflow_run_block_result.status == BlockStatus.completed and agent_action_count == 0:
+                                agent_actions_summary["failure_reason"] = script_service.VERIFIER_SWAP_FAILURE_REASON
+                            LOG.info(
+                                "AI fallback failed, keeping episode for triage",
+                                episode_id=fallback_episode_id,
+                                block_status=workflow_run_block_result.status,
+                                block_label=block.label,
+                                agent_action_count=agent_action_count,
+                            )
 
                         await app.DATABASE.scripts.update_fallback_episode(
                             episode_id=fallback_episode_id,
@@ -3318,6 +3422,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        browser_profile_id: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -3348,6 +3453,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
                 model=model,
                 workflow_permanent_id=workflow_permanent_id,
                 version=version,
@@ -3729,6 +3835,7 @@ class WorkflowService:
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
@@ -3750,6 +3857,7 @@ class WorkflowService:
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
                 persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
@@ -3772,6 +3880,7 @@ class WorkflowService:
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
             persist_browser_session=persist_browser_session,
+            browser_profile_id=browser_profile_id,
             model=model,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
@@ -5053,6 +5162,14 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             child_workflow_run_ids=child_workflow_run_ids,
         )
+        try:
+            await app.AGENT_FUNCTION.release_proxy_session_for_owner(workflow_run.workflow_run_id)
+        except Exception:
+            LOG.warning(
+                "Failed to release proxy session for workflow run",
+                exc_info=True,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
         if browser_state:
             await self.persist_video_data(
                 browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
@@ -5228,7 +5345,7 @@ class WorkflowService:
             headers=signed_data.headers,
         )
         try:
-            resp = await app.AGENT_FUNCTION.deliver_webhook(
+            resp = await deliver_webhook_with_retries(
                 url=workflow_run.webhook_callback_url,
                 payload=signed_data.signed_payload,
                 headers=signed_data.headers,
@@ -5478,6 +5595,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    browser_profile_id=request.browser_profile_id,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
@@ -5511,6 +5629,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    browser_profile_id=request.browser_profile_id,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,

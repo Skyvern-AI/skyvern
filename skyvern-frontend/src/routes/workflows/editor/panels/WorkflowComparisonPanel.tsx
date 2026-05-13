@@ -15,6 +15,7 @@ import { FlowRenderer } from "../FlowRenderer";
 import { getElements } from "../workflowEditorUtils";
 import { ProxyLocation } from "@/api/types";
 import { AppNode } from "../nodes";
+import { areBlocksIdentical } from "../../util/compareBlocks";
 
 type BlockComparison = {
   leftBlock?: WorkflowBlock;
@@ -67,23 +68,6 @@ function getBlockIdentifier(block: WorkflowBlock): string {
   const nodeType =
     BLOCK_TYPE_TO_NODE_TYPE[block.block_type] || block.block_type;
   return `${nodeType}:${block.label}`;
-}
-
-function areBlocksIdentical(
-  block1: WorkflowBlock,
-  block2: WorkflowBlock,
-): boolean {
-  // Convert blocks to string representation for comparison
-  // Remove dynamic fields that shouldn't affect equality
-  const normalize = (block: WorkflowBlock) => {
-    const normalized = { ...block };
-    // Remove output_parameter as it might have different IDs
-    const { output_parameter, ...rest } = normalized;
-    console.log(output_parameter);
-    return JSON.stringify(rest, Object.keys(rest).sort());
-  };
-
-  return normalize(block1) === normalize(block2);
 }
 
 function compareWorkflowBlocks(

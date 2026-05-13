@@ -16,6 +16,7 @@ COPILOT_RESPONSE_TYPES: tuple[str, ...] = get_args(ResponseType)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
+    from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
 
 class UrlVisit(BaseModel):
@@ -160,9 +161,12 @@ class CopilotContext(AgentContext):
     post_update_nudge_count: int = 0
     coverage_nudge_count: int = 0
     format_nudge_count: int = 0
+    no_workflow_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
     user_message: str = ""
     block_goal_main_goal: str = ""
+    allow_untested_workflow_draft: bool = False
+    request_policy: RequestPolicy | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
@@ -207,6 +211,13 @@ class CopilotContext(AgentContext):
     probable_site_block_streak_count: int = 0
     probable_site_block_stop_nudge_count: int = 0
     per_tool_budget_nudge_count: int = 0
+    effective_workflow_proxy_location: Any | None = None
+    # Labels of navigation blocks that were canceled/failed inside a
+    # PER_TOOL_BUDGET run. Armed after get_run_results inspects the budgeted
+    # run, and cleared only when a workflow update removes or changes the
+    # label away from navigation. Prevents rerunning the same oversized
+    # navigation block unchanged.
+    per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —

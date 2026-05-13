@@ -21,6 +21,7 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
+from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
@@ -57,7 +58,7 @@ class CdpChannel:
     def identity(self) -> t.Dict[str, t.Any]:
         base = self.vnc_channel.identity
 
-        return base | {"url": self.url}
+        return base | {"cdp_url": self.url}
 
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         """
@@ -99,7 +100,7 @@ class CdpChannel:
             close_task = asyncio.create_task(self.close())
             close_task.add_done_callback(lambda _: asyncio.create_task(self.connect()))  # TODO: avoid blind reconnect
 
-        self.browser = await pw.chromium.connect_over_cdp(url, headers=headers)
+        self.browser = await connect_over_cdp_with_diagnostics(pw, url, headers=headers)
         self.browser.on("disconnected", on_close)
 
         await self.apply_download_behavior(self.browser)

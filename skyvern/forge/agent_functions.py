@@ -2,7 +2,7 @@ import asyncio
 import copy
 import hashlib
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import httpx
 import structlog
@@ -14,7 +14,9 @@ from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteE
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -28,6 +30,9 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
 LOG = structlog.get_logger()
 
@@ -440,6 +445,39 @@ class AgentFunction:
     Cloud overrides this to True and provides the Temporal-backed implementations below.
     """
 
+    def get_flex_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
+
+        Cloud overrides this with the Gemini family → flex+GPT-5-fallback mapping.
+        OSS no-op so self-hosted users without flex routers see no behavior change.
+        """
+        return None
+
+    async def should_use_flex_llm_routing(
+        self,
+        *,
+        trigger_type: "WorkflowRunTriggerType | None",
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+    ) -> bool:
+        """Decide whether a given workflow run is eligible for flex-tier LLM routing.
+
+        Cloud overrides this to consult its experimentation provider; OSS has no flex
+        routers so the default returns False.
+        """
+        return False
+
+    async def record_workflow_run_metadata(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Persist per-run analytics metadata. OSS builds have no sidecar table."""
+        return None
+
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
     MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (
@@ -477,6 +515,9 @@ class AgentFunction:
         cloud modules from the OSS-synced ``skyvern/`` tree.
         """
         return AgentDB(database_string, debug_enabled=debug_enabled)
+
+    def build_azure_client_factory(self, factory: AzureClientFactory) -> AzureClientFactory:
+        return factory
 
     def resolve_mcp_oauth_org_lookups(self, db: object) -> tuple[Any, Any] | None:
         """Return ``(get_organization_entities, get_valid_org_auth_token)`` callables
@@ -622,6 +663,15 @@ class AgentFunction:
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
+
+    async def release_proxy_session_for_owner(self, owner_id: str) -> None:
+        """Release any proxy lease held by ``owner_id``.
+
+        OSS no-op. Cloud overrides this to release the lease back to the
+        proxy-session pool so workflow/task cleanup doesn't have to
+        import cloud-only modules from the OSS-synced ``skyvern/`` tree.
+        """
+        return None
 
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
         """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
@@ -1012,6 +1062,10 @@ class AgentFunction:
         OSS returns empty string (no hardening).
         """
         return ""
+
+    def get_copilot_config(self) -> CopilotConfig | None:
+        """Return an optional workflow copilot config override."""
+        return None
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.

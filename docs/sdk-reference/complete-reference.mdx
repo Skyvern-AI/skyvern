@@ -32,6 +32,10 @@ npm install @skyvern/client
 ```
 </CodeGroup>
 
+<Note>
+`pip install skyvern` is the lightweight SDK for Skyvern Cloud and remote API calls. Embedded local SDK features such as `Skyvern.local()` and local browser control require `pip install "skyvern[local]"`. Local server and local stdio MCP commands require `pip install "skyvern[server]"`. Guided quickstart and migrations currently require Docker Compose or a source checkout.
+</Note>
+
 <CodeGroup>
 ```python Python
 import asyncio
@@ -76,7 +80,8 @@ Skyvern(
     timeout: float | None = None,          # HTTP request timeout (seconds)
 )
 
-# Local mode (Python only - runs entirely on your machine, reads .env)
+# Local mode (Python only - requires pip install "skyvern[local]")
+# For local browser control, also run: python -m playwright install chromium
 client = Skyvern.local()
 ```
 
@@ -689,6 +694,6 @@ request_options=RequestOptions(
 - `browser_profile_id` works with `run_workflow` only - silently ignored by `run_task`.
 - Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
 - Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
-- `launch_local_browser` requires Python local mode (`Skyvern.local()`).
+- `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
 - `page.agent` methods always wait for completion.
 - Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `fill_from_mapping`, `extract_form_fields`, `validate_mapping`, `fill_autocomplete`), iframe management (`frame_switch`, `frame_main`, `frame_list`).

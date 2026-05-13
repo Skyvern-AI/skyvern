@@ -6,6 +6,10 @@ VALID_RUN_WITH_VALUES = ("agent", "code")
 # Known legacy values in prod: 'ai' (-> 'agent'), 'code_v2' (-> 'code')
 _LEGACY_RUN_WITH_MAP = {"ai": "agent", "code_v2": "code"}
 
+RUN_METADATA_MAX_KEYS = 20
+RUN_METADATA_MAX_KEY_LENGTH = 64
+RUN_METADATA_MAX_VALUE_LENGTH = 256
+
 
 def normalize_run_with(v: str | None) -> str:
     """Normalize null and legacy values to valid run_with values.
@@ -21,3 +25,26 @@ def normalize_run_with(v: str | None) -> str:
         LOG.warning("Unknown run_with value, defaulting to 'agent'", run_with=v)
         return "agent"
     return v
+
+
+def normalize_run_metadata(v: dict[str, str] | None) -> dict[str, str] | None:
+    """Normalize and bound user-supplied workflow run metadata tags."""
+    if v is None:
+        return None
+
+    if len(v) > RUN_METADATA_MAX_KEYS:
+        raise ValueError(f"run_metadata can include at most {RUN_METADATA_MAX_KEYS} entries")
+
+    normalized: dict[str, str] = {}
+    for key, value in v.items():
+        trimmed_key = key.strip()
+        trimmed_value = value.strip()
+        if not trimmed_key or not trimmed_value:
+            continue
+        if len(trimmed_key) > RUN_METADATA_MAX_KEY_LENGTH:
+            raise ValueError(f"run_metadata keys must be at most {RUN_METADATA_MAX_KEY_LENGTH} characters")
+        if len(trimmed_value) > RUN_METADATA_MAX_VALUE_LENGTH:
+            raise ValueError(f"run_metadata values must be at most {RUN_METADATA_MAX_VALUE_LENGTH} characters")
+        normalized[trimmed_key] = trimmed_value
+
+    return normalized or None

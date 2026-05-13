@@ -3,12 +3,15 @@ from http import HTTPStatus
 import pytest
 
 from skyvern.exceptions import (
+    CdpConnectionConfigurationError,
     SkyvernException,
     SkyvernExtraNotInstalled,
     SkyvernHTTPException,
     UnknownErrorWhileCreatingBrowserContext,
     get_user_facing_exception_message,
+    raise_local_extra_required,
     raise_server_extra_required,
+    require_local_extra_modules,
     require_server_extra_modules,
 )
 
@@ -31,6 +34,20 @@ def test_unknown_error_while_creating_browser_context_strips_call_log() -> None:
     assert "timed out after 180 seconds" in message
     assert "Please try re-running." in message
     assert "support@skyvern.com" in message
+
+
+def test_unknown_error_preserves_cdp_configuration_guidance() -> None:
+    inner_exception = CdpConnectionConfigurationError(
+        "Skyvern reached the configured CDP address, but /json/version returned HTTP 404. "
+        "Start Chrome with --remote-debugging-port=9222."
+    )
+
+    error = UnknownErrorWhileCreatingBrowserContext("cdp-connect", inner_exception)
+    message = str(error)
+
+    assert "CdpConnectionConfigurationError" in message
+    assert "/json/version returned HTTP 404" in message
+    assert "--remote-debugging-port=9222" in message
 
 
 def test_get_user_facing_exception_message_for_skyvern_exception() -> None:
@@ -57,7 +74,7 @@ def test_raise_server_extra_required_translates_when_server_extra_missing(monkey
     )
     missing = ModuleNotFoundError("No module named 'starlette_context'", name="starlette_context")
 
-    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[server\]"'):
         raise_server_extra_required("skyvern.library.skyvern_browser", missing)
 
 
@@ -68,8 +85,26 @@ def test_raise_server_extra_required_translates_missing_server_marker(monkeypatc
     )
     missing = ModuleNotFoundError("No module named 'playwright'", name="playwright")
 
-    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[server\]"'):
         raise_server_extra_required("skyvern.library.skyvern_browser", missing)
+
+
+def test_raise_local_extra_required_translates_missing_local_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "playwright" else object(),
+    )
+    missing = ModuleNotFoundError("No module named 'playwright'", name="playwright")
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[local\]"'):
+        raise_local_extra_required("Browser APIs", missing)
+
+
+def test_raise_local_extra_required_rewrites_nested_server_guard() -> None:
+    missing = SkyvernExtraNotInstalled("skyvern.forge.api_app", extra="server")
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[local\]"'):
+        raise_local_extra_required("Skyvern.local()", missing)
 
 
 def test_raise_server_extra_required_preserves_installed_marker_submodule_failure(
@@ -132,7 +167,7 @@ def test_require_server_extra_modules_requires_server_sentinels(monkeypatch: pyt
         lambda module_name: None if module_name == "sqlalchemy" else object(),
     )
 
-    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[server\]"'):
         require_server_extra_modules("skyvern.library.skyvern_browser_page")
 
 
@@ -142,8 +177,31 @@ def test_require_server_extra_modules_catches_partial_server_graph(monkeypatch: 
         lambda module_name: None if module_name == "jinja2" else object(),
     )
 
-    with pytest.raises(SkyvernExtraNotInstalled, match=r"pip install skyvern\[server\]"):
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[server\]"'):
         require_server_extra_modules("skyvern.library.skyvern_browser_page")
+
+
+def test_require_server_extra_modules_discriminates_from_local_with_explicit_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "uvicorn" else object(),
+    )
+
+    require_server_extra_modules("skyvern.forge.api_app")
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[server\]"'):
+        require_server_extra_modules("skyvern.forge", ("uvicorn",))
+
+
+def test_require_local_extra_modules_requires_local_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "playwright" else object(),
+    )
+
+    with pytest.raises(SkyvernExtraNotInstalled, match=r'pip install "skyvern\[local\]"'):
+        require_local_extra_modules("skyvern.library.skyvern_browser_page")
 
 
 def test_browser_connection_error_connect_over_cdp_websocket() -> None:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import http.server
 import threading
 import urllib.parse
+from pathlib import Path
 
+from skyvern.cli import auth_command
 from skyvern.cli.auth_command import _CallbackHandler, _derive_api_base_url, _find_free_port
 
 
@@ -40,6 +42,57 @@ class TestFindFreePort:
             assert sock.fileno() != -1
         finally:
             sock.close()
+
+
+def test_run_signup_defaults_to_cloud_write_path(tmp_path, monkeypatch) -> None:
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43210)
+
+    class FakeServer:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.auth_result = {"api_key": None, "organization_id": None, "email": None}
+
+        def server_activate(self) -> None:
+            pass
+
+        def serve_forever(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    class FakeEvent:
+        def wait(self, timeout: int | None = None) -> bool:
+            return True
+
+    class FakeThread:
+        def __init__(self, target, daemon: bool) -> None:
+            self.server = target.__self__
+
+        def start(self) -> None:
+            self.server.auth_result = {"api_key": "sk_test", "organization_id": None, "email": None}
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("SKYVERN_ENV_FILE", raising=False)
+    (tmp_path / ".env").write_text("SKYVERN_API_KEY=server-key\n")
+
+    saved: list[tuple[str, str, Path]] = []
+
+    def fake_update_or_add_env_var(key: str, value: str, env_path: Path) -> None:
+        saved.append((key, value, Path(env_path)))
+
+    monkeypatch.setattr(auth_command, "_find_free_port", lambda: FakeSocket())
+    monkeypatch.setattr(auth_command.http.server, "HTTPServer", FakeServer)
+    monkeypatch.setattr(auth_command.threading, "Event", FakeEvent)
+    monkeypatch.setattr(auth_command.threading, "Thread", FakeThread)
+    monkeypatch.setattr(auth_command.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr("skyvern.cli.llm_setup.update_or_add_env_var", fake_update_or_add_env_var)
+
+    assert auth_command.run_signup(timeout=1) == "sk_test"
+
+    assert {item[2] for item in saved} == {tmp_path / "home" / ".skyvern" / ".env"}
 
 
 class TestCallbackHandlerStateValidation:

@@ -15,6 +15,7 @@ import { FlowRenderer } from "../editor/FlowRenderer";
 import { getElements } from "../editor/workflowEditorUtils";
 import { ProxyLocation } from "@/api/types";
 import { AppNode } from "../editor/nodes";
+import { areBlocksIdentical } from "../util/compareBlocks";
 
 type BlockComparison = {
   leftBlock?: WorkflowBlock;
@@ -32,23 +33,6 @@ type Props = {
 
 function getBlockIdentifier(block: WorkflowBlock): string {
   return `${block.block_type}:${block.label}`;
-}
-
-function areBlocksIdentical(
-  block1: WorkflowBlock,
-  block2: WorkflowBlock,
-): boolean {
-  // Convert blocks to string representation for comparison
-  // Remove dynamic fields that shouldn't affect equality
-  const normalize = (block: WorkflowBlock) => {
-    const normalized = { ...block };
-    // Remove output_parameter as it might have different IDs
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { output_parameter, ...rest } = normalized;
-    return JSON.stringify(rest, Object.keys(rest).sort());
-  };
-
-  return normalize(block1) === normalize(block2);
 }
 
 function compareWorkflowBlocks(

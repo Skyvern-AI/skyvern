@@ -35,6 +35,22 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 LOG = structlog.get_logger()
 
 
+def _safe_get_file_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        LOG.warning("Failed to get file size", path=path, exc_info=True)
+        return None
+
+
+async def _get_object_info_safe(storage: "AzureStorage", uri: str) -> dict | None:
+    try:
+        return await storage.async_client.get_object_info(uri)
+    except Exception:
+        LOG.warning("Object info retrieval failed", uri=uri, exc_info=True)
+        return None
+
+
 class AzureStorage(BaseStorage):
     _PATH_VERSION = "v1"
 
@@ -332,14 +348,13 @@ class AzureStorage(BaseStorage):
         for key in object_keys:
             metadata = {}
             modified_at: datetime | None = None
+            content_length: int | None = None
             # Get metadata (including checksum)
-            try:
-                object_info = await self.async_client.get_object_info(key)
-                if object_info:
-                    metadata = object_info.get("Metadata", {})
-                    modified_at = object_info.get("LastModified")
-            except Exception:
-                LOG.exception("Object info retrieval failed", uri=key)
+            object_info = await _get_object_info_safe(self, key)
+            if object_info:
+                metadata = object_info.get("Metadata", {})
+                modified_at = object_info.get("LastModified")
+                content_length = object_info.get("ContentLength")
 
             # Create FileInfo object
             filename = os.path.basename(key)
@@ -354,6 +369,7 @@ class AzureStorage(BaseStorage):
                 url=sas_urls[0],
                 checksum=checksum,
                 filename=metadata.get("original_filename", filename) if metadata else filename,
+                file_size=content_length,
                 modified_at=modified_at,
             )
             file_infos.append(file_info)
@@ -443,14 +459,11 @@ class AzureStorage(BaseStorage):
             modified_at: datetime | None = None
             content_length: int | None = None
             # Get metadata (including checksum)
-            try:
-                object_info = await self.async_client.get_object_info(key)
-                if object_info:
-                    metadata = object_info.get("Metadata", {})
-                    modified_at = object_info.get("LastModified")
-                    content_length = object_info.get("ContentLength") or object_info.get("Size")
-            except Exception:
-                LOG.exception("Recording object info retrieval failed", uri=key)
+            object_info = await _get_object_info_safe(self, key)
+            if object_info:
+                metadata = object_info.get("Metadata", {})
+                modified_at = object_info.get("LastModified")
+                content_length = object_info.get("ContentLength")
 
             # Skip zero-byte objects (if any incomplete uploads)
             if content_length == 0:
@@ -469,6 +482,7 @@ class AzureStorage(BaseStorage):
                 url=sas_urls[0],
                 checksum=checksum,
                 filename=metadata.get("original_filename", filename) if metadata else filename,
+                file_size=content_length,
                 modified_at=modified_at,
             )
             file_infos.append(file_info)
@@ -512,6 +526,7 @@ class AzureStorage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
+            file_size = _safe_get_file_size(fpath)
             # Azure Blob metadata values must be ASCII; preserve the full
             # filename via the blob path / Artifact URI instead.
             metadata: dict[str, str] = {"sha256_checksum": checksum}
@@ -549,6 +564,7 @@ class AzureStorage(BaseStorage):
                         uri=uri,
                         filename=file,
                         checksum=checksum,
+                        file_size=file_size,
                     )
                 except Exception:
                     LOG.warning(
@@ -599,7 +615,12 @@ class AzureStorage(BaseStorage):
         for key in object_keys:
             object_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{key}"
 
-            metadata = await self.async_client.get_file_metadata(object_uri, log_exception=False)
+            metadata = {}
+            content_length: int | None = None
+            object_info = await _get_object_info_safe(self, object_uri)
+            if object_info:
+                metadata = object_info.get("Metadata", {})
+                content_length = object_info.get("ContentLength")
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
             display_name = metadata.get("original_filename", filename) if metadata else filename
@@ -613,6 +634,7 @@ class AzureStorage(BaseStorage):
                     url=sas_urls[0],
                     checksum=checksum,
                     filename=display_name,
+                    file_size=content_length,
                 )
             )
 
@@ -709,12 +731,14 @@ class AzureStorage(BaseStorage):
             # transient DB outage — both ops are idempotent.
             is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
             checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            file_size = None if is_partial else _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
                 checksum=checksum,
+                file_size=file_size,
             )
         elif artifact_type == "videos":
             # Recording uploaded once at session close — see s3.py. Artifact-
@@ -725,12 +749,14 @@ class AzureStorage(BaseStorage):
             # we fall through to the Azure LIST path, so a row-less recording
             # still surfaces via the legacy SAS URL).
             checksum = calculate_sha256_for_file(local_file_path)
+            file_size = _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
                 checksum=checksum,
+                file_size=file_size,
             )
 
         return uri

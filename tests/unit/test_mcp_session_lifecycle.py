@@ -11,7 +11,10 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import session as mcp_session
+from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
+
+CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
 
 @pytest.fixture(autouse=True)
@@ -619,6 +622,31 @@ async def test_session_create_stateless_mode_accepts_geotarget_proxy_location(
 
 
 @pytest.mark.asyncio
+async def test_session_create_stateless_mode_forwards_extensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_manager.set_stateless_http_mode(True)
+    fake_skyvern = MagicMock()
+    fake_skyvern.create_browser_session = AsyncMock(return_value=SimpleNamespace(browser_session_id="pbs_ext"))
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+
+    try:
+        result = await mcp_session.skyvern_browser_session_create(
+            timeout=45,
+            extensions=[CAPTCHA_SOLVER_EXTENSION],
+        )
+    finally:
+        session_manager.set_stateless_http_mode(False)
+
+    assert result["ok"] is True
+    fake_skyvern.create_browser_session.assert_awaited_once_with(
+        timeout=45,
+        proxy_location=None,
+        extensions=[CAPTCHA_SOLVER_EXTENSION],
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_create_stateless_mode_rejects_local() -> None:
     session_manager.set_stateless_http_mode(True)
     try:
@@ -649,6 +677,38 @@ async def test_session_create_rejects_local_or_cdp_browser_profile_id(
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
     assert "cloud" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_session_create_forwards_extensions_to_stateful_session_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_skyvern = MagicMock()
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+
+    fake_browser = MagicMock()
+    do_session_create = AsyncMock(
+        return_value=(
+            fake_browser,
+            SimpleNamespace(local=False, session_id="pbs_ext", timeout_minutes=60, headless=False),
+        )
+    )
+    monkeypatch.setattr(mcp_session, "do_session_create", do_session_create)
+
+    result = await mcp_session.skyvern_browser_session_create(
+        timeout=60,
+        extensions=[CAPTCHA_SOLVER_EXTENSION],
+    )
+
+    assert result["ok"] is True
+    do_session_create.assert_awaited_once_with(
+        fake_skyvern,
+        timeout=60,
+        proxy_location=None,
+        extensions=[CAPTCHA_SOLVER_EXTENSION],
+        local=False,
+        headless=False,
+    )
 
 
 @pytest.mark.asyncio

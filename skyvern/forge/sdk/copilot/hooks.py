@@ -49,6 +49,13 @@ class CopilotRunHooks(RunHooksBase):
             summary = summarize_tool_result(tool_name, parsed)
 
             activity_entry: dict[str, Any] = {"tool": tool_name, "summary": summary}
+            LOG.info(
+                "copilot tool completed",
+                tool_name=tool_name,
+                ok=parsed.get("ok"),
+                summary=summary,
+                total_tokens=getattr(self._ctx, "total_tokens_used", None),
+            )
 
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}

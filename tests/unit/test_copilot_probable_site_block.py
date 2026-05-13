@@ -14,18 +14,64 @@ from skyvern.forge.sdk.copilot.enforcement import (
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
     REPEATED_FRONTIER_STREAK_ESCALATE_AT,
+    _check_enforcement,
     _needs_probable_site_block_stop_nudge,
     _repeated_frontier_failure_nudge,
 )
 from skyvern.forge.sdk.copilot.tools import (
     _detect_probable_site_block_wall,
+    _detect_timing_only_challenge_wait_blocks,
     _record_run_blocks_result,
+    _timing_only_challenge_wait_reject_message,
+    _update_workflow,
 )
 
 _SCRAPE_WALL_REASON = (
     "Skyvern failed to load the website. The page may have navigated "
     "unexpectedly or become unresponsive during analysis."
 )
+
+_CHALLENGE_WAIT_WORKFLOW = """
+workflow_definition:
+  blocks:
+    - label: open_page
+      block_type: goto_url
+      url: https://example.com
+      next_block_label: wait_challenge
+    - label: wait_challenge
+      title: Wait for challenge
+      block_type: wait
+      wait_sec: 10
+"""
+
+_GENERIC_WAIT_WORKFLOW = """
+workflow_definition:
+  blocks:
+    - label: wait_for_download
+      title: Wait for download
+      block_type: wait
+      wait_sec: 10
+"""
+
+_CONDITIONAL_ACTION_WORKFLOW = """
+workflow_definition:
+  blocks:
+    - label: check_for_challenge
+      block_type: conditional
+      branch_conditions:
+        - condition_type: prompt
+          condition: If a challenge is visible on the page
+          next_block_label: handle_visible_challenge
+      next_block_label: extract_data
+    - label: handle_visible_challenge
+      title: Handle visible challenge
+      block_type: navigation
+      navigation_goal: Click the visible verification control if present.
+      next_block_label: extract_data
+    - label: extract_data
+      block_type: extraction
+      data_extraction_goal: Extract the requested data.
+"""
 
 
 def _fresh_context() -> CopilotContext:
@@ -298,3 +344,80 @@ def test_nudge_text_is_stop_oriented() -> None:
     # Sanity-check the stop nudge tells the agent not to retry.
     assert "STOP" in POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
     assert "Do NOT" in POST_PROBABLE_SITE_BLOCK_STOP_NUDGE
+
+
+def test_stop_nudge_uses_different_proxy_advice_when_effective_proxy_is_active() -> None:
+    ctx = _fresh_context()
+    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    ctx.effective_workflow_proxy_location = "RESIDENTIAL"
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge is not None
+    assert "configure a proxy" not in nudge.lower()
+    assert "different proxy location" in nudge.lower()
+    assert "US-CA" in nudge
+    assert "US-NY" in nudge
+    assert "residential/ISP" in nudge
+
+
+def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
+    ctx = _fresh_context()
+    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+    ctx.effective_workflow_proxy_location = "NONE"
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge is not None
+    assert "configure a proxy" in nudge.lower()
+
+
+def test_detects_challenge_named_wait_block() -> None:
+    assert _detect_timing_only_challenge_wait_blocks(_CHALLENGE_WAIT_WORKFLOW) == ["wait_challenge"]
+
+
+def test_rejects_challenge_wait_after_explicit_anti_bot_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.last_test_anti_bot = "Cloudflare challenge page detected"
+
+    message = _timing_only_challenge_wait_reject_message(ctx, _CHALLENGE_WAIT_WORKFLOW)
+
+    assert message is not None
+    assert "wait_challenge" in message
+    assert "timing-only challenge wait" in message
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_rejects_challenge_wait_after_explicit_anti_bot_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.last_test_anti_bot = "Cloudflare challenge page detected"
+
+    result = await _update_workflow({"workflow_yaml": _CHALLENGE_WAIT_WORKFLOW}, ctx)
+
+    assert result["ok"] is False
+    assert "wait_challenge" in str(result["error"])
+
+
+def test_rejects_challenge_wait_after_repeated_scrape_wall() -> None:
+    ctx = _fresh_context()
+    _record_run_blocks_result(ctx, _scrape_wall_result())
+    _record_run_blocks_result(ctx, _scrape_wall_result())
+
+    message = _timing_only_challenge_wait_reject_message(ctx, _CHALLENGE_WAIT_WORKFLOW)
+
+    assert message is not None
+    assert "wait_challenge" in message
+
+
+def test_allows_generic_wait_after_block_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.last_test_anti_bot = "challenge page detected"
+
+    assert _timing_only_challenge_wait_reject_message(ctx, _GENERIC_WAIT_WORKFLOW) is None
+
+
+def test_allows_conditional_challenge_action_after_block_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.last_test_anti_bot = "challenge page detected"
+
+    assert _timing_only_challenge_wait_reject_message(ctx, _CONDITIONAL_ACTION_WORKFLOW) is None

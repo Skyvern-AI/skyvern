@@ -1,20 +1,24 @@
+from __future__ import annotations
+
 import io
 import time
 from enum import StrEnum
 from mimetypes import add_type, guess_type
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import aioboto3
 import structlog
 from botocore.exceptions import ClientError
-from types_boto3_batch.client import BatchClient
-from types_boto3_ec2.client import EC2Client
-from types_boto3_ecs.client import ECSClient
-from types_boto3_s3.client import S3Client
-from types_boto3_secretsmanager.client import SecretsManagerClient
 
 from skyvern.config import settings
+
+if TYPE_CHECKING:
+    from types_boto3_batch.client import BatchClient
+    from types_boto3_ec2.client import EC2Client
+    from types_boto3_ecs.client import ECSClient
+    from types_boto3_s3.client import S3Client
+    from types_boto3_secretsmanager.client import SecretsManagerClient
 
 # Register custom mime types for mimetypes guessing
 add_type("application/json", ".har")

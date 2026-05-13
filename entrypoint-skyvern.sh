@@ -62,13 +62,15 @@ if [ "$run_migration" = true ]; then
     alembic check
 fi
 
-if [ ! -f ".streamlit/secrets.toml" ]; then
+SKYVERN_CREDENTIALS_FILE="${SKYVERN_CREDENTIALS_FILE:-/app/.skyvern/credentials.toml}"
+mkdir -p "$(dirname "$SKYVERN_CREDENTIALS_FILE")"
+
+if [ ! -f "$SKYVERN_CREDENTIALS_FILE" ]; then
     echo "Creating organization and API token..."
     org_output=$(python scripts/create_organization.py Skyvern-Open-Source)
     api_token=$(echo "$org_output" | awk '/token=/{gsub(/.*token='\''|'\''.*/, ""); print}')
-    # Update the secrets-open-source.toml file
-    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://skyvern:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
-    echo ".streamlit/secrets.toml file updated with organization details."
+    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://skyvern:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > "$SKYVERN_CREDENTIALS_FILE"
+    echo "$SKYVERN_CREDENTIALS_FILE file updated with organization details."
 fi
 
 _kill_xvfb_on_term() {

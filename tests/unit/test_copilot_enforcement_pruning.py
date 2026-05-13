@@ -655,6 +655,17 @@ class TestEnforcement:
         assert nudge != POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
         assert ctx.explore_without_workflow_nudge_count == 0
 
+    def test_update_without_test_allowed_for_explicit_untested_draft(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _check_enforcement
+
+        ctx = self._make_ctx(
+            allow_untested_workflow_draft=True,
+            update_workflow_called=True,
+            test_after_update_done=False,
+        )
+
+        assert _check_enforcement(ctx) is None
+
     def test_explore_without_workflow_not_when_test_done(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE, _check_enforcement
 
@@ -789,10 +800,10 @@ class TestEnforcement:
 
 class TestGoalLikelyNeedsMoreBlocks:
     @staticmethod
-    def _check(user_message: str, block_count: int) -> bool:
+    def _check(user_message: str, block_count: int, completion_contract: str | None = None) -> bool:
         from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 
-        return _goal_likely_needs_more_blocks(user_message, block_count)
+        return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
 
     def test_navigate_and_download_needs_two(self) -> None:
         assert self._check("Go to france.fr and then download regulations", 1) is True
@@ -805,6 +816,15 @@ class TestGoalLikelyNeedsMoreBlocks:
 
     def test_single_action_does_not_need_more(self) -> None:
         assert self._check("Go to france.fr", 1) is False
+
+    def test_completion_contract_does_not_force_extra_blocks_after_success(self) -> None:
+        user_message = "Go to example.com/contact, fill out the form, and submit it."
+        assert self._check(user_message, 1, "confirmation banner appears") is False
+
+    def test_completion_contract_still_requires_sequential_blocks(self) -> None:
+        user_message = "Go to example.com and then download the report."
+        assert self._check(user_message, 1, "download starts") is True
+        assert self._check(user_message, 2, "download starts") is False
 
     def test_sequential_connector_needs_at_least_two(self) -> None:
         assert self._check("Do X and then do Y", 1) is True

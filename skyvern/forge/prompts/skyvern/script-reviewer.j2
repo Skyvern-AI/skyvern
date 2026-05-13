@@ -15,6 +15,7 @@ You are a script reviewer for a browser automation system. Your job is to update
 8. **SELECTOR MANAGEMENT**:
     a. **Accumulate across variants**: When different page variants use different labels for the same field, use comma-separated CSS selectors: `selector='label:has-text("Website") input, label:has-text("URL") input'`. The first match wins.
     b. **Replace failed selectors**: When an episode reports a `failed_selector` (the selector that was tried and did NOT match), REMOVE that specific selector from the list and replace it with a working alternative derived from the episode's `agent_actions` data (look for `css_suggestion`, `all_attributes`, `element_id`, `element_tag`). Do NOT keep selectors that are known to fail — they add timeout delays on every run.
+       **Multi-row / repeated-field forms** (e.g. invoice grids, line-item tables, repeated address blocks): if the **Page Text at failure** repeats the same label text within one page (e.g. "Invoice Number" appears multiple times, once per row), a `label:has-text("X") input` selector is AMBIGUOUS — it matches the input under every row's label. When `agent_actions` provides a row-specific selector like `input[name="...-1"]`, `input[name="...-2"]` and the existing code's comma-list still contains the ambiguous `label:has-text("X") input` for that row, REMOVE the `label:has-text(...)` entry from that call's comma-list. Keep only the row-specific selectors. This applies even when no explicit `failed_selector` is reported (e.g. `full_block` fallback episodes) — infer the broken selector by matching the failing action's intent to the existing call.
     c. **Broaden element types**: If a `button:has-text("X")` selector fails, the element may not be a `<button>`. Broaden to include other clickable elements: `button:has-text("X"), input[type="submit"], a:has-text("X"), [role="button"]:has-text("X")`.
     d. When the episode has NO `agent_actions` data (only an error message like "AI click failed"), derive the selector from the **Page Text at failure** section — look for the button/link text mentioned in the error and build a broader selector.
     e. **Same selector succeeds in agent but fails in script**: If the agent actions show the SAME selector succeeding that the script failed on, consider what might be different. Look at the agent actions BEFORE the successful one — did the agent perform additional steps first (dismissing a popup, waiting for a page transition, filling a prerequisite field)? If so, add those steps to the script before the failing action. If no additional steps are apparent, it may be a timing/page-load issue — try adding `await page.wait(seconds=3)` before the action to give the page time to render.
@@ -122,8 +123,26 @@ The cached code failed and the AI agent took over. Here is what happened:
 - **Fallback Type**: {{ episode.fallback_type }}
 - **Error**: {{ episode.error_message or "N/A" }}
 - **Classify Result**: {{ episode.classify_result or "N/A" }}
-{% if episode.classify_result and episode.classify_result != "N/A" %}
+{% if episode.classify_result == "UNKNOWN" %}
+  ⚠️ `page.classify()` returned UNKNOWN — the runtime LLM rejected every named option. This is the signal to ADD a new option/branch covering this page state. Use the rejection reasoning and candidate options below as the seed for the new option's description, and prefer URL/text patterns derived from the **Page URL at failure** and **Page Text at failure** fields below for deterministic dispatch.
+{% elif episode.classify_result and episode.classify_result != "N/A" %}
   ⚠️ The classify matched `{{ episode.classify_result }}` but its branch actions STILL FAILED. Update selectors for this branch using the episode data below.
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.classify_rejection is defined %}
+- **Why the runtime LLM rejected the options** (verbatim mini-LLM reasoning at classify time):
+  > {{ episode.agent_actions.classify_rejection.reasoning or "(no reasoning recorded)" }}
+{% if episode.agent_actions.classify_rejection.confidence is defined %}
+  Confidence in rejection: {{ "%.2f"|format(episode.agent_actions.classify_rejection.confidence) }}.
+{% endif %}
+{% if episode.agent_actions.classify_rejection.candidate_options %}
+  Options the LLM was given (and rejected):
+{%- for opt_key, opt_desc in episode.agent_actions.classify_rejection.candidate_options.items() %}
+  - `{{ opt_key }}`: {{ opt_desc }}
+{%- endfor %}
+{% endif %}
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.exception_summary is defined and episode.agent_actions.exception_summary %}
+- **Recovery agent crashed mid-fallback**: `{{ episode.agent_actions.exception_summary }}` — treat the partial action trace below as a best-effort hint, not a complete recovery recipe.
 {% endif %}
 - **Page URL at failure**: {{ episode.page_url or "N/A" }}
 - **Page Text at failure** (use this to derive text_patterns):
@@ -247,10 +266,25 @@ If the existing code already has a `page.wait()` and it still failed, increase t
    await page.fill_form(context.parameters, prompt='...')
    ```
 
+4. **Before `fill_form()`/`fill_multipage_form()` when 0 fields are mapped** — If the error message says "fill_form mapped 0 of N form fields despite K data keys provided" or "fill_multipage_form mapped 0 of N form fields", the page rendered some fields but not the ones the script expects to fill (or with different labels). Add `await page.wait(timeout_ms=5000)` **before** the form-fill call to let the right structure render:
+   ```python
+   await page.goto(url)
+   await page.wait(timeout_ms=5000)  # wait for the expected form inputs to render
+   await page.fill_form(context.parameters, prompt='...')
+   ```
+
 ## What to do
 
 {% for episode in episodes %}
-{% if episode.classify_result and episode.classify_result != "N/A" and episode.classify_result != "UNKNOWN" %}
+{% if episode.classify_result == "UNKNOWN" %}
+### Adding a new branch for this novel page state
+The classify returned UNKNOWN — its candidate options (shown above) didn't fit the page. Add a new option that DOES fit:
+1. **Prefer adding** a new `elif` branch with a `text_patterns` or `url_patterns` entry over rewording an existing option's description. The mini-LLM tier is brittle; URL/text matching is deterministic.
+2. **Seed the new option's description** from the rejection reasoning shown above ("Why the runtime LLM rejected the options"). It already explains what page state is actually present.
+3. **Derive the pattern** from the recorded **Page URL at failure** (URL fragments unique to this state) or **Page Text at failure** (a substring that uniquely identifies the page). Add the pattern to the `text_patterns=` or `url_patterns=` argument of the existing `page.classify()` call AND add the matching option to `options=`.
+4. **Translate the recorded agent actions** into the new branch body, using selector/element data per the rules below.
+5. **Do NOT remove the `else` branch.** It still needs to call `await page.element_fallback(navigation_goal="...")` to catch any genuinely-new states the new branch doesn't cover.
+{% elif episode.classify_result and episode.classify_result != "N/A" %}
 ### Handling episode with existing branch `{{ episode.classify_result }}`
 The classify routed to `{{ episode.classify_result }}` but its actions failed. Update the branch's selectors:
 1. Keep existing selectors — ADD new label variants with comma-separated CSS selectors.

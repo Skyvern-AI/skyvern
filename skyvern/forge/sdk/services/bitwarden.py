@@ -353,11 +353,11 @@ class BitwardenService:
                     raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
 
                 login = item["login"]
-                totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+                totp = BitwardenService.extract_totp_secret(login.get("totp") or "")
 
                 return {
-                    BitwardenConstants.USERNAME: login.get("username", ""),
-                    BitwardenConstants.PASSWORD: login.get("password", ""),
+                    BitwardenConstants.USERNAME: login.get("username") or "",
+                    BitwardenConstants.PASSWORD: login.get("password") or "",
                     BitwardenConstants.TOTP: totp,
                 }
             elif not url:
@@ -415,16 +415,16 @@ class BitwardenService:
                     continue
 
                 login = item["login"]
-                totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+                totp = BitwardenService.extract_totp_secret(login.get("totp") or "")
 
                 bitwarden_result.append(
                     BitwardenQueryResult(
                         credential={
-                            BitwardenConstants.USERNAME: login.get("username", ""),
-                            BitwardenConstants.PASSWORD: login.get("password", ""),
+                            BitwardenConstants.USERNAME: login.get("username") or "",
+                            BitwardenConstants.PASSWORD: login.get("password") or "",
                             BitwardenConstants.TOTP: totp,
                         },
-                        uris=[uri.get("uri") for uri in login.get("uris", []) if "uri" in uri],
+                        uris=[uri.get("uri") for uri in login.get("uris") or [] if uri.get("uri")],
                     )
                 )
 

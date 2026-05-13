@@ -27,9 +27,11 @@ from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     copilot_session_input_callback,
+    make_copilot_call_model_input_filter,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
@@ -121,14 +123,19 @@ def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfi
     )
 
 
-def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, bool]:
+def resolve_model_config(
+    llm_api_handler: Any,
+    *,
+    copilot_config: CopilotConfig | None = None,
+    llm_key_override: str | None = None,
+) -> tuple[str, RunConfig, str, bool]:
     """Map Skyvern llm_key to OpenAI Agents SDK model string + RunConfig.
 
     Returns (model_name, run_config, llm_key, supports_vision).
     """
     configure_litellm_transport()
 
-    llm_key = getattr(llm_api_handler, "llm_key", None) or settings.LLM_KEY
+    llm_key = llm_key_override or getattr(llm_api_handler, "llm_key", None) or settings.LLM_KEY
     config = LLMConfigRegistry.get_config(llm_key)
 
     if isinstance(config, LLMRouterConfig):
@@ -201,7 +208,11 @@ def resolve_model_config(llm_api_handler: Any) -> tuple[str, RunConfig, str, boo
         model_settings=model_settings,
         tracing_disabled=not is_tracing_enabled(),
         session_input_callback=copilot_session_input_callback,
-        call_model_input_filter=copilot_call_model_input_filter,
+        call_model_input_filter=(
+            make_copilot_call_model_input_filter(copilot_config.token_budget)
+            if copilot_config is not None
+            else copilot_call_model_input_filter
+        ),
     )
 
     return config.model_name, run_config, llm_key, config.supports_vision

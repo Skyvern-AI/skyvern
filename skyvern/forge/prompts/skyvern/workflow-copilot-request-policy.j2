@@ -1,0 +1,50 @@
+Classify the latest Workflow Copilot request. Return only JSON with keys:
+testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract.
+
+testing_intent:
+- skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
+- require_test: the user asks to build/create and test/run/verify/end-to-end it, or asks for a complete workflow that should be validated.
+- unspecified: the user does not say whether Skyvern should test the workflow.
+- Do not use skip_test for a "done when", "complete when", or success-condition sentence; that is a completion_contract.
+
+credential_input_kind:
+- raw_secret: the user pasted inline login credentials or secrets, including passwords, API keys, tokens, bearer headers, cookies, TOTP/OTP codes, private keys, card numbers, or CVVs.
+- credential_id: the user provided one or more exact credential IDs beginning with `cred_`. Put every ID in credential_refs.
+- credential_name: the user gave an exact saved credential name, or vaguely says to use "my credentials", "my saved credentials", "credentials saved already", or an entry in the Credentials UI without enough website context. Treat quoted names and bare identifier-like names tied to credential verbs as exact names, for example `using azure_credentials`, `get the code from mfa_email`, or `use Login Prod`. Put exact names in credential_refs; leave credential_refs empty when the reference is vague.
+- website_stored_credential: the user asks to use stored/saved credentials for a specific website or login page URL. Put URLs in login_page_urls.
+- placeholder: the user asks to add credential/password/username fields but explicitly says there are no real credentials yet.
+- none: the request mentions a login workflow but does not provide, request, or refer to any credential material.
+
+requires_user_clarification:
+- true only when the user refers to credentials but does not provide enough information to identify a saved credential or login page.
+- false for normal build/test/verify requests with no credential reference, for explicit credential IDs/names/URLs, for placeholders, and for skip_test requests.
+
+completion_contract:
+- Set to the user's explicit done/complete/success condition when they provide one.
+- The value must be an exact span copied from the latest user message. Do not paraphrase, summarize, or infer a completion condition.
+- Set to null when the user does not provide an explicit completion condition.
+
+clarification_reason:
+- none: no clarification is needed.
+- raw_secret: the latest user message includes raw credential material.
+- credential_name_unresolved: the user asks for a saved login/credential without an exact saved credential name, credential ID, or resolvable login page URL.
+- credential_invention_requested: the user asks Copilot to make up, invent, fake, or fabricate credential metadata.
+- ambiguous_loop_edit: the user asks to put/move/wrap/place something in a loop but does not identify the loop scope or iterable.
+- missing_conditional_condition: the user gives a conditional target/action but no condition.
+- missing_target_context: the user gives a condition but not the target page/action.
+
+Rules:
+- Do not use skip_test to bypass missing or ambiguous credential scope; skip_test only means a workflow draft should not be executed after the credential scope is explicit.
+- Put exact saved credential names and credential IDs in credential_refs; do not include ordinary workflow parameters.
+- Use recent chat history when classifying a follow-up. For example, if the latest message says to draft without testing and the prior turn gave exact saved credential names, carry those names forward in credential_refs.
+- If a request has both unresolved credential refs and another possible clarification issue, prioritize the credential clarification.
+- Do not use missing_conditional_condition for ordinary if/then requirements that already state the condition, such as "if no value is provided, do X."
+- Credential classification anchors on whether the latest user message itself requests credentials — asks copilot to use, provide, reference, save, or pick credential material. Block labels, a {% raw %}`{{ credentials }}`{% endraw %} parameter inside workflow_yaml, and prior turns' credential context are topic mentions, not credential requests. The carry-forward rule above still applies for build-continuation follow-ups (a confirmation, a go-ahead, or a bare slot-fill of credential material). When the latest message is instead a question about workflow shape, behavior, runtime outcomes, or block structure, classify as credential_input_kind=none and requires_user_clarification=false — regardless of how much credential context lives in workflow_yaml or chat_history.
+- Identifier-shaped bare replies (UUID-like handles, vault/secret references such as `https://<vault>.vault.azure.net/secrets/<name>`, or key-vault secret names like `customer-<uuid>-pass`) inherit the most recent assistant turn's slot purpose. If that turn asked for a workflow-parameter value, a sample value, or a key-vault secret ID, classify the reply as credential_input_kind=none and requires_user_clarification=false; key-vault handles are vault pointers, not Skyvern saved-credential names. Promote a bare reply to credential_id, credential_name, or website_stored_credential only when the most recent assistant turn explicitly asked for a `cred_…` ID, a saved credential name, or a stored-credential URL respectively. This rule does NOT relax raw_secret detection: a bare value that itself looks like a literal password, API key, bearer token, OTP code, or private-key body remains credential_input_kind=raw_secret regardless of what the prior turn asked for.
+Latest user message:
+```{{ user_message }}```
+Recent chat history:
+```{{ chat_history }}```
+Current workflow YAML:
+```{{ workflow_yaml }}```
+Global context: ```{{ global_llm_context }}```

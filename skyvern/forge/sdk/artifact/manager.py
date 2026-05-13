@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import time
 import zipfile
 from collections import defaultdict
@@ -33,6 +34,16 @@ _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
     ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
 }
+
+
+def _safe_file_size_from_path(path: str | None) -> int | None:
+    if path is None:
+        return None
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        LOG.warning("Failed to get artifact file size", path=path, exc_info=True)
+        return None
 
 
 @dataclass
@@ -114,6 +125,7 @@ class ArtifactManager:
         uri: str,
         organization_id: str,
         bundle_key: str | None = None,
+        file_size: int | None = None,
         step_id: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -148,6 +160,7 @@ class ArtifactManager:
             artifact_type=artifact_type,
             uri=uri,
             bundle_key=bundle_key,
+            file_size=file_size,
             organization_id=organization_id,
             task_id=task_id,
             step_id=step_id,
@@ -174,6 +187,7 @@ class ArtifactManager:
         task_v2_id: str | None = None,
         run_id: str | None = None,
         ai_suggestion_id: str | None = None,
+        file_size: int | None = None,
         data: bytes | None = None,
         path: str | None = None,
     ) -> str:
@@ -194,6 +208,9 @@ class ArtifactManager:
         if not workflow_run_block_id and context:
             workflow_run_block_id = context.parent_workflow_run_block_id
 
+        if file_size is None:
+            file_size = _safe_file_size_from_path(path)
+
         artifact = await app.DATABASE.artifacts.create_artifact(
             artifact_id,
             artifact_type,
@@ -207,6 +224,7 @@ class ArtifactManager:
             run_id=run_id,
             organization_id=organization_id,
             ai_suggestion_id=ai_suggestion_id,
+            file_size=file_size,
         )
         if data:
             # Fire and forget
@@ -230,6 +248,7 @@ class ArtifactManager:
         uri = app.STORAGE.build_uri(
             organization_id=step.organization_id, artifact_id=artifact_id, step=step, artifact_type=artifact_type
         )
+        file_size = len(data) if data is not None else _safe_file_size_from_path(path)
         return await self._create_artifact(
             aio_task_primary_key=step.task_id,
             artifact_id=artifact_id,
@@ -238,6 +257,7 @@ class ArtifactManager:
             step_id=step.step_id,
             task_id=step.task_id,
             organization_id=step.organization_id,
+            file_size=file_size,
             data=data,
             path=path,
         )
@@ -286,6 +306,7 @@ class ArtifactManager:
         filename: str,
         workflow_run_id: str | None = None,
         checksum: str | None = None,
+        file_size: int | None = None,
     ) -> str:
         """Register a downloaded file as an Artifact row without re-uploading.
 
@@ -318,6 +339,7 @@ class ArtifactManager:
             run_id=run_id,
             workflow_run_id=workflow_run_id,
             checksum=checksum,
+            file_size=file_size,
         )
         LOG.debug(
             "Registered downloaded file as artifact",
@@ -335,6 +357,7 @@ class ArtifactManager:
         uri: str,
         filename: str,
         checksum: str | None = None,
+        file_size: int | None = None,
     ) -> str:
         """Register a session-scoped downloaded file as an Artifact row.
 
@@ -357,6 +380,7 @@ class ArtifactManager:
             filename=filename,
             artifact_type=ArtifactType.DOWNLOAD,
             checksum=checksum,
+            file_size=file_size,
         )
 
     async def create_browser_session_recording_artifact(
@@ -367,6 +391,7 @@ class ArtifactManager:
         uri: str,
         filename: str,
         checksum: str | None = None,
+        file_size: int | None = None,
     ) -> str:
         """Register a session-scoped recording (video) as a RECORDING Artifact row.
 
@@ -383,6 +408,7 @@ class ArtifactManager:
             filename=filename,
             artifact_type=ArtifactType.RECORDING,
             checksum=checksum,
+            file_size=file_size,
         )
 
     async def _create_browser_session_artifact(
@@ -394,6 +420,7 @@ class ArtifactManager:
         filename: str,
         artifact_type: ArtifactType,
         checksum: str | None = None,
+        file_size: int | None = None,
     ) -> str:
         """Shared idempotent insert keyed on ``(browser_session_id, uri, artifact_type)``."""
         existing = await app.DATABASE.artifacts.find_artifact_for_browser_session(
@@ -413,6 +440,7 @@ class ArtifactManager:
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             checksum=checksum,
+            file_size=file_size,
         )
         LOG.debug(
             "Registered session-scoped artifact",
@@ -631,6 +659,7 @@ class ArtifactManager:
             artifact_type=ArtifactType.SCRIPT_FILE,
             uri=uri,
             organization_id=organization_id,
+            file_size=len(data),
             data=data,
         )
 
@@ -1061,61 +1090,59 @@ class ArtifactManager:
         return f"{path}?{urlencode(extra)}" if extra else path
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        if artifact.bundle_key:
-            expiry_seconds = await self.resolve_artifact_url_expiry_seconds(artifact.organization_id)
-            return self._bundle_content_url(
+        """Return a Skyvern-origin signed ``/v1/artifacts/{id}/content`` URL.
+
+        SKY-8861: every customer-visible artifact URL goes through the content
+        endpoint — short, our origin, per-org TTL, no S3/Azure presigned URLs
+        leaking into webhooks or API responses. Bundled and non-bundled
+        artifacts share the same path; the content endpoint already serves
+        either (``retrieve_artifact`` handles bundle extraction transparently).
+        """
+        expiry_seconds = await self.resolve_artifact_url_expiry_seconds(artifact.organization_id)
+        return self._bundle_content_url(
+            artifact.artifact_id,
+            artifact_name=artifact.bundle_key,
+            artifact_type=artifact.artifact_type,
+            expiry_seconds=expiry_seconds,
+        )
+
+    async def get_share_links(self, artifacts: list[Artifact]) -> list[str | None]:
+        """Return signed content URLs for a batch of artifacts."""
+        return await self.get_share_links_with_bundle_support(artifacts)
+
+    async def get_share_links_with_bundle_support(self, artifacts: list[Artifact]) -> list[str | None]:
+        """Mint a signed ``/v1/artifacts/{id}/content`` URL for every artifact.
+
+        Bundled vs non-bundled used to branch here — bundled went through the
+        content endpoint, non-bundled fell through to ``STORAGE.get_share_links``
+        and leaked S3 presigned / Azure SAS URLs into webhooks and customer
+        API responses. SKY-8861: unify on the signed origin URL for both.
+
+        The per-org TTL is resolved once per batch (callers look up by
+        run/workflow scope so all artifacts share an org).
+        """
+        if not artifacts:
+            return []
+
+        organization_id = artifacts[0].organization_id
+        expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
+
+        result: list[str | None] = [
+            self._bundle_content_url(
                 artifact.artifact_id,
                 artifact_name=artifact.bundle_key,
                 artifact_type=artifact.artifact_type,
                 expiry_seconds=expiry_seconds,
             )
-        return await app.STORAGE.get_share_link(artifact)
-
-    async def get_share_links(self, artifacts: list[Artifact]) -> list[str | None]:
-        """Return share links for a list of artifacts, with bundle support.
-
-        Bundled artifacts (those with a bundle_key) return a backend content-endpoint URL
-        rather than a presigned S3 URL, which would 403 because the underlying S3 object is
-        a ZIP that cannot be accessed directly.
-        """
-        return await self.get_share_links_with_bundle_support(artifacts)
-
-    async def get_share_links_with_bundle_support(self, artifacts: list[Artifact]) -> list[str | None]:
-        """Get share links; bundled artifacts return an absolute backend content-endpoint URL instead of a presigned URL."""
-        result: list[str | None] = [None] * len(artifacts)
-        non_bundle_indices: list[int] = []
-        non_bundle_artifacts: list[Artifact] = []
-
-        # Resolve the per-org TTL once. All artifacts in a single batch share an
-        # org (callers always look up by run/workflow scope), so one DB hit
-        # covers every bundled URL we mint below.
-        organization_id = artifacts[0].organization_id if artifacts else None
-        bundled_expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
-
-        for i, artifact in enumerate(artifacts):
-            if artifact.bundle_key:
-                result[i] = self._bundle_content_url(
-                    artifact.artifact_id,
-                    artifact_name=artifact.bundle_key,
-                    artifact_type=artifact.artifact_type,
-                    expiry_seconds=bundled_expiry_seconds,
-                )
-            else:
-                non_bundle_indices.append(i)
-                non_bundle_artifacts.append(artifact)
+            for artifact in artifacts
+        ]
 
         LOG.debug(
             "get_share_links_with_bundle_support",
             total=len(artifacts),
-            bundled=len(artifacts) - len(non_bundle_artifacts),
-            non_bundled=len(non_bundle_artifacts),
+            bundled=sum(1 for a in artifacts if a.bundle_key),
+            non_bundled=sum(1 for a in artifacts if not a.bundle_key),
         )
-
-        if non_bundle_artifacts:
-            signed_urls = await app.STORAGE.get_share_links(non_bundle_artifacts)
-            if signed_urls:
-                for idx, url in zip(non_bundle_indices, signed_urls):
-                    result[idx] = url
 
         return result
 

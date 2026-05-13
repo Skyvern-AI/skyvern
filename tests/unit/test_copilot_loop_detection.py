@@ -106,6 +106,57 @@ class TestFailedToolStepLoopDetection:
         assert detect_failed_tool_step_loop(tracker, "click", {"selector": "#second"}) is None
         assert detect_failed_tool_step_loop(tracker, "click", {"selector": "#first"}) is not None
 
+    def test_block_running_credential_errors_share_failure_streak_across_arguments(self) -> None:
+        tracker: dict[str, int] = {}
+
+        record_tool_step_result(
+            tracker,
+            "run_blocks_and_collect_debug",
+            {"block_labels": ["draft_a"], "parameters": {}},
+            {"ok": False, "error": "Credential username not found by key: first"},
+        )
+        record_tool_step_result(
+            tracker,
+            "run_blocks_and_collect_debug",
+            {"block_labels": ["draft_b"], "parameters": {}},
+            {"ok": False, "error": "Credential username not found by key: second"},
+        )
+
+        msg = detect_failed_tool_step_loop(
+            tracker,
+            "run_blocks_and_collect_debug",
+            {"block_labels": ["draft_c"], "parameters": {}},
+        )
+
+        assert msg is not None
+        assert "LOOP DETECTED" in msg
+        assert "CREDENTIAL_ERROR" in msg
+
+    def test_generic_block_running_errors_still_key_by_arguments(self) -> None:
+        tracker: dict[str, int] = {}
+
+        record_tool_step_result(
+            tracker,
+            "run_blocks_and_collect_debug",
+            {"block_labels": ["draft_a"], "parameters": {}},
+            {"ok": False, "error": "temporary page state mismatch"},
+        )
+        record_tool_step_result(
+            tracker,
+            "run_blocks_and_collect_debug",
+            {"block_labels": ["draft_b"], "parameters": {}},
+            {"ok": False, "error": "temporary page state mismatch"},
+        )
+
+        assert (
+            detect_failed_tool_step_loop(
+                tracker,
+                "run_blocks_and_collect_debug",
+                {"block_labels": ["draft_c"], "parameters": {}},
+            )
+            is None
+        )
+
     def test_block_threshold_is_two_failures(self) -> None:
         tracker: dict[str, int] = {}
 

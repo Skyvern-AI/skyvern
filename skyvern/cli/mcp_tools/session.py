@@ -10,6 +10,7 @@ from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.session_ops import coerce_proxy_location, do_session_close, do_session_create, do_session_list
 from skyvern.client.errors import NotFoundError
+from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import proxy_location_to_request
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
@@ -53,6 +54,10 @@ async def skyvern_browser_session_create(
     browser_profile_id: Annotated[
         str | None,
         Field(description="Cloud browser profile ID (bp_...) to load saved authenticated state."),
+    ] = None,
+    extensions: Annotated[
+        list[Extensions] | None,
+        Field(description='Browser extensions to install, for example ["captcha-solver"].'),
     ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
@@ -125,11 +130,12 @@ async def skyvern_browser_session_create(
             skyvern = get_skyvern()
             if is_stateless_http_mode():
                 proxy = proxy_location_to_request(coerce_proxy_location(proxy_location))
-                session = await skyvern.create_browser_session(
-                    timeout=timeout or 60,
-                    proxy_location=proxy,
-                    browser_profile_id=browser_profile_id,
-                )
+                create_kwargs: dict[str, Any] = {"timeout": timeout or 60, "proxy_location": proxy}
+                if browser_profile_id is not None:
+                    create_kwargs["browser_profile_id"] = browser_profile_id
+                if extensions is not None:
+                    create_kwargs["extensions"] = extensions
+                session = await skyvern.create_browser_session(**create_kwargs)
                 timer.mark("sdk")
                 ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
                 response_data = {
@@ -151,14 +157,17 @@ async def skyvern_browser_session_create(
                     timing_ms=timer.timing_ms,
                 )
 
-            browser, result = await do_session_create(
-                skyvern,
-                timeout=timeout or 60,
-                proxy_location=coerce_proxy_location(proxy_location),
-                browser_profile_id=browser_profile_id,
-                local=local,
-                headless=headless,
-            )
+            session_create_kwargs: dict[str, Any] = {
+                "timeout": timeout or 60,
+                "proxy_location": coerce_proxy_location(proxy_location),
+                "local": local,
+                "headless": headless,
+            }
+            if browser_profile_id is not None:
+                session_create_kwargs["browser_profile_id"] = browser_profile_id
+            if extensions is not None:
+                session_create_kwargs["extensions"] = extensions
+            browser, result = await do_session_create(skyvern, **session_create_kwargs)
             timer.mark("sdk")
 
             if result.local:

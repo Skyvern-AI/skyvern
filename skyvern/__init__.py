@@ -32,6 +32,7 @@ _server_lazy_imports = {
     "goto": "skyvern.services.script_service",
     "login": "skyvern.services.script_service",
     "loop": "skyvern.services.script_service",
+    "while_loop": "skyvern.services.script_service",
     "parse_file": "skyvern.services.script_service",
     "parse_pdf": "skyvern.services.script_service",
     "prompt": "skyvern.services.script_service",

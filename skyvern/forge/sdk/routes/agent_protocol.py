@@ -29,6 +29,7 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
+from skyvern.constants import SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import (
     MissingBrowserAddressError,
     SkyvernHTTPException,
@@ -146,6 +147,8 @@ from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
 
+FORCE_TASK_V1_MAX_STEPS = 25
+
 _create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
 
 
@@ -187,6 +190,39 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+
+    skyvern_ctx = skyvern_context.current()
+    # Per-request distinct_id makes the TTLCache effectively single-use here; that's the
+    # price of true %-rollout randomization on a flag that's only checked once per request.
+    force_task_v1_distinct_id = (
+        skyvern_ctx.request_id if skyvern_ctx and skyvern_ctx.request_id else current_org.organization_id
+    )
+    if (
+        run_request.engine == RunEngine.skyvern_v2
+        and not run_request.publish_workflow
+        and await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "FORCE_TASK_V1",
+            force_task_v1_distinct_id,
+            properties={"organization_id": current_org.organization_id},
+        )
+    ):
+        cap = FORCE_TASK_V1_MAX_STEPS
+        if current_org.max_steps_per_run is not None:
+            cap = min(cap, current_org.max_steps_per_run)
+        log_extra: dict[str, Any] = {}
+        if run_request.run_with:
+            log_extra["dropped_run_with"] = run_request.run_with
+        LOG.info(
+            "FORCE_TASK_V1 flag set; routing to v1 engine",
+            organization_id=current_org.organization_id,
+            requested_max_steps=run_request.max_steps,
+            org_max_steps_per_run=current_org.max_steps_per_run,
+            effective_cap=cap,
+            **log_extra,
+        )
+        run_request.engine = RunEngine.skyvern_v1
+        if not run_request.max_steps or run_request.max_steps > cap:
+            run_request.max_steps = cap
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -274,6 +310,9 @@ async def run_task(
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
+        v2_trigger_type = (
+            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+        )
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=current_org,
@@ -283,6 +322,7 @@ async def run_task(
                 totp_verification_url=run_request.totp_url,
                 webhook_callback_url=run_request.webhook_url,
                 proxy_location=run_request.proxy_location,
+                trigger_type=v2_trigger_type,
                 publish_workflow=run_request.publish_workflow,
                 extracted_information_schema=run_request.data_extraction_schema,
                 error_code_mapping=run_request.error_code_mapping,
@@ -402,6 +442,7 @@ async def run_workflow(
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
         ai_fallback=workflow_run_request.ai_fallback,
+        run_metadata=workflow_run_request.run_metadata,
     )
 
     trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
@@ -1827,6 +1868,7 @@ async def run_block(
     user_id: str = Depends(org_auth_service.get_current_user_id),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
     """
     Kick off the execution of one or more blocks in a workflow. Returns the
@@ -1846,11 +1888,15 @@ async def run_block(
             block_labels=block_run_request.block_labels,
         )
 
+        block_trigger_type = (
+            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+        )
         workflow_run = await block_service.ensure_workflow_run(
             organization=organization,
             template=template,
             workflow_permanent_id=block_run_request.workflow_id,
             block_run_request=block_run_request,
+            trigger_type=block_trigger_type,
         )
 
         browser_session_id = block_run_request.browser_session_id
@@ -2190,8 +2236,8 @@ async def retry_webhook(
     if not latest_step:
         return await app.agent.build_task_response(task=task_obj)
 
-    # retry the webhook
-    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key)
+    # retry the webhook (single-shot - manual replay is itself the retry)
+    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key, enable_retries=False)
 
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
@@ -3403,6 +3449,7 @@ async def run_task_v2(
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
@@ -3413,6 +3460,9 @@ async def run_task_v2(
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
+    legacy_v2_trigger_type = (
+        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+    )
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
@@ -3430,6 +3480,7 @@ async def run_task_v2(
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
             browser_address=data.browser_address,
+            trigger_type=legacy_v2_trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

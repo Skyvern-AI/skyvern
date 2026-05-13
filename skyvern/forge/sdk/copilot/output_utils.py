@@ -47,6 +47,13 @@ _TYPE_ALTERNATION = "|".join(COPILOT_RESPONSE_TYPES)
 _LEADING_LABEL_RE = re.compile(rf"^\s*({_TYPE_ALTERNATION})\s*[:,]?\s+", re.IGNORECASE)
 _USER_RESPONSE_VALUE_RE = re.compile(r'"user_response"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _TYPE_VALUE_RE = re.compile(rf'"type"\s*:\s*"({_TYPE_ALTERNATION})"')
+_WORKFLOW_DELIVERY_CLAIM_PATTERNS = [
+    re.compile(r"\bhere(?:'|’)?s\s+(?:the|a)\s+workflow\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'|’)?ve|i\s+have)\s+drafted\b.{0,80}\bworkflow\b", re.IGNORECASE),
+    re.compile(r"\b(?:created|built|drafted|generated)\s+(?:a|the)\s+(?:draft\s+)?workflow\b", re.IGNORECASE),
+    re.compile(r"\byour\s+workflow\s+(?:is\s+)?(?:ready|complete|completed|set\s+up)\b", re.IGNORECASE),
+    re.compile(r"\bworkflow\s+(?:is\s+)?(?:ready|complete|completed)\b", re.IGNORECASE),
+]
 
 
 def _try_loads_dict(text: str) -> dict[str, Any] | None:
@@ -128,6 +135,12 @@ def parse_final_response(text: str) -> dict[str, Any]:
         return {"type": sniffed_type, "user_response": "Done."}
 
     return {"type": "REPLY", "user_response": text}
+
+
+def looks_like_workflow_delivery_claim(text: Any) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return any(pattern.search(text) for pattern in _WORKFLOW_DELIVERY_CLAIM_PATTERNS)
 
 
 def extract_screenshot_b64(result: dict[str, Any]) -> str | None:

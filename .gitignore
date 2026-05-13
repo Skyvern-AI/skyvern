@@ -172,7 +172,8 @@ postgres-data
 files/
 temp/
 
-# Streamlit ignores
+# Generated local deployment credentials
+.skyvern/
 **/secrets*.toml
 
 ## Frontend
